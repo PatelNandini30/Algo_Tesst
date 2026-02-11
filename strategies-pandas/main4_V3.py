@@ -1,0 +1,409 @@
+import os
+import glob
+import datetime
+import sys
+import time
+import pandas as pd
+import numpy as np
+import math
+from datetime import datetime, timedelta
+
+def main4_V3(call_sell_position=0, pct_diff=0.3):
+    data_df = getStrikeData("NIFTY")
+    data_df1 = data_df.copy(deep=True)
+    
+    base2_df = pd.read_csv("./Filter/base2.csv")
+    base2_df['Start'] = pd.to_datetime(base2_df['Start'], format='%Y-%m-%d')
+    base2_df['End'] = pd.to_datetime(base2_df['End'], format='%Y-%m-%d')
+    base2_df = base2_df.sort_values(by=['Start', 'End']).reset_index(drop=True)
+    
+    mask = pd.Series(False, index=data_df.index)
+    for _, row in base2_df.iterrows():
+        mask |= (data_df['Date'] >= row['Start']) & (data_df['Date'] <= row['End'])
+    data_df = data_df[mask].reset_index(drop=True)
+
+    monthly_expiry_df = pd.read_csv(f"./expiryData/NIFTY_Monthly.csv")
+    monthly_expiry_df['Previous Expiry'] = pd.to_datetime(monthly_expiry_df['Previous Expiry'], format='%Y-%m-%d')
+    monthly_expiry_df['Current Expiry'] = pd.to_datetime(monthly_expiry_df['Current Expiry'], format='%Y-%m-%d')
+    monthly_expiry_df['Next Expiry'] = pd.to_datetime(monthly_expiry_df['Next Expiry'], format='%Y-%m-%d')
+    
+    m, monthly_expiry_list = 0, []
+
+    while(m<len(monthly_expiry_df)):
+        pe = monthly_expiry_df.at[m, 'Previous Expiry']
+        ce = monthly_expiry_df.at[m, 'Current Expiry']
+        ne = monthly_expiry_df.at[m, 'Next Expiry']
+        
+        mask = (
+            (base2_df['Start'].dt.year == ce.year) &
+            (base2_df['Start'].dt.month == ce.month)
+        )
+        
+        # In case End is after Current Expiry 27-02-2020 Expiry Base End 28-02-2020
+        mask1 = (
+            (base2_df['End'].dt.year == ce.year) &
+            (base2_df['End'].dt.month == ce.month)
+        ) 
+        
+        if mask.any() and (not mask1.any()):
+            monthly_expiry_list.append((base2_df.loc[mask, 'Start'].min(), ne, monthly_expiry_df.at[m+1, 'Next Expiry']))
+            m += 2
+        else:
+            monthly_expiry_list.append((pe, ce, ne))
+            m += 1
+    
+    monthly_expiry_df = pd.DataFrame(monthly_expiry_list, 
+                                        columns=['Previous Expiry', 'Current Expiry', 'Next Expiry'])
+    analysis_data, first_instance = [], False
+
+
+    for w in range(0, len(monthly_expiry_df)):
+        prev_expiry = monthly_expiry_df.iloc[w]['Previous Expiry']
+        curr_expiry = monthly_expiry_df.iloc[w]['Current Expiry']
+        next_expiry = monthly_expiry_df.iloc[w]['Next Expiry']
+        fut_expiry = curr_expiry
+
+        filtered_data = data_df[
+                            (data_df['Date']>=prev_expiry)
+                            & (data_df['Date']<=curr_expiry)
+                        ].sort_values(by='Date').reset_index(drop=True)
+
+        if(len(filtered_data)<2):
+            continue
+        
+        if not first_instance:
+            filtered_data = data_df[
+                            (data_df['Date']>=prev_expiry)
+                            & (data_df['Date']<curr_expiry)
+                        ].sort_values(by='Date').reset_index(drop=True)
+            first_instance = True
+        
+        elif first_instance:
+            prev_date = data_df1[data_df1['Date']<prev_expiry]
+            if (prev_date.empty):
+                prev_date = prev_expiry
+            else:
+                prev_date = prev_date.iloc[-1]['Date']
+
+            filtered_data = data_df[
+                            (data_df['Date']>=prev_date)
+                            & (data_df['Date']<curr_expiry)
+                        ].sort_values(by='Date').reset_index(drop=True)
+        
+        if(len(filtered_data)<2):
+            continue
+        
+        interval, interval_df = [], pd.DataFrame()
+        interval.append((filtered_data.iloc[0]['Date'], filtered_data.iloc[-1]['Date'], curr_expiry))
+        interval_df = pd.DataFrame(interval, columns=['From', 'To', 'Expiry'])
+        
+        # If base ends falls between current and next expiry
+        base_ends = base2_df.loc[
+            (base2_df['End'] > curr_expiry) & (base2_df['End'] < next_expiry),
+            'End'
+        ].sort_values()
+        if not base_ends.empty:
+            interval.append((filtered_data.iloc[-1]['Date'], base_ends.max(), next_expiry))
+
+        interval_df = pd.DataFrame(interval, columns=['From', 'To', 'Expiry'])
+        
+        # Check for Base End within from and to Date
+        new_intervals = []
+        for _, row in interval_df.iterrows():
+            start, end, expiry = row['From'], row['To'], row['Expiry']
+
+            base_ends = base2_df.loc[
+                (base2_df['End'] > start) & (base2_df['End'] < end),
+                'End'
+            ].sort_values()
+
+            if base_ends.empty:
+                # no split needed
+                new_intervals.append((start, end, expiry))
+            else:
+                # Split into start and base_end. Skip base_end to End
+                curr_start = start
+                for be in base_ends:
+                    new_intervals.append((curr_start, be, expiry))
+            
+        interval_df = pd.DataFrame(new_intervals, columns=['From', 'To', 'Expiry'])
+
+        # Filter Data for Final
+        filtered_data = data_df[
+                            (data_df['Date']>=interval_df['From'].min())
+                            & (data_df['Date']<=interval_df['To'].max())
+                        ].sort_values(by='Date').reset_index(drop=True)
+        
+        
+        if(len(filtered_data)<2):
+            continue
+        
+
+        # CE Strike Based Adjustment
+        intervals = []
+        for i in range(0, len(interval_df)):
+            i_df_row = interval_df.iloc[i]
+            temp_curr_expiry = i_df_row['Expiry']
+            # temp_next_expiry = monthly_expiry_df[monthly_expiry_df['Current Expiry']>=temp_curr_expiry].iloc[0]['Next Expiry']
+
+            temp_filtered_df = filtered_data[
+                                    (filtered_data['Date']>=i_df_row['From'])
+                                    & (filtered_data['Date']<=i_df_row['To'])
+                                     ].reset_index(drop=True).copy(deep=True)
+            if len(temp_filtered_df)<2:
+                continue
+
+            call_strike = round_half_up((temp_filtered_df.iloc[0]['Close']*(1+(call_sell_position*0.01)))/100)*100
+            strike_change_date = pd.NaT
+            
+            for f in range(0, len(temp_filtered_df)):
+                f_row = temp_filtered_df.iloc[f]
+                curr_spot, curr_date = f_row['Close'], f_row['Date']    
+                target = round(call_strike * (1+(pct_diff*0.01)), 2)
+                temp_next_expiry = monthly_expiry_df[monthly_expiry_df['Current Expiry']>=curr_date].iloc[0]['Next Expiry']
+
+                if(f==0):
+                    call_expiry = temp_curr_expiry
+                
+                if(
+                    (curr_spot<=target) 
+                    and (f!=0)
+                    and (f!=(len(temp_filtered_df)-1))
+                ):
+                    if(pd.isna(strike_change_date)):
+                        intervals.append((temp_filtered_df.iloc[0]['Date'], curr_date, call_expiry, call_strike))
+                        call_strike = round_half_up((curr_spot*(1+(call_sell_position*0.01)))/100)*100
+                        strike_change_date = curr_date
+                        call_expiry = temp_next_expiry
+                    else:
+                        intervals.append((strike_change_date, curr_date, call_expiry, call_strike))
+                        call_strike = round_half_up((curr_spot*(1+(call_sell_position*0.01)))/100)*100
+                        strike_change_date = curr_date
+                        call_expiry = temp_next_expiry
+
+                if f == len(temp_filtered_df)-1:
+                    if pd.isna(strike_change_date):
+                        intervals.append((temp_filtered_df.iloc[0]['Date'], curr_date, call_expiry, call_strike))
+                    elif(strike_change_date!=curr_date):
+                        intervals.append((strike_change_date, curr_date, call_expiry, call_strike))
+            
+
+        if intervals:
+            interval_df = pd.DataFrame(intervals, columns=['From', 'To', 'Call Expiry', 'Call Strike'])
+    
+
+        for i in range(0, len(interval_df)):
+            fileName1 = fileName2 = ""
+            i_row = interval_df.iloc[i]
+
+            fromDate, toDate = i_row['From'], i_row['To']
+            if(fromDate==toDate):
+                continue
+
+            call_expiry, call_strike = i_row['Call Expiry'], i_row['Call Strike']
+            fut_expiry = monthly_expiry_df[monthly_expiry_df['Current Expiry']>fromDate].iloc[0]['Current Expiry']
+            
+            if fut_expiry<toDate:
+                fut_expiry = monthly_expiry_df[monthly_expiry_df['Current Expiry']>fromDate].iloc[0]['Next Expiry']
+            
+          
+            print(f"Call Sell Future Buy Monthly Expiry T-1 To T-1 - From:{fromDate.strftime('%Y-%m-%d')} To:{toDate.strftime('%Y-%m-%d')} CE Strike Based Adjustment")
+    
+            entrySpot = filtered_data[filtered_data['Date']==fromDate]
+            exitSpot =  filtered_data[filtered_data['Date']==toDate]
+
+            if entrySpot.empty:
+                continue
+            entrySpot = entrySpot.iloc[0]['Close']
+
+
+            if not exitSpot.empty:
+                exitSpot = exitSpot.iloc[0]['Close']
+            else:
+                exitSpot = None
+
+            fileName1 = fromDate.strftime("%Y-%m-%d") + ".csv"
+            fileName2 = toDate.strftime("%Y-%m-%d") + ".csv"         
+            bhav_df1, bhav_df2   = pd.DataFrame(), pd.DataFrame()
+            call_entry_price, call_exit_price = None, None
+            call_entry_turnover, call_exit_turnover = None, None
+            fut_entry_price, fut_exit_price = None, None
+            call_net, fut_net, total_net = None, None, None
+
+            try:
+                bhav_df1 = pd.read_csv(f"./cleaned_csvs/{fileName1}")
+            except:
+                reason = f"{fileName1} not found in cleaned_csvs. Skipping the Trade"
+                createLogFile("NIFTY", reason, call_expiry, pd.NaT, fut_expiry, fromDate, toDate)
+                continue
+
+            try:
+                bhav_df1['Date'] = pd.to_datetime(bhav_df1['Date'], format='%Y-%m-%d')
+            except:
+                bhav_df1['Date'] = pd.to_datetime(bhav_df1['Date'], format='%d-%m-%Y')
+            try:
+                bhav_df1['ExpiryDate'] = pd.to_datetime(bhav_df1['ExpiryDate'], format='%Y-%m-%d')
+            except:
+                bhav_df1['ExpiryDate'] = pd.to_datetime(bhav_df1['ExpiryDate'], format='%d-%m-%Y')
+
+            try:
+                bhav_df2 = pd.read_csv(f"./cleaned_csvs/{fileName2}")
+            except:
+                reason = f"{fileName2} not found in cleaned_csvs. Skipping the Trade"
+                createLogFile("NIFTY", reason, call_expiry, pd.NaT, fut_expiry, fromDate, toDate)
+                continue
+
+            try:
+                bhav_df2['Date'] = pd.to_datetime(bhav_df2['Date'], format='%Y-%m-%d')
+            except:
+                bhav_df2['Date'] = pd.to_datetime(bhav_df2['Date'], format='%d-%m-%Y')
+            try:
+                bhav_df2['ExpiryDate'] = pd.to_datetime(bhav_df2['ExpiryDate'], format='%Y-%m-%d')
+            except:
+                bhav_df2['ExpiryDate'] = pd.to_datetime(bhav_df2['ExpiryDate'], format='%d-%m-%Y')
+
+            if call_sell_position>=0:
+                    call_entry_data = bhav_df1[
+                                    (bhav_df1['Instrument']=="OPTIDX")
+                                    & (bhav_df1['Symbol']=="NIFTY")
+                                    & (bhav_df1['OptionType']=="CE")
+                                    & (
+                                        (bhav_df1['ExpiryDate']==call_expiry)
+                                        | (bhav_df1['ExpiryDate']==call_expiry-timedelta(days=1))
+                                        |  (bhav_df1['ExpiryDate']==call_expiry+timedelta(days=1))
+                                    )
+                                    & (bhav_df1['StrikePrice']>=call_strike)
+                                    & (bhav_df1['TurnOver']>0)
+                                    & (bhav_df1['StrikePrice']%100==0)
+                                ].sort_values(by='StrikePrice', ascending=True).reset_index(drop=True)
+            else:
+                call_entry_data = bhav_df1[
+                                    (bhav_df1['Instrument']=="OPTIDX")
+                                    & (bhav_df1['Symbol']=="NIFTY")
+                                    & (bhav_df1['OptionType']=="CE")
+                                    & (
+                                        (bhav_df1['ExpiryDate']==call_expiry)
+                                        | (bhav_df1['ExpiryDate']==call_expiry-timedelta(days=1))
+                                        |  (bhav_df1['ExpiryDate']==call_expiry+timedelta(days=1))
+                                    )
+                                    & (bhav_df1['StrikePrice']<=call_strike)
+                                    & (bhav_df1['TurnOver']>0)
+                                    & (bhav_df1['StrikePrice']%100==0)
+                                ].sort_values(by='StrikePrice', ascending=False).reset_index(drop=True)
+                
+            if(call_entry_data.empty):
+                reason = f"Call Data for Strike Below {call_strike} and TurnOver>0 not found"
+                createLogFile("NIFTY", reason, call_expiry, pd.NaT, fut_expiry, fromDate, toDate)
+                continue
+            call_strike = call_entry_data.iloc[0]['StrikePrice']
+            call_entry_data = call_entry_data[(call_entry_data['StrikePrice']==call_strike)]
+
+            call_exit_data = bhav_df2[
+                                (bhav_df2['Instrument']=="OPTIDX")
+                                & (bhav_df2['Symbol']=="NIFTY")
+                                & (bhav_df2['OptionType']=="CE")
+                                & (
+                                    (bhav_df2['ExpiryDate']==call_expiry)
+                                    | (bhav_df2['ExpiryDate']==call_expiry-timedelta(days=1))
+                                    |  (bhav_df2['ExpiryDate']==call_expiry+timedelta(days=1))
+                                )
+                                & (bhav_df2['StrikePrice']==call_strike)
+                            ]
+            
+            if call_entry_data.empty or call_exit_data.empty:
+                if(call_entry_data.empty):
+                    reason = f"Call Entry Data missing for Strike {int(call_strike)} with Expiry {call_expiry.strftime('%Y-%m-%d')}"
+                else:
+                    reason = f"Call Exit Data missing for Call Strike {int(call_strike)} with Expiry {call_expiry.strftime('%Y-%m-%d')}"
+                createLogFile("NIFTY", reason, call_expiry, pd.NaT, fut_expiry, fromDate, toDate)
+                continue
+        
+            call_entry_price = call_entry_data.iloc[0]['Close']
+            call_entry_turnover = call_entry_data.iloc[0]['TurnOver']
+            call_exit_price = call_exit_data.iloc[0]['Close']
+            call_exit_turnover = call_exit_data.iloc[0]['TurnOver']
+            call_net =  round(call_entry_price -  call_exit_price, 2)
+        
+            fut_entry_data = bhav_df1[
+                                (bhav_df1['Instrument']=="FUTIDX")
+                                & (bhav_df1['Symbol']=="NIFTY")
+                                & (bhav_df1['ExpiryDate'].dt.month==fut_expiry.month)
+                                & (bhav_df1['ExpiryDate'].dt.year==fut_expiry.year)
+                            ]
+            fut_exit_data = bhav_df2[
+                                (bhav_df2['Instrument']=="FUTIDX")
+                                & (bhav_df2['Symbol']=="NIFTY")
+                                & (bhav_df2['ExpiryDate'].dt.month==fut_expiry.month)
+                                & (bhav_df2['ExpiryDate'].dt.year==fut_expiry.year)
+                            ]
+            
+            if fut_entry_data.empty or fut_exit_data.empty:
+                if fut_entry_data.empty:
+                    reason = f"Future Entry Data missing for Expiry {fut_expiry}"
+                else:
+                    reason = f"Future Exit Data missing for Expiry {fut_expiry}"
+                createLogFile("NIFTY", reason, call_expiry, pd.NaT, fut_expiry, fromDate, toDate)
+                continue
+
+            fut_entry_price = fut_entry_data.iloc[0]['Close']
+            fut_exit_price = fut_exit_data.iloc[0]['Close']
+            fut_net = round(fut_exit_price - fut_entry_price, 2)
+
+            total_net = round(call_net + fut_net, 2)
+
+            analysis_data.append({
+                    "Entry Date" : fromDate,
+                    "Exit Date" : toDate,
+                    
+                    "Entry Spot" : entrySpot,
+                    "Exit Spot" : exitSpot,
+
+                    "Future Expiry" : fut_expiry,
+                    "Future EntryPrice": fut_entry_price,
+                    "Future ExitPrice" : fut_exit_price,
+                    "Future P&L": fut_net,
+
+                    "Call Expiry" : call_expiry,
+                    "Call Strike" : call_strike,
+                    "Call EntryPrice" : call_entry_price,
+                    "Call Entry Turnover" : call_entry_turnover,
+                    "Call ExitPrice" : call_exit_price,
+                    "Call Exit Turnover": call_exit_turnover,
+                    "Call P&L" : call_net,
+
+                    "Net P&L" : total_net,
+                    
+                })
+        
+      
+    if analysis_data:
+        path = "./Output/Call_Sell_Future_Buy/Monthly/T-1 To T-1"
+        if call_sell_position==0:
+            fileName = f"CE_ATM_Sell_FUT_Buy"
+        elif call_sell_position>0:
+            fileName = f"CE_{call_sell_position}%_OTM_Sell_FUT_Buy"
+        else:
+            fileName = f"CE_{call_sell_position}%_ITM_Sell_FUT_Buy"
+
+        fileName = fileName + f"_Monthly_Expiry_T-1_To_T-1(With_{pct_diff}%CE_Strike_Based_Adjustment)"
+        os.makedirs(path, exist_ok=True)
+        analyse_df = pd.DataFrame(analysis_data)
+        analyse_df = analyse_df.drop_duplicates(subset=['Entry Date', 'Exit Date']).reset_index(drop=True)
+        analyse_df.to_csv(f"{path}/Monthly/{fileName}.csv", index=False)
+        print(f"{fileName} saved to {path}/Monthly")
+
+    if logFile:
+        path = "./Output/Call_Sell_Future_Buy/Monthly/T-1 To T-1"
+        if call_sell_position==0:
+            fileName = f"CE_ATM_Sell_FUT_Buy"
+        elif call_sell_position>0:
+            fileName = f"CE_{call_sell_position}%_OTM_Sell_FUT_Buy"
+        else:
+            fileName = f"CE_{call_sell_position}%_ITM_Sell_FUT_Buy"
+
+        fileName = fileName + f"_Monthly_Expiry_T-1_To_T-1(With_{pct_diff}%CE_Strike_Based_Adjustment)"
+        os.makedirs(path, exist_ok=True)
+        fileName = fileName + "_Log"
+        log_df = pd.DataFrame(logFile)
+        log_df.to_csv(f"{path}/Monthly/{fileName}.csv", index=False)
+        logFile.clear()
