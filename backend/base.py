@@ -18,6 +18,11 @@ def round_half_up(x: float) -> int:
     """Round half values up (e.g., 0.5 -> 1, 1.5 -> 2)"""
     return int(math.floor(x + 0.5))
 
+
+def round_to_50(value: float) -> int:
+    """Round to nearest 50"""
+    return round(value / 50) * 50
+
 def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     """
     Read ./strikeData/Nifty_strike_data.csv

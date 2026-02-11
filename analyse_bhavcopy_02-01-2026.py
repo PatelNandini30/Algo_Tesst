@@ -391,8 +391,8 @@ def main():
 def main1(spot_adjustment_type=0, spot_adjustment=1, call_sell_position=0):
     data_df = getStrikeData("NIFTY")
     base2_df = pd.read_csv("./Filter/base2.csv")
-    base2_df['Start'] = pd.to_datetime(base2_df['Start'], format='%Y-%m-%d')
-    base2_df['End'] = pd.to_datetime(base2_df['End'], format='%Y-%m-%d')
+    base2_df['Start'] = pd.to_datetime(base2_df['Start'], dayfirst=True)
+    base2_df['End'] = pd.to_datetime(base2_df['End'], dayfirst=True)
     base2_df = base2_df.sort_values(by=['Start', 'End']).reset_index(drop=True)
     
     mask = pd.Series(False, index=data_df.index)
@@ -20175,12 +20175,18 @@ for spot_adjustment_type in range(0, 4):
     else:
         _range  = [i for i in range(1, 5)]
 
-    for spot_adjustment in _range:
-        for call_sell_position in np.arange(-4, 0.5, 0.5):
-            for put_strike_pct_below in np.arange(0.5, 2, 0.5):
-                main1_V8(
-                    spot_adjustment_type=spot_adjustment_type,
-                    spot_adjustment=spot_adjustment,
-                    call_sell_position=call_sell_position,
-                    put_strike_pct_below=put_strike_pct_below
-                )
+    # for spot_adjustment in _range:
+    #     for call_sell_position in np.arange(-4, 0.5, 0.5):
+    #         for put_strike_pct_below in np.arange(0.5, 2, 0.5):
+    #             main1_V8(
+    #                 spot_adjustment_type=spot_adjustment_type,
+    #                 spot_adjustment=spot_adjustment,
+    #                 call_sell_position=call_sell_position,
+    #                 put_strike_pct_below=put_strike_pct_below
+    #             )
+
+main1(
+    spot_adjustment_type=0,
+    spot_adjustment=0,
+    call_sell_position=1.0
+)

@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from base import (
     get_strike_data, load_expiry, load_base2, load_bhavcopy, 
-    get_option_price, build_intervals, compute_analytics, build_pivot, round_half_up
+    get_option_price, build_intervals, compute_analytics, build_pivot, round_half_up, round_to_50
 )
 
 def run_v4(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
@@ -62,9 +62,9 @@ def run_v4(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[s
                 continue
             exit_spot = exit_spot_row.iloc[0]['Close']
             
-            # Calculate strikes: round((spot*(1+pct%))/100)*100
-            call_strike = round_half_up((entry_spot * (1 + params.get("call_sell_position", 0.0)/100)) / 100) * 100
-            put_strike = round_half_up((entry_spot * (1 + params.get("put_sell_position", 0.0)/100)) / 100) * 100
+            # Calculate strikes: round((spot*(1+pct%))/50)*50
+            call_strike = round_to_50(entry_spot * (1 + params.get("call_sell_position", 0.0)/100))
+            put_strike = round_to_50(entry_spot * (1 + params.get("put_sell_position", 0.0)/100))
             
             try:
                 # Load bhavcopy CSVs

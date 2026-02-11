@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { 
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
   AreaChart, Area, Line, ComposedChart
@@ -11,21 +11,43 @@ const ResultsPanel = ({ results, onClose }) => {
   const { trades, summary, pivot } = results;
 
   // Format data for equity curve chart
-  const equityChartData = trades?.map(trade => ({
-    date: trade.exit_date || trade.ExitDate || trade.exitDate,
-    equity: trade.cumulative || trade.Cumulative || 0,
-    spot: trade.spot_equity || 0 // Placeholder - would need to calculate spot equivalent
-  })) || [];
+  const equityChartData = useMemo(() => 
+    trades?.map(trade => ({
+      date: trade.exit_date || trade.ExitDate || trade.exitDate,
+      equity: trade.cumulative || trade.Cumulative || 0,
+      spot: trade.spot_equity || 0
+    })) || [], [trades]
+  );
 
   // Format data for drawdown chart
-  const drawdownChartData = trades?.map(trade => ({
-    date: trade.exit_date || trade.ExitDate || trade.exitDate,
-    dd: trade.dd || trade.DD || trade['%DD'] || 0
-  })) || [];
+  const drawdownChartData = useMemo(() => 
+    trades?.map(trade => ({
+      date: trade.exit_date || trade.ExitDate || trade.exitDate,
+      dd: trade.dd || trade.DD || trade['%DD'] || 0
+    })) || [], [trades]
+  );
 
   // Format pivot data for heatmap
   const pivotRows = pivot?.rows || [];
   const pivotHeaders = pivot?.headers || [];
+
+  // Calculate year-wise returns from pivot data
+  const yearWiseReturns = useMemo(() => {
+    if (!pivotRows || pivotRows.length === 0) return [];
+    
+    return pivotRows.map(row => {
+      const year = row[0]; // First column is year
+      const yearlyTotal = row.slice(1).reduce((sum, val) => {
+        return sum + (typeof val === 'number' ? val : 0);
+      }, 0);
+      
+      return {
+        year: year,
+        return: yearlyTotal,
+        returnPct: yearlyTotal // Can be converted to % if needed
+      };
+    }).filter(item => item.year); // Remove any invalid entries
+  }, [pivotRows]);
 
   // Format pivot data for chart
   const pivotChartData = pivotRows.map(row => {
@@ -195,7 +217,7 @@ const ResultsPanel = ({ results, onClose }) => {
 
       {/* Monthly P&L Heatmap */}
       <div className="mb-8">
-        <h3 className="text-lg font-semibold mb-4">Monthly P&L Heatmap</h3>
+        <h3 className="text-lg font-semibold mb-4">Yearly Return</h3>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
@@ -279,7 +301,7 @@ const ResultsPanel = ({ results, onClose }) => {
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {trades?.slice(0, 50).map((trade, index) => renderTradeRow(trade, index))} {/* Limit to first 50 rows */}
+              {trades?.slice(0, 50).map((trade, index) => renderTradeRow(trade, index))}
             </tbody>
           </table>
         </div>

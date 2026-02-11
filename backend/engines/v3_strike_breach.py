@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from base import (
     get_strike_data, load_expiry, load_base2, load_bhavcopy, 
-    get_option_price, build_intervals, compute_analytics, build_pivot, round_half_up
+    get_option_price, build_intervals, compute_analytics, build_pivot, round_half_up, round_to_50
 )
 
 def run_v3(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
@@ -93,7 +93,12 @@ def run_v3(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[s
         fut_exp_rows = monthly_exp[monthly_exp['Current Expiry'] >= curr_exp]
         if fut_exp_rows.empty:
             continue
-        fut_exp = fut_exp_rows.iloc[0]['Current Expiry']
+        # Check if there are enough rows to access iloc[2]
+        if len(fut_exp_rows) < 3:
+            # If not enough rows, use the last available row
+            fut_exp = fut_exp_rows.iloc[-1]['Current Expiry']
+        else:
+            fut_exp = fut_exp_rows.iloc[2]['Current Expiry']
         
         # Filter spot to window
         window = spot_df[(spot_df['Date'] >= prev_exp) & (spot_df['Date'] <= curr_exp)]
@@ -121,8 +126,8 @@ def run_v3(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[s
                 continue
             exit_spot = exit_spot_row.iloc[0]['Close']
             
-            # Calculate strike: round((spot*(1+pct%))/100)*100
-            call_strike = round_half_up((entry_spot * (1 + params.get("call_sell_position", 0.0)/100)) / 100) * 100
+            # Calculate strike: round((spot*(1+pct%))/50)*50
+            call_strike = round_to_50(entry_spot * (1 + params.get("call_sell_position", 0.0)/100))
             
             # Check for strike breach during the period
             breach_occurred = False
