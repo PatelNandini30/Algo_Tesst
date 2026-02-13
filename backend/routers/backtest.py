@@ -1000,3 +1000,53 @@ async def export_summary_post(request: DynamicStrategyRequest):
     response.headers["Content-Disposition"] = f"attachment; filename=summary_{strategy_def.name}.csv"
     response.headers["Content-Type"] = "text/csv"
     return response
+
+
+@router.post("/algotest")
+async def run_algotest_backtest_endpoint(request: dict):
+    """
+    NEW ENDPOINT: AlgoTest-style backtest
+    
+    Request format:
+    {
+        "index": "NIFTY",
+        "from_date": "2024-01-01",
+        "to_date": "2024-12-31",
+        "expiry_type": "WEEKLY",
+        "entry_dte": 2,
+        "exit_dte": 0,
+        "legs": [
+            {
+                "segment": "OPTIONS",
+                "option_type": "CE",
+                "position": "SELL",
+                "lots": 1,
+                "strike_selection": "OTM2",
+                "expiry": "WEEKLY"
+            }
+        ]
+    }
+    """
+    try:
+        from engines.generic_algotest_engine import run_algotest_backtest
+        
+        # Run backtest
+        trades_df, summary, pivot = run_algotest_backtest(request)
+        
+        # Convert to JSON
+        trades_json = trades_df.to_dict('records') if not trades_df.empty else []
+        
+        return {
+            "status": "success",
+            "trades": trades_json,
+            "summary": summary,
+            "pivot": pivot
+        }
+    
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }

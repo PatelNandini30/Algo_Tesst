@@ -466,3 +466,337 @@ def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
     rows = [[str(year)] + [round(pivot.loc[year, m], 2) if m in pivot.columns and not pd.isna(pivot.loc[year, m]) else None for m in month_order + ['Grand Total']]
             for year in pivot.index]
     return {"headers": headers, "rows": rows}
+
+
+# ============================================
+# NEW FUNCTIONS FOR ALGOTEST-STYLE FEATURES
+# ============================================
+
+def calculate_trading_days_before_expiry(expiry_date, days_before, trading_calendar_df):
+    """
+    Calculate entry date by counting back trading days from expiry
+    
+    This is the CORE DTE calculation matching AlgoTest exactly
+    
+    Args:
+        expiry_date: datetime - The expiry date
+        days_before: int - Number of trading days before expiry
+        trading_calendar_df: DataFrame - Contains all trading dates
+    
+    Returns:
+        datetime - The entry date
+        
+    Example:
+        Expiry: 14-Jan-2025 (Tuesday)
+        Days Before: 2
+        
+        Count back:
+        14-Jan (Tue) = DTE 0
+        13-Jan (Mon) = DTE 1
+        10-Jan (Fri) = DTE 2 ✅ ENTRY DATE
+        (Skip Sat/Sun)
+    """
+    import pandas as pd
+    from datetime import timedelta
+    
+    # Get all trading days before expiry
+    trading_days = trading_calendar_df[
+        trading_calendar_df['date'] < expiry_date
+    ].sort_values('date', ascending=False)
+    
+    if days_before == 0:
+        # Entry on expiry day itself
+        return expiry_date
+    
+    # Validate enough trading days exist
+    if len(trading_days) < days_before:
+        raise ValueError(f"Not enough trading days before expiry {expiry_date}. Requested: {days_before}, Available: {len(trading_days)}")
+    
+    # Get the Nth trading day before expiry
+    # Index is 0-based, so days_before=1 means index 0, days_before=2 means index 1
+    entry_date = trading_days.iloc[days_before - 1]['date']
+    
+    return entry_date
+
+
+def get_trading_calendar(from_date, to_date, db_path='bhavcopy_data.db'):
+    """
+    Get all trading dates from database
+    
+    Returns:
+        DataFrame with columns: ['date']
+    """
+    import sqlite3
+    import pandas as pd
+    
+    conn = sqlite3.connect(db_path)
+    
+    query = f"""
+    SELECT DISTINCT date 
+    FROM bhavcopy 
+    WHERE date >= '{from_date}' AND date <= '{to_date}'
+    ORDER BY date
+    """
+    
+    df = pd.read_sql_query(query, conn)
+    df['date'] = pd.to_datetime(df['date'])
+    conn.close()
+    
+    return df
+
+
+def calculate_strike_from_selection(spot_price, strike_interval, selection, option_type):
+    """
+    Calculate strike based on AlgoTest-style selection
+    
+    This matches AlgoTest EXACTLY
+    
+    Args:
+        spot_price: float - Current spot price
+        strike_interval: int - Strike gap (50 for NIFTY, 100 for BANKNIFTY)
+        selection: str - 'ATM', 'ITM1', 'ITM2', ..., 'OTM1', 'OTM2', ...
+        option_type: str - 'CE' or 'PE'
+    
+    Returns:
+        float - Strike price
+        
+    Examples:
+        Spot = 24,350, Interval = 50, Selection = 'OTM2', Type = 'CE'
+        
+        Step 1: Calculate ATM
+        ATM = round(24350 / 50) * 50 = 488 * 50 = 24,400
+        
+        Step 2: For CE + OTM = Higher strikes
+        Offset = 2 strikes * 50 = 100
+        Strike = 24,400 + 100 = 24,500 ✅
+        
+        For PE + OTM = Lower strikes
+        Strike = 24,400 - 100 = 24,300 ✅
+    """
+    # Step 1: Calculate ATM strike
+    atm_strike = round(spot_price / strike_interval) * strike_interval
+    
+    # Step 2: Parse selection
+    selection = selection.upper().strip()
+    
+    if selection == 'ATM':
+        return atm_strike
+    
+    # Extract number from selection (ITM1 -> 1, OTM10 -> 10)
+    if selection.startswith('ITM'):
+        offset_strikes = int(selection.replace('ITM', ''))
+        offset_points = offset_strikes * strike_interval
+        
+        if option_type == 'CE':
+            # For CALL: ITM means LOWER strike (below spot)
+            return atm_strike - offset_points
+        else:  # PE
+            # For PUT: ITM means HIGHER strike (above spot)
+            return atm_strike + offset_points
+    
+    elif selection.startswith('OTM'):
+        offset_strikes = int(selection.replace('OTM', ''))
+        offset_points = offset_strikes * strike_interval
+        
+        if option_type == 'CE':
+            # For CALL: OTM means HIGHER strike (above spot)
+            return atm_strike + offset_points
+        else:  # PE
+            # For PUT: OTM means LOWER strike (below spot)
+            return atm_strike - offset_points
+    
+    raise ValueError(f"Invalid selection: {selection}. Must be ATM, ITM1-ITM30, or OTM1-OTM30")
+
+
+def get_strike_interval(index):
+    """
+    Get strike interval for index
+    
+    Returns:
+        int - Strike interval
+    """
+    intervals = {
+        'NIFTY': 50,
+        'BANKNIFTY': 100,
+        'FINNIFTY': 50,
+        'MIDCPNIFTY': 25,
+        'SENSEX': 100,
+        'BANKEX': 100,
+    }
+    
+    return intervals.get(index, 50)
+
+
+def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path='bhavcopy_data.db'):
+    """
+    Get option premium from database
+    
+    This is your existing logic but extracted for reuse
+    
+    Args:
+        date: str - Date in YYYY-MM-DD format
+        index: str - NIFTY, BANKNIFTY, etc.
+        strike: float - Strike price
+        option_type: str - 'CE' or 'PE'
+        expiry: str - Expiry date in YYYY-MM-DD
+        db_path: str - Path to database
+    
+    Returns:
+        float - Option premium (Close price)
+        None if not found
+    """
+    import sqlite3
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT close 
+    FROM bhavcopy 
+    WHERE date = ? 
+      AND symbol = ? 
+      AND strike = ? 
+      AND option_type = ? 
+      AND expiry = ?
+    LIMIT 1
+    """
+    
+    cursor.execute(query, (date, index, strike, option_type, expiry))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return float(result[0])
+    return None
+
+
+def get_future_price_from_db(date, index, expiry, db_path='bhavcopy_data.db'):
+    """
+    Get future price from database
+    
+    Args:
+        date: str - Date
+        index: str - Index symbol
+        expiry: str - Expiry date
+        db_path: str - Database path
+    
+    Returns:
+        float - Future close price
+    """
+    import sqlite3
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    query = """
+    SELECT close 
+    FROM bhavcopy 
+    WHERE date = ? 
+      AND symbol = ? 
+      AND expiry = ?
+      AND option_type IS NULL
+    LIMIT 1
+    """
+    
+    cursor.execute(query, (date, index, expiry))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return float(result[0])
+    return None
+
+def calculate_intrinsic_value(spot, strike, option_type):
+    """
+    Calculate intrinsic value on expiry
+    
+    This is CRITICAL for expiry day exit
+    
+    Args:
+        spot: float - Spot price at expiry
+        strike: float - Strike price
+        option_type: str - 'CE' or 'PE'
+    
+    Returns:
+        float - Intrinsic value
+        
+    Examples:
+        Spot = 24,500, Strike = 24,400, Type = CE
+        Intrinsic = max(0, 24500 - 24400) = 100 ✅
+        
+        Spot = 24,300, Strike = 24,400, Type = CE
+        Intrinsic = max(0, 24300 - 24400) = 0 ✅ (worthless)
+        
+        Spot = 24,300, Strike = 24,400, Type = PE
+        Intrinsic = max(0, 24400 - 24300) = 100 ✅
+    """
+    if option_type == 'CE':
+        # Call intrinsic = max(0, Spot - Strike)
+        return max(0, spot - strike)
+    else:  # PE
+        # Put intrinsic = max(0, Strike - Spot)
+        return max(0, strike - spot)
+
+def get_expiry_dates(symbol: str = "NIFTY", expiry_type: str = "weekly", from_date=None, to_date=None):
+    """
+    Get expiry dates for a given symbol and type
+    
+    Args:
+        symbol: str - Index symbol (NIFTY, BANKNIFTY, etc.)
+        expiry_type: str - 'weekly' or 'monthly'
+        from_date: str - Optional start date filter
+        to_date: str - Optional end date filter
+    
+    Returns:
+        DataFrame with expiry dates
+    """
+    from . import load_expiry
+    
+    # Load expiry data
+    expiry_df = load_expiry(symbol, expiry_type)
+    
+    # Apply date filters if provided
+    if from_date:
+        from_date = pd.to_datetime(from_date)
+        expiry_df = expiry_df[expiry_df['Current Expiry'] >= from_date]
+    
+    if to_date:
+        to_date = pd.to_datetime(to_date)
+        expiry_df = expiry_df[expiry_df['Current Expiry'] <= to_date]
+    
+    return expiry_df
+
+def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
+    """
+    Get spot price from database
+    
+    Note: Your database might store spot differently
+    Adjust this to match your schema
+    """
+    import sqlite3
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # This query assumes spot is stored in a specific way
+    # ADJUST based on your actual database schema
+    query = """
+    SELECT close 
+    FROM bhavcopy 
+    WHERE date = ? 
+      AND symbol = ?
+      AND strike IS NULL
+      AND option_type IS NULL
+    LIMIT 1
+    """
+    
+    cursor.execute(query, (date.strftime('%Y-%m-%d'), index))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return float(result[0])
+    
+    # Fallback: calculate from ATM options
+    # You may need to implement this based on your data
+    return None
