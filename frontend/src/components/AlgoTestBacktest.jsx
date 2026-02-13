@@ -83,101 +83,23 @@ const AlgoTestBacktest = () => {
     setLegs(newLegs);
   };
 
-  // Build payload for dynamic backtest
+  // Build payload
   const buildPayload = () => {
-    // Convert legs to dynamic backtest format
-    const dynamicLegs = legs.map((leg, index) => {
-      const dynamicLeg = {
-        leg_number: index + 1,
-        instrument: leg.segment === 'futures' ? 'Future' : 'Option',
-        position: leg.position === 'buy' ? 'Buy' : 'Sell',
-        lots: leg.lot || 1,
-        expiry_type: leg.expiry === 'weekly' ? 'Weekly' : 
-                     leg.expiry === 'next_weekly' ? 'Weekly_T1' :
-                     leg.expiry === 'monthly' ? 'Monthly' :
-                     leg.expiry === 'next_monthly' ? 'Monthly_T1' : 'Weekly',
-        strike_selection: convertStrikeSelection(leg.strike_selection),
-        entry_condition: {
-          type: strategyType === 'positional' ? 'DaysBeforeExpiry' : 'SpecificTime',
-          days_before_expiry: strategyType === 'positional' ? entryDaysBefore : null,
-          specific_time: strategyType === 'intraday' ? '09:15' : null
-        },
-        exit_condition: {
-          type: strategyType === 'positional' ? 'DaysBeforeExpiry' : 'SpecificTime',
-          days_before_expiry: strategyType === 'positional' ? exitDaysBefore : null,
-          specific_time: strategyType === 'intraday' ? '15:15' : null,
-          stop_loss_percent: overallStopLoss,
-          target_percent: overallTarget
-        }
-      };
-
-      // Add option_type only for options
-      if (leg.segment === 'options') {
-        dynamicLeg.option_type = leg.option_type === 'call' ? 'CE' : 'PE';
-      }
-
-      return dynamicLeg;
-    });
-
     return {
-      name: `Custom Strategy - ${new Date().toISOString()}`,
-      legs: dynamicLegs,
-      parameters: {},
-      index: instrument,
-      date_from: startDate,
-      date_to: endDate,
-      expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
-      spot_adjustment_type: 'None',
-      spot_adjustment: 1.0
+      instrument,
+      underlying,
+      strategy_type: strategyType,
+      expiry_basis: expiryBasis,
+      entry_days_before_expiry: entryDaysBefore,
+      exit_days_before_expiry: exitDaysBefore,
+      legs: legs,
+      overall_settings: {
+        stop_loss: overallStopLoss,
+        target: overallTarget
+      },
+      start_date: startDate,
+      end_date: endDate
     };
-  };
-
-  // Convert strike selection to backend format
-  const convertStrikeSelection = (strikeSelection) => {
-    switch (strikeSelection.type) {
-      case 'strike_type':
-        if (strikeSelection.strike_type === 'atm') {
-          return { type: 'ATM' };
-        } else if (strikeSelection.strike_type === 'otm') {
-          return { 
-            type: 'StrikesAway',
-            value: strikeSelection.strikes_away || 1,
-            strike_type: 'OTM'
-          };
-        } else if (strikeSelection.strike_type === 'itm') {
-          return { 
-            type: 'StrikesAway',
-            value: strikeSelection.strikes_away || 1,
-            strike_type: 'ITM'
-          };
-        }
-        break;
-      case 'premium_range':
-        return {
-          type: 'PremiumRange',
-          premium_min: strikeSelection.lower || 0,
-          premium_max: strikeSelection.upper || 0
-        };
-      case 'closest_premium':
-        return {
-          type: 'ClosestPremium',
-          value: strikeSelection.premium || 0
-        };
-      case 'premium_gte':
-        return {
-          type: 'PremiumRange',
-          premium_min: strikeSelection.premium || 0,
-          premium_max: 999999
-        };
-      case 'premium_lte':
-        return {
-          type: 'PremiumRange',
-          premium_min: 0,
-          premium_max: strikeSelection.premium || 0
-        };
-      default:
-        return { type: 'ATM' };
-    }
   };
 
   // Run backtest
@@ -192,8 +114,6 @@ const AlgoTestBacktest = () => {
 
     try {
       const payload = buildPayload();
-      console.log('Sending payload:', payload);
-      
       const response = await fetch('/api/dynamic-backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
