@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Backtest Payload</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .result {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .success {
+            background: #d4edda;
+            color: #155724;
+        }
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <h1>Backtest API Payload Tester</h1>
+    <p>Test different strategy payloads to diagnose 422 errors</p>
+
+    <div class="test-section">
+        <h3>Test 1: V1 CE + FUT</h3>
+        <button onclick="testV1()">Test V1 Strategy</button>
+        <div id="result1" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h3>Test 2: V4 Strangle</h3>
+        <button onclick="testV4()">Test V4 Strategy</button>
+        <div id="result2" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h3>Test 3: V8 Hedged Bull</h3>
+        <button onclick="testV8()">Test V8 Strategy</button>
+        <div id="result3" class="result"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000/api';
+
+        async function testBacktest(payload, resultId) {
+            const resultDiv = document.getElementById(resultId);
+            resultDiv.textContent = 'Testing...\n\nPayload:\n' + JSON.stringify(payload, null, 2);
+            resultDiv.className = 'result';
+
+            try {
+                const response = await fetch(`${API_BASE}/backtest`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(payload)
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    resultDiv.className = 'result success';
+                    resultDiv.textContent = `✅ SUCCESS (${response.status})\n\n` +
+                        `Trades: ${data.trades?.length || 0}\n` +
+                        `Total PnL: ${data.summary?.total_pnl?.toFixed(2) || 'N/A'}\n` +
+                        `Win %: ${data.summary?.win_pct?.toFixed(2) || 'N/A'}%\n\n` +
+                        `Payload sent:\n${JSON.stringify(payload, null, 2)}`;
+                } else {
+                    resultDiv.className = 'result error';
+                    let errorMsg = `❌ ERROR (${response.status})\n\n`;
+                    
+                    if (response.status === 422 && Array.isArray(data.detail)) {
+                        errorMsg += 'Validation Errors:\n';
+                        data.detail.forEach(err => {
+                            errorMsg += `  - ${err.loc.join('.')}: ${err.msg} (type: ${err.type})\n`;
+                        });
+                    } else {
+                        errorMsg += `Error: ${JSON.stringify(data, null, 2)}`;
+                    }
+                    
+                    errorMsg += `\n\nPayload sent:\n${JSON.stringify(payload, null, 2)}`;
+                    resultDiv.textContent = errorMsg;
+                }
+            } catch (error) {
+                resultDiv.className = 'result error';
+                resultDiv.textContent = `❌ NETWORK ERROR\n\n${error.message}\n\n` +
+                    `Make sure backend is running on ${API_BASE}`;
+            }
+        }
+
+        function testV1() {
+            const payload = {
+                strategy: "v1_ce_fut",
+                index: "NIFTY",
+                date_from: "2019-01-01",
+                date_to: "2026-01-01",
+                spot_adjustment_type: "None",
+                spot_adjustment: 1.0,
+                expiry_window: "weekly_expiry",
+                call_sell_position: 1.0,
+                call_sell: true,
+                put_sell: false,
+                put_buy: false,
+                future_buy: true
+            };
+            testBacktest(payload, 'result1');
+        }
+
+        function testV4() {
+            const payload = {
+                strategy: "v4_strangle",
+                index: "NIFTY",
+                date_from: "2019-01-01",
+                date_to: "2026-01-01",
+                spot_adjustment_type: "None",
+                spot_adjustment: 1.0,
+                call_sell_position: 1.0,
+                put_sell_position: -1.0,
+                call_sell: true,
+                put_sell: true,
+                put_buy: false,
+                future_buy: false
+            };
+            testBacktest(payload, 'result2');
+        }
+
+        function testV8() {
+            const payload = {
+                strategy: "v8_ce_pe_fut",
+                index: "NIFTY",
+                date_from: "2019-01-01",
+                date_to: "2026-01-01",
+                spot_adjustment_type: "None",
+                spot_adjustment: 1.0,
+                expiry_window: "weekly_expiry",
+                call_sell_position: 1.0,
+                put_strike_pct_below: 1.0,
+                call_sell: true,
+                put_sell: false,
+                put_buy: true,
+                future_buy: true
+            };
+            testBacktest(payload, 'result3');
+        }
+    </script>
+</body>
+</html>

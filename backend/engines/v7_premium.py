@@ -364,3 +364,15 @@ def run_v7_main2(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], 
     # We'll need to update the expiry handling logic to shift weeks
     # This is a simplified approach - in practice, you'd modify the expiry selection
     return run_v7(params)
+
+
+def run_v7_main3(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
+    """V7 with weekly_t2 expiry window (placeholder)"""
+    # Placeholder implementation - same as main2 for now
+    return run_v7_main2(params)
+
+
+def run_v7_main4(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
+    """V7 with monthly expiry window (placeholder)"""
+    # Placeholder implementation
+    return run_v7(params)

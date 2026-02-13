@@ -187,6 +187,133 @@ def get_option_price(bhavcopy_df, symbol, instrument, option_type, expiry, strik
     
     return None, None
 
+
+def apply_spot_adjustment(spot: float, mode: int, value: float) -> float:
+    """
+    Apply spot adjustment based on mode
+    
+    Args:
+        spot: Original spot price
+        mode: Adjustment mode (0-4)
+            0: Unadjusted spot
+            1: Spot rises by X%
+            2: Spot falls by X%
+            3: Spot may rise or fall (volatility assumption)
+            4: Custom spot shift
+        value: Adjustment value (percentage or points)
+    """
+    if mode == 0:
+        # Unadjusted spot
+        return spot
+    elif mode == 1:
+        # Spot rises by X%
+        return spot * (1 + value / 100)
+    elif mode == 2:
+        # Spot falls by X%
+        return spot * (1 - value / 100)
+    elif mode == 3:
+        # Spot may rise or fall (volatility assumption)
+        # For this mode, we might want to return both possibilities or average
+        # For now, return the original spot as a neutral value
+        return spot
+    elif mode == 4:
+        # Custom spot shift
+        return spot + value
+    else:
+        raise ValueError(f"Invalid spot adjustment mode: {mode}")
+
+
+def get_nearest_strike(adjusted_spot: float, available_strikes: pd.Series) -> float:
+    """
+    Get the nearest available strike to the adjusted spot price
+    
+    Args:
+        adjusted_spot: Adjusted spot price
+        available_strikes: Series of available strike prices
+    """
+    if available_strikes.empty:
+        return None
+    
+    # Find the strike closest to the adjusted spot
+    differences = abs(available_strikes - adjusted_spot)
+    nearest_idx = differences.idxmin()
+    return available_strikes.iloc[nearest_idx]
+
+
+def calculate_strike_offset(spot: float, offset_type: str, offset_value: float) -> float:
+    """
+    Calculate strike price based on offset from spot
+    
+    Args:
+        spot: Reference spot price
+        offset_type: 'percent' or 'points'
+        offset_value: Offset amount
+    """
+    if offset_type == 'percent':
+        return spot * (1 + offset_value / 100)
+    elif offset_type == 'points':
+        return spot + offset_value
+    else:
+        raise ValueError(f"Invalid offset type: {offset_type}")
+
+
+def get_atm_strike(spot: float, available_strikes: pd.Series) -> float:
+    """
+    Get ATM (At The Money) strike price
+    
+    Args:
+        spot: Current spot price
+        available_strikes: Series of available strike prices
+    """
+    return get_nearest_strike(spot, available_strikes)
+
+
+def get_otm_strike(spot: float, available_strikes: pd.Series, otm_distance: float, option_type: str) -> float:
+    """
+    Get OTM (Out of The Money) strike price
+    
+    Args:
+        spot: Current spot price
+        available_strikes: Series of available strike prices
+        otm_distance: Distance from ATM (can be percent or points)
+        option_type: 'CE' for calls or 'PE' for puts
+    """
+    if option_type == 'CE':
+        # For calls, OTM is above spot
+        otm_target = spot * (1 + abs(otm_distance) / 100) if isinstance(otm_distance, (int, float)) and otm_distance >= 0 else spot + abs(otm_distance)
+    elif option_type == 'PE':
+        # For puts, OTM is below spot
+        otm_target = spot * (1 - abs(otm_distance) / 100) if isinstance(otm_distance, (int, float)) and otm_distance >= 0 else spot - abs(otm_distance)
+    else:
+        raise ValueError(f"Invalid option type: {option_type}")
+    
+    # Find the nearest available strike to the calculated target
+    return get_nearest_strike(otm_target, available_strikes)
+
+
+def get_itm_strike(spot: float, available_strikes: pd.Series, itm_distance: float, option_type: str) -> float:
+    """
+    Get ITM (In The Money) strike price
+    
+    Args:
+        spot: Current spot price
+        available_strikes: Series of available strike prices
+        itm_distance: Distance from ATM (can be percent or points)
+        option_type: 'CE' for calls or 'PE' for puts
+    """
+    if option_type == 'CE':
+        # For calls, ITM is below spot
+        itm_target = spot * (1 - abs(itm_distance) / 100) if isinstance(itm_distance, (int, float)) and itm_distance >= 0 else spot - abs(itm_distance)
+    elif option_type == 'PE':
+        # For puts, ITM is above spot
+        itm_target = spot * (1 + abs(itm_distance) / 100) if isinstance(itm_distance, (int, float)) and itm_distance >= 0 else spot + abs(itm_distance)
+    else:
+        raise ValueError(f"Invalid option type: {option_type}")
+    
+    # Find the nearest available strike to the calculated target
+    return get_nearest_strike(itm_target, available_strikes)
+
+
 def build_intervals(filtered_data: pd.DataFrame, spot_adjustment_type: int, spot_adjustment: float) -> list:
     """
     Core re-entry engine — identical logic to all Python strategy functions

@@ -1,14 +1,82 @@
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 import { 
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
   AreaChart, Area, Line, ComposedChart
 } from 'recharts';
-import { TrendingUp, TrendingDown, DollarSign, Percent, Calendar, Calculator } from 'lucide-react';
+import { TrendingUp, TrendingDown, DollarSign, Percent, Calendar, Calculator, Download } from 'lucide-react';
 
 const ResultsPanel = ({ results, onClose }) => {
   if (!results) return null;
 
   const { trades, summary, pivot } = results;
+
+  // Export to CSV function
+  const exportToCSV = (data, filename) => {
+    if (!data || data.length === 0) return;
+    
+    const headers = Object.keys(data[0]);
+    const csvContent = [
+      headers.join(','),
+      ...data.map(row => 
+        headers.map(header => {
+          const value = row[header];
+          // Escape commas and quotes in values
+          if (typeof value === 'string' && (value.includes(',') || value.includes('"'))) {
+            return `"${value.replace(/"/g, '""')}"`;
+          }
+          return value;
+        }).join(',')
+      )
+    ].join('\n');
+    
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    link.setAttribute('href', url);
+    link.setAttribute('download', `${filename}.csv`);
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Export summary to CSV
+  const exportSummaryToCSV = () => {
+    if (!summary) return;
+    const summaryData = Object.entries(summary).map(([key, value]) => ({
+      Metric: key,
+      Value: typeof value === 'number' ? value.toFixed(2) : String(value)
+    }));
+    exportToCSV(summaryData, 'backtest_summary');
+  };
+
+  // Format date for chart display
+  const formatChartDate = (dateStr) => {
+    if (!dateStr) return '';
+    try {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+    } catch {
+      return dateStr;
+    }
+  };
+
+  // Custom tooltip for charts
+  const CustomTooltip = ({ active, payload, label }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div className="bg-white p-3 border border-gray-300 rounded shadow-lg">
+          <p className="text-sm font-medium text-gray-900">{formatChartDate(label)}</p>
+          {payload.map((entry, index) => (
+            <p key={index} className="text-sm" style={{ color: entry.color }}>
+              {entry.name}: {typeof entry.value === 'number' ? entry.value.toFixed(2) : entry.value}
+            </p>
+          ))}
+        </div>
+      );
+    }
+    return null;
+  };
 
   // Format data for equity curve chart
   const equityChartData = useMemo(() => 

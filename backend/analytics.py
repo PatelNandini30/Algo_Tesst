@@ -145,3 +145,119 @@ def getPivotTable(df: pd.DataFrame, expiry_col: str) -> pd.DataFrame:
     pivot['Grand Total'] = pivot[available_months].sum(axis=1).round(2)
     
     return pivot
+
+
+def generate_trade_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Generate a trade sheet with detailed breakdown of each trade
+    
+    Args:
+        df: DataFrame containing trade data
+        
+    Returns:
+        DataFrame with trade sheet format
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Create a copy of the dataframe to work with
+    df_copy = df.copy()
+    
+    # Create the trade sheet with relevant columns
+    trade_sheet = pd.DataFrame()
+    
+    # Add basic trade information
+    if 'Entry Date' in df_copy.columns:
+        trade_sheet['Trade Date'] = df_copy['Entry Date'].dt.strftime('%Y-%m-%d')
+    elif 'entry_date' in df_copy.columns:
+        trade_sheet['Trade Date'] = df_copy['entry_date'].dt.strftime('%Y-%m-%d')
+    
+    # Add strategy name if available
+    if 'Strategy Name' in df_copy.columns:
+        trade_sheet['Strategy Name'] = df_copy['Strategy Name']
+    else:
+        trade_sheet['Strategy Name'] = 'Dynamic Strategy'
+    
+    # Add leg-specific information if available
+    # Look for columns that contain leg information
+    leg_cols = [col for col in df_copy.columns if 'Leg_' in col]
+    
+    if leg_cols:
+        # Extract leg information
+        for col in leg_cols:
+            trade_sheet[col] = df_copy[col]
+    else:
+        # If no leg-specific info, just add general strategy info
+        if 'Net P&L' in df_copy.columns:
+            trade_sheet['Net P&L'] = df_copy['Net P&L']
+        if 'Cumulative' in df_copy.columns:
+            trade_sheet['Running Equity'] = df_copy['Cumulative']
+    
+    # Include all P&L related columns if available
+    pnl_cols = ['Net P&L', 'Call P&L', 'Put P&L', 'Future P&L', 'Spot P&L']
+    for col in pnl_cols:
+        if col in df_copy.columns:
+            trade_sheet[col] = df_copy[col]
+    
+    # Include strike and premium information if available
+    strike_cols = ['Call Strike', 'Put Strike', 'Call EntryPrice', 'Call ExitPrice', 
+                   'Put EntryPrice', 'Put ExitPrice', 'Future EntryPrice', 'Future ExitPrice']
+    for col in strike_cols:
+        if col in df_copy.columns:
+            trade_sheet[col] = df_copy[col]
+    
+    # Add running equity if available
+    if 'Cumulative' in df_copy.columns:
+        trade_sheet['Running Equity'] = df_copy['Cumulative']
+    
+    # Reorder columns to prioritize important ones
+    priority_cols = ['Trade Date', 'Strategy Name', 'Net P&L', 'Running Equity']
+    other_cols = [col for col in trade_sheet.columns if col not in priority_cols]
+    reordered_cols = priority_cols + other_cols
+    
+    trade_sheet = trade_sheet[reordered_cols]
+    
+    return trade_sheet
+
+
+def generate_summary_report(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Generate a summary report with key metrics
+    
+    Args:
+        df: DataFrame containing trade data
+        
+    Returns:
+        DataFrame with summary metrics
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Get summary stats from the existing function
+    summary_stats = create_summary_idx(df)
+    
+    # Create a summary report dataframe
+    summary_df = pd.DataFrame({
+        'Metric': [
+            'Total P&L', 'Total Trades', 'Win Rate (%)', 'Avg Win', 'Avg Loss', 
+            'Expectancy', 'CAGR Options (%)', 'CAGR Spot (%)', 'Max Drawdown (%)', 
+            'Max Drawdown Points', 'CAR/MDD', 'Recovery Factor', 'ROI vs Spot (%)'
+        ],
+        'Value': [
+            summary_stats.get('Sum', 0),
+            summary_stats.get('Count', 0),
+            summary_stats.get('W%', 0),
+            summary_stats.get('Avg(W)', 0),
+            summary_stats.get('Avg(L)', 0),
+            summary_stats.get('Expectancy', 0),
+            summary_stats.get('CAGR(Options)', 0),
+            summary_stats.get('CAGR(Spot)', 0),
+            summary_stats.get('DD', 0),
+            summary_stats.get('DD(Points)', 0),
+            summary_stats.get('CAR/MDD', 0),
+            summary_stats.get('Recovery Factor', 0),
+            summary_stats.get('ROI vs Spot', 0)
+        ]
+    })
+    
+    return summary_df

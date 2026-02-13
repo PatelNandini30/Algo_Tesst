@@ -26,7 +26,7 @@ async def get_strategies():
     strategies = [
         StrategyInfo(
             name="CE Sell + Future Buy (V1)",
-            version="v1",
+            version="v1_ce_fut",
             description="Sell Call Option and Buy Future",
             parameters={
                 "call_sell_position": "Percentage OTM for call strike",
@@ -38,12 +38,17 @@ async def get_strategies():
                 "call_sell_position": 0.0,
                 "spot_adjustment_type": 0,
                 "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry"
+                "expiry_window": "weekly_expiry",
+                "call_sell": True,
+                "put_sell": False,
+                "call_buy": False,
+                "put_buy": False,
+                "future_buy": True
             }
         ),
         StrategyInfo(
             name="PE Sell + Future Buy (V2)",
-            version="v2",
+            version="v2_pe_fut",
             description="Sell Put Option and Buy Future",
             parameters={
                 "put_sell_position": "Percentage OTM for put strike",
@@ -55,12 +60,17 @@ async def get_strategies():
                 "put_sell_position": 0.0,
                 "spot_adjustment_type": 0,
                 "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry"
+                "expiry_window": "weekly_expiry",
+                "call_sell": False,
+                "put_sell": True,
+                "call_buy": False,
+                "put_buy": False,
+                "future_buy": True
             }
         ),
         StrategyInfo(
             name="Short Strangle (V4)",
-            version="v4",
+            version="v4_strangle",
             description="Sell Call and Put Options (no future)",
             parameters={
                 "call_sell_position": "Percentage OTM for call strike",
@@ -72,7 +82,12 @@ async def get_strategies():
                 "call_sell_position": 0.0,
                 "put_sell_position": 0.0,
                 "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0
+                "spot_adjustment": 1.0,
+                "call_sell": True,
+                "put_sell": True,
+                "call_buy": False,
+                "put_buy": False,
+                "future_buy": False
             }
         ),
         StrategyInfo(
@@ -93,7 +108,12 @@ async def get_strategies():
                 "protection_pct": 1.0,
                 "spot_adjustment_type": 0,
                 "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry"
+                "expiry_window": "weekly_expiry",
+                "call_sell": True,
+                "put_sell": False,
+                "call_buy": True,
+                "put_buy": False,
+                "future_buy": False
             }
         ),
         StrategyInfo(
@@ -114,12 +134,17 @@ async def get_strategies():
                 "protection_pct": 1.0,
                 "spot_adjustment_type": 0,
                 "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry"
+                "expiry_window": "weekly_expiry",
+                "call_sell": False,
+                "put_sell": True,
+                "call_buy": False,
+                "put_buy": True,
+                "future_buy": False
             }
         ),
         StrategyInfo(
             name="Premium-Based Strangle (V7)",
-            version="v7",
+            version="v7_premium",
             description="Sell options based on premium targets",
             parameters={
                 "call_premium": "Use ATM call premium for target",
@@ -137,7 +162,10 @@ async def get_strategies():
                 "call_sell": True,
                 "put_sell": True,
                 "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0
+                "spot_adjustment": 1.0,
+                "call_buy": False,
+                "put_buy": False,
+                "future_buy": False
             }
         ),
         StrategyInfo(
@@ -156,12 +184,17 @@ async def get_strategies():
                 "put_strike_pct_below": 1.0,
                 "spot_adjustment_type": 0,
                 "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry"
+                "expiry_window": "weekly_expiry",
+                "call_sell": True,
+                "put_sell": False,
+                "call_buy": False,
+                "put_buy": True,
+                "future_buy": True
             }
         ),
         StrategyInfo(
             name="Counter-Expiry (V9)",
-            version="v9",
+            version="v9_counter",
             description="CE Sell + PE Buy with dynamic put expiry",
             parameters={
                 "call_sell_position": "Percentage OTM for call strike",
@@ -175,7 +208,33 @@ async def get_strategies():
                 "put_strike_pct_below": 1.0,
                 "max_put_spot_pct": 0.04,
                 "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0
+                "spot_adjustment": 1.0,
+                "call_sell": True,
+                "put_sell": False,
+                "call_buy": False,
+                "put_buy": True,
+                "future_buy": True
+            }
+        ),
+        StrategyInfo(
+            name="Days Before Expiry (V10)",
+            version="v10",
+            description="Fully dynamic entry/exit based on days before expiry",
+            parameters={
+                "entry_days_before_expiry": "Days before expiry to enter position",
+                "exit_days_before_expiry": "Days before expiry to exit position",
+                "option_type": "Option type (CE or PE)",
+                "position_type": "Position type (Buy or Sell)",
+                "strike_offset": "Strike offset (0=ATM, +1=1 strike OTM, -1=1 strike ITM)",
+                "expiry_type": "Expiry type (weekly or monthly)"
+            },
+            defaults={
+                "entry_days_before_expiry": 5,
+                "exit_days_before_expiry": 3,
+                "option_type": "CE",
+                "position_type": "Buy",
+                "strike_offset": 0,
+                "expiry_type": "weekly"
             }
         )
     ]
