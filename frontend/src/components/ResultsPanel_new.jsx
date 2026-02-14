@@ -64,7 +64,6 @@ const ResultsPanel = ({ results, onClose }) => {
     if (active && payload && payload.length) {
       return (
         <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 shadow-xl">
-          <p className="text-xs text-gray-400 mb-1">{payload[0]?.payload?.date}</p>
           {payload.map((entry, index) => (
             <p key={index} className="text-sm font-medium" style={{ color: entry.color }}>
               {entry.name}: {entry.name.includes('%') 
@@ -76,19 +75,6 @@ const ResultsPanel = ({ results, onClose }) => {
       );
     }
     return null;
-  };
-
-  const formatDateShort = (dateStr) => {
-    if (!dateStr) return '';
-    try {
-      const date = new Date(dateStr);
-      const day = date.getDate();
-      const month = date.toLocaleString('en-US', { month: 'short' });
-      const year = date.getFullYear();
-      return `${day} ${month} ${year}`;
-    } catch {
-      return dateStr;
-    }
   };
 
   return (
@@ -180,13 +166,10 @@ const ResultsPanel = ({ results, onClose }) => {
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
                   <XAxis 
-                    dataKey="date" 
+                    dataKey="index" 
                     stroke="#9ca3af"
-                    tick={{ fontSize: 10, fill: '#6b7280' }}
+                    tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
-                    tickFormatter={formatDateShort}
-                    interval="preserveStartEnd"
-                    minTickGap={50}
                   />
                   <YAxis 
                     stroke="#9ca3af"
@@ -220,13 +203,10 @@ const ResultsPanel = ({ results, onClose }) => {
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
                   <XAxis 
-                    dataKey="date" 
+                    dataKey="index" 
                     stroke="#9ca3af"
-                    tick={{ fontSize: 10, fill: '#6b7280' }}
+                    tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
-                    tickFormatter={formatDateShort}
-                    interval="preserveStartEnd"
-                    minTickGap={50}
                   />
                   <YAxis 
                     stroke="#9ca3af"

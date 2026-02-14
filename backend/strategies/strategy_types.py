@@ -81,6 +81,8 @@ class StrikeSelection(BaseModel):
     strike_type: Optional[StrikeType] = None  # ATM/ITM/OTM
     otm_strikes: Optional[int] = None  # Number of strikes OTM
     itm_strikes: Optional[int] = None  # Number of strikes ITM
+    spot_adjustment_mode: Optional[int] = 0  # Spot adjustment mode (0=None, 1=Rises, 2=Falls, 3=RisesOrFalls)
+    spot_adjustment: Optional[float] = 0.0  # Spot adjustment percentage
 
 class EntryCondition(BaseModel):
     """Entry timing configuration"""

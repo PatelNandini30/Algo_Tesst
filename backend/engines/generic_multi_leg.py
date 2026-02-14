@@ -46,7 +46,7 @@ try:
         StrategyDefinition,
         Leg
     )
-    print("✓ Successfully imported from strategies.strategy_types")
+    print("[OK] Successfully imported from strategies.strategy_types")
 except ImportError as e:
     print(f"Failed to import from strategies.strategy_types: {e}")
     # Fallback for different execution contexts
@@ -63,7 +63,7 @@ except ImportError as e:
             StrategyDefinition,
             Leg
         )
-        print("✓ Successfully imported from strategy_types (fallback)")
+        print("[OK] Successfully imported from strategy_types (fallback)")
     except ImportError as e2:
         print(f"CRITICAL: Both imports failed! Error: {e2}")
         print(f"backend_dir: {backend_dir}")
@@ -87,7 +87,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     Returns:
         Tuple of (trades_df, summary, pivot)
     """
-    strategy_def = params['strategy_definition']
+    strategy_def = params['strategy']
     
     index_name = params.get("index", "NIFTY")
     
@@ -235,7 +235,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     if leg.option_type == OptionType.CE:
                         # For calls, if value is positive, look for higher strikes; if negative, lower strikes
                         if leg.strike_selection.value >= 0:
-                            entry_mask = (
+                            entry_mask = bhav_entry[
                                 (bhav_entry['Instrument'] == "OPTIDX") &
                                 (bhav_entry['Symbol'] == index_name) &
                                 (bhav_entry['OptionType'] == "CE") &
@@ -247,9 +247,9 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                                 (bhav_entry['StrikePrice'] >= selected_strike) &
                                 (bhav_entry['TurnOver'] > 0) &
                                 (bhav_entry['StrikePrice'] % 100 == 0)
-                            ).sort_values(by='StrikePrice', ascending=True).reset_index(drop=True)
+                            ].sort_values(by='StrikePrice', ascending=True).reset_index(drop=True)
                         else:
-                            entry_mask = (
+                            entry_mask = bhav_entry[
                                 (bhav_entry['Instrument'] == "OPTIDX") &
                                 (bhav_entry['Symbol'] == index_name) &
                                 (bhav_entry['OptionType'] == "CE") &
@@ -261,45 +261,16 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                                 (bhav_entry['StrikePrice'] <= selected_strike) &
                                 (bhav_entry['TurnOver'] > 0) &
                                 (bhav_entry['StrikePrice'] % 100 == 0)
-                            ).sort_values(by='StrikePrice', ascending=False).reset_index(drop=True)
-                    else:  # PE
-                        if leg.strike_selection.value >= 0:
-                            entry_mask = (
-                                (bhav_entry['Instrument'] == "OPTIDX") &
-                                (bhav_entry['Symbol'] == index_name) &
-                                (bhav_entry['OptionType'] == "PE") &
-                                (
-                                    (bhav_entry['ExpiryDate'] == curr_expiry) |
-                                    (bhav_entry['ExpiryDate'] == curr_expiry - timedelta(days=1)) |
-                                    (bhav_entry['ExpiryDate'] == curr_expiry + timedelta(days=1))
-                                ) &
-                                (bhav_entry['StrikePrice'] >= selected_strike) &
-                                (bhav_entry['TurnOver'] > 0) &
-                                (bhav_entry['StrikePrice'] % 100 == 0)
-                            ).sort_values(by='StrikePrice', ascending=True).reset_index(drop=True)
-                        else:
-                            entry_mask = (
-                                (bhav_entry['Instrument'] == "OPTIDX") &
-                                (bhav_entry['Symbol'] == index_name) &
-                                (bhav_entry['OptionType'] == "PE") &
-                                (
-                                    (bhav_entry['ExpiryDate'] == curr_expiry) |
-                                    (bhav_entry['ExpiryDate'] == curr_expiry - timedelta(days=1)) |
-                                    (bhav_entry['ExpiryDate'] == curr_expiry + timedelta(days=1))
-                                ) &
-                                (bhav_entry['StrikePrice'] <= selected_strike) &
-                                (bhav_entry['TurnOver'] > 0) &
-                                (bhav_entry['StrikePrice'] % 100 == 0)
-                            ).sort_values(by='StrikePrice', ascending=False).reset_index(drop=True)
+                            ].sort_values(by='StrikePrice', ascending=False).reset_index(drop=True)
                     
-                    if entry_mask.empty:
-                        continue
-                    
-                    selected_strike = entry_mask.iloc[0]['StrikePrice']
+                        if entry_mask.empty:
+                            continue
+                        
+                        selected_strike = entry_mask.iloc[0]['StrikePrice']
                     leg_entry_price = entry_mask.iloc[0]['Close']
                     
                     # Get exit data for this leg's strike
-                    exit_mask = (
+                    exit_mask = bhav_exit[
                         (bhav_exit['Instrument'] == "OPTIDX") &
                         (bhav_exit['Symbol'] == index_name) &
                         (bhav_exit['OptionType'] == leg.option_type.value) &
@@ -309,7 +280,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                             (bhav_exit['ExpiryDate'] == curr_expiry + timedelta(days=1))
                         ) &
                         (bhav_exit['StrikePrice'] == selected_strike)
-                    )
+                    ]
                     
                     if exit_mask.empty:
                         continue
@@ -341,19 +312,19 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                         fut_expiry_for_leg = curr_expiry  # Weekly expiry
                         
                     # Get future entry data
-                    fut_entry_mask = (
+                    fut_entry_mask = bhav_entry[
                         (bhav_entry['Instrument'] == "FUTIDX") &
                         (bhav_entry['Symbol'] == index_name) &
                         (bhav_entry['ExpiryDate'].dt.month == fut_expiry_for_leg.month) &
                         (bhav_entry['ExpiryDate'].dt.year == fut_expiry_for_leg.year)
-                    )
+                    ]
                     
-                    fut_exit_mask = (
+                    fut_exit_mask = bhav_exit[
                         (bhav_exit['Instrument'] == "FUTIDX") &
                         (bhav_exit['Symbol'] == index_name) &
                         (bhav_exit['ExpiryDate'].dt.month == fut_expiry_for_leg.month) &
                         (bhav_exit['ExpiryDate'].dt.year == fut_expiry_for_leg.year)
-                    )
+                    ]
                     
                     if fut_entry_mask.empty or fut_exit_mask.empty:
                         continue

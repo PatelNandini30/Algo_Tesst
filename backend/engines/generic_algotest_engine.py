@@ -19,7 +19,10 @@ from base import (
     get_future_price_from_db,
     calculate_intrinsic_value,
     get_expiry_dates,
-    get_spot_price_from_db
+    get_spot_price_from_db,
+    get_custom_expiry_dates,
+    get_next_expiry_date,
+    get_monthly_expiry_date
 )
 
 
@@ -39,6 +42,7 @@ def run_algotest_backtest(params):
             - from_date: str (YYYY-MM-DD)
             - to_date: str (YYYY-MM-DD)
             - expiry_type: str ('WEEKLY' or 'MONTHLY')
+            - expiry_day_of_week: int (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday) - Optional, defaults to standard expiry days
             - entry_dte: int (0-4 for weekly, 0-24 for monthly)
             - exit_dte: int (0-4 for weekly, 0-24 for monthly)
             - legs: list of dicts, each with:
@@ -58,6 +62,7 @@ def run_algotest_backtest(params):
     from_date = params['from_date']
     to_date = params['to_date']
     expiry_type = params.get('expiry_type', 'WEEKLY')
+    expiry_day_of_week = params.get('expiry_day_of_week', None)  # Optional parameter for custom expiry day
     entry_dte = params.get('entry_dte', 2)
     exit_dte = params.get('exit_dte', 0)
     legs_config = params.get('legs', [])
@@ -79,12 +84,19 @@ def run_algotest_backtest(params):
     print(f"  Loaded {len(trading_calendar)} trading dates\n")
     
     print("Loading expiry dates...")
-    if expiry_type == 'WEEKLY':
-        expiry_df = get_expiry_dates(index, 'weekly', from_date, to_date)
-    else:  # MONTHLY
-        expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
-    
-    print(f"  Loaded {len(expiry_df)} expiries\n")
+    if expiry_day_of_week is not None:
+        # Use custom expiry days
+        expiry_dates = get_custom_expiry_dates(index, expiry_day_of_week, from_date, to_date)
+        # Create a dataframe similar to the standard one
+        expiry_df = pd.DataFrame({'Current Expiry': expiry_dates})
+        print(f"  Loaded {len(expiry_df)} custom expiries (Day {expiry_day_of_week}: {(['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])[expiry_day_of_week]})\n")
+    else:
+        # Use standard expiry dates
+        if expiry_type == 'WEEKLY':
+            expiry_df = get_expiry_dates(index, 'weekly', from_date, to_date)
+        else:  # MONTHLY
+            expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
+        print(f"  Loaded {len(expiry_df)} standard expiries\n")
     
     # ========== STEP 3: INITIALIZE RESULTS ==========
     all_trades = []

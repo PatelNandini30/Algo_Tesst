@@ -750,8 +750,6 @@ def get_expiry_dates(symbol: str = "NIFTY", expiry_type: str = "weekly", from_da
     Returns:
         DataFrame with expiry dates
     """
-    from . import load_expiry
-    
     # Load expiry data
     expiry_df = load_expiry(symbol, expiry_type)
     
@@ -765,6 +763,101 @@ def get_expiry_dates(symbol: str = "NIFTY", expiry_type: str = "weekly", from_da
         expiry_df = expiry_df[expiry_df['Current Expiry'] <= to_date]
     
     return expiry_df
+
+def get_custom_expiry_dates(symbol: str, expiry_day_of_week: int, from_date=None, to_date=None):
+    """
+    Get custom expiry dates based on specified day of week
+    
+    Args:
+        symbol: str - Index symbol (NIFTY, BANKNIFTY, etc.)
+        expiry_day_of_week: int - Day of week (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday)
+        from_date: str - Optional start date filter
+        to_date: str - Optional end date filter
+    
+    Returns:
+        list - List of expiry dates
+    """
+    import pandas as pd
+    from datetime import datetime, timedelta
+    
+    # Convert string dates to datetime if provided
+    if from_date:
+        from_date = pd.to_datetime(from_date)
+    else:
+        from_date = pd.to_datetime('2020-01-01')  # Default start
+        
+    if to_date:
+        to_date = pd.to_datetime(to_date)
+    else:
+        to_date = pd.to_datetime('2030-12-31')  # Default end
+    
+    # Find all dates in the range that match the specified day of week
+    current_date = from_date
+    expiry_dates = []
+    
+    while current_date <= to_date:
+        if current_date.weekday() == expiry_day_of_week:
+            expiry_dates.append(current_date)
+        current_date += timedelta(days=1)
+    
+    return expiry_dates
+
+
+def get_next_expiry_date(start_date, expiry_day_of_week: int):
+    """
+    Get the next expiry date from a given start date based on specified day of week
+    
+    Args:
+        start_date: datetime - Starting date to find next expiry from
+        expiry_day_of_week: int - Day of week (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday)
+    
+    Returns:
+        datetime - Next expiry date
+    """
+    import pandas as pd
+    from datetime import datetime, timedelta
+    
+    start_date = pd.to_datetime(start_date)
+    
+    # Calculate days until the next occurrence of the specified day of week
+    days_ahead = expiry_day_of_week - start_date.weekday()
+    
+    if days_ahead <= 0:  # Target day already happened this week
+        days_ahead += 7
+    
+    next_expiry = start_date + timedelta(days_ahead)
+    return next_expiry
+
+
+def get_monthly_expiry_date(year: int, month: int, expiry_day_of_week: int):
+    """
+    Get the monthly expiry date for a specific year/month based on specified day of week
+    For monthly expiry, gets the last occurrence of the specified day in the month
+    
+    Args:
+        year: int - Year
+        month: int - Month (1-12)
+        expiry_day_of_week: int - Day of week (0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday)
+    
+    Returns:
+        datetime - Last occurrence of the specified day in the month
+    """
+    import pandas as pd
+    from datetime import datetime, timedelta
+    import calendar
+    
+    # Get the last day of the month
+    last_day = calendar.monthrange(year, month)[1]
+    last_date = pd.to_datetime(f'{year}-{month:02d}-{last_day}')
+    
+    # Find the last occurrence of the specified day of week in the month
+    while last_date.weekday() != expiry_day_of_week:
+        last_date -= timedelta(days=1)
+        if last_date.month != month:  # Safety check
+            raise ValueError(f"Could not find {expiry_day_of_week} in {year}-{month:02d}")
+    
+    return last_date
+
 
 def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     """

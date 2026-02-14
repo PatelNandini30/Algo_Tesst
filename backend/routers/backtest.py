@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Tuple
 import sys
@@ -62,14 +62,7 @@ except ImportError as e:
                 return value
 
 # Import generic multi-leg engine
-try:
-    from engines.generic_multi_leg import run_generic_multi_leg
-except ImportError:
-    # Fallback for direct execution
-    engines_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'engines')
-    if engines_dir not in sys.path:
-        sys.path.insert(0, engines_dir)
-    from generic_multi_leg import run_generic_multi_leg
+from engines.generic_multi_leg import run_generic_multi_leg
 
 # Dynamically import the strategy engines
 v1_module = importlib.import_module('engines.v1_ce_fut')
@@ -549,15 +542,15 @@ class ExportResponse(BaseModel):
 def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
     """Execute a strategy based on its definition"""
     # Add strategy definition to params
-    params["strategy"] = strategy_def
+    params["strategy"] = strategy_def  # Use "strategy" key to match what run_generic_multi_leg expects
     
     # For now, route to generic multi-leg engine
     # In future, can add routing logic to specific engines for compatible strategies
     return run_generic_multi_leg(params)
 
 
-@router.post("/dynamic-backtest", response_model=BacktestResponse)
-async def dynamic_backtest(request: DynamicStrategyRequest):
+@router.post("/dynamic-backtest")
+async def dynamic_backtest(request: dict):
     """
     Dynamic backtesting endpoint for multi-leg strategies
     """
@@ -566,61 +559,221 @@ async def dynamic_backtest(request: DynamicStrategyRequest):
         raise HTTPException(status_code=500, detail="Strategy types import failed - backend not properly configured")
     
     try:
+        # Import here to avoid circular imports
+        from strategies.strategy_types import (
+            InstrumentType, OptionType, PositionType, ExpiryType,
+            StrikeSelectionType, Leg, StrikeSelection,
+            EntryTimeType, ExitTimeType, EntryCondition, ExitCondition,
+            ReEntryMode, StrategyDefinition
+        )
+        
+        # Convert dict to DynamicStrategyRequest-like object
+        class DynamicStrategyRequestObj:
+            def __init__(self, data):
+                self.name = data.get("name", "Dynamic Strategy")
+                self.legs = data.get("legs", [])
+                self.parameters = data.get("parameters", {})
+                self.index = data.get("index", "NIFTY")
+                self.date_from = data.get("date_from", data.get("from_date", ""))
+                self.date_to = data.get("date_to", data.get("to_date", ""))
+                self.expiry_window = data.get("expiry_window", "weekly_expiry")
+                self.spot_adjustment_type = data.get("spot_adjustment_type", "None")
+                self.spot_adjustment = data.get("spot_adjustment", 1.0)
+                # AlgoTest specific fields
+                self.entry_dte = data.get("entry_dte", 2)
+                self.exit_dte = data.get("exit_dte", 0)
+                self.expiry_type = data.get("expiry_type", "WEEKLY")
+        
+        request_obj = DynamicStrategyRequestObj(request)
+        
         # Convert request to StrategyDefinition
         legs = []
-        for req_leg in request.legs:
+        for req_leg in request_obj.legs:
+            # TRANSFORMATION: Handle AlgoTest format
+            # Check if this is AlgoTest format (has 'segment' field instead of 'instrument')
+            if 'segment' in req_leg and 'instrument' not in req_leg:
+                print(f"Detected AlgoTest format, transforming...")
+                
+                # Map segment to instrument
+                segment_map = {"options": "Option", "futures": "Future", "option": "Option", "future": "Future"}
+                option_type_map = {"call": "CE", "put": "PE", "ce": "CE", "pe": "PE"}
+                position_map = {"buy": "Buy", "sell": "Sell"}
+                expiry_map = {"weekly": "Weekly", "monthly": "Monthly"}
+                
+                segment = req_leg.get("segment", "options").lower()
+                position = req_leg.get("position", "sell").lower()
+                option_type_val = req_leg.get("option_type", "call").lower()
+                expiry = req_leg.get("expiry", "weekly").lower()
+                lots = req_leg.get("lot", req_leg.get("lots", 1))
+                
+                # Transform strike selection
+                strike_sel = req_leg.get("strike_selection", {})
+                strike_type_value = strike_sel.get("strike_type", "atm").lower()
+                
+                # Determine strike selection
+                backend_strike_type = "ATM"
+                backend_strike_value = 0.0
+                
+                if strike_type_value.startswith("itm"):
+                    try:
+                        num = int(strike_type_value.replace("itm", ""))
+                        backend_strike_type = "OTM %"
+                        backend_strike_value = -num * 1.0
+                    except:
+                        backend_strike_type = "ATM"
+                        backend_strike_value = 0.0
+                elif strike_type_value.startswith("otm"):
+                    try:
+                        num = int(strike_type_value.replace("otm", ""))
+                        backend_strike_type = "OTM %"
+                        backend_strike_value = num * 1.0
+                    except:
+                        backend_strike_type = "ATM"
+                        backend_strike_value = 0.0
+                else:
+                    backend_strike_type = "ATM"
+                    backend_strike_value = 0.0
+                
+                # Build transformed leg
+                req_leg = {
+                    "instrument": segment_map.get(segment, "Option"),
+                    "position": position_map.get(position, "Sell"),
+                    "lots": lots,
+                    "strike_selection": {
+                        "type": backend_strike_type,
+                        "value": backend_strike_value,
+                        "spot_adjustment_mode": 0,
+                        "spot_adjustment": 0.0
+                    },
+                    "entry_condition": {
+                        "type": "Days Before Expiry",
+                        "days_before_expiry": request_obj.entry_dte if hasattr(request_obj, 'entry_dte') else 2
+                    },
+                    "exit_condition": {
+                        "type": "Days Before Expiry",
+                        "days_before_expiry": request_obj.exit_dte if hasattr(request_obj, 'exit_dte') else 0
+                    }
+                }
+                
+                if segment_map.get(segment) == "Option":
+                    req_leg["option_type"] = option_type_map.get(option_type_val, "CE")
+                    req_leg["expiry_type"] = expiry_map.get(expiry, "Weekly")
+                
+                print(f"Transformed to: {req_leg}")
+            
             # Validate instrument type
+            instrument_str = req_leg.get("instrument", "")
+            if not instrument_str:
+                raise HTTPException(status_code=400, detail="Missing 'instrument' field in leg")
+            
             try:
-                instrument = InstrumentType(req_leg.instrument)
+                instrument = InstrumentType(instrument_str)
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid instrument type: {req_leg.instrument}")
+                raise HTTPException(status_code=400, detail=f"Invalid instrument type: {instrument_str}")
             
             # Validate option type if instrument is Option
             option_type = None
             if instrument == InstrumentType.OPTION:
-                if req_leg.option_type is None:
+                option_type_str = req_leg.get("option_type")
+                if not option_type_str:
                     raise HTTPException(status_code=400, detail="option_type is required for Option instrument")
                 try:
-                    option_type = OptionType(req_leg.option_type)
+                    option_type = OptionType(option_type_str)
                 except ValueError:
-                    raise HTTPException(status_code=400, detail=f"Invalid option type: {req_leg.option_type}")
+                    raise HTTPException(status_code=400, detail=f"Invalid option type: {option_type_str}")
             
             # Validate position type
+            position_str = req_leg.get("position", "")
+            if not position_str:
+                raise HTTPException(status_code=400, detail="Missing 'position' field in leg")
+            
             try:
-                position = PositionType(req_leg.position)
+                position = PositionType(position_str)
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid position type: {req_leg.position}")
+                raise HTTPException(status_code=400, detail=f"Invalid position type: {position_str}")
             
             # Validate expiry type
-            try:
-                expiry_type = ExpiryType(req_leg.expiry_type)
-            except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid expiry type: {req_leg.expiry_type}")
+            expiry_type_str = req_leg.get("expiry_type", "")
+            if not expiry_type_str:
+                raise HTTPException(status_code=400, detail="Missing 'expiry_type' field in leg")
             
-            # Validate strike selection
-            strike_sel_data = req_leg.strike_selection
             try:
-                strike_selection_type = StrikeSelectionType(strike_sel_data["type"])
+                expiry_type = ExpiryType(expiry_type_str)
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid strike selection type: {strike_sel_data['type']}")
+                raise HTTPException(status_code=400, detail=f"Invalid expiry type: {expiry_type_str}")
+            
+            # Validate strike selection with flexible mapping
+            strike_sel_data = req_leg.get("strike_selection", {})
+            if not strike_sel_data:
+                raise HTTPException(status_code=400, detail="Missing 'strike_selection' field in leg")
+            
+            # Map different formats to correct enum values
+            strike_type_map = {
+                "ATM": "ATM",
+                "ClosestPremium": "Closest Premium",
+                "PremiumRange": "Premium Range",
+                "StraddleWidth": "Straddle Width",
+                "%ofATM": "% of ATM",
+                "Delta": "Delta",
+                "StrikeType": "Strike Type",
+                "OTM%": "OTM %",
+                "ITM%": "ITM %",
+                # Keep original values if they match exactly
+                "Closest Premium": "Closest Premium",
+                "Premium Range": "Premium Range",
+                "Straddle Width": "Straddle Width",
+                "% of ATM": "% of ATM",
+                "Strike Type": "Strike Type",
+                "OTM %": "OTM %",
+                "ITM %": "ITM %",
+            }
+            
+            strike_type_raw = strike_sel_data.get("type", "")
+            if not strike_type_raw:
+                raise HTTPException(status_code=400, detail="Missing 'type' field in strike_selection")
+            
+            strike_type_mapped = strike_type_map.get(strike_type_raw, strike_type_raw)
+            
+            try:
+                strike_selection_type = StrikeSelectionType(strike_type_mapped)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid strike selection type: {strike_type_raw}. Valid types: ATM, Closest Premium, Premium Range, Straddle Width, % of ATM, Delta, Strike Type, OTM %, ITM %")
             
             strike_selection = StrikeSelection(
                 type=strike_selection_type,
-                value=strike_sel_data.get("value"),
-                premium_min=strike_sel_data.get("premium_min"),
-                premium_max=strike_sel_data.get("premium_max"),
-                delta_value=strike_sel_data.get("delta_value"),
-                strike_type=strike_sel_data.get("strike_type"),
-                otm_strikes=strike_sel_data.get("otm_strikes"),
-                itm_strikes=strike_sel_data.get("itm_strikes")
+                value=strike_sel_data.get("value", 0.0),
+                spot_adjustment_mode=strike_sel_data.get("spot_adjustment_mode", 0),
+                spot_adjustment=strike_sel_data.get("spot_adjustment", 0.0)
             )
             
-            # Validate entry condition
-            entry_cond_data = req_leg.entry_condition
+            # Validate entry condition with flexible mapping
+            entry_cond_data = req_leg.get("entry_condition", {})
+            if not entry_cond_data:
+                raise HTTPException(status_code=400, detail="Missing 'entry_condition' field in leg")
+            
+            # Map different formats to correct enum values
+            entry_type_map = {
+                "DaysBeforeExpiry": "Days Before Expiry",
+                "SpecificTime": "Specific Time",
+                "MarketOpen": "Market Open",
+                "MarketClose": "Market Close",
+                # Keep original values if they match exactly
+                "Days Before Expiry": "Days Before Expiry",
+                "Specific Time": "Specific Time",
+                "Market Open": "Market Open",
+                "Market Close": "Market Close",
+            }
+            
+            entry_type_raw = entry_cond_data.get("type", "")
+            if not entry_type_raw:
+                raise HTTPException(status_code=400, detail="Missing 'type' field in entry_condition")
+            
+            entry_type_mapped = entry_type_map.get(entry_type_raw, entry_type_raw)
+            
             try:
-                entry_time_type = EntryTimeType(entry_cond_data["type"])
+                entry_time_type = EntryTimeType(entry_type_mapped)
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid entry condition type: {entry_cond_data['type']}")
+                raise HTTPException(status_code=400, detail=f"Invalid entry condition type: {entry_type_raw}. Valid types: Days Before Expiry, Specific Time, Market Open, Market Close")
             
             entry_condition = EntryCondition(
                 type=entry_time_type,
@@ -628,12 +781,36 @@ async def dynamic_backtest(request: DynamicStrategyRequest):
                 specific_time=entry_cond_data.get("specific_time")
             )
             
-            # Validate exit condition
-            exit_cond_data = req_leg.exit_condition
+            # Validate exit condition with flexible mapping
+            exit_cond_data = req_leg.get("exit_condition", {})
+            if not exit_cond_data:
+                raise HTTPException(status_code=400, detail="Missing 'exit_condition' field in leg")
+            
+            # Map different formats to correct enum values
+            exit_type_map = {
+                "DaysBeforeExpiry": "Days Before Expiry",
+                "SpecificTime": "Specific Time",
+                "AtExpiry": "At Expiry",
+                "StopLoss": "Stop Loss",
+                "Target": "Target",
+                # Keep original values if they match exactly
+                "Days Before Expiry": "Days Before Expiry",
+                "Specific Time": "Specific Time",
+                "At Expiry": "At Expiry",
+                "Stop Loss": "Stop Loss",
+                "Target": "Target",
+            }
+            
+            exit_type_raw = exit_cond_data.get("type", "")
+            if not exit_type_raw:
+                raise HTTPException(status_code=400, detail="Missing 'type' field in exit_condition")
+            
+            exit_type_mapped = exit_type_map.get(exit_type_raw, exit_type_raw)
+            
             try:
-                exit_time_type = ExitTimeType(exit_cond_data["type"])
+                exit_time_type = ExitTimeType(exit_type_mapped)
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid exit condition type: {exit_cond_data['type']}")
+                raise HTTPException(status_code=400, detail=f"Invalid exit condition type: {exit_type_raw}. Valid types: Days Before Expiry, Specific Time, At Expiry, Stop Loss, Target")
             
             exit_condition = ExitCondition(
                 type=exit_time_type,
@@ -643,12 +820,13 @@ async def dynamic_backtest(request: DynamicStrategyRequest):
                 target_percent=exit_cond_data.get("target_percent")
             )
             
+            # Create leg with proper parameter names
             leg = Leg(
-                leg_number=req_leg.leg_number,
-                instrument=instrument,
+                leg_number=req_leg.get("leg_number", len(legs) + 1),
+                instrument=instrument,  # Correct field name
                 option_type=option_type,
-                position=position,
-                lots=req_leg.lots,
+                position=position,  # Correct field name
+                lots=req_leg.get("lots", 1),
                 expiry_type=expiry_type,
                 strike_selection=strike_selection,
                 entry_condition=entry_condition,
@@ -656,33 +834,20 @@ async def dynamic_backtest(request: DynamicStrategyRequest):
             )
             legs.append(leg)
         
-        if not legs:
-            raise HTTPException(status_code=400, detail="Strategy must have at least one leg")
-        
-        # Extract re-entry and base2 settings from parameters
-        re_entry_mode = request.parameters.get("re_entry_mode", "None")
-        re_entry_percent = request.parameters.get("re_entry_percent", 1.0)
-        use_base2_filter = request.parameters.get("use_base2_filter", True)
-        inverse_base2 = request.parameters.get("inverse_base2", False)
-        
         strategy_def = StrategyDefinition(
-            name=request.name,
+            name=request_obj.name,
             legs=legs,
-            index=request.index,
-            re_entry_mode=ReEntryMode(re_entry_mode),
-            re_entry_percent=re_entry_percent,
-            use_base2_filter=use_base2_filter,
-            inverse_base2=inverse_base2
+            parameters=request_obj.parameters
         )
         
         # Convert frontend parameters to engine format
         params = {
-            "index": request.index,
-            "from_date": request.date_from,
-            "to_date": request.date_to,
-            "expiry_window": request.expiry_window,
-            "spot_adjustment_type": request.spot_adjustment_type,
-            "spot_adjustment": request.spot_adjustment,
+            "index": request_obj.index,
+            "from_date": request_obj.date_from,
+            "to_date": request_obj.date_to,
+            "expiry_window": request_obj.expiry_window,
+            "spot_adjustment_type": request_obj.spot_adjustment_type,
+            "spot_adjustment": request_obj.spot_adjustment,
         }
         
         # SPOT ADJUSTMENT TYPE MAPPING
@@ -692,7 +857,7 @@ async def dynamic_backtest(request: DynamicStrategyRequest):
             "Falls": 2,
             "RisesOrFalls": 3
         }
-        params["spot_adjustment_type"] = spot_adjustment_mapping.get(request.spot_adjustment_type, 0)
+        params["spot_adjustment_type"] = spot_adjustment_mapping.get(request_obj.spot_adjustment_type, 0)
         
         # Execute the dynamic strategy
         df, summary, pivot = execute_strategy(strategy_def, params)
@@ -707,37 +872,42 @@ async def dynamic_backtest(request: DynamicStrategyRequest):
                     trade[key] = value.strftime('%Y-%m-%d')
                 elif pd.isna(value):
                     trade[key] = None
-        
-        response = BacktestResponse(
-            status="success",
-            meta={
-                "strategy": request.name,
-                "index": request.index,
+            
+        # Create response manually to match expected structure
+        response_data = {
+            "status": "success",
+            "meta": {
+                "strategy": request_obj.name,
+                "index": request_obj.index,
                 "total_trades": len(trades_list),
-                "date_range": f"{request.date_from} to {request.date_to}",
-                "expiry_window": request.expiry_window,
+                "date_range": f"{request_obj.date_from} to {request_obj.date_to}",
+                "expiry_window": request_obj.expiry_window,
                 "parameters": {
-                    "spot_adjustment_type": request.spot_adjustment_type,
-                    "spot_adjustment": request.spot_adjustment,
+                    "spot_adjustment_type": request_obj.spot_adjustment_type,
+                    "spot_adjustment": request_obj.spot_adjustment,
                 }
             },
-            trades=trades_list,
-            summary=SummaryStats(**summary) if summary else SummaryStats(
-                total_pnl=0, count=0, win_pct=0, avg_win=0, avg_loss=0, 
-                expectancy=0, cagr_options=0, cagr_spot=0, max_dd_pct=0, 
-                max_dd_pts=0, car_mdd=0, recovery_factor=0, roi_vs_spot=0
-            ),
-            pivot=PivotData(headers=pivot.get("headers", []), rows=pivot.get("rows", [])),
-            log=[]
-        )
-        
-        return response
+            "trades": trades_list,
+            "summary": summary if summary else {
+                "total_pnl": 0, "count": 0, "win_pct": 0, "avg_win": 0, "avg_loss": 0, 
+                "expectancy": 0, "cagr_options": 0, "cagr_spot": 0, "max_dd_pct": 0, 
+                "max_dd_pts": 0, "car_mdd": 0, "recovery_factor": 0, "roi_vs_spot": 0
+            },
+            "pivot": {"headers": pivot.get("headers", []), "rows": pivot.get("rows", [])},
+            "log": []
+        }
+            
+        return response_data
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in dynamic backtest endpoint: {str(e)}")
+        import traceback
+        error_msg = f"Error in dynamic backtest endpoint: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)
         raise HTTPException(status_code=500, detail=str(e))
+
+# End of dynamic_backtest function
 
 
 @router.get("/export/trades")
@@ -778,57 +948,86 @@ async def export_summary(strategy_id: str):
 
 
 @router.post("/export/trades")
-async def export_trades_post(request: DynamicStrategyRequest):
+async def export_trades_post(request: dict):
     """
     Export trade sheet as CSV for dynamic strategies
     """
     from io import StringIO
     import csv
     
+    # Import required classes
+    from strategies.strategy_types import (
+        InstrumentType, OptionType, PositionType, ExpiryType,
+        StrikeSelectionType, Leg, StrikeSelection,
+        EntryTimeType, ExitTimeType, EntryCondition, ExitCondition,
+        ReEntryMode, StrategyDefinition
+    )
+    
+    # Convert dict to object-like structure
+    class RequestObj:
+        def __init__(self, data):
+            self.name = data.get("name", "Export Strategy")
+            self.legs = data.get("legs", [])
+            self.parameters = data.get("parameters", {})
+            self.index = data.get("index", "NIFTY")
+            self.date_from = data.get("date_from", "")
+            self.date_to = data.get("date_to", "")
+            self.expiry_window = data.get("expiry_window", "weekly_expiry")
+            self.spot_adjustment_type = data.get("spot_adjustment_type", "None")
+            self.spot_adjustment = data.get("spot_adjustment", 1.0)
+            self.quantity = data.get("quantity", 1)
+    
+    request_obj = RequestObj(request)
+    
     # Execute the strategy to get the trade data
     strategy_def = StrategyDefinition(
-        name=request.name,
+        name=request_obj.name,
         legs=[],  # We'll populate this below
-        parameters=request.parameters
+        parameters=request_obj.parameters
     )
     
     # Transform dynamic legs to backend format
     legs = []
-    for req_leg in request.legs:
+    for req_leg in request_obj.legs:
         # Validate instrument type
         try:
-            instrument = InstrumentType(req_leg.instrument)
+            instrument = InstrumentType(req_leg["instrument"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid instrument type: {req_leg.instrument}")
+            instrument_val = req_leg.get("instrument", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid instrument type: {instrument_val}")
         
         # Validate option type if instrument is OPTION
         option_type = None
         if instrument == InstrumentType.OPTION:
-            if req_leg.option_type is None:
+            if req_leg.get("option_type") is None:
                 raise HTTPException(status_code=400, detail="option_type is required for OPTION instrument")
             try:
-                option_type = OptionType(req_leg.option_type)
+                option_type = OptionType(req_leg.get("option_type"))
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid option type: {req_leg.option_type}")
+                opt_type_val = req_leg.get("option_type", "unknown")
+                raise HTTPException(status_code=400, detail=f"Invalid option type: {opt_type_val}")
         
         # Validate position type
         try:
-            position = PositionType(req_leg.position)
+            position = PositionType(req_leg["position"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid position type: {req_leg.position}")
+            position_val = req_leg.get("position", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid position type: {position_val}")
         
         # Validate expiry type
         try:
-            expiry_type = ExpiryType(req_leg.expiry_type)
+            expiry_type = ExpiryType(req_leg["expiry_type"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid expiry type: {req_leg.expiry_type}")
+            expiry_type_val = req_leg.get("expiry_type", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid expiry type: {expiry_type_val}")
         
         # Validate strike selection
-        strike_sel_data = req_leg.strike_selection
+        strike_sel_data = req_leg["strike_selection"]
         try:
             strike_selection_type = StrikeSelectionType(strike_sel_data["type"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid strike selection type: {strike_sel_data['type']}")
+            strike_type_val = strike_sel_data.get("type", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid strike selection type: {strike_type_val}")
         
         strike_selection = StrikeSelection(
             type=strike_selection_type,
@@ -838,29 +1037,29 @@ async def export_trades_post(request: DynamicStrategyRequest):
         )
         
         leg = Leg(
-            instrument=instrument,
+            instrument=instrument,  # Correct field name
             option_type=option_type,
-            position=position,
+            position=position,  # Correct field name
             strike_selection=strike_selection,
-            quantity=req_leg.quantity,
+            quantity=req_leg.get('quantity', 1),
             expiry_type=expiry_type
         )
         legs.append(leg)
     
     strategy_def = StrategyDefinition(
-        name=request.name,
+        name=request_obj.name,
         legs=legs,
-        parameters=request.parameters
+        parameters=request_obj.parameters
     )
     
     # Convert frontend parameters to engine format
     params = {
-        "index": request.index,
-        "from_date": request.date_from,
-        "to_date": request.date_to,
-        "expiry_window": request.expiry_window,
-        "spot_adjustment_type": request.spot_adjustment_type,
-        "spot_adjustment": request.spot_adjustment,
+        "index": request_obj.index,
+        "from_date": request_obj.date_from,
+        "to_date": request_obj.date_to,
+        "expiry_window": request_obj.expiry_window,
+        "spot_adjustment_type": request_obj.spot_adjustment_type,
+        "spot_adjustment": request_obj.spot_adjustment,
     }
     
     # SPOT ADJUSTMENT TYPE MAPPING
@@ -870,7 +1069,7 @@ async def export_trades_post(request: DynamicStrategyRequest):
         "Falls": 2,
         "RisesOrFalls": 3
     }
-    params["spot_adjustment_type"] = spot_adjustment_mapping.get(request.spot_adjustment_type, 0)
+    params["spot_adjustment_type"] = spot_adjustment_mapping.get(request_obj.spot_adjustment_type, 0)
     
     # Execute the dynamic strategy
     df, summary, pivot = execute_strategy(strategy_def, params)
@@ -891,56 +1090,85 @@ async def export_trades_post(request: DynamicStrategyRequest):
 
 
 @router.post("/export/summary")
-async def export_summary_post(request: DynamicStrategyRequest):
+async def export_summary_post(request: dict):
     """
     Export summary as CSV for dynamic strategies
     """
     from io import StringIO
     
+    # Import required classes
+    from strategies.strategy_types import (
+        InstrumentType, OptionType, PositionType, ExpiryType,
+        StrikeSelectionType, Leg, StrikeSelection,
+        EntryTimeType, ExitTimeType, EntryCondition, ExitCondition,
+        ReEntryMode, StrategyDefinition
+    )
+    
+    # Convert dict to object-like structure
+    class RequestObj:
+        def __init__(self, data):
+            self.name = data.get("name", "Export Strategy")
+            self.legs = data.get("legs", [])
+            self.parameters = data.get("parameters", {})
+            self.index = data.get("index", "NIFTY")
+            self.date_from = data.get("date_from", "")
+            self.date_to = data.get("date_to", "")
+            self.expiry_window = data.get("expiry_window", "weekly_expiry")
+            self.spot_adjustment_type = data.get("spot_adjustment_type", "None")
+            self.spot_adjustment = data.get("spot_adjustment", 1.0)
+            self.quantity = data.get("quantity", 1)
+    
+    request_obj = RequestObj(request)
+    
     # Execute the strategy to get the summary data
     strategy_def = StrategyDefinition(
-        name=request.name,
+        name=request_obj.name,
         legs=[],  # We'll populate this below
-        parameters=request.parameters
+        parameters=request_obj.parameters
     )
     
     # Transform dynamic legs to backend format
     legs = []
-    for req_leg in request.legs:
+    for req_leg in request_obj.legs:
         # Validate instrument type
         try:
-            instrument = InstrumentType(req_leg.instrument)
+            instrument = InstrumentType(req_leg["instrument"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid instrument type: {req_leg.instrument}")
+            instrument_val = req_leg.get("instrument", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid instrument type: {instrument_val}")
         
         # Validate option type if instrument is OPTION
         option_type = None
         if instrument == InstrumentType.OPTION:
-            if req_leg.option_type is None:
+            if req_leg.get("option_type") is None:
                 raise HTTPException(status_code=400, detail="option_type is required for OPTION instrument")
             try:
-                option_type = OptionType(req_leg.option_type)
+                option_type = OptionType(req_leg.get("option_type"))
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid option type: {req_leg.option_type}")
+                opt_type_val = req_leg.get("option_type", "unknown")
+                raise HTTPException(status_code=400, detail=f"Invalid option type: {opt_type_val}")
         
         # Validate position type
         try:
-            position = PositionType(req_leg.position)
+            position = PositionType(req_leg["position"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid position type: {req_leg.position}")
+            position_val = req_leg.get("position", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid position type: {position_val}")
         
         # Validate expiry type
         try:
-            expiry_type = ExpiryType(req_leg.expiry_type)
+            expiry_type = ExpiryType(req_leg["expiry_type"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid expiry type: {req_leg.expiry_type}")
+            expiry_type_val = req_leg.get("expiry_type", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid expiry type: {expiry_type_val}")
         
         # Validate strike selection
-        strike_sel_data = req_leg.strike_selection
+        strike_sel_data = req_leg["strike_selection"]
         try:
             strike_selection_type = StrikeSelectionType(strike_sel_data["type"])
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid strike selection type: {strike_sel_data['type']}")
+            strike_type_val = strike_sel_data.get("type", "unknown")
+            raise HTTPException(status_code=400, detail=f"Invalid strike selection type: {strike_type_val}")
         
         strike_selection = StrikeSelection(
             type=strike_selection_type,
@@ -950,29 +1178,29 @@ async def export_summary_post(request: DynamicStrategyRequest):
         )
         
         leg = Leg(
-            instrument=instrument,
+            instrument=instrument,  # Correct field name
             option_type=option_type,
-            position=position,
+            position=position,  # Correct field name
             strike_selection=strike_selection,
-            quantity=req_leg.quantity,
+            quantity=req_leg.get('quantity', 1),
             expiry_type=expiry_type
         )
         legs.append(leg)
     
     strategy_def = StrategyDefinition(
-        name=request.name,
+        name=request_obj.name,
         legs=legs,
-        parameters=request.parameters
+        parameters=request_obj.parameters
     )
     
     # Convert frontend parameters to engine format
     params = {
-        "index": request.index,
-        "from_date": request.date_from,
-        "to_date": request.date_to,
-        "expiry_window": request.expiry_window,
-        "spot_adjustment_type": request.spot_adjustment_type,
-        "spot_adjustment": request.spot_adjustment,
+        "index": request_obj.index,
+        "from_date": request_obj.date_from,
+        "to_date": request_obj.date_to,
+        "expiry_window": request_obj.expiry_window,
+        "spot_adjustment_type": request_obj.spot_adjustment_type,
+        "spot_adjustment": request_obj.spot_adjustment,
     }
     
     # SPOT ADJUSTMENT TYPE MAPPING
@@ -982,7 +1210,7 @@ async def export_summary_post(request: DynamicStrategyRequest):
         "Falls": 2,
         "RisesOrFalls": 3
     }
-    params["spot_adjustment_type"] = spot_adjustment_mapping.get(request.spot_adjustment_type, 0)
+    params["spot_adjustment_type"] = spot_adjustment_mapping.get(request_obj.spot_adjustment_type, 0)
     
     # Execute the dynamic strategy
     df, summary, pivot = execute_strategy(strategy_def, params)

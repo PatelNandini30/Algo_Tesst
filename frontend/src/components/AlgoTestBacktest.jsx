@@ -86,19 +86,20 @@ const AlgoTestBacktest = () => {
   // Build payload
   const buildPayload = () => {
     return {
-      instrument,
+      index: instrument,
       underlying,
       strategy_type: strategyType,
-      expiry_basis: expiryBasis,
-      entry_days_before_expiry: entryDaysBefore,
-      exit_days_before_expiry: exitDaysBefore,
+      expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
+      entry_dte: entryDaysBefore,
+      exit_dte: exitDaysBefore,
       legs: legs,
       overall_settings: {
         stop_loss: overallStopLoss,
         target: overallTarget
       },
-      start_date: startDate,
-      end_date: endDate
+      date_from: startDate,
+      date_to: endDate,
+      expiry_type: expiryBasis.toUpperCase()
     };
   };
 

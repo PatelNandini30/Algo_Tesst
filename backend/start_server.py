@@ -33,16 +33,16 @@ from main import app
 if __name__ == "__main__":
     try:
         uvicorn.run(
-            app,
+            "main:app",
             host="0.0.0.0",
             port=8000,
             log_level="info",
-            reload=True,
+            reload=False,
             access_log=True
         )
     except KeyboardInterrupt:
         print("\n\nServer stopped by user")
     except Exception as e:
-        print(f"\n❌ Error starting server: {e}")
+        print(f"\nError starting server: {e}")
         import traceback
         traceback.print_exc()

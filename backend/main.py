@@ -1,3 +1,23 @@
+# Pandas 2.x compatibility - MUST be first before pandas is imported anywhere
+import pandas as pd
+
+# Patch DataFrame.sort_values to handle 'by' keyword (removed in pandas 2.x)
+_orig_df_sort = pd.DataFrame.sort_values
+def _patched_df_sort(self, by=None, **kwargs):
+    if by is not None:
+        by_list = [by] if isinstance(by, str) else list(by)
+        # pandas 2.x doesn't accept 'by' keyword - pass positionally
+        return _orig_df_sort(self, by_list, **kwargs)
+    return _orig_df_sort(self, **kwargs)
+pd.DataFrame.sort_values = _patched_df_sort
+
+# Patch Series.sort_values - pandas 2.x removed 'by' param from Series  
+_orig_series_sort = pd.Series.sort_values
+def _patched_series_sort(self, by=None, **kwargs):
+    # For Series, we just ignore 'by' since you can't sort a Series by column name
+    return _orig_series_sort(self, **kwargs)
+pd.Series.sort_values = _patched_series_sort
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os

@@ -1,50 +1,46 @@
-"""
-Test script to verify the /api/algotest-backtest endpoint
-"""
 import requests
 import json
 
-# Test payload - v1_ce_fut requires: call_sell=True, future_buy=True
-payload = {
-    "strategy": "v1_ce_fut",
-    "index": "NIFTY",
-    "date_from": "2024-01-01",
-    "date_to": "2024-01-31",
-    "expiry_window": "weekly_expiry",
-    "call_sell_position": 0.0,
-    "call_sell": True,
-    "put_sell": False,
-    "put_buy": False,
-    "future_buy": True,
-    "spot_adjustment_type": "None",
-    "spot_adjustment": 1.0
-}
-
-print("Testing /api/algotest-backtest endpoint...")
-print(f"Payload: {json.dumps(payload, indent=2)}")
-print("\nSending request...")
-
-try:
-    response = requests.post(
-        "http://localhost:8000/api/algotest-backtest",
-        json=payload,
-        headers={"Content-Type": "application/json"}
-    )
+# Test the new algotest endpoint
+def test_algotest_endpoint():
+    url = "http://localhost:8000/api/algotest"
     
-    print(f"\nStatus Code: {response.status_code}")
-    print(f"Response Headers: {dict(response.headers)}")
+    # Sample payload as specified in the integration guide
+    payload = {
+        "index": "NIFTY",
+        "from_date": "2024-01-01",
+        "to_date": "2024-03-31",
+        "expiry_type": "WEEKLY",
+        "entry_dte": 2,
+        "exit_dte": 0,
+        "legs": [
+            {
+                "segment": "OPTIONS",
+                "option_type": "CE",
+                "position": "SELL",
+                "lots": 1,
+                "strike_selection": "OTM2",
+                "expiry": "WEEKLY"
+            }
+        ]
+    }
     
-    if response.status_code == 200:
-        print("\n✅ SUCCESS! Endpoint is working.")
-        data = response.json()
-        print(f"\nResponse keys: {list(data.keys())}")
-        print(f"Status: {data.get('status')}")
-        print(f"Total trades: {data.get('meta', {}).get('total_trades')}")
-    else:
-        print(f"\n❌ ERROR: {response.status_code}")
-        print(f"Response: {response.text}")
+    print("Testing /api/algotest endpoint...")
+    print(f"Payload: {json.dumps(payload, indent=2)}")
+    
+    try:
+        response = requests.post(url, json=payload)
+        print(f"Status Code: {response.status_code}")
+        print(f"Response: {response.text[:500]}...")  # Print first 500 chars
         
-except Exception as e:
-    print(f"\n❌ EXCEPTION: {e}")
-    import traceback
-    traceback.print_exc()
+        if response.status_code == 200:
+            print("✅ Endpoint working correctly!")
+            data = response.json()
+            print(f"Success: {data.get('status', 'unknown')}")
+        else:
+            print("❌ Endpoint returned error")
+    except Exception as e:
+        print(f"❌ Error connecting to endpoint: {e}")
+
+if __name__ == "__main__":
+    test_algotest_endpoint()
