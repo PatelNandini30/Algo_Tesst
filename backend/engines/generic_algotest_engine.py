@@ -3,7 +3,16 @@ Generic AlgoTest-Style Engine
 Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
 
+# Set DEBUG = False to disable verbose logging for faster execution
+DEBUG = False
+
+def _log(*args, **kwargs):
+    """Helper to print only when DEBUG is True"""
+    if DEBUG:
+        print(*args, **kwargs)
+
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import sys
 import os
@@ -22,8 +31,87 @@ from base import (
     get_spot_price_from_db,
     get_custom_expiry_dates,
     get_next_expiry_date,
-    get_monthly_expiry_date
+    get_monthly_expiry_date,
+    get_strike_data,
+    # load_base2,  # Commented out - not using base2 filter
+    load_bhavcopy,
+    compute_analytics,
+    build_pivot
 )
+
+
+def check_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_config, 
+                          index, stop_loss_pct, target_pct, trading_calendar):
+    """
+    Check if stop loss or target is hit during the holding period.
+    Returns (exit_date, exit_reason) if hit, else (None, None)
+    """
+    if stop_loss_pct is None and target_pct is None:
+        return None, None
+    
+    # Get all trading days between entry and exit (exclusive of entry)
+    holding_days = trading_calendar[
+        (trading_calendar['date'] > entry_date) & 
+        (trading_calendar['date'] <= exit_date)
+    ]['date'].tolist()
+    
+    for check_date in holding_days:
+        # Calculate P&L for each leg at this date
+        total_pnl_pct = 0
+        has_data = False
+        
+        for leg in legs_config:
+            segment = leg.get('segment', 'OPTION')
+            if segment == 'FUTURES':
+                continue
+            
+            position = leg['position']
+            lots = leg['lots']
+            option_type = leg['option_type']
+            strike = leg.get('strike')
+            
+            if strike is None:
+                continue
+            
+            # Get premium at this date
+            current_premium = get_option_premium_from_db(
+                date=check_date.strftime('%Y-%m-%d'),
+                index=index,
+                strike=strike,
+                option_type=option_type,
+                expiry=expiry_date.strftime('%Y-%m-%d')
+            )
+            
+            if current_premium is None:
+                continue
+            
+            has_data = True
+            entry_premium = leg.get('entry_premium')
+            if entry_premium is None:
+                continue
+            
+            # Calculate P&L percentage for this leg
+            if position == 'BUY':
+                leg_pnl_pct = ((current_premium - entry_premium) / entry_premium) * 100 if entry_premium > 0 else 0
+            else:  # SELL
+                leg_pnl_pct = ((entry_premium - current_premium) / entry_premium) * 100 if entry_premium > 0 else 0
+            
+            total_pnl_pct += leg_pnl_pct
+        
+        if not has_data:
+            continue
+        
+        # Check stop loss (negative P&L)
+        if stop_loss_pct is not None and total_pnl_pct <= -stop_loss_pct:
+            print(f"      🛑 STOP LOSS HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
+            return check_date, 'STOP_LOSS'
+        
+        # Check target (positive P&L)
+        if target_pct is not None and total_pnl_pct >= target_pct:
+            print(f"      🎯 TARGET HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
+            return check_date, 'TARGET'
+    
+    return None, None
 
 
 def run_algotest_backtest(params):
@@ -62,10 +150,14 @@ def run_algotest_backtest(params):
     from_date = params['from_date']
     to_date = params['to_date']
     expiry_type = params.get('expiry_type', 'WEEKLY')
-    expiry_day_of_week = params.get('expiry_day_of_week', None)  # Optional parameter for custom expiry day
+    expiry_day_of_week = params.get('expiry_day_of_week', None)
     entry_dte = params.get('entry_dte', 2)
     exit_dte = params.get('exit_dte', 0)
     legs_config = params.get('legs', [])
+    
+    # Stop loss and target parameters
+    stop_loss_pct = params.get('stop_loss_pct', None)  # e.g., 50 = exit if loss exceeds 50%
+    target_pct = params.get('target_pct', None)  # e.g., 100 = exit if profit reaches 100%
     
     print(f"\n{'='*60}")
     print(f"ALGOTEST-STYLE BACKTEST")
@@ -75,13 +167,23 @@ def run_algotest_backtest(params):
     print(f"Expiry Type: {expiry_type}")
     print(f"Entry DTE: {entry_dte} (days before expiry)")
     print(f"Exit DTE: {exit_dte} (days before expiry)")
+    print(f"Stop Loss: {stop_loss_pct}%")
+    print(f"Target: {target_pct}%")
     print(f"Legs: {len(legs_config)}")
     print(f"{'='*60}\n")
     
-    # ========== STEP 2: LOAD DATA ==========
-    print("Loading trading calendar...")
-    trading_calendar = get_trading_calendar(from_date, to_date)
-    print(f"  Loaded {len(trading_calendar)} trading dates\n")
+    # ========== STEP 2: LOAD DATA FROM CSV (like generic_multi_leg) ==========
+    print("Loading spot data from CSV...")
+    spot_df = get_strike_data(index, from_date, to_date)
+    print(f"  Loaded {len(spot_df)} spot records\n")
+    
+    # Create trading calendar from spot data
+    trading_calendar = spot_df[['Date']].drop_duplicates().sort_values('Date').reset_index(drop=True)
+    trading_calendar.columns = ['date']
+    print(f"  Trading calendar: {len(trading_calendar)} trading days\n")
+    
+    # NOTE: base2 filter removed - using all trading days
+    print("  Using all trading days (base2 filter disabled)\n")
     
     print("Loading expiry dates...")
     if expiry_day_of_week is not None:
@@ -89,7 +191,7 @@ def run_algotest_backtest(params):
         expiry_dates = get_custom_expiry_dates(index, expiry_day_of_week, from_date, to_date)
         # Create a dataframe similar to the standard one
         expiry_df = pd.DataFrame({'Current Expiry': expiry_dates})
-        print(f"  Loaded {len(expiry_df)} custom expiries (Day {expiry_day_of_week}: {(['Mon','Tue','Wed','Thu','Fri','Sat','Sun'])[expiry_day_of_week]})\n")
+        print(f"  Loaded {len(expiry_df)} custom expiries (Day {expiry_day_of_week})\n")
     else:
         # Use standard expiry dates
         if expiry_type == 'WEEKLY':
@@ -103,12 +205,13 @@ def run_algotest_backtest(params):
     strike_interval = get_strike_interval(index)
     
     # ========== STEP 4: LOOP THROUGH EXPIRIES ==========
-    print("Processing expiries...\n")
+    if DEBUG:
+        print("Processing expiries...\n")
     
     for expiry_idx, expiry_row in expiry_df.iterrows():
         expiry_date = expiry_row['Current Expiry']
         
-        print(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
+        _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
         
         try:
             # ========== STEP 5: CALCULATE ENTRY DATE ==========
@@ -118,7 +221,7 @@ def run_algotest_backtest(params):
                 trading_calendar_df=trading_calendar
             )
             
-            print(f"  Entry Date (DTE={entry_dte}): {entry_date}")
+            _log(f"  Entry Date (DTE={entry_dte}): {entry_date}")
             
             # ========== STEP 6: CALCULATE EXIT DATE ==========
             exit_date = calculate_trading_days_before_expiry(
@@ -127,11 +230,11 @@ def run_algotest_backtest(params):
                 trading_calendar_df=trading_calendar
             )
             
-            print(f"  Exit Date (DTE={exit_dte}): {exit_date}")
+            _log(f"  Exit Date (DTE={exit_dte}): {exit_date}")
             
             # Validate entry before exit
             if entry_date > exit_date:
-                print(f"  ⚠️  Entry after exit - skipping")
+                _log(f"  ⚠️  Entry after exit - skipping")
                 continue
             
             # ========== STEP 7: GET ENTRY SPOT PRICE ==========
@@ -139,16 +242,16 @@ def run_algotest_backtest(params):
             entry_spot = get_spot_price_from_db(entry_date, index)
             
             if entry_spot is None:
-                print(f"  ⚠️  No spot data for {entry_date} - skipping")
+                _log(f"  ⚠️  No spot data for {entry_date} - skipping")
                 continue
             
-            print(f"  Entry Spot: {entry_spot}")
+            _log(f"  Entry Spot: {entry_spot}")
             
             # ========== STEP 8: PROCESS EACH LEG ==========
             trade_legs = []
             
             for leg_idx, leg_config in enumerate(legs_config):
-                print(f"\n    Processing Leg {leg_idx + 1}...")
+                _log(f"\n    Processing Leg {leg_idx + 1}...")
                 
                 segment = leg_config['segment']
                 position = leg_config['position']
@@ -156,8 +259,8 @@ def run_algotest_backtest(params):
                 
                 if segment == 'FUTURES':
                     # ========== FUTURES LEG ==========
-                    print(f"      Type: FUTURE")
-                    print(f"      Position: {position}")
+                    _log(f"      Type: FUTURE")
+                    _log(f"      Position: {position}")
                     
                     # Get future expiry
                     future_expiry = expiry_date  # Use same expiry for simplicity
@@ -170,10 +273,10 @@ def run_algotest_backtest(params):
                     )
                     
                     if entry_price is None:
-                        print(f"      ⚠️  No future price - skipping leg")
+                        _log(f"      ⚠️  No future price - skipping leg")
                         continue
                     
-                    print(f"      Entry Price: {entry_price}")
+                    _log(f"      Entry Price: {entry_price}")
                     
                     # Get exit price
                     exit_price = get_future_price_from_db(
@@ -183,18 +286,18 @@ def run_algotest_backtest(params):
                     )
                     
                     if exit_price is None:
-                        print(f"      ⚠️  No exit price - using entry")
+                        _log(f"      ⚠️  No exit price - using entry")
                         exit_price = entry_price
                     
-                    print(f"      Exit Price: {exit_price}")
+                    _log(f"      Exit Price: {exit_price}")
                     
-                    # Calculate P&L
+                    # Calculate P&L - use lots directly (user sends total quantity)
                     if position == 'BUY':
                         leg_pnl = (exit_price - entry_price) * lots
                     else:  # SELL
                         leg_pnl = (entry_price - exit_price) * lots
                     
-                    print(f"      P&L: {leg_pnl:,.2f}")
+                    _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
                     
                     trade_legs.append({
                         'leg_number': leg_idx + 1,
@@ -211,10 +314,10 @@ def run_algotest_backtest(params):
                     option_type = leg_config['option_type']
                     strike_selection = leg_config['strike_selection']
                     
-                    print(f"      Type: OPTION")
-                    print(f"      Option Type: {option_type}")
-                    print(f"      Position: {position}")
-                    print(f"      Strike Selection: {strike_selection}")
+                    _log(f"      Type: OPTION")
+                    _log(f"      Option Type: {option_type}")
+                    _log(f"      Position: {position}")
+                    _log(f"      Strike Selection: {strike_selection}")
                     
                     # ========== CALCULATE STRIKE ==========
                     strike = calculate_strike_from_selection(
@@ -224,7 +327,7 @@ def run_algotest_backtest(params):
                         option_type=option_type
                     )
                     
-                    print(f"      Calculated Strike: {strike}")
+                    _log(f"      Calculated Strike: {strike}")
                     
                     # Get entry premium
                     entry_premium = get_option_premium_from_db(
@@ -236,15 +339,15 @@ def run_algotest_backtest(params):
                     )
                     
                     if entry_premium is None:
-                        print(f"      ⚠️  No entry premium - skipping leg")
+                        _log(f"      ⚠️  No entry premium - skipping leg")
                         continue
                     
-                    print(f"      Entry Premium: {entry_premium}")
+                    _log(f"      Entry Premium: {entry_premium}")
                     
                     # Get exit premium
                     if exit_date >= expiry_date:
                         # ========== EXPIRY DAY - USE INTRINSIC VALUE ==========
-                        print(f"      Exit on/after expiry - using intrinsic value")
+                        _log(f"      Exit on/after expiry - using intrinsic value")
                         
                         exit_spot = get_spot_price_from_db(expiry_date, index)
                         
@@ -257,8 +360,8 @@ def run_algotest_backtest(params):
                             option_type=option_type
                         )
                         
-                        print(f"      Exit Spot: {exit_spot}")
-                        print(f"      Intrinsic Value: {exit_premium}")
+                        _log(f"      Exit Spot: {exit_spot}")
+                        _log(f"      Intrinsic Value: {exit_premium}")
                     
                     else:
                         # ========== PRE-EXPIRY EXIT - USE MARKET PRICE ==========
@@ -271,18 +374,18 @@ def run_algotest_backtest(params):
                         )
                         
                         if exit_premium is None:
-                            print(f"      ⚠️  No exit premium - using 0")
+                            _log(f"      ⚠️  No exit premium - using 0")
                             exit_premium = 0
                         
-                        print(f"      Exit Premium: {exit_premium}")
+                        _log(f"      Exit Premium: {exit_premium}")
                     
-                    # Calculate P&L
+                    # Calculate P&L - use lots directly (user sends total quantity)
                     if position == 'BUY':
                         leg_pnl = (exit_premium - entry_premium) * lots
                     else:  # SELL
                         leg_pnl = (entry_premium - exit_premium) * lots
                     
-                    print(f"      P&L: {leg_pnl:,.2f}")
+                    _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
                     
                     trade_legs.append({
                         'leg_number': leg_idx + 1,
@@ -296,12 +399,82 @@ def run_algotest_backtest(params):
                         'pnl': leg_pnl
                     })
             
+            # ========== STEP 8B: CHECK STOP LOSS / TARGET ==========
+            sl_hit_date = None
+            sl_reason = None
+            
+            if trade_legs and (stop_loss_pct is not None or target_pct is not None):
+                sl_hit_date, sl_reason = check_stop_loss_target(
+                    entry_date=entry_date,
+                    exit_date=exit_date,
+                    expiry_date=expiry_date,
+                    entry_spot=entry_spot,
+                    legs_config=trade_legs,
+                    index=index,
+                    stop_loss_pct=stop_loss_pct,
+                    target_pct=target_pct,
+                    trading_calendar=trading_calendar
+                )
+                
+                if sl_hit_date is not None:
+                    original_exit_date = exit_date
+                    exit_date = sl_hit_date
+                    print(f"  ⚠️  Exiting on {exit_date.strftime('%Y-%m-%d')} due to {sl_reason}")
+                    
+                    # Recalculate exit premium for each leg based on new exit_date
+                    for leg in trade_legs:
+                        if leg.get('segment') == 'OPTION':
+                            opt_type = leg.get('option_type')
+                            strike = leg.get('strike')
+                            position = leg.get('position')
+                            lots = leg.get('lots')
+                            entry_prem = leg.get('entry_premium')
+                            
+                            if opt_type and strike and position and entry_prem:
+                                # Calculate exit premium based on new date
+                                if exit_date >= expiry_date:
+                                    exit_spot = get_spot_price_from_db(exit_date, index)
+                                    if exit_spot is None:
+                                        exit_spot = entry_spot
+                                    new_exit_premium = calculate_intrinsic_value(
+                                        spot=exit_spot,
+                                        strike=strike,
+                                        option_type=opt_type
+                                    )
+                                else:
+                                    new_exit_premium = get_option_premium_from_db(
+                                        date=exit_date.strftime('%Y-%m-%d'),
+                                        index=index,
+                                        strike=strike,
+                                        option_type=opt_type,
+                                        expiry=expiry_date.strftime('%Y-%m-%d')
+                                    )
+                                
+                                if new_exit_premium is None:
+                                    new_exit_premium = 0
+                                
+                                # Recalculate P&L
+                                if position == 'BUY':
+                                    leg_pnl = (new_exit_premium - entry_prem) * lots
+                                else:
+                                    leg_pnl = (entry_prem - new_exit_premium) * lots
+                                
+                                leg['exit_premium'] = new_exit_premium
+                                leg['pnl'] = leg_pnl
+                                print(f"      Recalculated P&L for leg {leg['leg_number']}: {leg_pnl:,.2f}")
+            
             # ========== STEP 9: CALCULATE TOTAL P&L ==========
             total_pnl = sum(leg['pnl'] for leg in trade_legs)
             
             print(f"\n  Total P&L: {total_pnl:,.2f}")
             
-            # ========== STEP 10: RECORD TRADE ==========
+            # ========== STEP 10: GET EXIT SPOT ==========
+            # Get exit spot price for the trade
+            exit_spot = get_spot_price_from_db(exit_date, index)
+            if exit_spot is None:
+                exit_spot = entry_spot
+            
+            # ========== STEP 11: RECORD TRADE ==========
             trade_record = {
                 'entry_date': entry_date,
                 'exit_date': exit_date,
@@ -309,6 +482,8 @@ def run_algotest_backtest(params):
                 'entry_dte': entry_dte,
                 'exit_dte': exit_dte,
                 'entry_spot': entry_spot,
+                'exit_spot': exit_spot,
+                'exit_reason': sl_reason if sl_reason else 'SCHEDULED',
                 'legs': trade_legs,
                 'total_pnl': total_pnl
             }
@@ -333,60 +508,62 @@ def run_algotest_backtest(params):
     # Flatten for DataFrame
     trades_flat = []
     for trade in all_trades:
+        entry_spot_val = trade['entry_spot']
+        exit_spot_val = trade.get('exit_spot', trade['entry_spot'])
+        
         row = {
-            'entry_date': trade['entry_date'],
-            'exit_date': trade['exit_date'],
-            'expiry_date': trade['expiry_date'],
-            'entry_dte': trade['entry_dte'],
-            'exit_dte': trade['exit_dte'],
-            'entry_spot': trade['entry_spot'],
-            'total_pnl': trade['total_pnl']
+            'Entry Date': trade['entry_date'],
+            'Exit Date': trade['exit_date'],
+            'Expiry Date': trade['expiry_date'],
+            'Entry DTE': trade['entry_dte'],
+            'Exit DTE': trade['exit_dte'],
+            'Entry Spot': entry_spot_val,
+            'Exit Spot': exit_spot_val,
+            'Spot P&L': round(exit_spot_val - entry_spot_val, 2) if exit_spot_val and entry_spot_val else 0,
+            'Net P&L': trade['total_pnl'],
+            'Exit Reason': trade.get('exit_reason', 'SCHEDULED')
         }
         
         # Add leg details
         for leg in trade['legs']:
             leg_num = leg['leg_number']
             if leg['segment'] == 'FUTURE':
-                row[f'leg{leg_num}_type'] = 'FUTURE'
-                row[f'leg{leg_num}_position'] = leg['position']
-                row[f'leg{leg_num}_entry'] = leg['entry_price']
-                row[f'leg{leg_num}_exit'] = leg['exit_price']
+                row[f'Leg_{leg_num}_Type'] = 'FUTURE'
+                row[f'Leg_{leg_num}_Position'] = leg['position']
+                row[f'Leg_{leg_num}_EntryPrice'] = leg['entry_price']
+                row[f'Leg_{leg_num}_ExitPrice'] = leg['exit_price']
             else:
-                row[f'leg{leg_num}_type'] = f"{leg['option_type']}"
-                row[f'leg{leg_num}_strike'] = leg['strike']
-                row[f'leg{leg_num}_position'] = leg['position']
-                row[f'leg{leg_num}_entry'] = leg['entry_premium']
-                row[f'leg{leg_num}_exit'] = leg['exit_premium']
+                row[f'Leg_{leg_num}_Type'] = f"Option_{leg['option_type']}_{leg['position']}"
+                row[f'Leg_{leg_num}_Strike'] = leg['strike']
+                row[f'Leg_{leg_num}_Position'] = leg['position']
+                row[f'Leg_{leg_num}_EntryPrice'] = leg['entry_premium']
+                row[f'Leg_{leg_num}_ExitPrice'] = leg['exit_premium']
             
-            row[f'leg{leg_num}_pnl'] = leg['pnl']
+            row[f'Leg_{leg_num}_P&L'] = leg['pnl']
         
         trades_flat.append(row)
-    
     trades_df = pd.DataFrame(trades_flat)
     
-    # Calculate cumulative
-    trades_df['cumulative_pnl'] = trades_df['total_pnl'].cumsum()
+    # ========== STEP 12: COMPUTE ANALYTICS (ADDS CUMULATIVE, PEAK, DD, %DD) ==========
+    if DEBUG:
+        print(f"Computing analytics (Cumulative, Peak, DD, %DD)...")
     
-    # ========== STEP 12: CALCULATE SUMMARY ==========
-    summary = {
-        'total_trades': len(trades_df),
-        'total_pnl': trades_df['total_pnl'].sum(),
-        'winning_trades': len(trades_df[trades_df['total_pnl'] > 0]),
-        'losing_trades': len(trades_df[trades_df['total_pnl'] < 0]),
-        'win_rate': (len(trades_df[trades_df['total_pnl'] > 0]) / len(trades_df) * 100) if len(trades_df) > 0 else 0,
-        'avg_win': trades_df[trades_df['total_pnl'] > 0]['total_pnl'].mean() if len(trades_df[trades_df['total_pnl'] > 0]) > 0 else 0,
-        'avg_loss': trades_df[trades_df['total_pnl'] < 0]['total_pnl'].mean() if len(trades_df[trades_df['total_pnl'] < 0]) > 0 else 0,
-        'max_win': trades_df['total_pnl'].max(),
-        'max_loss': trades_df['total_pnl'].min(),
-    }
+    # Call compute_analytics from base.py
+    # This adds: Cumulative, Peak, DD, %DD columns
+    # And returns enhanced summary with CAGR, Max DD, etc.
+    trades_df, summary = compute_analytics(trades_df)
     
-    print(f"\nTotal P&L: ₹{summary['total_pnl']:,.2f}")
-    print(f"Win Rate: {summary['win_rate']:.2f}%")
-    print(f"Avg Win: ₹{summary['avg_win']:,.2f}")
-    print(f"Avg Loss: ₹{summary['avg_loss']:,.2f}")
+    print(f"\n{'='*60}")
+    print(f"ANALYTICS COMPLETE")
+    print(f"{'='*60}")
+    print(f"Total P&L: ₹{summary.get('total_pnl', 0):,.2f}")
+    print(f"Win Rate: {summary.get('win_pct', 0):.2f}%")
+    print(f"CAGR: {summary.get('cagr_options', 0):.2f}%")
+    print(f"Max Drawdown: {summary.get('max_dd_pct', 0):.2f}%")
+    print(f"CAR/MDD: {summary.get('car_mdd', 0):.2f}")
     print(f"{'='*60}\n")
     
-    # Pivot table (simplified)
-    pivot = {'headers': [], 'rows': []}
+    # ========== STEP 13: BUILD PIVOT TABLE ==========
+    pivot = build_pivot(trades_df, 'Expiry Date')
     
     return trades_df, summary, pivot

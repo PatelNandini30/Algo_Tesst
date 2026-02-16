@@ -2,6 +2,15 @@ import React, { useState } from 'react';
 import { Play, Plus, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
 import ResultsPanel from './ResultsPanel';
 
+// Lot sizes for different indices
+const LOT_SIZES = {
+  NIFTY: 75,
+  BANKNIFTY: 15,
+  FINNIFTY: 40,
+  MIDCPNIFTY: 75,
+  SENSEX: 10
+};
+
 const AlgoTestBacktest = () => {
   // Instrument Settings
   const [instrument, setInstrument] = useState('NIFTY');
@@ -85,6 +94,17 @@ const AlgoTestBacktest = () => {
 
   // Build payload
   const buildPayload = () => {
+    // Get lot size for the selected index
+    const lotSize = LOT_SIZES[instrument.toUpperCase()] || 1;
+    
+    // Multiply each leg's lot by the lot size
+    const legsWithLotSize = legs.map(leg => ({
+      ...leg,
+      lots: (leg.lot || leg.lots || 1) * lotSize
+    }));
+    
+    console.log(`Lot size for ${instrument}: ${lotSize}`);
+    
     return {
       index: instrument,
       underlying,
@@ -92,7 +112,7 @@ const AlgoTestBacktest = () => {
       expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
-      legs: legs,
+      legs: legsWithLotSize,
       overall_settings: {
         stop_loss: overallStopLoss,
         target: overallTarget

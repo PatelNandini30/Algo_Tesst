@@ -1,6 +1,15 @@
 import React, { useState } from 'react';
 import { Play, Save, Copy, Settings, Calendar, TrendingUp } from 'lucide-react';
 
+// Lot sizes for different indices
+const LOT_SIZES = {
+  NIFTY: 75,
+  BANKNIFTY: 15,
+  FINNIFTY: 40,
+  MIDCPNIFTY: 75,
+  SENSEX: 10
+};
+
 const AlgoTestBacktest = () => {
   const [config, setConfig] = useState({
     index: 'NIFTY',
@@ -67,14 +76,27 @@ const AlgoTestBacktest = () => {
     setError(null);
     
     try {
+      // Get lot size for the selected index
+      const lotSize = LOT_SIZES[config.index.toUpperCase()] || 1;
+      
+      // Multiply each leg's lot by the lot size
+      const configWithLotSize = {
+        ...config,
+        legs: config.legs.map(leg => ({
+          ...leg,
+          lots: (leg.lot || leg.lots || 1) * lotSize
+        }))
+      };
+      
       console.log('🚀 Sending backtest request:', config);
+      console.log(`   Lot size for ${config.index}: ${lotSize}`);
       
       const response = await fetch('http://localhost:8000/api/dynamic-backtest', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(config)
+        body: JSON.stringify(configWithLotSize)
       });
 
       console.log('📡 Response status:', response.status);

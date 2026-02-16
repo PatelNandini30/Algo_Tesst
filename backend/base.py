@@ -157,7 +157,10 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Close', 'TurnOver', 'Date']
     available_cols = [col for col in required_cols if col in df.columns]
     
-    return df[available_cols]
+    result = df[available_cols].copy()
+    # DEBUG print commented out for performance
+    # print(f"      DEBUG: Loaded CSV for {date_str}, rows: {len(result)}, NIFTY: {len(result[result['Symbol']=='NIFTY'])}")
+    return result
 
 def get_option_price(bhavcopy_df, symbol, instrument, option_type, expiry, strike):
     # Normalize expiry to Timestamp (no .date() calls)
@@ -444,27 +447,100 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
 def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
     """
-    Translation of getPivotTable()
+    Build year-wise returns pivot table with monthly breakdown, max drawdown, and R/MDD
     """
     if df.empty:
         return {"headers": [], "rows": []}
     
-    # Normalize column names
     df = df.copy()
     if 'net_pnl' in df.columns and 'Net P&L' not in df.columns:
         df = df.rename(columns={'net_pnl': 'Net P&L'})
     
-    df['Month'] = pd.to_datetime(df[expiry_col]).dt.strftime('%b')
-    df['Year'] = pd.to_datetime(df[expiry_col]).dt.year
+    exit_date_col = 'Exit Date' if 'Exit Date' in df.columns else 'exit_date'
     
-    pivot = df.pivot_table(values='Net P&L', index='Year', columns='Month', aggfunc='sum')
-    month_order = [m for m in ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'] if m in pivot.columns]
-    pivot = pivot[month_order]
-    pivot['Grand Total'] = pivot[month_order].sum(axis=1).round(2)
+    df['Month'] = pd.to_datetime(df[exit_date_col]).dt.strftime('%b')
+    df['Year'] = pd.to_datetime(df[exit_date_col]).dt.year
     
-    headers = ['Year'] + month_order + ['Grand Total']
-    rows = [[str(year)] + [round(pivot.loc[year, m], 2) if m in pivot.columns and not pd.isna(pivot.loc[year, m]) else None for m in month_order + ['Grand Total']]
-            for year in pivot.index]
+    month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    
+    # Calculate yearly metrics
+    yearly_data = []
+    for year in sorted(df['Year'].unique()):
+        year_df = df[df['Year'] == year].copy()
+        year_df = year_df.sort_values(exit_date_col)
+        
+        # Monthly P&L
+        monthly_pnl = year_df.groupby('Month')['Net P&L'].sum()
+        
+        # Calculate cumulative for the year to find max drawdown
+        year_df['Cumulative'] = year_df['Net P&L'].cumsum()
+        year_df['Peak'] = year_df['Cumulative'].cummax()
+        year_df['DD'] = np.where(year_df['Peak'] > year_df['Cumulative'], year_df['Cumulative'] - year_df['Peak'], 0)
+        
+        # Max drawdown for the year
+        max_dd = year_df['DD'].min()
+        max_dd_pct = round(100 * (max_dd / year_df['Peak'].iloc[0]), 2) if year_df['Peak'].iloc[0] > 0 else 0
+        
+        # Find dates for MDD
+        if max_dd < 0:
+            mdd_idx = year_df['DD'].idxmin()
+            mdd_start_date = year_df.loc[mdd_idx, exit_date_col]
+            
+            # Find when we recovered
+            recovery_df = year_df.loc[mdd_idx:]
+            recovered_idx = recovery_df[recovery_df['Cumulative'] >= year_df.loc[mdd_idx, 'Peak']].index
+            
+            if len(recovered_idx) > 0:
+                mdd_end_date = recovery_df.loc[recovered_idx[0], exit_date_col]
+                days_for_mdd = (mdd_end_date - mdd_start_date).days
+            else:
+                mdd_end_date = year_df[exit_date_col].max()
+                days_for_mdd = (mdd_end_date - mdd_start_date).days
+            
+            mdd_date_range = f"[{mdd_start_date.strftime('%m/%d/%Y')} to {mdd_end_date.strftime('%m/%d/%Y')}]"
+        else:
+            max_dd = 0
+            max_dd_pct = 0
+            days_for_mdd = 0
+            mdd_date_range = ""
+        
+        # Total P&L for year
+        total_pnl = year_df['Net P&L'].sum()
+        
+        # R/MDD (Return / Max Drawdown) - yearly return divided by absolute max drawdown
+        r_mdd = round(total_pnl / abs(max_dd), 2) if max_dd != 0 else 0
+        
+        yearly_data.append({
+            'year': year,
+            'monthly_pnl': monthly_pnl,
+            'total_pnl': total_pnl,
+            'max_dd': max_dd,
+            'max_dd_pct': max_dd_pct,
+            'days_for_mdd': days_for_mdd,
+            'mdd_date_range': mdd_date_range,
+            'r_mdd': r_mdd
+        })
+    
+    # Build headers
+    headers = ['Year', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 
+               'Total', 'Max Drawdown', 'Days for MDD', 'R/MDD']
+    
+    # Build rows
+    rows = []
+    for data in yearly_data:
+        row = [str(data['year'])]
+        
+        for m in month_order:
+            val = data['monthly_pnl'].get(m, 0)
+            row.append(round(val, 2) if pd.notna(val) else None)
+        
+        row.append(round(data['total_pnl'], 2))
+        row.append(data['mdd_date_range'] if data['mdd_date_range'] else str(round(data['max_dd'], 2)))
+        row.append(data['days_for_mdd'])
+        row.append(data['r_mdd'])
+        
+        rows.append(row)
+    
     return {"headers": headers, "rows": rows}
 
 
@@ -629,82 +705,97 @@ def get_strike_interval(index):
 
 def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path='bhavcopy_data.db'):
     """
-    Get option premium from database
-    
-    This is your existing logic but extracted for reuse
-    
-    Args:
-        date: str - Date in YYYY-MM-DD format
-        index: str - NIFTY, BANKNIFTY, etc.
-        strike: float - Strike price
-        option_type: str - 'CE' or 'PE'
-        expiry: str - Expiry date in YYYY-MM-DD
-        db_path: str - Path to database
-    
-    Returns:
-        float - Option premium (Close price)
-        None if not found
+    Get option premium from CSV only (no database fallback)
     """
-    import sqlite3
-    
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    query = """
-    SELECT close 
-    FROM bhavcopy 
-    WHERE date = ? 
-      AND symbol = ? 
-      AND strike = ? 
-      AND option_type = ? 
-      AND expiry = ?
-    LIMIT 1
-    """
-    
-    cursor.execute(query, (date, index, strike, option_type, expiry))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        return float(result[0])
-    return None
+    # DEBUG print commented out for performance
+    # print(f"      DEBUG: get_option_premium_from_db called with date={date}, index={index}, strike={strike}, option_type={option_type}, expiry={expiry}")
+    try:
+        # Get from bhavcopy CSV
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        
+        bhav_df = load_bhavcopy(date_str)
+        
+        if bhav_df is not None and not bhav_df.empty:
+            date_ts = pd.to_datetime(date)
+            expiry_ts = pd.to_datetime(expiry)
+            
+            # Normalize option_type (handle both string and enum)
+            if hasattr(option_type, 'value'):
+                opt_type_upper = str(option_type.value).upper()
+            elif hasattr(option_type, 'upper'):
+                opt_type_upper = option_type.upper()
+            else:
+                opt_type_upper = str(option_type).upper()
+            
+            if opt_type_upper in ['CE', 'CALL', 'C']:
+                opt_match = 'CE'
+            elif opt_type_upper in ['PE', 'PUT', 'P']:
+                opt_match = 'PE'
+            else:
+                opt_match = opt_type_upper
+            
+            # Debug: print what we're looking for
+            # print(f"      DEBUG: Looking for Symbol={index}, OptionType={opt_match}, Strike={strike}, Expiry={expiry_ts}")
+            
+            # Filter by Symbol first to see what symbols exist
+            symbol_matches = bhav_df[bhav_df['Symbol'] == index]
+            if symbol_matches.empty:
+                # print(f"      DEBUG: No matches for Symbol={index}. Available symbols: {bhav_df['Symbol'].unique()[:10]}")
+                return None
+            
+            mask = (
+                (bhav_df['Symbol'] == index) &
+                (bhav_df['OptionType'].str.upper() == opt_match) &
+                (abs(bhav_df['StrikePrice'] - strike) <= 1) &
+                (abs(bhav_df['ExpiryDate'] - expiry_ts) <= pd.Timedelta(days=1))
+            )
+            
+            matches = bhav_df[mask]
+            if not matches.empty:
+                return float(matches.iloc[0]['Close'])
+            else:
+                # More debug info
+                # print(f"      DEBUG: No match. Expiry dates in data: {bhav_df[bhav_df['Symbol']==index]['ExpiryDate'].unique()[:5]}")
+                pass
+        
+        return None
+    except Exception as e:
+        # print(f"Warning: Could not get option premium: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def get_future_price_from_db(date, index, expiry, db_path='bhavcopy_data.db'):
     """
-    Get future price from database
-    
-    Args:
-        date: str - Date
-        index: str - Index symbol
-        expiry: str - Expiry date
-        db_path: str - Database path
-    
-    Returns:
-        float - Future close price
+    Get future price from CSV only (no database fallback)
     """
-    import sqlite3
-    
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    query = """
-    SELECT close 
-    FROM bhavcopy 
-    WHERE date = ? 
-      AND symbol = ? 
-      AND expiry = ?
-      AND option_type IS NULL
-    LIMIT 1
-    """
-    
-    cursor.execute(query, (date, index, expiry))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        return float(result[0])
-    return None
+    try:
+        # Get from bhavcopy CSV
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        
+        bhav_df = load_bhavcopy(date_str)
+        
+        if bhav_df is not None and not bhav_df.empty:
+            date_ts = pd.to_datetime(date)
+            expiry_ts = pd.to_datetime(expiry)
+            
+            # Look for futures - usually marked as 'FUT' in Instrument
+            mask = (
+                (bhav_df['Symbol'] == index) &
+                (bhav_df['Instrument'].str.upper().str.contains('FUT', na=False)) &
+                (abs(bhav_df['ExpiryDate'] - expiry_ts) <= pd.Timedelta(days=1))
+            )
+            
+            matches = bhav_df[mask]
+            if not matches.empty:
+                return float(matches.iloc[0]['Close'])
+        
+        return None
+    except Exception as e:
+        # Warning print commented out for performance
+        # print(f"Warning: Could not get future price: {e}")
+        return None
 
 def calculate_intrinsic_value(spot, strike, option_type):
     """
@@ -861,35 +952,35 @@ def get_monthly_expiry_date(year: int, month: int, expiry_day_of_week: int):
 
 def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     """
-    Get spot price from database
-    
-    Note: Your database might store spot differently
-    Adjust this to match your schema
+    Get spot price - tries CSV first, then database fallback
     """
-    import sqlite3
+    try:
+        # PRIMARY: Get from strike_data CSV
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        
+        spot_df = get_strike_data(index, date_str, date_str)
+        
+        if spot_df is not None and not spot_df.empty:
+            date_ts = pd.to_datetime(date)
+            exact = spot_df[spot_df['Date'] == date_ts]
+            if not exact.empty:
+                return float(exact.iloc[0]['Close'])
+            # Get closest prior
+            prior = spot_df[spot_df['Date'] <= date_ts]
+            if not prior.empty:
+                return float(prior.iloc[-1]['Close'])
+        
+        return None
+    except Exception as e:
+        # Fallback to database
+        pass
     
+    # Database fallback
+    import sqlite3
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
-    # This query assumes spot is stored in a specific way
-    # ADJUST based on your actual database schema
-    query = """
-    SELECT close 
-    FROM bhavcopy 
-    WHERE date = ? 
-      AND symbol = ?
-      AND strike IS NULL
-      AND option_type IS NULL
-    LIMIT 1
-    """
-    
-    cursor.execute(query, (date.strftime('%Y-%m-%d'), index))
+    query = """SELECT close FROM bhavcopy WHERE date = ? AND symbol = ? AND strike IS NULL AND option_type IS NULL LIMIT 1"""
+    cursor.execute(query, (date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else date, index))
     result = cursor.fetchone()
     conn.close()
-    
-    if result:
-        return float(result[0])
-    
-    # Fallback: calculate from ATM options
-    # You may need to implement this based on your data
-    return None
+    return float(result[0]) if result else None

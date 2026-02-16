@@ -4,6 +4,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import sys
 import os
 import pandas as pd
+import numpy as np
 
 # Add the parent directory to the path to import engines
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -63,6 +64,7 @@ except ImportError as e:
 
 # Import generic multi-leg engine
 from engines.generic_multi_leg import run_generic_multi_leg
+from engines.generic_algotest_engine import run_algotest_backtest
 
 # Dynamically import the strategy engines
 v1_module = importlib.import_module('engines.v1_ce_fut')
@@ -540,13 +542,133 @@ class ExportResponse(BaseModel):
 
 
 def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
-    """Execute a strategy based on its definition"""
-    # Add strategy definition to params
-    params["strategy"] = strategy_def  # Use "strategy" key to match what run_generic_multi_leg expects
+    """
+    Execute a strategy using the AlgoTest engine for DTE-based positional strategies
+    """
+    # DEBUG: Print what params we received
+    print(f"\n>>> execute_strategy received params: {list(params.keys())}")
+    print(f">>> strategy_type: {params.get('strategy_type')}")
+    print(f">>> entry_dte: {params.get('entry_dte')}")
+    print(f">>> exit_dte: {params.get('exit_dte')}")
     
-    # For now, route to generic multi-leg engine
-    # In future, can add routing logic to specific engines for compatible strategies
+    # Check if positional strategy with entry_dte/exit_dte
+    is_positional = params.get('strategy_type') == 'positional' or ('entry_dte' in params and 'exit_dte' in params)
+    
+    print(f">>> is_positional: {is_positional}")
+    
+    if is_positional:
+        print("\n✓ Using AlgoTest engine (DTE-based positional strategy)\n")
+        
+        # Build AlgoTest params
+        entry_dte = params.get('entry_dte', 2)
+        exit_dte = params.get('exit_dte', 0)
+        expiry_type = params.get('expiry_type', 'WEEKLY')
+        
+        # Build legs config
+        legs_config = []
+        for leg in strategy_def.legs:
+            # Debug: show actual values
+            # Handle enum properly by using .value if available
+            if hasattr(leg.instrument, 'value'):
+                instr_str = str(leg.instrument.value)
+            else:
+                instr_str = str(leg.instrument)
+            print(f">>> DEBUG: leg.instrument = '{instr_str}'")
+            print(f">>> DEBUG: leg.option_type = '{leg.option_type}'")
+            
+            # Check for options more robustly
+            is_option = 'option' in instr_str.lower() or instr_str == 'Option'
+            print(f">>> DEBUG: is_option = {is_option}")
+            
+            # Handle position enum
+            if hasattr(leg.position, 'value'):
+                position_str = str(leg.position.value).upper()
+            else:
+                position_str = str(leg.position).upper()
+            
+            leg_config = {
+                'segment': 'OPTIONS' if is_option else 'FUTURES',
+                'position': position_str,
+                'lots': leg.lots
+            }
+            
+            if is_option:
+                # Get option_type - could be 'CE', 'PE', 'Call', 'Put', etc.
+                # Handle enum properly by using .value if available
+                if hasattr(leg.option_type, 'value'):
+                    opt_type = str(leg.option_type.value).upper()
+                else:
+                    opt_type = str(leg.option_type).upper()
+                
+                if opt_type in ['CALL', 'CE', 'C']:
+                    leg_config['option_type'] = 'CE'
+                elif opt_type in ['PUT', 'PE', 'P']:
+                    leg_config['option_type'] = 'PE'
+                else:
+                    leg_config['option_type'] = opt_type
+                
+                # Strike selection
+                strike_sel = leg.strike_selection
+                if hasattr(strike_sel, 'type'):
+                    strike_type = str(strike_sel.type).upper()
+                    if 'ATM' in strike_type:
+                        leg_config['strike_selection'] = 'ATM'
+                    elif 'OTM' in strike_type:
+                        leg_config['strike_selection'] = f'OTM{int(strike_sel.value)}' if strike_sel.value else 'ATM'
+                    else:
+                        leg_config['strike_selection'] = 'ATM'
+                else:
+                    leg_config['strike_selection'] = 'ATM'
+                leg_config['expiry'] = expiry_type
+            
+            print(f">>> DEBUG: final leg_config = {leg_config}")
+            legs_config.append(leg_config)
+        
+        algotest_params = {
+            'index': params.get('index', 'NIFTY'),
+            'from_date': params.get('from_date') or params.get('date_from'),
+            'to_date': params.get('to_date') or params.get('date_to'),
+            'expiry_type': expiry_type,
+            'entry_dte': entry_dte,
+            'exit_dte': exit_dte,
+            'legs': legs_config
+        }
+        
+        try:
+            return run_algotest_backtest(algotest_params)
+        except Exception as e:
+            print(f"⚠️ AlgoTest engine failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Default to generic_multi_leg
+    print("\n✓ Using generic_multi_leg engine\n")
+    params["strategy"] = strategy_def
     return run_generic_multi_leg(params)
+
+
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to Python native types for JSON serialization
+    """
+    import numpy as np
+    
+    if isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.strftime('%Y-%m-%d')
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
 
 
 @router.post("/dynamic-backtest")
@@ -554,6 +676,13 @@ async def dynamic_backtest(request: dict):
     """
     Dynamic backtesting endpoint for multi-leg strategies
     """
+     # ADD THIS - Log what frontend sends
+    print("\n" + "="*70)
+    print("REQUEST FROM FRONTEND:")
+    import json
+    print(json.dumps(request, indent=2, default=str))
+    print("="*70 + "\n")
+    
     # Check if imports were successful
     if not IMPORT_SUCCESS:
         raise HTTPException(status_code=500, detail="Strategy types import failed - backend not properly configured")
@@ -848,6 +977,11 @@ async def dynamic_backtest(request: dict):
             "expiry_window": request_obj.expiry_window,
             "spot_adjustment_type": request_obj.spot_adjustment_type,
             "spot_adjustment": request_obj.spot_adjustment,
+            # Add AlgoTest-style parameters
+            "strategy_type": request.get("strategy_type", "positional"),
+            "entry_dte": request.get("entry_dte", 2),
+            "exit_dte": request.get("exit_dte", 0),
+            "expiry_type": request.get("expiry_type", "WEEKLY"),
         }
         
         # SPOT ADJUSTMENT TYPE MAPPING
@@ -860,19 +994,131 @@ async def dynamic_backtest(request: dict):
         params["spot_adjustment_type"] = spot_adjustment_mapping.get(request_obj.spot_adjustment_type, 0)
         
         # Execute the dynamic strategy
+        with open('debug_backtest.log', 'a') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"DEBUG: About to execute strategy\n")
         df, summary, pivot = execute_strategy(strategy_def, params)
+        with open('debug_backtest.log', 'a') as f:
+            f.write(f"DEBUG: Strategy executed, df shape: {df.shape if not df.empty else 'empty'}\n")
+            f.write(f"DEBUG: df columns: {list(df.columns) if not df.empty else 'N/A'}\n")
         
-        # Prepare response (EXACT ENGINE OUTPUT)
-        trades_list = df.to_dict('records') if not df.empty else []
-        
-        # Convert date columns to strings (POSITIONAL FORMAT)
-        for trade in trades_list:
-            for key, value in trade.items():
-                if isinstance(value, pd.Timestamp):
-                    trade[key] = value.strftime('%Y-%m-%d')
-                elif pd.isna(value):
-                    trade[key] = None
+        # Prepare response with proper column mapping for frontend
+        if not df.empty:
+            print(f"DEBUG: Original columns: {list(df.columns)}")
+            # Rename columns to match frontend expectations (create a copy to avoid modifying original)
+            column_mapping = {
+                'entry_date': 'Entry Date',
+                'exit_date': 'Exit Date',
+                'expiry_date': 'Future Expiry',
+                'entry_spot': 'Entry Spot',
+                'exit_spot': 'Exit Spot',
+                'spot_pnl': 'Spot P&L',
+                'total_pnl': 'Net P&L',
+                'cumulative_pnl': 'Cumulative',
+                'exit_reason': 'Exit Reason',
+                'entry_dte': 'Entry DTE',
+                'exit_dte': 'Exit DTE',
+                'leg1_type': 'Leg 1 Type',
+                'leg1_strike': 'Leg 1 Strike',
+                'leg1_position': 'Leg 1 Position',
+                'leg1_entry': 'Leg 1 Entry',
+                'leg1_exit': 'Leg 1 Exit',
+                'leg1_pnl': 'Leg 1 P&L',
+            }
+            # Only rename columns that exist in the DataFrame
+            existing_columns = {k: v for k, v in column_mapping.items() if k in df.columns}
+            print(f"DEBUG: Renaming columns: {existing_columns}")
+            df = df.rename(columns=existing_columns)
             
+            # Reorder columns to match frontend expectations exactly
+            # Frontend expects: Entry Date, Exit Date, Entry Spot, Exit Spot, Spot P&L, Future Expiry, Net P&L, Leg 1 Type, Leg 1 Strike, Leg 1 Entry
+            frontend_columns = [
+                'Entry Date', 'Exit Date', 'Entry Spot', 'Exit Spot', 
+                'Spot P&L', 'Future Expiry', 'Net P&L', 
+                'Leg 1 Type', 'Leg 1 Strike', 'Leg 1 Entry'
+            ]
+            # Add any extra columns that exist
+            for col in df.columns:
+                if col not in frontend_columns:
+                    frontend_columns.append(col)
+            
+            # Only keep columns that exist
+            frontend_columns = [c for c in frontend_columns if c in df.columns]
+            df = df[frontend_columns]
+            
+            print(f"DEBUG: After reorder: {list(df.columns)}")
+            trades_list = df.to_dict('records')
+            print(f"DEBUG: First trade keys: {list(trades_list[0].keys()) if trades_list else 'No trades'}")
+        else:
+            trades_list = []
+        
+        # Convert ALL numpy types to Python native types
+        trades_list = convert_numpy_types(trades_list)
+        
+        # Calculate comprehensive analytics using analytics module
+        from analytics import create_summary_idx
+        
+        if not df.empty:
+            # Calculate drawdown and equity curve data
+            df_analytics = df.copy()
+            
+            # Calculate cumulative P&L for equity curve
+            if 'Cumulative' not in df_analytics.columns:
+                df_analytics['Cumulative'] = df_analytics['Net P&L'].cumsum()
+            
+            # Calculate drawdown
+            df_analytics['Peak'] = df_analytics['Cumulative'].cummax()
+            df_analytics['DD'] = np.where(df_analytics['Peak'] > df_analytics['Cumulative'], 
+                                          df_analytics['Cumulative'] - df_analytics['Peak'], 0)
+            df_analytics['%DD'] = np.where(df_analytics['DD'] == 0, 0, 
+                                           round(100 * (df_analytics['DD'] / df_analytics['Peak']), 2))
+            
+            # Get comprehensive summary
+            full_summary = create_summary_idx(df_analytics)
+            
+            # Prepare equity curve data for chart
+            equity_curve = []
+            for idx, row in df_analytics.iterrows():
+                equity_curve.append({
+                    "date": row['Entry Date'].strftime('%Y-%m-%d') if pd.notna(row['Entry Date']) else '',
+                    "cumulative_pnl": float(row['Cumulative']),
+                    "peak": float(row['Peak'])
+                })
+            
+            # Prepare drawdown data for chart
+            drawdown_data = []
+            for idx, row in df_analytics.iterrows():
+                drawdown_data.append({
+                    "date": row['Entry Date'].strftime('%Y-%m-%d') if pd.notna(row['Entry Date']) else '',
+                    "drawdown_pct": float(row['%DD']),
+                    "drawdown_pts": float(row['DD'])
+                })
+        else:
+            full_summary = {}
+            equity_curve = []
+            drawdown_data = []
+        
+        # Map summary fields to match frontend expectations EXACTLY
+        summary_mapped = {
+            "total_pnl": full_summary.get("Sum", summary.get("total_pnl", 0)),
+            "count": full_summary.get("Count", summary.get("total_trades", 0)),
+            "win_pct": full_summary.get("W%", summary.get("win_rate", 0)),
+            "avg_win": full_summary.get("Avg(W)", summary.get("avg_win", 0)),
+            "avg_loss": full_summary.get("Avg(L)", summary.get("avg_loss", 0)),
+            "expectancy": full_summary.get("Expectancy", 0),
+            "cagr_options": full_summary.get("CAGR(Options)", 0),
+            "cagr_spot": full_summary.get("CAGR(Spot)", 0),
+            "max_dd_pct": full_summary.get("DD", 0),
+            "max_dd_pts": full_summary.get("DD(Points)", 0),
+            "car_mdd": full_summary.get("CAR/MDD", 0),
+            "recovery_factor": full_summary.get("Recovery Factor", 0),
+            "roi_vs_spot": full_summary.get("ROI vs Spot", 0)
+        }
+        summary = convert_numpy_types(summary_mapped)
+        pivot = convert_numpy_types(pivot) if pivot else {"headers": [], "rows": []}
+        equity_curve = convert_numpy_types(equity_curve)
+        drawdown_data = convert_numpy_types(drawdown_data)
+        
         # Create response manually to match expected structure
         response_data = {
             "status": "success",
@@ -888,12 +1134,10 @@ async def dynamic_backtest(request: dict):
                 }
             },
             "trades": trades_list,
-            "summary": summary if summary else {
-                "total_pnl": 0, "count": 0, "win_pct": 0, "avg_win": 0, "avg_loss": 0, 
-                "expectancy": 0, "cagr_options": 0, "cagr_spot": 0, "max_dd_pct": 0, 
-                "max_dd_pts": 0, "car_mdd": 0, "recovery_factor": 0, "roi_vs_spot": 0
-            },
-            "pivot": {"headers": pivot.get("headers", []), "rows": pivot.get("rows", [])},
+            "summary": summary,
+            "pivot": pivot,
+            "equity_curve": equity_curve,
+            "drawdown": drawdown_data,
             "log": []
         }
             
@@ -1261,8 +1505,35 @@ async def run_algotest_backtest_endpoint(request: dict):
         # Run backtest
         trades_df, summary, pivot = run_algotest_backtest(request)
         
+        # Convert numpy types to Python types for JSON serialization
+        def convert_numpy(obj):
+            import numpy as np
+            if obj is None:
+                return None
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {str(k): convert_numpy(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_numpy(i) for i in obj]
+            elif hasattr(obj, 'item'):  # numpy scalar
+                return obj.item()
+            elif hasattr(obj, 'tolist'):  # numpy array
+                return obj.tolist()
+            return obj
+        
         # Convert to JSON
         trades_json = trades_df.to_dict('records') if not trades_df.empty else []
+        trades_json = convert_numpy(trades_json)
+        
+        summary = convert_numpy(summary)
+        pivot = convert_numpy(pivot)
         
         return {
             "status": "success",
@@ -1273,8 +1544,25 @@ async def run_algotest_backtest_endpoint(request: dict):
     
     except Exception as e:
         import traceback
+        import numpy as np
+        
+        def clean_error(obj):
+            if obj is None:
+                return None
+            elif isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, dict):
+                return {str(k): clean_error(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [clean_error(i) for i in obj]
+            return str(obj)
+        
         return {
             "status": "error",
-            "message": str(e),
+            "message": clean_error(str(e)),
             "traceback": traceback.format_exc()
         }
