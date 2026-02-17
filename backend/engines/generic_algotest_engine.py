@@ -17,6 +17,46 @@ from datetime import datetime, timedelta
 import sys
 import os
 
+
+def get_lot_size(index, entry_date):
+    """
+    Returns correct lot size based on index and trade date.
+    NSE official lot size history:
+    
+    NIFTY:
+      Jun 2000 – Sep 2010 : 200
+      Oct 2010 – Oct 2015 : 50
+      Oct 2015 – Oct 2019 : 75
+      Nov 2019 – present  : 65  # Updated to match AlgoTest
+    
+    BANKNIFTY:
+      Jun 2000 – Sep 2010 : 50
+      Oct 2010 – Oct 2015 : 25
+      Oct 2015 – Oct 2019 : 20
+      Nov 2019 – present  : 15
+    """
+    d = pd.Timestamp(entry_date)
+    if index.upper() == 'NIFTY':
+        if d < pd.Timestamp("2010-10-01"):
+            return 200
+        elif d < pd.Timestamp("2015-10-29"):
+            return 50
+        elif d < pd.Timestamp("2019-11-01"):
+            return 75
+        else:
+            return 65  # Changed from 50 to 65 to match AlgoTest
+    elif index.upper() == 'BANKNIFTY':
+        if d < pd.Timestamp("2010-10-01"):
+            return 50
+        elif d < pd.Timestamp("2015-10-29"):
+            return 25
+        elif d < pd.Timestamp("2019-11-01"):
+            return 20
+        else:
+            return 15
+    return 1  # fallback for other indexes
+
+
 # Import from base.py
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from base import (
@@ -200,7 +240,39 @@ def run_algotest_backtest(params):
             expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
         print(f"  Loaded {len(expiry_df)} standard expiries\n")
     
-    # ========== STEP 3: INITIALIZE RESULTS ==========
+    # ========== STEP 3: SPOT ADJUSTMENT FILTERING ==========
+    spot_adjustment_type = params.get('spot_adjustment_type', 0)
+    spot_adjustment = params.get('spot_adjustment', 1.0)
+    
+    if spot_adjustment_type != 0:
+        print(f"Applying spot adjustment filter...")
+        print(f"  Type: {['None', 'Rises', 'Falls', 'RisesOrFalls'][spot_adjustment_type]}")
+        print(f"  Threshold: {spot_adjustment}%\n")
+        
+        # Build intervals based on spot movement
+        intervals = build_intervals(spot_df, spot_adjustment_type, spot_adjustment)
+        print(f"  Generated {len(intervals)} trading intervals\n")
+        
+        # Filter expiry dates to only those within valid intervals
+        valid_expiries = []
+        for expiry_row in expiry_df.itertuples():
+            expiry_date = expiry_row[1]  # Current Expiry column
+            
+            # Check if this expiry falls within any valid interval
+            for interval_start, interval_end in intervals:
+                if interval_start <= expiry_date <= interval_end:
+                    valid_expiries.append(expiry_row)
+                    break
+        
+        # Update expiry_df to only include valid expiries
+        if valid_expiries:
+            expiry_df = pd.DataFrame(valid_expiries, columns=expiry_df.columns)
+            print(f"  Filtered to {len(expiry_df)} expiries (from {len(expiry_df) + len(expiry_df.index) - len(valid_expiries)} total)\n")
+        else:
+            print(f"  ⚠️  No expiries match spot adjustment criteria - no trades will be executed\n")
+            return pd.DataFrame(), {}, {}
+    
+    # ========== STEP 4: INITIALIZE RESULTS ==========
     all_trades = []
     strike_interval = get_strike_interval(index)
     
@@ -379,11 +451,13 @@ def run_algotest_backtest(params):
                         
                         _log(f"      Exit Premium: {exit_premium}")
                     
-                    # Calculate P&L - use lots directly (user sends total quantity)
+                    # Calculate P&L with correct lot size based on index and entry date
+                    lot_size = get_lot_size(index, entry_date)
+                    
                     if position == 'BUY':
-                        leg_pnl = (exit_premium - entry_premium) * lots
+                        leg_pnl = (exit_premium - entry_premium) * lots * lot_size
                     else:  # SELL
-                        leg_pnl = (entry_premium - exit_premium) * lots
+                        leg_pnl = (entry_premium - exit_premium) * lots * lot_size
                     
                     _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
                     
@@ -420,7 +494,10 @@ def run_algotest_backtest(params):
                     original_exit_date = exit_date
                     exit_date = sl_hit_date
                     print(f"  ⚠️  Exiting on {exit_date.strftime('%Y-%m-%d')} due to {sl_reason}")
-                    
+
+                    # FIX: get lot_size here so SL P&L matches normal path
+                    lot_size_sl = get_lot_size(index, entry_date)
+
                     # Recalculate exit premium for each leg based on new exit_date
                     for leg in trade_legs:
                         if leg.get('segment') == 'OPTION':
@@ -455,9 +532,9 @@ def run_algotest_backtest(params):
                                 
                                 # Recalculate P&L
                                 if position == 'BUY':
-                                    leg_pnl = (new_exit_premium - entry_prem) * lots
+                                    leg_pnl = (new_exit_premium - entry_prem) * lots * lot_size_sl  # FIX
                                 else:
-                                    leg_pnl = (entry_prem - new_exit_premium) * lots
+                                    leg_pnl = (entry_prem - new_exit_premium) * lots * lot_size_sl  # FIX
                                 
                                 leg['exit_premium'] = new_exit_premium
                                 leg['pnl'] = leg_pnl

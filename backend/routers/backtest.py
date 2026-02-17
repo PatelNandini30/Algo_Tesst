@@ -733,7 +733,8 @@ async def dynamic_backtest(request: dict):
                 position = req_leg.get("position", "sell").lower()
                 option_type_val = req_leg.get("option_type", "call").lower()
                 expiry = req_leg.get("expiry", "weekly").lower()
-                lots = req_leg.get("lot", req_leg.get("lots", 1))
+                lots = int(req_leg.get("lot") or req_leg.get("lots") or 1)
+                lots = max(1, lots)  # ensure at least 1
                 
                 # Transform strike selection
                 strike_sel = req_leg.get("strike_selection", {})
@@ -1101,18 +1102,28 @@ async def dynamic_backtest(request: dict):
         # Map summary fields to match frontend expectations EXACTLY
         summary_mapped = {
             "total_pnl": full_summary.get("Sum", summary.get("total_pnl", 0)),
-            "count": full_summary.get("Count", summary.get("total_trades", 0)),
-            "win_pct": full_summary.get("W%", summary.get("win_rate", 0)),
+            "count": full_summary.get("Count", summary.get("count", summary.get("total_trades", 0))),
+            "win_pct": full_summary.get("W%", summary.get("win_pct", summary.get("win_rate", 0))),
+            "loss_pct": full_summary.get("L%", summary.get("loss_pct", 0)),
             "avg_win": full_summary.get("Avg(W)", summary.get("avg_win", 0)),
             "avg_loss": full_summary.get("Avg(L)", summary.get("avg_loss", 0)),
-            "expectancy": full_summary.get("Expectancy", 0),
-            "cagr_options": full_summary.get("CAGR(Options)", 0),
-            "cagr_spot": full_summary.get("CAGR(Spot)", 0),
-            "max_dd_pct": full_summary.get("DD", 0),
-            "max_dd_pts": full_summary.get("DD(Points)", 0),
-            "car_mdd": full_summary.get("CAR/MDD", 0),
-            "recovery_factor": full_summary.get("Recovery Factor", 0),
-            "roi_vs_spot": full_summary.get("ROI vs Spot", 0)
+            "max_win": summary.get("max_win", 0),
+            "max_loss": summary.get("max_loss", 0),
+            "avg_profit_per_trade": summary.get("avg_profit_per_trade", 0),
+            "expectancy": full_summary.get("Expectancy", summary.get("expectancy", 0)),
+            "reward_to_risk": summary.get("reward_to_risk", 0),
+            "cagr_options": full_summary.get("CAGR(Options)", summary.get("cagr_options", 0)),
+            "cagr_spot": full_summary.get("CAGR(Spot)", summary.get("cagr_spot", 0)),
+            "max_dd_pct": full_summary.get("DD", summary.get("max_dd_pct", 0)),
+            "max_dd_pts": full_summary.get("DD(Points)", summary.get("max_dd_pts", 0)),
+            "car_mdd": full_summary.get("CAR/MDD", summary.get("car_mdd", 0)),
+            "recovery_factor": full_summary.get("Recovery Factor", summary.get("recovery_factor", 0)),
+            "max_win_streak": summary.get("max_win_streak", 0),
+            "max_loss_streak": summary.get("max_loss_streak", 0),
+            "mdd_duration_days": summary.get("mdd_duration_days", 0),
+            "mdd_start_date": summary.get("mdd_start_date", ""),
+            "mdd_end_date": summary.get("mdd_end_date", ""),
+            "spot_change": summary.get("spot_change", 0),
         }
         summary = convert_numpy_types(summary_mapped)
         pivot = convert_numpy_types(pivot) if pivot else {"headers": [], "rows": []}

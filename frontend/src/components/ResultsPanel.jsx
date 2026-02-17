@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { 
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer 
@@ -9,6 +9,8 @@ const ResultsPanel = ({ results, onClose }) => {
   if (!results) return null;
 
   const { trades = [], summary = {}, pivot = {} } = results;
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 25;
 
   // Prepare chart data
   const equityData = useMemo(() => {
@@ -21,10 +23,11 @@ const ResultsPanel = ({ results, onClose }) => {
   }, [trades]);
 
   const drawdownData = useMemo(() => {
+    // Show absolute rupee drawdown on Y-axis (like your bottom chart)
     return trades.map((trade, index) => ({
       index: index + 1,
       date: trade['Exit Date'] || trade.exit_date || `Trade ${index + 1}`,
-      drawdown: trade['%DD'] || trade.pct_dd || 0
+      drawdown: trade['DD'] || trade.dd || 0  // Absolute rupee drawdown for both Y-axis and tooltip
     }));
   }, [trades]);
 
@@ -33,11 +36,22 @@ const ResultsPanel = ({ results, onClose }) => {
     totalPnL: summary.total_pnl || 0,
     totalTrades: summary.count || trades.length || 0,
     winRate: summary.win_pct || 0,
+    lossPct: summary.loss_pct || 0,
     cagr: summary.cagr_options || 0,
-    maxDD: summary.max_dd_pct || 0,
+    maxDD: summary.max_dd_pts || 0,
     carMdd: summary.car_mdd || 0,
     avgWin: summary.avg_win || 0,
     avgLoss: summary.avg_loss || 0,
+    maxWin: summary.max_win || 0,
+    maxLoss: summary.max_loss || 0,
+    avgProfitPerTrade: summary.avg_profit_per_trade || 0,
+    expectancy: summary.expectancy || 0,
+    rewardToRisk: summary.reward_to_risk || 0,
+    maxWinStreak: summary.max_win_streak || 0,
+    maxLossStreak: summary.max_loss_streak || 0,
+    mddDuration: summary.mdd_duration_days || 0,
+    mddStartDate: summary.mdd_start_date || '',
+    mddEndDate: summary.mdd_end_date || '',
     cagrSpot: summary.cagr_spot || 0,
     recoveryFactor: summary.recovery_factor || 0
   }), [summary, trades]);
@@ -69,7 +83,7 @@ const ResultsPanel = ({ results, onClose }) => {
             <p key={index} className="text-sm font-medium" style={{ color: entry.color }}>
               {entry.name}: {entry.name.includes('%') 
                 ? `${entry.value?.toFixed(2)}%`
-                : `₹${entry.value?.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`}
+                : `₹${entry.value?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`}
             </p>
           ))}
         </div>
@@ -146,7 +160,7 @@ const ResultsPanel = ({ results, onClose }) => {
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Max DD</p>
               <p className="text-2xl font-bold text-red-600">
-                {stats.maxDD.toFixed(1)}%
+                ₹{Math.abs(stats.maxDD).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
               </p>
             </div>
             
@@ -214,8 +228,8 @@ const ResultsPanel = ({ results, onClose }) => {
                 <AreaChart data={drawdownData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
                     <linearGradient id="colorDrawdown" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#ef4444" stopOpacity={0.8}/>
-                      <stop offset="95%" stopColor="#ef4444" stopOpacity={0.1}/>
+                      <stop offset="5%" stopColor="#ef4444" stopOpacity={0.6}/>
+                      <stop offset="95%" stopColor="#ef4444" stopOpacity={0.2}/>
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
@@ -232,17 +246,18 @@ const ResultsPanel = ({ results, onClose }) => {
                     stroke="#9ca3af"
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
-                    tickFormatter={(value) => `${value.toFixed(1)}%`}
+                    tickFormatter={(value) => `₹${(value/1000).toFixed(0)}k`}
                     domain={['dataMin', 0]}
+                    reversed={false}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area 
                     type="monotone"
                     dataKey="drawdown" 
                     stroke="#dc2626" 
-                    strokeWidth={2}
+                    strokeWidth={1.5}
                     fill="url(#colorDrawdown)" 
-                    name="Drawdown %"
+                    name="Drawdown"
                   />
                 </AreaChart>
               </ResponsiveContainer>
@@ -294,47 +309,224 @@ const ResultsPanel = ({ results, onClose }) => {
               </div>
             )}
 
-            {/* Trade Log */}
+            {/* Detailed Statistics Summary */}
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
-              <h3 className="text-base font-bold text-gray-800 mb-4">Trade Log (Latest 50)</h3>
+              <h3 className="text-base font-bold text-gray-800 mb-4">Detailed Statistics</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {/* Left Column */}
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Overall Profit</span>
+                    <span className={`text-sm font-bold ${stats.totalPnL >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      ₹{stats.totalPnL.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">No. of Trades</span>
+                    <span className="text-sm font-bold text-gray-900">{stats.totalTrades}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Average Profit per Trade</span>
+                    <span className={`text-sm font-bold ${stats.avgProfitPerTrade >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      ₹{stats.avgProfitPerTrade.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Win %</span>
+                    <span className="text-sm font-bold text-blue-600">{stats.winRate.toFixed(2)}%</span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Loss %</span>
+                    <span className="text-sm font-bold text-red-600">{stats.lossPct.toFixed(2)}%</span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Average Profit on Winning Trades</span>
+                    <span className="text-sm font-bold text-green-600">
+                      ₹{Math.abs(stats.avgWin).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Average Loss on Losing Trades</span>
+                    <span className="text-sm font-bold text-red-600">
+                      ₹{stats.avgLoss.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+
+                </div>
+
+                {/* Right Column */}
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Max Drawdown</span>
+                    <span className="text-sm font-bold text-red-600">
+                      ₹{Math.abs(stats.maxDD).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Duration of Max Drawdown</span>
+                    <span className="text-sm font-bold text-gray-900">
+                      {stats.mddDuration} days
+                      {stats.mddStartDate && stats.mddEndDate && (
+                        <span className="block text-xs text-gray-500 mt-1">
+                          [{stats.mddStartDate} to {stats.mddEndDate}]
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Return/MaxDD</span>
+                    <span className={`text-sm font-bold ${stats.recoveryFactor >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {stats.recoveryFactor.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Reward to Risk Ratio</span>
+                    <span className="text-sm font-bold text-indigo-600">
+                      {stats.rewardToRisk.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">Expectancy Ratio</span>
+                    <span className={`text-sm font-bold ${stats.expectancy >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {stats.expectancy.toFixed(2)}
+                    </span>
+                  </div>
+
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">CAGR (Options)</span>
+                    <span className={`text-sm font-bold ${stats.cagr >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {stats.cagr.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-2 border-b border-gray-200">
+                    <span className="text-sm font-medium text-gray-600">CAR/MDD</span>
+                    <span className={`text-sm font-bold ${stats.carMdd >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {stats.carMdd.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Full Report Table */}
+            <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-base font-bold text-gray-800">Full Report</h3>
+                <div className="text-sm text-gray-600">
+                  Showing <span className="font-semibold">{((currentPage - 1) * itemsPerPage) + 1} - {Math.min(currentPage * itemsPerPage, trades.length)}</span> of <span className="font-semibold">{trades.length}</span> trades
+                </div>
+              </div>
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">
                   <thead>
-                    <tr className="border-b-2 border-gray-300">
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-700 uppercase">Entry Date</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-700 uppercase">Exit Date</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-700 uppercase">Entry Spot</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-700 uppercase">Exit Spot</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-700 uppercase">Spot P&L</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-700 uppercase">Future Expiry</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-700 uppercase">Net P&L</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-700 uppercase">Leg 1 Type</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-700 uppercase">Leg 1 Strike</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-700 uppercase">Leg 1 Entry</th>
+                    <tr className="bg-gray-200 border-b-2 border-gray-400">
+                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Index</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Date</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Date</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Type</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Strike</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">B/S</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">P/L</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {trades.slice(0, 50).map((trade, idx) => {
-                      const netPnl = trade['Net P&L'] || trade.net_pnl || 0;
+                    {trades.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage).map((trade, idx) => {
+                      const netPnl = trade['Net P&L'] || trade.net_pnl || trade.pnl || 0;
+                      const actualIdx = (currentPage - 1) * itemsPerPage + idx;
+                      
+                      // Extract option type from Leg_1_Type (e.g., "Option_CE_SELL" -> "CE")
+                      const legType = trade['Leg_1_Type'] || trade['Leg 1 Type'] || '';
+                      let optionType = 'CE';
+                      let position = 'Sell';
+                      
+                      if (legType.includes('_PE_')) {
+                        optionType = 'PE';
+                      } else if (legType.includes('_CE_')) {
+                        optionType = 'CE';
+                      }
+                      
+                      if (legType.includes('_BUY')) {
+                        position = 'Buy';
+                      } else if (legType.includes('_SELL')) {
+                        position = 'Sell';
+                      }
+                      
                       return (
-                        <tr key={idx} className="border-b border-gray-200 hover:bg-gray-50 transition-colors">
+                        <tr key={actualIdx} className={`border-b border-gray-200 ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
+                          <td className="px-3 py-2 text-gray-900">{actualIdx + 1}</td>
                           <td className="px-3 py-2 text-gray-900">{trade['Entry Date'] || '-'}</td>
                           <td className="px-3 py-2 text-gray-900">{trade['Exit Date'] || '-'}</td>
-                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Entry Spot'] || 0).toFixed(2)}</td>
-                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Exit Spot'] || 0).toFixed(2)}</td>
-                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Spot P&L'] || 0).toFixed(2)}</td>
-                          <td className="px-3 py-2 text-gray-900">{trade['Future Expiry'] || '-'}</td>
-                          <td className={`px-3 py-2 text-right font-semibold ${netPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                          <td className="px-3 py-2 text-gray-900">{optionType}</td>
+                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Leg_1_Strike'] || trade['Leg 1 Strike'] || 0).toFixed(2)}</td>
+                          <td className="px-3 py-2 text-gray-900">{position}</td>
+                          <td className="px-3 py-2 text-right text-gray-900">{trade.qty || trade.quantity || 65}</td>
+                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Leg_1_EntryPrice'] || trade['Leg 1 Entry'] || 0).toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Leg_1_ExitPrice'] || trade['Leg 1 Exit'] || 0).toFixed(2)}</td>
+                          <td className={`px-3 py-2 text-right font-bold ${netPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                             {netPnl.toFixed(2)}
                           </td>
-                          <td className="px-3 py-2 text-gray-900">{trade['Leg_1_Type'] || '-'}</td>
-                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Leg_1_Strike'] || 0).toFixed(2)}</td>
-                          <td className="px-3 py-2 text-right text-gray-900">{(trade['Leg_1_EntryPrice'] || 0).toFixed(2)}</td>
                         </tr>
                       );
                     })}
                   </tbody>
                 </table>
+              </div>
+              
+              {/* Pagination */}
+              <div className="flex justify-center items-center gap-2 mt-4 pt-4 border-t">
+                <button 
+                  onClick={() => setCurrentPage(1)} 
+                  disabled={currentPage === 1}
+                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  ≪
+                </button>
+                <button 
+                  onClick={() => setCurrentPage(p => Math.max(1, p - 1))} 
+                  disabled={currentPage === 1}
+                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  ‹
+                </button>
+                {[...Array(Math.min(6, Math.ceil(trades.length / itemsPerPage)))].map((_, i) => {
+                  const totalPages = Math.ceil(trades.length / itemsPerPage);
+                  let pageNum = i + 1;
+                  if (totalPages > 6) {
+                    if (currentPage <= 3) pageNum = i + 1;
+                    else if (currentPage >= totalPages - 2) pageNum = totalPages - 5 + i;
+                    else pageNum = currentPage - 2 + i;
+                  }
+                  return (
+                    <button
+                      key={i}
+                      onClick={() => setCurrentPage(pageNum)}
+                      className={`px-3 py-1 text-sm rounded ${
+                        currentPage === pageNum 
+                          ? 'bg-blue-600 text-white' 
+                          : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-300'
+                      }`}
+                    >
+                      {pageNum}
+                    </button>
+                  );
+                })}
+                <button 
+                  onClick={() => setCurrentPage(p => Math.min(Math.ceil(trades.length / itemsPerPage), p + 1))} 
+                  disabled={currentPage === Math.ceil(trades.length / itemsPerPage)}
+                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  ›
+                </button>
+                <button 
+                  onClick={() => setCurrentPage(Math.ceil(trades.length / itemsPerPage))} 
+                  disabled={currentPage === Math.ceil(trades.length / itemsPerPage)}
+                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  ≫
+                </button>
               </div>
             </div>
           </div>

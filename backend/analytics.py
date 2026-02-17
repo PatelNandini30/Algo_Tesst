@@ -33,7 +33,9 @@ def create_summary_idx(df: pd.DataFrame) -> Dict[str, Any]:
         df['DD'] = np.where(df['Peak'] > df['Cumulative'], df['Cumulative'] - df['Peak'], 0)
     
     if '%DD' not in df.columns:
-        df['%DD'] = np.where(df['DD'] == 0, 0, round(100 * (df['DD'] / df['Peak']), 2))
+        # Use entry spot as reference capital (consistent with most backtest platforms)
+        initial_capital = df.iloc[0]['Entry Spot'] if 'Entry Spot' in df.columns else df.iloc[0]['entry_spot']
+        df['%DD'] = np.where(df['DD'] == 0, 0, round(100 * (df['DD'] / initial_capital), 2))
     
     # Calculate summary statistics
     total_pnl = df['Net P&L'].sum()
@@ -64,17 +66,44 @@ def create_summary_idx(df: pd.DataFrame) -> Dict[str, Any]:
     end_date = df['Exit Date'].max() if 'Exit Date' in df.columns else df['exit_date'].max()
     n_years = (end_date - start_date).days / 365.25
     
-    cagr_options = round(100 * (((total_pnl + initial_capital) / initial_capital) ** (1/n_years) - 1), 2) if n_years > 0 else 0
+    # Calculate CAGR with safety checks for negative values and edge cases
+    if n_years > 0 and initial_capital > 0:
+        final_capital = total_pnl + initial_capital
+        if final_capital > 0:
+            cagr_options = round(100 * ((final_capital / initial_capital) ** (1/n_years) - 1), 2)
+        else:
+            # If final capital is negative or zero, CAGR is -100%
+            cagr_options = -100.0
+    else:
+        cagr_options = 0.0
+    
+    # Ensure CAGR is a valid number
+    if not np.isfinite(cagr_options):
+        cagr_options = -100.0
     
     # Calculate max drawdown
     max_dd_pct = df['%DD'].min()
     max_dd_pts = round(df['DD'].min(), 2)
     
-    # Calculate CAR/MDD (Calmar ratio)
-    car_mdd = round(cagr_options / abs(max_dd_pct), 2) if max_dd_pct != 0 else 0
+    # Calculate CAR/MDD (Calmar ratio) with safety checks
+    if max_dd_pct != 0 and np.isfinite(max_dd_pct) and np.isfinite(cagr_options):
+        car_mdd = round(cagr_options / abs(max_dd_pct), 2)
+    else:
+        car_mdd = 0.0
     
-    # Calculate recovery factor
-    recovery_factor = round(total_pnl / abs(max_dd_pts), 2) if max_dd_pts != 0 else 0
+    # Ensure CAR/MDD is a valid number
+    if not np.isfinite(car_mdd):
+        car_mdd = 0.0
+    
+    # Calculate recovery factor with safety checks
+    if max_dd_pts != 0 and np.isfinite(max_dd_pts):
+        recovery_factor = round(total_pnl / abs(max_dd_pts), 2)
+    else:
+        recovery_factor = 0.0
+    
+    # Ensure recovery factor is a valid number
+    if not np.isfinite(recovery_factor):
+        recovery_factor = 0.0
     
     # Calculate ROI vs Spot
     total_spot_change = df['Spot P&L'].sum() if 'Spot P&L' in df.columns else 0

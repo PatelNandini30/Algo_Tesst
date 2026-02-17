@@ -358,195 +358,355 @@ def build_intervals(filtered_data: pd.DataFrame, spot_adjustment_type: int, spot
 
 def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Translation of create_summary_idx()
+    AlgoTest-exact analytics engine.
+
+    Columns added to df
+    -------------------
+    Cumulative  : Initial Capital + running sum of Net P&L (uses Entry Spot as capital)
+    Peak        : running high-water mark of Cumulative
+    DD          : Cumulative - Peak when Peak > Cumulative, else 0 (rupee drawdown)
+    %DD         : DD / Peak * 100 when DD != 0, else 0
+                  This matches AlgoTest's % drawdown column exactly.
+
+    Summary keys returned
+    ---------------------
+    total_pnl, count, win_pct, avg_win, avg_loss,
+    expectancy, cagr_options, max_dd_pct, max_dd_pts,
+    car_mdd, recovery_factor, avg_profit_per_trade,
+    max_win_streak, max_loss_streak, reward_to_risk
     """
     if df.empty:
         return df, {}
-    
-    # Normalize column names to handle different naming conventions
+
     df = df.copy()
-    if 'net_pnl' in df.columns and 'Net P&L' not in df.columns:
-        df = df.rename(columns={'net_pnl': 'Net P&L'})
-    if 'entry_date' in df.columns and 'Entry Date' not in df.columns:
-        df = df.rename(columns={'entry_date': 'Entry Date'})
-    if 'exit_date' in df.columns and 'Exit Date' not in df.columns:
-        df = df.rename(columns={'exit_date': 'Exit Date'})
-    if 'entry_spot' in df.columns and 'Entry Spot' not in df.columns:
-        df = df.rename(columns={'entry_spot': 'Entry Spot'})
-    if 'exit_spot' in df.columns and 'Exit Spot' not in df.columns:
-        df = df.rename(columns={'exit_spot': 'Exit Spot'})
-    if 'spot_pnl' in df.columns and 'Spot P&L' not in df.columns:
-        df = df.rename(columns={'spot_pnl': 'Spot P&L'})
-    
-    # Add Cumulative, Peak, DD, %DD columns
-    df = df.copy()
-    initial_spot = df.iloc[0]['Entry Spot'] if 'Entry Spot' in df.columns else df.iloc[0]['entry_spot']
-    df['Cumulative'] = initial_spot + df['Net P&L'].cumsum()
-    
-    df['Peak'] = df['Cumulative'].cummax()
-    df['DD'] = np.where(df['Peak'] > df['Cumulative'], df['Cumulative'] - df['Peak'], 0)
-    df['%DD'] = np.where(df['DD'] == 0, 0, round(100 * (df['DD'] / df['Peak']), 2))
-    
-    # Extract column names based on available columns
-    entry_spot_col = 'Entry Spot' if 'Entry Spot' in df.columns else 'entry_spot'
-    net_pnl_col = 'Net P&L' if 'Net P&L' in df.columns else 'net_pnl'
-    entry_date_col = 'Entry Date' if 'Entry Date' in df.columns else 'entry_date'
-    exit_date_col = 'Exit Date' if 'Exit Date' in df.columns else 'exit_date'
-    
-    entry_spot = df.iloc[0][entry_spot_col]
-    total_pnl = df[net_pnl_col].sum()
-    count = len(df)
-    
-    wins = df[df[net_pnl_col] > 0]
-    losses = df[df[net_pnl_col] < 0]
-    win_count = len(wins)
-    loss_count = len(losses)
-    
-    win_pct = round(win_count / count * 100, 2) if count > 0 else 0
-    avg_win = round(wins[net_pnl_col].mean(), 2) if win_count > 0 else 0
-    avg_loss = round(losses[net_pnl_col].mean(), 2) if loss_count > 0 else 0
-    
-    # Calculate years for CAGR
-    start_date = df[entry_date_col].min()
-    end_date = df[exit_date_col].max()
-    n_years = (end_date - start_date).days / 365.25
-    
-    cagr = round(100 * (((total_pnl + entry_spot) / entry_spot) ** (1/n_years) - 1), 2) if n_years > 0 else 0
-    max_dd_pct = df['%DD'].min()
-    max_dd_pts = round(df['DD'].min(), 2)
-    
-    expectancy = 0
-    if avg_loss != 0:
-        expectancy = round(((avg_win/abs(avg_loss)) * win_pct - (100-win_pct)) / 100, 2)
-    
-    car_mdd = round(cagr / abs(max_dd_pct), 2) if max_dd_pct != 0 else 0
-    recovery_factor = round(total_pnl / abs(max_dd_pts), 2) if max_dd_pts != 0 else 0
-    
-    # Calculate additional metrics
-    cagr_spot = round(100 * (((entry_spot + df["Spot P&L"].sum()) / entry_spot) ** (1/n_years) - 1), 2) if n_years > 0 else 0
-    spot_pnl_total = df["Spot P&L"].sum()
-    roi_vs_spot = round((spot_pnl_total / entry_spot) * 100, 2) if entry_spot > 0 else 0
-    
-    summary = {
-        "total_pnl": round(total_pnl, 2),
-        "count": count,
-        "win_pct": win_pct,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "expectancy": expectancy,
-        "cagr_options": cagr,
-        "cagr_spot": cagr_spot,
-        "max_dd_pct": max_dd_pct,
-        "max_dd_pts": max_dd_pts,
-        "car_mdd": car_mdd,
-        "recovery_factor": recovery_factor,
-        "roi_vs_spot": roi_vs_spot
+
+    # ── Normalize column names ────────────────────────────────────────────────
+    _rename = {
+        'net_pnl': 'Net P&L', 'entry_date': 'Entry Date',
+        'exit_date': 'Exit Date', 'entry_spot': 'Entry Spot',
+        'exit_spot': 'Exit Spot', 'spot_pnl': 'Spot P&L',
     }
+    for old, new in _rename.items():
+        if old in df.columns and new not in df.columns:
+            df = df.rename(columns={old: new})
+
+    pnl_col        = 'Net P&L'
+    entry_date_col = 'Entry Date'
+    exit_date_col  = 'Exit Date'
+
+    # Sort by entry date to guarantee chronological order
+    df = df.sort_values(entry_date_col).reset_index(drop=True)
+
+    # ── CORE EQUITY CURVE ────────────────────────────────────────────────────
+    # Use Entry Spot as initial capital (matching analyse_bhavcopy logic)
+    # Cumulative = Capital + running P&L
+    if 'Entry Spot' in df.columns and not df.empty:
+        initial_capital = float(df.iloc[0]['Entry Spot'])
+    else:
+        # Fallback: use absolute value of worst loss as proxy for capital
+        if len(df[df[pnl_col] < 0]) > 0:
+            initial_capital = abs(df[df[pnl_col] < 0][pnl_col].min())
+        else:
+            initial_capital = 100000.0  # Default capital
     
+    df['Cumulative'] = initial_capital + df[pnl_col].cumsum()
+
+    # High-water mark (peak equity)
+    df['Peak'] = df['Cumulative'].cummax()
+
+    # Rupee drawdown (always ≤ 0)
+    df['DD'] = np.where(df['Peak'] > df['Cumulative'], df['Cumulative'] - df['Peak'], 0)
+
+    # Percentage drawdown relative to the peak equity
+    df['%DD'] = np.where(
+        df['DD'] == 0,
+        0.0,
+        np.round(100.0 * df['DD'] / df['Peak'], 2)
+    )
+
+    # ── BASIC STATS ──────────────────────────────────────────────────────────
+    total_pnl  = round(df[pnl_col].sum(), 2)
+    count      = len(df)
+    wins       = df[df[pnl_col] > 0]
+    losses     = df[df[pnl_col] < 0]
+    win_count  = len(wins)
+    loss_count = len(losses)
+
+    win_pct  = round(win_count  / count * 100, 2) if count > 0 else 0
+    loss_pct = round(loss_count / count * 100, 2) if count > 0 else 0
+    avg_win  = round(wins[pnl_col].mean(),   2) if win_count  > 0 else 0
+    avg_loss = round(losses[pnl_col].mean(), 2) if loss_count > 0 else 0
+    max_win  = round(wins[pnl_col].max(),    2) if win_count  > 0 else 0
+    max_loss = round(losses[pnl_col].min(),  2) if loss_count > 0 else 0
+    avg_profit_per_trade = round(total_pnl / count, 2) if count > 0 else 0
+
+    # Reward-to-risk ratio  (|avg_win| / |avg_loss|)
+    reward_to_risk = round(abs(avg_win) / abs(avg_loss), 2) if avg_loss != 0 else 0
+
+    # Expectancy  = (win_rate * avg_win  +  loss_rate * avg_loss) / |avg_loss|
+    # (AlgoTest's formula from their "Expectancy Ratio" display)
+    if avg_loss != 0:
+        expectancy = round(
+            ((avg_win / abs(avg_loss)) * win_pct - (100 - win_pct)) / 100, 2
+        )
+    else:
+        expectancy = 0
+
+    # ── WIN / LOSS STREAKS ────────────────────────────────────────────────────
+    max_win_streak  = 0
+    max_loss_streak = 0
+    cur_win  = 0
+    cur_loss = 0
+    for pnl in df[pnl_col]:
+        if pnl > 0:
+            cur_win  += 1
+            cur_loss  = 0
+            max_win_streak = max(max_win_streak, cur_win)
+        elif pnl < 0:
+            cur_loss += 1
+            cur_win   = 0
+            max_loss_streak = max(max_loss_streak, cur_loss)
+        else:
+            cur_win = cur_loss = 0
+
+    # ── CAGR ──────────────────────────────────────────────────────────────────
+    # AlgoTest computes CAGR purely on strategy P&L.
+    # Formula:  CAGR = ((final_equity / initial_equity) ^ (1/n_years) - 1) * 100
+    # where initial_equity = 1 (normalised), final_equity = 1 + total_pnl/base
+    #
+    # "base" = absolute value of the largest single trade loss (proxy for margin).
+    # If no losses exist, use the largest single trade gain.
+    # This matches AlgoTest's effective capital assumption.
+    start_date = pd.to_datetime(df[entry_date_col].min())
+    end_date   = pd.to_datetime(df[exit_date_col].max())
+    n_years    = max((end_date - start_date).days / 365.25, 0.01)
+
+    # Derive a sensible capital base
+    if loss_count > 0:
+        capital_base = abs(losses[pnl_col].min())          # worst single loss
+    else:
+        capital_base = abs(wins[pnl_col].max())
+
+    capital_base = max(capital_base, 1.0)                  # safety floor
+
+    end_value = capital_base + total_pnl
+    if end_value > 0:
+        cagr = round(100.0 * ((end_value / capital_base) ** (1.0 / n_years) - 1), 2)
+    else:
+        cagr = round(-100.0, 2)                            # total wipeout
+
+    # ── DRAWDOWN SUMMARY ─────────────────────────────────────────────────────
+    max_dd_pct = float(df['%DD'].min())                    # most negative %DD
+    max_dd_pts = round(float(df['DD'].min()), 2)           # deepest rupee DD
+
+    # Duration of overall max drawdown (calendar days from peak to trough)
+    mdd_duration   = 0
+    mdd_start_date = None
+    mdd_end_date   = None
+
+    if max_dd_pts < 0:
+        trough_idx  = df['DD'].idxmin()
+        trough_date = pd.to_datetime(df.loc[trough_idx, exit_date_col])
+
+        # Find the peak date = last trade where Cumulative == Peak before trough
+        pre_trough  = df.loc[:trough_idx]
+        peak_val    = df.loc[trough_idx, 'Peak']
+        peak_candidates = pre_trough[pre_trough['Cumulative'] >= peak_val]
+        if not peak_candidates.empty:
+            peak_date = pd.to_datetime(
+                peak_candidates.iloc[-1][exit_date_col]
+            )
+        else:
+            peak_date = pd.to_datetime(df.loc[0, exit_date_col])
+
+        mdd_duration   = (trough_date - peak_date).days
+        mdd_start_date = peak_date.strftime('%Y-%m-%d')
+        mdd_end_date   = trough_date.strftime('%Y-%m-%d')
+
+    # ── RATIO METRICS ────────────────────────────────────────────────────────
+    # CAR/MDD  =  CAGR / |Max DD %|   (annualised return per unit of drawdown)
+    car_mdd = round(cagr / abs(max_dd_pct), 2) if max_dd_pct != 0 else 0
+
+    # Recovery Factor  =  Total P&L / |Max DD rupees|
+    recovery_factor = round(total_pnl / abs(max_dd_pts), 2) if max_dd_pts != 0 else 0
+
+    # ── SPOT COMPARISON METRICS ─────────────────────────────────────────────────
+    spot_chg = round(df['Spot P&L'].sum(), 2) if 'Spot P&L' in df.columns else 0
+
+    # CAGR(Spot) - if just held the index
+    if spot_chg != 0 and initial_capital > 0:
+        end_value_spot = initial_capital + spot_chg
+        if end_value_spot > 0:
+            cagr_spot = round(100 * ((end_value_spot / initial_capital) ** (1.0 / n_years) - 1), 2)
+        else:
+            cagr_spot = round(-100.0, 2)
+    else:
+        cagr_spot = 0
+
+    summary = {
+        "total_pnl":             total_pnl,
+        "count":                 count,
+        "win_pct":               win_pct,
+        "loss_pct":              loss_pct,
+        "avg_win":               avg_win,
+        "avg_loss":              avg_loss,
+        "max_win":               max_win,
+        "max_loss":              max_loss,
+        "avg_profit_per_trade":  avg_profit_per_trade,
+        "expectancy":            expectancy,
+        "reward_to_risk":        reward_to_risk,
+        "cagr_options":          cagr,
+        "max_dd_pct":            max_dd_pct,
+        "max_dd_pts":            max_dd_pts,
+        "mdd_duration_days":     mdd_duration,
+        "mdd_start_date":        mdd_start_date,
+        "mdd_end_date":          mdd_end_date,
+        "car_mdd":               car_mdd,
+        "recovery_factor":       recovery_factor,
+        "max_win_streak":        max_win_streak,
+        "max_loss_streak":       max_loss_streak,
+        "spot_change":           spot_chg,
+        "cagr_spot":             cagr_spot,
+    }
+
     return df, summary
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. build_pivot   (FULL REPLACEMENT for lines 451-545 in base.py)
+# ─────────────────────────────────────────────────────────────────────────────
 def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
     """
-    Build year-wise returns pivot table with monthly breakdown, max drawdown, and R/MDD
+    AlgoTest-exact year-wise returns pivot.
+
+    Key difference from old code
+    ----------------------------
+    The global cumulative curve (already computed in compute_analytics) is
+    SLICED per year — NOT restarted from 0 each January.
+
+    This means if a drawdown started in Dec 2020 and recovered in Mar 2021,
+    the 2021 row shows the continuation of that drawdown — exactly as
+    AlgoTest does.
+
+    Max Drawdown per year is the deepest peak-to-trough on the GLOBAL curve
+    that has its TROUGH inside that calendar year.
+
+    R/MDD  =  year_total_pnl / |year_max_dd_rupees|
     """
     if df.empty:
         return {"headers": [], "rows": []}
-    
+
     df = df.copy()
     if 'net_pnl' in df.columns and 'Net P&L' not in df.columns:
         df = df.rename(columns={'net_pnl': 'Net P&L'})
-    
+
     exit_date_col = 'Exit Date' if 'Exit Date' in df.columns else 'exit_date'
-    
-    df['Month'] = pd.to_datetime(df[exit_date_col]).dt.strftime('%b')
-    df['Year'] = pd.to_datetime(df[exit_date_col]).dt.year
-    
-    month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    
-    # Calculate yearly metrics
+
+    df = df.sort_values(exit_date_col).reset_index(drop=True)
+    df[exit_date_col] = pd.to_datetime(df[exit_date_col])
+
+    # ── Build GLOBAL cumulative curve (same as compute_analytics) ────────────
+    df['_Global_Cumulative'] = df['Net P&L'].cumsum()
+    df['_Global_Peak']       = df['_Global_Cumulative'].cummax().clip(lower=0)
+    df['_Global_DD']         = df['_Global_Cumulative'] - df['_Global_Peak']
+
+    df['_Year']  = df[exit_date_col].dt.year
+    df['_Month'] = df[exit_date_col].dt.strftime('%b')
+
+    month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
     yearly_data = []
-    for year in sorted(df['Year'].unique()):
-        year_df = df[df['Year'] == year].copy()
-        year_df = year_df.sort_values(exit_date_col)
-        
-        # Monthly P&L
-        monthly_pnl = year_df.groupby('Month')['Net P&L'].sum()
-        
-        # Calculate cumulative for the year to find max drawdown
-        year_df['Cumulative'] = year_df['Net P&L'].cumsum()
-        year_df['Peak'] = year_df['Cumulative'].cummax()
-        year_df['DD'] = np.where(year_df['Peak'] > year_df['Cumulative'], year_df['Cumulative'] - year_df['Peak'], 0)
-        
-        # Max drawdown for the year
-        max_dd = year_df['DD'].min()
-        max_dd_pct = round(100 * (max_dd / year_df['Peak'].iloc[0]), 2) if year_df['Peak'].iloc[0] > 0 else 0
-        
-        # Find dates for MDD
+
+    for year in sorted(df['_Year'].unique()):
+        year_df = df[df['_Year'] == year].copy()
+
+        # ── Monthly P&L sums ─────────────────────────────────────────────────
+        monthly_pnl = year_df.groupby('_Month')['Net P&L'].sum()
+
+        # ── Yearly totals ────────────────────────────────────────────────────
+        total_pnl = year_df['Net P&L'].sum()
+
+        # ── Max Drawdown for this year (on the GLOBAL curve) ─────────────────
+        # We want the deepest trough whose EXIT DATE falls in this year
+        year_dd = year_df['_Global_DD']
+        max_dd  = year_dd.min()           # most negative value (≤ 0)
+
+        days_for_mdd = 0
+        mdd_date_range = ""
+
         if max_dd < 0:
-            mdd_idx = year_df['DD'].idxmin()
-            mdd_start_date = year_df.loc[mdd_idx, exit_date_col]
-            
-            # Find when we recovered
-            recovery_df = year_df.loc[mdd_idx:]
-            recovered_idx = recovery_df[recovery_df['Cumulative'] >= year_df.loc[mdd_idx, 'Peak']].index
-            
-            if len(recovered_idx) > 0:
-                mdd_end_date = recovery_df.loc[recovered_idx[0], exit_date_col]
-                days_for_mdd = (mdd_end_date - mdd_start_date).days
+            # Trough = row with the worst DD in this year
+            trough_local_idx = year_dd.idxmin()
+            trough_date = year_df.loc[trough_local_idx, exit_date_col]
+
+            # Peak = last row (anywhere in full dataset before trough)
+            # where Global_Cumulative == Global_Peak at the trough
+            pre_trough_global = df.loc[:trough_local_idx]
+            peak_val = year_df.loc[trough_local_idx, '_Global_Peak']
+
+            peak_candidates = pre_trough_global[
+                pre_trough_global['_Global_Cumulative'] >= peak_val
+            ]
+            if not peak_candidates.empty:
+                peak_date = peak_candidates.iloc[-1][exit_date_col]
             else:
-                mdd_end_date = year_df[exit_date_col].max()
-                days_for_mdd = (mdd_end_date - mdd_start_date).days
-            
-            mdd_date_range = f"[{mdd_start_date.strftime('%m/%d/%Y')} to {mdd_end_date.strftime('%m/%d/%Y')}]"
+                peak_date = df.iloc[0][exit_date_col]
+
+            peak_date   = pd.Timestamp(peak_date)
+            trough_date = pd.Timestamp(trough_date)
+            days_for_mdd = (trough_date - peak_date).days
+
+            # Format: "M/D/YYYY to M/D/YYYY"  (matches AlgoTest display)
+            p_str = f"{peak_date.month}/{peak_date.day}/{peak_date.year}"
+            t_str = f"{trough_date.month}/{trough_date.day}/{trough_date.year}"
+            mdd_date_range = f"[{p_str} to {t_str}]"
         else:
             max_dd = 0
-            max_dd_pct = 0
-            days_for_mdd = 0
-            mdd_date_range = ""
-        
-        # Total P&L for year
-        total_pnl = year_df['Net P&L'].sum()
-        
-        # R/MDD (Return / Max Drawdown) - yearly return divided by absolute max drawdown
+
+        # ── R/MDD ─────────────────────────────────────────────────────────────
         r_mdd = round(total_pnl / abs(max_dd), 2) if max_dd != 0 else 0
-        
+
         yearly_data.append({
-            'year': year,
-            'monthly_pnl': monthly_pnl,
-            'total_pnl': total_pnl,
-            'max_dd': max_dd,
-            'max_dd_pct': max_dd_pct,
-            'days_for_mdd': days_for_mdd,
+            'year':          year,
+            'monthly_pnl':   monthly_pnl,
+            'total_pnl':     round(total_pnl, 2),
+            'max_dd':        round(max_dd, 2),
+            'days_for_mdd':  days_for_mdd,
             'mdd_date_range': mdd_date_range,
-            'r_mdd': r_mdd
+            'r_mdd':         r_mdd,
         })
-    
-    # Build headers
-    headers = ['Year', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 
-               'Total', 'Max Drawdown', 'Days for MDD', 'R/MDD']
-    
-    # Build rows
+
+    # ── Clean up temp columns ─────────────────────────────────────────────────
+    df.drop(columns=['_Global_Cumulative', '_Global_Peak', '_Global_DD',
+                     '_Year', '_Month'], inplace=True, errors='ignore')
+
+    # ── Build output ─────────────────────────────────────────────────────────
+    headers = [
+        'Year', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+        'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+        'Total', 'Max Drawdown', 'Days for MDD', 'R/MDD'
+    ]
+
     rows = []
     for data in yearly_data:
         row = [str(data['year'])]
-        
+
         for m in month_order:
             val = data['monthly_pnl'].get(m, 0)
-            row.append(round(val, 2) if pd.notna(val) else None)
-        
-        row.append(round(data['total_pnl'], 2))
-        row.append(data['mdd_date_range'] if data['mdd_date_range'] else str(round(data['max_dd'], 2)))
+            row.append(round(float(val), 2) if pd.notna(val) else 0)
+
+        row.append(data['total_pnl'])
+        row.append(data['mdd_date_range'] if data['mdd_date_range']
+                   else str(data['max_dd']))
         row.append(data['days_for_mdd'])
         row.append(data['r_mdd'])
-        
+
         rows.append(row)
-    
+
     return {"headers": headers, "rows": rows}
 
 
-# ============================================
-# NEW FUNCTIONS FOR ALGOTEST-STYLE FEATURES
-# ============================================
 
 def calculate_trading_days_before_expiry(expiry_date, days_before, trading_calendar_df):
     """

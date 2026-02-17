@@ -5,15 +5,6 @@ import EntryExitSettings from './EntryExitSettings';
 import DynamicLegBuilder from './DynamicLegBuilder';
 import ResultsPanel from './ResultsPanel';
 
-// Lot sizes for different indices
-const LOT_SIZES = {
-  NIFTY: 75,
-  BANKNIFTY: 15,
-  FINNIFTY: 40,
-  MIDCPNIFTY: 75,
-  SENSEX: 10
-};
-
 const AlgoTestStyleBuilder = () => {
   // Instrument Settings
   const [instrumentSettings, setInstrumentSettings] = useState({
@@ -87,11 +78,6 @@ const AlgoTestStyleBuilder = () => {
 
   // Build API Payload
   const buildPayload = () => {
-    // Get lot size for the selected index
-    const lotSize = LOT_SIZES[instrumentSettings.index?.toUpperCase()] || 1;
-    
-    console.log(`Lot size for ${instrumentSettings.index}: ${lotSize}`);
-    
     return {
       instrument_settings: instrumentSettings,
       entry_settings: entrySettings,
@@ -101,7 +87,7 @@ const AlgoTestStyleBuilder = () => {
         instrument: leg.instrument,
         option_type: leg.instrument === 'OPTION' ? leg.option_type : null,
         position: leg.position,
-        total_lot: (leg.total_lot || 1) * lotSize,
+        lot: leg.total_lot || 1,  // just send the count; engine handles units
         expiry: leg.expiry,
         strike_criteria: leg.instrument === 'OPTION' ? leg.strike_criteria : null
       })),
