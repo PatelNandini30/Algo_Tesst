@@ -21,7 +21,7 @@ try:
     from base import (
         get_strike_data,
         load_expiry,
-        load_base2,
+        # load_base2,  # Disabled - base2 filter not used
         load_bhavcopy,
         build_intervals,
         compute_analytics,
@@ -95,13 +95,13 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     spot_df = get_strike_data(index_name, params["from_date"], params["to_date"])
     weekly_exp = load_expiry(index_name, "weekly")
     monthly_exp = load_expiry(index_name, "monthly")
-    base2 = load_base2()
+    # base2 = load_base2()  # Disabled - base2 filter not used
 
-    # Base2 Filter (same as existing engines)
-    mask = pd.Series(False, index=spot_df.index)
-    for _, row in base2.iterrows():
-        mask |= (spot_df['Date'] >= row['Start']) & (spot_df['Date'] <= row['End'])
-    spot_df = spot_df[mask].reset_index(drop=True)
+    # Base2 Filter - DISABLED (not using base2 filter)
+    # mask = pd.Series(False, index=spot_df.index)
+    # for _, row in base2.iterrows():
+    #     mask |= (spot_df['Date'] >= row['Start']) & (spot_df['Date'] <= row['End'])
+    # spot_df = spot_df[mask].reset_index(drop=True)
 
     trades = []
 

@@ -9,7 +9,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from base import (
-    get_strike_data, load_expiry, load_base2, load_bhavcopy, 
+    get_strike_data, load_expiry, # load_base2,  # Disabled - base2 filter not used load_bhavcopy, 
     get_option_price, build_intervals, compute_analytics, build_pivot, round_half_up, round_to_50
 )
 
@@ -21,17 +21,17 @@ def run_v6(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[s
     # Load required data
     spot_df = get_strike_data(params.get("index", "NIFTY"), params["from_date"], params["to_date"])
     weekly_exp = load_expiry(params.get("index", "NIFTY"), "weekly")
-    base2 = load_base2()
+    # base2 = load_base2()  # Disabled - base2 filter not used
     
-    # Filter spot to OUTSIDE base2 ranges (opposite of other strategies)
-    mask = pd.Series(True, index=spot_df.index)  # Start with all True
-    for _, row in base2.iterrows():
-        mask &= ~((spot_df['Date'] >= row['Start']) & (spot_df['Date'] <= row['End']))  # Invert the condition
-    spot_df = spot_df[mask]
+    # Filter spot to OUTSIDE base2 ranges - DISABLED
+    # mask = pd.Series(True, index=spot_df.index)  # Start with all True
+    # for _, row in base2.iterrows():
+    #     mask &= ~((spot_df['Date'] >= row['Start']) & (spot_df['Date'] <= row['End']))  # Invert the condition
+    # spot_df = spot_df[mask]
     
-    if spot_df.empty:
-        print("No data points outside base2 ranges. Cannot run inverse strategy.")
-        return pd.DataFrame(), {}, {}
+    # if spot_df.empty:
+    #     print("No data points outside base2 ranges. Cannot run inverse strategy.")
+    #     return pd.DataFrame(), {}, {}
     
     trades = []
     

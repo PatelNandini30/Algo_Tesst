@@ -15,7 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from base import (
     get_strike_data,
     load_expiry,
-    load_base2,
+    # load_base2,  # Disabled - base2 filter not used
     load_bhavcopy,
     build_intervals,
     compute_analytics,

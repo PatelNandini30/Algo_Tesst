@@ -62,7 +62,7 @@ def summary_alt():
                                                 df['Exit Date'] == df['Call Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] < df['Call Strike'], 
-                                                        0,                              
+                                                        df['Call ExitPrice'].fillna(0),                              
                                                         df['Exit Spot'] - df['Call Strike']  
                                                     ),
                                                 df['Call ExitPrice']
@@ -75,7 +75,7 @@ def summary_alt():
                                                 df['Exit Date'] == df['Put Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] > df['Put Strike'], 
-                                                        0,                              
+                                                        df['Put ExitPrice'].fillna(0),                              
                                                         df['Put Strike'] - df['Exit Spot']  
                                                     ),
                                                 df['Put ExitPrice']

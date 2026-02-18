@@ -50,7 +50,7 @@ def summary_V5_Call_protection():
                                                 df['Exit Date'] == df['Call Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] < df['Call Strike'], 
-                                                        0,                              
+                                                        df['Call ExitPrice'].fillna(0),                              
                                                         df['Exit Spot'] - df['Call Strike'] 
                                                     ),
                                                 df['Call ExitPrice']
@@ -63,7 +63,7 @@ def summary_V5_Call_protection():
                                                 df['Exit Date'] == df['Call Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] < df['Protective Call Strike'], 
-                                                        0,                              
+                                                        df['Protective Call ExitPrice'].fillna(0),                              
                                                         df['Exit Spot'] - df['Protective Call Strike'] 
                                                     ),
                                                 df['Protective Call ExitPrice']

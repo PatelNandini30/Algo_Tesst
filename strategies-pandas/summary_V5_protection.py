@@ -52,7 +52,7 @@ def summary_V5_protection():
                                                 df['Exit Date'] == df['Put Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] > df['Put Strike'], 
-                                                        0,                              
+                                                        df['Put ExitPrice'].fillna(0),                              
                                                         df['Put Strike']- df['Exit Spot']   
                                                     ),
                                                 df['Put ExitPrice']
@@ -65,7 +65,7 @@ def summary_V5_protection():
                                                 df['Exit Date'] == df['Put Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] > df['Protective Put Strike'], 
-                                                        0,                              
+                                                        df['Protective Put ExitPrice'].fillna(0),                              
                                                         df['Protective Put Strike']- df['Exit Spot']   
                                                     ),
                                                 df['Protective Put ExitPrice']

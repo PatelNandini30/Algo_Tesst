@@ -50,7 +50,7 @@ def summary_V5_Call():
                                                 df['Exit Date'] == df['Call Expiry'],
                                                     np.where(
                                                         df['Exit Spot'] < df['Call Strike'], 
-                                                        0,                              
+                                                        df['Call ExitPrice'].fillna(0),                              
                                                         df['Exit Spot'] - df['Call Strike'] 
                                                     ),
                                                 df['Call ExitPrice']

@@ -63,6 +63,8 @@ from base import (
     calculate_trading_days_before_expiry,
     get_trading_calendar,
     calculate_strike_from_selection,
+    calculate_strike_advanced,
+    get_expiry_for_selection,
     get_strike_interval,
     get_option_premium_from_db,
     get_future_price_from_db,
@@ -148,7 +150,7 @@ def check_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_
         
         # Check target (positive P&L)
         if target_pct is not None and total_pnl_pct >= target_pct:
-            print(f"      🎯 TARGET HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
+            print(f"      TARGET HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
             return check_date, 'TARGET'
     
     return None, None
@@ -269,7 +271,7 @@ def run_algotest_backtest(params):
             expiry_df = pd.DataFrame(valid_expiries, columns=expiry_df.columns)
             print(f"  Filtered to {len(expiry_df)} expiries (from {len(expiry_df) + len(expiry_df.index) - len(valid_expiries)} total)\n")
         else:
-            print(f"  ⚠️  No expiries match spot adjustment criteria - no trades will be executed\n")
+            print(f"  WARNING: No expiries match spot adjustment criteria - no trades will be executed\n")
             return pd.DataFrame(), {}, {}
     
     # ========== STEP 4: INITIALIZE RESULTS ==========
@@ -306,7 +308,7 @@ def run_algotest_backtest(params):
             
             # Validate entry before exit
             if entry_date > exit_date:
-                _log(f"  ⚠️  Entry after exit - skipping")
+                _log(f"  WARNING: Entry after exit - skipping")
                 continue
             
             # ========== STEP 7: GET ENTRY SPOT PRICE ==========
@@ -314,7 +316,7 @@ def run_algotest_backtest(params):
             entry_spot = get_spot_price_from_db(entry_date, index)
             
             if entry_spot is None:
-                _log(f"  ⚠️  No spot data for {entry_date} - skipping")
+                _log(f"  WARNING: No spot data for {entry_date} - skipping")
                 continue
             
             _log(f"  Entry Spot: {entry_spot}")
@@ -345,7 +347,7 @@ def run_algotest_backtest(params):
                     )
                     
                     if entry_price is None:
-                        _log(f"      ⚠️  No future price - skipping leg")
+                        _log(f"      WARNING: No future price - skipping leg")
                         continue
                     
                     _log(f"      Entry Price: {entry_price}")
@@ -358,7 +360,7 @@ def run_algotest_backtest(params):
                     )
                     
                     if exit_price is None:
-                        _log(f"      ⚠️  No exit price - using entry")
+                        _log(f"      WARNING: No exit price - using entry")
                         exit_price = entry_price
                     
                     _log(f"      Exit Price: {exit_price}")
@@ -411,19 +413,35 @@ def run_algotest_backtest(params):
                     )
                     
                     if entry_premium is None:
-                        _log(f"      ⚠️  No entry premium - skipping leg")
+                        _log(f"      WARNING: No entry premium - skipping leg")
                         continue
                     
                     _log(f"      Entry Premium: {entry_premium}")
                     
-                    # Get exit premium
-                    if exit_date >= expiry_date:
-                        # ========== EXPIRY DAY - USE INTRINSIC VALUE ==========
-                        _log(f"      Exit on/after expiry - using intrinsic value")
+                    # ========== GET EXIT PREMIUM ==========
+                    # CRITICAL FIX: Always try to fetch MARKET premium first,
+                    # regardless of whether exit is at expiry or before.
+                    # AlgoTest uses actual closing prices even on expiry day.
+                    # Only fall back to intrinsic value if market data is missing.
+                    
+                    exit_premium = get_option_premium_from_db(
+                        date=exit_date.strftime('%Y-%m-%d'),
+                        index=index,
+                        strike=strike,
+                        option_type=option_type,
+                        expiry=expiry_date.strftime('%Y-%m-%d')
+                    )
+                    
+                    if exit_premium is not None:
+                        # Market data found — use it
+                        _log(f"      SUCCESS: Exit Premium (market data): {exit_premium}")
+                    else:
+                        # Market data missing — fallback to intrinsic value
+                        _log(f"      WARNING: No market data found for exit - calculating intrinsic value")
                         
-                        exit_spot = get_spot_price_from_db(expiry_date, index)
-                        
+                        exit_spot = get_spot_price_from_db(exit_date, index)
                         if exit_spot is None:
+                            _log(f"      WARNING: No exit spot data - using entry spot")
                             exit_spot = entry_spot
                         
                         exit_premium = calculate_intrinsic_value(
@@ -432,24 +450,20 @@ def run_algotest_backtest(params):
                             option_type=option_type
                         )
                         
-                        _log(f"      Exit Spot: {exit_spot}")
-                        _log(f"      Intrinsic Value: {exit_premium}")
-                    
-                    else:
-                        # ========== PRE-EXPIRY EXIT - USE MARKET PRICE ==========
-                        exit_premium = get_option_premium_from_db(
-                            date=exit_date.strftime('%Y-%m-%d'),
-                            index=index,
-                            strike=strike,
-                            option_type=option_type,
-                            expiry=expiry_date.strftime('%Y-%m-%d')
-                        )
+                        _log(f"      Exit Spot Price: {exit_spot}")
+                        _log(f"      Strike Price: {strike}")
+                        _log(f"      Option Type: {option_type}")
                         
-                        if exit_premium is None:
-                            _log(f"      ⚠️  No exit premium - using 0")
-                            exit_premium = 0
+                        if option_type.upper() == 'CE':
+                            intrinsic_calc = f"max(0, {exit_spot} - {strike}) = max(0, {exit_spot - strike})"
+                        else:  # PE
+                            intrinsic_calc = f"max(0, {strike} - {exit_spot}) = max(0, {strike - exit_spot})"
                         
-                        _log(f"      Exit Premium: {exit_premium}")
+                        _log(f"      🧮 Intrinsic Value Calculation: {intrinsic_calc}")
+                        _log(f"      💰 Exit Premium (intrinsic): {exit_premium}")
+                        
+                        if exit_premium == 0:
+                            _log(f"      INFO: Option expired WORTHLESS (OTM)")
                     
                     # Calculate P&L with correct lot size based on index and entry date
                     lot_size = get_lot_size(index, entry_date)
@@ -493,7 +507,7 @@ def run_algotest_backtest(params):
                 if sl_hit_date is not None:
                     original_exit_date = exit_date
                     exit_date = sl_hit_date
-                    print(f"  ⚠️  Exiting on {exit_date.strftime('%Y-%m-%d')} due to {sl_reason}")
+                    print(f"  WARNING: Exiting on {exit_date.strftime('%Y-%m-%d')} due to {sl_reason}")
 
                     # FIX: get lot_size here so SL P&L matches normal path
                     lot_size_sl = get_lot_size(index, entry_date)
@@ -508,8 +522,18 @@ def run_algotest_backtest(params):
                             entry_prem = leg.get('entry_premium')
                             
                             if opt_type and strike and position and entry_prem:
-                                # Calculate exit premium based on new date
-                                if exit_date >= expiry_date:
+                                # Calculate exit premium based on new SL exit date
+                                # Apply same fix: try market data first, fallback to intrinsic
+                                new_exit_premium = get_option_premium_from_db(
+                                    date=exit_date.strftime('%Y-%m-%d'),
+                                    index=index,
+                                    strike=strike,
+                                    option_type=opt_type,
+                                    expiry=expiry_date.strftime('%Y-%m-%d')
+                                )
+                                
+                                if new_exit_premium is None:
+                                    # Market data missing — use intrinsic value as fallback
                                     exit_spot = get_spot_price_from_db(exit_date, index)
                                     if exit_spot is None:
                                         exit_spot = entry_spot
@@ -518,27 +542,16 @@ def run_algotest_backtest(params):
                                         strike=strike,
                                         option_type=opt_type
                                     )
-                                else:
-                                    new_exit_premium = get_option_premium_from_db(
-                                        date=exit_date.strftime('%Y-%m-%d'),
-                                        index=index,
-                                        strike=strike,
-                                        option_type=opt_type,
-                                        expiry=expiry_date.strftime('%Y-%m-%d')
-                                    )
-                                
-                                if new_exit_premium is None:
-                                    new_exit_premium = 0
                                 
                                 # Recalculate P&L
                                 if position == 'BUY':
-                                    leg_pnl = (new_exit_premium - entry_prem) * lots * lot_size_sl  # FIX
+                                    leg_pnl = (new_exit_premium - entry_prem) * lots * lot_size_sl
                                 else:
-                                    leg_pnl = (entry_prem - new_exit_premium) * lots * lot_size_sl  # FIX
+                                    leg_pnl = (entry_prem - new_exit_premium) * lots * lot_size_sl
                                 
                                 leg['exit_premium'] = new_exit_premium
                                 leg['pnl'] = leg_pnl
-                                print(f"      Recalculated P&L for leg {leg['leg_number']}: {leg_pnl:,.2f}")
+                                print(f"      Recalculated P&L for leg {leg['leg_number']}: {leg_pnl:,.2f} (lot_size={lot_size_sl})")
             
             # ========== STEP 9: CALCULATE TOTAL P&L ==========
             total_pnl = sum(leg['pnl'] for leg in trade_legs)
@@ -566,10 +579,10 @@ def run_algotest_backtest(params):
             }
             
             all_trades.append(trade_record)
-            print(f"  ✅ Trade recorded\n")
+            print(f"  SUCCESS: Trade recorded\n")
         
         except Exception as e:
-            print(f"  ❌ Error: {str(e)}\n")
+            print(f"  ERROR: {str(e)}\n")
             continue
     
     # ========== STEP 11: CONVERT TO DATAFRAME ==========

@@ -109,34 +109,35 @@ def load_expiry(index: str, expiry_type: str) -> pd.DataFrame:
     
     return df.sort_values('Current Expiry').reset_index(drop=True)
 
-def load_base2() -> pd.DataFrame:
-    """
-    Read ./Filter/base2.csv, parse Start and End
-    Return sorted DataFrame
-    """
-    file_path = os.path.join(FILTER_DIR, "base2.csv")
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Base2 file not found: {file_path}")
-    
-    df = pd.read_csv(file_path)
-    
-    # Handle multiple date formats for base2 dates
-    date_columns = ['Start', 'End']
-    for col in date_columns:
-        if col in df.columns:
-            format_list = ["%Y-%m-%d", "%d-%m-%Y", "%y-%m-%d", "%d-%m-%y", "%d-%b-%Y", "%d-%b-%y"]
-            for format_type in format_list:
-                try:
-                    df[col] = pd.to_datetime(df[col], format=format_type, errors="raise")
-                    break
-                except:
-                    continue
-            
-            # If still not datetime, try dayfirst=True
-            if not pd.api.types.is_datetime64_any_dtype(df[col]):
-                df[col] = pd.to_datetime(df[col], dayfirst=True)
-    
-    return df.sort_values('Start').reset_index(drop=True)
+# NOTE: load_base2() is disabled - base2 filter not used
+# def load_base2() -> pd.DataFrame:
+#     """
+#     Read ./Filter/base2.csv, parse Start and End
+#     Return sorted DataFrame
+#     """
+#     file_path = os.path.join(FILTER_DIR, "base2.csv")
+#     if not os.path.exists(file_path):
+#         raise FileNotFoundError(f"Base2 file not found: {file_path}")
+#     
+#     df = pd.read_csv(file_path)
+#     
+#     # Handle multiple date formats for base2 dates
+#     date_columns = ['Start', 'End']
+#     for col in date_columns:
+#         if col in df.columns:
+#             format_list = ["%Y-%m-%d", "%d-%m-%Y", "%y-%m-%d", "%d-%m-%y", "%d-%b-%Y", "%d-%b-%y"]
+#             for format_type in format_list:
+#                 try:
+#                     df[col] = pd.to_datetime(df[col], format=format_type, errors="raise")
+#                     break
+#                 except:
+#                     continue
+#             
+#             # If still not datetime, try dayfirst=True
+#             if not pd.api.types.is_datetime64_any_dtype(df[col]):
+#                 df[col] = pd.to_datetime(df[col], dayfirst=True)
+#     
+#     return df.sort_values('Start').reset_index(drop=True)
 
 @lru_cache(maxsize=500)
 def load_bhavcopy(date_str: str) -> pd.DataFrame:
@@ -867,7 +868,7 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
     """
     Get option premium from CSV only (no database fallback)
     """
-    # DEBUG print commented out for performance
+    # DEBUG: Disabled for performance
     # print(f"      DEBUG: get_option_premium_from_db called with date={date}, index={index}, strike={strike}, option_type={option_type}, expiry={expiry}")
     try:
         # Get from bhavcopy CSV
@@ -894,7 +895,7 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
             else:
                 opt_match = opt_type_upper
             
-            # Debug: print what we're looking for
+            # Debug: Disabled for performance
             # print(f"      DEBUG: Looking for Symbol={index}, OptionType={opt_match}, Strike={strike}, Expiry={expiry_ts}")
             
             # Filter by Symbol first to see what symbols exist
@@ -902,6 +903,8 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
             if symbol_matches.empty:
                 # print(f"      DEBUG: No matches for Symbol={index}. Available symbols: {bhav_df['Symbol'].unique()[:10]}")
                 return None
+            
+            # print(f"      DEBUG: Found {len(symbol_matches)} rows for Symbol={index}")
             
             mask = (
                 (bhav_df['Symbol'] == index) &
@@ -912,15 +915,20 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
             
             matches = bhav_df[mask]
             if not matches.empty:
-                return float(matches.iloc[0]['Close'])
+                close_price = float(matches.iloc[0]['Close'])
+                # print(f"      DEBUG: SUCCESS - Found match! Close price: {close_price}")
+                return close_price
             else:
-                # More debug info
-                # print(f"      DEBUG: No match. Expiry dates in data: {bhav_df[bhav_df['Symbol']==index]['ExpiryDate'].unique()[:5]}")
+                # More debug info - Disabled for performance
+                # print(f"      DEBUG: FAILED - No match found.")
+                # print(f"      DEBUG: Expiry dates in data for {index}: {symbol_matches['ExpiryDate'].unique()[:5]}")
+                # print(f"      DEBUG: Strike prices in data for {index}: {sorted(symbol_matches['StrikePrice'].unique())[:10]}")
+                # print(f"      DEBUG: Option types in data: {symbol_matches['OptionType'].unique()}")
                 pass
         
         return None
     except Exception as e:
-        # print(f"Warning: Could not get option premium: {e}")
+        print(f"Warning: Could not get option premium: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -1144,3 +1152,357 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     result = cursor.fetchone()
     conn.close()
     return float(result[0]) if result else None
+
+
+# ============================================================================
+# ADVANCED STRIKE SELECTION SYSTEM
+# ============================================================================
+
+def get_expiry_for_selection(entry_date, index, expiry_selection):
+    """
+    Get the appropriate expiry date based on selection type
+    
+    Args:
+        entry_date: datetime - Entry date for the trade
+        index: str - 'NIFTY' or 'BANKNIFTY'
+        expiry_selection: str - 'WEEKLY', 'NEXT_WEEKLY', 'MONTHLY', 'NEXT_MONTHLY'
+    
+    Returns:
+        datetime - Expiry date
+        
+    Trading Logic:
+        WEEKLY: Current week's expiry (Thursday)
+        NEXT_WEEKLY: Next week's expiry (next Thursday)
+        MONTHLY: Current month's expiry (last Thursday)
+        NEXT_MONTHLY: Next month's expiry (last Thursday of next month)
+    """
+    entry_date = pd.to_datetime(entry_date)
+    expiry_selection = expiry_selection.upper().strip()
+    
+    if expiry_selection in ['WEEKLY', 'NEXT_WEEKLY']:
+        # Load weekly expiry data
+        expiry_df = load_expiry(index, 'weekly')
+        
+        # Find current expiry (where entry_date is between Previous and Current Expiry)
+        mask = (expiry_df['Previous Expiry'] <= entry_date) & (entry_date <= expiry_df['Current Expiry'])
+        current_row = expiry_df[mask]
+        
+        if current_row.empty:
+            raise ValueError(f"No weekly expiry found for {index} on {entry_date}")
+        
+        if expiry_selection == 'WEEKLY':
+            return current_row.iloc[0]['Current Expiry']
+        else:  # NEXT_WEEKLY
+            return current_row.iloc[0]['Next Expiry']
+    
+    elif expiry_selection in ['MONTHLY', 'NEXT_MONTHLY']:
+        # Load monthly expiry data
+        expiry_df = load_expiry(index, 'monthly')
+        
+        # Find current monthly expiry
+        mask = (expiry_df['Previous Expiry'] <= entry_date) & (entry_date <= expiry_df['Current Expiry'])
+        current_row = expiry_df[mask]
+        
+        if current_row.empty:
+            raise ValueError(f"No monthly expiry found for {index} on {entry_date}")
+        
+        if expiry_selection == 'MONTHLY':
+            return current_row.iloc[0]['Current Expiry']
+        else:  # NEXT_MONTHLY
+            return current_row.iloc[0]['Next Expiry']
+    
+    else:
+        raise ValueError(f"Invalid expiry selection: {expiry_selection}. Use WEEKLY, NEXT_WEEKLY, MONTHLY, or NEXT_MONTHLY")
+
+
+def get_all_strikes_with_premiums(date, index, expiry, option_type, spot_price, strike_interval):
+    """
+    Get all available strikes with their premiums for a given date and expiry
+    
+    Args:
+        date: str or datetime - Trading date
+        index: str - 'NIFTY' or 'BANKNIFTY'
+        expiry: str or datetime - Expiry date
+        option_type: str - 'CE' or 'PE'
+        spot_price: float - Current spot price
+        strike_interval: int - Strike interval (50 or 100)
+    
+    Returns:
+        list of dict: [{'strike': 24500, 'premium': 150.5}, ...]
+        Sorted by strike price
+        
+    Trading Logic:
+        - Loads bhavcopy data for the date
+        - Filters by index, expiry, and option type
+        - Returns all available strikes with premiums
+        - Used for premium-based strike selection
+    """
+    date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+    expiry_str = expiry.strftime('%Y-%m-%d') if hasattr(expiry, 'strftime') else str(expiry)
+    
+    # Load bhavcopy data
+    bhav_df = load_bhavcopy(date_str)
+    
+    if bhav_df is None or bhav_df.empty:
+        return []
+    
+    # Normalize option type
+    opt_type = option_type.upper()
+    if opt_type in ['CALL', 'C']:
+        opt_type = 'CE'
+    elif opt_type in ['PUT', 'P']:
+        opt_type = 'PE'
+    
+    # Filter for the specific index, expiry, and option type
+    expiry_ts = pd.to_datetime(expiry_str)
+    mask = (
+        (bhav_df['Symbol'] == index) &
+        (bhav_df['OptionType'] == opt_type) &
+        (bhav_df['ExpiryDate'] == expiry_ts)
+    )
+    
+    filtered_df = bhav_df[mask].copy()
+    
+    if filtered_df.empty:
+        return []
+    
+    # Extract strikes and premiums
+    strikes_with_premiums = []
+    for _, row in filtered_df.iterrows():
+        strikes_with_premiums.append({
+            'strike': float(row['StrikePrice']),
+            'premium': float(row['Close'])
+        })
+    
+    # Sort by strike
+    strikes_with_premiums.sort(key=lambda x: x['strike'])
+    
+    return strikes_with_premiums
+
+
+def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_price, 
+                                       strike_interval, min_premium, max_premium):
+    """
+    Find strike where premium falls within specified range
+    
+    Args:
+        date: str or datetime - Trading date
+        index: str - 'NIFTY' or 'BANKNIFTY'
+        expiry: str or datetime - Expiry date
+        option_type: str - 'CE' or 'PE'
+        spot_price: float - Current spot price
+        strike_interval: int - Strike interval (50 or 100)
+        min_premium: float - Minimum premium (e.g., 100)
+        max_premium: float - Maximum premium (e.g., 200)
+    
+    Returns:
+        float - Strike price where premium is in range
+        None if no strike found in range
+        
+    Trading Logic:
+        1. Get all available strikes with premiums
+        2. Filter strikes where premium is between min and max
+        3. Select the strike closest to ATM from filtered list
+        4. This ensures we get liquid strikes with desired premium range
+        
+    Example:
+        Spot = 24,350, Min = 100, Max = 200
+        Available: 24300 (₹250), 24350 (₹180), 24400 (₹120), 24450 (₹80)
+        In Range: 24350 (₹180), 24400 (₹120)
+        Closest to ATM: 24350 ✅
+    """
+    # Get all strikes with premiums
+    strikes_data = get_all_strikes_with_premiums(
+        date, index, expiry, option_type, spot_price, strike_interval
+    )
+    
+    if not strikes_data:
+        return None
+    
+    # Filter by premium range
+    in_range = [s for s in strikes_data if min_premium <= s['premium'] <= max_premium]
+    
+    if not in_range:
+        return None
+    
+    # Calculate ATM for reference
+    atm_strike = round(spot_price / strike_interval) * strike_interval
+    
+    # Find strike closest to ATM
+    closest = min(in_range, key=lambda x: abs(x['strike'] - atm_strike))
+    
+    return closest['strike']
+
+
+def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot_price,
+                                         strike_interval, target_premium):
+    """
+    Find strike with premium closest to target premium
+    
+    Args:
+        date: str or datetime - Trading date
+        index: str - 'NIFTY' or 'BANKNIFTY'
+        expiry: str or datetime - Expiry date
+        option_type: str - 'CE' or 'PE'
+        spot_price: float - Current spot price
+        strike_interval: int - Strike interval (50 or 100)
+        target_premium: float - Target premium (e.g., 150)
+    
+    Returns:
+        float - Strike price with premium closest to target
+        None if no strikes available
+        
+    Trading Logic:
+        1. Get all available strikes with premiums
+        2. Find strike where premium is closest to target
+        3. Useful for consistent risk/reward across trades
+        
+    Example:
+        Target Premium = 150
+        Available: 24300 (₹250), 24350 (₹180), 24400 (₹120), 24450 (₹80)
+        Differences: 100, 30, 30, 70
+        Closest: 24350 (₹180) or 24400 (₹120) - picks first one (24350) ✅
+    """
+    # Get all strikes with premiums
+    strikes_data = get_all_strikes_with_premiums(
+        date, index, expiry, option_type, spot_price, strike_interval
+    )
+    
+    if not strikes_data:
+        return None
+    
+    # Find strike with premium closest to target
+    closest = min(strikes_data, key=lambda x: abs(x['premium'] - target_premium))
+    
+    return closest['strike']
+
+
+def calculate_strike_advanced(date, index, spot_price, strike_interval, option_type,
+                              strike_selection_type, strike_selection_value=None,
+                              expiry_selection='WEEKLY', min_premium=None, max_premium=None):
+    """
+    Universal strike calculation function supporting all selection methods
+    
+    Args:
+        date: str or datetime - Trading date
+        index: str - 'NIFTY' or 'BANKNIFTY'
+        spot_price: float - Current spot price
+        strike_interval: int - Strike interval (50 or 100)
+        option_type: str - 'CE' or 'PE'
+        strike_selection_type: str - Selection method:
+            - 'ATM', 'ITM', 'OTM' (requires strike_selection_value for ITM/OTM)
+            - 'PREMIUM_RANGE' (requires min_premium, max_premium)
+            - 'CLOSEST_PREMIUM' (requires strike_selection_value as target premium)
+        strike_selection_value: int or float - Value for selection (offset or premium)
+        expiry_selection: str - 'WEEKLY', 'NEXT_WEEKLY', 'MONTHLY', 'NEXT_MONTHLY'
+        min_premium: float - Minimum premium for PREMIUM_RANGE
+        max_premium: float - Maximum premium for PREMIUM_RANGE
+    
+    Returns:
+        dict: {
+            'strike': float,
+            'expiry': datetime,
+            'premium': float (if available)
+        }
+        
+    Trading Examples:
+        
+        1. ATM Weekly:
+           calculate_strike_advanced(
+               date='2024-01-15', index='NIFTY', spot_price=24350,
+               strike_interval=50, option_type='CE',
+               strike_selection_type='ATM', expiry_selection='WEEKLY'
+           )
+           → Strike: 24350, Expiry: 2024-01-18 (current week Thursday)
+        
+        2. OTM2 Next Weekly:
+           calculate_strike_advanced(
+               date='2024-01-15', index='NIFTY', spot_price=24350,
+               strike_interval=50, option_type='CE',
+               strike_selection_type='OTM', strike_selection_value=2,
+               expiry_selection='NEXT_WEEKLY'
+           )
+           → Strike: 24450, Expiry: 2024-01-25 (next week Thursday)
+        
+        3. Premium Range 100-200:
+           calculate_strike_advanced(
+               date='2024-01-15', index='NIFTY', spot_price=24350,
+               strike_interval=50, option_type='CE',
+               strike_selection_type='PREMIUM_RANGE',
+               min_premium=100, max_premium=200,
+               expiry_selection='MONTHLY'
+           )
+           → Strike: 24400, Premium: 150, Expiry: 2024-01-31 (monthly expiry)
+        
+        4. Closest to Premium 150:
+           calculate_strike_advanced(
+               date='2024-01-15', index='NIFTY', spot_price=24350,
+               strike_interval=50, option_type='PE',
+               strike_selection_type='CLOSEST_PREMIUM',
+               strike_selection_value=150,
+               expiry_selection='WEEKLY'
+           )
+           → Strike: 24300, Premium: 148, Expiry: 2024-01-18
+    """
+    # Step 1: Get expiry date
+    expiry = get_expiry_for_selection(date, index, expiry_selection)
+    
+    # Step 2: Calculate strike based on selection type
+    strike_selection_type = strike_selection_type.upper().strip()
+    
+    if strike_selection_type == 'ATM':
+        # ATM strike
+        strike = round(spot_price / strike_interval) * strike_interval
+        
+    elif strike_selection_type in ['ITM', 'OTM']:
+        # ITM/OTM with offset
+        if strike_selection_value is None:
+            raise ValueError(f"{strike_selection_type} requires strike_selection_value (offset)")
+        
+        # Use existing function
+        selection_str = f"{strike_selection_type}{int(strike_selection_value)}"
+        strike = calculate_strike_from_selection(spot_price, strike_interval, selection_str, option_type)
+        
+    elif strike_selection_type == 'PREMIUM_RANGE':
+        # Premium range selection
+        if min_premium is None or max_premium is None:
+            raise ValueError("PREMIUM_RANGE requires min_premium and max_premium")
+        
+        strike = calculate_strike_from_premium_range(
+            date, index, expiry, option_type, spot_price,
+            strike_interval, min_premium, max_premium
+        )
+        
+        if strike is None:
+            raise ValueError(f"No strike found with premium between {min_premium} and {max_premium}")
+        
+    elif strike_selection_type == 'CLOSEST_PREMIUM':
+        # Closest premium selection
+        if strike_selection_value is None:
+            raise ValueError("CLOSEST_PREMIUM requires strike_selection_value (target premium)")
+        
+        strike = calculate_strike_from_closest_premium(
+            date, index, expiry, option_type, spot_price,
+            strike_interval, strike_selection_value
+        )
+        
+        if strike is None:
+            raise ValueError(f"No strike found for closest premium to {strike_selection_value}")
+        
+    else:
+        raise ValueError(f"Invalid strike_selection_type: {strike_selection_type}")
+    
+    # Step 3: Get premium for the selected strike
+    premium = get_option_premium_from_db(
+        date=date,
+        index=index,
+        strike=strike,
+        option_type=option_type,
+        expiry=expiry
+    )
+    
+    return {
+        'strike': strike,
+        'expiry': expiry,
+        'premium': premium
+    }

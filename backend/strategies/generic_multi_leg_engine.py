@@ -14,7 +14,8 @@ import os
 # Import from base (existing helper functions)
 try:
     from ..base import (
-        get_strike_data, load_expiry, load_base2, load_bhavcopy,
+        get_strike_data, load_expiry, # load_base2,  # Disabled - base2 filter not used
+        load_bhavcopy,
         build_intervals, compute_analytics, build_pivot
     )
 except ImportError:
@@ -25,7 +26,8 @@ except ImportError:
     if backend_dir not in sys.path:
         sys.path.insert(0, backend_dir)
     from base import (
-        get_strike_data, load_expiry, load_base2, load_bhavcopy,
+        get_strike_data, load_expiry, # load_base2,  # Disabled - base2 filter not used
+        load_bhavcopy,
         build_intervals, compute_analytics, build_pivot
     )
 
@@ -268,18 +270,18 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     spot_df = get_strike_data(index_name, params["from_date"], params["to_date"])
     weekly_exp = load_expiry(index_name, "weekly")
     monthly_exp = load_expiry(index_name, "monthly")
-    base2 = load_base2()
+    # base2 = load_base2()  # Disabled - base2 filter not used
     
-    # Base2 Filter (EXACT same logic)
-    if strategy_def.use_base2_filter:
-        mask = pd.Series(False, index=spot_df.index)
-        for _, row in base2.iterrows():
-            mask |= (spot_df['Date'] >= row['Start']) & (spot_df['Date'] <= row['End'])
-        
-        if strategy_def.inverse_base2:
-            mask = ~mask  # Invert for v6-style strategies
-        
-        spot_df = spot_df[mask].reset_index(drop=True)
+    # Base2 Filter (EXACT same logic) - DISABLED
+    # if strategy_def.use_base2_filter:
+    #     mask = pd.Series(False, index=spot_df.index)
+    #     for _, row in base2.iterrows():
+    #         mask |= (spot_df['Date'] >= row['Start']) & (spot_df['Date'] <= row['End'])
+    #     
+    #     if strategy_def.inverse_base2:
+    #         mask = ~mask  # Invert for v6-style strategies
+    #     
+    #     spot_df = spot_df[mask].reset_index(drop=True)
     
     trades = []
     

@@ -140,6 +140,23 @@ const AlgoTestBacktest = () => {
               onChange={(e) => updateStrikeSelection(index, 'strike_type', e.target.value)}
               className="w-full p-2 border rounded"
             >
+              <option value="itm20">ITM 20</option>
+              <option value="itm19">ITM 19</option>
+              <option value="itm18">ITM 18</option>
+              <option value="itm17">ITM 17</option>
+              <option value="itm16">ITM 16</option>
+              <option value="itm15">ITM 15</option>
+              <option value="itm14">ITM 14</option>
+              <option value="itm13">ITM 13</option>
+              <option value="itm12">ITM 12</option>
+              <option value="itm11">ITM 11</option>
+              <option value="itm10">ITM 10</option>
+              <option value="itm9">ITM 9</option>
+              <option value="itm8">ITM 8</option>
+              <option value="itm7">ITM 7</option>
+              <option value="itm6">ITM 6</option>
+              <option value="itm5">ITM 5</option>
+              <option value="itm4">ITM 4</option>
               <option value="itm3">ITM 3</option>
               <option value="itm2">ITM 2</option>
               <option value="itm1">ITM 1</option>
@@ -147,6 +164,23 @@ const AlgoTestBacktest = () => {
               <option value="otm1">OTM 1</option>
               <option value="otm2">OTM 2</option>
               <option value="otm3">OTM 3</option>
+              <option value="otm4">OTM 4</option>
+              <option value="otm5">OTM 5</option>
+              <option value="otm6">OTM 6</option>
+              <option value="otm7">OTM 7</option>
+              <option value="otm8">OTM 8</option>
+              <option value="otm9">OTM 9</option>
+              <option value="otm10">OTM 10</option>
+              <option value="otm11">OTM 11</option>
+              <option value="otm12">OTM 12</option>
+              <option value="otm13">OTM 13</option>
+              <option value="otm14">OTM 14</option>
+              <option value="otm15">OTM 15</option>
+              <option value="otm16">OTM 16</option>
+              <option value="otm17">OTM 17</option>
+              <option value="otm18">OTM 18</option>
+              <option value="otm19">OTM 19</option>
+              <option value="otm20">OTM 20</option>
             </select>
           </div>
         );

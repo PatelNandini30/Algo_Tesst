@@ -69,7 +69,7 @@ def summary_hsl():
                                                 df['Call Exit Date'] == df['Call Expiry'],
                                                     np.where(
                                                         df['Call Exit Spot'] < df['Call Strike'], 
-                                                        0,                              
+                                                        df['Call ExitPrice'].fillna(0),                              
                                                         df['Call Exit Spot'] - df['Call Strike']  
                                                     ),
                                                 df['Call ExitPrice']
@@ -82,7 +82,7 @@ def summary_hsl():
                                                 df['Put Exit Date'] == df['Put Expiry'],
                                                     np.where(
                                                         df['Put Exit Spot'] > df['Put Strike'], 
-                                                        0,                              
+                                                        df['Put ExitPrice'].fillna(0),                              
                                                         df['Put Strike'] - df['Put Exit Spot']  
                                                     ),
                                                 df['Put ExitPrice']
