@@ -24,15 +24,25 @@ ChartJS.register(
 );
 
 const EquityCurve = ({ trades }) => {
-  // Calculate cumulative P&L
-  const cumulativePnL = trades.reduce((acc, trade, index) => {
-    const prevValue = index > 0 ? acc[index - 1].value : 0;
-    acc.push({
-      date: trade.entry_date,
-      value: prevValue + (trade.pnl || 0)
-    });
-    return acc;
-  }, []);
+  // Use backend's Cumulative if available, else calculate
+  const hasBackendCumulative = trades.length > 0 && (
+    trades[0].Cumulative !== undefined || 
+    trades[0].cumulative !== undefined
+  );
+  
+  const cumulativePnL = hasBackendCumulative 
+    ? trades.map((trade, index) => ({
+        date: trade.entry_date || trade.EntryDate || trade.exit_date || `Trade ${index + 1}`,
+        value: trade.Cumulative || trade.cumulative || 0
+      }))
+    : trades.reduce((acc, trade, index) => {
+        const prevValue = index > 0 ? acc[index - 1].value : 0;
+        acc.push({
+          date: trade.entry_date || trade.EntryDate || `Trade ${index + 1}`,
+          value: prevValue + (trade.pnl || trade.NetPnL || trade.net_pnl || 0)
+        });
+        return acc;
+      }, []);
   
   const data = {
     labels: cumulativePnL.map(d => d.date),

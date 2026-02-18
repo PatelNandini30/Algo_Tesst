@@ -399,8 +399,10 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df = df.sort_values(entry_date_col).reset_index(drop=True)
 
     # ── CORE EQUITY CURVE ────────────────────────────────────────────────────
-    # Use Entry Spot as initial capital (matching analyse_bhavcopy logic)
-    # Cumulative = Capital + running P&L
+    # Cumulative = running sum of P&L (no initial capital added)
+    df['Cumulative'] = df[pnl_col].cumsum()
+    
+    # Get initial capital for CAGR calculation only
     if 'Entry Spot' in df.columns and not df.empty:
         initial_capital = float(df.iloc[0]['Entry Spot'])
     else:
@@ -409,8 +411,6 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             initial_capital = abs(df[df[pnl_col] < 0][pnl_col].min())
         else:
             initial_capital = 100000.0  # Default capital
-    
-    df['Cumulative'] = initial_capital + df[pnl_col].cumsum()
 
     # High-water mark (peak equity)
     df['Peak'] = df['Cumulative'].cummax()
@@ -471,30 +471,24 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             cur_win = cur_loss = 0
 
     # ── CAGR ──────────────────────────────────────────────────────────────────
-    # AlgoTest computes CAGR purely on strategy P&L.
-    # Formula:  CAGR = ((final_equity / initial_equity) ^ (1/n_years) - 1) * 100
-    # where initial_equity = 1 (normalised), final_equity = 1 + total_pnl/base
-    #
-    # "base" = absolute value of the largest single trade loss (proxy for margin).
-    # If no losses exist, use the largest single trade gain.
-    # This matches AlgoTest's effective capital assumption.
+    # CAGR = ((Final Capital / Initial Capital) ^ (1/Years) - 1) * 100
+    # Where:
+    #   - Initial Capital = First trade's Entry Spot
+    #   - Final Capital = Initial Capital + Total P&L
+    #   - Years = Total Calendar Days / 365
     start_date = pd.to_datetime(df[entry_date_col].min())
     end_date   = pd.to_datetime(df[exit_date_col].max())
-    n_years    = max((end_date - start_date).days / 365.25, 0.01)
+    n_years    = max((end_date - start_date).days / 365.0, 0.01)
 
-    # Derive a sensible capital base
-    if loss_count > 0:
-        capital_base = abs(losses[pnl_col].min())          # worst single loss
+    # Use Entry Spot of first trade as Initial Capital
+    initial_capital = float(df.iloc[0]['Entry Spot'])
+    final_capital = initial_capital + total_pnl
+
+    # Calculate CAGR
+    if initial_capital > 0 and final_capital > 0:
+        cagr = round(100.0 * ((final_capital / initial_capital) ** (1.0 / n_years) - 1), 2)
     else:
-        capital_base = abs(wins[pnl_col].max())
-
-    capital_base = max(capital_base, 1.0)                  # safety floor
-
-    end_value = capital_base + total_pnl
-    if end_value > 0:
-        cagr = round(100.0 * ((end_value / capital_base) ** (1.0 / n_years) - 1), 2)
-    else:
-        cagr = round(-100.0, 2)                            # total wipeout
+        cagr = round(-100.0, 2)  # total wipeout
 
     # ── DRAWDOWN SUMMARY ─────────────────────────────────────────────────────
     max_dd_pct = float(df['%DD'].min())                    # most negative %DD
@@ -504,10 +498,14 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     mdd_duration   = 0
     mdd_start_date = None
     mdd_end_date   = None
+    mdd_trade_number = None
 
     if max_dd_pts < 0:
         trough_idx  = df['DD'].idxmin()
         trough_date = pd.to_datetime(df.loc[trough_idx, exit_date_col])
+        
+        # Trade number where max drawdown occurred (1-indexed for display)
+        mdd_trade_number = int(trough_idx) + 1
 
         # Find the peak date = last trade where Cumulative == Peak before trough
         pre_trough  = df.loc[:trough_idx]
@@ -534,15 +532,17 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     # ── SPOT COMPARISON METRICS ─────────────────────────────────────────────────
     spot_chg = round(df['Spot P&L'].sum(), 2) if 'Spot P&L' in df.columns else 0
 
-    # CAGR(Spot) - if just held the index
-    if spot_chg != 0 and initial_capital > 0:
-        end_value_spot = initial_capital + spot_chg
-        if end_value_spot > 0:
-            cagr_spot = round(100 * ((end_value_spot / initial_capital) ** (1.0 / n_years) - 1), 2)
+    # CAGR(Spot) - if just held the index (Buy & Hold)
+    # CAGR = ((Final Spot / Initial Spot) ^ (1/Years) - 1) * 100
+    if 'Entry Spot' in df.columns and 'Exit Spot' in df.columns:
+        initial_spot = float(df.iloc[0]['Entry Spot'])
+        final_spot = float(df.iloc[-1]['Exit Spot'])
+        if n_years > 0 and initial_spot > 0 and final_spot > 0:
+            cagr_spot = round(100 * ((final_spot / initial_spot) ** (1.0 / n_years) - 1), 2)
         else:
-            cagr_spot = round(-100.0, 2)
+            cagr_spot = 0.0
     else:
-        cagr_spot = 0
+        cagr_spot = 0.0
 
     summary = {
         "total_pnl":             total_pnl,
@@ -562,6 +562,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "mdd_duration_days":     mdd_duration,
         "mdd_start_date":        mdd_start_date,
         "mdd_end_date":          mdd_end_date,
+        "mdd_trade_number":      mdd_trade_number,
         "car_mdd":               car_mdd,
         "recovery_factor":       recovery_factor,
         "max_win_streak":        max_win_streak,

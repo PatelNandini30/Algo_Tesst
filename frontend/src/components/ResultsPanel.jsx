@@ -52,6 +52,7 @@ const ResultsPanel = ({ results, onClose }) => {
     mddDuration: summary.mdd_duration_days || 0,
     mddStartDate: summary.mdd_start_date || '',
     mddEndDate: summary.mdd_end_date || '',
+    mddTradeNumber: summary.mdd_trade_number || null,
     cagrSpot: summary.cagr_spot || 0,
     recoveryFactor: summary.recovery_factor || 0
   }), [summary, trades]);
@@ -135,7 +136,7 @@ const ResultsPanel = ({ results, onClose }) => {
           </div>
 
           {/* Summary Cards */}
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 p-6 bg-gradient-to-br from-gray-50 to-gray-100">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6 bg-gradient-to-br from-gray-50 to-gray-100">
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Total P&L</p>
               <p className={`text-2xl font-bold ${stats.totalPnL >= 0 ? 'text-green-600' : 'text-red-600'}`}>
@@ -161,13 +162,6 @@ const ResultsPanel = ({ results, onClose }) => {
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Max DD</p>
               <p className="text-2xl font-bold text-red-600">
                 ₹{Math.abs(stats.maxDD).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-              </p>
-            </div>
-            
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">CAR/MDD</p>
-              <p className="text-2xl font-bold text-indigo-600">
-                {stats.carMdd.toFixed(2)}
               </p>
             </div>
             
@@ -363,12 +357,12 @@ const ResultsPanel = ({ results, onClose }) => {
                     </span>
                   </div>
                   <div className="flex justify-between items-center py-2 border-b border-gray-200">
-                    <span className="text-sm font-medium text-gray-600">Duration of Max Drawdown</span>
+                    <span className="text-sm font-medium text-gray-600">Max Drawdown at Trade</span>
                     <span className="text-sm font-bold text-gray-900">
-                      {stats.mddDuration} days
-                      {stats.mddStartDate && stats.mddEndDate && (
+                      {stats.mddTradeNumber ? `Trade #${stats.mddTradeNumber}` : 'N/A'}
+                      {stats.mddEndDate && (
                         <span className="block text-xs text-gray-500 mt-1">
-                          [{stats.mddStartDate} to {stats.mddEndDate}]
+                          [{stats.mddEndDate}]
                         </span>
                       )}
                     </span>

@@ -45,24 +45,49 @@ const AlgoTestResults = ({ results, onClose }) => {
     }
   };
 
-  // Prepare chart data
+  // Prepare chart data - use backend Cumulative if available, else calculate
   const chartData = useMemo(() => {
+    // Use backend's Cumulative column if available (includes Initial Capital)
+    // Otherwise fallback to calculating from scratch
+    const hasBackendCumulative = trades.length > 0 && (
+      trades[0].Cumulative !== undefined || 
+      trades[0].cumulative !== undefined
+    );
+    
+    if (hasBackendCumulative) {
+      // Use backend's cumulative (Initial Capital + cumsum P&L)
+      return trades.map((trade, index) => {
+        const cumulative = trade.Cumulative || trade.cumulative || 0;
+        const pnl = getTradePnL(trade);
+        
+        return {
+          index: index + 1,
+          date: formatDate(getExitDate(trade)),
+          cumulative: cumulative,
+          pnl: pnl,
+          drawdown: getDrawdown(trade)
+        };
+      });
+    }
+    
+    // Fallback: calculate from scratch (Initial Capital = Entry Spot of first trade)
     let cumulativePnL = 0;
     let peak = 0;
+    let initialCapital = trades.length > 0 ? (trades[0].EntrySpot || trades[0].entry_spot || trades[0].entry_spot || 0) : 0;
     
     return trades.map((trade, index) => {
       const pnl = getTradePnL(trade);
       cumulativePnL += pnl;
-      peak = Math.max(peak, cumulativePnL);
-      const dd = peak > 0 ? ((cumulativePnL - peak) / peak) * 100 : 0;
+      const cumulative = initialCapital + cumulativePnL;
+      peak = Math.max(peak, cumulative);
+      const dd = peak > 0 ? ((cumulative - peak) / peak) * 100 : 0;
 
       return {
         index: index + 1,
         date: formatDate(getExitDate(trade)),
-        cumulative: cumulativePnL,
+        cumulative: cumulative,
         pnl: pnl,
-        drawdown: dd,
-        peak: peak
+        drawdown: dd
       };
     });
   }, [trades]);

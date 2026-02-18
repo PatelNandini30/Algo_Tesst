@@ -128,7 +128,7 @@ def run_v10(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[
             'Symbol': symbol,
             'Entry Price': entry_price,
             'Exit Price': exit_price,
-            'P&L': pnl,
+            'Net P&L': pnl,
             'Position': f"{position_type} {option_type}"
         })
     
@@ -139,9 +139,9 @@ def run_v10(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[
     trades_df = pd.DataFrame(trades)
     
     # Compute analytics
-    analytics = compute_analytics(trades_df, params.get("initial_capital", 100000))
+    trades_df, analytics = compute_analytics(trades_df)
     
     # Build pivot table
-    pivot = build_pivot(trades_df)
+    pivot = build_pivot(trades_df, 'Expiry')
     
     return trades_df, analytics, pivot

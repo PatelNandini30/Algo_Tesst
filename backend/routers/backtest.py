@@ -443,73 +443,6 @@ async def algotest_backtest(request: BacktestRequest):
     return await run_backtest_logic(request)
 
 
-# Import strategy functions dynamically to avoid circular imports
-import importlib
-
-# Dynamically import the strategy engines
-v1_module = importlib.import_module('engines.v1_ce_fut')
-v2_module = importlib.import_module('engines.v2_pe_fut')
-v3_module = importlib.import_module('engines.v3_strike_breach')
-v4_module = importlib.import_module('engines.v4_strangle')
-v5_module = importlib.import_module('engines.v5_protected')
-v6_module = importlib.import_module('engines.v6_inverse_strangle')
-v7_module = importlib.import_module('engines.v7_premium')
-v8_hsl_module = importlib.import_module('engines.v8_hsl')
-v8_ce_pe_fut_module = importlib.import_module('engines.v8_ce_pe_fut')
-v9_module = importlib.import_module('engines.v9_counter')
-
-# Get the functions
-run_v1_main1 = getattr(v1_module, 'run_v1_main1')
-run_v1_main2 = getattr(v1_module, 'run_v1_main2')
-run_v1_main3 = getattr(v1_module, 'run_v1_main3')
-run_v1_main4 = getattr(v1_module, 'run_v1_main4')
-run_v1_main5 = getattr(v1_module, 'run_v1_main5')
-
-run_v2_main1 = getattr(v2_module, 'run_v2_main1')
-run_v2_main2 = getattr(v2_module, 'run_v2_main2')
-run_v2_main3 = getattr(v2_module, 'run_v2_main3')
-run_v2_main4 = getattr(v2_module, 'run_v2_main4')
-run_v2_main5 = getattr(v2_module, 'run_v2_main5')
-
-run_v3_main1 = getattr(v3_module, 'run_v3_main1')
-run_v3_main2 = getattr(v3_module, 'run_v3_main2')
-run_v3_main3 = getattr(v3_module, 'run_v3_main3')
-run_v3_main4 = getattr(v3_module, 'run_v3_main4')
-run_v3_main5 = getattr(v3_module, 'run_v3_main5')
-
-run_v4_main1 = getattr(v4_module, 'run_v4_main1')
-run_v4_main2 = getattr(v4_module, 'run_v4_main2')
-
-run_v5_call_main1 = getattr(v5_module, 'run_v5_call_main1')
-run_v5_call_main2 = getattr(v5_module, 'run_v5_call_main2')
-run_v5_put_main1 = getattr(v5_module, 'run_v5_put_main1')
-run_v5_put_main2 = getattr(v5_module, 'run_v5_put_main2')
-
-run_v6_main1 = getattr(v6_module, 'run_v6_main1')
-run_v6_main2 = getattr(v6_module, 'run_v6_main2')
-
-run_v7_main1 = getattr(v7_module, 'run_v7_main1')
-run_v7_main2 = getattr(v7_module, 'run_v7_main2')
-run_v7_main3 = getattr(v7_module, 'run_v7_main3')
-run_v7_main4 = getattr(v7_module, 'run_v7_main4')
-
-run_v8_hsl_main1 = getattr(v8_hsl_module, 'run_v8_hsl_main1')
-run_v8_hsl_main2 = getattr(v8_hsl_module, 'run_v8_hsl_main2')
-run_v8_hsl_main3 = getattr(v8_hsl_module, 'run_v8_hsl_main3')
-run_v8_hsl_main4 = getattr(v8_hsl_module, 'run_v8_hsl_main4')
-run_v8_hsl_main5 = getattr(v8_hsl_module, 'run_v8_hsl_main5')
-
-run_v8_main1 = getattr(v8_ce_pe_fut_module, 'run_v8_main1')
-run_v8_main2 = getattr(v8_ce_pe_fut_module, 'run_v8_main2')
-run_v8_main3 = getattr(v8_ce_pe_fut_module, 'run_v8_main3')
-run_v8_main4 = getattr(v8_ce_pe_fut_module, 'run_v8_main4')
-
-run_v9_main1 = getattr(v9_module, 'run_v9_main1')
-run_v9_main2 = getattr(v9_module, 'run_v9_main2')
-run_v9_main3 = getattr(v9_module, 'run_v9_main3')
-run_v9_main4 = getattr(v9_module, 'run_v9_main4')
-
-
 class DynamicLegRequest(BaseModel):
     leg_number: int
     instrument: str  # "Option" or "Future"
@@ -738,43 +671,103 @@ async def dynamic_backtest(request: dict):
                 
                 # Transform strike selection
                 strike_sel = req_leg.get("strike_selection", {})
-                strike_type_value = strike_sel.get("strike_type", "atm").lower()
+                strike_sel_type = strike_sel.get("type", "strike_type").lower()
                 
-                # Determine strike selection
+                # Determine strike selection based on type
                 backend_strike_type = "ATM"
                 backend_strike_value = 0.0
+                premium_min = None
+                premium_max = None
                 
-                if strike_type_value.startswith("itm"):
-                    try:
-                        num = int(strike_type_value.replace("itm", ""))
-                        backend_strike_type = "OTM %"
-                        backend_strike_value = -num * 1.0
-                    except:
+                if strike_sel_type == "strike_type":
+                    # Traditional ATM/ITM/OTM selection
+                    strike_type_value = strike_sel.get("strike_type", "atm").lower()
+                    
+                    if strike_type_value.startswith("itm"):
+                        try:
+                            num = int(strike_type_value.replace("itm", ""))
+                            backend_strike_type = "OTM %"
+                            backend_strike_value = -num * 1.0
+                        except:
+                            backend_strike_type = "ATM"
+                            backend_strike_value = 0.0
+                    elif strike_type_value.startswith("otm"):
+                        try:
+                            num = int(strike_type_value.replace("otm", ""))
+                            backend_strike_type = "OTM %"
+                            backend_strike_value = num * 1.0
+                        except:
+                            backend_strike_type = "ATM"
+                            backend_strike_value = 0.0
+                    else:
                         backend_strike_type = "ATM"
                         backend_strike_value = 0.0
-                elif strike_type_value.startswith("otm"):
-                    try:
-                        num = int(strike_type_value.replace("otm", ""))
-                        backend_strike_type = "OTM %"
-                        backend_strike_value = num * 1.0
-                    except:
-                        backend_strike_type = "ATM"
-                        backend_strike_value = 0.0
+                
+                elif strike_sel_type == "premium_range":
+                    # Premium range selection
+                    backend_strike_type = "Premium Range"
+                    premium_min = float(strike_sel.get("lower", 0))
+                    premium_max = float(strike_sel.get("upper", 0))
+                    backend_strike_value = 0.0
+                
+                elif strike_sel_type == "closest_premium":
+                    # Closest premium selection
+                    backend_strike_type = "Closest Premium"
+                    backend_strike_value = float(strike_sel.get("premium", 0))
+                
+                elif strike_sel_type == "premium_gte":
+                    # Premium >= value
+                    backend_strike_type = "Premium Range"
+                    premium_min = float(strike_sel.get("premium", 0))
+                    premium_max = 999999.0  # Large number for upper bound
+                    backend_strike_value = 0.0
+                
+                elif strike_sel_type == "premium_lte":
+                    # Premium <= value
+                    backend_strike_type = "Premium Range"
+                    premium_min = 0.0
+                    premium_max = float(strike_sel.get("premium", 0))
+                    backend_strike_value = 0.0
+                
+                elif strike_sel_type == "straddle_width":
+                    # Straddle width selection
+                    backend_strike_type = "Straddle Width"
+                    backend_strike_value = float(strike_sel.get("width", 0))
+                
+                elif strike_sel_type == "pct_of_atm":
+                    # % of ATM selection
+                    backend_strike_type = "% of ATM"
+                    backend_strike_value = float(strike_sel.get("pct", 0))
+                
+                elif strike_sel_type == "atm_straddle_premium_pct":
+                    # ATM Straddle Premium % selection
+                    backend_strike_type = "% of ATM"
+                    backend_strike_value = float(strike_sel.get("pct", 0))
+                
                 else:
+                    # Default to ATM
                     backend_strike_type = "ATM"
                     backend_strike_value = 0.0
                 
                 # Build transformed leg
+                strike_selection_dict = {
+                    "type": backend_strike_type,
+                    "value": backend_strike_value,
+                    "spot_adjustment_mode": 0,
+                    "spot_adjustment": 0.0
+                }
+                
+                # Add premium range if applicable
+                if premium_min is not None:
+                    strike_selection_dict["premium_min"] = premium_min
+                if premium_max is not None:
+                    strike_selection_dict["premium_max"] = premium_max
+                
                 req_leg = {
                     "instrument": segment_map.get(segment, "Option"),
                     "position": position_map.get(position, "Sell"),
                     "lots": lots,
-                    "strike_selection": {
-                        "type": backend_strike_type,
-                        "value": backend_strike_value,
-                        "spot_adjustment_mode": 0,
-                        "spot_adjustment": 0.0
-                    },
+                    "strike_selection": strike_selection_dict,
                     "entry_condition": {
                         "type": "Days Before Expiry",
                         "days_before_expiry": request_obj.entry_dte if hasattr(request_obj, 'entry_dte') else 2

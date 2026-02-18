@@ -61,14 +61,19 @@ def create_summary_idx(df: pd.DataFrame) -> Dict[str, Any]:
         expectancy = round(((avg_win/abs(avg_loss)) * win_pct - (100-win_pct)) / 100, 2)
     
     # Calculate CAGR
+    # CAGR = ((Final Capital / Initial Capital) ^ (1/Years) - 1) * 100
+    # Where:
+    #   - Initial Capital = First trade's Entry Spot
+    #   - Final Capital = Initial Capital + Total P&L
+    #   - Years = Total Calendar Days / 365
     initial_capital = df.iloc[0]['Entry Spot'] if 'Entry Spot' in df.columns else df.iloc[0]['entry_spot']
     start_date = df['Entry Date'].min() if 'Entry Date' in df.columns else df['entry_date'].min()
     end_date = df['Exit Date'].max() if 'Exit Date' in df.columns else df['exit_date'].max()
-    n_years = (end_date - start_date).days / 365.25
+    n_years = max((end_date - start_date).days / 365.0, 0.01)
     
     # Calculate CAGR with safety checks for negative values and edge cases
     if n_years > 0 and initial_capital > 0:
-        final_capital = total_pnl + initial_capital
+        final_capital = initial_capital + total_pnl
         if final_capital > 0:
             cagr_options = round(100 * ((final_capital / initial_capital) ** (1/n_years) - 1), 2)
         else:
@@ -109,10 +114,14 @@ def create_summary_idx(df: pd.DataFrame) -> Dict[str, Any]:
     total_spot_change = df['Spot P&L'].sum() if 'Spot P&L' in df.columns else 0
     roi_vs_spot = round((total_pnl / abs(total_spot_change)) * 100, 2) if total_spot_change != 0 else 0
     
-    # Calculate CAGR for spot
+    # Calculate CAGR for spot (buy and hold)
+    # CAGR = ((Final Spot / Initial Spot) ^ (1/Years) - 1) * 100
     initial_spot = df.iloc[0]['Entry Spot'] if 'Entry Spot' in df.columns else df.iloc[0]['entry_spot']
     final_spot = df.iloc[-1]['Exit Spot'] if 'Exit Spot' in df.columns else df.iloc[-1]['exit_spot']
-    cagr_spot = round(100 * (((final_spot - initial_spot) / initial_spot) / n_years), 2) if n_years > 0 else 0
+    if n_years > 0 and initial_spot > 0 and final_spot > 0:
+        cagr_spot = round(100 * ((final_spot / initial_spot) ** (1/n_years) - 1), 2)
+    else:
+        cagr_spot = 0.0
     
     summary = {
         "Count": count,

@@ -140,16 +140,16 @@ def run_v1(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[s
                 continue
 
             # ---------------------------------------------------
-            # BASE START OVERRIDE — EXACT COPY of script lines 489-494
+            # BASE START OVERRIDE — DISABLED (base2 filter not used)
             # When fromDate is the start of a base2 range, override fut_expiry
             # to iloc[1] of monthly > fromDate  (NOT >=, strictly >)
             # ---------------------------------------------------
-            is_base_start = (base2['Start'] == fromDate).any()
-            if is_base_start:
-                override_df = monthly_exp[
-                    monthly_exp['Current Expiry'] > fromDate   # strictly >
-                ].reset_index(drop=True)
-                fut_expiry = override_df.iloc[1]['Current Expiry']   # iloc[1]
+            # is_base_start = (base2['Start'] == fromDate).any()
+            # if is_base_start:
+            #     override_df = monthly_exp[
+            #         monthly_exp['Current Expiry'] > fromDate   # strictly >
+            #     ].reset_index(drop=True)
+            #     fut_expiry = override_df.iloc[1]['Current Expiry']   # iloc[1]
 
             # ---------------------------------------------------
             # Entry / Exit spots  (script lines 498-508)
