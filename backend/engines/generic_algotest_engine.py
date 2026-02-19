@@ -365,11 +365,13 @@ def run_algotest_backtest(params):
                     
                     _log(f"      Exit Price: {exit_price}")
                     
-                    # Calculate P&L - use lots directly (user sends total quantity)
+                    # Calculate P&L with correct lot size
+                    lot_size = get_lot_size(index, entry_date)
+                    
                     if position == 'BUY':
-                        leg_pnl = (exit_price - entry_price) * lots
+                        leg_pnl = (exit_price - entry_price) * lots * lot_size
                     else:  # SELL
-                        leg_pnl = (entry_price - exit_price) * lots
+                        leg_pnl = (entry_price - exit_price) * lots * lot_size
                     
                     _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
                     
@@ -378,6 +380,7 @@ def run_algotest_backtest(params):
                         'segment': 'FUTURE',
                         'position': position,
                         'lots': lots,
+                        'lot_size': lot_size,  # Store lot_size for DataFrame
                         'entry_price': entry_price,
                         'exit_price': exit_price,
                         'pnl': leg_pnl
@@ -482,6 +485,7 @@ def run_algotest_backtest(params):
                         'strike': strike,
                         'position': position,
                         'lots': lots,
+                        'lot_size': lot_size,  # Store lot_size for DataFrame
                         'entry_premium': entry_premium,
                         'exit_premium': exit_premium,
                         'pnl': leg_pnl
@@ -595,53 +599,82 @@ def run_algotest_backtest(params):
         print("No trades executed - returning empty results")
         return pd.DataFrame(), {}, {}
     
-    # Flatten for DataFrame
+    # Flatten for DataFrame - Create rows for EACH leg (AlgoTest format)
+    # But we'll aggregate them back for analytics
     trades_flat = []
-    for trade in all_trades:
+    trade_counter = 0
+    for trade_idx, trade in enumerate(all_trades, 1):
         entry_spot_val = trade['entry_spot']
         exit_spot_val = trade.get('exit_spot', trade['entry_spot'])
         
-        row = {
-            'Entry Date': trade['entry_date'],
-            'Exit Date': trade['exit_date'],
-            'Expiry Date': trade['expiry_date'],
-            'Entry DTE': trade['entry_dte'],
-            'Exit DTE': trade['exit_dte'],
-            'Entry Spot': entry_spot_val,
-            'Exit Spot': exit_spot_val,
-            'Spot P&L': round(exit_spot_val - entry_spot_val, 2) if exit_spot_val and entry_spot_val else 0,
-            'Net P&L': trade['total_pnl'],
-            'Exit Reason': trade.get('exit_reason', 'SCHEDULED')
-        }
-        
-        # Add leg details
+        # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
         for leg in trade['legs']:
             leg_num = leg['leg_number']
-            if leg['segment'] == 'FUTURE':
-                row[f'Leg_{leg_num}_Type'] = 'FUTURE'
-                row[f'Leg_{leg_num}_Position'] = leg['position']
-                row[f'Leg_{leg_num}_EntryPrice'] = leg['entry_price']
-                row[f'Leg_{leg_num}_ExitPrice'] = leg['exit_price']
-            else:
-                row[f'Leg_{leg_num}_Type'] = f"Option_{leg['option_type']}_{leg['position']}"
-                row[f'Leg_{leg_num}_Strike'] = leg['strike']
-                row[f'Leg_{leg_num}_Position'] = leg['position']
-                row[f'Leg_{leg_num}_EntryPrice'] = leg['entry_premium']
-                row[f'Leg_{leg_num}_ExitPrice'] = leg['exit_premium']
             
-            row[f'Leg_{leg_num}_P&L'] = leg['pnl']
+            # Determine Type and Position
+            if leg['segment'] == 'FUTURE':
+                option_type = 'FUT'
+                position = leg['position']
+                strike = ''
+                entry_price = leg['entry_price']
+                exit_price = leg.get('exit_price', 0)
+            else:
+                option_type = leg['option_type']
+                position = leg['position']
+                strike = leg['strike']
+                entry_price = leg['entry_premium']
+                exit_price = leg.get('exit_premium', 0)
+            
+            leg_pnl = leg['pnl']
+            lot_size = leg.get('lot_size', 65)  # Get stored lot_size
+            qty = lots * lot_size  # Calculate total quantity
+            
+            row = {
+                'Trade': trade_idx,  # Trade group number
+                'Leg': leg_num,  # Leg number within trade
+                'Index': trade_counter + leg_num,  # Unique row index
+                'Entry Date': trade['entry_date'],
+                'Exit Date': trade['exit_date'],
+                'Type': option_type,
+                'Strike': strike,
+                'B/S': position,
+                'Qty': qty,  # Use lots × lot_size
+                'Entry Price': entry_price,
+                'Exit Price': exit_price,
+                'Entry Spot': entry_spot_val,
+                'Exit Spot': exit_spot_val,
+                'Spot P&L': round(exit_spot_val - entry_spot_val, 2) if exit_spot_val and entry_spot_val else 0,
+                'Future Expiry': trade['expiry_date'],
+                'Net P&L': leg_pnl,
+                'Exit Reason': trade.get('exit_reason', 'SCHEDULED')
+            }
+            
+            trades_flat.append(row)
         
-        trades_flat.append(row)
+        trade_counter += len(trade['legs'])
+    
     trades_df = pd.DataFrame(trades_flat)
+    
+    # ========== AGGREGATE LEGS INTO TRADES FOR ANALYTICS ==========
+    # Group by Trade number and sum P&L to get one row per trade
+    trades_aggregated = trades_df.groupby('Trade').agg({
+        'Entry Date': 'first',
+        'Exit Date': 'first',
+        'Entry Spot': 'first',
+        'Exit Spot': 'first',
+        'Spot P&L': 'first',
+        'Net P&L': 'sum',  # Sum P&L across all legs
+        'Exit Reason': 'first'
+    }).reset_index()
     
     # ========== STEP 12: COMPUTE ANALYTICS (ADDS CUMULATIVE, PEAK, DD, %DD) ==========
     if DEBUG:
-        print(f"Computing analytics (Cumulative, Peak, DD, %DD)...")
+        print(f"Computing analytics on {len(trades_aggregated)} trades...")
     
-    # Call compute_analytics from base.py
+    # Call compute_analytics on AGGREGATED trades (one row per trade)
     # This adds: Cumulative, Peak, DD, %DD columns
     # And returns enhanced summary with CAGR, Max DD, etc.
-    trades_df, summary = compute_analytics(trades_df)
+    trades_aggregated, summary = compute_analytics(trades_aggregated)
     
     print(f"\n{'='*60}")
     print(f"ANALYTICS COMPLETE")
@@ -653,7 +686,16 @@ def run_algotest_backtest(params):
     print(f"CAR/MDD: {summary.get('car_mdd', 0):.2f}")
     print(f"{'='*60}\n")
     
+    # ========== MERGE ANALYTICS BACK TO DETAILED TRADES ==========
+    # Merge Cumulative, Peak, DD, %DD from aggregated back to detailed leg-by-leg DataFrame
+    analytics_cols = ['Trade', 'Cumulative', 'Peak', 'DD', '%DD']
+    trades_aggregated_subset = trades_aggregated[analytics_cols]
+    trades_df = trades_df.merge(trades_aggregated_subset, on='Trade', how='left')
+    
+    print(f"\nDEBUG: trades_df columns after merge: {list(trades_df.columns)}")
+    print(f"DEBUG: First row Cumulative: {trades_df.iloc[0]['Cumulative'] if 'Cumulative' in trades_df.columns else 'MISSING'}")
+    
     # ========== STEP 13: BUILD PIVOT TABLE ==========
-    pivot = build_pivot(trades_df, 'Expiry Date')
+    pivot = build_pivot(trades_aggregated, 'Exit Date')
     
     return trades_df, summary, pivot

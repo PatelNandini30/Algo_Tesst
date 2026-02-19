@@ -105,7 +105,7 @@ def format_response(df: pd.DataFrame, summary: Dict[str, Any], pivot: Dict[str, 
                 value = row[col]
                 # Convert timestamps to strings
                 if isinstance(value, pd.Timestamp):
-                    trade[col] = value.strftime('%Y-%m-%d')
+                    trade[col] = value.strftime('%d-%m-%Y')
                 # Convert numpy types to Python types
                 elif isinstance(value, (np.integer, np.floating)):
                     trade[col] = float(value) if isinstance(value, np.floating) else int(value)

@@ -38,6 +38,16 @@ const AlgoTestResults = ({ results, onClose }) => {
   const formatDate = (dateStr) => {
     if (!dateStr) return '';
     try {
+      // Handle dd-mm-yyyy format from backend
+      const parts = dateStr.split('-');
+      if (parts.length === 3) {
+        const day = parseInt(parts[0]);
+        const month = parseInt(parts[1]) - 1;
+        const year = parseInt(parts[2]);
+        const date = new Date(year, month, day);
+        return date.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+      }
+      // Fallback for other formats
       const date = new Date(dateStr);
       return date.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
     } catch {
@@ -463,16 +473,58 @@ const AlgoTestResults = ({ results, onClose }) => {
             {activeTab === 'analytics' && (
               <div className="space-y-6">
                 <div className="bg-white border rounded-xl p-6">
-                  <h3 className="text-lg font-semibold mb-4">Complete Statistics</h3>
-                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                    {Object.entries(summary).map(([key, value]) => (
-                      <div key={key} className="border-l-4 border-blue-500 pl-4 py-2">
-                        <p className="text-xs text-gray-500 uppercase mb-1">{key.replace(/_/g, ' ')}</p>
-                        <p className="text-lg font-semibold text-gray-900">
-                          {typeof value === 'number' ? value.toFixed(2) : value}
-                        </p>
-                      </div>
-                    ))}
+                  <h3 className="text-lg font-semibold mb-6">Detailed Statistics</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-x-8 gap-y-4">
+                    {Object.entries(summary).slice(0, Object.entries(summary).length - 3).map(([key, value], idx, arr) => {
+                      const isProfit = key.toLowerCase().includes('pnl') || key.toLowerCase().includes('profit') || key.toLowerCase().includes('return');
+                      const isLoss = key.toLowerCase().includes('loss') || key.toLowerCase().includes('dd') || key.toLowerCase().includes('drawdown');
+                      const isNeutral = !isProfit && !isLoss;
+                      
+                      let textColor = 'text-gray-900';
+                      if (typeof value === 'number') {
+                        if (isProfit && value > 0) textColor = 'text-green-600';
+                        else if (isLoss || (isProfit && value < 0)) textColor = 'text-red-600';
+                        else textColor = 'text-gray-600';
+                      }
+                      
+                      const isLastInSection = idx === arr.length - 1 - 3;
+                      
+                      return (
+                        <div key={key} className={`py-3 ${!isLastInSection ? 'border-b border-gray-200' : ''}`}>
+                          <p className="text-xs text-gray-500 uppercase mb-1 font-medium">{key.replace(/_/g, ' ')}</p>
+                          <p className={`text-lg font-semibold ${textColor}`}>
+                            {typeof value === 'number' ? value.toFixed(2) : value}
+                          </p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                
+                <div className="bg-white border rounded-xl p-6 pt-6">
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-x-8 gap-y-4 border-t pt-6">
+                    {Object.entries(summary).slice(-3).map(([key, value], idx, arr) => {
+                      const isProfit = key.toLowerCase().includes('pnl') || key.toLowerCase().includes('profit') || key.toLowerCase().includes('return');
+                      const isLoss = key.toLowerCase().includes('loss') || key.toLowerCase().includes('dd') || key.toLowerCase().includes('drawdown');
+                      
+                      let textColor = 'text-gray-900';
+                      if (typeof value === 'number') {
+                        if (isProfit && value > 0) textColor = 'text-green-600';
+                        else if (isLoss || (isProfit && value < 0)) textColor = 'text-red-600';
+                        else textColor = 'text-gray-600';
+                      }
+                      
+                      const isLastInSection = idx === arr.length - 1;
+                      
+                      return (
+                        <div key={key} className={`py-3 ${!isLastInSection ? 'border-b border-gray-200' : ''}`}>
+                          <p className="text-xs text-gray-500 uppercase mb-1 font-medium">{key.replace(/_/g, ' ')}</p>
+                          <p className={`text-lg font-semibold ${textColor}`}>
+                            {typeof value === 'number' ? value.toFixed(2) : value}
+                          </p>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

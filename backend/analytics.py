@@ -206,9 +206,9 @@ def generate_trade_sheet(df: pd.DataFrame) -> pd.DataFrame:
     
     # Add basic trade information
     if 'Entry Date' in df_copy.columns:
-        trade_sheet['Trade Date'] = df_copy['Entry Date'].dt.strftime('%Y-%m-%d')
+        trade_sheet['Trade Date'] = df_copy['Entry Date'].dt.strftime('%d-%m-%Y')
     elif 'entry_date' in df_copy.columns:
-        trade_sheet['Trade Date'] = df_copy['entry_date'].dt.strftime('%Y-%m-%d')
+        trade_sheet['Trade Date'] = df_copy['entry_date'].dt.strftime('%d-%m-%Y')
     
     # Add strategy name if available
     if 'Strategy Name' in df_copy.columns:
@@ -241,6 +241,12 @@ def generate_trade_sheet(df: pd.DataFrame) -> pd.DataFrame:
     strike_cols = ['Call Strike', 'Put Strike', 'Call EntryPrice', 'Call ExitPrice', 
                    'Put EntryPrice', 'Put ExitPrice', 'Future EntryPrice', 'Future ExitPrice']
     for col in strike_cols:
+        if col in df_copy.columns:
+            trade_sheet[col] = df_copy[col]
+    
+    # Include spot price information if available
+    spot_cols = ['Entry Spot', 'Exit Spot']
+    for col in spot_cols:
         if col in df_copy.columns:
             trade_sheet[col] = df_copy[col]
     

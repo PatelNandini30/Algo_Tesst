@@ -373,7 +373,7 @@ async def run_backtest_logic(request: BacktestRequest):
         for trade in trades_list:
             for key, value in trade.items():
                 if isinstance(value, pd.Timestamp):
-                    trade[key] = value.strftime('%Y-%m-%d')
+                    trade[key] = value.strftime('%d-%m-%Y')
                 elif pd.isna(value):
                     trade[key] = None
         
@@ -597,7 +597,7 @@ def convert_numpy_types(obj):
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
     elif isinstance(obj, pd.Timestamp):
-        return obj.strftime('%Y-%m-%d')
+        return obj.strftime('%d-%m-%Y')
     elif pd.isna(obj):
         return None
     else:
@@ -1025,11 +1025,11 @@ async def dynamic_backtest(request: dict):
             df = df.rename(columns=existing_columns)
             
             # Reorder columns to match frontend expectations exactly
-            # Frontend expects: Entry Date, Exit Date, Entry Spot, Exit Spot, Spot P&L, Future Expiry, Net P&L, Leg 1 Type, Leg 1 Strike, Leg 1 Entry
+            # Frontend expects: Index, Entry Date, Exit Date, Type, Strike, B/S, Qty, Entry Price, Exit Price, P/L
             frontend_columns = [
-                'Entry Date', 'Exit Date', 'Entry Spot', 'Exit Spot', 
-                'Spot P&L', 'Future Expiry', 'Net P&L', 
-                'Leg 1 Type', 'Leg 1 Strike', 'Leg 1 Entry'
+                'Index', 'Entry Date', 'Exit Date', 'Type', 'Strike', 'B/S', 'Qty',
+                'Entry Price', 'Exit Price', 'Entry Spot', 'Exit Spot',
+                'Spot P&L', 'Future Expiry', 'Net P&L'
             ]
             # Add any extra columns that exist
             for col in df.columns:
@@ -1049,73 +1049,54 @@ async def dynamic_backtest(request: dict):
         # Convert ALL numpy types to Python native types
         trades_list = convert_numpy_types(trades_list)
         
-        # Calculate comprehensive analytics using analytics module
-        from analytics import create_summary_idx
+        # Use the summary directly from the engine (already has all analytics calculated)
+        # The engine's compute_analytics() already calculated everything correctly
+        # Don't recalculate - just use what the engine returned
         
-        if not df.empty:
-            # Calculate drawdown and equity curve data
-            df_analytics = df.copy()
-            
-            # Calculate cumulative P&L for equity curve
-            if 'Cumulative' not in df_analytics.columns:
-                df_analytics['Cumulative'] = df_analytics['Net P&L'].cumsum()
-            
-            # Calculate drawdown
-            df_analytics['Peak'] = df_analytics['Cumulative'].cummax()
-            df_analytics['DD'] = np.where(df_analytics['Peak'] > df_analytics['Cumulative'], 
-                                          df_analytics['Cumulative'] - df_analytics['Peak'], 0)
-            df_analytics['%DD'] = np.where(df_analytics['DD'] == 0, 0, 
-                                           round(100 * (df_analytics['DD'] / df_analytics['Peak']), 2))
-            
-            # Get comprehensive summary
-            full_summary = create_summary_idx(df_analytics)
-            
-            # Prepare equity curve data for chart
-            equity_curve = []
-            for idx, row in df_analytics.iterrows():
+        # Prepare equity curve data for chart (if Cumulative column exists)
+        equity_curve = []
+        drawdown_data = []
+        
+        if not df.empty and 'Cumulative' in df.columns:
+            for idx, row in df.iterrows():
                 equity_curve.append({
-                    "date": row['Entry Date'].strftime('%Y-%m-%d') if pd.notna(row['Entry Date']) else '',
+                    "date": row['Entry Date'].strftime('%d-%m-%Y') if pd.notna(row['Entry Date']) else '',
                     "cumulative_pnl": float(row['Cumulative']),
-                    "peak": float(row['Peak'])
+                    "peak": float(row.get('Peak', 0))
                 })
-            
-            # Prepare drawdown data for chart
-            drawdown_data = []
-            for idx, row in df_analytics.iterrows():
+                
                 drawdown_data.append({
-                    "date": row['Entry Date'].strftime('%Y-%m-%d') if pd.notna(row['Entry Date']) else '',
-                    "drawdown_pct": float(row['%DD']),
-                    "drawdown_pts": float(row['DD'])
+                    "date": row['Entry Date'].strftime('%d-%m-%Y') if pd.notna(row['Entry Date']) else '',
+                    "drawdown_pct": float(row.get('%DD', 0)),
+                    "drawdown_pts": float(row.get('DD', 0))
                 })
-        else:
-            full_summary = {}
-            equity_curve = []
-            drawdown_data = []
         
-        # Map summary fields to match frontend expectations EXACTLY
+        # Use summary directly from engine - it's already correct!
+        # Just convert numpy types to Python native types
         summary_mapped = {
-            "total_pnl": full_summary.get("Sum", summary.get("total_pnl", 0)),
-            "count": full_summary.get("Count", summary.get("count", summary.get("total_trades", 0))),
-            "win_pct": full_summary.get("W%", summary.get("win_pct", summary.get("win_rate", 0))),
-            "loss_pct": full_summary.get("L%", summary.get("loss_pct", 0)),
-            "avg_win": full_summary.get("Avg(W)", summary.get("avg_win", 0)),
-            "avg_loss": full_summary.get("Avg(L)", summary.get("avg_loss", 0)),
+            "total_pnl": summary.get("total_pnl", 0),
+            "count": summary.get("count", 0),  # This is the CORRECT count from engine (53)
+            "win_pct": summary.get("win_pct", 0),
+            "loss_pct": summary.get("loss_pct", 0),
+            "avg_win": summary.get("avg_win", 0),
+            "avg_loss": summary.get("avg_loss", 0),
             "max_win": summary.get("max_win", 0),
             "max_loss": summary.get("max_loss", 0),
             "avg_profit_per_trade": summary.get("avg_profit_per_trade", 0),
-            "expectancy": full_summary.get("Expectancy", summary.get("expectancy", 0)),
+            "expectancy": summary.get("expectancy", 0),
             "reward_to_risk": summary.get("reward_to_risk", 0),
-            "cagr_options": full_summary.get("CAGR(Options)", summary.get("cagr_options", 0)),
-            "cagr_spot": full_summary.get("CAGR(Spot)", summary.get("cagr_spot", 0)),
-            "max_dd_pct": full_summary.get("DD", summary.get("max_dd_pct", 0)),
-            "max_dd_pts": full_summary.get("DD(Points)", summary.get("max_dd_pts", 0)),
-            "car_mdd": full_summary.get("CAR/MDD", summary.get("car_mdd", 0)),
-            "recovery_factor": full_summary.get("Recovery Factor", summary.get("recovery_factor", 0)),
+            "cagr_options": summary.get("cagr_options", 0),
+            "cagr_spot": summary.get("cagr_spot", 0),
+            "max_dd_pct": summary.get("max_dd_pct", 0),
+            "max_dd_pts": summary.get("max_dd_pts", 0),
+            "car_mdd": summary.get("car_mdd", 0),
+            "recovery_factor": summary.get("recovery_factor", 0),
             "max_win_streak": summary.get("max_win_streak", 0),
             "max_loss_streak": summary.get("max_loss_streak", 0),
             "mdd_duration_days": summary.get("mdd_duration_days", 0),
             "mdd_start_date": summary.get("mdd_start_date", ""),
             "mdd_end_date": summary.get("mdd_end_date", ""),
+            "mdd_trade_number": summary.get("mdd_trade_number", None),
             "spot_change": summary.get("spot_change", 0),
         }
         summary = convert_numpy_types(summary_mapped)
@@ -1144,6 +1125,15 @@ async def dynamic_backtest(request: dict):
             "drawdown": drawdown_data,
             "log": []
         }
+        
+        # DEBUG: Log what we're sending to frontend
+        print(f"\n{'='*70}")
+        print(f"RESPONSE TO FRONTEND:")
+        print(f"  trades array length: {len(trades_list)}")
+        print(f"  summary.count: {summary.get('count', 'MISSING')}")
+        print(f"  meta.total_trades: {response_data['meta']['total_trades']}")
+        print(f"  First trade has Cumulative: {'Cumulative' in trades_list[0] if trades_list else 'No trades'}")
+        print(f"{'='*70}\n")
             
         return response_data
         

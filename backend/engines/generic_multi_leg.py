@@ -144,6 +144,8 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
         for i in range(len(interval_df)):
             fromDate = interval_df.iloc[i]['From']
             toDate = interval_df.iloc[i]['To']
+            
+            trade_number = i + 1  # Trade number (1, 2, 3...)
 
             if fromDate == toDate:
                 continue
@@ -351,22 +353,49 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 # Add this leg's P&L to total
                 total_pnl += leg_pnl
 
-            # Create trade record with all leg details
-            trade_record = {
-                "Entry Date": fromDate,
-                "Exit Date": toDate,
-                "Entry Spot": entry_spot,
-                "Exit Spot": exit_spot,
-                "Spot P&L": round(exit_spot - entry_spot, 2) if exit_spot else None,
-                "Future Expiry": fut_expiry,
-                "Net P&L": round(total_pnl, 2),
-            }
-            
-            # Add all leg details to the trade record
-            for leg_detail in leg_details:
-                trade_record.update(leg_detail)
+            # Create SEPARATE trade record for EACH LEG (like AlgoTest format)
+            for idx, leg_detail in enumerate(leg_details):
+                # Get the actual leg object for this iteration
+                leg_obj = strategy_def.legs[idx]
                 
-            trades.append(trade_record)
+                # Find P&L key dynamically (could be Leg_1_P&L, Leg_2_P&L, etc.)
+                pnl_key = [k for k in leg_detail.keys() if 'P&L' in k][0]
+                leg_pnl_value = leg_detail.get(pnl_key, 0)
+                
+                # Extract leg info from Type field (e.g., "OPTION_CE_SELL")
+                leg_type = leg_detail.get(f'Leg_{idx+1}_Type', '')
+                parts = leg_type.split('_')
+                
+                # Determine Type, Position
+                if len(parts) >= 3:
+                    option_type = parts[1] if len(parts) > 1 else ''  # CE or PE
+                    position = parts[2] if len(parts) > 2 else ''     # BUY or SELL
+                else:
+                    option_type = ''
+                    position = ''
+                
+                strike = leg_detail.get(f'Leg_{idx+1}_Strike', '')
+                entry_price = leg_detail.get(f'Leg_{idx+1}_EntryPrice', '')
+                exit_price = leg_detail.get(f'Leg_{idx+1}_ExitPrice', '')
+                
+                trade_record = {
+                    "Index": trade_number,
+                    "Entry Date": fromDate,
+                    "Exit Date": toDate,
+                    "Type": option_type,
+                    "Strike": strike,
+                    "B/S": position,
+                    "Qty": leg_obj.lots,  # Use lot size from leg configuration
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "Entry Spot": entry_spot,
+                    "Exit Spot": exit_spot,
+                    "Spot P&L": round(exit_spot - entry_spot, 2) if exit_spot else None,
+                    "Future Expiry": fut_expiry,
+                    "Net P&L": leg_pnl_value,
+                }
+                
+                trades.append(trade_record)
 
     # Final output processing
     if not trades:
