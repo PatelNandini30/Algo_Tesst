@@ -4,7 +4,12 @@ from functools import lru_cache
 from datetime import datetime, timedelta
 import math
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Optional, Dict, Any
+
+# Thread pool for async file I/O
+_executor = ThreadPoolExecutor(max_workers=4)
 
 # Constants for data directories
 # Hardcoded absolute paths for Windows environment
@@ -162,6 +167,15 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     # DEBUG print commented out for performance
     # print(f"      DEBUG: Loaded CSV for {date_str}, rows: {len(result)}, NIFTY: {len(result[result['Symbol']=='NIFTY'])}")
     return result
+
+
+async def load_bhavcopy_async(date_str: str) -> pd.DataFrame:
+    """
+    Async version of load_bhavcopy - runs in thread pool to avoid blocking event loop
+    Uses the same LRU cache for performance
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, load_bhavcopy, date_str)
 
 def get_option_price(bhavcopy_df, symbol, instrument, option_type, expiry, strike):
     # Normalize expiry to Timestamp (no .date() calls)
@@ -403,14 +417,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df['Cumulative'] = df[pnl_col].cumsum()
     
     # Get initial capital for CAGR calculation only
-    if 'Entry Spot' in df.columns and not df.empty:
-        initial_capital = float(df.iloc[0]['Entry Spot'])
-    else:
-        # Fallback: use absolute value of worst loss as proxy for capital
-        if len(df[df[pnl_col] < 0]) > 0:
-            initial_capital = abs(df[df[pnl_col] < 0][pnl_col].min())
-        else:
-            initial_capital = 100000.0  # Default capital
+    # Use default capital of 1 lakh (100000) as initial trading capital
+    initial_capital = 100000.0
 
     # High-water mark (peak equity)
     df['Peak'] = df['Cumulative'].cummax()

@@ -5,6 +5,51 @@ import sys
 import os
 import pandas as pd
 import numpy as np
+import hashlib
+import json
+import threading
+import time
+
+# Simple in-memory cache for backtest results
+class BacktestCache:
+    def __init__(self, max_size=100, ttl_seconds=3600):
+        self._cache: Dict[str, tuple] = {}
+        self._lock = threading.Lock()
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+    
+    def _make_key(self, params: dict) -> str:
+        # Create a hash key from the request params
+        # Remove non-serializable items
+        serializable = {k: v for k, v in params.items() if k != 'strategy'}
+        try:
+            key_str = json.dumps(serializable, sort_keys=True, default=str)
+        except:
+            key_str = str(serializable)
+        return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def get(self, params: dict) -> Optional[dict]:
+        key = self._make_key(params)
+        with self._lock:
+            if key in self._cache:
+                result, timestamp = self._cache[key]
+                if time.time() - timestamp < self._ttl:
+                    return result
+                else:
+                    del self._cache[key]
+        return None
+    
+    def set(self, params: dict, result: dict):
+        key = self._make_key(params)
+        with self._lock:
+            if len(self._cache) >= self._max_size:
+                # Remove oldest entry
+                oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][1])
+                del self._cache[oldest_key]
+            self._cache[key] = (result, time.time())
+
+# Global cache instance
+backtest_cache = BacktestCache(max_size=50, ttl_seconds=1800)  # 30 min cache
 
 # Add the parent directory to the path to import engines
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -241,6 +286,12 @@ async def run_backtest_logic(request: BacktestRequest):
     - Positional only (no intraday)
     - Future expiry = first monthly >= option expiry
     """
+    # Check cache first
+    cache_params = request.model_dump()
+    cached_result = backtest_cache.get(cache_params)
+    if cached_result is not None:
+        return cached_result
+    
     try:
         # Convert frontend parameters to engine format (STRICT MAPPING)
         params = {
@@ -506,12 +557,12 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                 instr_str = str(leg.instrument.value)
             else:
                 instr_str = str(leg.instrument)
-            print(f">>> DEBUG: leg.instrument = '{instr_str}'")
-            print(f">>> DEBUG: leg.option_type = '{leg.option_type}'")
+            # print(f">>> DEBUG: leg.instrument = '{instr_str}'")
+            # print(f">>> DEBUG: leg.option_type = '{leg.option_type}'")
             
             # Check for options more robustly
             is_option = 'option' in instr_str.lower() or instr_str == 'Option'
-            print(f">>> DEBUG: is_option = {is_option}")
+            # print(f">>> DEBUG: is_option = {is_option}")
             
             # Handle position enum
             if hasattr(leg.position, 'value'):
@@ -575,7 +626,7 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             traceback.print_exc()
     
     # Default to generic_multi_leg
-    print("\n✓ Using generic_multi_leg engine\n")
+    # print("\n✓ Using generic_multi_leg engine\n")
     params["strategy"] = strategy_def
     return run_generic_multi_leg(params)
 
@@ -609,12 +660,21 @@ async def dynamic_backtest(request: dict):
     """
     Dynamic backtesting endpoint for multi-leg strategies
     """
+    # Create cache key from request
+    cache_params = request.copy()
+    
+    # Check cache first
+    cached_result = backtest_cache.get(cache_params)
+    if cached_result is not None:
+        print("✓ Returning cached result")
+        return cached_result
+    
      # ADD THIS - Log what frontend sends
-    print("\n" + "="*70)
-    print("REQUEST FROM FRONTEND:")
-    import json
-    print(json.dumps(request, indent=2, default=str))
-    print("="*70 + "\n")
+    # print("\n" + "="*70)
+    # print("REQUEST FROM FRONTEND:")
+    # import json
+    # print(json.dumps(request, indent=2, default=str))
+    # print("="*70 + "\n")
     
     # Check if imports were successful
     if not IMPORT_SUCCESS:
@@ -998,7 +1058,7 @@ async def dynamic_backtest(request: dict):
         
         # Prepare response with proper column mapping for frontend
         if not df.empty:
-            print(f"DEBUG: Original columns: {list(df.columns)}")
+            # print(f"DEBUG: Original columns: {list(df.columns)}")
             # Rename columns to match frontend expectations (create a copy to avoid modifying original)
             column_mapping = {
                 'entry_date': 'Entry Date',
@@ -1021,7 +1081,7 @@ async def dynamic_backtest(request: dict):
             }
             # Only rename columns that exist in the DataFrame
             existing_columns = {k: v for k, v in column_mapping.items() if k in df.columns}
-            print(f"DEBUG: Renaming columns: {existing_columns}")
+            # print(f"DEBUG: Renaming columns: {existing_columns}")
             df = df.rename(columns=existing_columns)
             
             # Reorder columns to match frontend expectations exactly
@@ -1040,9 +1100,9 @@ async def dynamic_backtest(request: dict):
             frontend_columns = [c for c in frontend_columns if c in df.columns]
             df = df[frontend_columns]
             
-            print(f"DEBUG: After reorder: {list(df.columns)}")
+            # print(f"DEBUG: After reorder: {list(df.columns)}")
             trades_list = df.to_dict('records')
-            print(f"DEBUG: First trade keys: {list(trades_list[0].keys()) if trades_list else 'No trades'}")
+            # print(f"DEBUG: First trade keys: {list(trades_list[0].keys()) if trades_list else 'No trades'}")
         else:
             trades_list = []
         
@@ -1126,15 +1186,18 @@ async def dynamic_backtest(request: dict):
             "log": []
         }
         
+        # Cache the result
+        backtest_cache.set(cache_params, response_data)
+        
         # DEBUG: Log what we're sending to frontend
-        print(f"\n{'='*70}")
-        print(f"RESPONSE TO FRONTEND:")
-        print(f"  trades array length: {len(trades_list)}")
-        print(f"  summary.count: {summary.get('count', 'MISSING')}")
-        print(f"  meta.total_trades: {response_data['meta']['total_trades']}")
-        print(f"  First trade has Cumulative: {'Cumulative' in trades_list[0] if trades_list else 'No trades'}")
-        print(f"{'='*70}\n")
-            
+        # print(f"\n{'='*70}")
+        # print(f"RESPONSE TO FRONTEND:")
+        # print(f"  trades array length: {len(trades_list)}")
+        # print(f"  summary.count: {summary.get('count', 'MISSING')}")
+        # print(f"  meta.total_trades: {response_data['meta']['total_trades']}")
+        # print(f"  First trade has Cumulative: {'Cumulative' in trades_list[0] if trades_list else 'No trades'}")
+        # print(f"{'='*70}\n")
+             
         return response_data
         
     except HTTPException:

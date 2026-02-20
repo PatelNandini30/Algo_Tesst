@@ -337,14 +337,14 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
             if fromDate == toDate:
                 continue
             
-            # BASE START OVERRIDE (EXACT copy from v1)
-            is_base_start = (base2['Start'] == fromDate).any()
-            if is_base_start:
-                override_df = monthly_exp[
-                    monthly_exp['Current Expiry'] > fromDate
-                ].reset_index(drop=True)
-                if len(override_df) > 1:
-                    fut_expiry = override_df.iloc[1]['Current Expiry']
+            # BASE START OVERRIDE - DISABLED (base2 not loaded)
+            # is_base_start = (base2['Start'] == fromDate).any()
+            # if is_base_start:
+            #     override_df = monthly_exp[
+            #         monthly_exp['Current Expiry'] > fromDate
+            #     ].reset_index(drop=True)
+            #     if len(override_df) > 1:
+            #         fut_expiry = override_df.iloc[1]['Current Expiry']
             
             # Entry / Exit spots
             entry_row = filtered_data[filtered_data['Date'] == fromDate]

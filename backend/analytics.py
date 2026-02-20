@@ -62,11 +62,8 @@ def create_summary_idx(df: pd.DataFrame) -> Dict[str, Any]:
     
     # Calculate CAGR
     # CAGR = ((Final Capital / Initial Capital) ^ (1/Years) - 1) * 100
-    # Where:
-    #   - Initial Capital = First trade's Entry Spot
-    #   - Final Capital = Initial Capital + Total P&L
-    #   - Years = Total Calendar Days / 365
-    initial_capital = df.iloc[0]['Entry Spot'] if 'Entry Spot' in df.columns else df.iloc[0]['entry_spot']
+    # Use default capital of 1 lakh (100000) as initial trading capital
+    initial_capital = 100000.0
     start_date = df['Entry Date'].min() if 'Entry Date' in df.columns else df['entry_date'].min()
     end_date = df['Exit Date'].max() if 'Exit Date' in df.columns else df['exit_date'].max()
     n_years = max((end_date - start_date).days / 365.0, 0.01)

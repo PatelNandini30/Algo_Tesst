@@ -82,40 +82,211 @@ from base import (
 )
 
 
-def check_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_config, 
-                          index, stop_loss_pct, target_pct, trading_calendar):
+def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_config,
+                               index, trading_calendar, square_off_mode='partial'):
     """
-    Check if stop loss or target is hit during the holding period.
-    Returns (exit_date, exit_reason) if hit, else (None, None)
+    Check per-leg stop loss / target during the holding period.
+
+    Each leg can carry its own:
+        stop_loss       – numeric value or None  (absence = no SL)
+        stop_loss_type  – 'pct'  → % of entry premium
+                          'points' → absolute index points of net P&L on this leg
+        target          – numeric value or None
+        target_type     – 'pct' | 'points'
+
+    square_off_mode:
+        'partial'  – only the triggered leg is marked as "early-exit"; others continue.
+        'complete' – the first triggered leg causes ALL legs to early-exit on the same day.
+
+    Returns:
+        A list of dicts, one per leg_config, with keys:
+            'triggered'    : bool
+            'exit_date'    : pd.Timestamp (original exit_date if not triggered)
+            'exit_reason'  : str
+        If no legs have SL/Target configured, returns None (caller uses original logic).
+    """
+    # Quick exit: nothing to check
+    has_any_sl_target = any(
+        (lg.get('stop_loss') is not None or lg.get('target') is not None)
+        for lg in legs_config
+    )
+    if not has_any_sl_target:
+        return None
+
+    # All trading days between entry (exclusive) and planned exit (inclusive)
+    holding_days = trading_calendar[
+        (trading_calendar['date'] > entry_date) &
+        (trading_calendar['date'] <= exit_date)
+    ]['date'].tolist()
+
+    # Per-leg tracking: once a leg is triggered it stays triggered
+    leg_results = [
+        {
+            'triggered': False,
+            'exit_date': exit_date,
+            'exit_reason': 'SCHEDULED',
+        }
+        for _ in legs_config
+    ]
+
+    for check_date in holding_days:
+        all_triggered = all(r['triggered'] for r in leg_results)
+        if all_triggered:
+            break  # Nothing left to check
+
+        # Evaluate each still-active leg
+        newly_triggered_this_day = []
+
+        for li, leg in enumerate(legs_config):
+            if leg_results[li]['triggered']:
+                continue  # Already done
+
+            sl_val   = leg.get('stop_loss')
+            sl_type  = leg.get('stop_loss_type', 'pct')
+            tgt_val  = leg.get('target')
+            tgt_type = leg.get('target_type', 'pct')
+
+            if sl_val is None and tgt_val is None:
+                continue  # No SL/Target for this leg
+
+            segment = leg.get('segment', 'OPTION')
+            if segment == 'FUTURES':
+                # For futures we use points P&L only
+                current_price = get_future_price_from_db(
+                    date=check_date.strftime('%Y-%m-%d'),
+                    index=index,
+                    expiry=expiry_date.strftime('%Y-%m-%d')
+                )
+                if current_price is None:
+                    continue
+
+                entry_price = leg.get('entry_price')
+                if entry_price is None:
+                    continue
+
+                position = leg['position']
+                lot_size = leg.get('lot_size', get_lot_size(index, entry_date))
+                lots     = leg.get('lots', 1)
+
+                if position == 'BUY':
+                    raw_pnl  = (current_price - entry_price) * lots * lot_size
+                    raw_pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price else 0
+                else:
+                    raw_pnl  = (entry_price - current_price) * lots * lot_size
+                    raw_pnl_pct = ((entry_price - current_price) / entry_price * 100) if entry_price else 0
+
+            else:  # OPTIONS
+                option_type = leg.get('option_type')
+                strike      = leg.get('strike')
+                if not option_type or not strike:
+                    continue
+
+                current_premium = get_option_premium_from_db(
+                    date=check_date.strftime('%Y-%m-%d'),
+                    index=index,
+                    strike=strike,
+                    option_type=option_type,
+                    expiry=expiry_date.strftime('%Y-%m-%d')
+                )
+                if current_premium is None:
+                    continue
+
+                entry_premium = leg.get('entry_premium')
+                if entry_premium is None:
+                    continue
+
+                position = leg['position']
+                lot_size = leg.get('lot_size', get_lot_size(index, entry_date))
+                lots     = leg.get('lots', 1)
+
+                if position == 'BUY':
+                    raw_pnl     = (current_premium - entry_premium) * lots * lot_size
+                    raw_pnl_pct = ((current_premium - entry_premium) / entry_premium * 100) if entry_premium else 0
+                else:
+                    raw_pnl     = (entry_premium - current_premium) * lots * lot_size
+                    raw_pnl_pct = ((entry_premium - current_premium) / entry_premium * 100) if entry_premium else 0
+
+            # ── Evaluate SL ──
+            if sl_val is not None:
+                if sl_type == 'pct':
+                    hit_sl = raw_pnl_pct <= -sl_val
+                else:  # points
+                    hit_sl = raw_pnl <= -sl_val
+            else:
+                hit_sl = False
+
+            # ── Evaluate Target ──
+            if tgt_val is not None:
+                if tgt_type == 'pct':
+                    hit_tgt = raw_pnl_pct >= tgt_val
+                else:
+                    hit_tgt = raw_pnl >= tgt_val
+            else:
+                hit_tgt = False
+
+            if hit_sl or hit_tgt:
+                reason = 'STOP_LOSS' if hit_sl else 'TARGET'
+                _log(f"      {'🛑' if hit_sl else '✅'} Leg {li+1} {reason} hit on {check_date.strftime('%Y-%m-%d')} "
+                     f"(pnl={raw_pnl:.2f}, pnl%={raw_pnl_pct:.2f}%)")
+                newly_triggered_this_day.append((li, check_date, reason))
+
+        # ── Apply triggers based on square_off_mode ──
+        if newly_triggered_this_day:
+            if square_off_mode == 'complete':
+                # All legs exit on the earliest trigger date of this day
+                trigger_date = newly_triggered_this_day[0][1]
+                trigger_reason = newly_triggered_this_day[0][2]
+                for li2, r in enumerate(leg_results):
+                    if not r['triggered']:
+                        leg_results[li2] = {
+                            'triggered': True,
+                            'exit_date': trigger_date,
+                            'exit_reason': f'COMPLETE_{trigger_reason}',
+                        }
+                break  # No need to check further dates
+            else:
+                # 'partial' – mark only triggered legs
+                for (li, tdate, treason) in newly_triggered_this_day:
+                    leg_results[li] = {
+                        'triggered': True,
+                        'exit_date': tdate,
+                        'exit_reason': treason,
+                    }
+
+    return leg_results
+
+
+# ── Legacy wrapper kept for backward-compat with old code paths ──────────────
+def check_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_config,
+                           index, stop_loss_pct, target_pct, trading_calendar):
+    """
+    Legacy overall-level SL/Target check (used by old engines).
+    Checks combined portfolio P&L, exits ALL legs on breach.
     """
     if stop_loss_pct is None and target_pct is None:
         return None, None
-    
-    # Get all trading days between entry and exit (exclusive of entry)
+
     holding_days = trading_calendar[
-        (trading_calendar['date'] > entry_date) & 
+        (trading_calendar['date'] > entry_date) &
         (trading_calendar['date'] <= exit_date)
     ]['date'].tolist()
-    
+
     for check_date in holding_days:
-        # Calculate P&L for each leg at this date
         total_pnl_pct = 0
         has_data = False
-        
+
         for leg in legs_config:
             segment = leg.get('segment', 'OPTION')
             if segment == 'FUTURES':
                 continue
-            
-            position = leg['position']
-            lots = leg['lots']
-            option_type = leg['option_type']
-            strike = leg.get('strike')
-            
+
+            position      = leg['position']
+            lots          = leg['lots']
+            option_type   = leg['option_type']
+            strike        = leg.get('strike')
             if strike is None:
                 continue
-            
-            # Get premium at this date
+
             current_premium = get_option_premium_from_db(
                 date=check_date.strftime('%Y-%m-%d'),
                 index=index,
@@ -123,36 +294,32 @@ def check_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_
                 option_type=option_type,
                 expiry=expiry_date.strftime('%Y-%m-%d')
             )
-            
             if current_premium is None:
                 continue
-            
+
             has_data = True
             entry_premium = leg.get('entry_premium')
             if entry_premium is None:
                 continue
-            
-            # Calculate P&L percentage for this leg
+
             if position == 'BUY':
                 leg_pnl_pct = ((current_premium - entry_premium) / entry_premium) * 100 if entry_premium > 0 else 0
-            else:  # SELL
+            else:
                 leg_pnl_pct = ((entry_premium - current_premium) / entry_premium) * 100 if entry_premium > 0 else 0
-            
+
             total_pnl_pct += leg_pnl_pct
-        
+
         if not has_data:
             continue
-        
-        # Check stop loss (negative P&L)
+
         if stop_loss_pct is not None and total_pnl_pct <= -stop_loss_pct:
-            print(f"      🛑 STOP LOSS HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
+            _log(f"      🛑 STOP LOSS HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
             return check_date, 'STOP_LOSS'
-        
-        # Check target (positive P&L)
+
         if target_pct is not None and total_pnl_pct >= target_pct:
-            print(f"      TARGET HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
+            _log(f"      ✅ TARGET HIT at {check_date.strftime('%Y-%m-%d')} (P&L: {total_pnl_pct:.2f}%)")
             return check_date, 'TARGET'
-    
+
     return None, None
 
 
@@ -200,6 +367,7 @@ def run_algotest_backtest(params):
     # Stop loss and target parameters
     stop_loss_pct = params.get('stop_loss_pct', None)  # e.g., 50 = exit if loss exceeds 50%
     target_pct = params.get('target_pct', None)  # e.g., 100 = exit if profit reaches 100%
+    square_off_mode = params.get('square_off_mode', 'partial')  # 'partial' | 'complete'
     
     print(f"\n{'='*60}")
     print(f"ALGOTEST-STYLE BACKTEST")
@@ -491,11 +659,35 @@ def run_algotest_backtest(params):
                         'pnl': leg_pnl
                     })
             
-            # ========== STEP 8B: CHECK STOP LOSS / TARGET ==========
-            sl_hit_date = None
-            sl_reason = None
+            # ========== STEP 8B: CHECK PER-LEG STOP LOSS / TARGET ==========
+            # Also supports legacy overall stop_loss_pct / target_pct for backward compat.
             
-            if trade_legs and (stop_loss_pct is not None or target_pct is not None):
+            # ── Per-leg SL/Target (new path) ──
+            # Attach per-leg SL/Target config from frontend payload into trade_legs
+            for li, tleg in enumerate(trade_legs):
+                src = legs_config[li] if li < len(legs_config) else {}
+                tleg['stop_loss']       = src.get('stop_loss', None)
+                tleg['stop_loss_type']  = src.get('stop_loss_type', 'pct')
+                tleg['target']          = src.get('target', None)
+                tleg['target_type']     = src.get('target_type', 'pct')
+
+            per_leg_results = check_leg_stop_loss_target(
+                entry_date=entry_date,
+                exit_date=exit_date,
+                expiry_date=expiry_date,
+                entry_spot=entry_spot,
+                legs_config=trade_legs,
+                index=index,
+                trading_calendar=trading_calendar,
+                square_off_mode=square_off_mode
+            )
+
+            # ── Overall (legacy) SL/Target fallback ──
+            sl_hit_date = None
+            sl_reason   = None
+
+            if per_leg_results is None and (stop_loss_pct is not None or target_pct is not None):
+                # No per-leg SL/Target configured → use legacy overall check
                 sl_hit_date, sl_reason = check_stop_loss_target(
                     entry_date=entry_date,
                     exit_date=exit_date,
@@ -507,60 +699,86 @@ def run_algotest_backtest(params):
                     target_pct=target_pct,
                     trading_calendar=trading_calendar
                 )
-                
                 if sl_hit_date is not None:
-                    original_exit_date = exit_date
-                    exit_date = sl_hit_date
-                    print(f"  WARNING: Exiting on {exit_date.strftime('%Y-%m-%d')} due to {sl_reason}")
+                    # Legacy path: all legs exit together
+                    per_leg_results = [
+                        {'triggered': True, 'exit_date': sl_hit_date, 'exit_reason': sl_reason}
+                        for _ in trade_legs
+                    ]
 
-                    # FIX: get lot_size here so SL P&L matches normal path
-                    lot_size_sl = get_lot_size(index, entry_date)
+            # ── Apply per-leg exit dates & recalculate P&L where needed ──
+            if per_leg_results is not None:
+                lot_size_sl = get_lot_size(index, entry_date)
+                any_early = False
 
-                    # Recalculate exit premium for each leg based on new exit_date
-                    for leg in trade_legs:
-                        if leg.get('segment') == 'OPTION':
-                            opt_type = leg.get('option_type')
-                            strike = leg.get('strike')
-                            position = leg.get('position')
-                            lots = leg.get('lots')
-                            entry_prem = leg.get('entry_premium')
-                            
-                            if opt_type and strike and position and entry_prem:
-                                # Calculate exit premium based on new SL exit date
-                                # Apply same fix: try market data first, fallback to intrinsic
-                                new_exit_premium = get_option_premium_from_db(
-                                    date=exit_date.strftime('%Y-%m-%d'),
-                                    index=index,
-                                    strike=strike,
-                                    option_type=opt_type,
-                                    expiry=expiry_date.strftime('%Y-%m-%d')
-                                )
-                                
-                                if new_exit_premium is None:
-                                    # Market data missing — use intrinsic value as fallback
-                                    exit_spot = get_spot_price_from_db(exit_date, index)
-                                    if exit_spot is None:
-                                        exit_spot = entry_spot
-                                    new_exit_premium = calculate_intrinsic_value(
-                                        spot=exit_spot,
-                                        strike=strike,
-                                        option_type=opt_type
-                                    )
-                                
-                                # Recalculate P&L
-                                if position == 'BUY':
-                                    leg_pnl = (new_exit_premium - entry_prem) * lots * lot_size_sl
-                                else:
-                                    leg_pnl = (entry_prem - new_exit_premium) * lots * lot_size_sl
-                                
-                                leg['exit_premium'] = new_exit_premium
-                                leg['pnl'] = leg_pnl
-                                print(f"      Recalculated P&L for leg {leg['leg_number']}: {leg_pnl:,.2f} (lot_size={lot_size_sl})")
+                for li, tleg in enumerate(trade_legs):
+                    res = per_leg_results[li]
+                    leg_exit_date = res['exit_date']
+
+                    if res['triggered'] and leg_exit_date < exit_date:
+                        any_early = True
+                        _log(f"  ⚡ Leg {li+1} exits early on {leg_exit_date.strftime('%Y-%m-%d')} "
+                             f"({res['exit_reason']})")
+
+                        # Recalculate exit price / premium for the early exit date
+                        if tleg.get('segment') == 'OPTION':
+                            opt_type     = tleg.get('option_type')
+                            strike       = tleg.get('strike')
+                            position_leg = tleg.get('position')
+                            lots_leg     = tleg.get('lots', 1)
+                            entry_prem   = tleg.get('entry_premium')
+
+                            new_exit_prem = get_option_premium_from_db(
+                                date=leg_exit_date.strftime('%Y-%m-%d'),
+                                index=index,
+                                strike=strike,
+                                option_type=opt_type,
+                                expiry=expiry_date.strftime('%Y-%m-%d')
+                            )
+                            if new_exit_prem is None:
+                                e_spot = get_spot_price_from_db(leg_exit_date, index) or entry_spot
+                                new_exit_prem = calculate_intrinsic_value(spot=e_spot, strike=strike, option_type=opt_type)
+
+                            if position_leg == 'BUY':
+                                tleg['pnl'] = (new_exit_prem - entry_prem) * lots_leg * lot_size_sl
+                            else:
+                                tleg['pnl'] = (entry_prem - new_exit_prem) * lots_leg * lot_size_sl
+
+                            tleg['exit_premium']   = new_exit_prem
+                            tleg['early_exit_date'] = leg_exit_date
+                            tleg['exit_reason']     = res['exit_reason']
+
+                        elif tleg.get('segment') == 'FUTURE':
+                            position_leg = tleg.get('position')
+                            lots_leg     = tleg.get('lots', 1)
+                            entry_price  = tleg.get('entry_price')
+
+                            new_exit_price = get_future_price_from_db(
+                                date=leg_exit_date.strftime('%Y-%m-%d'),
+                                index=index,
+                                expiry=expiry_date.strftime('%Y-%m-%d')
+                            )
+                            if new_exit_price is None:
+                                new_exit_price = entry_price
+
+                            if position_leg == 'BUY':
+                                tleg['pnl'] = (new_exit_price - entry_price) * lots_leg * lot_size_sl
+                            else:
+                                tleg['pnl'] = (entry_price - new_exit_price) * lots_leg * lot_size_sl
+
+                            tleg['exit_price']      = new_exit_price
+                            tleg['early_exit_date'] = leg_exit_date
+                            tleg['exit_reason']     = res['exit_reason']
+
+                # For trade-level exit_reason, use the first triggered reason (if any)
+                if any_early:
+                    triggered = [r for r in per_leg_results if r['triggered']]
+                    sl_reason = triggered[0]['exit_reason'] if triggered else None
             
             # ========== STEP 9: CALCULATE TOTAL P&L ==========
             total_pnl = sum(leg['pnl'] for leg in trade_legs)
             
-            print(f"\n  Total P&L: {total_pnl:,.2f}")
+            _log(f"\n  Total P&L: {total_pnl:,.2f}")
             
             # ========== STEP 10: GET EXIT SPOT ==========
             # Get exit spot price for the trade
@@ -579,7 +797,9 @@ def run_algotest_backtest(params):
                 'exit_spot': exit_spot,
                 'exit_reason': sl_reason if sl_reason else 'SCHEDULED',
                 'legs': trade_legs,
-                'total_pnl': total_pnl
+                'total_pnl': total_pnl,
+                'square_off_mode': square_off_mode,
+                'per_leg_results': per_leg_results,  # None if no SL/Target
             }
             
             all_trades.append(trade_record)
@@ -606,11 +826,21 @@ def run_algotest_backtest(params):
     for trade_idx, trade in enumerate(all_trades, 1):
         entry_spot_val = trade['entry_spot']
         exit_spot_val = trade.get('exit_spot', trade['entry_spot'])
-        
+        per_leg_res    = trade.get('per_leg_results')  # May be None
+
         # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
         for leg in trade['legs']:
             leg_num = leg['leg_number']
-            
+            li      = leg_num - 1  # 0-based index
+
+            # Resolve per-leg exit date/reason
+            if per_leg_res is not None and li < len(per_leg_res):
+                leg_exit_date   = per_leg_res[li]['exit_date']
+                leg_exit_reason = per_leg_res[li]['exit_reason']
+            else:
+                leg_exit_date   = trade['exit_date']
+                leg_exit_reason = trade.get('exit_reason', 'SCHEDULED')
+
             # Determine Type and Position
             if leg['segment'] == 'FUTURE':
                 option_type = 'FUT'
@@ -626,19 +856,20 @@ def run_algotest_backtest(params):
                 exit_price = leg.get('exit_premium', 0)
             
             leg_pnl = leg['pnl']
-            lot_size = leg.get('lot_size', 65)  # Get stored lot_size
-            qty = lots * lot_size  # Calculate total quantity
+            lots = leg.get('lots', 1)
+            lot_size = leg.get('lot_size', 65)
+            qty = lots * lot_size
             
             row = {
-                'Trade': trade_idx,  # Trade group number
-                'Leg': leg_num,  # Leg number within trade
-                'Index': trade_counter + leg_num,  # Unique row index
+                'Trade': trade_idx,
+                'Leg': leg_num,
+                'Index': trade_counter + leg_num,
                 'Entry Date': trade['entry_date'],
-                'Exit Date': trade['exit_date'],
+                'Exit Date': leg_exit_date,         # Per-leg exit date (may differ in partial mode)
                 'Type': option_type,
                 'Strike': strike,
                 'B/S': position,
-                'Qty': qty,  # Use lots × lot_size
+                'Qty': qty,
                 'Entry Price': entry_price,
                 'Exit Price': exit_price,
                 'Entry Spot': entry_spot_val,
@@ -646,7 +877,7 @@ def run_algotest_backtest(params):
                 'Spot P&L': round(exit_spot_val - entry_spot_val, 2) if exit_spot_val and entry_spot_val else 0,
                 'Future Expiry': trade['expiry_date'],
                 'Net P&L': leg_pnl,
-                'Exit Reason': trade.get('exit_reason', 'SCHEDULED')
+                'Exit Reason': leg_exit_reason,     # Per-leg reason
             }
             
             trades_flat.append(row)

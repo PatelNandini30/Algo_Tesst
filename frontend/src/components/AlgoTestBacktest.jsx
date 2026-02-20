@@ -1,22 +1,14 @@
-import React, { useState } from 'react';
-import { Play, Plus, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle } from 'lucide-react';
 import ResultsPanel from './ResultsPanel';
 
-// ─── CHANGE 1 ───────────────────────────────────────────────────────────────
-// REMOVED: static LOT_SIZES = { NIFTY: 75, BANKNIFTY: 15, ... }
-//   Problem: NIFTY:75 was applied to ALL years but NSE changed lot sizes 4x.
-//   For 2000-2026 data this was wrong for every period except Oct2015-Oct2019.
-// ADDED: date-aware getLotSize(index, tradeDate) — mirrors backend exactly.
-//   NIFTY:     2000–Sep2010=200 | Oct2010–Oct2015=50 | Oct2015–Oct2019=75 | Nov2019+=65
-//   BANKNIFTY: 2000–Sep2010=50  | Oct2010–Oct2015=25 | Oct2015–Oct2019=20 | Nov2019+=15
-// ────────────────────────────────────────────────────────────────────────────
 const getLotSize = (index, tradeDate) => {
   const d = new Date(tradeDate);
   if (index === 'NIFTY') {
     if (d < new Date('2010-10-01')) return 200;
     if (d < new Date('2015-10-29')) return 50;
     if (d < new Date('2019-11-01')) return 75;
-    return 65;  // Updated to match AlgoTest
+    return 65;
   }
   if (index === 'BANKNIFTY') {
     if (d < new Date('2010-10-01')) return 50;
@@ -30,66 +22,157 @@ const getLotSize = (index, tradeDate) => {
   return 1;
 };
 
+const Toggle = ({ enabled, onToggle, size = 'md' }) => {
+  const sizeClasses = size === 'sm' ? 'h-4 w-7' : 'h-5 w-9';
+  const dotClasses = size === 'sm' ? 'h-3 w-3' : 'h-3.5 w-3.5';
+  const translateClasses = size === 'sm' ? (enabled ? 'translate-x-3' : 'translate-x-0.5') : (enabled ? 'translate-x-4' : 'translate-x-0.5');
+  
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={`relative inline-flex ${sizeClasses} flex-shrink-0 items-center rounded-full transition-colors focus:outline-none ${
+        enabled ? 'bg-blue-600' : 'bg-gray-300'
+      }`}
+    >
+      <span className={`inline-block ${dotClasses} transform rounded-full bg-white shadow transition-transform ${translateClasses}`} />
+    </button>
+  );
+};
+
+const Tooltip = ({ text }) => {
+  const [show, setShow] = useState(false);
+  return (
+    <span className="relative inline-flex">
+      <button
+        type="button"
+        className="text-gray-400 hover:text-gray-600 focus:outline-none"
+        onMouseEnter={() => setShow(true)}
+        onMouseLeave={() => setShow(false)}
+      >
+        <Info size={12} />
+      </button>
+      {show && (
+        <span className="absolute left-5 top-0 z-50 w-56 rounded bg-gray-900 p-2.5 text-xs text-white shadow-xl whitespace-normal leading-relaxed">
+          {text}
+        </span>
+      )}
+    </span>
+  );
+};
+
+const SegBtn = ({ options, value, onChange, size = 'md' }) => {
+  const sizeClasses = size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-3 py-1 text-xs';
+  
+  return (
+    <div className="inline-flex rounded border border-gray-300 overflow-hidden">
+      {options.map((opt, i) => (
+        <button
+          key={opt.value}
+          type="button"
+          onClick={() => onChange(opt.value)}
+          className={`${sizeClasses} font-medium transition-colors ${
+            i < options.length - 1 ? 'border-r border-gray-300' : ''
+          } ${
+            value === opt.value
+              ? 'bg-blue-600 text-white border-blue-600'
+              : 'bg-white text-gray-700 hover:bg-gray-50'
+          }`}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+};
+
 const AlgoTestBacktest = () => {
   const [instrument, setInstrument] = useState('NIFTY');
   const [underlying, setUnderlying] = useState('cash');
   const [strategyType, setStrategyType] = useState('positional');
   const [expiryBasis, setExpiryBasis] = useState('weekly');
-  const [entryDaysBefore, setEntryDaysBefore] = useState(2);
+  const [entryDaysBefore, setEntryDaysBefore] = useState(0);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
+  const [delayRestart, setDelayRestart] = useState(false);
+  const [delayTime, setDelayTime] = useState('09:15');
+  const [overallMomentum, setOverallMomentum] = useState(false);
+  const [momentumType, setMomentumType] = useState('points_up');
+  const [momentumValue, setMomentumValue] = useState(0);
+  const [squareOffMode, setSquareOffMode] = useState('partial');
+  const [trailSLBreakeven, setTrailSLBreakeven] = useState(false);
+  const [trailSLTarget, setTrailSLTarget] = useState('all_legs');
   const [legs, setLegs] = useState([]);
-  const [expandedLeg, setExpandedLeg] = useState(null);
-  const [overallStopLoss, setOverallStopLoss] = useState(null);
-  const [overallTarget, setOverallTarget] = useState(null);
-  const [startDate, setStartDate] = useState('2020-01-01');
-  const [endDate, setEndDate] = useState('2023-12-31');
+  const [overallSLEnabled, setOverallSLEnabled] = useState(false);
+  const [overallSLType, setOverallSLType] = useState('max_loss');
+  const [overallSLValue, setOverallSLValue] = useState(0);
+  const [overallTgtEnabled, setOverallTgtEnabled] = useState(false);
+  const [overallTgtType, setOverallTgtType] = useState('max_profit');
+  const [overallTgtValue, setOverallTgtValue] = useState(0);
+  const [trailingEnabled, setTrailingEnabled] = useState(false);
+  const [trailingType, setTrailingType] = useState('lock');
+  const [trailingIfProfit, setTrailingIfProfit] = useState(0);
+  const [trailingLockProfit, setTrailingLockProfit] = useState(1);
+  const [reentryOnSL, setReentryOnSL] = useState(false);
+  const [reentryOnSLMode, setReentryOnSLMode] = useState('re_asap');
+  const [reentryOnSLCount, setReentryOnSLCount] = useState(1);
+  const [reentryOnTgt, setReentryOnTgt] = useState(false);
+  const [reentryOnTgtMode, setReentryOnTgtMode] = useState('re_asap');
+  const [reentryOnTgtCount, setReentryOnTgtCount] = useState(1);
+  const [startDate, setStartDate] = useState('2025-02-20');
+  const [endDate, setEndDate] = useState('2026-02-20');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
+  const [validationError, setValidationError] = useState(null);
 
-  // ─── CHANGE 2 ─────────────────────────────────────────────────────────────
-  // ADDED: currentLotSize derived from startDate so header badge and summary
-  // always show the correct lot size for the selected backtest period.
-  // Old: LOT_SIZES[instrument] → always 75 for NIFTY regardless of date.
-  // ────────────────────────────────────────────────────────────────────────────
-  const currentLotSize = getLotSize(instrument, startDate);
+  const daysOptions = expiryBasis === 'weekly' ? [0, 1, 2, 3, 4] : Array.from({ length: 25 }, (_, i) => i);
 
-  const getDaysOptions = () =>
-    expiryBasis === 'weekly'
-      ? [0, 1, 2, 3, 4]
-      : Array.from({ length: 25 }, (_, i) => i);
-  const daysOptions = getDaysOptions();
+  // Validate expiry mismatch
+  const validateExpiry = () => {
+    if (expiryBasis === 'monthly') {
+      const weeklyLegs = legs.filter(l => l.expiry === 'weekly');
+      if (weeklyLegs.length > 0) {
+        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
+        setValidationError(`Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`);
+        return false;
+      }
+    }
+    setValidationError(null);
+    return true;
+  };
+
+  // Run validation when expiryBasis or legs change
+  useEffect(() => {
+    validateExpiry();
+  }, [expiryBasis, legs]);
+
+  const canRunBacktest = !validationError && legs.length > 0 && !loading;
 
   const addLeg = () => {
-    const newLeg = {
+    if (legs.length >= 6) return;
+    setLegs(prev => [...prev, {
       id: Date.now(),
       segment: 'options',
+      lot: 1,
       position: 'sell',
       option_type: 'call',
       expiry: 'weekly',
-      lot: 1,
-      strike_selection: { type: 'strike_type', strike_type: 'atm', strikes_away: 0 }
-    };
-    setLegs([...legs, newLeg]);
-    setExpandedLeg(legs.length);
+      strike_criteria: 'strike_type',
+      strike_type: 'atm',
+      premium_value: 0,
+      premium_min: 0,
+      premium_max: 0,
+      stop_loss_enabled: false,
+      stop_loss: null,
+      stop_loss_type: 'pct',
+      target_enabled: false,
+      target: null,
+      target_type: 'pct',
+    }]);
   };
 
-  const removeLeg = (index) => {
-    setLegs(legs.filter((_, i) => i !== index));
-    if (expandedLeg === index) setExpandedLeg(null);
-  };
-
-  const updateLeg = (index, field, value) => {
-    const newLegs = [...legs];
-    newLegs[index] = { ...newLegs[index], [field]: value };
-    setLegs(newLegs);
-  };
-
-  const updateStrikeSelection = (index, field, value) => {
-    const newLegs = [...legs];
-    newLegs[index].strike_selection = { ...newLegs[index].strike_selection, [field]: value };
-    setLegs(newLegs);
-  };
+  const removeLeg = (id) => setLegs(prev => prev.filter(l => l.id !== id));
+  const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => l.id === id ? { ...l, [field]: value } : l));
 
   const buildPayload = () => ({
     index: instrument,
@@ -98,440 +181,659 @@ const AlgoTestBacktest = () => {
     expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
     entry_dte: entryDaysBefore,
     exit_dte: exitDaysBefore,
-    legs: legs.map(leg => ({ ...leg, lot: leg.lot || 1 })),
-    overall_settings: { stop_loss: overallStopLoss, target: overallTarget },
+    square_off_mode: squareOffMode,
+    trail_sl_breakeven: trailSLBreakeven,
+    trail_sl_target: trailSLTarget,
+    legs: legs.map(l => ({
+      ...l,
+      lot: l.lot || 1,
+      strike_selection: {
+        type: l.strike_criteria,
+        strike_type: l.strike_type,
+        premium: l.premium_value,
+        lower: l.premium_min,
+        upper: l.premium_max,
+      },
+    })),
+    overall_settings: {
+      stop_loss: overallSLEnabled ? overallSLValue : null,
+      stop_loss_type: overallSLType,
+      target: overallTgtEnabled ? overallTgtValue : null,
+      target_type: overallTgtType,
+    },
     date_from: startDate,
     date_to: endDate,
-    expiry_type: expiryBasis.toUpperCase()
+    expiry_type: expiryBasis.toUpperCase(),
   });
 
   const runBacktest = async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
-    setLoading(true);
-    setError(null);
+    if (!validateExpiry()) { setError(validationError); return; }
+    setLoading(true); setError(null);
     try {
-      const response = await fetch('/api/dynamic-backtest', {
+      const res = await fetch('/api/dynamic-backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildPayload())
+        body: JSON.stringify(buildPayload()),
       });
-      if (response.ok) {
-        setResults(await response.json());
-      } else {
-        const e = await response.json();
-        setError(e.detail || 'Backtest failed');
-      }
-    } catch (err) {
+      if (res.ok) setResults(await res.json());
+      else { const e = await res.json(); setError(e.detail || 'Backtest failed'); }
+    } catch {
       setError('Network error. Check if backend is running.');
     } finally {
       setLoading(false);
     }
   };
 
-  const renderStrikeCriteria = (leg, index) => {
-    const { strike_selection: ss } = leg;
-    switch (ss.type) {
-      case 'strike_type':
-        return (
-          <div>
-            <label className="block text-xs font-medium mb-1">Strike Type</label>
-            <select
-              value={ss.strike_type || 'atm'}
-              onChange={(e) => updateStrikeSelection(index, 'strike_type', e.target.value)}
-              className="w-full p-1.5 border rounded text-sm"
-            >
-              <option value="itm20">ITM 20</option>
-              <option value="itm19">ITM 19</option>
-              <option value="itm18">ITM 18</option>
-              <option value="itm17">ITM 17</option>
-              <option value="itm16">ITM 16</option>
-              <option value="itm15">ITM 15</option>
-              <option value="itm14">ITM 14</option>
-              <option value="itm13">ITM 13</option>
-              <option value="itm12">ITM 12</option>
-              <option value="itm11">ITM 11</option>
-              <option value="itm10">ITM 10</option>
-              <option value="itm9">ITM 9</option>
-              <option value="itm8">ITM 8</option>
-              <option value="itm7">ITM 7</option>
-              <option value="itm6">ITM 6</option>
-              <option value="itm5">ITM 5</option>
-              <option value="itm4">ITM 4</option>
-              <option value="itm3">ITM 3</option>
-              <option value="itm2">ITM 2</option>
-              <option value="itm1">ITM 1</option>
-              <option value="atm">ATM</option>
-              <option value="otm1">OTM 1</option>
-              <option value="otm2">OTM 2</option>
-              <option value="otm3">OTM 3</option>
-              <option value="otm4">OTM 4</option>
-              <option value="otm5">OTM 5</option>
-              <option value="otm6">OTM 6</option>
-              <option value="otm7">OTM 7</option>
-              <option value="otm8">OTM 8</option>
-              <option value="otm9">OTM 9</option>
-              <option value="otm10">OTM 10</option>
-              <option value="otm11">OTM 11</option>
-              <option value="otm12">OTM 12</option>
-              <option value="otm13">OTM 13</option>
-              <option value="otm14">OTM 14</option>
-              <option value="otm15">OTM 15</option>
-              <option value="otm16">OTM 16</option>
-              <option value="otm17">OTM 17</option>
-              <option value="otm18">OTM 18</option>
-              <option value="otm19">OTM 19</option>
-              <option value="otm20">OTM 20</option>
-            </select>
-          </div>
-        );
-      case 'premium_range':
-        return (
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="block text-xs font-medium mb-1">Lower (₹)</label>
-              <input type="number" value={ss.lower || 0}
-                onChange={(e) => updateStrikeSelection(index, 'lower', parseFloat(e.target.value))}
-                className="w-full p-1.5 border rounded text-sm" />
-            </div>
-            <div>
-              <label className="block text-xs font-medium mb-1">Upper (₹)</label>
-              <input type="number" value={ss.upper || 0}
-                onChange={(e) => updateStrikeSelection(index, 'upper', parseFloat(e.target.value))}
-                className="w-full p-1.5 border rounded text-sm" />
-            </div>
-          </div>
-        );
-      case 'closest_premium':
-      case 'premium_gte':
-      case 'premium_lte':
-        return (
-          <div>
-            <label className="block text-xs font-medium mb-1">Premium (₹)</label>
-            <input type="number" value={ss.premium || 0}
-              onChange={(e) => updateStrikeSelection(index, 'premium', parseFloat(e.target.value))}
-              className="w-full p-1.5 border rounded text-sm" />
-          </div>
-        );
-      case 'straddle_width':
-        return (
-          <div>
-            <label className="block text-xs font-medium mb-1">Width (%)</label>
-            <input type="number" value={ss.width || 0}
-              onChange={(e) => updateStrikeSelection(index, 'width', parseFloat(e.target.value))}
-              className="w-full p-1.5 border rounded text-sm" />
-          </div>
-        );
-      case 'pct_of_atm':
-        return (
-          <div>
-            <label className="block text-xs font-medium mb-1">% of ATM</label>
-            <input type="number" value={ss.pct || 0}
-              onChange={(e) => updateStrikeSelection(index, 'pct', parseFloat(e.target.value))}
-              className="w-full p-1.5 border rounded text-sm" />
-          </div>
-        );
-      default: return null;
-    }
-  };
+  const strikeTypeOpts = [
+    ...Array.from({ length: 20 }, (_, i) => ({ value: `itm${20 - i}`, label: `ITM ${20 - i}` })),
+    { value: 'atm', label: 'ATM' },
+    ...Array.from({ length: 20 }, (_, i) => ({ value: `otm${i + 1}`, label: `OTM ${i + 1}` })),
+  ];
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
+    <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, sans-serif' }}>
       {/* Header */}
-      <div className="bg-white border-b border-gray-200 shadow-sm sticky top-0 z-10">
-        <div className="max-w-full mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900">Options Backtest</h1>
-              <p className="text-xs text-gray-600 mt-1">Build and test your options strategy</p>
+      <div className="bg-white border-b border-gray-200 px-6 py-3">
+        <div className="max-w-screen-2xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
+                <span className="text-white font-bold text-sm">SL</span>
+              </div>
+              <span className="font-bold text-lg text-gray-800">StrategyLab</span>
             </div>
-            <div className="flex items-center gap-4">
-              <div className="text-right bg-blue-50 px-3 py-1.5 rounded-lg border border-blue-200">
-                <p className="text-xs text-blue-600 font-medium">Lot Size ({startDate.slice(0, 4)})</p>
-                <p className="text-sm font-bold text-blue-700">{instrument}: {currentLotSize}</p>
-              </div>
-              <div className="text-right bg-gray-50 px-3 py-1.5 rounded-lg border border-gray-200">
-                <p className="text-xs text-gray-500 font-medium">Strategy</p>
-                <p className="text-sm font-bold text-gray-700">{legs.length} Leg{legs.length !== 1 ? 's' : ''}</p>
-              </div>
-              {results && (
-                <button onClick={() => setResults(null)}
-                  className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm font-medium">
-                  New Backtest
-                </button>
+            <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">Backtest Builder</span>
+          </div>
+          <div className="flex items-center gap-4 text-sm">
+            <span className="text-gray-600">{instrument}</span>
+            <span className="text-gray-400">•</span>
+            <span className="text-gray-600">{legs.length} Legs Active</span>
+            <button className="flex items-center gap-1.5 px-3 py-1.5 text-blue-600 hover:bg-blue-50 rounded text-sm font-medium transition-colors">
+              <Save size={14} />
+              Save
+            </button>
+            <button
+              onClick={runBacktest}
+              disabled={!canRunBacktest}
+              className="flex items-center gap-1.5 px-4 py-1.5 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
+            >
+              {loading ? (
+                <><div className="h-3.5 w-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />Running</>
+              ) : (
+                <><Play size={14} />Run Backtest</>
               )}
-            </div>
+            </button>
           </div>
         </div>
+
+        {/* Validation Error Alert */}
+        {validationError && (
+          <div className="mx-6 mt-2 flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-lg">
+            <AlertTriangle size={16} className="text-red-600 flex-shrink-0" />
+            <span className="text-sm text-red-700">{validationError}</span>
+          </div>
+        )}
       </div>
 
-      <div className="max-w-full mx-auto px-4 sm:px-6 lg:px-8 py-4">
-        {/* Configuration Section - Always full width at top */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+      <div className="max-w-screen-2xl mx-auto px-6 py-4">
+        <div className="grid grid-cols-12 gap-4">
 
-          {/* Left — Leg Builder */}
-          <div className="lg:col-span-2 space-y-3">
-            <div className="bg-white rounded-lg shadow-md p-4 border border-gray-200">
-              <div className="flex justify-between items-center mb-4">
+          {/* LEFT COLUMN - Configuration */}
+          <div className="col-span-5 space-y-3">
+            {/* Configuration Card */}
+            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+              <div className="px-4 py-3 border-b border-gray-100">
+                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Configuration</h3>
+              </div>
+              <div className="p-4 space-y-4">
+                {/* Strategy Type */}
                 <div>
-                  <h3 className="text-lg font-bold text-gray-900">Strategy Legs</h3>
-                  <p className="text-xs text-gray-500 mt-0.5">Configure positions</p>
+                  <label className="block text-xs font-medium text-gray-600 mb-2">Strategy</label>
+                  <SegBtn
+                    options={[
+                      { value: 'intraday', label: 'Intraday' },
+                      { value: 'btst', label: 'BTST' },
+                      { value: 'positional', label: 'Positional' },
+                    ]}
+                    value={strategyType}
+                    onChange={setStrategyType}
+                  />
                 </div>
-                <button onClick={addLeg} disabled={legs.length >= 4}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg hover:from-blue-700 hover:to-blue-800 disabled:from-gray-300 disabled:to-gray-400 disabled:cursor-not-allowed shadow-md transition-all text-sm">
-                  <Plus size={16} /> Add Leg
+
+                {/* Instrument */}
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-2">Instrument</label>
+                  <select
+                    value={instrument}
+                    onChange={e => setInstrument(e.target.value)}
+                    className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                  >
+                    <option>NIFTY</option>
+                    <option>BANKNIFTY</option>
+                    <option>FINNIFTY</option>
+                    <option>MIDCPNIFTY</option>
+                    <option>SENSEX</option>
+                  </select>
+                </div>
+
+                {/* Underlying */}
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-2">Underlying</label>
+                  <SegBtn
+                    options={[{ value: 'cash', label: 'Cash' }, { value: 'futures', label: 'Futures' }]}
+                    value={underlying}
+                    onChange={setUnderlying}
+                  />
+                </div>
+
+                {/* Expiry Basis */}
+                {strategyType === 'positional' && (
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-2">Expires on</label>
+                    <select
+                      value={expiryBasis}
+                      onChange={e => setExpiryBasis(e.target.value)}
+                      className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                    >
+                      <option value="weekly">Weekly Expiry</option>
+                      <option value="monthly">Monthly Expiry</option>
+                    </select>
+                  </div>
+                )}
+
+                {/* Entry/Exit Days */}
+                {strategyType === 'positional' && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-2">Entry (days before expiry)</label>
+                      <select
+                        value={entryDaysBefore}
+                        onChange={e => setEntryDaysBefore(+e.target.value)}
+                        className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                      >
+                        {daysOptions.map(d => <option key={d}>{d}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-2">Exit (days before expiry)</label>
+                      <select
+                        value={exitDaysBefore}
+                        onChange={e => setExitDaysBefore(+e.target.value)}
+                        className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                      >
+                        {daysOptions.map(d => <option key={d}>{d}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                )}
+
+                {/* Delay Restart */}
+                <div className="flex items-center justify-between py-2">
+                  <span className="text-xs text-gray-600">Delay Restart</span>
+                  <Toggle enabled={delayRestart} onToggle={() => setDelayRestart(v => !v)} size="sm" />
+                </div>
+
+                {/* Overall Momentum */}
+                <div className="flex items-center justify-between py-2">
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs text-gray-600">Overall Momentum</span>
+                    <Tooltip text="Entry only when market momentum matches the selected direction and threshold." />
+                  </div>
+                  <Toggle enabled={overallMomentum} onToggle={() => setOverallMomentum(v => !v)} size="sm" />
+                </div>
+              </div>
+            </div>
+
+            {/* Legwise Controls Card */}
+            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+              <div className="px-4 py-3 border-b border-gray-100">
+                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Legwise Controls</h3>
+              </div>
+              <div className="p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-600">Square Off Mode</span>
+                  <SegBtn
+                    options={[{ value: 'partial', label: 'Partial' }, { value: 'complete', label: 'Complete' }]}
+                    value={squareOffMode}
+                    onChange={setSquareOffMode}
+                    size="sm"
+                  />
+                </div>
+
+                <div className="flex items-center gap-2 py-2">
+                  <input
+                    type="checkbox"
+                    id="trailSL"
+                    checked={trailSLBreakeven}
+                    onChange={e => setTrailSLBreakeven(e.target.checked)}
+                    className="h-3.5 w-3.5 rounded border-gray-300 accent-blue-600"
+                  />
+                  <label htmlFor="trailSL" className="text-xs text-gray-600 cursor-pointer flex-1">
+                    Trail Stop Loss to Break-even
+                  </label>
+                  <SegBtn
+                    options={[{ value: 'all_legs', label: 'All Legs' }, { value: 'sl_legs', label: 'SL Legs' }]}
+                    value={trailSLTarget}
+                    onChange={setTrailSLTarget}
+                    size="sm"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Overall Settings Card */}
+            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+              <div className="px-4 py-3 border-b border-gray-100">
+                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Overall Settings</h3>
+              </div>
+              <div className="p-4 space-y-4">
+                {/* Overall Stop Loss */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-medium text-gray-600">Overall Stop Loss</span>
+                    <Toggle enabled={overallSLEnabled} onToggle={() => setOverallSLEnabled(v => !v)} size="sm" />
+                  </div>
+                  {overallSLEnabled && (
+                    <div className="flex gap-2">
+                      <select
+                        value={overallSLType}
+                        onChange={e => setOverallSLType(e.target.value)}
+                        className="flex-1 h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                      >
+                        <option value="max_loss">Max Loss</option>
+                        <option value="pct">%</option>
+                        <option value="points">Points</option>
+                      </select>
+                      <input
+                        type="number"
+                        value={overallSLValue}
+                        onChange={e => setOverallSLValue(+e.target.value)}
+                        className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Overall Target */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-medium text-gray-600">Overall Target</span>
+                    <Toggle enabled={overallTgtEnabled} onToggle={() => setOverallTgtEnabled(v => !v)} size="sm" />
+                  </div>
+                  {overallTgtEnabled && (
+                    <div className="flex gap-2">
+                      <select
+                        value={overallTgtType}
+                        onChange={e => setOverallTgtType(e.target.value)}
+                        className="flex-1 h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                      >
+                        <option value="max_profit">Max Profit</option>
+                        <option value="pct">%</option>
+                        <option value="points">Points</option>
+                      </select>
+                      <input
+                        type="number"
+                        value={overallTgtValue}
+                        onChange={e => setOverallTgtValue(+e.target.value)}
+                        className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {/* Trailing */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-medium text-gray-600">Trailing</span>
+                    <Toggle enabled={trailingEnabled} onToggle={() => setTrailingEnabled(v => !v)} size="sm" />
+                  </div>
+                  {trailingEnabled && (
+                    <div className="space-y-2">
+                      <select
+                        value={trailingType}
+                        onChange={e => setTrailingType(e.target.value)}
+                        className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                      >
+                        <option value="lock">Lock</option>
+                        <option value="lock_and_trail">Lock & Trail</option>
+                      </select>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-xs text-gray-500 mb-1">If profit reaches</label>
+                          <input
+                            type="number"
+                            value={trailingIfProfit}
+                            onChange={e => setTrailingIfProfit(+e.target.value)}
+                            className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-gray-500 mb-1">Lock profit at</label>
+                          <input
+                            type="number"
+                            value={trailingLockProfit}
+                            onChange={e => setTrailingLockProfit(+e.target.value)}
+                            className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT COLUMN - Leg Builder */}
+          <div className="col-span-7">
+            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+              <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Leg Builder</h3>
+                  <Tooltip text="Build your strategy by adding individual option or futures legs." />
+                </div>
+                <button
+                  onClick={addLeg}
+                  disabled={legs.length >= 6}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded text-xs font-medium transition-colors"
+                >
+                  <Plus size={13} />
+                  Add Leg
                 </button>
               </div>
 
-              {legs.length === 0 ? (
-                <div className="text-center py-12 border-2 border-dashed border-gray-300 rounded-xl bg-gray-50">
-                  <div className="text-gray-400 mb-2">
-                    <svg className="mx-auto h-12 w-12" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                    </svg>
+              <div className="p-4">
+                {legs.length === 0 ? (
+                  <div className="text-center py-12 border-2 border-dashed border-gray-200 rounded-lg">
+                    <p className="text-sm text-gray-400 mb-3">No legs added yet</p>
+                    <button
+                      onClick={addLeg}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium transition-colors"
+                    >
+                      <Plus size={14} />
+                      Add Your First Leg
+                    </button>
                   </div>
-                  <p className="text-sm font-semibold text-gray-700 mb-1">No legs configured</p>
-                  <p className="text-xs text-gray-500">Click "Add Leg" to start</p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {legs.map((leg, index) => (
-                    <div key={leg.id} className="border-2 border-gray-200 rounded-lg overflow-hidden hover:border-blue-300 transition-colors">
-                      {/* Leg header row */}
-                      <div className="flex justify-between items-center p-2 bg-gray-50 cursor-pointer"
-                        onClick={() => setExpandedLeg(expandedLeg === index ? null : index)}>
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-medium text-gray-700 text-sm">Leg {index + 1}</span>
-                          <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
-                            leg.position === 'sell' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>
-                            {leg.position?.toUpperCase()}
+                ) : (
+                  <div className="space-y-3">
+                    {legs.map((leg, idx) => (
+                      <div key={leg.id} className="border border-gray-200 rounded-lg overflow-hidden">
+                        {/* Leg Header */}
+                        <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 py-2 flex items-center justify-between border-b border-blue-200">
+                          <span className="text-xs font-bold text-blue-900">
+                            Leg {idx + 1} | {leg.segment === 'options' ? `${leg.position.toUpperCase()} ${leg.option_type.toUpperCase()}` : 'FUTURE'} | {leg.expiry}
                           </span>
-                          <span className="text-xs text-gray-500">
-                            {leg.segment === 'options'
-                              ? `${leg.option_type?.toUpperCase()} · ${leg.strike_selection?.strike_type?.toUpperCase()}`
-                              : 'FUT'} · {leg.lot} lot
-                          </span>
-                          <span className="text-xs text-blue-500 font-medium">
-                            = {leg.lot * getLotSize(instrument, startDate)} units
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button onClick={(e) => { e.stopPropagation(); removeLeg(index); }}
-                            className="p-1 text-red-400 hover:text-red-600">
-                            <Trash2 size={14} />
+                          <button
+                            onClick={() => removeLeg(leg.id)}
+                            className="p-1 text-red-500 hover:text-red-700 hover:bg-red-50 rounded transition-colors"
+                          >
+                            <Trash2 size={13} />
                           </button>
-                          {expandedLeg === index ? <ChevronUp size={14} className="text-gray-400" /> : <ChevronDown size={14} className="text-gray-400" />}
                         </div>
-                      </div>
 
-                      {expandedLeg === index && (
-                        <div className="p-3 grid grid-cols-2 gap-3">
-                          <div>
-                            <label className="block text-xs font-medium mb-1">Segment</label>
-                            <select value={leg.segment} onChange={(e) => updateLeg(index, 'segment', e.target.value)}
-                              className="w-full p-1.5 border rounded text-sm">
-                              <option value="options">Options</option>
-                              <option value="futures">Futures</option>
-                            </select>
-                          </div>
-
-                          <div>
-                            <label className="block text-xs font-medium mb-1">Position</label>
-                            <div className="flex gap-1">
-                              <button onClick={() => updateLeg(index, 'position', 'buy')}
-                                className={`flex-1 py-1.5 rounded border text-xs font-medium ${leg.position === 'buy' ? 'bg-green-600 text-white border-green-600' : 'border-gray-300'}`}>Buy</button>
-                              <button onClick={() => updateLeg(index, 'position', 'sell')}
-                                className={`flex-1 py-1.5 rounded border text-xs font-medium ${leg.position === 'sell' ? 'bg-red-600 text-white border-red-600' : 'border-gray-300'}`}>Sell</button>
+                        {/* Leg Content */}
+                        <div className="p-3 space-y-3">
+                          {/* Row 1: Segment, Position, Lots */}
+                          <div className="grid grid-cols-3 gap-3">
+                            <div>
+                              <label className="block text-xs text-gray-500 mb-1">Segment</label>
+                              <SegBtn
+                                options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
+                                value={leg.segment}
+                                onChange={v => updateLeg(leg.id, 'segment', v)}
+                                size="sm"
+                              />
                             </div>
-                          </div>
-
-                          <div>
-                            <label className="block text-xs font-medium mb-1">Lots</label>
-                            <input type="number" min="1" value={leg.lot}
-                              onChange={(e) => updateLeg(index, 'lot', parseInt(e.target.value) || 1)}
-                              className="w-full p-1.5 border rounded text-sm" />
+                            <div>
+                              <label className="block text-xs text-gray-500 mb-1">Position</label>
+                              <SegBtn
+                                options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
+                                value={leg.position}
+                                onChange={v => updateLeg(leg.id, 'position', v)}
+                                size="sm"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs text-gray-500 mb-1">Lots</label>
+                              <input
+                                type="number"
+                                min={1}
+                                value={leg.lot}
+                                onChange={e => updateLeg(leg.id, 'lot', parseInt(e.target.value) || 1)}
+                                className="w-full h-7 px-2 border border-gray-300 rounded text-xs text-center bg-white"
+                              />
+                            </div>
                           </div>
 
                           {leg.segment === 'options' && (
                             <>
-                              <div>
-                                <label className="block text-xs font-medium mb-1">Option Type</label>
-                                <div className="flex gap-1">
-                                  <button onClick={() => updateLeg(index, 'option_type', 'call')}
-                                    className={`flex-1 py-1.5 rounded border text-xs ${leg.option_type === 'call' ? 'bg-blue-600 text-white' : ''}`}>Call</button>
-                                  <button onClick={() => updateLeg(index, 'option_type', 'put')}
-                                    className={`flex-1 py-1.5 rounded border text-xs ${leg.option_type === 'put' ? 'bg-purple-600 text-white' : ''}`}>Put</button>
+                              {/* Row 2: Option Type, Expiry */}
+                              <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                  <label className="block text-xs text-gray-500 mb-1">Option Type</label>
+                                  <SegBtn
+                                    options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
+                                    value={leg.option_type}
+                                    onChange={v => updateLeg(leg.id, 'option_type', v)}
+                                    size="sm"
+                                  />
+                                </div>
+                                <div>
+                                  <label className="block text-xs text-gray-500 mb-1">Expiry</label>
+                                  <select
+                                    value={leg.expiry}
+                                    onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
+                                    className="w-full h-7 px-2 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    <option value="weekly">Weekly</option>
+                                    <option value="next_weekly">Next Weekly</option>
+                                    <option value="monthly">Monthly</option>
+                                    <option value="next_monthly">Next Monthly</option>
+                                  </select>
                                 </div>
                               </div>
 
-                              <div className="col-span-2">
-                                <label className="block text-xs font-medium mb-1">Expiry</label>
-                                <select value={leg.expiry} onChange={(e) => updateLeg(index, 'expiry', e.target.value)}
-                                  className="w-full p-1.5 border rounded text-sm">
-                                  <option value="weekly">Weekly</option>
-                                  <option value="next_weekly">Next Weekly</option>
-                                  <option value="monthly">Monthly</option>
-                                  <option value="next_monthly">Next Monthly</option>
-                                </select>
-                              </div>
-
-                              <div className="col-span-2">
-                                <label className="block text-xs font-medium mb-1">Strike Criteria</label>
-                                <select value={leg.strike_selection.type}
-                                  onChange={(e) => updateStrikeSelection(index, 'type', e.target.value)}
-                                  className="w-full p-1.5 border rounded mb-2 text-sm">
-                                  <option value="strike_type">Strike Type (ATM/ITM/OTM)</option>
+                              {/* Row 3: Strike Criteria */}
+                              <div>
+                                <label className="block text-xs text-gray-500 mb-1">Strike Criteria</label>
+                                <select
+                                  value={leg.strike_criteria}
+                                  onChange={e => updateLeg(leg.id, 'strike_criteria', e.target.value)}
+                                  className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                                >
+                                  <option value="strike_type">Strike Type</option>
                                   <option value="premium_range">Premium Range</option>
                                   <option value="closest_premium">Closest Premium</option>
                                   <option value="premium_gte">Premium ≥</option>
                                   <option value="premium_lte">Premium ≤</option>
-                                  <option value="straddle_width">Straddle Width</option>
-                                  <option value="pct_of_atm">% of ATM</option>
-                                  <option value="atm_straddle_premium_pct">ATM Straddle Premium %</option>
                                 </select>
-                                {renderStrikeCriteria(leg, index)}
+                              </div>
+
+                              {/* Row 4: Strike Value */}
+                              <div>
+                                {leg.strike_criteria === 'strike_type' ? (
+                                  <div>
+                                    <label className="block text-xs text-gray-500 mb-1">Strike Type</label>
+                                    <select
+                                      value={leg.strike_type}
+                                      onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
+                                      className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                                    >
+                                      {strikeTypeOpts.map(o => (
+                                        <option key={o.value} value={o.value}>{o.label}</option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                ) : leg.strike_criteria === 'premium_range' ? (
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                      <label className="block text-xs text-gray-500 mb-1">Min Premium</label>
+                                      <input
+                                        type="number"
+                                        placeholder="Min"
+                                        value={leg.premium_min || ''}
+                                        onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
+                                        className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="block text-xs text-gray-500 mb-1">Max Premium</label>
+                                      <input
+                                        type="number"
+                                        placeholder="Max"
+                                        value={leg.premium_max || ''}
+                                        onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
+                                        className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                      />
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div>
+                                    <label className="block text-xs text-gray-500 mb-1">Premium Value</label>
+                                    <input
+                                      type="number"
+                                      placeholder="Premium ₹"
+                                      value={leg.premium_value || ''}
+                                      onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
+                                      className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                    />
+                                  </div>
+                                )}
                               </div>
                             </>
                           )}
 
                           {leg.segment === 'futures' && (
-                            <div className="col-span-2">
-                              <label className="block text-xs font-medium mb-1">Expiry</label>
-                              <select value={leg.expiry} onChange={(e) => updateLeg(index, 'expiry', e.target.value)}
-                                className="w-full p-1.5 border rounded text-sm">
+                            <div>
+                              <label className="block text-xs text-gray-500 mb-1">Expiry</label>
+                              <select
+                                value={leg.expiry}
+                                onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
+                                className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                              >
                                 <option value="monthly">Monthly</option>
                                 <option value="next_monthly">Next Monthly</option>
                               </select>
                             </div>
                           )}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
 
-          {/* Right — Settings */}
-          <div className="space-y-3">
-            <div className="bg-white rounded-lg shadow p-4">
-              <h3 className="font-semibold mb-3 text-sm">Entry Settings</h3>
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-medium mb-1">Instrument</label>
-                  <select value={instrument} onChange={(e) => setInstrument(e.target.value)}
-                    className="w-full p-1.5 border rounded text-sm">
-                    <option value="NIFTY">NIFTY</option>
-                    <option value="BANKNIFTY">BANKNIFTY</option>
-                    <option value="FINNIFTY">FINNIFTY</option>
-                    <option value="MIDCPNIFTY">MIDCPNIFTY</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium mb-1">Strategy Type</label>
-                  <div className="flex gap-1">
-                    {['intraday', 'btst', 'positional'].map(type => (
-                      <button key={type} onClick={() => setStrategyType(type)}
-                        className={`flex-1 py-1.5 rounded border text-xs ${strategyType === type ? 'bg-blue-600 text-white' : ''}`}>
-                        {type.charAt(0).toUpperCase() + type.slice(1)}
-                      </button>
+                          {/* Stop Loss & Target */}
+                          <div className="pt-3 border-t border-gray-100">
+                            <div className="grid grid-cols-2 gap-3">
+                              {/* Stop Loss Toggle */}
+                              <div>
+                                <div className="flex items-center justify-between mb-2">
+                                  <label className="text-xs font-medium text-gray-600 flex items-center gap-1.5">
+                                    <input
+                                      type="checkbox"
+                                      checked={leg.stop_loss_enabled}
+                                      onChange={e => updateLeg(leg.id, 'stop_loss_enabled', e.target.checked)}
+                                      className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                    />
+                                    Stop Loss
+                                  </label>
+                                  {leg.stop_loss_enabled && (
+                                    <SegBtn
+                                      options={[{ value: 'pct', label: '%' }, { value: 'points', label: 'Pts' }]}
+                                      value={leg.stop_loss_type}
+                                      onChange={v => updateLeg(leg.id, 'stop_loss_type', v)}
+                                      size="sm"
+                                    />
+                                  )}
+                                </div>
+                                {leg.stop_loss_enabled && (
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    placeholder="—"
+                                    value={leg.stop_loss ?? ''}
+                                    onChange={e => updateLeg(leg.id, 'stop_loss', e.target.value === '' ? null : +e.target.value)}
+                                    className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                  />
+                                )}
+                              </div>
+                              {/* Target Toggle */}
+                              <div>
+                                <div className="flex items-center justify-between mb-2">
+                                  <label className="text-xs font-medium text-gray-600 flex items-center gap-1.5">
+                                    <input
+                                      type="checkbox"
+                                      checked={leg.target_enabled}
+                                      onChange={e => updateLeg(leg.id, 'target_enabled', e.target.checked)}
+                                      className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                    />
+                                    Target
+                                  </label>
+                                  {leg.target_enabled && (
+                                    <SegBtn
+                                      options={[{ value: 'pct', label: '%' }, { value: 'points', label: 'Pts' }]}
+                                      value={leg.target_type}
+                                      onChange={v => updateLeg(leg.id, 'target_type', v)}
+                                      size="sm"
+                                    />
+                                  )}
+                                </div>
+                                {leg.target_enabled && (
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    placeholder="—"
+                                    value={leg.target ?? ''}
+                                    onChange={e => updateLeg(leg.id, 'target', e.target.value === '' ? null : +e.target.value)}
+                                    className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                  />
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Units Display */}
+                          <div className="text-right">
+                            <span className="text-xs text-blue-600 font-medium">
+                              {leg.lot * getLotSize(instrument, startDate)} units
+                            </span>
+                          </div>
+                        </div>
+                      </div>
                     ))}
                   </div>
-                </div>
-                {strategyType === 'positional' && (
-                  <>
-                    <div>
-                      <label className="block text-xs font-medium mb-1">Positional expires on</label>
-                      <select value={expiryBasis} onChange={(e) => setExpiryBasis(e.target.value)}
-                        className="w-full p-1.5 border rounded text-sm">
-                        <option value="weekly">Weekly Expiry</option>
-                        <option value="monthly">Monthly Expiry</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium mb-1">Entry</label>
-                      <div className="flex items-center gap-2">
-                        <select value={entryDaysBefore} onChange={(e) => setEntryDaysBefore(parseInt(e.target.value))}
-                          className="w-16 p-1.5 border rounded text-sm">
-                          {daysOptions.map(d => <option key={d} value={d}>{d}</option>)}
-                        </select>
-                        <span className="text-xs">days before expiry</span>
-                      </div>
-                    </div>
-                  </>
                 )}
               </div>
             </div>
-
-            {strategyType === 'positional' && (
-              <div className="bg-white rounded-lg shadow p-4">
-                <h3 className="font-semibold mb-3 text-sm">Exit Settings</h3>
-                <div className="flex items-center gap-2">
-                  <select value={exitDaysBefore} onChange={(e) => setExitDaysBefore(parseInt(e.target.value))}
-                    className="w-16 p-1.5 border rounded text-sm">
-                    {daysOptions.map(d => <option key={d} value={d}>{d}</option>)}
-                  </select>
-                  <span className="text-xs">days before expiry</span>
-                </div>
-              </div>
-            )}
-
-            <div className="bg-white rounded-lg shadow p-4">
-              <h3 className="font-semibold mb-3 text-sm">Backtest Duration</h3>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium mb-1">Start Date</label>
-                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)}
-                    className="w-full p-1.5 border rounded text-sm" />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium mb-1">End Date</label>
-                  <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)}
-                    className="w-full p-1.5 border rounded text-sm" />
-                </div>
-              </div>
-            </div>
-
-            {error && (
-              <div className="bg-red-50 border border-red-200 rounded p-2 text-xs text-red-700">{error}</div>
-            )}
-
-            <button onClick={runBacktest} disabled={loading || legs.length === 0}
-              className={`w-full py-2.5 rounded font-medium flex items-center justify-center gap-2 text-sm ${
-                loading || legs.length === 0 ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-green-600 text-white hover:bg-green-700'}`}>
-              {loading ? (
-                <><div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>Running...</>
-              ) : (
-                <><Play size={16} />Start Backtest</>
-              )}
-            </button>
-
-            {legs.length > 0 && (
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
-                <h4 className="font-medium text-blue-900 mb-2 text-sm">Strategy Summary</h4>
-                <div className="text-xs text-blue-800 space-y-0.5">
-                  <p>• Index: {instrument}</p>
-                  <p>• Period: {startDate} → {endDate}</p>
-                  <p>• Lot size ({startDate.slice(0, 4)}): {currentLotSize} units/lot</p>
-                  <p>• Entry: {entryDaysBefore} day(s) before {expiryBasis} expiry</p>
-                  <p>• Exit: {exitDaysBefore} day(s) before expiry</p>
-                  {legs.map((leg, i) => (
-                    <p key={leg.id} className="ml-2">
-                      - Leg {i + 1}: {leg.segment === 'futures' ? 'FUT' : leg.option_type?.toUpperCase()}{' '}
-                      {leg.position?.toUpperCase()} · {leg.lot} lot
-                      ({leg.lot * getLotSize(instrument, startDate)} units)
-                    </p>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
-
         </div>
 
-        {/* Results Section - Full width below configuration */}
+        {/* Date Range Bar */}
+        <div className="mt-4 bg-white rounded-lg border border-gray-200 shadow-sm px-5 py-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-gray-600">Start Date</label>
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={e => setStartDate(e.target.value)}
+                  className="h-8 px-2 border border-gray-300 rounded text-xs"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-gray-600">End Date</label>
+                <input
+                  type="date"
+                  value={endDate}
+                  onChange={e => setEndDate(e.target.value)}
+                  className="h-8 px-2 border border-gray-300 rounded text-xs"
+                />
+              </div>
+            </div>
+            {error && <span className="text-xs text-red-600">{error}</span>}
+          </div>
+        </div>
+
+        {/* Results */}
         {results && (
-          <div className="w-full">
+          <div className="mt-4">
             <ResultsPanel results={results} onClose={() => setResults(null)} showCloseButton={false} />
           </div>
         )}

@@ -150,14 +150,14 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
             if fromDate == toDate:
                 continue
 
-            # BASE START OVERRIDE (same as existing engines)
-            is_base_start = (base2['Start'] == fromDate).any()
-            if is_base_start:
-                override_df = monthly_exp[
-                    monthly_exp['Current Expiry'] > fromDate   # strictly >
-                ].reset_index(drop=True)
-                if len(override_df) > 1:
-                    fut_expiry = override_df.iloc[1]['Current Expiry']   # iloc[1]
+            # BASE START OVERRIDE - DISABLED (base2 not loaded)
+            # is_base_start = (base2['Start'] == fromDate).any()
+            # if is_base_start:
+            #     override_df = monthly_exp[
+            #         monthly_exp['Current Expiry'] > fromDate   # strictly >
+            #     ].reset_index(drop=True)
+            #     if len(override_df) > 1:
+            #         fut_expiry = override_df.iloc[1]['Current Expiry']   # iloc[1]
 
             # Entry / Exit spots (same as existing engines)
             entry_row = filtered_data[filtered_data['Date'] == fromDate]
@@ -211,20 +211,79 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     # Select strike based on strike selection type
                     if leg.strike_selection.type == StrikeSelectionType.ATM:
                         selected_strike = get_atm_strike(adjusted_spot, available_strikes_series)
-                    elif leg.strike_selection.type == StrikeSelectionType.OTM:
+                    elif leg.strike_selection.type == StrikeSelectionType.OTM_PERCENT:
                         selected_strike = get_otm_strike(
                             adjusted_spot, 
                             available_strikes_series, 
                             leg.strike_selection.value, 
                             leg.option_type.value
                         )
-                    elif leg.strike_selection.type == StrikeSelectionType.ITM:
+                    elif leg.strike_selection.type == StrikeSelectionType.ITM_PERCENT:
                         selected_strike = get_itm_strike(
                             adjusted_spot, 
                             available_strikes_series, 
                             leg.strike_selection.value, 
                             leg.option_type.value
                         )
+                    elif leg.strike_selection.type == StrikeSelectionType.CLOSEST_PREMIUM:
+                        # Find strike with premium closest to target value
+                        target_premium = leg.strike_selection.value
+                        selected_strike = None
+                        min_diff = float('inf')
+                        
+                        for strike in available_strikes:
+                            strike_mask = bhav_entry[
+                                (bhav_entry['Instrument'] == "OPTIDX") &
+                                (bhav_entry['Symbol'] == index_name) &
+                                (bhav_entry['OptionType'] == leg.option_type.value) &
+                                (
+                                    (bhav_entry['ExpiryDate'] == curr_expiry) |
+                                    (bhav_entry['ExpiryDate'] == curr_expiry - timedelta(days=1)) |
+                                    (bhav_entry['ExpiryDate'] == curr_expiry + timedelta(days=1))
+                                ) &
+                                (bhav_entry['StrikePrice'] == strike) &
+                                (bhav_entry['TurnOver'] > 0)
+                            ]
+                            
+                            if not strike_mask.empty:
+                                premium = strike_mask.iloc[0]['Close']
+                                diff = abs(premium - target_premium)
+                                if diff < min_diff:
+                                    min_diff = diff
+                                    selected_strike = strike
+                    
+                    elif leg.strike_selection.type == StrikeSelectionType.PREMIUM_RANGE:
+                        # Find strikes within premium range
+                        premium_min = leg.strike_selection.premium_min or 0.0
+                        premium_max = leg.strike_selection.premium_max or float('inf')
+                        valid_strikes = []
+                        
+                        for strike in available_strikes:
+                            strike_mask = bhav_entry[
+                                (bhav_entry['Instrument'] == "OPTIDX") &
+                                (bhav_entry['Symbol'] == index_name) &
+                                (bhav_entry['OptionType'] == leg.option_type.value) &
+                                (
+                                    (bhav_entry['ExpiryDate'] == curr_expiry) |
+                                    (bhav_entry['ExpiryDate'] == curr_expiry - timedelta(days=1)) |
+                                    (bhav_entry['ExpiryDate'] == curr_expiry + timedelta(days=1))
+                                ) &
+                                (bhav_entry['StrikePrice'] == strike) &
+                                (bhav_entry['TurnOver'] > 0)
+                            ]
+                            
+                            if not strike_mask.empty:
+                                premium = strike_mask.iloc[0]['Close']
+                                if premium_min <= premium <= premium_max:
+                                    valid_strikes.append((strike, premium))
+                        
+                        # Select the strike closest to ATM from valid strikes
+                        if valid_strikes:
+                            atm_strike = get_atm_strike(adjusted_spot, available_strikes_series)
+                            selected_strike = min(valid_strikes, key=lambda x: abs(x[0] - atm_strike))[0]
+                        else:
+                            selected_strike = None
+                    
                     elif leg.strike_selection.type == StrikeSelectionType.SPOT:
                         selected_strike = get_nearest_strike(adjusted_spot, available_strikes_series)
                     else:

@@ -203,13 +203,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
             </div>
             
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">CAGR</p>
-              <p className="text-2xl font-bold text-purple-600">
-                {stats.cagr.toFixed(1)}%
-              </p>
-            </div>
-            
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Max DD</p>
               <p className="text-2xl font-bold text-red-600">
                 ₹{Math.abs(stats.maxDD).toLocaleString('en-IN', { maximumFractionDigits: 0 })}

@@ -121,9 +121,7 @@ class StrategyDefinition(BaseModel):
     re_entry_mode: ReEntryMode = ReEntryMode.NONE
     re_entry_percent: Optional[float] = None
     
-    # Base2 range filter
-    use_base2_filter: bool = True
-    inverse_base2: bool = False  # For v6-like strategies
+    # Note: base2 filter removed - using all trading days
     
 class BacktestRequest(BaseModel):
     """Backtest execution request"""
