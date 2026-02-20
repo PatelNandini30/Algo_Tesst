@@ -1089,7 +1089,7 @@ async def dynamic_backtest(request: dict):
             frontend_columns = [
                 'Index', 'Entry Date', 'Exit Date', 'Type', 'Strike', 'B/S', 'Qty',
                 'Entry Price', 'Exit Price', 'Entry Spot', 'Exit Spot',
-                'Spot P&L', 'Future Expiry', 'Net P&L'
+                'Spot P&L', 'Future Expiry', 'Net P&L', '% P&L'
             ]
             # Add any extra columns that exist
             for col in df.columns:

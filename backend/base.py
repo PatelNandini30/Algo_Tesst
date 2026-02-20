@@ -434,6 +434,9 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     )
 
     # ── BASIC STATS ──────────────────────────────────────────────────────────
+    # Ensure pnl_col values are numeric
+    df[pnl_col] = pd.to_numeric(df[pnl_col], errors='coerce').fillna(0)
+    
     total_pnl  = round(df[pnl_col].sum(), 2)
     count      = len(df)
     wins       = df[df[pnl_col] > 0]
@@ -451,6 +454,21 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     # Reward-to-risk ratio  (|avg_win| / |avg_loss|)
     reward_to_risk = round(abs(avg_win) / abs(avg_loss), 2) if avg_loss != 0 else 0
+
+    # Profit Factor = Gross Profit / |Gross Loss|
+    gross_profit = round(wins[pnl_col].sum(), 2) if win_count > 0 else 0
+    gross_loss_val = losses[pnl_col].sum() if loss_count > 0 else 0
+    if pd.isna(gross_loss_val):
+        gross_loss_val = 0
+    gross_loss = round(abs(gross_loss_val), 2)
+    
+    # If all trades are wins (no losses), profit factor is N/A or infinite
+    if gross_loss == 0 and gross_profit > 0:
+        profit_factor = 999.99  # All winning trades
+    elif gross_loss == 0 and gross_profit == 0:
+        profit_factor = 0
+    else:
+        profit_factor = round(gross_profit / gross_loss, 2)
 
     # Expectancy  = (win_rate * avg_win  +  loss_rate * avg_loss) / |avg_loss|
     # (AlgoTest's formula from their "Expectancy Ratio" display)
@@ -564,6 +582,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "avg_profit_per_trade":  avg_profit_per_trade,
         "expectancy":            expectancy,
         "reward_to_risk":        reward_to_risk,
+        "profit_factor":         profit_factor,
         "cagr_options":          cagr,
         "max_dd_pct":            max_dd_pct,
         "max_dd_pts":            max_dd_pts,

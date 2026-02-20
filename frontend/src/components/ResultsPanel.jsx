@@ -69,30 +69,37 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
   }, [groupedTrades]);
 
   // Calculate stats
-  const stats = useMemo(() => ({
-    totalPnL: summary.total_pnl || 0,
-    totalTrades: summary.count || trades.length || 0,
-    winRate: summary.win_pct || 0,
-    lossPct: summary.loss_pct || 0,
-    cagr: summary.cagr_options || 0,
-    maxDD: summary.max_dd_pts || 0,
-    carMdd: summary.car_mdd || 0,
-    avgWin: summary.avg_win || 0,
-    avgLoss: summary.avg_loss || 0,
-    maxWin: summary.max_win || 0,
-    maxLoss: summary.max_loss || 0,
-    avgProfitPerTrade: summary.avg_profit_per_trade || 0,
-    expectancy: summary.expectancy || 0,
-    rewardToRisk: summary.reward_to_risk || 0,
-    maxWinStreak: summary.max_win_streak || 0,
-    maxLossStreak: summary.max_loss_streak || 0,
-    mddDuration: summary.mdd_duration_days || 0,
-    mddStartDate: summary.mdd_start_date || '',
-    mddEndDate: summary.mdd_end_date || '',
-    mddTradeNumber: summary.mdd_trade_number || null,
-    cagrSpot: summary.cagr_spot || 0,
-    recoveryFactor: summary.recovery_factor || 0
-  }), [summary, trades]);
+  const stats = useMemo(() => {
+    const totalPnL = summary.total_pnl || 0;
+    const initialCapital = 100000; // Default initial capital used in backend
+    const totalPnLPct = (totalPnL / initialCapital) * 100;
+    
+    return {
+      totalPnL: totalPnL,
+      totalPnLPct: totalPnLPct,
+      totalTrades: summary.count || trades.length || 0,
+      winRate: summary.win_pct || 0,
+      lossPct: summary.loss_pct || 0,
+      cagr: summary.cagr_options || 0,
+      maxDD: summary.max_dd_pts || 0,
+      carMdd: summary.car_mdd || 0,
+      avgWin: summary.avg_win || 0,
+      avgLoss: summary.avg_loss || 0,
+      maxWin: summary.max_win || 0,
+      maxLoss: summary.max_loss || 0,
+      avgProfitPerTrade: summary.avg_profit_per_trade || 0,
+      expectancy: summary.expectancy || 0,
+      rewardToRisk: summary.reward_to_risk || 0,
+      maxWinStreak: summary.max_win_streak || 0,
+      maxLossStreak: summary.max_loss_streak || 0,
+      mddDuration: summary.mdd_duration_days || 0,
+      mddStartDate: summary.mdd_start_date || '',
+      mddEndDate: summary.mdd_end_date || '',
+      mddTradeNumber: summary.mdd_trade_number || null,
+      cagrSpot: summary.cagr_spot || 0,
+      recoveryFactor: summary.recovery_factor || 0
+    };
+  }, [summary, trades]);
 
 
   // Export CSV
@@ -190,8 +197,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6 bg-gradient-to-br from-gray-50 to-gray-100">
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Total P&L</p>
-              <p className={`text-2xl font-bold ${stats.totalPnL >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                ₹{stats.totalPnL.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+              <p className={`text-2xl font-bold ${stats.totalPnLPct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                {stats.totalPnLPct >= 0 ? '+' : ''}{stats.totalPnLPct.toFixed(2)}%
               </p>
             </div>
             
@@ -201,11 +208,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                 {stats.winRate.toFixed(1)}%
               </p>
             </div>
+
+            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">CAGR</p>
+              <p className={`text-2xl font-bold ${stats.cagr >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                {stats.cagr.toFixed(1)}%
+              </p>
+            </div>
             
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Max DD</p>
               <p className="text-2xl font-bold text-red-600">
-                ₹{Math.abs(stats.maxDD).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                ₹{stats.maxDD.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
               </p>
             </div>
             
@@ -397,15 +411,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                 
                 <div className="border-b border-gray-200 pb-2">
                   <p className="font-bold text-gray-900 mb-0.5">Max Drawdown</p>
-                  <p className="font-normal text-gray-900">₹{Math.abs(stats.maxDD).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                  <p className="font-normal text-gray-900">₹{stats.maxDD.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
                 </div>
                 
                 <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Duration of Max Drawdown</p>
+                  <p className="font-bold text-gray-900 mb-0.5">Max DD Days</p>
                   <p className="font-normal text-gray-900">
-                    {stats.mddDuration > 0 && stats.mddStartDate && stats.mddEndDate 
-                      ? `${stats.mddDuration} [${stats.mddStartDate} to ${stats.mddEndDate}]`
-                      : 'N/A'}
+                    {stats.mddDuration > 0 ? stats.mddDuration : 'N/A'}
                   </p>
                 </div>
                 
@@ -465,6 +477,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">P&L</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Points P&L</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">% P&L</th>
                     </tr>
@@ -475,25 +488,27 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                       
                       return group.legs.map((leg, legIdx) => {
                         const isFirstLeg = legIdx === 0;
-                        const netPnl = leg['Net P&L'] || leg.net_pnl || leg.pnl || 0;
                         
                         const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
                         const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
                         const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
-                        const qty = leg['Qty'] || leg.qty || leg.quantity || 65;
-                        const entryPrice = leg['Entry Price'] || leg['Leg_1_EntryPrice'] || leg['Leg 1 Entry'] || 0;
-                        const exitPrice = leg['Exit Price'] || leg['Leg_1_ExitPrice'] || leg['Leg 1 Exit'] || 0;
+                        const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
+                        const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
+                        const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
                         
                         const spotPnl = leg['Spot P&L'] || (group.exitSpot - group.entrySpot) || 0;
                         
                         // Calculate Points P&L based on position (Buy/Sell)
                         const pointsPnl = position.toLowerCase() === 'sell' 
-                          ? parseFloat(entryPrice) - parseFloat(exitPrice)
-                          : parseFloat(exitPrice) - parseFloat(entryPrice);
+                          ? entryPrice - exitPrice
+                          : exitPrice - entryPrice;
+                        
+                        // Calculate actual P&L = Points P&L × Qty
+                        const actualPnl = pointsPnl * qty;
                         
                         // Calculate Percent P&L
-                        const percentPnl = parseFloat(entryPrice) !== 0 
-                          ? (pointsPnl / parseFloat(entryPrice)) * 100
+                        const percentPnl = entryPrice !== 0 
+                          ? (pointsPnl / entryPrice) * 100
                           : 0;
                         
                         return (
@@ -516,8 +531,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                             <td className="px-3 py-2 text-right text-gray-700 text-xs">{parseFloat(strike).toFixed(0)}</td>
                             <td className="px-3 py-2 text-gray-700 text-xs">{position}</td>
                             <td className="px-3 py-2 text-right text-gray-700 text-xs">{qty}</td>
-                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{parseFloat(entryPrice).toFixed(2)}</td>
-                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{parseFloat(exitPrice).toFixed(2)}</td>
+                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{entryPrice.toFixed(2)}</td>
+                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{exitPrice.toFixed(2)}</td>
+                            <td className={`px-3 py-2 text-right text-xs font-semibold ${actualPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {actualPnl >= 0 ? '+' : ''}{actualPnl.toFixed(2)}
+                            </td>
                             <td className={`px-3 py-2 text-right text-xs ${pointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                               {pointsPnl.toFixed(2)}
                             </td>

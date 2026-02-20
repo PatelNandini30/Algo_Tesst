@@ -141,12 +141,7 @@ const AlgoTestBacktest = () => {
     return true;
   };
 
-  // Run validation when expiryBasis or legs change
-  useEffect(() => {
-    validateExpiry();
-  }, [expiryBasis, legs]);
-
-  const canRunBacktest = !validationError && legs.length > 0 && !loading;
+  const canRunBacktest = legs.length > 0 && !loading;
 
   const addLeg = () => {
     if (legs.length >= 6) return;
@@ -208,7 +203,16 @@ const AlgoTestBacktest = () => {
 
   const runBacktest = async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
-    if (!validateExpiry()) { setError(validationError); return; }
+    // Validate expiry and set error message
+    if (expiryBasis === 'monthly') {
+      const weeklyLegs = legs.filter(l => l.expiry === 'weekly');
+      if (weeklyLegs.length > 0) {
+        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
+        const msg = `Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`;
+        setError(msg);
+        return;
+      }
+    }
     setLoading(true); setError(null);
     try {
       const res = await fetch('/api/dynamic-backtest', {
@@ -253,27 +257,8 @@ const AlgoTestBacktest = () => {
               <Save size={14} />
               Save
             </button>
-            <button
-              onClick={runBacktest}
-              disabled={!canRunBacktest}
-              className="flex items-center gap-1.5 px-4 py-1.5 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition-colors"
-            >
-              {loading ? (
-                <><div className="h-3.5 w-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />Running</>
-              ) : (
-                <><Play size={14} />Run Backtest</>
-              )}
-            </button>
           </div>
         </div>
-
-        {/* Validation Error Alert */}
-        {validationError && (
-          <div className="mx-6 mt-2 flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-lg">
-            <AlertTriangle size={16} className="text-red-600 flex-shrink-0" />
-            <span className="text-sm text-red-700">{validationError}</span>
-          </div>
-        )}
       </div>
 
       <div className="max-w-screen-2xl mx-auto px-6 py-4">
@@ -827,7 +812,6 @@ const AlgoTestBacktest = () => {
                 />
               </div>
             </div>
-            {error && <span className="text-xs text-red-600">{error}</span>}
           </div>
         </div>
 
@@ -837,6 +821,29 @@ const AlgoTestBacktest = () => {
             <ResultsPanel results={results} onClose={() => setResults(null)} showCloseButton={false} />
           </div>
         )}
+
+        {/* Error Alert - Above Button */}
+        {error && (
+          <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-lg shadow-lg">
+            <AlertTriangle size={16} className="text-red-600 flex-shrink-0" />
+            <span className="text-sm text-red-700">{error}</span>
+          </div>
+        )}
+
+        {/* Run Backtest Button - Bottom */}
+        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50">
+          <button
+            onClick={runBacktest}
+            disabled={!canRunBacktest}
+            className="flex items-center gap-2 px-8 py-3 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-full text-base font-semibold shadow-lg transition-all hover:shadow-xl"
+          >
+            {loading ? (
+              <><div className="h-5 w-5 border-2 border-white border-t-transparent rounded-full animate-spin" />Running Backtest...</>
+            ) : (
+              <><Play size={18} />Run Backtest</>
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );

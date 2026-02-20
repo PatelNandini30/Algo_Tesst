@@ -860,6 +860,9 @@ def run_algotest_backtest(params):
             lot_size = leg.get('lot_size', 65)
             qty = lots * lot_size
             
+            # Calculate % P&L based on entry price
+            pct_pnl = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price != 0 else 0
+            
             row = {
                 'Trade': trade_idx,
                 'Leg': leg_num,
@@ -877,6 +880,7 @@ def run_algotest_backtest(params):
                 'Spot P&L': round(exit_spot_val - entry_spot_val, 2) if exit_spot_val and entry_spot_val else 0,
                 'Future Expiry': trade['expiry_date'],
                 'Net P&L': leg_pnl,
+                '% P&L': pct_pnl,
                 'Exit Reason': leg_exit_reason,     # Per-leg reason
             }
             
