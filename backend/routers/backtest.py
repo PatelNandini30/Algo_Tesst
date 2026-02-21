@@ -615,7 +615,11 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             'expiry_type': expiry_type,
             'entry_dte': entry_dte,
             'exit_dte': exit_dte,
-            'legs': legs_config
+            'legs': legs_config,
+            'overall_sl_type': params.get('overall_sl_type'),
+            'overall_sl_value': params.get('overall_sl_value'),
+            'overall_target_type': params.get('overall_target_type'),
+            'overall_target_value': params.get('overall_target_value'),
         }
         
         try:
@@ -705,6 +709,11 @@ async def dynamic_backtest(request: dict):
                 self.entry_dte = data.get("entry_dte", 2)
                 self.exit_dte = data.get("exit_dte", 0)
                 self.expiry_type = data.get("expiry_type", "WEEKLY")
+                # Overall SL/TGT fields
+                self.overall_sl_type = data.get("overall_sl_type")
+                self.overall_sl_value = data.get("overall_sl_value")
+                self.overall_target_type = data.get("overall_target_type")
+                self.overall_target_value = data.get("overall_target_value")
         
         request_obj = DynamicStrategyRequestObj(request)
         
@@ -1036,6 +1045,11 @@ async def dynamic_backtest(request: dict):
             "entry_dte": request.get("entry_dte", 2),
             "exit_dte": request.get("exit_dte", 0),
             "expiry_type": request.get("expiry_type", "WEEKLY"),
+            # Overall SL/TGT
+            "overall_sl_type": request_obj.overall_sl_type,
+            "overall_sl_value": request_obj.overall_sl_value,
+            "overall_target_type": request_obj.overall_target_type,
+            "overall_target_value": request_obj.overall_target_value,
         }
         
         # SPOT ADJUSTMENT TYPE MAPPING
@@ -1535,7 +1549,7 @@ async def export_summary_post(request: dict):
 async def run_algotest_backtest_endpoint(request: dict):
     """
     NEW ENDPOINT: AlgoTest-style backtest
-    
+
     Request format:
     {
         "index": "NIFTY",
@@ -1544,13 +1558,46 @@ async def run_algotest_backtest_endpoint(request: dict):
         "expiry_type": "WEEKLY",
         "entry_dte": 2,
         "exit_dte": 0,
+
+        // ── Overall Stop Loss (mirrors AlgoTest 'Overall Strategy Settings') ──
+        //
+        // Mode 1 — Max Loss (fixed ₹):
+        //   "overall_sl_type":  "max_loss",
+        //   "overall_sl_value": 5000          // exit ALL legs if combined P&L ≤ -₹5000
+        //
+        // Mode 2 — Total Premium % (dynamic, % of combined entry premium in ₹):
+        //   "overall_sl_type":  "total_premium_pct",
+        //   "overall_sl_value": 10            // exit if P&L ≤ -(10% of total entry premium ₹)
+        //
+        // Calculation for Total Premium % mode:
+        //   total_entry_premium_rs = Σ (entry_premium × lots × lot_size)  [options legs only]
+        //   sl_threshold           = total_entry_premium_rs × (overall_sl_value / 100)
+        //   SL fires when combined_live_pnl ≤ -sl_threshold
+        //
+        // Overall Target (same two modes):
+        //   "overall_target_type":  "max_profit" | "total_premium_pct",
+        //   "overall_target_value": <number>
+
+        "overall_sl_type":     "total_premium_pct",   // or "max_loss"
+        "overall_sl_value":    10,                    // 10% of total entry premium
+        "overall_target_type": "max_profit",          // or "total_premium_pct"
+        "overall_target_value": null,                 // null = no target
+
         "legs": [
             {
                 "segment": "OPTIONS",
                 "option_type": "CE",
                 "position": "SELL",
                 "lots": 1,
-                "strike_selection": "OTM2",
+                "strike_selection": "ITM1",
+                "expiry": "WEEKLY"
+            },
+            {
+                "segment": "OPTIONS",
+                "option_type": "PE",
+                "position": "BUY",
+                "lots": 1,
+                "strike_selection": "OTM1",
                 "expiry": "WEEKLY"
             }
         ]
