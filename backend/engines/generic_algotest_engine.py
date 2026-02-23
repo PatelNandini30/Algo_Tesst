@@ -410,18 +410,18 @@ def check_overall_stop_loss_target(
         (trading_calendar['date'] <= exit_date)
     ]['date'].tolist()
 
-    print("\n========== OVERALL SL DEBUG START ==========")
-    print(f"Entry Date: {entry_date}")
-    print(f"Exit Date: {exit_date}")
-    print(f"Expiry Date: {expiry_date}")
-    print(f"SL Threshold: -₹{sl_threshold_rs}")
-    print("=============================================\n")
+    # print("\n========== OVERALL SL DEBUG START ==========")
+    # print(f"Entry Date: {entry_date}")
+    # print(f"Exit Date: {exit_date}")
+    # print(f"Expiry Date: {expiry_date}")
+    # print(f"SL Threshold: -₹{sl_threshold_rs}")
+    # print("=============================================\n")
 
     for check_date in holding_days:
         combined_live_pnl = 0.0
         has_data = False
 
-        print(f"\n--- Checking Date: {check_date.strftime('%Y-%m-%d')} ---")
+        # print(f"\n--- Checking Date: {check_date.strftime('%Y-%m-%d')} ---")
 
         for leg in trade_legs:
             seg      = leg.get('segment', 'OPTION')
@@ -445,12 +445,12 @@ def check_overall_stop_loss_target(
                     expiry=expiry_date.strftime('%Y-%m-%d')
                 )
 
-                print(f"  OPTION LEG -> Strike: {strike}, Type: {option_type}")
-                print(f"      Entry Premium: {entry_premium}")
-                print(f"      Current Premium from DB: {current_premium}")
+                # print(f"  OPTION LEG -> Strike: {strike}, Type: {option_type}")
+                # print(f"      Entry Premium: {entry_premium}")
+                # print(f"      Current Premium from DB: {current_premium}")
 
                 if current_premium is None:
-                    print("      ⚠ No data for this date")
+                    # print("      ⚠ No data for this date")
                     continue
 
                 has_data = True
@@ -460,7 +460,7 @@ def check_overall_stop_loss_target(
                 else:
                     leg_live_pnl = (entry_premium - current_premium) * lots * lot_size
 
-                print(f"      Leg Live PnL: ₹{leg_live_pnl}")
+                # print(f"      Leg Live PnL: ₹{leg_live_pnl}")
 
             elif seg in ('FUTURE', 'FUTURES'):
                 entry_price = leg.get('entry_price')
@@ -471,9 +471,9 @@ def check_overall_stop_loss_target(
                     expiry=expiry_date.strftime('%Y-%m-%d')
                 )
 
-                print(f"  FUTURE LEG")
-                print(f"      Entry Price: {entry_price}")
-                print(f"      Current Price: {current_price}")
+                # print(f"  FUTURE LEG")
+                # print(f"      Entry Price: {entry_price}")
+                # print(f"      Current Price: {current_price}")
 
                 if current_price is None:
                     continue
@@ -485,7 +485,7 @@ def check_overall_stop_loss_target(
                 else:
                     leg_live_pnl = (entry_price - current_price) * lots * lot_size
 
-                print(f"      Leg Live PnL: ₹{leg_live_pnl}")
+                # print(f"      Leg Live PnL: ₹{leg_live_pnl}")
 
             else:
                 continue
@@ -493,26 +493,26 @@ def check_overall_stop_loss_target(
             combined_live_pnl += leg_live_pnl
 
         if not has_data:
-            print("  ⚠ No data available for this date. Skipping.")
+            # print("  ⚠ No data available for this date. Skipping.")
             continue
 
-        print(f"\n  >>> Combined Live PnL = ₹{combined_live_pnl}")
-        print(f"  >>> SL Trigger Level  = -₹{sl_threshold_rs}")
+        # print(f"\n  >>> Combined Live PnL = ₹{combined_live_pnl}")
+        # print(f"  >>> SL Trigger Level  = -₹{sl_threshold_rs}")
 
         # STOP LOSS CHECK
         if sl_threshold_rs is not None and combined_live_pnl <= -sl_threshold_rs:
-            print(f"\n🛑 OVERALL SL HIT on {check_date.strftime('%Y-%m-%d')}")
-            print("========== OVERALL SL DEBUG END ==========\n")
+            # print(f"\n🛑 OVERALL SL HIT on {check_date.strftime('%Y-%m-%d')}")
+            # print("========== OVERALL SL DEBUG END ==========\n")
             return check_date, 'OVERALL_SL'
 
         # TARGET CHECK
         if tgt_threshold_rs is not None and combined_live_pnl >= tgt_threshold_rs:
-            print(f"\n✅ OVERALL TARGET HIT on {check_date.strftime('%Y-%m-%d')}")
-            print("========== OVERALL SL DEBUG END ==========\n")
+            # print(f"\n✅ OVERALL TARGET HIT on {check_date.strftime('%Y-%m-%d')}")
+            # print("========== OVERALL SL DEBUG END ==========\n")
             return check_date, 'OVERALL_TARGET'
 
-    print("\nNo Overall SL/Target Triggered")
-    print("========== OVERALL SL DEBUG END ==========\n")
+    # print("\nNo Overall SL/Target Triggered")
+    # print("========== OVERALL SL DEBUG END ==========\n")
 
     return None, None
 
@@ -879,12 +879,25 @@ def run_algotest_backtest(params):
             
             # ========== STEP 8B: PER-LEG STOP LOSS / TARGET ==========
             # Attach per-leg SL/Target config from frontend payload into trade_legs
+            # Support both old format (stop_loss, stop_loss_type) and new format (stopLoss, targetProfit)
             for li, tleg in enumerate(trade_legs):
                 src = legs_config[li] if li < len(legs_config) else {}
-                tleg['stop_loss']       = src.get('stop_loss', None)
-                tleg['stop_loss_type']  = src.get('stop_loss_type', 'pct')
-                tleg['target']          = src.get('target', None)
-                tleg['target_type']     = src.get('target_type', 'pct')
+                
+                # Handle new format (stopLoss with mode/value)
+                if 'stopLoss' in src:
+                    tleg['stop_loss'] = src['stopLoss'].get('value') if isinstance(src['stopLoss'], dict) else None
+                    tleg['stop_loss_type'] = src['stopLoss'].get('mode', 'pct').lower() if isinstance(src['stopLoss'], dict) else 'pct'
+                else:
+                    tleg['stop_loss'] = src.get('stop_loss', None)
+                    tleg['stop_loss_type'] = src.get('stop_loss_type', 'pct')
+                
+                # Handle new format (targetProfit with mode/value)
+                if 'targetProfit' in src:
+                    tleg['target'] = src['targetProfit'].get('value') if isinstance(src['targetProfit'], dict) else None
+                    tleg['target_type'] = src['targetProfit'].get('mode', 'pct').lower() if isinstance(src['targetProfit'], dict) else 'pct'
+                else:
+                    tleg['target'] = src.get('target', None)
+                    tleg['target_type'] = src.get('target_type', 'pct')
 
             per_leg_results = check_leg_stop_loss_target(
                 entry_date=entry_date,
@@ -979,20 +992,34 @@ def run_algotest_backtest(params):
 
             sl_reason = None   # always initialise; overwritten below if SL triggered
 
+            # Calculate actual_exit_date early - this is the date we'll use for exit
+            # If overall SL fired, use that date; otherwise use planned exit date
+            computed_actual_exit_date = (
+                overall_sl_triggered_date
+                if overall_sl_triggered_date is not None
+                else exit_date
+            )
+
             if per_leg_results is not None:
                 lot_size_sl = get_lot_size(index, entry_date)
                 any_early = False
 
+                _log(f"DEBUG: per_leg_results exists, overall_sl_triggered_date={overall_sl_triggered_date}, computed_actual_exit_date={computed_actual_exit_date}")
+
                 for li, tleg in enumerate(trade_legs):
                     res = per_leg_results[li]
                     leg_exit_date = res['exit_date']
+                    
+                    _log(f"DEBUG: Leg {li+1}: res_triggered={res['triggered']}, leg_exit_date={leg_exit_date}, exit_date={exit_date}")
 
-                    # FIX: compare against actual_exit_date (which == SL date if
-                    # Overall SL fired, or original exit_date otherwise)
-                    if res['triggered'] and leg_exit_date < actual_exit_date:
+                    # FIX: Use <= to catch case where leg_exit_date == computed_actual_exit_date (when overall SL fires)
+                    # Also check if triggered to ensure we recalculate when SL/TGT was hit
+                    # if res['triggered'] and leg_exit_date <= computed_actual_exit_date and leg_exit_date != exit_date:
+                    if res['triggered'] and leg_exit_date < exit_date:
                         any_early = True
                         _log(f"  ⚡ Leg {li+1} exits early on {leg_exit_date.strftime('%Y-%m-%d')} "
                              f"({res['exit_reason']})")
+                        _log(f"      DEBUG: leg_exit_date={leg_exit_date}, computed_actual_exit_date={computed_actual_exit_date}, exit_date={exit_date}")
 
                         # Recalculate exit price / premium for the early exit date
                         if tleg.get('segment') == 'OPTION':
@@ -1002,6 +1029,8 @@ def run_algotest_backtest(params):
                             lots_leg     = tleg.get('lots', 1)
                             entry_prem   = tleg.get('entry_premium')
 
+                            _log(f"      DEBUG: Fetching exit premium for date={leg_exit_date.strftime('%Y-%m-%d')}, strike={strike}, opt_type={opt_type}, expiry={expiry_date.strftime('%Y-%m-%d')}")
+                            
                             new_exit_prem = get_option_premium_from_db(
                                 date=leg_exit_date.strftime('%Y-%m-%d'),
                                 index=index,
@@ -1009,6 +1038,8 @@ def run_algotest_backtest(params):
                                 option_type=opt_type,
                                 expiry=expiry_date.strftime('%Y-%m-%d')
                             )
+                            _log(f"      DEBUG: new_exit_prem from DB = {new_exit_prem}")
+                            
                             if new_exit_prem is None:
                                 e_spot = get_spot_price_from_db(leg_exit_date, index) or entry_spot
                                 new_exit_prem = calculate_intrinsic_value(
@@ -1089,10 +1120,10 @@ def run_algotest_backtest(params):
             }
             
             all_trades.append(trade_record)
-            print(f"  SUCCESS: Trade recorded\n")
+            # print(f"  SUCCESS: Trade recorded\n")
         
         except Exception as e:
-            print(f"  ERROR: {str(e)}\n")
+            # print(f"  ERROR: {str(e)}\n")
             continue
     
     # ========== STEP 11: CONVERT TO DATAFRAME ==========
@@ -1213,8 +1244,8 @@ def run_algotest_backtest(params):
     trades_aggregated_subset = trades_aggregated[analytics_cols]
     trades_df = trades_df.merge(trades_aggregated_subset, on='Trade', how='left')
     
-    print(f"\nDEBUG: trades_df columns after merge: {list(trades_df.columns)}")
-    print(f"DEBUG: First row Cumulative: {trades_df.iloc[0]['Cumulative'] if 'Cumulative' in trades_df.columns else 'MISSING'}")
+    # print(f"\nDEBUG: trades_df columns after merge: {list(trades_df.columns)}")
+    # print(f"DEBUG: First row Cumulative: {trades_df.iloc[0]['Cumulative'] if 'Cumulative' in trades_df.columns else 'MISSING'}")
     
     # ========== STEP 13: BUILD PIVOT TABLE ==========
     pivot = build_pivot(trades_aggregated, 'Exit Date')

@@ -148,8 +148,8 @@ const AlgoTestBacktest = () => {
     setLegs(prev => [...prev, {
       id: Date.now(),
       segment: 'options',
-      lot: 1,
       position: 'sell',
+      lot: 1,
       option_type: 'call',
       expiry: 'weekly',
       strike_criteria: 'strike_type',
@@ -157,49 +157,133 @@ const AlgoTestBacktest = () => {
       premium_value: 0,
       premium_min: 0,
       premium_max: 0,
-      stop_loss_enabled: false,
-      stop_loss: null,
-      stop_loss_type: 'pct',
+
+      // Target Profit
       target_enabled: false,
-      target: null,
-      target_type: 'pct',
+      target_mode: 'POINTS',
+      target_value: 0,
+
+      // Stop Loss
+      stop_loss_enabled: false,
+      stop_loss_mode: 'POINTS',
+      stop_loss_value: 0,
+
+      // Trail SL
+      trail_sl_enabled: false,
+      trail_sl_mode: 'POINTS',
+      trail_sl_trigger: 0,
+      trail_sl_move: 0,
+
+      // Re-entry on Target
+      re_entry_target_enabled: false,
+      re_entry_target_mode: 'RE_ASAP',
+      re_entry_target_count: 1,
+
+      // Re-entry on SL
+      re_entry_sl_enabled: false,
+      re_entry_sl_mode: 'RE_ASAP',
+      re_entry_sl_count: 1,
+
+      // Simple Momentum
+      simple_momentum_enabled: false,
+      simple_momentum_mode: 'POINTS_UP',
+      simple_momentum_value: 0,
     }]);
   };
 
   const removeLeg = (id) => setLegs(prev => prev.filter(l => l.id !== id));
   const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => l.id === id ? { ...l, [field]: value } : l));
 
-  const buildPayload = () => ({
-    index: instrument,
-    underlying,
-    strategy_type: strategyType,
-    expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
-    entry_dte: entryDaysBefore,
-    exit_dte: exitDaysBefore,
-    square_off_mode: squareOffMode,
-    trail_sl_breakeven: trailSLBreakeven,
-    trail_sl_target: trailSLTarget,
-    legs: legs.map(l => ({
-      ...l,
-      lot: l.lot || 1,
-      strike_selection: {
-        type: l.strike_criteria,
-        strike_type: l.strike_type,
-        premium: l.premium_value,
-        lower: l.premium_min,
-        upper: l.premium_max,
-      },
-    })),
-    overall_settings: {
-      stop_loss: overallSLEnabled ? overallSLValue : null,
-      stop_loss_type: overallSLType,
-      target: overallTgtEnabled ? overallTgtValue : null,
-      target_type: overallTgtType,
-    },
-    date_from: startDate,
-    date_to: endDate,
-    expiry_type: expiryBasis.toUpperCase(),
-  });
+  const buildPayload = () => {
+    const legsPayload = legs.map(l => {
+      const leg = {
+        segment: l.segment.toUpperCase(),
+        position: l.position.toUpperCase(),
+        lots: l.lot || 1,
+        option_type: l.option_type.toUpperCase(),
+        expiry: l.expiry.toUpperCase(),
+        strike_selection: {
+          type: l.strike_criteria.toUpperCase(),
+          strike_type: l.strike_type.toUpperCase(),
+          premium: l.premium_value,
+          lower: l.premium_min,
+          upper: l.premium_max,
+        },
+      };
+
+      // Target Profit - only send if enabled
+      if (l.target_enabled) {
+        leg.targetProfit = {
+          mode: l.target_mode,
+          value: l.target_value,
+        };
+      }
+
+      // Stop Loss - only send if enabled
+      if (l.stop_loss_enabled) {
+        leg.stopLoss = {
+          mode: l.stop_loss_mode,
+          value: l.stop_loss_value,
+        };
+      }
+
+      // Trail SL - only send if enabled
+      if (l.trail_sl_enabled) {
+        leg.trailSL = {
+          mode: l.trail_sl_mode,
+          trigger: l.trail_sl_trigger,
+          move: l.trail_sl_move,
+        };
+      }
+
+      // Re-entry on Target - only send if enabled
+      if (l.re_entry_target_enabled) {
+        leg.reEntryOnTarget = {
+          mode: l.re_entry_target_mode,
+          count: l.re_entry_target_count,
+        };
+      }
+
+      // Re-entry on SL - only send if enabled
+      if (l.re_entry_sl_enabled) {
+        leg.reEntryOnSL = {
+          mode: l.re_entry_sl_mode,
+          count: l.re_entry_sl_count,
+        };
+      }
+
+      // Simple Momentum - only send if enabled
+      if (l.simple_momentum_enabled) {
+        leg.simpleMomentum = {
+          mode: l.simple_momentum_mode,
+          value: l.simple_momentum_value,
+        };
+      }
+
+      return leg;
+    });
+
+    return {
+      index: instrument,
+      underlying,
+      strategy_type: strategyType,
+      expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
+      entry_dte: entryDaysBefore,
+      exit_dte: exitDaysBefore,
+      square_off_mode: squareOffMode,
+      trail_sl_breakeven: trailSLBreakeven,
+      trail_sl_target: trailSLTarget,
+      legs: legsPayload,
+      // Overall SL/TGT - send flat structure with correct field names expected by backend
+      overall_sl_type: overallSLEnabled ? overallSLType : null,
+      overall_sl_value: overallSLEnabled ? (overallSLValue === '' ? 0 : overallSLValue) : null,
+      overall_target_type: overallTgtEnabled ? overallTgtType : null,
+      overall_target_value: overallTgtEnabled ? (overallTgtValue === '' ? 0 : overallTgtValue) : null,
+      date_from: startDate,
+      date_to: endDate,
+      expiry_type: expiryBasis.toUpperCase(),
+    };
+  };
 
   const runBacktest = async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
@@ -426,15 +510,15 @@ const AlgoTestBacktest = () => {
                         onChange={e => setOverallSLType(e.target.value)}
                         className="flex-1 h-8 px-2 border border-gray-300 rounded text-xs bg-white"
                       >
-                        <option value="max_loss">Max Loss</option>
-                        <option value="pct">%</option>
-                        <option value="points">Points</option>
+                        <option value="max_loss">Max Loss </option>
+                        <option value="total_premium_pct"> Total Premium %</option>
                       </select>
                       <input
                         type="number"
                         value={overallSLValue}
-                        onChange={e => setOverallSLValue(+e.target.value)}
+                        onChange={e => setOverallSLValue(e.target.value === '' ? '' : +e.target.value)}
                         className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                        placeholder={overallSLType === 'max_loss' ? '₹' : '%'}
                       />
                     </div>
                   )}
@@ -454,14 +538,14 @@ const AlgoTestBacktest = () => {
                         className="flex-1 h-8 px-2 border border-gray-300 rounded text-xs bg-white"
                       >
                         <option value="max_profit">Max Profit</option>
-                        <option value="pct">%</option>
-                        <option value="points">Points</option>
+                        <option value="total_premium_pct">% of Premium</option>
                       </select>
                       <input
                         type="number"
                         value={overallTgtValue}
-                        onChange={e => setOverallTgtValue(+e.target.value)}
+                        onChange={e => setOverallTgtValue(e.target.value === '' ? '' : +e.target.value)}
                         className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                        placeholder={overallTgtType === 'max_profit' ? '₹' : '%'}
                       />
                     </div>
                   )}
@@ -703,73 +787,189 @@ const AlgoTestBacktest = () => {
                             </div>
                           )}
 
-                          {/* Stop Loss & Target */}
-                          <div className="pt-3 border-t border-gray-100">
-                            <div className="grid grid-cols-2 gap-3">
-                              {/* Stop Loss Toggle */}
-                              <div>
-                                <div className="flex items-center justify-between mb-2">
-                                  <label className="text-xs font-medium text-gray-600 flex items-center gap-1.5">
-                                    <input
-                                      type="checkbox"
-                                      checked={leg.stop_loss_enabled}
-                                      onChange={e => updateLeg(leg.id, 'stop_loss_enabled', e.target.checked)}
-                                      className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                                    />
-                                    Stop Loss
-                                  </label>
-                                  {leg.stop_loss_enabled && (
-                                    <SegBtn
-                                      options={[{ value: 'pct', label: '%' }, { value: 'points', label: 'Pts' }]}
-                                      value={leg.stop_loss_type}
-                                      onChange={v => updateLeg(leg.id, 'stop_loss_type', v)}
-                                      size="sm"
-                                    />
-                                  )}
-                                </div>
-                                {leg.stop_loss_enabled && (
+                          {/* Compact Stop Loss & Target */}
+                          <div className="pt-3 border-t border-gray-100 grid grid-cols-2 gap-3">
+                            {/* Stop Loss */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.stop_loss_enabled} onToggle={() => updateLeg(leg.id, 'stop_loss_enabled', !leg.stop_loss_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600">SL</span>
+                              {leg.stop_loss_enabled && (
+                                <select
+                                  value={leg.stop_loss_mode}
+                                  onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)}
+                                  className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                >
+                                  <option value="POINTS">Pts</option>
+                                  <option value="UNDERLYING_POINTS">UPts</option>
+                                  <option value="PERCENT">%</option>
+                                  <option value="UNDERLYING_PERCENT">U%</option>
+                                </select>
+                              )}
+                              {leg.stop_loss_enabled && (
+                                <input
+                                  type="number"
+                                  min={0}
+                                  value={leg.stop_loss_value ?? ''}
+                                  onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)}
+                                  className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center"
+                                />
+                              )}
+                            </div>
+
+                            {/* Target Profit */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.target_enabled} onToggle={() => updateLeg(leg.id, 'target_enabled', !leg.target_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600">TGT</span>
+                              {leg.target_enabled && (
+                                <select
+                                  value={leg.target_mode}
+                                  onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)}
+                                  className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                >
+                                  <option value="POINTS">Pts</option>
+                                  <option value="UNDERLYING_POINTS">UPts</option>
+                                  <option value="PERCENT">%</option>
+                                  <option value="UNDERLYING_PERCENT">U%</option>
+                                </select>
+                              )}
+                              {leg.target_enabled && (
+                                <input
+                                  type="number"
+                                  min={0}
+                                  value={leg.target_value ?? ''}
+                                  onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)}
+                                  className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center"
+                                />
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Compact Trail SL & Re-entry */}
+                          <div className="grid grid-cols-2 gap-3">
+                            {/* Trail SL */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.trail_sl_enabled} onToggle={() => updateLeg(leg.id, 'trail_sl_enabled', !leg.trail_sl_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600">Trail</span>
+                              {leg.trail_sl_enabled && (
+                                <>
+                                  <select
+                                    value={leg.trail_sl_mode}
+                                    onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)}
+                                    className="w-14 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    <option value="POINTS">Pts</option>
+                                    <option value="PERCENT">%</option>
+                                  </select>
                                   <input
                                     type="number"
                                     min={0}
-                                    placeholder="—"
-                                    value={leg.stop_loss ?? ''}
-                                    onChange={e => updateLeg(leg.id, 'stop_loss', e.target.value === '' ? null : +e.target.value)}
-                                    className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                    placeholder="T"
+                                    value={leg.trail_sl_trigger ?? ''}
+                                    onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)}
+                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs text-center"
                                   />
-                                )}
-                              </div>
-                              {/* Target Toggle */}
-                              <div>
-                                <div className="flex items-center justify-between mb-2">
-                                  <label className="text-xs font-medium text-gray-600 flex items-center gap-1.5">
-                                    <input
-                                      type="checkbox"
-                                      checked={leg.target_enabled}
-                                      onChange={e => updateLeg(leg.id, 'target_enabled', e.target.checked)}
-                                      className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                                    />
-                                    Target
-                                  </label>
-                                  {leg.target_enabled && (
-                                    <SegBtn
-                                      options={[{ value: 'pct', label: '%' }, { value: 'points', label: 'Pts' }]}
-                                      value={leg.target_type}
-                                      onChange={v => updateLeg(leg.id, 'target_type', v)}
-                                      size="sm"
-                                    />
-                                  )}
-                                </div>
-                                {leg.target_enabled && (
                                   <input
                                     type="number"
                                     min={0}
-                                    placeholder="—"
-                                    value={leg.target ?? ''}
-                                    onChange={e => updateLeg(leg.id, 'target', e.target.value === '' ? null : +e.target.value)}
-                                    className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                                    placeholder="M"
+                                    value={leg.trail_sl_move ?? ''}
+                                    onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)}
+                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs text-center"
                                   />
-                                )}
-                              </div>
+                                </>
+                              )}
+                            </div>
+
+                            {/* Re-entry on Target */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.re_entry_target_enabled} onToggle={() => updateLeg(leg.id, 're_entry_target_enabled', !leg.re_entry_target_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600">RE-T</span>
+                              {leg.re_entry_target_enabled && (
+                                <>
+                                  <select
+                                    value={leg.re_entry_target_mode}
+                                    onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)}
+                                    className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    <option value="RE_ASAP">ASAP</option>
+                                    <option value="RE_MOMENTUM">↻</option>
+                                    <option value="RE_COST">Cost</option>
+                                    <option value="LAZY_LEG">Lazy</option>
+                                  </select>
+                                  <select
+                                    value={leg.re_entry_target_count}
+                                    onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)}
+                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    {[1,2,3,4,5].map(n => (
+                                      <option key={n} value={n}>{n}</option>
+                                    ))}
+                                  </select>
+                                </>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Compact Re-entry SL & Momentum */}
+                          <div className="grid grid-cols-2 gap-3">
+                            {/* Re-entry on SL */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.re_entry_sl_enabled} onToggle={() => updateLeg(leg.id, 're_entry_sl_enabled', !leg.re_entry_sl_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600">RE-SL</span>
+                              {leg.re_entry_sl_enabled && (
+                                <>
+                                  <select
+                                    value={leg.re_entry_sl_mode}
+                                    onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)}
+                                    className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    <option value="RE_ASAP">ASAP</option>
+                                    <option value="RE_MOMENTUM">↻</option>
+                                    <option value="RE_COST">Cost</option>
+                                    <option value="LAZY_LEG">Lazy</option>
+                                  </select>
+                                  <select
+                                    value={leg.re_entry_sl_count}
+                                    onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)}
+                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    {[1,2,3,4,5].map(n => (
+                                      <option key={n} value={n}>{n}</option>
+                                    ))}
+                                  </select>
+                                </>
+                              )}
+                            </div>
+
+                            {/* Simple Momentum */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.simple_momentum_enabled} onToggle={() => updateLeg(leg.id, 'simple_momentum_enabled', !leg.simple_momentum_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600">Mom</span>
+                              {leg.simple_momentum_enabled && (
+                                <>
+                                  <select
+                                    value={leg.simple_momentum_mode}
+                                    onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)}
+                                    className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
+                                  >
+                                    <option value="POINTS_UP">↑</option>
+                                    <option value="POINTS_DOWN">↓</option>
+                                    <option value="PERCENT_UP">%↑</option>
+                                    <option value="PERCENT_DOWN">%↓</option>
+                                    <option value="UNDERLYING_POINTS_UP">U↑</option>
+                                    <option value="UNDERLYING_POINTS_DOWN">U↓</option>
+                                    <option value="UNDERLYING_PERCENT_UP">U%↑</option>
+                                    <option value="UNDERLYING_PERCENT_DOWN">U%↓</option>
+                                  </select>
+                                  <input
+                                    type="number"
+                                    min={0}
+                                    value={leg.simple_momentum_value ?? ''}
+                                    onChange={e => updateLeg(leg.id, 'simple_momentum_value', e.target.value === '' ? null : +e.target.value)}
+                                    className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center"
+                                  />
+                                </>
+                              )}
                             </div>
                           </div>
 

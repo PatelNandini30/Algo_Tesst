@@ -777,4 +777,4 @@ const KPICard = ({ title, value, positive = true }) => {
   );
 };
 
-export default AlgoTestBacktest;
+export default AlgoTestBacktest; 

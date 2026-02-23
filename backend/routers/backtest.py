@@ -10,6 +10,13 @@ import json
 import threading
 import time
 
+# ADD THESE — after existing imports
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
+# Thread pool for running CPU-bound backtest without blocking FastAPI
+_backtest_executor = ThreadPoolExecutor(max_workers=3)
+
 # Simple in-memory cache for backtest results
 class BacktestCache:
     def __init__(self, max_size=100, ttl_seconds=3600):
@@ -605,7 +612,7 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                     leg_config['strike_selection'] = 'ATM'
                 leg_config['expiry'] = expiry_type
             
-            print(f">>> DEBUG: final leg_config = {leg_config}")
+            # print(f">>> DEBUG: final leg_config = {leg_config}")
             legs_config.append(leg_config)
         
         algotest_params = {
