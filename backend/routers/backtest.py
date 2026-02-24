@@ -606,6 +606,8 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                         leg_config['strike_selection'] = 'ATM'
                     elif 'OTM' in strike_type:
                         leg_config['strike_selection'] = f'OTM{int(strike_sel.value)}' if strike_sel.value else 'ATM'
+                    elif 'ITM' in strike_type:
+                        leg_config['strike_selection'] = f'ITM{int(strike_sel.value)}' if strike_sel.value else 'ATM'
                     else:
                         leg_config['strike_selection'] = 'ATM'
                 else:
@@ -635,6 +637,7 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             print(f"⚠️ AlgoTest engine failed: {e}")
             import traceback
             traceback.print_exc()
+            raise 
     
     # Default to generic_multi_leg
     # print("\n✓ Using generic_multi_leg engine\n")
@@ -1191,7 +1194,7 @@ async def dynamic_backtest(request: dict):
             "meta": {
                 "strategy": request_obj.name,
                 "index": request_obj.index,
-                "total_trades": len(trades_list),
+                "total_trades": summary.get("count", len(trades_list)),
                 "date_range": f"{request_obj.date_from} to {request_obj.date_to}",
                 "expiry_window": request_obj.expiry_window,
                 "parameters": {

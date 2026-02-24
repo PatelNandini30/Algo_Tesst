@@ -586,6 +586,13 @@ def run_algotest_backtest(params):
 
     square_off_mode = params.get('square_off_mode', 'partial')  # 'partial' | 'complete'
 
+    # Re-entry settings (for both Weekly and Monthly strategies)
+    # If trade exits before expiry due to SL/Target:
+    # - re_entry_enabled: whether to allow re-entry after SL/Target trigger
+    # - re_entry_max: maximum number of re-entries allowed per expiry
+    re_entry_enabled = params.get('re_entry_enabled', True)  # Default: allow re-entry
+    re_entry_max = params.get('re_entry_max', 20)  # Default: max 20 re-entries per expiry
+
     print(f"\n{'='*60}")
     print(f"ALGOTEST-STYLE BACKTEST")
     print(f"{'='*60}")
@@ -596,9 +603,10 @@ def run_algotest_backtest(params):
     print(f"Exit DTE: {exit_dte} (days before expiry)")
     print(f"Overall SL:  type={overall_sl_type}, value={overall_sl_value}")
     print(f"Overall TGT: type={overall_target_type}, value={overall_target_value}")
+    print(f"Re-entry: enabled={re_entry_enabled}, max_per_expiry={re_entry_max}")
     print(f"Legs: {len(legs_config)}")
     print(f"{'='*60}\n")
-    print(f"{'='*60}\n")
+
     
     # ========== STEP 2: LOAD DATA FROM CSV (like generic_multi_leg) ==========
     print("Loading spot data from CSV...")

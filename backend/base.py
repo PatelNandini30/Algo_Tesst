@@ -25,6 +25,7 @@ class BacktestDataCache:
     This is OPTIONAL - existing functions continue to work without it.
     """
     
+    
     def __init__(self):
         self.option_cache: Dict[str, Dict[str, Dict[float, Dict[str, Dict[str, float]]]]] = {}
         self.future_cache: Dict[str, Dict[str, float]] = {}

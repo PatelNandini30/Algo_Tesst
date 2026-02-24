@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Play, Plus, Trash2, Info, Save, AlertTriangle } from 'lucide-react';
 import ResultsPanel from './ResultsPanel';
 
@@ -124,8 +124,19 @@ const AlgoTestBacktest = () => {
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
+  const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
 
-  const daysOptions = expiryBasis === 'weekly' ? [0, 1, 2, 3, 4] : Array.from({ length: 25 }, (_, i) => i);
+  // Memoize static derived values so they don't rebuild on every keystroke
+  const daysOptions = useMemo(
+    () => expiryBasis === 'weekly' ? [0, 1, 2, 3, 4] : Array.from({ length: 25 }, (_, i) => i),
+    [expiryBasis]
+  );
+
+  const strikeTypeOpts = useMemo(() => [
+    ...Array.from({ length: 20 }, (_, i) => ({ value: `itm${20 - i}`, label: `ITM ${20 - i}` })),
+    { value: 'atm', label: 'ATM' },
+    ...Array.from({ length: 20 }, (_, i) => ({ value: `otm${i + 1}`, label: `OTM ${i + 1}` })),
+  ], []);
 
   // Validate expiry mismatch
   const validateExpiry = () => {
@@ -285,9 +296,9 @@ const AlgoTestBacktest = () => {
     };
   };
 
-  const runBacktest = async () => {
+  const runBacktest = useCallback(async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
-    // Validate expiry and set error message
+    if (loading) return;  // guard: ignore clicks while already running
     if (expiryBasis === 'monthly') {
       const weeklyLegs = legs.filter(l => l.expiry === 'weekly');
       if (weeklyLegs.length > 0) {
@@ -297,27 +308,31 @@ const AlgoTestBacktest = () => {
         return;
       }
     }
+
+    // Cancel any previous in-flight request
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true); setError(null);
     try {
       const res = await fetch('/api/dynamic-backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildPayload()),
+        signal: controller.signal,
       });
       if (res.ok) setResults(await res.json());
       else { const e = await res.json(); setError(e.detail || 'Backtest failed'); }
-    } catch {
-      setError('Network error. Check if backend is running.');
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setError('Network error. Check if backend is running.');
+      }
     } finally {
       setLoading(false);
+      abortRef.current = null;
     }
-  };
-
-  const strikeTypeOpts = [
-    ...Array.from({ length: 20 }, (_, i) => ({ value: `itm${20 - i}`, label: `ITM ${20 - i}` })),
-    { value: 'atm', label: 'ATM' },
-    ...Array.from({ length: 20 }, (_, i) => ({ value: `otm${i + 1}`, label: `OTM ${i + 1}` })),
-  ];
+  }, [legs, loading, expiryBasis, buildPayload]);
 
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, sans-serif' }}>
