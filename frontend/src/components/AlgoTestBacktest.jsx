@@ -807,17 +807,17 @@ const AlgoTestBacktest = () => {
                             {/* Stop Loss */}
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.stop_loss_enabled} onToggle={() => updateLeg(leg.id, 'stop_loss_enabled', !leg.stop_loss_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">SL</span>
+                              <span className="text-xs font-medium text-gray-600">Stop Loss</span>
                               {leg.stop_loss_enabled && (
                                 <select
                                   value={leg.stop_loss_mode}
                                   onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)}
                                   className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
                                 >
-                                  <option value="POINTS">Pts</option>
-                                  <option value="UNDERLYING_POINTS">UPts</option>
-                                  <option value="PERCENT">%</option>
-                                  <option value="UNDERLYING_PERCENT">U%</option>
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="UNDERLYING_POINTS">Underlying Pts</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                  <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
                               )}
                               {leg.stop_loss_enabled && (
@@ -834,17 +834,17 @@ const AlgoTestBacktest = () => {
                             {/* Target Profit */}
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.target_enabled} onToggle={() => updateLeg(leg.id, 'target_enabled', !leg.target_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">TGT</span>
+                              <span className="text-xs font-medium text-gray-600">Target Profit</span>
                               {leg.target_enabled && (
                                 <select
                                   value={leg.target_mode}
                                   onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)}
                                   className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
                                 >
-                                  <option value="POINTS">Pts</option>
-                                  <option value="UNDERLYING_POINTS">UPts</option>
-                                  <option value="PERCENT">%</option>
-                                  <option value="UNDERLYING_PERCENT">U%</option>
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="UNDERLYING_POINTS">Underlying Pts</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                  <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
                               )}
                               {leg.target_enabled && (
@@ -872,8 +872,8 @@ const AlgoTestBacktest = () => {
                                     onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)}
                                     className="w-14 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
                                   >
-                                    <option value="POINTS">Pts</option>
-                                    <option value="PERCENT">%</option>
+                                    <option value="POINTS">Points (Pts)</option>
+                                    <option value="PERCENT">Percent (%)</option>
                                   </select>
                                   <input
                                     type="number"

@@ -388,7 +388,7 @@ const StrategyPage = () => {
               <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-4">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-sm font-semibold text-gray-700">Backtest Results</h3>
-                  <span className="text-xs text-gray-500">{results.trades?.length || 0} trades</span>
+                  <span className="text-xs text-gray-500">{results.summary?.count || results.trades?.length || 0} trades</span>
                 </div>
                 
                 {results.summary && (

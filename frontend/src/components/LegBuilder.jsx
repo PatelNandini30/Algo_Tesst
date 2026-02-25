@@ -365,8 +365,10 @@ const LegBuilder = ({
                                   onChange={(e) => updateLeg(index, 'stop_loss_type', e.target.value)}
                                   className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md"
                                 >
-                                  <option value="pct">Percentage</option>
-                                  <option value="pts">Points</option>
+                                  <option value="pts">Points (Pts)</option>
+                                  <option value="underlying_pts">Underlying Pts</option>
+                                  <option value="pct">Percent (%)</option>
+                                  <option value="underlying_pct">Underlying %</option>
                                 </select>
                               </div>
                             </div>
@@ -409,8 +411,10 @@ const LegBuilder = ({
                                   onChange={(e) => updateLeg(index, 'target_type', e.target.value)}
                                   className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md"
                                 >
-                                  <option value="pct">Percentage</option>
-                                  <option value="pts">Points</option>
+                                  <option value="pts">Points (Pts)</option>
+                                  <option value="underlying_pts">Underlying Pts</option>
+                                  <option value="pct">Percent (%)</option>
+                                  <option value="underlying_pct">Underlying %</option>
                                 </select>
                               </div>
                             </div>
