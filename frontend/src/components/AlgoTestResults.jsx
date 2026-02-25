@@ -133,10 +133,28 @@ const AlgoTestResults = ({ results, onClose }) => {
   const exportToCSV = () => {
     if (!trades || trades.length === 0) return;
     
-    const headers = Object.keys(trades[0]);
+    // Add P&L column to each trade if not present
+    const tradesWithPnL = trades.map(trade => {
+      const position = (trade['B/S'] || '').toLowerCase();
+      const entryPrice = parseFloat(trade['Entry Price']) || 0;
+      const exitPrice = parseFloat(trade['Exit Price']) || 0;
+      const qty = parseInt(trade['Qty']) || 65;
+      
+      const pointsPnl = position === 'sell' 
+        ? entryPrice - exitPrice 
+        : exitPrice - entryPrice;
+      const actualPnl = pointsPnl * qty;
+      
+      return {
+        ...trade,
+        'P&L': actualPnl
+      };
+    });
+    
+    const headers = Object.keys(tradesWithPnL[0]);
     const csvContent = [
       headers.join(','),
-      ...trades.map(trade => 
+      ...tradesWithPnL.map(trade => 
         headers.map(h => {
           const val = trade[h];
           return typeof val === 'string' && val.includes(',') ? `"${val}"` : val;

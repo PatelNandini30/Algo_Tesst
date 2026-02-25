@@ -90,7 +90,14 @@ const StrategyPage = () => {
       setError(validationErrors.join('; '));
       return;
     }
-
+    
+    // Check for same-day expiry entry (Entry DTE = 0 and Exit DTE = 0)
+    if (entryDaysBefore === 0 && exitDaysBefore === 0) {
+      setError('Expiry day entry requires same-day spot data for accurate ATM/spot strike selection; results may differ when using previous close data.');
+      setTimeout(() => setError(null), 1000);
+      return;
+    }
+    
     setLoading(true);
     
     try {

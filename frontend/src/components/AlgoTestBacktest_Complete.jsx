@@ -84,6 +84,14 @@ const AlgoTestBacktest = () => {
       alert('Please add at least one leg to your strategy');
       return;
     }
+    
+    // Check for same-day expiry entry (Entry DTE = 0 and Exit DTE = 0)
+    if (config.entry_dte === 0 && config.exit_dte === 0) {
+      setError('Expiry day entry requires same-day spot data for accurate ATM/spot strike selection; results may differ when using previous close data.');
+      setTimeout(() => setError(null), 100);
+      return;
+    }
+    
     setLoading(true);
     setError(null);
     try {
@@ -363,8 +371,27 @@ const AlgoTestBacktest = () => {
 
           const exportCSV = () => {
             if (!trades || trades.length === 0) return;
-            const headers = Object.keys(trades[0]);
-            const csv = [headers.join(','), ...trades.map(t => headers.map(h => t[h]).join(','))].join('\n');
+            
+            // Add P&L column to each trade
+            const tradesWithPnL = trades.map(trade => {
+              const position = (trade['B/S'] || '').toLowerCase();
+              const entryPrice = parseFloat(trade['Entry Price']) || 0;
+              const exitPrice = parseFloat(trade['Exit Price']) || 0;
+              const qty = parseInt(trade['Qty']) || 65;
+              
+              const pointsPnl = position === 'sell' 
+                ? entryPrice - exitPrice 
+                : exitPrice - entryPrice;
+              const actualPnl = pointsPnl * qty;
+              
+              return {
+                ...trade,
+                'P&L': actualPnl
+              };
+            });
+            
+            const headers = Object.keys(tradesWithPnL[0]);
+            const csv = [headers.join(','), ...tradesWithPnL.map(t => headers.map(h => t[h]).join(','))].join('\n');
             const blob = new Blob([csv], { type: 'text/csv' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -398,19 +425,19 @@ const AlgoTestBacktest = () => {
                 <table className="min-w-full">
                   <thead>
                     <tr className="bg-gray-200 border-b-2 border-gray-400">
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Index</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Date</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Time</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Date</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Time</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Type</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Strike</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">B/S</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Qty</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Price</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Price</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Via</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">P/L</th>
+                      <th className="w-16 px-3 py-3 text-left text-xs font-bold text-gray-800">Index</th>
+                      <th className="w-28 px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Date</th>
+                      <th className="w-24 px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Time</th>
+                      <th className="w-28 px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Date</th>
+                      <th className="w-24 px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Time</th>
+                      <th className="w-20 px-3 py-3 text-left text-xs font-bold text-gray-800">Type</th>
+                      <th className="w-24 px-3 py-3 text-right text-xs font-bold text-gray-800">Strike</th>
+                      <th className="w-16 px-3 py-3 text-left text-xs font-bold text-gray-800">B/S</th>
+                      <th className="w-20 px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
+                      <th className="w-28 px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
+                      <th className="w-28 px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
+                      <th className="w-20 px-3 py-3 text-left text-xs font-bold text-gray-800">Via</th>
+                      <th className="w-28 px-3 py-3 text-right text-xs font-bold text-gray-800">P/L</th>
                     </tr>
                   </thead>
                   <tbody className="bg-white">
@@ -419,19 +446,19 @@ const AlgoTestBacktest = () => {
                       const isProfit = pnlValue >= 0;
                       return (
                         <tr key={idx} className={`border-b border-gray-200 ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}`}>
-                          <td className="px-3 py-2 text-sm text-gray-900">{startIndex + idx + 1}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.entry_date || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.entry_time || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.exit_date || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.exit_time || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.type || trade.option_type || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.strike || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.position || trade.bs || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.qty || trade.quantity || '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{typeof trade.entry_price === 'number' ? trade.entry_price.toFixed(2) : '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{typeof trade.exit_price === 'number' ? trade.exit_price.toFixed(2) : '-'}</td>
-                          <td className="px-3 py-2 text-sm text-gray-900">{trade.via || '-'}</td>
-                          <td className={`px-3 py-2 text-sm font-semibold ${isProfit ? 'text-green-600' : 'text-red-600'}`}>
+                          <td className="w-16 px-3 py-2 text-sm text-gray-900">{startIndex + idx + 1}</td>
+                          <td className="w-28 px-3 py-2 text-sm text-gray-900">{trade.entry_date || '-'}</td>
+                          <td className="w-24 px-3 py-2 text-sm text-gray-900">{trade.entry_time || '-'}</td>
+                          <td className="w-28 px-3 py-2 text-sm text-gray-900">{trade.exit_date || '-'}</td>
+                          <td className="w-24 px-3 py-2 text-sm text-gray-900">{trade.exit_time || '-'}</td>
+                          <td className="w-20 px-3 py-2 text-sm text-gray-900">{trade.type || trade.option_type || '-'}</td>
+                          <td className="w-24 px-3 py-2 text-sm text-gray-900 text-right">{trade.strike || '-'}</td>
+                          <td className="w-16 px-3 py-2 text-sm text-gray-900">{trade.position || trade.bs || '-'}</td>
+                          <td className="w-20 px-3 py-2 text-sm text-gray-900 text-right">{trade.qty || trade.quantity || '-'}</td>
+                          <td className="w-28 px-3 py-2 text-sm text-gray-900 text-right">{typeof trade.entry_price === 'number' ? trade.entry_price.toFixed(2) : '-'}</td>
+                          <td className="w-28 px-3 py-2 text-sm text-gray-900 text-right">{typeof trade.exit_price === 'number' ? trade.exit_price.toFixed(2) : '-'}</td>
+                          <td className="w-20 px-3 py-2 text-sm text-gray-900">{trade.via || '-'}</td>
+                          <td className={`w-28 px-3 py-2 text-sm font-semibold text-right ${isProfit ? 'text-green-600' : 'text-red-600'}`}>
                             {pnlValue.toFixed(2)}
                           </td>
                         </tr>
@@ -469,16 +496,16 @@ const AlgoTestBacktest = () => {
                   <table className="min-w-full">
                     <thead>
                       <tr className="bg-gray-200 border-b-2 border-gray-400">
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Date</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Date</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Spot Price</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Spot Price</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Spot P&L</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Future Expiry</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Net P&L</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Option Type</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Strike Price</th>
-                        <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Premium</th>
+                        <th className="px-3 py-3 w-28 text-left text-xs font-bold text-gray-800">Entry Date</th>
+                        <th className="px-3 py-3 w-28 text-left text-xs font-bold text-gray-800">Exit Date</th>
+                        <th className="px-3 py-3 w-32 text-right text-xs font-bold text-gray-800">Entry Spot Price</th>
+                        <th className="px-3 py-3 w-32 text-right text-xs font-bold text-gray-800">Exit Spot Price</th>
+                        <th className="px-3 py-3 w-28 text-right text-xs font-bold text-gray-800">Spot P&L</th>
+                        <th className="px-3 py-3 w-28 text-left text-xs font-bold text-gray-800">Future Expiry</th>
+                        <th className="px-3 py-3 w-28 text-right text-xs font-bold text-gray-800">Net P&L</th>
+                        <th className="px-3 py-3 w-24 text-left text-xs font-bold text-gray-800">Option Type</th>
+                        <th className="px-3 py-3 w-28 text-right text-xs font-bold text-gray-800">Strike Price</th>
+                        <th className="px-3 py-3 w-28 text-right text-xs font-bold text-gray-800">Entry Premium</th>
                       </tr>
                     </thead>
                     <tbody className="bg-white">

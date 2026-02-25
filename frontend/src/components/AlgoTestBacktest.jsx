@@ -102,6 +102,20 @@ const AlgoTestBacktest = () => {
   const [trailSLBreakeven, setTrailSLBreakeven] = useState(false);
   const [trailSLTarget, setTrailSLTarget] = useState('all_legs');
   const [legs, setLegs] = useState([]);
+
+  const [draftLeg, setDraftLeg] = useState({
+    segment: 'options',
+    position: 'sell',
+    lot: 1,
+    option_type: 'call',
+    expiry: 'weekly',
+    strike_criteria: 'strike_type',
+    strike_type: 'atm',
+    premium_value: 0,
+    premium_min: 0,
+    premium_max: 0,
+  });
+
   const [overallSLEnabled, setOverallSLEnabled] = useState(false);
   const [overallSLType, setOverallSLType] = useState('max_loss');
   const [overallSLValue, setOverallSLValue] = useState(0);
@@ -154,53 +168,21 @@ const AlgoTestBacktest = () => {
 
   const canRunBacktest = legs.length > 0 && !loading;
 
-  const addLeg = () => {
+  const addLegFromDraft = () => {
     if (legs.length >= 6) return;
     setLegs(prev => [...prev, {
       id: Date.now(),
-      segment: 'options',
-      position: 'sell',
-      lot: 1,
-      option_type: 'call',
-      expiry: 'weekly',
-      strike_criteria: 'strike_type',
-      strike_type: 'atm',
-      premium_value: 0,
-      premium_min: 0,
-      premium_max: 0,
-
-      // Target Profit
-      target_enabled: false,
-      target_mode: 'POINTS',
-      target_value: 0,
-
-      // Stop Loss
-      stop_loss_enabled: false,
-      stop_loss_mode: 'POINTS',
-      stop_loss_value: 0,
-
-      // Trail SL
-      trail_sl_enabled: false,
-      trail_sl_mode: 'POINTS',
-      trail_sl_trigger: 0,
-      trail_sl_move: 0,
-
-      // Re-entry on Target
-      re_entry_target_enabled: false,
-      re_entry_target_mode: 'RE_ASAP',
-      re_entry_target_count: 1,
-
-      // Re-entry on SL
-      re_entry_sl_enabled: false,
-      re_entry_sl_mode: 'RE_ASAP',
-      re_entry_sl_count: 1,
-
-      // Simple Momentum
-      simple_momentum_enabled: false,
-      simple_momentum_mode: 'POINTS_UP',
-      simple_momentum_value: 0,
+      ...draftLeg,
+      target_enabled: false, target_mode: 'POINTS', target_value: 0,
+      stop_loss_enabled: false, stop_loss_mode: 'POINTS', stop_loss_value: 0,
+      trail_sl_enabled: false, trail_sl_mode: 'POINTS', trail_sl_trigger: 0, trail_sl_move: 0,
+      re_entry_target_enabled: false, re_entry_target_mode: 'RE_ASAP', re_entry_target_count: 1,
+      re_entry_sl_enabled: false, re_entry_sl_mode: 'RE_ASAP', re_entry_sl_count: 1,
+      simple_momentum_enabled: false, simple_momentum_mode: 'POINTS_UP', simple_momentum_value: 0,
     }]);
+    setDraftLeg(prev => ({ ...prev, strike_type: 'atm', premium_value: 0, premium_min: 0, premium_max: 0 }));
   };
+  const addLeg = addLegFromDraft;
 
   const removeLeg = (id) => setLegs(prev => prev.filter(l => l.id !== id));
   const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => l.id === id ? { ...l, [field]: value } : l));
@@ -299,6 +281,14 @@ const AlgoTestBacktest = () => {
   const runBacktest = useCallback(async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
     if (loading) return;  // guard: ignore clicks while already running
+    
+    // Check for same-day expiry entry (Entry DTE = 0 and Exit DTE = 0)
+    if (entryDaysBefore === 0 && exitDaysBefore === 0) {
+      setError('Expiry day entry requires same-day spot data for accurate ATM/spot strike selection; results may differ when using previous close data.');
+      setTimeout(() => setError(null), 1000);
+      return;
+    }
+    
     if (expiryBasis === 'monthly') {
       const weeklyLegs = legs.filter(l => l.expiry === 'weekly');
       if (weeklyLegs.length > 0) {
@@ -609,398 +599,358 @@ const AlgoTestBacktest = () => {
             </div>
           </div>
 
-          {/* RIGHT COLUMN - Leg Builder */}
-          <div className="col-span-7">
-            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-              <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Leg Builder</h3>
-                  <Tooltip text="Build your strategy by adding individual option or futures legs." />
-                </div>
-                <button
-                  onClick={addLeg}
-                  disabled={legs.length >= 6}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded text-xs font-medium transition-colors"
-                >
-                  <Plus size={13} />
-                  Add Leg
-                </button>
-              </div>
+          {/* RIGHT COLUMN - Leg Builder (AlgoTest style) */}
+          <div className="col-span-7 space-y-3">
 
-              <div className="p-4">
-                {legs.length === 0 ? (
-                  <div className="text-center py-12 border-2 border-dashed border-gray-200 rounded-lg">
-                    <p className="text-sm text-gray-400 mb-3">No legs added yet</p>
-                    <button
-                      onClick={addLeg}
-                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium transition-colors"
-                    >
-                      <Plus size={14} />
-                      Add Your First Leg
-                    </button>
+            {/* ── Top configurator panel ── */}
+            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+              <div className="px-4 py-2.5 border-b border-gray-100 flex items-center gap-2">
+                <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wide">Leg Builder</h3>
+                <Tooltip text="Configure your leg settings then click Add Leg." />
+              </div>
+              <div className="px-4 py-3 flex flex-wrap items-end gap-3">
+
+                {/* Segment */}
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Select segments</label>
+                  <SegBtn
+                    options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }]}
+                    value={draftLeg.segment}
+                    onChange={v => setDraftLeg(prev => ({ ...prev, segment: v }))}
+                  />
+                </div>
+
+                {/* Total Lot */}
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Total Lot</label>
+                  <input type="number" min={1} value={draftLeg.lot}
+                    onChange={e => setDraftLeg(prev => ({ ...prev, lot: Math.max(1, parseInt(e.target.value) || 1) }))}
+                    className="w-16 h-8 px-2 border border-gray-300 rounded text-xs text-center bg-white focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </div>
+
+                {/* Position */}
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Position</label>
+                  <SegBtn
+                    options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
+                    value={draftLeg.position}
+                    onChange={v => setDraftLeg(prev => ({ ...prev, position: v }))}
+                  />
+                </div>
+
+                {/* Option Type */}
+                {draftLeg.segment === 'options' && (
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Option Type</label>
+                    <SegBtn
+                      options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
+                      value={draftLeg.option_type}
+                      onChange={v => setDraftLeg(prev => ({ ...prev, option_type: v }))}
+                    />
                   </div>
-                ) : (
-                  <div className="space-y-3">
-                    {legs.map((leg, idx) => (
-                      <div key={leg.id} className="border border-gray-200 rounded-lg overflow-hidden">
-                        {/* Leg Header */}
-                        <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 py-2 flex items-center justify-between border-b border-blue-200">
-                          <span className="text-xs font-bold text-blue-900">
-                            Leg {idx + 1} | {leg.segment === 'options' ? `${leg.position.toUpperCase()} ${leg.option_type.toUpperCase()}` : 'FUTURE'} | {leg.expiry}
-                          </span>
-                          <button
-                            onClick={() => removeLeg(leg.id)}
-                            className="p-1 text-red-500 hover:text-red-700 hover:bg-red-50 rounded transition-colors"
-                          >
+                )}
+
+                {/* Expiry */}
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Expiry</label>
+                  <select value={draftLeg.expiry}
+                    onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
+                    className="h-8 px-2 border border-gray-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 w-36">
+                    {draftLeg.segment === 'options' ? (
+                      <>
+                        <option value="weekly">Weekly</option>
+                        <option value="next_weekly">Next Weekly</option>
+                        <option value="monthly">Monthly</option>
+                        <option value="next_monthly">Next Monthly</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="monthly">Monthly</option>
+                        <option value="next_monthly">Next Monthly</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                {/* Strike Criteria */}
+                {draftLeg.segment === 'options' && (
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Strike Criteria</label>
+                    <select value={draftLeg.strike_criteria}
+                      onChange={e => setDraftLeg(prev => ({ ...prev, strike_criteria: e.target.value }))}
+                      className="h-8 px-2 border border-gray-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 w-44">
+                      <option value="strike_type">Strike Type</option>
+                      <option value="premium_range">Premium Range</option>
+                      <option value="closest_premium">Closest Premium</option>
+                      <option value="premium_gte">Premium &gt;=</option>
+                      <option value="premium_lte">Premium &lt;=</option>
+                      <option value="straddle_width">Straddle Width</option>
+                      <option value="pct_of_atm">% of ATM</option>
+                      <option value="synthetic_future">Synthetic Future</option>
+                      <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
+                      <option value="closest_delta">Closest Delta</option>
+                      <option value="delta_range">Delta Range</option>
+                    </select>
+                  </div>
+                )}
+
+                {/* Strike Type / Premium */}
+                {draftLeg.segment === 'options' && (
+                  <div>
+                    <label className="block text-xs text-gray-500 mb-1">Strike Type</label>
+                    {draftLeg.strike_criteria === 'strike_type' ? (
+                      <select value={draftLeg.strike_type}
+                        onChange={e => setDraftLeg(prev => ({ ...prev, strike_type: e.target.value }))}
+                        className="h-8 px-2 border border-gray-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 w-28">
+                        {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                    ) : draftLeg.strike_criteria === 'premium_range' ? (
+                      <div className="flex gap-1">
+                        <input type="number" min={0} placeholder="Min" value={draftLeg.premium_min || ''}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_min: +e.target.value }))}
+                          className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center" />
+                        <input type="number" min={0} placeholder="Max" value={draftLeg.premium_max || ''}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_max: +e.target.value }))}
+                          className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center" />
+                      </div>
+                    ) : (
+                      <input type="number" min={0} placeholder="Value" value={draftLeg.premium_value || ''}
+                        onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: +e.target.value }))}
+                        className="w-24 h-8 px-2 border border-gray-300 rounded text-xs text-center" />
+                    )}
+                  </div>
+                )}
+
+                {/* Add Leg */}
+                <div className="ml-auto">
+                  <button type="button" onClick={addLegFromDraft} disabled={legs.length >= 6}
+                    className="h-9 px-6 bg-blue-700 hover:bg-blue-800 disabled:opacity-40 text-white text-sm font-semibold rounded transition-colors shadow-sm">
+                    Add Leg
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* ── Added legs list ── */}
+            {legs.length > 0 && (
+              <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+                <div className="px-4 py-2.5 border-b border-gray-100">
+                  <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wide">Legs <span className="font-normal text-gray-400 ml-1">({legs.length}/6)</span></h3>
+                </div>
+                <div className="p-3 space-y-3">
+                  {legs.map((leg, idx) => (
+                    <div key={leg.id} className="border border-gray-200 rounded-lg overflow-hidden">
+                      <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 py-2 flex items-center justify-between border-b border-blue-200">
+                        <span className="text-xs font-bold text-blue-900">
+                          Leg {idx + 1} | {leg.segment === 'options' ? `${leg.position.toUpperCase()} ${leg.option_type.toUpperCase()}` : 'FUTURE'} | {leg.expiry}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-blue-600 font-medium">{leg.lot * getLotSize(instrument, startDate)} units</span>
+                          <button onClick={() => removeLeg(leg.id)} className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors">
                             <Trash2 size={13} />
                           </button>
                         </div>
+                      </div>
 
-                        {/* Leg Content */}
-                        <div className="p-3 space-y-3">
-                          {/* Row 1: Segment, Position, Lots */}
-                          <div className="grid grid-cols-3 gap-3">
-                            <div>
-                              <label className="block text-xs text-gray-500 mb-1">Segment</label>
-                              <SegBtn
-                                options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
-                                value={leg.segment}
-                                onChange={v => updateLeg(leg.id, 'segment', v)}
-                                size="sm"
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-xs text-gray-500 mb-1">Position</label>
-                              <SegBtn
-                                options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
-                                value={leg.position}
-                                onChange={v => updateLeg(leg.id, 'position', v)}
-                                size="sm"
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-xs text-gray-500 mb-1">Lots</label>
-                              <input
-                                type="number"
-                                min={1}
-                                value={leg.lot}
-                                onChange={e => updateLeg(leg.id, 'lot', parseInt(e.target.value) || 1)}
-                                className="w-full h-7 px-2 border border-gray-300 rounded text-xs text-center bg-white"
-                              />
-                            </div>
+                      <div className="p-3 space-y-3">
+                        {/* Basic fields */}
+                        <div className="flex flex-wrap items-end gap-3">
+                          <div>
+                            <label className="block text-xs text-gray-500 mb-1">Segment</label>
+                            <SegBtn size="sm"
+                              options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
+                              value={leg.segment} onChange={v => updateLeg(leg.id, 'segment', v)} />
                           </div>
-
+                          <div>
+                            <label className="block text-xs text-gray-500 mb-1">Lots</label>
+                            <input type="number" min={1} value={leg.lot}
+                              onChange={e => updateLeg(leg.id, 'lot', parseInt(e.target.value) || 1)}
+                              className="w-16 h-7 px-2 border border-gray-300 rounded text-xs text-center bg-white" />
+                          </div>
+                          <div>
+                            <label className="block text-xs text-gray-500 mb-1">Position</label>
+                            <SegBtn size="sm"
+                              options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
+                              value={leg.position} onChange={v => updateLeg(leg.id, 'position', v)} />
+                          </div>
+                          {leg.segment === 'options' && (
+                            <div>
+                              <label className="block text-xs text-gray-500 mb-1">Option Type</label>
+                              <SegBtn size="sm"
+                                options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
+                                value={leg.option_type} onChange={v => updateLeg(leg.id, 'option_type', v)} />
+                            </div>
+                          )}
+                          <div>
+                            <label className="block text-xs text-gray-500 mb-1">Expiry</label>
+                            <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
+                              className="h-7 px-2 border border-gray-300 rounded text-xs bg-white w-28">
+                              {leg.segment === 'options' ? (
+                                <>
+                                  <option value="weekly">Weekly</option>
+                                  <option value="next_weekly">Next Weekly</option>
+                                  <option value="monthly">Monthly</option>
+                                  <option value="next_monthly">Next Monthly</option>
+                                </>
+                              ) : (
+                                <>
+                                  <option value="monthly">Monthly</option>
+                                  <option value="next_monthly">Next Monthly</option>
+                                </>
+                              )}
+                            </select>
+                          </div>
                           {leg.segment === 'options' && (
                             <>
-                              {/* Row 2: Option Type, Expiry */}
-                              <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                  <label className="block text-xs text-gray-500 mb-1">Option Type</label>
-                                  <SegBtn
-                                    options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
-                                    value={leg.option_type}
-                                    onChange={v => updateLeg(leg.id, 'option_type', v)}
-                                    size="sm"
-                                  />
-                                </div>
-                                <div>
-                                  <label className="block text-xs text-gray-500 mb-1">Expiry</label>
-                                  <select
-                                    value={leg.expiry}
-                                    onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
-                                    className="w-full h-7 px-2 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    <option value="weekly">Weekly</option>
-                                    <option value="next_weekly">Next Weekly</option>
-                                    <option value="monthly">Monthly</option>
-                                    <option value="next_monthly">Next Monthly</option>
-                                  </select>
-                                </div>
-                              </div>
-
-                              {/* Row 3: Strike Criteria */}
                               <div>
                                 <label className="block text-xs text-gray-500 mb-1">Strike Criteria</label>
-                                <select
-                                  value={leg.strike_criteria}
-                                  onChange={e => updateLeg(leg.id, 'strike_criteria', e.target.value)}
-                                  className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
-                                >
+                                <select value={leg.strike_criteria} onChange={e => updateLeg(leg.id, 'strike_criteria', e.target.value)}
+                                  className="h-7 px-2 border border-gray-300 rounded text-xs bg-white w-36">
                                   <option value="strike_type">Strike Type</option>
                                   <option value="premium_range">Premium Range</option>
                                   <option value="closest_premium">Closest Premium</option>
-                                  <option value="premium_gte">Premium ≥</option>
-                                  <option value="premium_lte">Premium ≤</option>
+                                  <option value="premium_gte">Premium &gt;=</option>
+                                  <option value="premium_lte">Premium &lt;=</option>
+                                  <option value="straddle_width">Straddle Width</option>
+                                  <option value="pct_of_atm">% of ATM</option>
+                                  <option value="synthetic_future">Synthetic Future</option>
+                                  <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
+                                  <option value="closest_delta">Closest Delta</option>
+                                  <option value="delta_range">Delta Range</option>
                                 </select>
                               </div>
-
-                              {/* Row 4: Strike Value */}
                               <div>
+                                <label className="block text-xs text-gray-500 mb-1">Strike Type</label>
                                 {leg.strike_criteria === 'strike_type' ? (
-                                  <div>
-                                    <label className="block text-xs text-gray-500 mb-1">Strike Type</label>
-                                    <select
-                                      value={leg.strike_type}
-                                      onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
-                                      className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
-                                    >
-                                      {strikeTypeOpts.map(o => (
-                                        <option key={o.value} value={o.value}>{o.label}</option>
-                                      ))}
-                                    </select>
-                                  </div>
+                                  <select value={leg.strike_type} onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
+                                    className="h-7 px-2 border border-gray-300 rounded text-xs bg-white w-24">
+                                    {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                  </select>
                                 ) : leg.strike_criteria === 'premium_range' ? (
-                                  <div className="grid grid-cols-2 gap-2">
-                                    <div>
-                                      <label className="block text-xs text-gray-500 mb-1">Min Premium</label>
-                                      <input
-                                        type="number"
-                                        placeholder="Min"
-                                        value={leg.premium_min || ''}
-                                        onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
-                                        className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
-                                      />
-                                    </div>
-                                    <div>
-                                      <label className="block text-xs text-gray-500 mb-1">Max Premium</label>
-                                      <input
-                                        type="number"
-                                        placeholder="Max"
-                                        value={leg.premium_max || ''}
-                                        onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
-                                        className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
-                                      />
-                                    </div>
+                                  <div className="flex gap-1">
+                                    <input type="number" min={0} placeholder="Min" value={leg.premium_min || ''}
+                                      onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
+                                      className="w-16 h-7 px-1 border border-gray-300 rounded text-xs text-center" />
+                                    <input type="number" min={0} placeholder="Max" value={leg.premium_max || ''}
+                                      onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
+                                      className="w-16 h-7 px-1 border border-gray-300 rounded text-xs text-center" />
                                   </div>
                                 ) : (
-                                  <div>
-                                    <label className="block text-xs text-gray-500 mb-1">Premium Value</label>
-                                    <input
-                                      type="number"
-                                      placeholder="Premium ₹"
-                                      value={leg.premium_value || ''}
-                                      onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
-                                      className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
-                                    />
-                                  </div>
+                                  <input type="number" min={0} placeholder="Value" value={leg.premium_value || ''}
+                                    onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
+                                    className="w-20 h-7 px-1 border border-gray-300 rounded text-xs text-center" />
                                 )}
                               </div>
                             </>
                           )}
+                        </div>
 
-                          {leg.segment === 'futures' && (
-                            <div>
-                              <label className="block text-xs text-gray-500 mb-1">Expiry</label>
-                              <select
-                                value={leg.expiry}
-                                onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
-                                className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
-                              >
-                                <option value="monthly">Monthly</option>
-                                <option value="next_monthly">Next Monthly</option>
-                              </select>
-                            </div>
-                          )}
-
-                          {/* Compact Stop Loss & Target */}
-                          <div className="pt-3 border-t border-gray-100 grid grid-cols-2 gap-3">
-                            {/* Stop Loss */}
-                            <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.stop_loss_enabled} onToggle={() => updateLeg(leg.id, 'stop_loss_enabled', !leg.stop_loss_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">Stop Loss</span>
-                              {leg.stop_loss_enabled && (
-                                <select
-                                  value={leg.stop_loss_mode}
-                                  onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)}
-                                  className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                >
-                                  <option value="POINTS">Points (Pts)</option>
-                                  <option value="UNDERLYING_POINTS">Underlying Pts</option>
-                                  <option value="PERCENT">Percent (%)</option>
-                                  <option value="UNDERLYING_PERCENT">Underlying %</option>
-                                </select>
-                              )}
-                              {leg.stop_loss_enabled && (
-                                <input
-                                  type="number"
-                                  min={0}
-                                  value={leg.stop_loss_value ?? ''}
-                                  onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)}
-                                  className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center"
-                                />
-                              )}
-                            </div>
-
-                            {/* Target Profit */}
+                        {/* Advanced controls */}
+                        <div className="pt-2 border-t border-gray-100 space-y-2">
+                          <div className="flex flex-wrap gap-x-4 gap-y-2">
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.target_enabled} onToggle={() => updateLeg(leg.id, 'target_enabled', !leg.target_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">Target Profit</span>
-                              {leg.target_enabled && (
-                                <select
-                                  value={leg.target_mode}
-                                  onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)}
-                                  className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                >
+                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Target Profit</span>
+                              {leg.target_enabled && (<>
+                                <select value={leg.target_mode} onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="UNDERLYING_POINTS">Underlying Pts</option>
                                   <option value="PERCENT">Percent (%)</option>
                                   <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
-                              )}
-                              {leg.target_enabled && (
-                                <input
-                                  type="number"
-                                  min={0}
-                                  value={leg.target_value ?? ''}
-                                  onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)}
-                                  className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center"
-                                />
-                              )}
+                                <input type="number" min={0} value={leg.target_value ?? ''} onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                              </>)}
                             </div>
-                          </div>
-
-                          {/* Compact Trail SL & Re-entry */}
-                          <div className="grid grid-cols-2 gap-3">
-                            {/* Trail SL */}
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.stop_loss_enabled} onToggle={() => updateLeg(leg.id, 'stop_loss_enabled', !leg.stop_loss_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Stop Loss</span>
+                              {leg.stop_loss_enabled && (<>
+                                <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="UNDERLYING_POINTS">Underlying Pts</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                  <option value="UNDERLYING_PERCENT">Underlying %</option>
+                                </select>
+                                <input type="number" min={0} value={leg.stop_loss_value ?? ''} onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                              </>)}
+                            </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.trail_sl_enabled} onToggle={() => updateLeg(leg.id, 'trail_sl_enabled', !leg.trail_sl_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">Trail</span>
-                              {leg.trail_sl_enabled && (
-                                <>
-                                  <select
-                                    value={leg.trail_sl_mode}
-                                    onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)}
-                                    className="w-14 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    <option value="POINTS">Points (Pts)</option>
-                                    <option value="PERCENT">Percent (%)</option>
-                                  </select>
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    placeholder="T"
-                                    value={leg.trail_sl_trigger ?? ''}
-                                    onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)}
-                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs text-center"
-                                  />
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    placeholder="M"
-                                    value={leg.trail_sl_move ?? ''}
-                                    onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)}
-                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs text-center"
-                                  />
-                                </>
-                              )}
+                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Trail SL</span>
+                              <Tooltip text="For every X profit, trail SL by Y." />
+                              {leg.trail_sl_enabled && (<>
+                                <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  <option value="POINTS">Points</option>
+                                  <option value="PERCENT">Percent</option>
+                                </select>
+                                <input type="number" min={0} placeholder="X" value={leg.trail_sl_trigger ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                                <input type="number" min={0} placeholder="Y" value={leg.trail_sl_move ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                              </>)}
                             </div>
-
-                            {/* Re-entry on Target */}
+                          </div>
+                          <div className="flex flex-wrap gap-x-4 gap-y-2">
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.re_entry_target_enabled} onToggle={() => updateLeg(leg.id, 're_entry_target_enabled', !leg.re_entry_target_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">RE-T</span>
-                              {leg.re_entry_target_enabled && (
-                                <>
-                                  <select
-                                    value={leg.re_entry_target_mode}
-                                    onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)}
-                                    className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    <option value="RE_ASAP">ASAP</option>
-                                    <option value="RE_MOMENTUM">↻</option>
-                                    <option value="RE_COST">Cost</option>
-                                    <option value="LAZY_LEG">Lazy</option>
-                                  </select>
-                                  <select
-                                    value={leg.re_entry_target_count}
-                                    onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)}
-                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    {[1,2,3,4,5].map(n => (
-                                      <option key={n} value={n}>{n}</option>
-                                    ))}
-                                  </select>
-                                </>
-                              )}
+                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Re-entry on Tgt</span>
+                              {leg.re_entry_target_enabled && (<>
+                                <select value={leg.re_entry_target_mode} onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  <option value="RE_ASAP">RE ASAP</option>
+                                  <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+                                  <option value="RE_MOMENTUM">RE MOMENTUM</option>
+                                  <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+                                  <option value="RE_COST">RE COST</option>
+                                  <option value="RE_COST_REV">RE COST &#8629;</option>
+                                  <option value="LAZY_LEG">Lazy Leg</option>
+                                </select>
+                                <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
+                                </select>
+                              </>)}
                             </div>
-                          </div>
-
-                          {/* Compact Re-entry SL & Momentum */}
-                          <div className="grid grid-cols-2 gap-3">
-                            {/* Re-entry on SL */}
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.re_entry_sl_enabled} onToggle={() => updateLeg(leg.id, 're_entry_sl_enabled', !leg.re_entry_sl_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">RE-SL</span>
-                              {leg.re_entry_sl_enabled && (
-                                <>
-                                  <select
-                                    value={leg.re_entry_sl_mode}
-                                    onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)}
-                                    className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    <option value="RE_ASAP">ASAP</option>
-                                    <option value="RE_MOMENTUM">↻</option>
-                                    <option value="RE_COST">Cost</option>
-                                    <option value="LAZY_LEG">Lazy</option>
-                                  </select>
-                                  <select
-                                    value={leg.re_entry_sl_count}
-                                    onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)}
-                                    className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    {[1,2,3,4,5].map(n => (
-                                      <option key={n} value={n}>{n}</option>
-                                    ))}
-                                  </select>
-                                </>
-                              )}
+                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Re-entry on SL</span>
+                              {leg.re_entry_sl_enabled && (<>
+                                <select value={leg.re_entry_sl_mode} onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  <option value="RE_ASAP">RE ASAP</option>
+                                  <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+                                  <option value="RE_MOMENTUM">RE MOMENTUM</option>
+                                  <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+                                  <option value="RE_COST">RE COST</option>
+                                  <option value="RE_COST_REV">RE COST &#8629;</option>
+                                  <option value="LAZY_LEG">Lazy Leg</option>
+                                </select>
+                                <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
+                                </select>
+                              </>)}
                             </div>
-
-                            {/* Simple Momentum */}
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.simple_momentum_enabled} onToggle={() => updateLeg(leg.id, 'simple_momentum_enabled', !leg.simple_momentum_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600">Mom</span>
-                              {leg.simple_momentum_enabled && (
-                                <>
-                                  <select
-                                    value={leg.simple_momentum_mode}
-                                    onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)}
-                                    className="flex-1 h-6 px-1 border border-gray-300 rounded text-xs bg-white"
-                                  >
-                                    <option value="POINTS_UP">↑</option>
-                                    <option value="POINTS_DOWN">↓</option>
-                                    <option value="PERCENT_UP">%↑</option>
-                                    <option value="PERCENT_DOWN">%↓</option>
-                                    <option value="UNDERLYING_POINTS_UP">U↑</option>
-                                    <option value="UNDERLYING_POINTS_DOWN">U↓</option>
-                                    <option value="UNDERLYING_PERCENT_UP">U%↑</option>
-                                    <option value="UNDERLYING_PERCENT_DOWN">U%↓</option>
-                                  </select>
-                                  <input
-                                    type="number"
-                                    min={0}
-                                    value={leg.simple_momentum_value ?? ''}
-                                    onChange={e => updateLeg(leg.id, 'simple_momentum_value', e.target.value === '' ? null : +e.target.value)}
-                                    className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center"
-                                  />
-                                </>
-                              )}
+                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Simple Momentum</span>
+                              {leg.simple_momentum_enabled && (<>
+                                <select value={leg.simple_momentum_mode} onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                  <option value="POINTS_UP">Points (Pts) &#8593;</option>
+                                  <option value="POINTS_DOWN">Points (Pts) &#8595;</option>
+                                  <option value="PERCENT_UP">Percent (%) &#8593;</option>
+                                  <option value="PERCENT_DOWN">Percent (%) &#8595;</option>
+                                  <option value="UNDERLYING_POINTS_UP">Underlying Pts &#8593;</option>
+                                  <option value="UNDERLYING_POINTS_DOWN">Underlying Pts &#8595;</option>
+                                  <option value="UNDERLYING_PERCENT_UP">Underlying % &#8593;</option>
+                                  <option value="UNDERLYING_PERCENT_DOWN">Underlying % &#8595;</option>
+                                </select>
+                                <input type="number" min={0} value={leg.simple_momentum_value ?? ''} onChange={e => updateLeg(leg.id, 'simple_momentum_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                              </>)}
                             </div>
-                          </div>
-
-                          {/* Units Display */}
-                          <div className="text-right">
-                            <span className="text-xs text-blue-600 font-medium">
-                              {leg.lot * getLotSize(instrument, startDate)} units
-                            </span>
                           </div>
                         </div>
                       </div>
-                    ))}
-                  </div>
-                )}
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
 

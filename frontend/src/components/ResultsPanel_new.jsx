@@ -45,8 +45,27 @@ const ResultsPanel = ({ results, onClose }) => {
   // Export CSV
   const exportToCSV = () => {
     if (!trades || trades.length === 0) return;
-    const headers = Object.keys(trades[0]).join(',');
-    const rows = trades.map(trade => 
+    
+    // Add P&L column to each trade
+    const tradesWithPnL = trades.map(trade => {
+      const position = (trade['B/S'] || '').toLowerCase();
+      const entryPrice = parseFloat(trade['Entry Price']) || 0;
+      const exitPrice = parseFloat(trade['Exit Price']) || 0;
+      const qty = parseInt(trade['Qty']) || 65;
+      
+      const pointsPnl = position === 'sell' 
+        ? entryPrice - exitPrice 
+        : exitPrice - entryPrice;
+      const actualPnl = pointsPnl * qty;
+      
+      return {
+        ...trade,
+        'P&L': actualPnl
+      };
+    });
+    
+    const headers = Object.keys(tradesWithPnL[0]).join(',');
+    const rows = tradesWithPnL.map(trade => 
       Object.values(trade).map(val => 
         typeof val === 'string' && val.includes(',') ? `"${val}"` : val
       ).join(',')
