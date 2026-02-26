@@ -608,6 +608,20 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                         leg_config['strike_selection'] = f'OTM{int(strike_sel.value)}' if strike_sel.value else 'ATM'
                     elif 'ITM' in strike_type:
                         leg_config['strike_selection'] = f'ITM{int(strike_sel.value)}' if strike_sel.value else 'ATM'
+                    elif 'CLOSEST' in strike_type and 'PREMIUM' in strike_type:
+                        # Closest Premium: Store as dict with value
+                        leg_config['strike_selection'] = 'CLOSEST_PREMIUM'
+                        leg_config['premium'] = strike_sel.value  # Target premium value
+                    elif 'PREMIUM_RANGE' in strike_type:
+                        leg_config['strike_selection'] = 'PREMIUM_RANGE'
+                        leg_config['premium_min'] = strike_sel.premium_min
+                        leg_config['premium_max'] = strike_sel.premium_max
+                    elif 'PREMIUM_GTE' in strike_type or 'PREMIUM_GE' in strike_type:
+                        leg_config['strike_selection'] = 'PREMIUM_GTE'
+                        leg_config['premium'] = strike_sel.value
+                    elif 'PREMIUM_LTE' in strike_type or 'PREMIUM_LE' in strike_type:
+                        leg_config['strike_selection'] = 'PREMIUM_LTE'
+                        leg_config['premium'] = strike_sel.value
                     else:
                         leg_config['strike_selection'] = 'ATM'
                 else:

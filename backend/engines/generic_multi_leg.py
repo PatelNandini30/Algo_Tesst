@@ -230,6 +230,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                         target_premium = leg.strike_selection.value
                         selected_strike = None
                         min_diff = float('inf')
+                        tie_candidates = []
                         
                         for strike in available_strikes:
                             strike_mask = bhav_entry[
@@ -250,7 +251,18 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                                 diff = abs(premium - target_premium)
                                 if diff < min_diff:
                                     min_diff = diff
-                                    selected_strike = strike
+                                    tie_candidates = [(strike, premium)]
+                                elif diff == min_diff:
+                                    tie_candidates.append((strike, premium))
+                        
+                        # Deterministic tie-breaking: AlgoTest style
+                        if tie_candidates:
+                            if leg.option_type.value.upper() in ['CE', 'CALL', 'C']:
+                                # CE: prefer higher strike
+                                selected_strike = max(tie_candidates, key=lambda x: x[0])[0]
+                            else:
+                                # PE: prefer lower strike
+                                selected_strike = min(tie_candidates, key=lambda x: x[0])[0]
                     
                     elif leg.strike_selection.type == StrikeSelectionType.PREMIUM_RANGE:
                         # Find strikes within premium range
@@ -327,8 +339,9 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                         if entry_mask.empty:
                             continue
                         
-                        selected_strike = entry_mask.iloc[0]['StrikePrice']
-                    leg_entry_price = entry_mask.iloc[0]['Close']
+                        # Use the originally selected strike, not the recalculated one
+                        # The entry_mask lookup is just to get the premium, not to change strike
+                        leg_entry_price = entry_mask[entry_mask['StrikePrice'] == selected_strike]['Close'].iloc[0] if not entry_mask[entry_mask['StrikePrice'] == selected_strike].empty else entry_mask.iloc[0]['Close']
                     
                     # Get exit data for this leg's strike
                     exit_mask = bhav_exit[

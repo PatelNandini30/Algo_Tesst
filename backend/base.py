@@ -1681,8 +1681,13 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
     # Calculate ATM for reference
     atm_strike = round(spot_price / strike_interval) * strike_interval
     
-    # Find strike closest to ATM
-    closest = min(in_range, key=lambda x: abs(x['strike'] - atm_strike))
+    # Find strike closest to ATM with deterministic tie-breaking
+    # For CE: prefer higher strike, For PE: prefer lower strike
+    option_type_upper = option_type.upper() if option_type else 'CE'
+    if option_type_upper in ['CE', 'CALL', 'C']:
+        closest = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), -x['strike']))
+    else:
+        closest = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), x['strike']))
     
     return closest['strike']
 
@@ -1724,8 +1729,20 @@ def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot
     if not strikes_data:
         return None
     
-    # Find strike with premium closest to target
-    closest = min(strikes_data, key=lambda x: abs(x['premium'] - target_premium))
+    # Find strikes with minimum premium distance
+    min_diff = min(abs(s['premium'] - target_premium) for s in strikes_data)
+    candidates = [s for s in strikes_data if abs(s['premium'] - target_premium) == min_diff]
+    
+    # Deterministic tie-breaking: AlgoTest style
+    # For CE: prefer HIGHER strike (more premium, more downside protection)
+    # For PE: prefer LOWER strike (more premium, more downside protection)
+    option_type_upper = option_type.upper() if option_type else 'CE'
+    if option_type_upper in ['CE', 'CALL', 'C']:
+        # CE: prefer higher strike
+        closest = max(candidates, key=lambda x: x['strike'])
+    else:
+        # PE: prefer lower strike
+        closest = min(candidates, key=lambda x: x['strike'])
     
     return closest['strike']
 
