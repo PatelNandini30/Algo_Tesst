@@ -313,22 +313,34 @@ def _copy_sl_tgt_to_leg(leg_dict, leg_src):
     if 'stopLoss' in leg_src and isinstance(leg_src['stopLoss'], dict):
         leg_dict['stop_loss']      = leg_src['stopLoss'].get('value')
         leg_dict['stop_loss_type'] = _normalize_sl_tgt_type(leg_src['stopLoss'].get('mode'))
+        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Stop Loss configured - "
+              f"value={leg_dict['stop_loss']}, type={leg_dict['stop_loss_type']} "
+              f"(from stopLoss dict)")
     elif leg_src.get('stop_loss') is not None:
         leg_dict['stop_loss']      = leg_src['stop_loss']
         leg_dict['stop_loss_type'] = _normalize_sl_tgt_type(leg_src.get('stop_loss_type'))
+        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Stop Loss configured - "
+              f"value={leg_dict['stop_loss']}, type={leg_dict['stop_loss_type']} "
+              f"(from flat keys)")
     else:
         leg_dict['stop_loss']      = None
         leg_dict['stop_loss_type'] = 'pct'
+        print(f"  ✗ Leg {leg_dict.get('leg_number', '?')}: No Stop Loss configured")
 
     if 'targetProfit' in leg_src and isinstance(leg_src['targetProfit'], dict):
         leg_dict['target']      = leg_src['targetProfit'].get('value')
         leg_dict['target_type'] = _normalize_sl_tgt_type(leg_src['targetProfit'].get('mode'))
+        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Target configured - "
+              f"value={leg_dict['target']}, type={leg_dict['target_type']}")
     elif leg_src.get('target') is not None:
         leg_dict['target']      = leg_src['target']
         leg_dict['target_type'] = _normalize_sl_tgt_type(leg_src.get('target_type'))
+        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Target configured - "
+              f"value={leg_dict['target']}, type={leg_dict['target_type']}")
     else:
         leg_dict['target']      = None
         leg_dict['target_type'] = 'pct'
+        print(f"  ✗ Leg {leg_dict.get('leg_number', '?')}: No Target configured")
 
 
 def _apply_overall_sl_to_per_leg(per_leg_results, overall_date, overall_reason, n_legs, scheduled_exit_date=None):
@@ -438,6 +450,11 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
 
             if sl_val is None and tgt_val is None:
                 continue  # No SL/Target for this leg
+            
+            # Log what we're checking (only when SL/Target is configured)
+            if sl_val is not None or tgt_val is not None:
+                print(f"    Checking Leg {li+1} on {check_date.strftime('%Y-%m-%d')}: "
+                      f"SL={sl_val} ({sl_type}), Target={tgt_val} ({tgt_type})")
 
             position = leg['position']
             lot_size = leg.get('lot_size', get_lot_size(index, entry_date))
@@ -500,22 +517,34 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
 
             # ── Spot movement (for underlying-based modes) ────────────────────
             # adverse_spot_pts: positive = spot moved adversely for THIS leg
+            # 
+            # UNDERLYING POINTS LOGIC:
+            # For CE (CALL): Stop loss triggers when spot moves UP by X points from entry_spot
+            #   Example: Entry spot 25500, SL 50 pts → triggers when spot >= 25550
+            # For PE (PUT): Stop loss triggers when spot moves DOWN by X points from entry_spot
+            #   Example: Entry spot 25500, SL 50 pts → triggers when spot <= 25450
+            #
+            # This is independent of position (BUY/SELL) - it's based on option type direction
             adverse_spot_pts  = 0.0
             adverse_spot_pct  = 0.0
             if sl_type in ('underlying_pts', 'underlying_pct') or \
                tgt_type in ('underlying_pts', 'underlying_pct'):
                 current_spot = get_spot_price_from_db(check_date, index)
                 if current_spot is not None and entry_spot:
-                    spot_move = current_spot - entry_spot  # positive = spot rose
-                    # CE SELL / CE BUY-as-hedge: adverse = spot RISES
-                    # PE SELL / PE BUY-as-hedge: adverse = spot FALLS
+                    spot_move = current_spot - entry_spot  # positive = spot rose, negative = spot fell
+                    
                     opt = option_type.upper() if option_type else 'CE'
                     if opt in ('CE', 'CALL', 'C'):
-                        # CE: adverse direction is UP for SELL, DOWN for BUY
+                        # CE (CALL): Adverse when spot RISES (option becomes more ITM/valuable)
+                        # For SELL: loss when premium rises (spot goes up)
+                        # For BUY: loss when premium falls (spot goes down)
                         adverse_spot_pts = spot_move if position == 'SELL' else -spot_move
-                    else:  # PE
-                        # PE: adverse direction is DOWN for SELL, UP for BUY
+                    else:  # PE (PUT)
+                        # PE (PUT): Adverse when spot FALLS (option becomes more ITM/valuable)
+                        # For SELL: loss when premium rises (spot goes down)
+                        # For BUY: loss when premium falls (spot goes up)
                         adverse_spot_pts = -spot_move if position == 'SELL' else spot_move
+                    
                     adverse_spot_pct = (adverse_spot_pts / entry_spot * 100) if entry_spot else 0
 
             # ── Evaluate STOP LOSS ────────────────────────────────────────────
@@ -553,10 +582,15 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
 
             if hit_sl or hit_tgt:
                 reason = 'STOP_LOSS' if hit_sl else 'TARGET'
-                _log(f"      {'🛑' if hit_sl else '✅'} Leg {li+1} {reason} on "
-                     f"{check_date.strftime('%Y-%m-%d')} "
-                     f"adverse_pct={adverse_pct:.2f} "
-                     f"adverse_pts={adverse_premium_pts:.2f}")
+                # ALWAYS log when SL/Target triggers (even when DEBUG=False)
+                print(f"      {'🛑' if hit_sl else '✅'} Leg {li+1} {reason} on "
+                      f"{check_date.strftime('%Y-%m-%d')} "
+                      f"| Mode: {sl_type if hit_sl else tgt_type} "
+                      f"| Threshold: {sl_val if hit_sl else tgt_val} "
+                      f"| adverse_pct={adverse_pct:.2f}% "
+                      f"| adverse_pts={adverse_premium_pts:.2f} "
+                      f"| adverse_spot_pts={adverse_spot_pts:.2f} "
+                      f"| adverse_spot_pct={adverse_spot_pct:.2f}%")
                 newly_triggered_this_day.append((li, check_date, reason))
 
         # ── Apply triggers based on square_off_mode ──

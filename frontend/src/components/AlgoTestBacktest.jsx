@@ -204,16 +204,16 @@ const AlgoTestBacktest = () => {
         },
       };
 
-      // Target Profit - only send if enabled
-      if (l.target_enabled) {
+      // Target Profit - only send if enabled AND value is set
+      if (l.target_enabled && l.target_value != null && l.target_value > 0) {
         leg.targetProfit = {
           mode: l.target_mode,
           value: l.target_value,
         };
       }
 
-      // Stop Loss - only send if enabled
-      if (l.stop_loss_enabled) {
+      // Stop Loss - only send if enabled AND value is set
+      if (l.stop_loss_enabled && l.stop_loss_value != null && l.stop_loss_value > 0) {
         leg.stopLoss = {
           mode: l.stop_loss_mode,
           value: l.stop_loss_value,

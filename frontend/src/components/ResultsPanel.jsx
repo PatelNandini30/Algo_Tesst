@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { 
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer 
@@ -505,65 +505,108 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                     {groupedTrades.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage).map((group, groupIdx) => {
                       const actualTradeNum = (currentPage - 1) * itemsPerPage + groupIdx + 1;
                       
-                      return group.legs.map((leg, legIdx) => {
-                        const isFirstLeg = legIdx === 0;
-                        
-                        const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
-                        const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
+                      // Calculate totals for summary row
+                      const totalPointsPnl = group.legs.reduce((sum, leg) => {
                         const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
-                        const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
-                        const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
-                        const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
-                        
-                        const spotPnl = leg['Spot P&L'] || (group.exitSpot - group.entrySpot) || 0;
-                        
-                        // Calculate Points P&L based on position (Buy/Sell)
-                        const pointsPnl = position.toLowerCase() === 'sell' 
-                          ? entryPrice - exitPrice
-                          : exitPrice - entryPrice;
-                        
-                        // Calculate actual P&L = Points P&L × Qty
-                        const actualPnl = pointsPnl * qty;
-                        
-                        // Calculate Percent P&L
-                        const percentPnl = entryPrice !== 0 
-                          ? (pointsPnl / entryPrice) * 100
-                          : 0;
-                        
-                        return (
-                          <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-gray-200 ${groupIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
-                            {/* Show trade number and dates only on first leg */}
-                            {isFirstLeg ? (
-                              <>
-                                <td className="px-3 py-2 text-gray-900 font-semibold" rowSpan={group.legs.length}>{actualTradeNum}</td>
-                                <td className="px-3 py-2 text-gray-900" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
-                                <td className="px-3 py-2 text-gray-900" rowSpan={group.legs.length}>{group.exitDate || '-'}</td>
-                                <td className="px-3 py-2 text-right text-gray-900" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
-                                <td className="px-3 py-2 text-right text-gray-900" rowSpan={group.legs.length}>{(group.exitSpot || 0).toFixed(2)}</td>
-                                <td className="px-3 py-2 text-right text-gray-900" rowSpan={group.legs.length}>
-                                  {spotPnl.toFixed(2)}
+                        const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || 0;
+                        const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || 0;
+                        const pointsPnl = position.toLowerCase() === 'sell' ? entryPrice - exitPrice : exitPrice - entryPrice;
+                        return sum + pointsPnl;
+                      }, 0);
+                      
+                      const totalPnl = group.legs.reduce((sum, leg) => {
+                        const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
+                        const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || 65;
+                        const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || 0;
+                        const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || 0;
+                        const pointsPnl = position.toLowerCase() === 'sell' ? entryPrice - exitPrice : exitPrice - entryPrice;
+                        return sum + (pointsPnl * qty);
+                      }, 0);
+                      
+                      return (
+                        <React.Fragment key={group.tradeNumber}>
+                          {/* Leg rows */}
+                          {group.legs.map((leg, legIdx) => {
+                            const isFirstLeg = legIdx === 0;
+                            
+                            const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
+                            const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
+                            const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
+                            const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
+                            const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
+                            const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
+                            
+                            const spotPnl = leg['Spot P&L'] || (group.exitSpot - group.entrySpot) || 0;
+                            
+                            const pointsPnl = position.toLowerCase() === 'sell' 
+                              ? entryPrice - exitPrice
+                              : exitPrice - entryPrice;
+                            
+                            const actualPnl = pointsPnl * qty;
+                            
+                            const percentPnl = entryPrice !== 0 
+                              ? (pointsPnl / entryPrice) * 100
+                              : 0;
+                            
+                            return (
+                              <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-gray-200 ${groupIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
+                                {isFirstLeg ? (
+                                  <>
+                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{actualTradeNum}</td>
+                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
+                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.exitDate || '-'}</td>
+                                    <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
+                                    <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.exitSpot || 0).toFixed(2)}</td>
+                                    <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>
+                                      {spotPnl.toFixed(2)}
+                                    </td>
+                                  </>
+                                ) : null}
+                                <td className="px-3 py-2 text-xs text-gray-700">{optionType}</td>
+                                <td className="px-3 py-2 text-xs text-right text-gray-700">{parseFloat(strike).toFixed(0)}</td>
+                                <td className="px-3 py-2 text-xs text-gray-700">{position}</td>
+                                <td className="px-3 py-2 text-xs text-right text-gray-700">{qty}</td>
+                                <td className="px-3 py-2 text-xs text-right text-gray-700">{entryPrice.toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-right text-gray-700">{exitPrice.toFixed(2)}</td>
+                                <td className={`px-3 py-2 text-xs text-right ${actualPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                  {actualPnl >= 0 ? '+' : ''}{actualPnl.toFixed(2)}
                                 </td>
-                              </>
-                            ) : null}
-                            {/* Leg-specific data */}
-                            <td className="px-3 py-2 text-gray-700 text-xs">{optionType}</td>
-                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{parseFloat(strike).toFixed(0)}</td>
-                            <td className="px-3 py-2 text-gray-700 text-xs">{position}</td>
-                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{qty}</td>
-                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{entryPrice.toFixed(2)}</td>
-                            <td className="px-3 py-2 text-right text-gray-700 text-xs">{exitPrice.toFixed(2)}</td>
-                            <td className={`px-3 py-2 text-right text-xs font-semibold ${actualPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {actualPnl >= 0 ? '+' : ''}{actualPnl.toFixed(2)}
+                                <td className={`px-3 py-2 text-xs text-right ${pointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                  {pointsPnl.toFixed(2)}
+                                </td>
+                                <td className={`px-3 py-2 text-xs text-right ${percentPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                  {percentPnl.toFixed(2)}%
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          
+                          {/* Summary Row - Only show for multi-leg trades */}
+                          {group.legs.length > 1 && (
+                          <tr className="border-b-2 border-gray-300 bg-slate-50">
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className="px-3 py-2"></td>
+                            <td className={`px-3 py-2 text-right text-xs ${totalPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
                             </td>
-                            <td className={`px-3 py-2 text-right text-xs ${pointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {pointsPnl.toFixed(2)}
+                            <td className={`px-3 py-2 text-right text-xs ${totalPointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {totalPointsPnl >= 0 ? '+' : ''}{totalPointsPnl.toFixed(2)}
                             </td>
-                            <td className={`px-3 py-2 text-right text-xs ${percentPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {percentPnl.toFixed(2)}%
-                            </td>
+                            <td className="px-3 py-2"></td>
                           </tr>
-                        );
-                      });
+                          )}
+                        </React.Fragment>
+                      );
                     })}
                   </tbody>
                 </table>
