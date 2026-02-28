@@ -1676,20 +1676,30 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
     in_range = [s for s in strikes_data if min_premium <= s['premium'] <= max_premium]
     
     if not in_range:
+        print(f"         WARNING: No strikes found with premium between {min_premium} and {max_premium}")
         return None
     
-    # Calculate ATM for reference
+    print(f"         Found {len(in_range)} strikes in range: {[(s['strike'], s['premium']) for s in in_range[:5]]}")
+    
+    # Calculate ATM strike for distance comparison
     atm_strike = round(spot_price / strike_interval) * strike_interval
     
-    # Find strike closest to ATM with deterministic tie-breaking
-    # For CE: prefer higher strike, For PE: prefer lower strike
-    option_type_upper = option_type.upper() if option_type else 'CE'
-    if option_type_upper in ['CE', 'CALL', 'C']:
-        closest = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), -x['strike']))
-    else:
-        closest = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), x['strike']))
+    # Normalize option type
+    opt_type = option_type.upper()
+    if opt_type in ['CALL', 'C']:
+        opt_type = 'CE'
+    elif opt_type in ['PUT', 'P']:
+        opt_type = 'PE'
     
-    return closest['strike']
+    # Pick strike closest to ATM with deterministic tie-breaking
+    # For CE: prefer higher strike, For PE: prefer lower strike
+    if opt_type in ['CE', 'CALL', 'C']:
+        best = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), -x['strike']))
+    else:
+        best = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), x['strike']))
+    
+    print(f"         Selected strike {best['strike']} (premium={best['premium']:.2f}, ATM={atm_strike})")
+    return best['strike']
 
 
 def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot_price,
@@ -1727,11 +1737,17 @@ def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot
     )
     
     if not strikes_data:
+        print(f"         WARNING: No strikes data available for closest premium")
         return None
+    
+    print(f"         Searching for strike with premium closest to {target_premium}")
+    print(f"         Available strikes: {len(strikes_data)}, showing first 5: {[(s['strike'], s['premium']) for s in strikes_data[:5]]}")
     
     # Find strikes with minimum premium distance
     min_diff = min(abs(s['premium'] - target_premium) for s in strikes_data)
     candidates = [s for s in strikes_data if abs(s['premium'] - target_premium) == min_diff]
+    
+    print(f"         Found {len(candidates)} candidate(s) with min difference {min_diff:.2f}: {[(s['strike'], s['premium']) for s in candidates]}")
     
     # Deterministic tie-breaking: AlgoTest style
     # For CE: prefer HIGHER strike (more premium, more downside protection)
@@ -1744,6 +1760,7 @@ def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot
         # PE: prefer lower strike
         closest = min(candidates, key=lambda x: x['strike'])
     
+    print(f"         Selected strike {closest['strike']} (premium={closest['premium']:.2f}, target={target_premium})")
     return closest['strike']
 
 

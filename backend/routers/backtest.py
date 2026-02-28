@@ -556,8 +556,26 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
         expiry_type = params.get('expiry_type', 'WEEKLY')
         
         # Build legs config
+        original_legs = params.get('original_legs', [])
+        print(f"\n>>> DEBUG: original_legs count = {len(original_legs)}")
+        if original_legs:
+            print(f">>> DEBUG: First original leg keys: {list(original_legs[0].keys())}")
+            if 'stopLoss' in original_legs[0]:
+                print(f">>> DEBUG: First leg has stopLoss: {original_legs[0]['stopLoss']}")
+            else:
+                print(f">>> DEBUG: First leg does NOT have stopLoss")
+        
         legs_config = []
-        for leg in strategy_def.legs:
+        for idx, leg in enumerate(strategy_def.legs):
+            # Get the original leg data from params to access stopLoss/targetProfit
+            original_leg = original_legs[idx] if idx < len(original_legs) else {}
+            
+            # If original_leg is a Pydantic model, convert to dict
+            if hasattr(original_leg, 'dict'):
+                original_leg = original_leg.dict()
+            elif hasattr(original_leg, 'model_dump'):
+                original_leg = original_leg.model_dump()
+            
             # Debug: show actual values
             # Handle enum properly by using .value if available
             if hasattr(leg.instrument, 'value'):
@@ -611,17 +629,27 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                     elif 'CLOSEST' in strike_type and 'PREMIUM' in strike_type:
                         # Closest Premium: Store as dict with value
                         leg_config['strike_selection'] = 'CLOSEST_PREMIUM'
-                        leg_config['premium'] = strike_sel.value  # Target premium value
+                        leg_config['strike_selection_type'] = 'CLOSEST_PREMIUM'
+                        leg_config['premium'] = strike_sel.premium or strike_sel.value  # Target premium value
                     elif 'PREMIUM_RANGE' in strike_type:
                         leg_config['strike_selection'] = 'PREMIUM_RANGE'
-                        leg_config['premium_min'] = strike_sel.premium_min
-                        leg_config['premium_max'] = strike_sel.premium_max
-                    elif 'PREMIUM_GTE' in strike_type or 'PREMIUM_GE' in strike_type:
+                        leg_config['strike_selection_type'] = 'PREMIUM_RANGE'
+                        # Frontend may send 'lower'/'upper' OR 'premium_min'/'premium_max'
+                        lower_val = getattr(strike_sel, 'lower', None) or getattr(strike_sel, 'premium_min', None)
+                        upper_val = getattr(strike_sel, 'upper', None) or getattr(strike_sel, 'premium_max', None)
+                        leg_config['lower'] = lower_val
+                        leg_config['upper'] = upper_val
+                        print(f"  >>> PREMIUM_RANGE: lower={lower_val}, upper={upper_val}")
+                    elif 'PREMIUM_GTE' in strike_type or 'PREMIUM_GE' in strike_type or 'PREMIUM >=' in strike_type:
                         leg_config['strike_selection'] = 'PREMIUM_GTE'
-                        leg_config['premium'] = strike_sel.value
-                    elif 'PREMIUM_LTE' in strike_type or 'PREMIUM_LE' in strike_type:
+                        leg_config['strike_selection_type'] = 'PREMIUM_GTE'
+                        leg_config['premium'] = strike_sel.premium or strike_sel.value
+                        print(f"  >>> PREMIUM_GTE: premium={leg_config['premium']}")
+                    elif 'PREMIUM_LTE' in strike_type or 'PREMIUM_LE' in strike_type or 'PREMIUM <=' in strike_type:
                         leg_config['strike_selection'] = 'PREMIUM_LTE'
-                        leg_config['premium'] = strike_sel.value
+                        leg_config['strike_selection_type'] = 'PREMIUM_LTE'
+                        leg_config['premium'] = strike_sel.premium or strike_sel.value
+                        print(f"  >>> PREMIUM_LTE: premium={leg_config['premium']}")
                     else:
                         leg_config['strike_selection'] = 'ATM'
                 else:
@@ -629,7 +657,22 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                 leg_config['expiry'] = expiry_type
             
             # print(f">>> DEBUG: final leg_config = {leg_config}")
+            
+            # ========== ADD STOP LOSS AND TARGET PROFIT FROM ORIGINAL REQUEST ==========
+            # Copy stopLoss from original leg if present
+            if 'stopLoss' in original_leg and isinstance(original_leg['stopLoss'], dict):
+                leg_config['stopLoss'] = original_leg['stopLoss']
+                print(f"  ✓ Leg {idx+1}: Copying stopLoss from request: {original_leg['stopLoss']}")
+            
+            # Copy targetProfit from original leg if present
+            if 'targetProfit' in original_leg and isinstance(original_leg['targetProfit'], dict):
+                leg_config['targetProfit'] = original_leg['targetProfit']
+                print(f"  ✓ Leg {idx+1}: Copying targetProfit from request: {original_leg['targetProfit']}")
+            
             legs_config.append(leg_config)
+        
+        square_off_mode = params.get('square_off_mode', 'partial')
+        print(f"\n>>> DEBUG: square_off_mode from params = '{square_off_mode}'")
         
         algotest_params = {
             'index': params.get('index', 'NIFTY'),
@@ -643,6 +686,7 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             'overall_sl_value': params.get('overall_sl_value'),
             'overall_target_type': params.get('overall_target_type'),
             'overall_target_value': params.get('overall_target_value'),
+            'square_off_mode': square_off_mode,
         }
         
         try:
@@ -809,18 +853,14 @@ async def dynamic_backtest(request: dict):
                     backend_strike_value = float(strike_sel.get("premium", 0))
                 
                 elif strike_sel_type == "premium_gte":
-                    # Premium >= value
-                    backend_strike_type = "Premium Range"
-                    premium_min = float(strike_sel.get("premium", 0))
-                    premium_max = 999999.0  # Large number for upper bound
-                    backend_strike_value = 0.0
+                    # Premium >= value - keep as separate type
+                    backend_strike_type = "PREMIUM_GTE"
+                    backend_strike_value = float(strike_sel.get("premium", 0))
                 
                 elif strike_sel_type == "premium_lte":
-                    # Premium <= value
-                    backend_strike_type = "Premium Range"
-                    premium_min = 0.0
-                    premium_max = float(strike_sel.get("premium", 0))
-                    backend_strike_value = 0.0
+                    # Premium <= value - keep as separate type
+                    backend_strike_type = "PREMIUM_LTE"
+                    backend_strike_value = float(strike_sel.get("premium", 0))
                 
                 elif strike_sel_type == "straddle_width":
                     # Straddle width selection
@@ -958,6 +998,10 @@ async def dynamic_backtest(request: dict):
             strike_selection = StrikeSelection(
                 type=strike_selection_type,
                 value=strike_sel_data.get("value", 0.0),
+                premium_min=strike_sel_data.get("premium_min"),
+                premium_max=strike_sel_data.get("premium_max"),
+                lower=strike_sel_data.get("lower"),
+                upper=strike_sel_data.get("upper"),
                 spot_adjustment_mode=strike_sel_data.get("spot_adjustment_mode", 0),
                 spot_adjustment=strike_sel_data.get("spot_adjustment", 0.0)
             )
@@ -1069,6 +1113,7 @@ async def dynamic_backtest(request: dict):
             "entry_dte": request.get("entry_dte", 2),
             "exit_dte": request.get("exit_dte", 0),
             "expiry_type": request.get("expiry_type", "WEEKLY"),
+            "square_off_mode": request.get("square_off_mode", "partial"),  # Add square_off_mode
             # Overall SL/TGT
             "overall_sl_type": request_obj.overall_sl_type,
             "overall_sl_value": request_obj.overall_sl_value,
@@ -1084,6 +1129,9 @@ async def dynamic_backtest(request: dict):
             "RisesOrFalls": 3
         }
         params["spot_adjustment_type"] = spot_adjustment_mapping.get(request_obj.spot_adjustment_type, 0)
+        
+        # Pass original legs data for stopLoss/targetProfit extraction
+        params["original_legs"] = request_obj.legs
         
         # Execute the dynamic strategy
         with open('debug_backtest.log', 'a') as f:

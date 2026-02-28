@@ -554,7 +554,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                                   <>
                                     <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{actualTradeNum}</td>
                                     <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
-                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.exitDate || '-'}</td>
+                                  </>
+                                ) : null}
+                                {/* Show individual exit date for each leg */}
+                                <td className="px-3 py-2 text-xs text-gray-900">{leg['Exit Date'] || group.exitDate || '-'}</td>
+                                {isFirstLeg ? (
+                                  <>
                                     <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
                                     <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.exitSpot || 0).toFixed(2)}</td>
                                     <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>

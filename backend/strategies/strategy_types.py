@@ -34,6 +34,8 @@ class StrikeSelectionType(str, Enum):
     ATM = "ATM"  # At The Money
     CLOSEST_PREMIUM = "Closest Premium"
     PREMIUM_RANGE = "Premium Range"
+    PREMIUM_GTE = "PREMIUM_GTE"  # Premium >= value
+    PREMIUM_LTE = "PREMIUM_LTE"  # Premium <= value
     STRADDLE_WIDTH = "Straddle Width"
     PERCENT_OF_ATM = "% of ATM"
     DELTA = "Delta"
@@ -75,8 +77,11 @@ class StrikeSelection(BaseModel):
     """Strike selection configuration"""
     type: StrikeSelectionType
     value: Optional[float] = None  # For percentage-based selections
+    premium: Optional[float] = None  # For Closest Premium, Premium >=, Premium <= (frontend compatibility)
     premium_min: Optional[float] = None  # For premium range
     premium_max: Optional[float] = None  # For premium range
+    lower: Optional[float] = None  # Alternative name for premium_min (frontend compatibility)
+    upper: Optional[float] = None  # Alternative name for premium_max (frontend compatibility)
     delta_value: Optional[float] = None  # For delta-based selection
     strike_type: Optional[StrikeType] = None  # ATM/ITM/OTM
     otm_strikes: Optional[int] = None  # Number of strikes OTM
