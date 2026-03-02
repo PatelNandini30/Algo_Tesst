@@ -544,8 +544,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                             
                             const actualPnl = pointsPnl * qty;
                             
-                            const percentPnl = entryPrice !== 0 
-                              ? (pointsPnl / entryPrice) * 100
+                            const percentPnl = group.entrySpot !== 0 
+                              ? (pointsPnl / group.entrySpot) * 100
                               : 0;
                             
                             return (
@@ -607,7 +607,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
                             <td className={`px-3 py-2 text-right text-xs ${totalPointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                               {totalPointsPnl >= 0 ? '+' : ''}{totalPointsPnl.toFixed(2)}
                             </td>
-                            <td className="px-3 py-2"></td>
+                            <td className={`px-3 py-2 text-right text-xs ${totalPointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                              {group.entrySpot !== 0 ? ((totalPointsPnl / group.entrySpot) * 100).toFixed(2) + '%' : '0.00%'}
+                            </td>
                           </tr>
                           )}
                         </React.Fragment>

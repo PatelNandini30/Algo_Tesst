@@ -1911,9 +1911,9 @@ def run_algotest_backtest(params):
             lot_size = leg.get('lot_size', 65)
             qty      = lots * lot_size
 
-            # % P&L — direction-aware: positive = profitable for this leg's position
-            entry_value = entry_price * qty
-            pct_pnl = round(leg_pnl / entry_value * 100, 2) if entry_value else 0
+            # % P&L — based on Entry Spot: (Points P&L / Entry Spot) * 100
+            entry_spot_val = trade.get('entry_spot', 0)
+            pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
 
             row = {
                 'Trade':        trade_idx,
@@ -1953,6 +1953,12 @@ def run_algotest_backtest(params):
         'Net P&L': 'sum',  # Sum P&L across all legs
         'Exit Reason': 'first'
     }).reset_index()
+    
+    # Calculate Trade-level % P&L = Total Points P&L / Entry Spot * 100
+    trades_aggregated['% P&L'] = trades_aggregated.apply(
+        lambda row: round(row['Net P&L'] / row['Entry Spot'] * 100, 2) if row['Entry Spot'] else 0, 
+        axis=1
+    )
     
     # ========== STEP 12: COMPUTE ANALYTICS (ADDS CUMULATIVE, PEAK, DD, %DD) ==========
     if DEBUG:
