@@ -129,12 +129,18 @@ def calculate_strike_from_selection(
             if not option_data.empty:
                 premium = option_data.iloc[0]['Close']
                 if min_premium <= premium <= max_premium:
-                    valid_strikes.append(strike)
+                    valid_strikes.append((strike, premium))
         
-        # Return closest to ATM from valid strikes
+        # Return strike closest to either min or max boundary
         if valid_strikes:
-            atm = round(entry_spot / 100) * 100
-            return min(valid_strikes, key=lambda x: abs(x - atm))
+            # Log all valid strikes with their distances
+            for strike, premium in valid_strikes:
+                dist_to_min = abs(premium - min_premium)
+                dist_to_max = abs(premium - max_premium)
+                min_dist = min(dist_to_min, dist_to_max)
+                print(f"            Strike {strike}: premium={premium:.2f}, dist_to_min={dist_to_min:.2f}, dist_to_max={dist_to_max:.2f}, min_dist={min_dist:.2f}")
+            
+            return min(valid_strikes, key=lambda x: min(abs(x[1] - min_premium), abs(x[1] - max_premium)))[0]
         return round(entry_spot / 100) * 100
     
     elif strike_type == StrikeSelectionType.STRADDLE_WIDTH:

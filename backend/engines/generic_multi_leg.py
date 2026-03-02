@@ -289,10 +289,19 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                                 if premium_min <= premium <= premium_max:
                                     valid_strikes.append((strike, premium))
                         
-                        # Select the strike closest to ATM from valid strikes
+                        # Select the strike whose premium is nearest to either boundary (min or max).
+                        # For each valid strike, compute its distance to the nearer boundary.
+                        # The strike with the smallest such distance wins.
+                        # Example: range 150-200, premiums at 159 and 198.
+                        #   159 -> min_dist=9, max_dist=41 -> nearest_boundary_dist=9
+                        #   198 -> min_dist=48, max_dist=2  -> nearest_boundary_dist=2
+                        # Winner: 198 (closest to max boundary)
                         if valid_strikes:
-                            atm_strike = get_atm_strike(adjusted_spot, available_strikes_series)
-                            selected_strike = min(valid_strikes, key=lambda x: abs(x[0] - atm_strike))[0]
+                            def nearest_boundary_dist(item):
+                                _, prem = item
+                                return min(abs(prem - premium_min), abs(prem - premium_max))
+                            
+                            selected_strike = min(valid_strikes, key=nearest_boundary_dist)[0]
                         else:
                             selected_strike = None
                     

@@ -1655,14 +1655,14 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
     Trading Logic:
         1. Get all available strikes with premiums
         2. Filter strikes where premium is between min and max
-        3. Select the strike closest to ATM from filtered list
-        4. This ensures we get liquid strikes with desired premium range
+        3. Select the strike with premium closest to max_premium (highest in range)
+        4. This ensures we get the maximum premium within the specified range
         
     Example:
-        Spot = 24,350, Min = 100, Max = 200
-        Available: 24300 (₹250), 24350 (₹180), 24400 (₹120), 24450 (₹80)
-        In Range: 24350 (₹180), 24400 (₹120)
-        Closest to ATM: 24350 ✅
+        Spot = 24,350, Min = 150, Max = 200
+        Available: 24300 (₹250), 24350 (₹156), 24400 (₹198), 24450 (₹80)
+        In Range: 24350 (₹156), 24400 (₹198)
+        Selected: 24400 (₹198 - closest to max ₹200) ✅
     """
     # Get all strikes with premiums
     strikes_data = get_all_strikes_with_premiums(
@@ -1672,6 +1672,9 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
     if not strikes_data:
         return None
     
+    # Print ALL strikes with premiums for debugging
+    print(f"         ALL strikes with premiums: {[(s['strike'], s['premium']) for s in strikes_data[:15]]}")
+    
     # Filter by premium range
     in_range = [s for s in strikes_data if min_premium <= s['premium'] <= max_premium]
     
@@ -1679,24 +1682,13 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
         print(f"         WARNING: No strikes found with premium between {min_premium} and {max_premium}")
         return None
     
-    print(f"         Found {len(in_range)} strikes in range: {[(s['strike'], s['premium']) for s in in_range[:5]]}")
+    print(f"         Found {len(in_range)} strikes in range: {[(s['strike'], s['premium']) for s in in_range[:10]]}")
     
     # Calculate ATM strike for distance comparison
     atm_strike = round(spot_price / strike_interval) * strike_interval
     
-    # Normalize option type
-    opt_type = option_type.upper()
-    if opt_type in ['CALL', 'C']:
-        opt_type = 'CE'
-    elif opt_type in ['PUT', 'P']:
-        opt_type = 'PE'
-    
-    # Pick strike closest to ATM with deterministic tie-breaking
-    # For CE: prefer higher strike, For PE: prefer lower strike
-    if opt_type in ['CE', 'CALL', 'C']:
-        best = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), -x['strike']))
-    else:
-        best = min(in_range, key=lambda x: (abs(x['strike'] - atm_strike), x['strike']))
+    # Select strike closest to ATM from valid strikes in range
+    best = min(in_range, key=lambda x: abs(x['strike'] - atm_strike))
     
     print(f"         Selected strike {best['strike']} (premium={best['premium']:.2f}, ATM={atm_strike})")
     return best['strike']
