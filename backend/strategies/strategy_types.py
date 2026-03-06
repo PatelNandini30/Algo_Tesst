@@ -71,6 +71,13 @@ class ReEntryMode(str, Enum):
     DOWN_MOVE = "Down Move"  # Re-enter on downward move
     EITHER_MOVE = "Either Move"  # Re-enter on any move
 
+
+class SuperTrendConfig(str, Enum):
+    """Super Trend configuration types"""
+    NONE = "None"
+    FIVE_BY_ONE = "5x1"  # 5 period, 1 multiplier
+    FIVE_BY_TWO = "5x2"  # 5 period, 2 multiplier
+
 # ==================== MODELS ====================
 
 class StrikeSelection(BaseModel):
@@ -125,6 +132,9 @@ class StrategyDefinition(BaseModel):
     # Re-entry configuration
     re_entry_mode: ReEntryMode = ReEntryMode.NONE
     re_entry_percent: Optional[float] = None
+    
+    # Super Trend filter configuration
+    super_trend_config: SuperTrendConfig = SuperTrendConfig.NONE
     
     # Note: base2 filter removed - using all trading days
     

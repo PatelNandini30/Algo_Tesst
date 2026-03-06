@@ -1,0 +1,156 @@
+import pandas as pd
+from sqlalchemy import text
+
+
+class MarketDataRepository:
+    """
+    PostgreSQL-backed repository for market data.
+    Supports both legacy schema (002) and refactored schema (003).
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self._columns_cache = {}
+
+    def _table_columns(self, table_name: str):
+        if table_name in self._columns_cache:
+            return self._columns_cache[table_name]
+        q = text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = :t
+            """
+        )
+        with self.engine.begin() as conn:
+            cols = {r[0] for r in conn.execute(q, {"t": table_name}).fetchall()}
+        self._columns_cache[table_name] = cols
+        return cols
+
+    def _pick(self, cols: set, preferred: str, fallback: str):
+        return preferred if preferred in cols else fallback
+
+    def get_bhavcopy_by_date(self, date_str: str) -> pd.DataFrame:
+        cols = self._table_columns("option_data")
+        if not cols:
+            return pd.DataFrame()
+        date_col = self._pick(cols, "trade_date", "date")
+        close_col = self._pick(cols, "close_price", "close")
+        q = text(
+            f"""
+            SELECT
+                instrument AS "Instrument",
+                symbol AS "Symbol",
+                expiry_date AS "ExpiryDate",
+                option_type AS "OptionType",
+                strike_price AS "StrikePrice",
+                {close_col} AS "Close",
+                turnover AS "TurnOver",
+                {date_col} AS "Date"
+            FROM option_data
+            WHERE {date_col} = :d
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"d": date_str})
+        if df.empty:
+            return df
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"])
+        return df
+
+    def get_spot_data(self, symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
+        cols = self._table_columns("spot_data")
+        if not cols:
+            return pd.DataFrame(columns=["Date", "Close"])
+        date_col = self._pick(cols, "trade_date", "date")
+        close_col = self._pick(cols, "close_price", "close")
+        q = text(
+            f"""
+            SELECT
+                {date_col} AS "Date",
+                {close_col} AS "Close"
+            FROM spot_data
+            WHERE symbol = :symbol
+              AND {date_col} >= :from_date
+              AND {date_col} <= :to_date
+            ORDER BY {date_col}
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"symbol": symbol.upper(), "from_date": from_date, "to_date": to_date})
+        if df.empty:
+            return pd.DataFrame(columns=["Date", "Close"])
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df[["Date", "Close"]]
+
+    def get_expiry_data(self, symbol: str, expiry_type: str) -> pd.DataFrame:
+        cols = self._table_columns("expiry_calendar")
+        if not cols:
+            return pd.DataFrame(columns=["Previous Expiry", "Current Expiry", "Next Expiry"])
+        q = text(
+            """
+            SELECT
+                previous_expiry AS "Previous Expiry",
+                current_expiry AS "Current Expiry",
+                next_expiry AS "Next Expiry"
+            FROM expiry_calendar
+            WHERE symbol = :symbol AND expiry_type = :expiry_type
+            ORDER BY current_expiry
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"symbol": symbol.upper(), "expiry_type": expiry_type.lower()})
+        for c in ["Previous Expiry", "Current Expiry", "Next Expiry"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c])
+        return df
+
+    def get_super_trend_segments(self, config: str, symbol: str = "NIFTY") -> pd.DataFrame:
+        cols = self._table_columns("super_trend_segments")
+        if not cols:
+            return pd.DataFrame(columns=["start_date", "end_date"])
+        q = text(
+            """
+            SELECT start_date, end_date
+            FROM super_trend_segments
+            WHERE symbol = :symbol AND config = :config
+            ORDER BY start_date
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"symbol": symbol.upper(), "config": config})
+        if not df.empty:
+            df["start_date"] = pd.to_datetime(df["start_date"])
+            df["end_date"] = pd.to_datetime(df["end_date"])
+        return df
+
+    def get_available_date_range(self) -> dict:
+        cols = self._table_columns("option_data")
+        if not cols:
+            return {"min_date": None, "max_date": None}
+        date_col = self._pick(cols, "trade_date", "date")
+        q = text(f"SELECT MIN({date_col}) AS min_date, MAX({date_col}) AS max_date FROM option_data")
+        with self.engine.begin() as conn:
+            row = conn.execute(q).first()
+        return {"min_date": row[0], "max_date": row[1]}
+
+    def get_trading_calendar(self, from_date: str, to_date: str) -> pd.DataFrame:
+        cols = self._table_columns("option_data")
+        if not cols:
+            return pd.DataFrame(columns=["date"])
+        date_col = self._pick(cols, "trade_date", "date")
+        q = text(
+            f"""
+            SELECT DISTINCT {date_col} AS date
+            FROM option_data
+            WHERE {date_col} >= :from_date AND {date_col} <= :to_date
+            ORDER BY {date_col}
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"from_date": from_date, "to_date": to_date})
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"])
+        return df
+

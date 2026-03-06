@@ -3,282 +3,94 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 import sys
 import os
+import pandas as pd
+from database import get_data_source, engine as db_engine
+from repositories.market_data_repository import MarketDataRepository
 
 router = APIRouter()
+_repo = MarketDataRepository(db_engine)
 
-class StrategyInfo(BaseModel):
-    name: str
-    version: str
-    description: str
-    parameters: Dict[str, Any]
-    defaults: Dict[str, Any]
+class StrategyOptions(BaseModel):
+    instrument_types: List[str]
+    option_types: List[str]
+    position_types: List[str]
+    expiry_types: List[str]
+    strike_selection_types: List[str]
+    strike_types: List[str]
+    entry_time_types: List[str]
+    exit_time_types: List[str]
+    re_entry_modes: List[str]
+    super_trend_configs: List[str]
+    indices: List[str]
 
 
-class StrategiesResponse(BaseModel):
-    strategies: List[StrategyInfo]
+class DateRangeResponse(BaseModel):
+    min_date: str
+    max_date: str
 
 
-@router.get("/strategies", response_model=StrategiesResponse)
-async def get_strategies():
+@router.get("/strategies", response_model=StrategyOptions)
+async def get_strategy_options():
     """
-    Get list of all supported strategies with their parameters and defaults
+    Get available strategy configuration options (dynamic, not hardcoded).
+    Frontend uses these to build custom multi-leg strategies.
     """
-    strategies = [
-        StrategyInfo(
-            name="CE Sell + Future Buy (V1)",
-            version="v1_ce_fut",
-            description="Sell Call Option and Buy Future",
-            parameters={
-                "call_sell_position": "Percentage OTM for call strike",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold",
-                "expiry_window": "Expiry window type"
-            },
-            defaults={
-                "call_sell_position": 0.0,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry",
-                "call_sell": True,
-                "put_sell": False,
-                "call_buy": False,
-                "put_buy": False,
-                "future_buy": True
-            }
-        ),
-        StrategyInfo(
-            name="PE Sell + Future Buy (V2)",
-            version="v2_pe_fut",
-            description="Sell Put Option and Buy Future",
-            parameters={
-                "put_sell_position": "Percentage OTM for put strike",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold",
-                "expiry_window": "Expiry window type"
-            },
-            defaults={
-                "put_sell_position": 0.0,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry",
-                "call_sell": False,
-                "put_sell": True,
-                "call_buy": False,
-                "put_buy": False,
-                "future_buy": True
-            }
-        ),
-        StrategyInfo(
-            name="Short Strangle (V4)",
-            version="v4_strangle",
-            description="Sell Call and Put Options (no future)",
-            parameters={
-                "call_sell_position": "Percentage OTM for call strike",
-                "put_sell_position": "Percentage OTM for put strike",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold"
-            },
-            defaults={
-                "call_sell_position": 0.0,
-                "put_sell_position": 0.0,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "call_sell": True,
-                "put_sell": True,
-                "call_buy": False,
-                "put_buy": False,
-                "future_buy": False
-            }
-        ),
-        StrategyInfo(
-            name="Protected CE Sell (V5 Call)",
-            version="v5_call",
-            description="Sell Call with protective Call buy",
-            parameters={
-                "call_sell_position": "Percentage OTM for call strike",
-                "protection": "Enable protective leg",
-                "protection_pct": "Percentage OTM for protective leg",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold",
-                "expiry_window": "Expiry window type"
-            },
-            defaults={
-                "call_sell_position": 0.0,
-                "protection": False,
-                "protection_pct": 1.0,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry",
-                "call_sell": True,
-                "put_sell": False,
-                "call_buy": True,
-                "put_buy": False,
-                "future_buy": False
-            }
-        ),
-        StrategyInfo(
-            name="Protected PE Sell (V5 Put)",
-            version="v5_put",
-            description="Sell Put with protective Put buy",
-            parameters={
-                "put_sell_position": "Percentage OTM for put strike",
-                "protection": "Enable protective leg",
-                "protection_pct": "Percentage OTM for protective leg",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold",
-                "expiry_window": "Expiry window type"
-            },
-            defaults={
-                "put_sell_position": 0.0,
-                "protection": False,
-                "protection_pct": 1.0,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry",
-                "call_sell": False,
-                "put_sell": True,
-                "call_buy": False,
-                "put_buy": True,
-                "future_buy": False
-            }
-        ),
-        StrategyInfo(
-            name="Premium-Based Strangle (V7)",
-            version="v7_premium",
-            description="Sell options based on premium targets",
-            parameters={
-                "call_premium": "Use ATM call premium for target",
-                "put_premium": "Use ATM put premium for target",
-                "premium_multiplier": "Multiplier for premium target",
-                "call_sell": "Include call sell leg",
-                "put_sell": "Include put sell leg",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold"
-            },
-            defaults={
-                "call_premium": True,
-                "put_premium": True,
-                "premium_multiplier": 1.0,
-                "call_sell": True,
-                "put_sell": True,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "call_buy": False,
-                "put_buy": False,
-                "future_buy": False
-            }
-        ),
-        StrategyInfo(
-            name="Hedged Bull (V8)",
-            version="v8_ce_pe_fut",
-            description="CE Sell + PE Buy + Future Buy",
-            parameters={
-                "call_sell_position": "Percentage OTM for call strike",
-                "put_strike_pct_below": "Percentage below call for put strike",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold",
-                "expiry_window": "Expiry window type"
-            },
-            defaults={
-                "call_sell_position": 0.0,
-                "put_strike_pct_below": 1.0,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "expiry_window": "weekly_expiry",
-                "call_sell": True,
-                "put_sell": False,
-                "call_buy": False,
-                "put_buy": True,
-                "future_buy": True
-            }
-        ),
-        StrategyInfo(
-            name="Counter-Expiry (V9)",
-            version="v9_counter",
-            description="CE Sell + PE Buy with dynamic put expiry",
-            parameters={
-                "call_sell_position": "Percentage OTM for call strike",
-                "put_strike_pct_below": "Percentage below call for put strike",
-                "max_put_spot_pct": "Maximum put strike percentage below spot",
-                "spot_adjustment_type": "Type of spot adjustment (0=none, 1=rise, 2=fall, 3=both)",
-                "spot_adjustment": "Adjustment percentage threshold"
-            },
-            defaults={
-                "call_sell_position": 0.0,
-                "put_strike_pct_below": 1.0,
-                "max_put_spot_pct": 0.04,
-                "spot_adjustment_type": 0,
-                "spot_adjustment": 1.0,
-                "call_sell": True,
-                "put_sell": False,
-                "call_buy": False,
-                "put_buy": True,
-                "future_buy": True
-            }
-        ),
-        StrategyInfo(
-            name="Days Before Expiry (V10)",
-            version="v10",
-            description="Fully dynamic entry/exit based on days before expiry",
-            parameters={
-                "entry_days_before_expiry": "Days before expiry to enter position",
-                "exit_days_before_expiry": "Days before expiry to exit position",
-                "option_type": "Option type (CE or PE)",
-                "position_type": "Position type (Buy or Sell)",
-                "strike_offset": "Strike offset (0=ATM, +1=1 strike OTM, -1=1 strike ITM)",
-                "expiry_type": "Expiry type (weekly or monthly)"
-            },
-            defaults={
-                "entry_days_before_expiry": 5,
-                "exit_days_before_expiry": 3,
-                "option_type": "CE",
-                "position_type": "Buy",
-                "strike_offset": 0,
-                "expiry_type": "weekly"
-            }
-        )
-    ]
-    
-    return StrategiesResponse(strategies=strategies)
+    return StrategyOptions(
+        instrument_types=["Option", "Future", "Spot"],
+        option_types=["CE", "PE"],
+        position_types=["Buy", "Sell"],
+        expiry_types=["Weekly", "Monthly", "Weekly_T1", "Weekly_T2", "Monthly_T1"],
+        strike_selection_types=[
+            "ATM", "Closest Premium", "Premium Range", "PREMIUM_GTE", 
+            "PREMIUM_LTE", "Straddle Width", "% of ATM", "Delta", 
+            "Strike Type", "OTM %", "ITM %"
+        ],
+        strike_types=["ATM", "ITM", "OTM"],
+        entry_time_types=["Days Before Expiry", "Specific Time", "Market Open", "Market Close"],
+        exit_time_types=["Days Before Expiry", "Specific Time", "At Expiry", "Stop Loss", "Target"],
+        re_entry_modes=["None", "Up Move", "Down Move", "Either Move"],
+        super_trend_configs=["None", "5x1", "5x2"],
+        indices=["NIFTY", "BANKNIFTY", "FINNIFTY"]
+    )
 
 
-@router.get("/data/dates")
+@router.get("/data/dates", response_model=DateRangeResponse)
 async def get_date_range(index: str = "NIFTY"):
     """
     Get min/max available dates for a given index
     """
-    import pandas as pd
     from datetime import datetime
-    import os
-    from base import get_strike_data
     
-    try:
-        # Get all CSV files in cleaned_csvs directory
-        csv_dir = os.path.join(os.getcwd(), 'cleaned_csvs')
-        if not os.path.exists(csv_dir):
-            return {"min_date": None, "max_date": None}
-        
-        # Get all CSV files and extract dates from filenames
-        csv_files = [f for f in os.listdir(csv_dir) if f.endswith('.csv')]
-        dates = []
-        
-        for filename in csv_files:
-            date_str = filename.replace('.csv', '')
-            try:
-                # Validate date format
-                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                dates.append(date_obj)
-            except ValueError:
-                # Skip invalid date formats
-                continue
-        
-        if not dates:
-            return {"min_date": None, "max_date": None}
-        
-        min_date = min(dates).strftime('%Y-%m-%d')
-        max_date = max(dates).strftime('%Y-%m-%d')
-        
-        return {"min_date": min_date, "max_date": max_date}
-        
-    except Exception as e:
-        return {"min_date": None, "max_date": None}
+    if get_data_source() == "postgres":
+        try:
+            dr = _repo.get_available_date_range()
+            if dr["min_date"] and dr["max_date"]:
+                return DateRangeResponse(
+                    min_date=pd.to_datetime(dr["min_date"]).strftime('%Y-%m-%d'),
+                    max_date=pd.to_datetime(dr["max_date"]).strftime('%Y-%m-%d')
+                )
+        except Exception:
+            pass
+
+    csv_dir = os.path.join(os.getcwd(), 'cleaned_csvs')
+    if not os.path.exists(csv_dir):
+        return DateRangeResponse(min_date="2019-01-01", max_date="2026-01-01")
+    
+    csv_files = [f for f in os.listdir(csv_dir) if f.endswith('.csv')]
+    dates = []
+    
+    for filename in csv_files:
+        date_str = filename.replace('.csv', '')
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            dates.append(date_obj)
+        except ValueError:
+            continue
+    
+    if not dates:
+        return DateRangeResponse(min_date="2019-01-01", max_date="2026-01-01")
+    
+    min_date = min(dates).strftime('%Y-%m-%d')
+    max_date = max(dates).strftime('%Y-%m-%d')
+    
+    return DateRangeResponse(min_date=min_date, max_date=max_date)

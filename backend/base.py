@@ -7,6 +7,8 @@ import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Optional, Dict, Any
+from database import get_data_source, engine as db_engine, DATA_DIR
+from repositories.market_data_repository import MarketDataRepository
 
 # Thread pool for async file I/O
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -204,12 +206,17 @@ def clear_backtest_cache():
 # ============================================================================
 
 # Constants for data directories
-# Hardcoded absolute paths for Windows environment
-PROJECT_ROOT = r'E:\Algo_Test_Software'
+PROJECT_ROOT = DATA_DIR
 CLEANED_CSV_DIR = os.path.join(PROJECT_ROOT, 'cleaned_csvs')
 EXPIRY_DATA_DIR = os.path.join(PROJECT_ROOT, 'expiryData')
 STRIKE_DATA_DIR = os.path.join(PROJECT_ROOT, 'strikeData')
 FILTER_DIR = os.path.join(PROJECT_ROOT, 'Filter')
+
+_repo = MarketDataRepository(db_engine)
+
+
+def _use_postgres() -> bool:
+    return get_data_source() == "postgres"
 
 def round_half_up(x: float) -> int:
     """Round half values up (e.g., 0.5 -> 1, 1.5 -> 2)"""
@@ -226,6 +233,15 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     Filter by symbol, parse Date, filter to date range
     Return DataFrame: Date, Close
     """
+    if _use_postgres():
+        try:
+            pg_df = _repo.get_spot_data(symbol=symbol, from_date=from_date, to_date=to_date)
+            if not pg_df.empty:
+                return pg_df.reset_index(drop=True)
+        except Exception:
+            # Compatibility fallback to CSV path below
+            pass
+
     # Handle different capitalization formats for symbol
     possible_filenames = [
         f"{symbol}_strike_data.csv",
@@ -265,8 +281,9 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     to_dt = pd.to_datetime(to_date)
     df = df[(df['Date'] >= from_dt) & (df['Date'] <= to_dt)]
     
-    # Filter by symbol (ticker)
-    df = df[df['Ticker'] == symbol]
+    # Filter by symbol (ticker) if column exists
+    if 'Ticker' in df.columns:
+        df = df[df['Ticker'] == symbol]
     
     return df[['Date', 'Close']].reset_index(drop=True)
 
@@ -276,6 +293,15 @@ def load_expiry(index: str, expiry_type: str) -> pd.DataFrame:
     Parse Previous Expiry, Current Expiry, Next Expiry
     Return sorted DataFrame
     """
+    if _use_postgres():
+        try:
+            pg_df = _repo.get_expiry_data(symbol=index, expiry_type=expiry_type)
+            if not pg_df.empty:
+                return pg_df.sort_values('Current Expiry').reset_index(drop=True)
+        except Exception:
+            # Compatibility fallback to CSV path below
+            pass
+
     if expiry_type.lower() == 'weekly':
         file_path = os.path.join(EXPIRY_DATA_DIR, f"{index}.csv")
     elif expiry_type.lower() == 'monthly':
@@ -343,6 +369,17 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     Parse Date and ExpiryDate columns
     Return DataFrame: Instrument, Symbol, ExpiryDate, OptionType, StrikePrice, Close, TurnOver
     """
+    if _use_postgres():
+        try:
+            df = _repo.get_bhavcopy_by_date(date_str=date_str)
+            if not df.empty:
+                required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Close', 'TurnOver', 'Date']
+                available_cols = [col for col in required_cols if col in df.columns]
+                return df[available_cols].copy()
+        except Exception:
+            # Compatibility fallback to CSV path below
+            pass
+
     file_path = os.path.join(CLEANED_CSV_DIR, f"{date_str}.csv")
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Bhavcopy file not found: {file_path}")
@@ -985,6 +1022,13 @@ def get_trading_calendar(from_date, to_date, db_path='bhavcopy_data.db'):
     """
     import sqlite3
     import pandas as pd
+
+    if _use_postgres():
+        try:
+            return _repo.get_trading_calendar(from_date=str(from_date), to_date=str(to_date))
+        except Exception:
+            # Compatibility fallback to sqlite path below
+            pass
     
     conn = sqlite3.connect(db_path)
     
@@ -1177,6 +1221,196 @@ def clear_fast_lookup_caches():
 # ============================================================================
 # END OF FAST LOOKUP CACHE HELPERS
 # ============================================================================
+
+
+# ============================================================================
+# SUPER TREND FILTER - Load segments from CSV files
+# ============================================================================
+
+_super_trend_segments: Dict[str, list] = {"5x1": [], "5x2": []}
+_super_trend_loaded = False
+
+
+def _normalize_str_config(config: Any) -> Optional[str]:
+    """
+    Normalize config from enum/string/etc to '5x1' / '5x2' / None.
+    """
+    if config is None:
+        return None
+
+    raw = config.value if hasattr(config, "value") else config
+    raw = str(raw).strip()
+
+    if raw.lower() in {"none", ""}:
+        return None
+    if raw == "5x1":
+        return "5x1"
+    if raw == "5x2":
+        return "5x2"
+    return None
+
+
+def _parse_str_date(raw_value: Any) -> Optional[datetime]:
+    """
+    Parse STR date using ordered formats:
+    1) DD-MM-YYYY
+    2) YYYY-MM-DD
+    3) DD-MMM-YYYY
+    """
+    try:
+        if pd.isna(raw_value):
+            return None
+    except Exception:
+        pass
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def load_super_trend_dates(force_reload: bool = False):
+    """
+    Load STR segments once from CSV files.
+    Missing/unreadable file => warning + empty segment list for that config.
+    """
+    global _super_trend_loaded, _super_trend_segments
+
+    if _super_trend_loaded and not force_reload:
+        return
+
+    loaded: Dict[str, list] = {"5x1": [], "5x2": []}
+
+    if _use_postgres():
+        try:
+            for config_key in ("5x1", "5x2"):
+                df = _repo.get_super_trend_segments(config=config_key, symbol="NIFTY")
+                segments = []
+                for _, row in df.iterrows():
+                    start_dt = pd.Timestamp(row["start_date"]).to_pydatetime()
+                    end_dt = pd.Timestamp(row["end_date"]).to_pydatetime()
+                    if end_dt < start_dt:
+                        continue
+                    segments.append({"start": start_dt, "end": end_dt})
+                segments.sort(key=lambda s: s["start"])
+                loaded[config_key] = segments
+                print(f"Loaded {len(segments)} STR segments for {config_key} (postgres)")
+
+            _super_trend_segments = loaded
+            _super_trend_loaded = True
+            return
+        except Exception:
+            # Compatibility fallback to CSV path below
+            pass
+
+    file_map = {
+        "5x1": os.path.join(FILTER_DIR, "STR5,1_5,1.csv"),
+        "5x2": os.path.join(FILTER_DIR, "STR5,2_5,2.csv")
+    }
+
+    for config_key, file_path in file_map.items():
+        segments = []
+        try:
+            if not os.path.exists(file_path):
+                print(f"Warning: STR file not found for {config_key}: {file_path}")
+                loaded[config_key] = []
+                continue
+
+            df = pd.read_csv(file_path)
+            df.columns = [str(c).strip() for c in df.columns]
+
+            if "Start" not in df.columns or "End" not in df.columns:
+                print(f"Warning: STR file missing Start/End columns for {config_key}: {file_path}")
+                loaded[config_key] = []
+                continue
+
+            for _, row in df.iterrows():
+                start_dt = _parse_str_date(row.get("Start"))
+                end_dt = _parse_str_date(row.get("End"))
+
+                if start_dt is None or end_dt is None:
+                    continue
+                if end_dt < start_dt:
+                    continue
+
+                segments.append({"start": start_dt, "end": end_dt})
+
+            segments.sort(key=lambda s: s["start"])
+            loaded[config_key] = segments
+            print(f"Loaded {len(segments)} STR segments for {config_key}")
+
+        except Exception as e:
+            print(f"Warning: Could not read STR file for {config_key}: {file_path}. Error: {e}")
+            loaded[config_key] = []
+
+    _super_trend_segments = loaded
+    _super_trend_loaded = True
+
+
+def get_super_trend_segments(config: Any) -> list:
+    """
+    Return list of segment dicts for '5x1'/'5x2', else [].
+    """
+    load_super_trend_dates()
+    cfg = _normalize_str_config(config)
+    if cfg is None:
+        return []
+    return _super_trend_segments.get(cfg, [])
+
+
+def get_active_str_segment(trade_date, config: Any) -> Optional[dict]:
+    """
+    Return the STR segment that contains trade_date, or None.
+    Boundary inclusive (>= start AND <= end).
+    """
+    cfg = _normalize_str_config(config)
+    if cfg is None or trade_date is None:
+        return None
+
+    segments = get_super_trend_segments(cfg)
+    if not segments:
+        return None
+
+    d = pd.Timestamp(trade_date).to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for seg in segments:
+        seg_start = seg["start"].replace(hour=0, minute=0, second=0, microsecond=0)
+        seg_end = seg["end"].replace(hour=0, minute=0, second=0, microsecond=0)
+        if seg_start <= d <= seg_end:
+            return seg
+    return None
+
+
+def get_super_trend_sl_dates(config: Any) -> set:
+    """
+    Backward-compatible API:
+    derive SL dates from segment end dates.
+    """
+    segs = get_super_trend_segments(config)
+    return {seg["end"].strftime("%Y-%m-%d") for seg in segs}
+
+
+def is_super_trend_sl_date(date_str: str, config: Any) -> bool:
+    """
+    Backward-compatible API:
+    check whether date_str is one of segment end dates.
+    """
+    if not date_str:
+        return False
+    return str(date_str).strip() in get_super_trend_sl_dates(config)
+
+
+# ============================================================================
+# END OF SUPER TREND FILTER
+# ============================================================================
+
+
 
 
 def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path='bhavcopy_data.db'):
@@ -1859,6 +2093,7 @@ def calculate_strike_advanced(date, index, spot_price, strike_interval, option_t
         # Closest premium selection
         if strike_selection_value is None:
             raise ValueError("CLOSEST_PREMIUM requires strike_selection_value (target premium)")
+        
         
         strike = calculate_strike_from_closest_premium(
             date, index, expiry, option_type, spot_price,

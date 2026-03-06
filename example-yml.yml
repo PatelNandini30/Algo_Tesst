@@ -1,0 +1,209 @@
+# YT-AlgoTest - Production-Grade Options Backtesting Platform
+# Phase-1: Foundation Infrastructure
+# DO NOT MODIFY - This is production infrastructure
+
+
+services:
+  # PostgreSQL - Primary Database (handles 100GB+ data)
+  postgres:
+    image: postgres:15-alpine
+    container_name: yt-algotest-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: yt_algotest
+      POSTGRES_USER: ${POSTGRES_USER:-algotest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_secure_2026}
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotest} -d yt_algotest"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - algotest-network
+
+  # Redis - Queue + Cache (BullMQ + caching layer)
+  redis:
+    image: redis:7-alpine
+    container_name: yt-algotest-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - algotest-network
+
+  # Backend API - Express Server (handles user requests)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: yt-algotest-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: yt_algotest
+      POSTGRES_USER: ${POSTGRES_USER:-algotest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_secure_2026}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET:-change_this_in_production_2026}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+      JOB_MAX_RETRIES: ${JOB_MAX_RETRIES:-3}
+      JOB_RETRY_DELAY_SECONDS: ${JOB_RETRY_DELAY_SECONDS:-10}
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - backtest_results:/app/results
+      - ./downloads:/app/downloads
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - algotest-network
+
+  # Worker Engine - Backtest Processor (CPU-intensive operations)
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: yt-algotest-worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: yt_algotest
+      POSTGRES_USER: ${POSTGRES_USER:-algotest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_secure_2026}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      WORKER_ID: ${WORKER_ID:-worker-1}
+      MAX_EXECUTION_MINUTES: ${MAX_EXECUTION_MINUTES:-30}
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_ACCESS_KEY: algotest
+      MINIO_SECRET_KEY: strongpassword
+      ENGINE_SERVICE_URL: http://yt-algotest-engine:8000
+      ENGINE_TIMEOUT_SECONDS: ${ENGINE_TIMEOUT_SECONDS:-900}
+    volumes:
+      - ./worker:/app
+      - /app/node_modules
+      - backtest_results:/app/results
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      engine-service:
+        condition: service_started
+    networks:
+      - algotest-network
+    extra_hosts:
+      - "engine-service:172.18.0.5"
+    # Scale workers: docker-compose up -d --scale worker=4
+
+  # Engine Service - Python FastAPI Backtest Engine
+  engine-service:
+    build:
+      context: .
+      dockerfile: engine-service/Dockerfile
+    container_name: yt-algotest-engine
+    restart: unless-stopped
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MAX_ENGINE_CONCURRENCY: ${MAX_ENGINE_CONCURRENCY:-8}
+      ENGINE_TIMEOUT_SECONDS: ${ENGINE_TIMEOUT_SECONDS:-900}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - algotest-network
+
+  # Frontend - Next.js UI
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/}
+    container_name: yt-algotest-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/}
+    depends_on:
+      - backend
+    networks:
+      - algotest-network
+
+  # MinIO - Object Storage (for backtest results/artifacts)
+  minio:
+    image: minio/minio:latest
+    container_name: yt-algotest-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: algotest
+      MINIO_ROOT_PASSWORD: strongpassword
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - algotest-network
+
+  # Nginx - Reverse Proxy (routing + compression)
+  nginx:
+    image: nginx:alpine
+    container_name: yt-algotest-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - algotest-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backtest_results:
+    driver: local
+  nginx_logs:
+    driver: local
+  minio_data:
+
+networks:
+  algotest-network:
+    driver: bridge

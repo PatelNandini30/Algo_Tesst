@@ -4,7 +4,7 @@ Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
 
 # Set DEBUG = True to enable verbose logging for debugging
-DEBUG = True
+DEBUG = False
 
 def _log(*args, **kwargs):
     """Helper to print only when DEBUG is True"""
@@ -82,7 +82,26 @@ from base import (
     calculate_strike_from_premium_range,
     calculate_strike_from_closest_premium,
     get_all_strikes_with_premiums,
+    load_super_trend_dates,
+    get_super_trend_segments,
+    get_active_str_segment,
 )
+
+
+def _last_trading_day_on_or_before(trading_calendar_df, target_date):
+    target_ts = pd.Timestamp(target_date)
+    rows = trading_calendar_df[trading_calendar_df['date'] <= target_ts].sort_values('date')
+    if rows.empty:
+        return None
+    return rows.iloc[-1]['date']
+
+
+def _next_trading_day_after(trading_calendar_df, target_date):
+    target_ts = pd.Timestamp(target_date)
+    rows = trading_calendar_df[trading_calendar_df['date'] > target_ts].sort_values('date')
+    if rows.empty:
+        return None
+    return rows.iloc[0]['date']
 
 
 
@@ -1068,6 +1087,18 @@ def run_algotest_backtest(params):
     entry_dte = params.get('entry_dte', 2)
     exit_dte = params.get('exit_dte', 0)
     legs_config = params.get('legs', [])
+    super_trend_config = params.get('super_trend_config', 'None')
+    if hasattr(super_trend_config, 'value'):
+        super_trend_config = super_trend_config.value
+    super_trend_config = str(super_trend_config)
+    str_enabled = super_trend_config in ('5x1', '5x2')
+    str_segments = []
+    if str_enabled:
+        load_super_trend_dates()
+        str_segments = get_super_trend_segments(super_trend_config)
+        _log(f"STR Filter ON: {super_trend_config}, segments={len(str_segments)}")
+    else:
+        _log("STR Filter OFF")
     
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -1222,6 +1253,29 @@ def run_algotest_backtest(params):
             if entry_date == exit_date:
                 _log(f"  INFO: Entry == Exit ({entry_date}) — zero-holding trade skipped")
                 continue
+
+            # ===== STR ENTRY/EXIT FILTERING =====
+            str_segment = None
+            str_segment_label = ''
+            base_exit_reason = 'SCHEDULED'
+            if str_enabled:
+                str_segment = get_active_str_segment(entry_date, super_trend_config)
+                if str_segment is None:
+                    _log(f"  STR skip: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} outside segments")
+                    continue
+                seg_start = pd.Timestamp(str_segment['start'])
+                seg_end = pd.Timestamp(str_segment['end'])
+                str_segment_label = f"{seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}"
+                if seg_end < pd.Timestamp(exit_date):
+                    str_exit = _last_trading_day_on_or_before(trading_calendar, seg_end)
+                    if str_exit is None or pd.Timestamp(str_exit) < pd.Timestamp(entry_date):
+                        _log("  STR skip: no valid trading day on/before segment end")
+                        continue
+                    exit_date = pd.Timestamp(str_exit)
+                    base_exit_reason = 'STR_Exit'
+                    _log(f"  STR exit adjusted: {exit_date}")
+                else:
+                    base_exit_reason = 'Expiry'
             
             # ========== STEP 7: GET ENTRY SPOT PRICE ==========
             # Get spot from database (use index price at entry_date)
@@ -1609,7 +1663,8 @@ def run_algotest_backtest(params):
                 'exit_dte':        exit_dte,
                 'entry_spot':      entry_spot,
                 'exit_spot':       exit_spot,
-                'exit_reason':     sl_reason or 'SCHEDULED',
+                'exit_reason':     sl_reason or base_exit_reason,
+                'str_segment':     str_segment_label if str_enabled else '',
                 'legs':            trade_legs,
                 'total_pnl':       total_pnl,
                 'square_off_mode': square_off_mode,
@@ -1934,6 +1989,7 @@ def run_algotest_backtest(params):
                 'Net P&L':      leg_pnl,
                 '% P&L':        pct_pnl,
                 'Exit Reason':  leg_exit_reason,        # per-leg reason
+                'STR Segment':  trade.get('str_segment', ''),
             }
 
             trades_flat.append(row)

@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: algotest-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-algotest}
+      POSTGRES_USER: ${POSTGRES_USER:-algotest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotest}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - algotest-network
+
+  # Redis for caching and queue
+  redis:
+    image: redis:7-alpine
+    container_name: algotest-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - algotest-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: algotest-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+      - USE_POSTGRESQL=${USE_POSTGRESQL:-false}
+      - PYTHONUNBUFFERED=1
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-algotest}
+      - POSTGRES_USER=${POSTGRES_USER:-algotest}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-algotest_password}
+    volumes:
+      - ./cleaned_csvs:/data/cleaned_csvs:ro
+      - ./expiryData:/data/expiryData:ro
+      - ./strikeData:/data/strikeData:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - algotest-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: algotest-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - VITE_API_URL=http://localhost:${BACKEND_PORT:-8000}
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - algotest-network
+
+  # Worker (optional - uncomment to enable)
+  # worker:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: Dockerfile
+  #   container_name: algotest-worker
+  #   command: ["python", "-m", "celery", "-A", "worker.celery", "worker", "--loglevel=info"]
+  #   environment:
+  #     - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
+  #     - REDIS_URL=redis://redis:6379/0
+  #     - DATA_DIR=/data
+  #   volumes:
+  #     - ./cleaned_csvs:/data/cleaned_csvs:ro
+  #     - ./expiryData:/data/expiryData:ro
+  #     - ./strikeData:/data/strikeData:ro
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - algotest-network
+
+volumes:
+  pgdata:
+  redis_data:
+
+networks:
+  algotest-network:
+    driver: bridge

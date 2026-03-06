@@ -132,6 +132,10 @@ const AlgoTestBacktest = () => {
   const [reentryOnTgt, setReentryOnTgt] = useState(false);
   const [reentryOnTgtMode, setReentryOnTgtMode] = useState('re_asap');
   const [reentryOnTgtCount, setReentryOnTgtCount] = useState(1);
+  const [strEnabled, setStrEnabled] = useState(false);
+  const [strType, setStrType] = useState('5x1');
+  const [strSegmentsVisible, setStrSegmentsVisible] = useState(false);
+  const [strSegments, setStrSegments] = useState({ '5x1': [], '5x2': [] });
   const [startDate, setStartDate] = useState('2025-02-20');
   const [endDate, setEndDate] = useState('2026-02-20');
   const [loading, setLoading] = useState(false);
@@ -151,6 +155,33 @@ const AlgoTestBacktest = () => {
     { value: 'atm', label: 'ATM' },
     ...Array.from({ length: 20 }, (_, i) => ({ value: `otm${i + 1}`, label: `OTM ${i + 1}` })),
   ], []);
+
+  useEffect(() => {
+    let mounted = true;
+    const loadSegments = async () => {
+      const endpoints = ['/api/backtest/str-segments', '/api/str-segments', '/str-segments'];
+      for (const url of endpoints) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (!mounted) return;
+          setStrSegments({
+            '5x1': Array.isArray(data?.['5x1']) ? data['5x1'] : [],
+            '5x2': Array.isArray(data?.['5x2']) ? data['5x2'] : [],
+          });
+          return;
+        } catch (_) {
+          // Try next endpoint
+        }
+      }
+      console.warn('STR segments fetch failed on all endpoints');
+    };
+    loadSegments();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // Validate expiry mismatch
   const validateExpiry = () => {
@@ -275,6 +306,7 @@ const AlgoTestBacktest = () => {
       date_from: startDate,
       date_to: endDate,
       expiry_type: expiryBasis.toUpperCase(),
+      super_trend_config: strEnabled ? strType : 'None',
     };
   };
 
@@ -312,7 +344,13 @@ const AlgoTestBacktest = () => {
         body: JSON.stringify(buildPayload()),
         signal: controller.signal,
       });
-      if (res.ok) setResults(await res.json());
+      if (res.ok) {
+        const data = await res.json();
+        setResults(data);
+        if (strEnabled && Array.isArray(data?.trades) && data.trades.length === 0) {
+          setError('No trades matched the SuperTrend filter for this date range. Try switching to STR 52 or adjusting the date range.');
+        }
+      }
       else { const e = await res.json(); setError(e.detail || 'Backtest failed'); }
     } catch (err) {
       if (err.name !== 'AbortError') {
@@ -455,6 +493,82 @@ const AlgoTestBacktest = () => {
                     <Tooltip text="Entry only when market momentum matches the selected direction and threshold." />
                   </div>
                   <Toggle enabled={overallMomentum} onToggle={() => setOverallMomentum(v => !v)} size="sm" />
+                </div>
+
+                {/* SuperTrend Filter */}
+                <div className="pt-2 border-t border-gray-100">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-gray-700 uppercase">SuperTrend Filter</span>
+                    <button
+                      type="button"
+                      onClick={() => setStrEnabled(v => !v)}
+                      className={`px-2 py-1 rounded text-xs font-semibold ${
+                        strEnabled ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+                      }`}
+                    >
+                      {strEnabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {strEnabled && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-4 text-xs text-gray-700">
+                        <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="strType"
+                            value="5x1"
+                            checked={strType === '5x1'}
+                            onChange={(e) => setStrType(e.target.value)}
+                            className="accent-blue-600"
+                          />
+                          STR 51
+                        </label>
+                        <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name="strType"
+                            value="5x2"
+                            checked={strType === '5x2'}
+                            onChange={(e) => setStrType(e.target.value)}
+                            className="accent-blue-600"
+                          />
+                          STR 52
+                        </label>
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {(strSegments[strType] || []).length} segments loaded
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setStrSegmentsVisible(v => !v)}
+                        className="text-xs text-blue-600 hover:text-blue-700 underline"
+                      >
+                        {strSegmentsVisible ? 'Hide Segments' : 'View Segments'}
+                      </button>
+                      {strSegmentsVisible && (strSegments[strType] || []).length > 0 && (
+                        <div className="max-h-44 overflow-auto border border-gray-200 rounded">
+                          <table className="w-full text-xs">
+                            <thead className="bg-gray-50 sticky top-0">
+                              <tr>
+                                <th className="px-2 py-1 text-left">#</th>
+                                <th className="px-2 py-1 text-left">Start</th>
+                                <th className="px-2 py-1 text-left">End</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(strSegments[strType] || []).map((seg, i) => (
+                                <tr key={`${seg.start}-${seg.end}-${i}`} className="border-t border-gray-100">
+                                  <td className="px-2 py-1">{i + 1}</td>
+                                  <td className="px-2 py-1">{seg.start}</td>
+                                  <td className="px-2 py-1">{seg.end}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -770,9 +884,16 @@ const AlgoTestBacktest = () => {
                           </div>
                           <div>
                             <label className="block text-xs text-gray-500 mb-1">Position</label>
-                            <SegBtn size="sm"
-                              options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
-                              value={leg.position} onChange={v => updateLeg(leg.id, 'position', v)} />
+                            <div className="flex items-center gap-2">
+                              <SegBtn size="sm"
+                                options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
+                                value={leg.position} onChange={v => updateLeg(leg.id, 'position', v)} />
+                              {strEnabled && (
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700 border border-blue-200">
+                                  STR
+                                </span>
+                              )}
+                            </div>
                           </div>
                           {leg.segment === 'options' && (
                             <div>
@@ -983,6 +1104,11 @@ const AlgoTestBacktest = () => {
         {/* Results */}
         {results && (
           <div className="mt-4">
+            {results?.meta?.str_enabled && (
+              <div className="mb-3 text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded px-3 py-2 inline-block">
+                STR {results?.meta?.str_type}: {results?.meta?.trades_before_str_filter} -&gt; {results?.meta?.trades_after_str_filter}
+              </div>
+            )}
             <ResultsPanel results={results} onClose={() => setResults(null)} showCloseButton={false} />
           </div>
         )}
