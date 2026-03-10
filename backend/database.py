@@ -9,9 +9,22 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import NullPool
 
-# Get database URL from environment
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://algotest:algotest_password@localhost:5432/algotest")
-USE_POSTGRESQL = os.getenv("USE_POSTGRESQL", "false").lower() == "true"
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "algotest")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "algotest")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "algotest_password")
+
+
+def _build_default_database_url() -> str:
+    return f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+
+
+ALLOW_CSV_FALLBACK = os.getenv("ALLOW_CSV_FALLBACK", "true").lower() == "true"
+
+# Get database URL from environment (DATABASE_URL overrides component-based values)
+DATABASE_URL = os.getenv("DATABASE_URL") or _build_default_database_url()
+USE_POSTGRESQL = os.getenv("USE_POSTGRESQL", "true").lower() == "true"
 
 # Create SQLAlchemy engine with connection pooling
 engine = create_engine(
@@ -62,8 +75,27 @@ EXPIRY_DATA_DIR = os.path.join(DATA_DIR, "expiryData")
 STRIKE_DATA_DIR = os.path.join(DATA_DIR, "strikeData")
 
 
+
+def _determine_data_source() -> str:
+    """Decide whether PostgreSQL or CSV is the active data source."""
+    if USE_POSTGRESQL:
+        if check_postgres_connection():
+            return "postgres"
+        if ALLOW_CSV_FALLBACK:
+            print("Falling back to CSV data source because Postgres is unreachable.")
+            return "csv"
+        raise RuntimeError("PostgreSQL is unreachable and CSV fallback is disabled (set ALLOW_CSV_FALLBACK=true to enable).")
+
+    if ALLOW_CSV_FALLBACK:
+        print("PostgreSQL usage disabled; using CSV fallback.")
+        return "csv"
+
+    raise RuntimeError("PostgreSQL usage is disabled and CSV fallback is turned off. Enable one source.")
+
+
+DATA_SOURCE = _determine_data_source()
+
+
 def get_data_source() -> str:
     """Return current data source: 'postgres' or 'csv'."""
-    if USE_POSTGRESQL and check_postgres_connection():
-        return "postgres"
-    return "csv"
+    return DATA_SOURCE

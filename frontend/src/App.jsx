@@ -1,8 +1,8 @@
 import React from 'react';
-import AlgoTestBacktest from './components/AlgoTestBacktest';
+import StrategyBuilder from './components/StrategyBuilder';
 
 function App() {
-  return <AlgoTestBacktest />;
+  return <StrategyBuilder />;
 }
 
 export default App;

@@ -7,7 +7,7 @@ import os
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Optional, Dict, Any
-from database import get_data_source, engine as db_engine, DATA_DIR
+from database import ALLOW_CSV_FALLBACK, get_data_source, engine as db_engine, DATA_DIR
 from repositories.market_data_repository import MarketDataRepository
 
 # Thread pool for async file I/O
@@ -236,11 +236,14 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     if _use_postgres():
         try:
             pg_df = _repo.get_spot_data(symbol=symbol, from_date=from_date, to_date=to_date)
-            if not pg_df.empty:
-                return pg_df.reset_index(drop=True)
-        except Exception:
-            # Compatibility fallback to CSV path below
-            pass
+            return pg_df.reset_index(drop=True)
+        except Exception as exc:
+            if not ALLOW_CSV_FALLBACK:
+                raise RuntimeError("PostgreSQL strike data lookup failed and CSV fallback is disabled.") from exc
+            print("Postgres strike lookup failed; falling back to CSV.")
+
+    if not ALLOW_CSV_FALLBACK:
+        raise RuntimeError("CSV fallback is disabled; strike data must be loaded from PostgreSQL.")
 
     # Handle different capitalization formats for symbol
     possible_filenames = [
@@ -296,11 +299,14 @@ def load_expiry(index: str, expiry_type: str) -> pd.DataFrame:
     if _use_postgres():
         try:
             pg_df = _repo.get_expiry_data(symbol=index, expiry_type=expiry_type)
-            if not pg_df.empty:
-                return pg_df.sort_values('Current Expiry').reset_index(drop=True)
-        except Exception:
-            # Compatibility fallback to CSV path below
-            pass
+            return pg_df.sort_values('Current Expiry').reset_index(drop=True)
+        except Exception as exc:
+            if not ALLOW_CSV_FALLBACK:
+                raise RuntimeError("PostgreSQL expiry lookup failed and CSV fallback is disabled.") from exc
+            print("Postgres expiry lookup failed; falling back to CSV.")
+
+    if not ALLOW_CSV_FALLBACK:
+        raise RuntimeError("CSV fallback is disabled; expiry calendar must be sourced from PostgreSQL.")
 
     if expiry_type.lower() == 'weekly':
         file_path = os.path.join(EXPIRY_DATA_DIR, f"{index}.csv")
@@ -372,13 +378,16 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     if _use_postgres():
         try:
             df = _repo.get_bhavcopy_by_date(date_str=date_str)
-            if not df.empty:
-                required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Close', 'TurnOver', 'Date']
-                available_cols = [col for col in required_cols if col in df.columns]
-                return df[available_cols].copy()
-        except Exception:
-            # Compatibility fallback to CSV path below
-            pass
+            required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Close', 'TurnOver', 'Date']
+            available_cols = [col for col in required_cols if col in df.columns]
+            return df[available_cols].copy()
+        except Exception as exc:
+            if not ALLOW_CSV_FALLBACK:
+                raise RuntimeError("PostgreSQL bhavcopy lookup failed and CSV fallback is disabled.") from exc
+            print("Postgres bhavcopy lookup failed; falling back to CSV.")
+
+    if not ALLOW_CSV_FALLBACK:
+        raise RuntimeError("CSV fallback disabled; bhavcopy data must be sourced from PostgreSQL.")
 
     file_path = os.path.join(CLEANED_CSV_DIR, f"{date_str}.csv")
     if not os.path.exists(file_path):
@@ -1305,9 +1314,13 @@ def load_super_trend_dates(force_reload: bool = False):
             _super_trend_segments = loaded
             _super_trend_loaded = True
             return
-        except Exception:
-            # Compatibility fallback to CSV path below
-            pass
+        except Exception as exc:
+            if not ALLOW_CSV_FALLBACK:
+                raise RuntimeError("PostgreSQL super-trend lookup failed and CSV fallback is disabled.") from exc
+            print("Postgres super-trend lookup failed; falling back to CSV.")
+
+    if not ALLOW_CSV_FALLBACK:
+        raise RuntimeError("CSV fallback disabled; super-trend segments must be loaded from PostgreSQL.")
 
     file_map = {
         "5x1": os.path.join(FILTER_DIR, "STR5,1_5,1.csv"),

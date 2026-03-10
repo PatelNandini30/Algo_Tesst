@@ -456,8 +456,8 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
     print(f">>> is_positional: {is_positional}")
     
     if is_positional:
-        print("\n✓ Using AlgoTest engine (DTE-based positional strategy)\n")
-        
+        print("\nUsing AlgoTest engine (DTE-based positional strategy)\n")
+
         # Build AlgoTest params
         entry_dte = params.get('entry_dte', 2)
         exit_dte = params.get('exit_dte', 0)
@@ -570,12 +570,12 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             # Copy stopLoss from original leg if present
             if 'stopLoss' in original_leg and isinstance(original_leg['stopLoss'], dict):
                 leg_config['stopLoss'] = original_leg['stopLoss']
-                print(f"  ✓ Leg {idx+1}: Copying stopLoss from request: {original_leg['stopLoss']}")
+                print(f"  Leg {idx+1}: Copying stopLoss from request: {original_leg['stopLoss']}")
             
             # Copy targetProfit from original leg if present
             if 'targetProfit' in original_leg and isinstance(original_leg['targetProfit'], dict):
                 leg_config['targetProfit'] = original_leg['targetProfit']
-                print(f"  ✓ Leg {idx+1}: Copying targetProfit from request: {original_leg['targetProfit']}")
+                print(f"  Leg {idx+1}: Copying targetProfit from request: {original_leg['targetProfit']}")
             
             legs_config.append(leg_config)
         
@@ -600,10 +600,10 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
         try:
             return run_algotest_backtest(algotest_params)
         except Exception as e:
-            print(f"⚠️ AlgoTest engine failed: {e}")
+            print(f"[WARN] AlgoTest engine failed: {e}")
             import traceback
             traceback.print_exc()
-            raise 
+            raise
     
     # Default to generic_multi_leg
     # print("\n✓ Using generic_multi_leg engine\n")
@@ -657,7 +657,7 @@ async def dynamic_backtest(
     if not no_cache:
         cached_result = backtest_cache.get(cache_params)
         if cached_result is not None:
-            print("✓ Returning cached result")
+            print("Returning cached result")
             return cached_result
     
      # ADD THIS - Log what frontend sends

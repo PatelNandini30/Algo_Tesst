@@ -5,7 +5,7 @@ import {
 } from 'recharts';
 import { Download, X } from 'lucide-react';
 
-const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
+const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) => {
   if (!results) return null;
 
   const { trades = [], summary = {}, pivot = {} } = results;
@@ -187,12 +187,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true }) => {
         <div className={showCloseButton ? "max-w-[1400px] mx-auto bg-white rounded-xl shadow-2xl" : "bg-white rounded-xl shadow-md"}>
           {/* Header */}
           <div className="flex justify-between items-center px-6 py-5 border-b border-gray-200">
-            <div>
-              <h2 className="text-2xl font-bold text-gray-900">Backtest Results</h2>
-              <p className="text-sm text-gray-600 mt-1">
-                {stats.totalTrades} trades • {results.meta?.date_range || ''}
-              </p>
-            </div>
+          <div>
+            <h2 className="text-2xl font-bold text-gray-900">Backtest Results</h2>
+            <p className="text-sm text-gray-600 mt-1">
+              {stats.totalTrades} trades • {results.meta?.date_range || ''}
+            </p>
+            {filterInfo && (
+              <span className="mt-2 inline-flex items-center rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                {filterInfo}
+              </span>
+            )}
+          </div>
             <div className="flex gap-3">
               <button
                 onClick={exportToCSV}

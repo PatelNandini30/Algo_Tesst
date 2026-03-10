@@ -1,14 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2 } from 'lucide-react';
 import ResultsPanel from './ResultsPanel';
-
-const DATA_UPLOAD_OPTIONS = [
-  { value: 'option_data', label: 'Option quotes (cleaned_csvs)' },
-  { value: 'spot_data', label: 'Spot/strike data (strikeData)' },
-  { value: 'expiry_calendar', label: 'Weekly/monthly expiry calendar' },
-  { value: 'trading_holidays', label: 'Base2 / holiday ranges' },
-  { value: 'super_trend_segments', label: 'SuperTrend STR segments' },
-];
+import CsvUpload from './CsvUpload';
+import SuperTrendFilter from './SuperTrendFilter';
+import Toggle from './ui/Toggle';
 
 const getLotSize = (index, tradeDate) => {
   const d = new Date(tradeDate);
@@ -28,24 +23,6 @@ const getLotSize = (index, tradeDate) => {
   if (index === 'MIDCPNIFTY') return 75;
   if (index === 'SENSEX')     return 10;
   return 1;
-};
-
-const Toggle = ({ enabled, onToggle, size = 'md' }) => {
-  const sizeClasses = size === 'sm' ? 'h-4 w-7' : 'h-5 w-9';
-  const dotClasses = size === 'sm' ? 'h-3 w-3' : 'h-3.5 w-3.5';
-  const translateClasses = size === 'sm' ? (enabled ? 'translate-x-3' : 'translate-x-0.5') : (enabled ? 'translate-x-4' : 'translate-x-0.5');
-  
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      className={`relative inline-flex ${sizeClasses} flex-shrink-0 items-center rounded-full transition-colors focus:outline-none ${
-        enabled ? 'bg-blue-600' : 'bg-gray-300'
-      }`}
-    >
-      <span className={`inline-block ${dotClasses} transform rounded-full bg-white shadow transition-transform ${translateClasses}`} />
-    </button>
-  );
 };
 
 const Tooltip = ({ text }) => {
@@ -94,7 +71,7 @@ const SegBtn = ({ options, value, onChange, size = 'md' }) => {
   );
 };
 
-const AlgoTestBacktest = () => {
+const StrategyBuilder = () => {
   const [instrument, setInstrument] = useState('NIFTY');
   const [underlying, setUnderlying] = useState('cash');
   const [strategyType, setStrategyType] = useState('positional');
@@ -140,10 +117,12 @@ const AlgoTestBacktest = () => {
   const [reentryOnTgt, setReentryOnTgt] = useState(false);
   const [reentryOnTgtMode, setReentryOnTgtMode] = useState('re_asap');
   const [reentryOnTgtCount, setReentryOnTgtCount] = useState(1);
-  const [strEnabled, setStrEnabled] = useState(false);
-  const [strType, setStrType] = useState('5x1');
-  const [strSegmentsVisible, setStrSegmentsVisible] = useState(false);
-  const [strSegments, setStrSegments] = useState({ '5x1': [], '5x2': [] });
+  const [strFilter, setStrFilter] = useState({
+    enabled: false,
+    configId: '5x1',
+    configLabel: 'STR 5x1',
+    summary: null,
+  });
   const [startDate, setStartDate] = useState('2025-02-20');
   const [endDate, setEndDate] = useState('2026-02-20');
   const [loading, setLoading] = useState(false);
@@ -151,12 +130,6 @@ const AlgoTestBacktest = () => {
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
   const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
-  const [uploadFile, setUploadFile] = useState(null);
-  const [uploadType, setUploadType] = useState(DATA_UPLOAD_OPTIONS[0].value);
-  const [uploadForce, setUploadForce] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [uploadResult, setUploadResult] = useState(null);
-  const [uploadError, setUploadError] = useState(null);
 
   // Memoize static derived values so they don't rebuild on every keystroke
   const daysOptions = useMemo(
@@ -197,46 +170,7 @@ const AlgoTestBacktest = () => {
     };
   }, []);
 
-  const handleUploadFileChange = (file) => {
-    setUploadFile(file);
-    setUploadResult(null);
-    setUploadError(null);
-  };
-
-  const runUpload = useCallback(async () => {
-    if (!uploadFile) {
-      setUploadError('Please choose a CSV file before uploading.');
-      return;
-    }
-
-    setUploading(true);
-    setUploadError(null);
-    setUploadResult(null);
-
-    const formData = new FormData();
-    formData.append('data_type', uploadType);
-    formData.append('file', uploadFile);
-    formData.append('force', uploadForce ? 'true' : 'false');
-
-    try {
-      const response = await fetch('/api/data/upload', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.detail || 'Upload failed');
-      }
-
-      const data = await response.json();
-      setUploadResult(data);
-    } catch (err) {
-      setUploadError(err.message || 'Upload failed');
-    } finally {
-      setUploading(false);
-    }
-  }, [uploadFile, uploadType, uploadForce]);
+  // Upload management removed - handled by CsvUpload component
 
   // Validate expiry mismatch
   const validateExpiry = () => {
@@ -361,7 +295,10 @@ const AlgoTestBacktest = () => {
       date_from: startDate,
       date_to: endDate,
       expiry_type: expiryBasis.toUpperCase(),
-      super_trend_config: strEnabled ? strType : 'None',
+      super_trend_config: strFilter.enabled ? strFilter.configId : 'None',
+      str_filter: strFilter.enabled
+        ? { enabled: true, config: strFilter.configId }
+        : { enabled: false },
     };
   };
 
@@ -450,8 +387,8 @@ const AlgoTestBacktest = () => {
           <div className="col-span-5 space-y-3">
             {/* Configuration Card */}
             <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-              <div className="px-4 py-3 border-b border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Configuration</h3>
+                <div className="px-4 py-3 border-b border-gray-100">
+                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide border-l-4 border-blue-600 pl-3">Configuration</h3>
             </div>
             <div className="p-4 space-y-4">
                 {/* Strategy Type */}
@@ -551,182 +488,20 @@ const AlgoTestBacktest = () => {
                 </div>
 
                 {/* SuperTrend Filter */}
-                <div className="pt-2 border-t border-gray-100">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-semibold text-gray-700 uppercase">SuperTrend Filter</span>
-                    <button
-                      type="button"
-                      onClick={() => setStrEnabled(v => !v)}
-                      className={`px-2 py-1 rounded text-xs font-semibold ${
-                        strEnabled ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
-                      }`}
-                    >
-                      {strEnabled ? 'ON' : 'OFF'}
-                    </button>
-                  </div>
-                  {strEnabled && (
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-4 text-xs text-gray-700">
-                        <label className="inline-flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="strType"
-                            value="5x1"
-                            checked={strType === '5x1'}
-                            onChange={(e) => setStrType(e.target.value)}
-                            className="accent-blue-600"
-                          />
-                          STR 51
-                        </label>
-                        <label className="inline-flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="radio"
-                            name="strType"
-                            value="5x2"
-                            checked={strType === '5x2'}
-                            onChange={(e) => setStrType(e.target.value)}
-                            className="accent-blue-600"
-                          />
-                          STR 52
-                        </label>
-                      </div>
-                      <div className="text-xs text-gray-500">
-                        {(strSegments[strType] || []).length} segments loaded
-                      </div>
-                  <button
-                    type="button"
-                    onClick={() => setStrSegmentsVisible(v => !v)}
-                    className="text-xs text-blue-600 hover:text-blue-700 underline"
-                  >
-                    {strSegmentsVisible ? 'Hide Segments' : 'View Segments'}
-                      </button>
-                      {strSegmentsVisible && (strSegments[strType] || []).length > 0 && (
-                        <div className="max-h-44 overflow-auto border border-gray-200 rounded">
-                          <table className="w-full text-xs">
-                            <thead className="bg-gray-50 sticky top-0">
-                              <tr>
-                                <th className="px-2 py-1 text-left">#</th>
-                                <th className="px-2 py-1 text-left">Start</th>
-                                <th className="px-2 py-1 text-left">End</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {(strSegments[strType] || []).map((seg, i) => (
-                                <tr key={`${seg.start}-${seg.end}-${i}`} className="border-t border-gray-100">
-                                  <td className="px-2 py-1">{i + 1}</td>
-                                  <td className="px-2 py-1">{seg.start}</td>
-                                  <td className="px-2 py-1">{seg.end}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <SuperTrendFilter
+                  enabled={strFilter.enabled}
+                  onToggle={() => setStrFilter(prev => ({ ...prev, enabled: !prev.enabled }))}
+                  onFilterChange={(payload) => setStrFilter(prev => ({ ...prev, ...payload }))}
+                />
             </div>
           </div>
 
-            {/* CSV Upload Card */}
-            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-              <div className="px-4 py-3 border-b border-gray-100">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">CSV Upload</h3>
-                  <span className="text-xs text-gray-500">Postgres source tables</span>
-                </div>
-                <p className="text-xs text-gray-500 mt-1">Upload cleaned CSVs so the backend migrator writes them directly into PostgreSQL.</p>
-              </div>
-              <div className="p-4 space-y-3">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Target table</label>
-                  <select
-                    value={uploadType}
-                    onChange={e => setUploadType(e.target.value)}
-                    className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
-                  >
-                    {DATA_UPLOAD_OPTIONS.map(opt => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">CSV file</label>
-                  <input
-                    type="file"
-                    accept=".csv"
-                    onChange={e => handleUploadFileChange(e.target.files?.[0] ?? null)}
-                    className="text-xs text-gray-600 w-full"
-                  />
-                  {uploadFile && (
-                    <p className="text-[11px] text-gray-500 mt-1 truncate">Selected: {uploadFile.name}</p>
-                  )}
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600">Force re-import</span>
-                  <Toggle enabled={uploadForce} onToggle={() => setUploadForce(v => !v)} size="sm" />
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={runUpload}
-                    disabled={uploading}
-                    className="flex-1 h-9 px-3 rounded text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
-                  >
-                    {uploading ? 'Uploading...' : 'Upload CSV'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleUploadFileChange(null)}
-                    disabled={uploading}
-                    className="h-9 px-3 rounded text-sm font-semibold border border-gray-300 text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    Clear
-                  </button>
-                </div>
-
-                {uploadError && (
-                  <p className="text-xs text-red-600">{uploadError}</p>
-                )}
-
-                {uploadResult && (
-                  <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs text-gray-700 space-y-2">
-                    <p className="font-semibold text-[11px] text-gray-900">Import summary</p>
-                    <p className="text-[11px]">
-                      Status: {uploadResult.status} · Valid rows: {uploadResult.rows_valid}
-                    </p>
-                    <div className="grid grid-cols-2 gap-1 text-[11px]">
-                      <span>Read: {uploadResult.rows_read}</span>
-                      <span>Skipped: {uploadResult.rows_skipped}</span>
-                      <span>Inserted: {uploadResult.rows_inserted}</span>
-                      <span>Updated: {uploadResult.rows_updated}</span>
-                    </div>
-                    {uploadResult.errors.length > 0 && (
-                      <div className="text-red-600 space-y-1 text-[11px]">
-                        <p className="font-semibold uppercase text-[10px]">Errors</p>
-                        <ul className="list-disc list-inside space-y-0.5">
-                          {uploadResult.errors.map((err, idx) => (
-                            <li key={idx}>{err}</li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                <p className="text-[11px] text-gray-400">
-                  Files are tracked by path+size; duplicates are skipped unless you toggle force.
-                </p>
-              </div>
-            </div>
+            <CsvUpload />
 
             {/* Legwise Controls Card */}
             <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-              <div className="px-4 py-3 border-b border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Legwise Controls</h3>
+                <div className="px-4 py-3 border-b border-gray-100">
+                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide border-l-4 border-blue-600 pl-3">Legwise Controls</h3>
               </div>
               <div className="p-4 space-y-3">
                 <div className="flex items-center justify-between">
@@ -762,8 +537,8 @@ const AlgoTestBacktest = () => {
 
             {/* Overall Settings Card */}
             <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-              <div className="px-4 py-3 border-b border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Overall Settings</h3>
+                <div className="px-4 py-3 border-b border-gray-100">
+                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide border-l-4 border-blue-600 pl-3">Overall Settings</h3>
               </div>
               <div className="p-4 space-y-4">
                 {/* Overall Stop Loss */}
@@ -1259,7 +1034,12 @@ const AlgoTestBacktest = () => {
                 STR {results?.meta?.str_type}: {results?.meta?.trades_before_str_filter} -&gt; {results?.meta?.trades_after_str_filter}
               </div>
             )}
-            <ResultsPanel results={results} onClose={() => setResults(null)} showCloseButton={false} />
+            <ResultsPanel
+              results={results}
+              onClose={() => setResults(null)}
+              showCloseButton={false}
+              filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
+            />
           </div>
         )}
 
@@ -1276,12 +1056,20 @@ const AlgoTestBacktest = () => {
           <button
             onClick={runBacktest}
             disabled={!canRunBacktest}
-            className="flex items-center gap-2 px-8 py-3 bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-full text-base font-semibold shadow-lg transition-all hover:shadow-xl"
+            className={`flex items-center gap-3 px-10 py-3 rounded-full text-white shadow-xl transition duration-200 transform ${
+              loading ? 'from-green-500 to-emerald-500 animate-pulse bg-gradient-to-r scale-100 hover:scale-[1.02]' : 'bg-gradient-to-r from-emerald-500 to-lime-500 hover:scale-[1.02]'
+            } ${!canRunBacktest ? 'opacity-60 cursor-not-allowed' : ''}`}
           >
             {loading ? (
-              <><div className="h-5 w-5 border-2 border-white border-t-transparent rounded-full animate-spin" />Running Backtest...</>
+              <>
+                <Loader2 size={18} className="animate-spin" />
+                <span className="text-sm font-semibold">Running Backtest…</span>
+              </>
             ) : (
-              <><Play size={18} />Run Backtest</>
+              <>
+                <Play size={18} />
+                <span className="text-sm font-semibold">Run Backtest</span>
+              </>
             )}
           </button>
         </div>
@@ -1290,4 +1078,4 @@ const AlgoTestBacktest = () => {
   );
 };
 
-export default AlgoTestBacktest;
+export default StrategyBuilder;

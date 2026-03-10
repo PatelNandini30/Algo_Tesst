@@ -2,20 +2,20 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Copy package files first for better caching
-COPY package.json package-lock.json* ./
+# Copy package files
+COPY package.json ./
 
-# Install dependencies
-RUN npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+# Install ALL dependencies including devDependencies
+RUN npm install --legacy-peer-deps
 
 # Copy source code
 COPY . .
 
+# Build using npx to ensure vite is found
+RUN npx vite build
+
 # Expose port
 EXPOSE 3000
 
-# Build the application
-RUN npm run build
-
 # Start the production server
-CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0", "--port", "3000"]
+CMD ["npx", "vite", "preview", "--host", "0.0.0.0", "--port", "3000"]
