@@ -2,6 +2,14 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { Play, Plus, Trash2, Info, Save, AlertTriangle } from 'lucide-react';
 import ResultsPanel from './ResultsPanel';
 
+const DATA_UPLOAD_OPTIONS = [
+  { value: 'option_data', label: 'Option quotes (cleaned_csvs)' },
+  { value: 'spot_data', label: 'Spot/strike data (strikeData)' },
+  { value: 'expiry_calendar', label: 'Weekly/monthly expiry calendar' },
+  { value: 'trading_holidays', label: 'Base2 / holiday ranges' },
+  { value: 'super_trend_segments', label: 'SuperTrend STR segments' },
+];
+
 const getLotSize = (index, tradeDate) => {
   const d = new Date(tradeDate);
   if (index === 'NIFTY') {
@@ -143,6 +151,12 @@ const AlgoTestBacktest = () => {
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
   const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadType, setUploadType] = useState(DATA_UPLOAD_OPTIONS[0].value);
+  const [uploadForce, setUploadForce] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState(null);
+  const [uploadError, setUploadError] = useState(null);
 
   // Memoize static derived values so they don't rebuild on every keystroke
   const daysOptions = useMemo(
@@ -182,6 +196,47 @@ const AlgoTestBacktest = () => {
       mounted = false;
     };
   }, []);
+
+  const handleUploadFileChange = (file) => {
+    setUploadFile(file);
+    setUploadResult(null);
+    setUploadError(null);
+  };
+
+  const runUpload = useCallback(async () => {
+    if (!uploadFile) {
+      setUploadError('Please choose a CSV file before uploading.');
+      return;
+    }
+
+    setUploading(true);
+    setUploadError(null);
+    setUploadResult(null);
+
+    const formData = new FormData();
+    formData.append('data_type', uploadType);
+    formData.append('file', uploadFile);
+    formData.append('force', uploadForce ? 'true' : 'false');
+
+    try {
+      const response = await fetch('/api/data/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail || 'Upload failed');
+      }
+
+      const data = await response.json();
+      setUploadResult(data);
+    } catch (err) {
+      setUploadError(err.message || 'Upload failed');
+    } finally {
+      setUploading(false);
+    }
+  }, [uploadFile, uploadType, uploadForce]);
 
   // Validate expiry mismatch
   const validateExpiry = () => {
@@ -397,8 +452,8 @@ const AlgoTestBacktest = () => {
             <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
               <div className="px-4 py-3 border-b border-gray-100">
                 <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Configuration</h3>
-              </div>
-              <div className="p-4 space-y-4">
+            </div>
+            <div className="p-4 space-y-4">
                 {/* Strategy Type */}
                 <div>
                   <label className="block text-xs font-medium text-gray-600 mb-2">Strategy</label>
@@ -538,12 +593,12 @@ const AlgoTestBacktest = () => {
                       <div className="text-xs text-gray-500">
                         {(strSegments[strType] || []).length} segments loaded
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setStrSegmentsVisible(v => !v)}
-                        className="text-xs text-blue-600 hover:text-blue-700 underline"
-                      >
-                        {strSegmentsVisible ? 'Hide Segments' : 'View Segments'}
+                  <button
+                    type="button"
+                    onClick={() => setStrSegmentsVisible(v => !v)}
+                    className="text-xs text-blue-600 hover:text-blue-700 underline"
+                  >
+                    {strSegmentsVisible ? 'Hide Segments' : 'View Segments'}
                       </button>
                       {strSegmentsVisible && (strSegments[strType] || []).length > 0 && (
                         <div className="max-h-44 overflow-auto border border-gray-200 rounded">
@@ -570,6 +625,101 @@ const AlgoTestBacktest = () => {
                     </div>
                   )}
                 </div>
+            </div>
+          </div>
+
+            {/* CSV Upload Card */}
+            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
+              <div className="px-4 py-3 border-b border-gray-100">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">CSV Upload</h3>
+                  <span className="text-xs text-gray-500">Postgres source tables</span>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">Upload cleaned CSVs so the backend migrator writes them directly into PostgreSQL.</p>
+              </div>
+              <div className="p-4 space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Target table</label>
+                  <select
+                    value={uploadType}
+                    onChange={e => setUploadType(e.target.value)}
+                    className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                  >
+                    {DATA_UPLOAD_OPTIONS.map(opt => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">CSV file</label>
+                  <input
+                    type="file"
+                    accept=".csv"
+                    onChange={e => handleUploadFileChange(e.target.files?.[0] ?? null)}
+                    className="text-xs text-gray-600 w-full"
+                  />
+                  {uploadFile && (
+                    <p className="text-[11px] text-gray-500 mt-1 truncate">Selected: {uploadFile.name}</p>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-gray-600">Force re-import</span>
+                  <Toggle enabled={uploadForce} onToggle={() => setUploadForce(v => !v)} size="sm" />
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={runUpload}
+                    disabled={uploading}
+                    className="flex-1 h-9 px-3 rounded text-sm font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {uploading ? 'Uploading...' : 'Upload CSV'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleUploadFileChange(null)}
+                    disabled={uploading}
+                    className="h-9 px-3 rounded text-sm font-semibold border border-gray-300 text-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    Clear
+                  </button>
+                </div>
+
+                {uploadError && (
+                  <p className="text-xs text-red-600">{uploadError}</p>
+                )}
+
+                {uploadResult && (
+                  <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs text-gray-700 space-y-2">
+                    <p className="font-semibold text-[11px] text-gray-900">Import summary</p>
+                    <p className="text-[11px]">
+                      Status: {uploadResult.status} · Valid rows: {uploadResult.rows_valid}
+                    </p>
+                    <div className="grid grid-cols-2 gap-1 text-[11px]">
+                      <span>Read: {uploadResult.rows_read}</span>
+                      <span>Skipped: {uploadResult.rows_skipped}</span>
+                      <span>Inserted: {uploadResult.rows_inserted}</span>
+                      <span>Updated: {uploadResult.rows_updated}</span>
+                    </div>
+                    {uploadResult.errors.length > 0 && (
+                      <div className="text-red-600 space-y-1 text-[11px]">
+                        <p className="font-semibold uppercase text-[10px]">Errors</p>
+                        <ul className="list-disc list-inside space-y-0.5">
+                          {uploadResult.errors.map((err, idx) => (
+                            <li key={idx}>{err}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <p className="text-[11px] text-gray-400">
+                  Files are tracked by path+size; duplicates are skipped unless you toggle force.
+                </p>
               </div>
             </div>
 

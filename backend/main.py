@@ -28,6 +28,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Include routers
 from routers import backtest, expiry, strategies
+from routers.upload import router as upload_router
 
 # Create the FastAPI app
 app = FastAPI(
@@ -49,6 +50,7 @@ app.add_middleware(
 app.include_router(backtest.router, prefix="/api", tags=["backtest"])
 app.include_router(expiry.router, prefix="/api", tags=["expiry"])
 app.include_router(strategies.router, prefix="/api", tags=["strategies"])
+app.include_router(upload_router, prefix="/api", tags=["data"])
 
 @app.get("/")
 def read_root():

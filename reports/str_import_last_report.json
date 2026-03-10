@@ -1,0 +1,28 @@
+{
+  "started_at": "2026-03-10T07:50:12.869625",
+  "files": [
+    {
+      "file": "E:\\Algo_Test_Software\\Filter\\STR5,1_5,1.csv",
+      "table": "super_trend_segments",
+      "status": "completed",
+      "errors": [],
+      "rows_read": 209,
+      "rows_valid": 209,
+      "rows_skipped": 0,
+      "rows_inserted": 209,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\Filter\\STR5,2_5,2.csv",
+      "table": "super_trend_segments",
+      "status": "completed",
+      "errors": [],
+      "rows_read": 97,
+      "rows_valid": 97,
+      "rows_skipped": 0,
+      "rows_inserted": 97,
+      "rows_updated": 0
+    }
+  ],
+  "finished_at": "2026-03-10T07:50:12.869625"
+}

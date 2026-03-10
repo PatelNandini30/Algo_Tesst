@@ -1,0 +1,171 @@
+{
+  "started_at": "2026-03-10T07:38:06.026763",
+  "files": [
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCAXISBANK.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCBHARTIARTL.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCHDFCBANK.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCICICIBANK.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCINFY.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCITC.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCLT.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCRELIANCE.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCSBIN.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\DailyNCTCS.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\index_strike_data.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\Nifty 50_strike_data.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\Nifty_strike_data.csv",
+      "table": "spot_data",
+      "status": "completed",
+      "errors": [],
+      "rows_read": 6490,
+      "rows_skipped": 0,
+      "rows_valid": 6490,
+      "rows_inserted": 6490,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\Sensex.csv",
+      "table": "spot_data",
+      "status": "skipped",
+      "errors": [],
+      "rows_read": 0,
+      "rows_valid": 0,
+      "rows_skipped": 0,
+      "rows_inserted": 0,
+      "rows_updated": 0
+    },
+    {
+      "file": "E:\\Algo_Test_Software\\strikeData\\STOCK_strike_data.csv",
+      "table": "spot_data",
+      "status": "completed",
+      "errors": [],
+      "rows_read": 42189,
+      "rows_skipped": 0,
+      "rows_valid": 42189,
+      "rows_inserted": 42189,
+      "rows_updated": 0
+    }
+  ],
+  "finished_at": "2026-03-10T07:38:06.026763"
+}

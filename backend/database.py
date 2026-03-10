@@ -13,11 +13,17 @@ from sqlalchemy.pool import NullPool
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://algotest:algotest_password@localhost:5432/algotest")
 USE_POSTGRESQL = os.getenv("USE_POSTGRESQL", "false").lower() == "true"
 
-# Create SQLAlchemy engine
+# Create SQLAlchemy engine with connection pooling
 engine = create_engine(
     DATABASE_URL,
-    poolclass=NullPool,  # Use NullPool for containerized environments
-    echo=False
+    pool_size=10,  # Connection pool for better performance
+    max_overflow=20,
+    pool_pre_ping=True,  # Verify connections before using
+    pool_recycle=3600,  # Recycle connections after 1 hour
+    echo=False,
+    connect_args={
+        "options": "-c statement_timeout=300000"  # 5 min timeout
+    }
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

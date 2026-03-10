@@ -1,4 +1,4 @@
-version: '3.8'
+
 
 services:
   # PostgreSQL Database
@@ -9,10 +9,32 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-algotest}
       POSTGRES_USER: ${POSTGRES_USER:-algotest}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
+      # Performance tuning for read-heavy workloads
+      POSTGRES_SHARED_BUFFERS: 2GB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 6GB
+      POSTGRES_WORK_MEM: 64MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 512MB
+      POSTGRES_MAX_CONNECTIONS: 100
+      POSTGRES_RANDOM_PAGE_COST: 1.1
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres-tuning.sh:/docker-entrypoint-initdb.d/postgres-tuning.sh
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c work_mem=64MB
+      -c maintenance_work_mem=512MB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_worker_processes=4
+      -c max_parallel_workers_per_gather=2
+      -c max_parallel_workers=4
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotest}"]
       interval: 10s
