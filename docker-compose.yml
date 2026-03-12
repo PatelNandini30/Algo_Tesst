@@ -1,5 +1,3 @@
-
-
 services:
   # PostgreSQL Database
   postgres:
@@ -9,13 +7,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-algotest}
       POSTGRES_USER: ${POSTGRES_USER:-algotest}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
-      # Performance tuning for read-heavy workloads
-      POSTGRES_SHARED_BUFFERS: 2GB
-      POSTGRES_EFFECTIVE_CACHE_SIZE: 6GB
-      POSTGRES_WORK_MEM: 64MB
-      POSTGRES_MAINTENANCE_WORK_MEM: 512MB
-      POSTGRES_MAX_CONNECTIONS: 100
-      POSTGRES_RANDOM_PAGE_COST: 1.1
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
@@ -71,7 +62,8 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
       - REDIS_URL=redis://redis:6379/0
       - DATA_DIR=/data
-      - USE_POSTGRESQL=${USE_POSTGRESQL:-false}
+      - USE_POSTGRESQL=true
+      - ALLOW_CSV_FALLBACK=false
       - PYTHONUNBUFFERED=1
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -92,11 +84,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     networks:
       - algotest-network
 
-  # Frontend
+  # Frontend - served via nginx which proxies /api to backend
   frontend:
     build:
       context: ./frontend
@@ -104,8 +96,6 @@ services:
     container_name: algotest-frontend
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
-    environment:
-      - VITE_API_URL=http://localhost:8000
     depends_on:
       backend:
         condition: service_healthy
@@ -114,31 +104,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 10s
     networks:
       - algotest-network
-
-  # Worker (optional - uncomment to enable)
-  # worker:
-  #   build:
-  #     context: ./backend
-  #     dockerfile: Dockerfile
-  #   container_name: algotest-worker
-  #   command: ["python", "-m", "celery", "-A", "worker.celery", "worker", "--loglevel=info"]
-  #   environment:
-  #     - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
-  #     - REDIS_URL=redis://redis:6379/0
-  #     - DATA_DIR=/data
-  #   volumes:
-  #     - ./cleaned_csvs:/data/cleaned_csvs:ro
-  #     - ./expiryData:/data/expiryData:ro
-  #     - ./strikeData:/data/strikeData:ro
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   networks:
-  #     - algotest-network
 
 volumes:
   pgdata:

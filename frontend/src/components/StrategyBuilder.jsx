@@ -339,7 +339,7 @@ const StrategyBuilder = () => {
       if (res.ok) {
         const data = await res.json();
         setResults(data);
-        if (strEnabled && Array.isArray(data?.trades) && data.trades.length === 0) {
+        if (strFilter.enabled && Array.isArray(data?.trades) && data.trades.length === 0) {
           setError('No trades matched the SuperTrend filter for this date range. Try switching to STR 52 or adjusting the date range.');
         }
       }
@@ -813,7 +813,7 @@ const StrategyBuilder = () => {
                               <SegBtn size="sm"
                                 options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
                                 value={leg.position} onChange={v => updateLeg(leg.id, 'position', v)} />
-                              {strEnabled && (
+                              {strFilter.enabled && (
                                 <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700 border border-blue-200">
                                   STR
                                 </span>

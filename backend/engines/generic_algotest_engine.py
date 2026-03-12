@@ -85,6 +85,8 @@ from base import (
     load_super_trend_dates,
     get_super_trend_segments,
     get_active_str_segment,
+    preload_all_data,
+    clear_fast_lookup_caches,
 )
 
 

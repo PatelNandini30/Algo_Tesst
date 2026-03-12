@@ -281,6 +281,15 @@ async def run_backtest_logic(request: BacktestRequest):
         if cached_result is not None:
             return cached_result
     
+    # Preload data for maximum performance when using PostgreSQL
+    from base import preload_all_data, clear_fast_lookup_caches
+    print(f"🚀 PRELOAD CHECK 2: date_from={request.date_from}, date_to={request.date_to}, index={request.index}")
+    if request.date_from and request.date_to:
+        clear_fast_lookup_caches()
+        preload_all_data(request.date_from, request.date_to, [request.index])
+    else:
+        print("⚠️ PRELOAD SKIPPED: date_from or date_to is None")
+    
     try:
         # Convert frontend parameters to engine format (STRICT MAPPING)
         params = {
@@ -449,6 +458,16 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
     print(f">>> strategy_type: {params.get('strategy_type')}")
     print(f">>> entry_dte: {params.get('entry_dte')}")
     print(f">>> exit_dte: {params.get('exit_dte')}")
+    
+    # PRELOAD DATA FOR PERFORMANCE
+    from base import preload_all_data, clear_fast_lookup_caches
+    from_date = params.get('from_date') or params.get('date_from')
+    to_date = params.get('to_date') or params.get('date_to')
+    index = params.get('index', 'NIFTY')
+    print(f"🚀 PRELOAD CHECK 3: from_date={from_date}, to_date={to_date}, index={index}")
+    if from_date and to_date:
+        clear_fast_lookup_caches()
+        preload_all_data(from_date, to_date, [index])
     
     # Check if positional strategy with entry_dte/exit_dte
     is_positional = params.get('strategy_type') == 'positional' or ('entry_dte' in params and 'exit_dte' in params)
@@ -1609,6 +1628,21 @@ async def run_algotest_backtest_endpoint(request: dict):
     """
     try:
         from engines.generic_algotest_engine import run_algotest_backtest
+        from base import preload_all_data, clear_fast_lookup_caches
+        
+        # Clear caches and preload data for maximum performance
+        from_date = request.get('from_date', request.get('date_from'))
+        to_date = request.get('to_date', request.get('date_to'))
+        index = request.get('index', 'NIFTY')
+        
+        print(f"🚀 PRELOAD CHECK: from_date={from_date}, to_date={to_date}, index={index}")
+        
+        # Preload all data at once if using PostgreSQL
+        if from_date and to_date:
+            clear_fast_lookup_caches()
+            preload_all_data(from_date, to_date, [index])
+        else:
+            print("⚠️ PRELOAD SKIPPED: from_date or to_date is None")
         
         # Run backtest
         trades_df, summary, pivot = run_algotest_backtest(request)

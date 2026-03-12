@@ -154,3 +154,72 @@ class MarketDataRepository:
             df["date"] = pd.to_datetime(df["date"])
         return df
 
+    def get_bhavcopy_bulk(self, from_date: str, to_date: str, symbols: list = None) -> pd.DataFrame:
+        """Bulk load all bhavcopy data for a date range in one query."""
+        cols = self._table_columns("option_data")
+        if not cols:
+            return pd.DataFrame()
+        date_col = self._pick(cols, "trade_date", "date")
+        close_col = self._pick(cols, "close_price", "close")
+        
+        symbol_filter = ""
+        if symbols:
+            symbol_list = ", ".join([f"'{s.upper()}'" for s in symbols])
+            symbol_filter = f"AND symbol IN ({symbol_list})"
+        
+        q = text(
+            f"""
+            SELECT
+                instrument AS "Instrument",
+                symbol AS "Symbol",
+                expiry_date AS "ExpiryDate",
+                option_type AS "OptionType",
+                strike_price AS "StrikePrice",
+                {close_col} AS "Close",
+                turnover AS "TurnOver",
+                {date_col} AS "Date"
+            FROM option_data
+            WHERE {date_col} >= :from_date
+              AND {date_col} <= :to_date
+              {symbol_filter}
+            ORDER BY {date_col}, symbol, strike_price, option_type
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"from_date": from_date, "to_date": to_date})
+        if df.empty:
+            return df
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"])
+        return df
+
+    def get_spot_data_bulk(self, symbols: list, from_date: str, to_date: str) -> pd.DataFrame:
+        """Bulk load spot data for multiple symbols in one query."""
+        cols = self._table_columns("spot_data")
+        if not cols:
+            return pd.DataFrame()
+        date_col = self._pick(cols, "trade_date", "date")
+        close_col = self._pick(cols, "close_price", "close")
+        
+        symbol_list = ", ".join([f"'{s.upper()}'" for s in symbols])
+        
+        q = text(
+            f"""
+            SELECT
+                symbol AS "Symbol",
+                {date_col} AS "Date",
+                {close_col} AS "Close"
+            FROM spot_data
+            WHERE symbol IN ({symbol_list})
+              AND {date_col} >= :from_date
+              AND {date_col} <= :to_date
+            ORDER BY symbol, {date_col}
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"from_date": from_date, "to_date": to_date})
+        if df.empty:
+            return df
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df
+

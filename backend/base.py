@@ -1152,29 +1152,118 @@ _future_lookup_cache: Dict[tuple, dict] = {}
 # key: (date_str, index) → float
 _spot_lookup_cache: Dict[tuple, Optional[float]] = {}
 
+# Bulk preloaded DataFrames (when using PostgreSQL bulk mode)
+_bulk_bhav_df: pd.DataFrame = None
+_bulk_spot_df: pd.DataFrame = None
+_bulk_loaded = False
+_bulk_date_range = None
+
+# HIGH-PERFORMANCE CACHE: Pre-indexed lookup tables
+_option_lookup_table = {}  # (date, symbol, strike, opt_type, expiry) -> premium
+_future_lookup_table = {}   # (date, symbol, expiry) -> future_price
+_spot_lookup_table = {}     # (date, symbol) -> spot_price
+
+
+def _load_bhavcopy_range_csv(from_date: str, to_date: str, symbols: list) -> pd.DataFrame:
+    """Load bhavcopy data from CSV files for a date range."""
+    import os
+    from datetime import datetime, timedelta
+    
+    start = datetime.strptime(from_date, '%Y-%m-%d')
+    end = datetime.strptime(to_date, '%Y-%m-%d')
+    
+    all_dfs = []
+    current = start
+    while current <= end:
+        date_str = current.strftime('%Y-%m-%d')
+        try:
+            df = load_bhavcopy(date_str)
+            if df is not None and not df.empty:
+                df = df[df['Symbol'].isin(symbols)]
+                all_dfs.append(df)
+        except:
+            pass
+        current += timedelta(days=1)
+    
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+
+def _load_spot_range_csv(symbols: list, from_date: str, to_date: str) -> pd.DataFrame:
+    """Load spot data from CSV files for a date range."""
+    all_dfs = []
+    for symbol in symbols:
+        try:
+            df = get_strike_data(symbol, from_date, to_date)
+            if df is not None and not df.empty:
+                df['Symbol'] = symbol
+                all_dfs.append(df)
+        except:
+            pass
+    
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+
+def preload_all_data(from_date: str, to_date: str, symbols: list):
+    """
+    SMART CACHING: Don't preload all data at once (too slow for large date ranges).
+    Instead, use aggressive per-date caching which is faster.
+    """
+    print(f"🔧 SMART CACHE MODE: Using per-date caching with bulk lookup tables")
+    print(f"   Date range: {from_date} to {to_date}")
+    print(f"   Data will be loaded on-demand and cached for subsequent lookups")
+    
+    # Initialize the lookup tables (will be populated on-demand)
+    global _bulk_loaded, _bulk_date_range
+    _bulk_date_range = (from_date, to_date)
+    _bulk_loaded = True  # Enable the instant lookup path
+    _option_lookup_table.clear()
+    _future_lookup_table.clear()
+    _spot_lookup_table.clear()
+    
+    # Pre-fetch trading calendar to know which dates have data
+    try:
+        trading_dates = _repo.get_trading_calendar(from_date, to_date)
+        if trading_dates is not None and not trading_dates.empty:
+            print(f"   📅 Found {len(trading_dates)} trading days")
+    except:
+        pass
+    
+    print(f"   ✅ SMART CACHE enabled! Data will be loaded on first access and cached.")
+
 
 def _build_option_lookup(date_str: str, index: str):
     """
     Index all options for a date+index into a fast dict.
-    Called once per date — subsequent calls are instant (cache hit).
+    Uses bulk preloaded data if available, otherwise falls back to per-date loading.
     """
     cache_key = (date_str, index)
     if cache_key in _option_lookup_cache:
-        return  # Already built — nothing to do
+        return
 
     try:
-        bhav_df = load_bhavcopy(date_str)
+        if _bulk_loaded and _bulk_bhav_df is not None and not _bulk_bhav_df.empty:
+            date_ts = pd.Timestamp(date_str)
+            bhav_df = _bulk_bhav_df[
+                (_bulk_bhav_df['Date'] == date_ts) & 
+                (_bulk_bhav_df['Symbol'] == index)
+            ].copy()
+        else:
+            bhav_df = load_bhavcopy(date_str)
+        
         if bhav_df is None or bhav_df.empty:
             _option_lookup_cache[cache_key] = {}
             return
 
-        # Filter once by symbol — avoids scanning entire CSV on every lookup
         filtered = bhav_df[bhav_df['Symbol'] == index].copy()
         lookup = {}
         for _, row in filtered.iterrows():
             opt_type = str(row.get('OptionType', '')).upper()
             if opt_type not in ('CE', 'PE'):
-                continue  # Skip futures and other instrument types
+                continue
             strike  = int(round(float(row['StrikePrice'])))
             expiry  = pd.Timestamp(row['ExpiryDate']).strftime('%Y-%m-%d')
             lookup[(strike, opt_type, expiry)] = float(row['Close'])
@@ -1182,21 +1271,28 @@ def _build_option_lookup(date_str: str, index: str):
         _option_lookup_cache[cache_key] = lookup
 
     except Exception:
-        # If CSV missing or malformed, store empty dict so we don't retry
         _option_lookup_cache[cache_key] = {}
 
 
 def _build_future_lookup(date_str: str, index: str):
     """
     Index all futures for a date+index into a fast dict.
-    Called once per date — subsequent calls are instant (cache hit).
+    Uses bulk preloaded data if available.
     """
     cache_key = (date_str, index)
     if cache_key in _future_lookup_cache:
-        return  # Already built
+        return
 
     try:
-        bhav_df = load_bhavcopy(date_str)
+        if _bulk_loaded and _bulk_bhav_df is not None and not _bulk_bhav_df.empty:
+            date_ts = pd.Timestamp(date_str)
+            bhav_df = _bulk_bhav_df[
+                (_bulk_bhav_df['Date'] == date_ts) & 
+                (_bulk_bhav_df['Symbol'] == index)
+            ].copy()
+        else:
+            bhav_df = load_bhavcopy(date_str)
+        
         if bhav_df is None or bhav_df.empty:
             _future_lookup_cache[cache_key] = {}
             return
@@ -1222,9 +1318,18 @@ def clear_fast_lookup_caches():
     Clear the fast O(1) lookup caches.
     Call this between backtests if memory is a concern, or after changing data files.
     """
+    global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
+    global _option_lookup_table, _future_lookup_table, _spot_lookup_table
     _option_lookup_cache.clear()
     _future_lookup_cache.clear()
     _spot_lookup_cache.clear()
+    _option_lookup_table.clear()
+    _future_lookup_table.clear()
+    _spot_lookup_table.clear()
+    _bulk_bhav_df = None
+    _bulk_spot_df = None
+    _bulk_loaded = False
+    _bulk_date_range = None
 
 
 # ============================================================================
@@ -1428,22 +1533,14 @@ def is_super_trend_sl_date(date_str: str, config: Any) -> bool:
 
 def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path='bhavcopy_data.db'):
     """
-    Get option premium using O(1) dict lookup (replaces per-call DataFrame scan).
-
-    The first call for a given date+index builds an indexed dict from the bhavcopy
-    CSV (via load_bhavcopy which is already LRU-cached). Every subsequent call for
-    the same date+index is an instant dict lookup — no DataFrame operations at all.
-
-    Backward-compatible: same signature and return value as original function.
+    HIGH-PERFORMANCE: O(1) lookup with on-demand loading per date.
+    Loads data for each date once, then caches forever.
     """
-    # DEBUG: Disabled for performance
-    # print(f"      DEBUG: get_option_premium_from_db called with date={date}, index={index}, strike={strike}, option_type={option_type}, expiry={expiry}")
     try:
         date_str  = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
         expiry_ts = pd.Timestamp(expiry)
         expiry_str = expiry_ts.strftime('%Y-%m-%d')
 
-        # Normalize option_type (handle both string and enum)
         if hasattr(option_type, 'value'):
             opt_type_upper = str(option_type.value).upper()
         elif hasattr(option_type, 'upper'):
@@ -1458,80 +1555,131 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
         else:
             opt_match = opt_type_upper
 
-        # Debug: Disabled for performance
-        # print(f"      DEBUG: Looking for Symbol={index}, OptionType={opt_match}, Strike={strike}, Expiry={expiry_ts}")
-
         strike_key = int(round(float(strike)))
 
-        # Build lookup dict for this date+index if not already done
+        # Check instant lookup table first
+        if _bulk_loaded and _option_lookup_table:
+            result = _option_lookup_table.get((date_str, index, strike_key, opt_match, expiry_str))
+            if result is not None:
+                return result
+            result = _option_lookup_table.get((date_str, index, strike_key, opt_match, 
+                                               (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            if result is not None:
+                return result
+            result = _option_lookup_table.get((date_str, index, strike_key, opt_match,
+                                               (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            if result is not None:
+                return result
+            # If date is in range but not found, try loading on-demand
+            if _bulk_date_range and _bulk_date_range[0] <= date_str <= _bulk_date_range[1]:
+                _load_date_data_on_demand(date_str, index)
+                result = _option_lookup_table.get((date_str, index, strike_key, opt_match, expiry_str))
+                if result is not None:
+                    return result
+            return None
+
+        # Fallback: old method
         _build_option_lookup(date_str, index)
         lookup = _option_lookup_cache.get((date_str, index), {})
-
-        # Filter by Symbol first to see what symbols exist (debug comment preserved)
-        # symbol_matches check is now implicit — if lookup is empty, no matches exist
-        # print(f"      DEBUG: No matches for Symbol={index}. Available symbols: {bhav_df['Symbol'].unique()[:10]}")
-        # print(f"      DEBUG: Found {len(symbol_matches)} rows for Symbol={index}")
-
-        # Exact expiry match — O(1) dict lookup
         result = lookup.get((strike_key, opt_match, expiry_str))
         if result is not None:
-            # print(f"      DEBUG: SUCCESS - Found match! Close price: {result}")
             return result
-
-        # ±1 day tolerance (same logic as original)
-        result = lookup.get((strike_key, opt_match,
-                             (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+        result = lookup.get((strike_key, opt_match, (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
         if result is not None:
             return result
-
-        result = lookup.get((strike_key, opt_match,
-                             (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+        result = lookup.get((strike_key, opt_match, (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
         if result is not None:
             return result
-
-        # More debug info - Disabled for performance
-        # print(f"      DEBUG: FAILED - No match found.")
-        # print(f"      DEBUG: Expiry dates in data for {index}: ...")
-        # print(f"      DEBUG: Strike prices in data for {index}: ...")
-        # print(f"      DEBUG: Option types in data: ...")
-
         return None
 
+    except Exception:
+        return None
+
+
+def _load_date_data_on_demand(date_str: str, index: str):
+    """Load data for a specific date and index, build lookup tables."""
+    if not _bulk_loaded:
+        return
+    
+    # Check if already loaded for this date
+    if any(key[0] == date_str and key[1] == index for key in _option_lookup_table.keys()):
+        return
+    
+    try:
+        # Load data for just this date from PostgreSQL
+        df = _repo.get_bhavcopy_bulk(date_str, date_str, [index])
+        if df is None or df.empty:
+            return
+        
+        # Build lookup entries
+        for _, row in df.iterrows():
+            try:
+                symbol = row['Symbol']
+                instrument = str(row.get('Instrument', '')).upper()
+                opt_type = str(row.get('OptionType', '')).upper()
+                strike = int(round(float(row.get('StrikePrice', 0))))
+                expiry = pd.Timestamp(row['ExpiryDate']).strftime('%Y-%m-%d')
+                close = float(row['Close'])
+                
+                if opt_type in ('CE', 'PE'):
+                    _option_lookup_table[(date_str, symbol, strike, opt_type, expiry)] = close
+                elif 'FUT' in instrument:
+                    _future_lookup_table[(date_str, symbol, expiry)] = close
+            except:
+                continue
+        
+        # Also load spot data
+        spot_df = _repo.get_spot_data_bulk([index], date_str, date_str)
+        if spot_df is not None and not spot_df.empty:
+            for _, row in spot_df.iterrows():
+                try:
+                    symbol = row['Symbol']
+                    close = float(row['Close'])
+                    _spot_lookup_table[(date_str, symbol)] = close
+                except:
+                    continue
+                    
     except Exception as e:
-        print(f"Warning: Could not get option premium: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        pass  # Silently fail - will use fallback
 
 
 def get_future_price_from_db(date, index, expiry, db_path='bhavcopy_data.db'):
     """
-    Get future price using O(1) dict lookup (replaces per-call DataFrame scan).
-
-    The first call for a given date+index builds an indexed dict from the bhavcopy
-    CSV. Every subsequent call for the same date+index is an instant dict lookup.
-
-    Backward-compatible: same signature and return value as original function.
+    HIGH-PERFORMANCE: O(1) lookup with on-demand loading.
     """
     try:
         date_str   = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
         expiry_ts  = pd.Timestamp(expiry)
         expiry_str = expiry_ts.strftime('%Y-%m-%d')
 
-        # Build lookup dict for this date+index if not already done
+        # HIGH-PERFORMANCE: Use instant lookup table
+        if _bulk_loaded and _future_lookup_table:
+            result = _future_lookup_table.get((date_str, index, expiry_str))
+            if result is not None:
+                return result
+            result = _future_lookup_table.get((date_str, index, (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            if result is not None:
+                return result
+            result = _future_lookup_table.get((date_str, index, (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            if result is not None:
+                return result
+            # Try loading on-demand
+            if _bulk_date_range and _bulk_date_range[0] <= date_str <= _bulk_date_range[1]:
+                _load_date_data_on_demand(date_str, index)
+                result = _future_lookup_table.get((date_str, index, expiry_str))
+                if result is not None:
+                    return result
+            return None
+
+        # Fallback: old method
         _build_future_lookup(date_str, index)
         lookup = _future_lookup_cache.get((date_str, index), {})
-
-        # Exact expiry match — O(1) dict lookup
         result = lookup.get(expiry_str)
         if result is not None:
             return result
-
-        # ±1 day tolerance (same logic as original)
         result = lookup.get((expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
         if result is not None:
             return result
-
         result = lookup.get((expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
         if result is not None:
             return result
@@ -1539,8 +1687,6 @@ def get_future_price_from_db(date, index, expiry, db_path='bhavcopy_data.db'):
         return None
 
     except Exception as e:
-        # Warning print commented out for performance
-        # print(f"Warning: Could not get future price: {e}")
         return None
 
 def calculate_intrinsic_value(spot, strike, option_type):
@@ -1698,22 +1844,30 @@ def get_monthly_expiry_date(year: int, month: int, expiry_day_of_week: int):
 
 def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     """
-    Get spot price with in-memory cache — reads strike CSV once per date+index,
-    then returns cached value on all subsequent calls.
-
-    Backward-compatible: same signature and return value as original function.
-    Falls back to SQLite if CSV lookup fails, exactly as before.
+    HIGH-PERFORMANCE: O(1) lookup using pre-built instant lookup table.
     """
     date_str  = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
     cache_key = (date_str, index)
 
-    # Return cached value if already looked up (including None for "not found")
+    # Check old cache first
     if cache_key in _spot_lookup_cache:
         return _spot_lookup_cache[cache_key]
 
+    # HIGH-PERFORMANCE: Use instant lookup table
+    if _bulk_loaded and _spot_lookup_table:
+        val = _spot_lookup_table.get((date_str, index))
+        if val is not None:
+            _spot_lookup_cache[cache_key] = val
+            return val
+        return None
+
+    # Fallback to old method
     try:
-        # PRIMARY: Get from strike_data CSV
-        spot_df = get_strike_data(index, date_str, date_str)
+        if _bulk_loaded and _bulk_spot_df is not None and not _bulk_spot_df.empty:
+            date_ts = pd.Timestamp(date_str)
+            spot_df = _bulk_spot_df[_bulk_spot_df['Symbol'] == index]
+        else:
+            spot_df = get_strike_data(index, date_str, date_str)
 
         if spot_df is not None and not spot_df.empty:
             date_ts = pd.to_datetime(date_str)
@@ -1722,18 +1876,15 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
                 val = float(exact.iloc[0]['Close'])
                 _spot_lookup_cache[cache_key] = val
                 return val
-            # Get closest prior
             prior = spot_df[spot_df['Date'] <= date_ts]
             if not prior.empty:
                 val = float(prior.iloc[-1]['Close'])
                 _spot_lookup_cache[cache_key] = val
                 return val
 
-    except Exception as e:
-        # Fallback to database
+    except Exception:
         pass
 
-    # Database fallback
     try:
         import sqlite3
         conn = sqlite3.connect(db_path)
@@ -1749,7 +1900,6 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     except Exception:
         pass
 
-    # Cache the None result too so we don't retry on every call
     _spot_lookup_cache[cache_key] = None
     return None
 

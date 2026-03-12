@@ -458,7 +458,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     break
 
                 roll_count += 1
-                current_entry = next_entry
+                current_entry = nexwt_entry
 
     if not trades:
         return pd.DataFrame(), {}, {}
