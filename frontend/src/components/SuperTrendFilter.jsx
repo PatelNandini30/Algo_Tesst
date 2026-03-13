@@ -310,20 +310,6 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
           )}
         </div>
       )}
-
-      {/* Exit Rule Reminder - Always visible */}
-      <div className="pt-2 border-t border-gray-100">
-        <div className="flex items-center gap-1 text-xs text-gray-500">
-          <span className="font-medium">Exit:</span>
-          <span className="px-1.5 py-0.5 bg-red-50 text-red-600 rounded">SL</span>
-          <span>·</span>
-          <span className="px-1.5 py-0.5 bg-green-50 text-green-600 rounded">Target</span>
-          <span>·</span>
-          <span className="px-1.5 py-0.5 bg-orange-50 text-orange-600 rounded">Filter End</span>
-          <span>·</span>
-          <span className="px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded">Expiry</span>
-        </div>
-      </div>
     </div>
   );
 };

@@ -295,6 +295,9 @@ const StrategyBuilder = () => {
       date_from: startDate,
       date_to: endDate,
       expiry_type: expiryBasis.toUpperCase(),
+      filter: strFilter.enabled ? strFilter.configId : null,
+      filter_config: strFilter.enabled ? strFilter.configId : null,
+      filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
       super_trend_config: strFilter.enabled ? strFilter.configId : 'None',
       str_filter: strFilter.enabled
         ? { enabled: true, config: strFilter.configId }
