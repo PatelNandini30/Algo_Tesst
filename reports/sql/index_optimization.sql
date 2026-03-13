@@ -51,7 +51,20 @@ ON option_data(symbol, date, expiry_date, option_type, strike_price)
 WHERE option_type IN ('CE', 'PE');
 
 -- ============================================================================
--- STEP 4: Analyze Tables (update statistics)
+-- STEP 4: Spot Data Indexes (NEW)
+-- ============================================================================
+
+-- Index for spot data queries
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_spot_date_symbol
+ON spot_data(date, symbol);
+
+-- Covering index for spot data
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_spot_cover
+ON spot_data(symbol, date)
+INCLUDE (open, high, low, close);
+
+-- ============================================================================
+-- STEP 5: Analyze Tables (update statistics)
 -- ============================================================================
 
 -- Analyze option_data to update query planner statistics

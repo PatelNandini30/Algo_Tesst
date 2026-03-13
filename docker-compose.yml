@@ -12,6 +12,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres-tuning.sh:/docker-entrypoint-initdb.d/postgres-tuning.sh
+      - ./reports/sql:/data:ro
     command: >
       postgres
       -c shared_buffers=2GB
