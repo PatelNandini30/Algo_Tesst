@@ -1227,6 +1227,9 @@ async def dynamic_backtest(
             "overall_target_value": request_obj.overall_target_value,
             # SuperTrend filter
             "super_trend_config": getattr(request_obj, 'super_trend_config', 'None'),
+            # Date Range Filter
+            "filter_config": request.get("filter_config", None),
+            "filter_segments": request.get("filter_segments", []),
         }
         
         # SPOT ADJUSTMENT TYPE MAPPING
