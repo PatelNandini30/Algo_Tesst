@@ -1115,6 +1115,8 @@ def run_algotest_backtest(params):
     filter_config = params.get('filter_config', None)
     filter_segments_custom = params.get('filter_segments', [])
     
+    _log(f"DEBUG: filter_config = {repr(filter_config)}, filter_segments_custom = {len(filter_segments_custom)}")
+    
     filter_enabled = filter_config is not None and filter_config != ''
     filter_segments = []
     if filter_enabled:
