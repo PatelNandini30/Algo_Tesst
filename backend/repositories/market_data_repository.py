@@ -1,4 +1,6 @@
 import pandas as pd
+import threading
+from typing import Optional
 from sqlalchemy import text
 
 
@@ -7,6 +9,9 @@ class MarketDataRepository:
     PostgreSQL-backed repository for market data.
     Supports both legacy schema (002) and refactored schema (003).
     """
+
+    _trading_calendar_cache_df: Optional[pd.DataFrame] = None
+    _trading_calendar_cache_lock = threading.Lock()
 
     def __init__(self, engine):
         self.engine = engine
@@ -136,23 +141,66 @@ class MarketDataRepository:
         return {"min_date": row[0], "max_date": row[1]}
 
     def get_trading_calendar(self, from_date: str, to_date: str) -> pd.DataFrame:
+        """
+        Get all trading dates in a date range.
+        Uses spot_data table first (smaller), falls back to option_data if needed.
+        """
+        # First try spot_data (much smaller table)
+        cols = self._table_columns("spot_data")
+        if cols:
+            date_col = self._pick(cols, "trade_date", "date")
+            q = text(
+                f"""
+                SELECT DISTINCT {date_col} AS date
+                FROM spot_data
+                WHERE {date_col} >= :from_date AND {date_col} <= :to_date
+                ORDER BY {date_col}
+                """
+            )
+            try:
+                with self.engine.begin() as conn:
+                    df = pd.read_sql(q, conn, params={"from_date": from_date, "to_date": to_date})
+                if not df.empty:
+                    df["date"] = pd.to_datetime(df["date"])
+                    return df
+            except Exception as e:
+                print(f"[WARN] spot_data query failed: {e}")
+        
+        # Fallback to option_data (larger table)
         cols = self._table_columns("option_data")
         if not cols:
             return pd.DataFrame(columns=["date"])
         date_col = self._pick(cols, "trade_date", "date")
-        q = text(
-            f"""
-            SELECT DISTINCT {date_col} AS date
-            FROM option_data
-            WHERE {date_col} >= :from_date AND {date_col} <= :to_date
-            ORDER BY {date_col}
-            """
-        )
-        with self.engine.begin() as conn:
-            df = pd.read_sql(q, conn, params={"from_date": from_date, "to_date": to_date})
-        if not df.empty:
+        self._ensure_trading_calendar_cache(date_col)
+        return self._filter_trading_calendar(from_date, to_date)
+
+    def _ensure_trading_calendar_cache(self, date_col: str):
+        if self.__class__._trading_calendar_cache_df is not None:
+            return
+        with self.__class__._trading_calendar_cache_lock:
+            if self.__class__._trading_calendar_cache_df is not None:
+                return
+            q = text(
+                f"""
+                SELECT DISTINCT {date_col} AS date
+                FROM option_data
+                ORDER BY {date_col}
+                """
+            )
+            with self.engine.begin() as conn:
+                df = pd.read_sql(q, conn)
+            if df.empty:
+                self.__class__._trading_calendar_cache_df = pd.DataFrame(columns=["date"])
+                return
             df["date"] = pd.to_datetime(df["date"])
-        return df
+            self.__class__._trading_calendar_cache_df = df
+
+    def _filter_trading_calendar(self, from_date: str, to_date: str) -> pd.DataFrame:
+        df = self.__class__._trading_calendar_cache_df
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["date"])
+        mask = (df["date"] >= pd.to_datetime(from_date)) & (df["date"] <= pd.to_datetime(to_date))
+        return df.loc[mask].copy()
 
     def get_bhavcopy_bulk(self, from_date: str, to_date: str, symbols: list = None) -> pd.DataFrame:
         """Bulk load all bhavcopy data for a date range in one query."""
@@ -223,3 +271,43 @@ class MarketDataRepository:
         df["Date"] = pd.to_datetime(df["Date"])
         return df
 
+    def get_options_bulk(self, symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
+        """
+        Bulk load ALL option data for a symbol across date range.
+        Returns DataFrame with only required columns for fast in-memory lookups.
+        This is the key method for Phase 1 optimization - loads millions of rows at once,
+        then filtering happens in memory with Polars (microseconds vs DB round-trip).
+        """
+        cols = self._table_columns("option_data")
+        if not cols:
+            return pd.DataFrame()
+        date_col = self._pick(cols, "trade_date", "date")
+        close_col = self._pick(cols, "close_price", "close")  # FIX: Use _pick() for dynamic column name
+        
+        q = text(
+            f"""
+            SELECT
+                {date_col} AS "Date",
+                symbol AS "Symbol",
+                expiry_date AS "ExpiryDate",
+                option_type AS "OptionType",
+                strike_price AS "StrikePrice",
+                {close_col} AS "Close"
+            FROM option_data
+            WHERE symbol = :symbol
+              AND {date_col} >= :from_date
+              AND {date_col} <= :to_date
+            ORDER BY {date_col}, symbol, expiry_date, strike_price, option_type
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={
+                "symbol": symbol.upper(), 
+                "from_date": from_date, 
+                "to_date": to_date
+            })
+        if df.empty:
+            return df
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"])
+        return df

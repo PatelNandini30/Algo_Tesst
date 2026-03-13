@@ -36,6 +36,7 @@ Usage:
 import os
 import time
 import logging
+import pandas as pd
 from typing import Optional, List, Dict, Any, Tuple
 from collections import OrderedDict
 from functools import lru_cache
@@ -653,6 +654,28 @@ class HighPerformanceLoader:
     # =========================================================================
     # TRADING CALENDAR - WITH CACHING
     # =========================================================================
+    # TRADING DAYS CACHE - avoid repeated DISTINCT queries on 73GB table
+    # =========================================================================
+    _trading_days_cache: Dict[str, pl.DataFrame] = {}
+    _trading_days_cache_order: List[str] = []
+    _MAX_TRADING_DAYS_CACHE = 10  # Keep last 10 date ranges
+    
+    def _get_cached_trading_days(self, symbol: str, from_date: str, to_date: str) -> Optional[pl.DataFrame]:
+        """Check module-level cache for trading days."""
+        cache_key = f"trading_days:{symbol.upper()}:{from_date}:{to_date}"
+        if cache_key in self._trading_days_cache:
+            return self._trading_days_cache[cache_key]
+        return None
+    
+    def _set_cached_trading_days(self, symbol: str, from_date: str, to_date: str, df: pl.DataFrame):
+        """Cache trading days with LRU eviction."""
+        cache_key = f"trading_days:{symbol.upper()}:{from_date}:{to_date}"
+        self._trading_days_cache[cache_key] = df
+        self._trading_days_cache_order.append(cache_key)
+        # Evict old entries
+        while len(self._trading_days_cache_order) > self._MAX_TRADING_DAYS_CACHE:
+            old_key = self._trading_days_cache_order.pop(0)
+            self._trading_days_cache.pop(old_key, None)
     
     def get_trading_days(
         self,
@@ -661,34 +684,73 @@ class HighPerformanceLoader:
         to_date: str
     ) -> pl.DataFrame:
         """Get all trading days for symbol in date range. Uses caching."""
-        # Check cache first
+        # Check cache first (both instance and module level)
         cache_key = ("trading_days", symbol.upper(), from_date, to_date)
         cached_df = self._trading_days_cache.get(cache_key)
         if cached_df is not None:
             logger.debug(f"[CACHE] get_trading_days HIT: {cache_key}")
             return cached_df
         
-        query = """
-            SELECT DISTINCT date 
-            FROM option_data 
+        # Check module-level cache
+        cached_df = self._get_cached_trading_days(symbol, from_date, to_date)
+        if cached_df is not None:
+            # Promote to instance cache
+            self._trading_days_cache.put(cache_key, cached_df)
+            return cached_df
+        
+        # Try spot_data first (much smaller) - use raw SQL with proper column detection
+        from repositories.market_data_repository import MarketDataRepository
+        from database import get_engine
+        try:
+            repo = MarketDataRepository(get_engine())
+            spot_df = repo.get_spot_data([symbol], from_date, to_date)
+            if not spot_df.empty:
+                # Extract unique dates from spot data
+                dates = spot_df['Date'].unique()
+                dates = sorted(dates)
+                result_df = pl.DataFrame({"Date": dates})
+                # Cache it
+                self._set_cached_trading_days(symbol, from_date, to_date, result_df)
+                self._trading_days_cache.put(cache_key, result_df)
+                logger.debug(f"[PERF] Found {len(result_df)} trading days from spot_data")
+                return result_df
+        except Exception as e:
+            logger.debug(f"[CACHE] spot_data query failed: {e}")
+        
+        # Fallback to option_data with proper column detection
+        cols = self._table_columns("option_data")
+        if not cols:
+            return pl.DataFrame()
+        date_col = self._pick(cols, "trade_date", "date")
+        
+        query = text(f"""
+            SELECT DISTINCT {date_col} AS Date
+            FROM option_data
             WHERE symbol = :symbol
-              AND date >= :from_date 
-              AND date <= :to_date
-            ORDER BY date
-        """
+              AND {date_col} >= :from_date
+              AND {date_col} <= :to_date
+            ORDER BY {date_col}
+        """)
         
         with PerformanceTimer(f"get_trading_days({symbol}, {from_date} to {to_date})"):
-            df = self._query_to_polars(query, {
-                "symbol": symbol.upper(),
-                "from_date": from_date,
-                "to_date": to_date
-            })
+            with get_engine().begin() as conn:
+                df = pd.read_sql(query, conn, params={
+                    "symbol": symbol.upper(),
+                    "from_date": from_date,
+                    "to_date": to_date
+                })
+        
+        if not df.empty:
+            result_df = pl.from_pandas(df)
+        else:
+            result_df = pl.DataFrame()
         
         # Cache the result
-        self._trading_days_cache.put(cache_key, df)
+        self._trading_days_cache.put(cache_key, result_df)
+        self._set_cached_trading_days(symbol, from_date, to_date, result_df)
         
-        logger.debug(f"[PERF] Found {len(df)} trading days for {symbol}")
-        return df
+        logger.debug(f"[PERF] Found {len(result_df)} trading days for {symbol}")
+        return result_df
     
     def get_date_range(self) -> tuple:
         """Get min/max dates in database."""
@@ -766,6 +828,232 @@ class HighPerformanceLoader:
         self._expiry_cache.put(cache_key, df)
         
         return df
+
+
+# ============================================================================
+# PHASE 1: BULK DATA LOADING - THE KEY OPTIMIZATION
+# ============================================================================
+# These module-level variables hold the bulk-loaded DataFrames.
+# Each backtest request loads its data here, engines filter in-memory.
+
+_bulk_options_df: Optional[pl.DataFrame] = None
+_bulk_spot_df: Optional[pl.DataFrame] = None
+_bulk_expiry_df: Optional[pl.DataFrame] = None
+_bulk_loaded_key: Optional[str] = None
+
+
+def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
+    """
+    Load ALL option data for symbol/date-range into memory ONCE.
+    This is the "on-ramp to the new highway" - call this before the engine loop.
+    
+    After this call, all lookups happen in-memory (microseconds).
+    
+    Returns dict with stats about loaded data.
+    """
+    global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key
+    
+    cache_key = f"{symbol}:{from_date}:{to_date}"
+    
+    # Already loaded for this request? Skip.
+    if _bulk_loaded_key == cache_key and _bulk_options_df is not None:
+        logger.info(f"[BULK] Already loaded: {cache_key}")
+        return _get_bulk_stats()
+    
+    logger.info(f"[BULK] Loading {symbol} {from_date} -> {to_date} ...")
+    start_time = time.perf_counter()
+    
+    # Import repository
+    from repositories.market_data_repository import MarketDataRepository
+    from database import get_engine
+    from concurrent.futures import ThreadPoolExecutor
+    
+    repo = MarketDataRepository(get_engine())
+    
+    # PARALLEL LOADING: Load options, spot, and expiry concurrently
+    logger.info("[BULK] Loading options, spot, expiry in parallel...")
+    
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        # Submit all loading tasks
+        options_future = executor.submit(repo.get_options_bulk, symbol, from_date, to_date)
+        spot_future = executor.submit(repo.get_spot_data, symbol, from_date, to_date)
+        expiry_future = executor.submit(repo.get_expiry_data, symbol, 'weekly')
+        
+        # Wait for all to complete
+        options_df = options_future.result()
+        spot_df = spot_future.result()
+        expiry_df = expiry_future.result()
+    
+    if not options_df.empty:
+        _bulk_options_df = pl.from_pandas(options_df)
+        logger.info(f"[BULK] Loaded {len(_bulk_options_df)} option rows")
+    else:
+        _bulk_options_df = pl.DataFrame()
+        logger.warning("[BULK] No option data returned!")
+    
+    # Load spot data in bulk
+    logger.info("[BULK] Loading spot...")
+    # Process results from parallel loading
+    if not spot_df.empty:
+        _bulk_spot_df = pl.from_pandas(spot_df)
+        logger.info(f"[BULK] Loaded {len(_bulk_spot_df)} spot rows")
+    else:
+        _bulk_spot_df = pl.DataFrame()
+        logger.warning("[BULK] No spot data returned!")
+    
+    # Process expiry - filter by date range if provided
+    if not expiry_df.empty:
+        if from_date:
+            expiry_df = expiry_df[expiry_df['Current Expiry'] >= pd.to_datetime(from_date)]
+        if to_date:
+            expiry_df = expiry_df[expiry_df['Current Expiry'] <= pd.to_datetime(to_date)]
+        _bulk_expiry_df = pl.from_pandas(expiry_df)
+        logger.info(f"[BULK] Loaded {len(_bulk_expiry_df)} expiry rows")
+    else:
+        _bulk_expiry_df = pl.DataFrame()
+        logger.warning("[BULK] No expiry data returned!")
+    
+    _bulk_loaded_key = cache_key
+    elapsed = time.perf_counter() - start_time
+    logger.info(f"[BULK] Load complete in {elapsed:.2f}s")
+    
+    return _get_bulk_stats()
+
+
+def _get_bulk_stats() -> dict:
+    """Return stats about currently loaded bulk data."""
+    return {
+        "options_rows": len(_bulk_options_df) if _bulk_options_df is not None else 0,
+        "spot_rows": len(_bulk_spot_df) if _bulk_spot_df is not None else 0,
+        "expiry_rows": len(_bulk_expiry_df) if _bulk_expiry_df is not None else 0,
+        "loaded_key": _bulk_loaded_key
+    }
+
+
+def bulk_clear():
+    """
+    Clear bulk-loaded data from memory.
+    MUST be called in try/finally to prevent memory leaks and stale data.
+    """
+    global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key
+    
+    _bulk_options_df = None
+    _bulk_spot_df = None
+    _bulk_expiry_df = None
+    _bulk_loaded_key = None
+    
+    logger.info("[BULK] Cleared bulk data from memory")
+
+
+def is_bulk_loaded() -> bool:
+    """Check if bulk data is currently loaded."""
+    return _bulk_options_df is not None and _bulk_loaded_key is not None
+
+
+def get_bulk_option_price(
+    date: str,
+    strike_price: float,
+    option_type: str,
+    expiry_date: str
+) -> Optional[float]:
+    """
+    Fast in-memory lookup for single option price.
+    Filters the bulk-loaded Polars DataFrame (microseconds vs DB round-trip).
+    """
+    if _bulk_options_df is None or _bulk_options_df.is_empty():
+        return None
+    
+    try:
+        result = _bulk_options_df.filter(
+            (pl.col("Date") == date) &
+            (pl.col("StrikePrice") == strike_price) &
+            (pl.col("OptionType") == option_type.upper()) &
+            (pl.col("ExpiryDate") == expiry_date)
+        )
+        
+        if result.is_empty():
+            return None
+        
+        return result["Close"][0]
+    except Exception as e:
+        logger.warning(f"[BULK] Lookup failed: {e}")
+        return None
+
+
+def get_bulk_spot_price(date: str) -> Optional[float]:
+    """
+    Fast in-memory lookup for spot price on a date.
+    """
+    if _bulk_spot_df is None or _bulk_spot_df.is_empty():
+        return None
+    
+    try:
+        result = _bulk_spot_df.filter(pl.col("Date") == date)
+        
+        if result.is_empty():
+            return None
+        
+        return result["Close"][0]
+    except Exception as e:
+        logger.warning(f"[BULK] Spot lookup failed: {e}")
+        return None
+
+
+def get_bulk_strikes_for_date(
+    date: str,
+    expiry_date: str,
+    option_type: str = None
+) -> pl.DataFrame:
+    """
+    Get all strikes for a specific date/expiry combination.
+    Returns Polars DataFrame for fast filtering.
+    """
+    if _bulk_options_df is None or _bulk_options_df.is_empty():
+        return pl.DataFrame()
+    
+    try:
+        result = _bulk_options_df.filter(
+            (pl.col("Date") == date) &
+            (pl.col("ExpiryDate") == expiry_date)
+        )
+        
+        if option_type:
+            result = result.filter(pl.col("OptionType") == option_type.upper())
+        
+        return result
+    except Exception as e:
+        logger.warning(f"[BULK] Strikes lookup failed: {e}")
+        return pl.DataFrame()
+
+
+def get_bulk_expiry_dates(
+    from_date: str = None,
+    to_date: str = None
+) -> pl.DataFrame:
+    """
+    Get expiry dates from bulk-loaded data.
+    """
+    if _bulk_expiry_df is None or _bulk_expiry_df.is_empty():
+        return pl.DataFrame()
+    
+    result = _bulk_expiry_df
+    
+    if from_date:
+        result = result.filter(pl.col("Current Expiry") >= from_date)
+    if to_date:
+        result = result.filter(pl.col("Current Expiry") <= to_date)
+    
+    return result
+
+
+def get_bulk_spot_df() -> Optional[pl.DataFrame]:
+    """Get the full bulk-loaded spot DataFrame."""
+    return _bulk_spot_df
+
+
+def get_bulk_options_df() -> Optional[pl.DataFrame]:
+    """Get the full bulk-loaded options DataFrame."""
+    return _bulk_options_df
 
 
 # Singleton instance

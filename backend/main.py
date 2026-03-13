@@ -74,6 +74,35 @@ def health_check():
         "version": "1.0.0"
     }
 
+@app.get("/cache/stats")
+def cache_stats():
+    """Get cache statistics for monitoring."""
+    stats = {
+        "status": "ok"
+    }
+    
+    try:
+        from services.backtest_cache import get_backtest_cache
+        redis_cache = get_backtest_cache()
+        stats["redis"] = redis_cache.get_stats()
+    except Exception as e:
+        stats["redis"] = {"error": str(e)}
+    
+    try:
+        from services.data_memory_cache import get_memory_cache
+        memory_cache = get_memory_cache()
+        stats["memory"] = memory_cache.get_stats()
+    except Exception as e:
+        stats["memory"] = {"error": str(e)}
+    
+    try:
+        from database import get_pool_status
+        stats["database"] = get_pool_status()
+    except Exception as e:
+        stats["database"] = {"error": str(e)}
+    
+    return stats
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1086,8 +1086,15 @@ def run_algotest_backtest(params):
     to_date = params['to_date']
     expiry_type = params.get('expiry_type', 'WEEKLY')
     expiry_day_of_week = params.get('expiry_day_of_week', None)
-    entry_dte = params.get('entry_dte', 2)
-    exit_dte = params.get('exit_dte', 0)
+    def _coerce_int(value, default, label):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            print(f"  WARNING: {label} DTE '{value}' is not a valid integer; defaulting to {default}")
+            return default
+
+    entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
+    exit_dte = _coerce_int(params.get('exit_dte', 0), 0, 'Exit')
     legs_config = params.get('legs', [])
     super_trend_config = params.get('super_trend_config', 'None')
     if hasattr(super_trend_config, 'value'):
@@ -1176,7 +1183,7 @@ def run_algotest_backtest(params):
         print(f"  Loaded {len(expiry_df)} custom expiries (Day {expiry_day_of_week})\n")
     else:
         # Use standard expiry dates
-        if expiry_type == 'WEEKLY':
+        if expiry_type.upper() == 'WEEKLY':
             expiry_df = get_expiry_dates(index, 'weekly', from_date, to_date)
         else:  # MONTHLY
             expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
@@ -1294,6 +1301,18 @@ def run_algotest_backtest(params):
             
             for leg_idx, leg_config in enumerate(legs_config):
                 _log(f"\n    Processing Leg {leg_idx + 1}...")
+                
+                # ========== CONVERT LEG FORMAT ==========
+                # Handle both simple format (from users) and full format (from router)
+                # Simple: {'action': 'sell', 'strike': 'ATM', 'opt_type': 'CE', 'premium': 0}
+                # Full:   {'segment': 'OPTIONS', 'position': 'SELL', 'lots': 1, 'option_type': 'CE', 'strike_selection': 'ATM'}
+                if 'segment' not in leg_config:
+                    # Simple format - convert to full format
+                    leg_config['segment'] = 'OPTIONS'
+                    leg_config['position'] = str(leg_config.get('action', leg_config.get('position', 'SELL'))).upper()
+                    leg_config['lots'] = leg_config.get('lots', 1)
+                    leg_config['option_type'] = leg_config.get('opt_type', leg_config.get('option_type', 'CE'))
+                    leg_config['strike_selection'] = leg_config.get('strike', leg_config.get('strike_selection', 'ATM'))
                 
                 segment = leg_config['segment']
                 position = leg_config['position']
@@ -2001,6 +2020,10 @@ def run_algotest_backtest(params):
     trades_df = pd.DataFrame(trades_flat)
     
     # ========== AGGREGATE LEGS INTO TRADES FOR ANALYTICS ==========
+    if trades_df.empty:
+        print("No trade legs to aggregate - returning empty results")
+        return pd.DataFrame(), {}, {}
+    
     # Group by Trade number and sum P&L to get one row per trade
     trades_aggregated = trades_df.groupby('Trade').agg({
         'Entry Date': 'first',

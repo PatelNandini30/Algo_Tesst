@@ -7,9 +7,10 @@ Calculates P&L per leg and aggregates across all legs.
 import os
 import sys
 from datetime import timedelta
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import pandas as pd
+import numpy as np
 
 # Add backend to path for direct imports
 backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,6 +92,133 @@ def _format_trade_index(base_index: int, roll_count: int):
     return f"{base_index}R{roll_count}"
 
 
+def _get_all_strikes_for_expiry(bhav_df: pd.DataFrame, index_name: str, 
+                                  expiry: pd.Timestamp, option_type: str) -> pd.DataFrame:
+    """
+    OPTIMIZED: Pre-filter once to get all strikes for an expiry.
+    Returns DataFrame with StrikePrice and Close columns.
+    This replaces the row-by-row scanning - O(1) filter instead of O(strikes) filters.
+    """
+    if bhav_df is None or bhav_df.empty:
+        return pd.DataFrame()
+    
+    # Single filter for all strikes at once - vectorized operation
+    expiry_mask = (
+        (bhav_df["Instrument"] == "OPTIDX") &
+        (bhav_df["Symbol"] == index_name) &
+        (bhav_df["OptionType"] == option_type) &
+        (
+            (bhav_df["ExpiryDate"] == expiry) |
+            (bhav_df["ExpiryDate"] == expiry - timedelta(days=1)) |
+            (bhav_df["ExpiryDate"] == expiry + timedelta(days=1))
+        )
+    )
+    
+    # Filter once and return
+    filtered = bhav_df[expiry_mask]
+    # Get first row per strike (in case of duplicates)
+    return filtered.drop_duplicates(subset=["StrikePrice"]).sort_values("StrikePrice")
+
+
+def _select_strike_vectorized(available_strikes_df: pd.DataFrame, adjusted_spot: float,
+                               strike_selection) -> Optional[float]:
+    """
+    OPTIMIZED: Vectorized strike selection using pre-filtered DataFrame.
+    Replaces the row-by-row loop with pandas vectorized operations.
+    """
+    if available_strikes_df is None or available_strikes_df.empty:
+        return None
+    
+    strikes = available_strikes_df["StrikePrice"].values
+    premiums = available_strikes_df["Close"].values
+    
+    if len(strikes) == 0:
+        return None
+    
+    strike_type = strike_selection.type
+    
+    if strike_type == StrikeSelectionType.ATM:
+        return get_atm_strike(adjusted_spot, pd.Series(strikes))
+    
+    elif strike_type == StrikeSelectionType.OTM_PERCENT:
+        return get_otm_strike(adjusted_spot, pd.Series(strikes), 
+                              strike_selection.value, strike_selection.option_type.value)
+    
+    elif strike_type == StrikeSelectionType.ITM_PERCENT:
+        return get_itm_strike(adjusted_spot, pd.Series(strikes),
+                              strike_selection.value, strike_selection.option_type.value)
+    
+    elif strike_type == StrikeSelectionType.CLOSEST_PREMIUM:
+        target_premium = strike_selection.value
+        # Vectorized: calculate all differences at once
+        diffs = np.abs(premiums - target_premium)
+        min_diff = np.min(diffs)
+        # Find all strikes with minimum difference
+        min_indices = np.where(diffs == min_diff)[0]
+        
+        if len(min_indices) == 0:
+            return None
+        
+        tie_candidates = [(strikes[i], premiums[i]) for i in min_indices]
+        
+        # Break ties: higher strike for CE, lower for PE
+        opt = strike_selection.option_type.value.upper()
+        if opt in ["CE", "CALL", "C"]:
+            return max(tie_candidates, key=lambda x: x[0])[0]
+        else:
+            return min(tie_candidates, key=lambda x: x[0])[0]
+    
+    elif strike_type == StrikeSelectionType.PREMIUM_RANGE:
+        premium_min = strike_selection.premium_min or 0.0
+        premium_max = strike_selection.premium_max or float("inf")
+        
+        # Vectorized: find all strikes in range
+        valid_mask = (premiums >= premium_min) & (premiums <= premium_max)
+        valid_strikes = strikes[valid_mask]
+        valid_premiums = premiums[valid_mask]
+        
+        if len(valid_strikes) == 0:
+            return None
+        
+        # Find strike closest to boundary
+        dist_to_min = np.abs(valid_premiums - premium_min)
+        dist_to_max = np.abs(valid_premiums - premium_max)
+        min_dists = np.minimum(dist_to_min, dist_to_max)
+        best_idx = np.argmin(min_dists)
+        
+        return valid_strikes[best_idx]
+    
+    elif strike_type == StrikeSelectionType.SPOT:
+        return get_nearest_strike(adjusted_spot, pd.Series(strikes))
+    
+    return None
+
+
+def _get_bhav_data(date: pd.Timestamp) -> pd.DataFrame:
+    """
+    Get bhavcopy data for a date - uses bulk-loaded in-memory data if available,
+    falls back to load_bhavcopy DB query if not.
+    This is the KEY optimization: avoids 100+ DB queries inside the loop.
+    """
+    from base import is_bulk_data_loaded, fast_get_strikes_for_date
+    
+    date_str = date.strftime("%Y-%m-%d")
+    
+    # Try to use bulk-loaded data first
+    if is_bulk_data_loaded():
+        try:
+            # Get all options for this date from bulk-loaded Polars DataFrame
+            result = fast_get_strikes_for_date(date_str, None, None)
+            if result is not None and not result.is_empty():
+                # Convert Polars to Pandas for compatibility with existing code
+                return result.to_pandas()
+        except Exception as e:
+            print(f"[WARN] Bulk lookup failed for {date_str}: {e}")
+    
+    # Fallback to original DB query
+    return load_bhavcopy(date_str)
+
+
 def _process_trade_legs(
     strategy_def: StrategyDefinition,
     index_name: str,
@@ -100,8 +228,9 @@ def _process_trade_legs(
     fut_expiry: pd.Timestamp,
     entry_spot: float,
 ):
-    bhav_entry = load_bhavcopy(from_date.strftime("%Y-%m-%d"))
-    bhav_exit = load_bhavcopy(to_date.strftime("%Y-%m-%d"))
+    # Use optimized data loading - the KEY fix for Phase 1
+    bhav_entry = _get_bhav_data(from_date)
+    bhav_exit = _get_bhav_data(to_date)
     if bhav_entry is None or bhav_exit is None:
         return []
 
@@ -137,88 +266,30 @@ def _process_trade_legs(
             if available_strikes_series.empty:
                 continue
 
-            if leg.strike_selection.type == StrikeSelectionType.ATM:
-                selected_strike = get_atm_strike(adjusted_spot, available_strikes_series)
-            elif leg.strike_selection.type == StrikeSelectionType.OTM_PERCENT:
-                selected_strike = get_otm_strike(
-                    adjusted_spot,
-                    available_strikes_series,
-                    leg.strike_selection.value,
-                    leg.option_type.value,
+            # OPTIMIZED: Use vectorized strike selection instead of row-by-row loop
+            # Pre-filter once to get all strikes with premiums
+            all_strikes_df = _get_all_strikes_for_expiry(
+                bhav_entry, index_name, curr_expiry, leg.option_type.value
+            )
+            
+            if not all_strikes_df.empty:
+                # Use vectorized selection
+                selected_strike = _select_strike_vectorized(
+                    all_strikes_df, adjusted_spot, leg.strike_selection
                 )
-            elif leg.strike_selection.type == StrikeSelectionType.ITM_PERCENT:
-                selected_strike = get_itm_strike(
-                    adjusted_spot,
-                    available_strikes_series,
-                    leg.strike_selection.value,
-                    leg.option_type.value,
-                )
-            elif leg.strike_selection.type == StrikeSelectionType.CLOSEST_PREMIUM:
-                target_premium = leg.strike_selection.value
-                min_diff = float("inf")
-                tie_candidates = []
-
-                for strike in available_strikes:
-                    strike_mask = bhav_entry[
-                        (bhav_entry["Instrument"] == "OPTIDX")
-                        & (bhav_entry["Symbol"] == index_name)
-                        & (bhav_entry["OptionType"] == leg.option_type.value)
-                        & (
-                            (bhav_entry["ExpiryDate"] == curr_expiry)
-                            | (bhav_entry["ExpiryDate"] == curr_expiry - timedelta(days=1))
-                            | (bhav_entry["ExpiryDate"] == curr_expiry + timedelta(days=1))
-                        )
-                        & (bhav_entry["StrikePrice"] == strike)
-                        & (bhav_entry["TurnOver"] > 0)
-                    ]
-                    if strike_mask.empty:
-                        continue
-                    premium = strike_mask.iloc[0]["Close"]
-                    diff = abs(premium - target_premium)
-                    if diff < min_diff:
-                        min_diff = diff
-                        tie_candidates = [(strike, premium)]
-                    elif diff == min_diff:
-                        tie_candidates.append((strike, premium))
-
-                if tie_candidates:
-                    if leg.option_type.value.upper() in ["CE", "CALL", "C"]:
-                        selected_strike = max(tie_candidates, key=lambda x: x[0])[0]
-                    else:
-                        selected_strike = min(tie_candidates, key=lambda x: x[0])[0]
-
-            elif leg.strike_selection.type == StrikeSelectionType.PREMIUM_RANGE:
-                premium_min = leg.strike_selection.premium_min or 0.0
-                premium_max = leg.strike_selection.premium_max or float("inf")
-                valid_strikes = []
-                for strike in available_strikes:
-                    strike_mask = bhav_entry[
-                        (bhav_entry["Instrument"] == "OPTIDX")
-                        & (bhav_entry["Symbol"] == index_name)
-                        & (bhav_entry["OptionType"] == leg.option_type.value)
-                        & (
-                            (bhav_entry["ExpiryDate"] == curr_expiry)
-                            | (bhav_entry["ExpiryDate"] == curr_expiry - timedelta(days=1))
-                            | (bhav_entry["ExpiryDate"] == curr_expiry + timedelta(days=1))
-                        )
-                        & (bhav_entry["StrikePrice"] == strike)
-                        & (bhav_entry["TurnOver"] > 0)
-                    ]
-                    if strike_mask.empty:
-                        continue
-                    premium = strike_mask.iloc[0]["Close"]
-                    if premium_min <= premium <= premium_max:
-                        valid_strikes.append((strike, premium))
-                if valid_strikes:
-                    def nearest_boundary_dist(item):
-                        _, prem = item
-                        return min(abs(prem - premium_min), abs(prem - premium_max))
-                    selected_strike = min(valid_strikes, key=nearest_boundary_dist)[0]
-
-            elif leg.strike_selection.type == StrikeSelectionType.SPOT:
-                selected_strike = get_nearest_strike(adjusted_spot, available_strikes_series)
             else:
-                raise ValueError(f"Invalid strike selection type: {leg.strike_selection.type}")
+                # Fallback to old logic if bulk lookup didn't work
+                selected_strike = None
+                if leg.strike_selection.type == StrikeSelectionType.ATM:
+                    selected_strike = get_atm_strike(adjusted_spot, available_strikes_series)
+                elif leg.strike_selection.type == StrikeSelectionType.OTM_PERCENT:
+                    selected_strike = get_otm_strike(adjusted_spot, available_strikes_series, 
+                                                     leg.strike_selection.value, leg.option_type.value)
+                elif leg.strike_selection.type == StrikeSelectionType.ITM_PERCENT:
+                    selected_strike = get_itm_strike(adjusted_spot, available_strikes_series,
+                                                      leg.strike_selection.value, leg.option_type.value)
+                elif leg.strike_selection.type == StrikeSelectionType.SPOT:
+                    selected_strike = get_nearest_strike(adjusted_spot, available_strikes_series)
 
             if selected_strike is None:
                 continue
@@ -314,6 +385,8 @@ def _process_trade_legs(
 def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
     strategy_def = params["strategy"]
     index_name = params.get("index", "NIFTY")
+    from_date = params.get("from_date", "2020-01-01")
+    to_date = params.get("to_date", "2025-12-31")
 
     # STR initialization
     super_trend_config = getattr(strategy_def, "super_trend_config", SuperTrendConfig.NONE)
@@ -326,6 +399,16 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
         print(f"STR Filter ON: {str_config_value}, {len(str_segments)} segments loaded")
     else:
         print("STR Filter OFF")
+
+    # ========== PHASE 1: BULK LOAD DATA INTO MEMORY ==========
+    print("⚡ PHASE 1: Bulk loading data into memory...")
+    try:
+        from base import bulk_load_options
+        bulk_stats = bulk_load_options(index_name, from_date, to_date)
+        print(f"   ✅ Bulk load complete: {bulk_stats['options_rows']} options, {bulk_stats['spot_rows']} spot, {bulk_stats['expiry_rows']} expiries")
+    except Exception as e:
+        print(f"   ⚠️  Bulk load failed: {e}")
+        print("   Falling back to per-row queries (slower)...")
 
     # Data load
     spot_df = get_strike_data(index_name, params["from_date"], params["to_date"]).sort_values("Date").reset_index(drop=True)
@@ -458,7 +541,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     break
 
                 roll_count += 1
-                current_entry = nexwt_entry
+                current_entry = next_entry
 
     if not trades:
         return pd.DataFrame(), {}, {}

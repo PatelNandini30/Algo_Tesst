@@ -156,7 +156,7 @@ class DataMemoryCache:
         
         Returns True if cached, False if skipped (memory limit).
         """
-        if df is None or df.is_empty:
+        if df is None or df.is_empty():
             return False
         
         # Only cache popular symbols to save memory

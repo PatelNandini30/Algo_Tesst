@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 # Configuration
-DEFAULT_WORKERS = int(os.getenv("MAX_WORKERS", str(mp.cpu_count()))  # Use all cores
+DEFAULT_WORKERS = int(os.getenv("MAX_WORKERS", str(mp.cpu_count())))  # Use all cores
 
 
 @dataclass
@@ -58,8 +58,8 @@ class BacktestResult:
     trades_df: Optional[pd.DataFrame]
     summary: Dict[str, Any]
     pivot: Dict[str, Any]
-    success: bool str
-    error: = None
+    success: bool
+    error: Optional[str] = None
 
 
 class ParallelExecutor:

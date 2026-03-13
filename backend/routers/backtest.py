@@ -1,6 +1,9 @@
 from fastapi import APIRouter, HTTPException, Response, Header
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Tuple
+# Import generic multi-leg engine
+from engines.generic_multi_leg import run_generic_multi_leg
+from engines.generic_algotest_engine import run_algotest_backtest
 import sys
 import os
 import pandas as pd
@@ -9,6 +12,7 @@ import hashlib
 import json
 import threading
 import time
+import traceback
 
 # ADD THESE — after existing imports
 from concurrent.futures import ThreadPoolExecutor
@@ -113,10 +117,6 @@ except ImportError as e:
             @classmethod
             def __call__(cls, value):
                 return value
-
-# Import generic multi-leg engine
-from engines.generic_multi_leg import run_generic_multi_leg
-from engines.generic_algotest_engine import run_algotest_backtest
 
 router = APIRouter()
 
@@ -267,71 +267,95 @@ class BacktestResponse(BaseModel):
 async def run_backtest_logic(request: BacktestRequest):
     """
     Core backtest logic - shared by both endpoints
-    STRICT RULES:
-    - No logic changes to engines
-    - No PnL recomputation
-    - No cumulative calculation in frontend
-    - Positional only (no intraday)
-    - Future expiry = first monthly >= option expiry
+    OPTIMIZED with new data loader services
     """
-    # Check cache first (skip if no_cache=True)
+    # Check Redis cache first
     cache_params = request.model_dump()
+    if not request.no_cache:
+        try:
+            from services.backtest_cache import get_backtest_cache
+            redis_cache = get_backtest_cache()
+            if redis_cache.is_available():
+                cache_key = redis_cache.generate_key(
+                    symbol=request.index,
+                    from_date=request.date_from,
+                    to_date=request.date_to,
+                    strategy_config=cache_params
+                )
+                cached_result = redis_cache.get(cache_key)
+                if cached_result:
+                    print(f"⚡ REDIS CACHE HIT")
+                    return cached_result
+        except:
+            pass
+    
+    # Check in-memory cache
     if not request.no_cache:
         cached_result = backtest_cache.get(cache_params)
         if cached_result is not None:
             return cached_result
     
-    # Preload data for maximum performance when using PostgreSQL
-    from base import preload_all_data, clear_fast_lookup_caches
-    print(f"🚀 PRELOAD CHECK 2: date_from={request.date_from}, date_to={request.date_to}, index={request.index}")
-    if request.date_from and request.date_to:
-        clear_fast_lookup_caches()
-        preload_all_data(request.date_from, request.date_to, [request.index])
-    else:
-        print("⚠️ PRELOAD SKIPPED: date_from or date_to is None")
-    
+    print(f"🚀 FAST LOAD: {request.index} {request.date_from} to {request.date_to}")
+
+    # Convert frontend parameters to engine format (STRICT MAPPING)
+    params = {
+        # Core parameters
+        "index": request.index,
+        "from_date": request.date_from,
+        "to_date": request.date_to,
+        "expiry_window": request.expiry_window,
+        
+        # Strike parameters
+        "call_sell_position": request.call_sell_position,
+        "put_sell_position": request.put_sell_position,
+        "put_strike_pct_below": request.put_strike_pct_below,
+        "max_put_spot_pct": request.max_put_spot_pct,
+        "premium_multiplier": request.premium_multiplier,
+        "call_premium": request.call_premium,
+        "put_premium": request.put_premium,
+        
+        # Risk parameters
+        "spot_adjustment_type": request.spot_adjustment_type,
+        "spot_adjustment": request.spot_adjustment,
+        "call_hsl_pct": request.call_hsl_pct,
+        "put_hsl_pct": request.put_hsl_pct,
+        "pct_diff": request.pct_diff,
+        
+        # Protection (for V5)
+        "protection": request.protection,
+        "protection_pct": request.protection_pct,
+    }
+
+    # SPOT ADJUSTMENT TYPE MAPPING
+    spot_adjustment_mapping = {
+        "None": 0,
+        "Rises": 1,
+        "Falls": 2,
+        "RisesOrFalls": 3
+    }
+    params["spot_adjustment_type"] = spot_adjustment_mapping.get(request.spot_adjustment_type, 0)
+
+    def _load_and_run():
+        # Bulk load + engine run together off the main thread.
+        # Keeps FastAPI event loop free during the 120s DB query.
+        from base import bulk_load_options, bulk_clear_options
+        try:
+            bulk_load_options(request.index, request.date_from, request.date_to)
+            print(f"   ✅ Data loader ready")
+        except Exception as e:
+            print(f"[WARN] bulk_load_options: {e}")
+        try:
+            return run_generic_multi_leg(params)
+        finally:
+            try:
+                bulk_clear_options()
+                print("[CLEANUP] Bulk data cleared from memory")
+            except Exception as e:
+                print(f"[WARN] Failed to clear bulk data: {e}")
+
     try:
-        # Convert frontend parameters to engine format (STRICT MAPPING)
-        params = {
-            # Core parameters
-            "index": request.index,
-            "from_date": request.date_from,
-            "to_date": request.date_to,
-            "expiry_window": request.expiry_window,
-            
-            # Strike parameters
-            "call_sell_position": request.call_sell_position,
-            "put_sell_position": request.put_sell_position,
-            "put_strike_pct_below": request.put_strike_pct_below,
-            "max_put_spot_pct": request.max_put_spot_pct,
-            "premium_multiplier": request.premium_multiplier,
-            "call_premium": request.call_premium,
-            "put_premium": request.put_premium,
-            
-            # Risk parameters
-            "spot_adjustment_type": request.spot_adjustment_type,
-            "spot_adjustment": request.spot_adjustment,
-            "call_hsl_pct": request.call_hsl_pct,
-            "put_hsl_pct": request.put_hsl_pct,
-            "pct_diff": request.pct_diff,
-            
-            # Protection (for V5)
-            "protection": request.protection,
-            "protection_pct": request.protection_pct,
-        }
-        
-        # Use generic multi-leg engine for all strategies
-        # SPOT ADJUSTMENT TYPE MAPPING
-        spot_adjustment_mapping = {
-            "None": 0,
-            "Rises": 1,
-            "Falls": 2,
-            "RisesOrFalls": 3
-        }
-        params["spot_adjustment_type"] = spot_adjustment_mapping.get(request.spot_adjustment_type, 0)
-        
-        # Execute using generic multi-leg engine
-        df, summary, pivot = run_generic_multi_leg(params)
+        loop = asyncio.get_running_loop()
+        df, summary, pivot = await loop.run_in_executor(_backtest_executor, _load_and_run)
         
         # Prepare response (EXACT ENGINE OUTPUT)
         trades_list = df.to_dict('records') if not df.empty else []
@@ -385,6 +409,22 @@ async def run_backtest_logic(request: BacktestRequest):
             pivot=PivotData(headers=pivot.get("headers", []), rows=pivot.get("rows", [])),
             log=[]
         )
+        
+        # Store result in Redis cache for future requests
+        if not request.no_cache:
+            try:
+                import json
+                result_data = {
+                    "status": response.status,
+                    "meta": response.meta,
+                    "trades": trades_list,
+                    "summary": summary if summary else {},
+                    "pivot": pivot
+                }
+                redis_cache.set(cache_key, result_data, ttl=86400)  # 24hr TTL
+                print(f"💾 Stored result in Redis cache")
+            except Exception as e:
+                print(f"[WARN] Failed to cache to Redis: {e}")
         
         return response
         
@@ -456,18 +496,27 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
     # DEBUG: Print what params we received
     print(f"\n>>> execute_strategy received params: {list(params.keys())}")
     print(f">>> strategy_type: {params.get('strategy_type')}")
-    print(f">>> entry_dte: {params.get('entry_dte')}")
-    print(f">>> exit_dte: {params.get('exit_dte')}")
+    # Normalize DTE values before passing to the AlgoTest engine so it always receives integers.
+    def _coerce_int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    entry_dte = _coerce_int(params.get('entry_dte', 2), 2)
+    exit_dte = _coerce_int(params.get('exit_dte', 0), 0)
+    print(f">>> entry_dte: {entry_dte}")
+    print(f">>> exit_dte: {exit_dte}")
     
     # PRELOAD DATA FOR PERFORMANCE
-    from base import preload_all_data, clear_fast_lookup_caches
+    # bulk_load_options builds the O(1) lookup dict — called from thread pool (never blocks main loop)
+    from base import bulk_load_options
     from_date = params.get('from_date') or params.get('date_from')
     to_date = params.get('to_date') or params.get('date_to')
     index = params.get('index', 'NIFTY')
     print(f"🚀 PRELOAD CHECK 3: from_date={from_date}, to_date={to_date}, index={index}")
     if from_date and to_date:
-        clear_fast_lookup_caches()
-        preload_all_data(from_date, to_date, [index])
+        bulk_load_options(index, from_date, to_date)
     
     # Check if positional strategy with entry_dte/exit_dte
     is_positional = params.get('strategy_type') == 'positional' or ('entry_dte' in params and 'exit_dte' in params)
@@ -478,8 +527,6 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
         print("\nUsing AlgoTest engine (DTE-based positional strategy)\n")
 
         # Build AlgoTest params
-        entry_dte = params.get('entry_dte', 2)
-        exit_dte = params.get('exit_dte', 0)
         expiry_type = params.get('expiry_type', 'WEEKLY')
         
         # Build legs config
@@ -617,24 +664,35 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
         }
         
         try:
-            return run_algotest_backtest(algotest_params)
-        except Exception as e:
-            print(f"[WARN] AlgoTest engine failed: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+            result = run_algotest_backtest(algotest_params)
+        finally:
+            try:
+                from base import bulk_clear_options
+                bulk_clear_options()
+                print("[CLEANUP] Bulk data cleared from memory")
+            except Exception as e:
+                print(f"[WARN] Failed to clear bulk data: {e}")
+        return result
     
     # Default to generic_multi_leg
     # print("\n✓ Using generic_multi_leg engine\n")
     params["strategy"] = strategy_def
-    return run_generic_multi_leg(params)
+    try:
+        result = run_generic_multi_leg(params)
+    finally:
+        try:
+            from base import bulk_clear_options
+            bulk_clear_options()
+            print("[CLEANUP] Bulk data cleared from memory")
+        except Exception as e:
+            print(f"[WARN] Failed to clear bulk data: {e}")
+    return result
 
 
 def convert_numpy_types(obj):
     """
     Recursively convert numpy types to Python native types for JSON serialization
     """
-    import numpy as np
     
     if isinstance(obj, dict):
         return {key: convert_numpy_types(value) for key, value in obj.items()}
@@ -1084,14 +1142,12 @@ async def dynamic_backtest(
         # Pass original legs data for stopLoss/targetProfit extraction
         params["original_legs"] = request_obj.legs
         
-        # Execute the dynamic strategy
-        with open('debug_backtest.log', 'a') as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"DEBUG: About to execute strategy\n")
-        df, summary, pivot = execute_strategy(strategy_def, params)
-        with open('debug_backtest.log', 'a') as f:
-            f.write(f"DEBUG: Strategy executed, df shape: {df.shape if not df.empty else 'empty'}\n")
-            f.write(f"DEBUG: df columns: {list(df.columns) if not df.empty else 'N/A'}\n")
+        # Execute in thread pool — keeps FastAPI event loop free during 120s DB load
+        loop = asyncio.get_running_loop()
+        df, summary, pivot = await loop.run_in_executor(
+            _backtest_executor,
+            lambda: execute_strategy(strategy_def, params)
+        )
         
         # Prepare response with proper column mapping for frontend
         if not df.empty:
@@ -1573,79 +1629,72 @@ async def run_algotest_backtest_endpoint(request: dict):
     """
     NEW ENDPOINT: AlgoTest-style backtest
 
-    Request format:
-    {
-        "index": "NIFTY",
-        "from_date": "2024-01-01",
-        "to_date": "2024-12-31",
-        "expiry_type": "WEEKLY",
-        "entry_dte": 2,
-        "exit_dte": 0,
-
-        // ── Overall Stop Loss (mirrors AlgoTest 'Overall Strategy Settings') ──
-        //
-        // Mode 1 — Max Loss (fixed ₹):
-        //   "overall_sl_type":  "max_loss",
-        //   "overall_sl_value": 5000          // exit ALL legs if combined P&L ≤ -₹5000
-        //
-        // Mode 2 — Total Premium % (dynamic, % of combined entry premium in ₹):
-        //   "overall_sl_type":  "total_premium_pct",
-        //   "overall_sl_value": 10            // exit if P&L ≤ -(10% of total entry premium ₹)
-        //
-        // Calculation for Total Premium % mode:
-        //   total_entry_premium_rs = Σ (entry_premium × lots × lot_size)  [options legs only]
-        //   sl_threshold           = total_entry_premium_rs × (overall_sl_value / 100)
-        //   SL fires when combined_live_pnl ≤ -sl_threshold
-        //
-        // Overall Target (same two modes):
-        //   "overall_target_type":  "max_profit" | "total_premium_pct",
-        //   "overall_target_value": <number>
-
-        "overall_sl_type":     "total_premium_pct",   // or "max_loss"
-        "overall_sl_value":    10,                    // 10% of total entry premium
-        "overall_target_type": "max_profit",          // or "total_premium_pct"
-        "overall_target_value": null,                 // null = no target
-
-        "legs": [
-            {
-                "segment": "OPTIONS",
-                "option_type": "CE",
-                "position": "SELL",
-                "lots": 1,
-                "strike_selection": "ITM1",
-                "expiry": "WEEKLY"
-            },
-            {
-                "segment": "OPTIONS",
-                "option_type": "PE",
-                "position": "BUY",
-                "lots": 1,
-                "strike_selection": "OTM1",
-                "expiry": "WEEKLY"
-            }
-        ]
-    }
+    Optimized with:
+    - Redis caching for results
+    - Preloaded data using optimized data loader
+    - Memory caching for frequently accessed data
     """
     try:
         from engines.generic_algotest_engine import run_algotest_backtest
-        from base import preload_all_data, clear_fast_lookup_caches
         
-        # Clear caches and preload data for maximum performance
+        # Import new optimization services
+        try:
+            from services.backtest_cache import get_backtest_cache
+            from services.data_memory_cache import get_memory_cache
+            redis_cache = get_backtest_cache()
+            memory_cache = get_memory_cache()
+            use_redis = redis_cache.is_available()
+        except Exception as e:
+            print(f"[CACHE] Service import failed: {e}")
+            use_redis = False
+        
+        # Get request parameters
         from_date = request.get('from_date', request.get('date_from'))
         to_date = request.get('to_date', request.get('date_to'))
         index = request.get('index', 'NIFTY')
         
-        print(f"🚀 PRELOAD CHECK: from_date={from_date}, to_date={to_date}, index={index}")
+        print(f"🚀 BACKTEST: {index} from {from_date} to {to_date}")
         
-        # Preload all data at once if using PostgreSQL
-        if from_date and to_date:
-            clear_fast_lookup_caches()
-            preload_all_data(from_date, to_date, [index])
-        else:
-            print("⚠️ PRELOAD SKIPPED: from_date or to_date is None")
+        # Check Redis cache first
+        if use_redis:
+            cache_key = redis_cache.generate_key(
+                symbol=index,
+                from_date=from_date,
+                to_date=to_date,
+                strategy_config=request
+            )
+            cached_result = redis_cache.get(cache_key)
+            if cached_result:
+                print(f"⚡ REDIS CACHE HIT: {cache_key}")
+                return {
+                    "status": "success",
+                    "trades": cached_result.get("trades", []),
+                    "summary": cached_result.get("summary", {}),
+                    "pivot": cached_result.get("pivot", {}),
+                    "cached": True
+                }
         
-        # Run backtest
-        trades_df, summary, pivot = run_algotest_backtest(request)
+        # Run load + backtest together in thread pool — keeps event loop free
+        def _load_and_run_algotest():
+            from base import bulk_load_options, bulk_clear_options
+            try:
+                bulk_load_options(index, from_date, to_date)
+                print(f"   ✅ O(1) lookup dict ready")
+            except Exception as e:
+                print(f"[WARN] bulk_load_options: {e}")
+            try:
+                return run_algotest_backtest(request)
+            finally:
+                try:
+                    bulk_clear_options()
+                    print("[CLEANUP] Bulk data cleared from memory")
+                except Exception as e:
+                    print(f"[WARN] Failed to clear bulk data: {e}")
+
+        loop = asyncio.get_running_loop()
+        trades_df, summary, pivot = await loop.run_in_executor(
+            _backtest_executor, _load_and_run_algotest
+        )
         
         # Convert numpy types to Python types for JSON serialization
         def convert_numpy(obj):
@@ -1677,16 +1726,25 @@ async def run_algotest_backtest_endpoint(request: dict):
         summary = convert_numpy(summary)
         pivot = convert_numpy(pivot)
         
+        # Cache result in Redis
+        if use_redis:
+            result_data = {
+                "trades": trades_json,
+                "summary": summary,
+                "pivot": pivot
+            }
+            redis_cache.set(cache_key, result_data)
+            print(f"💾 CACHED: {cache_key}")
+        
         return {
             "status": "success",
             "trades": trades_json,
             "summary": summary,
-            "pivot": pivot
+            "pivot": pivot,
+            "cached": False
         }
     
     except Exception as e:
-        import traceback
-        import numpy as np
         
         def clean_error(obj):
             if obj is None:

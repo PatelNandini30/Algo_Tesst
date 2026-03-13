@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import polars as pl
 from functools import lru_cache
 from datetime import datetime, timedelta
 import math
@@ -1002,18 +1003,32 @@ def calculate_trading_days_before_expiry(expiry_date, days_before, trading_calen
     import pandas as pd
     from datetime import timedelta
     
-    # Get all trading days before expiry
-    trading_days = trading_calendar_df[
-        trading_calendar_df['date'] < expiry_date
-    ].sort_values('date', ascending=False)
+    # NORMALIZE: Convert all dates to pd.Timestamp for comparison
+    if isinstance(expiry_date, pd.Timestamp):
+        expiry_ts = expiry_date
+    else:
+        expiry_ts = pd.Timestamp(expiry_date)
+    
+    # Ensure trading_calendar_df['date'] is also Timestamp
+    df = trading_calendar_df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Get all trading days BEFORE expiry (use <= to include expiry day for days_before=0)
+    if days_before == 0:
+        # For days_before=0, include the expiry day itself
+        trading_days = df[df['date'] <= expiry_ts].sort_values('date', ascending=False)
+    else:
+        trading_days = df[df['date'] < expiry_ts].sort_values('date', ascending=False)
     
     if days_before == 0:
-        # Entry on expiry day itself
-        return expiry_date
+        # Entry on expiry day itself - return the closest trading day <= expiry
+        if not trading_days.empty:
+            return trading_days.iloc[0]['date']
+        return expiry_ts
     
     # Validate enough trading days exist
     if len(trading_days) < days_before:
-        raise ValueError(f"Not enough trading days before expiry {expiry_date}. Requested: {days_before}, Available: {len(trading_days)}")
+        return None  # Don't raise, just return None
     
     # Get the Nth trading day before expiry
     # Index is 0-based, so days_before=1 means index 0, days_before=2 means index 1
@@ -1209,30 +1224,19 @@ def _load_spot_range_csv(symbols: list, from_date: str, to_date: str) -> pd.Data
 
 def preload_all_data(from_date: str, to_date: str, symbols: list):
     """
-    SMART CACHING: Don't preload all data at once (too slow for large date ranges).
-    Instead, use aggressive per-date caching which is faster.
+    Preload all option data for the given symbols and date range.
+    Delegates to bulk_load_options() which builds the O(1) lookup dict.
     """
-    print(f"🔧 SMART CACHE MODE: Using per-date caching with bulk lookup tables")
-    print(f"   Date range: {from_date} to {to_date}")
-    print(f"   Data will be loaded on-demand and cached for subsequent lookups")
+    if symbols:
+        primary_symbol = symbols[0] if isinstance(symbols, list) else symbols
+        print(f"🔧 PRELOAD: Loading {primary_symbol} data for {from_date} to {to_date}")
+        try:
+            result = bulk_load_options(primary_symbol, from_date, to_date)
+            print(f"   ✅ Preload complete: {result}")
+        except Exception as e:
+            print(f"   ⚠️  Preload failed: {e}")
     
-    # Initialize the lookup tables (will be populated on-demand)
-    global _bulk_loaded, _bulk_date_range
-    _bulk_date_range = (from_date, to_date)
-    _bulk_loaded = True  # Enable the instant lookup path
-    _option_lookup_table.clear()
-    _future_lookup_table.clear()
-    _spot_lookup_table.clear()
-    
-    # Pre-fetch trading calendar to know which dates have data
-    try:
-        trading_dates = _repo.get_trading_calendar(from_date, to_date)
-        if trading_dates is not None and not trading_dates.empty:
-            print(f"   📅 Found {len(trading_dates)} trading days")
-    except:
-        pass
-    
-    print(f"   ✅ SMART CACHE enabled! Data will be loaded on first access and cached.")
+    print(f"   ✅ SMART CACHE enabled!")
 
 
 def _build_option_lookup(date_str: str, index: str):
@@ -1557,28 +1561,28 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
 
         strike_key = int(round(float(strike)))
 
-        # Check instant lookup table first
+        # O(1) dict lookup — built during bulk_load_options()
         if _bulk_loaded and _option_lookup_table:
-            result = _option_lookup_table.get((date_str, index, strike_key, opt_match, expiry_str))
+            key = (date_str, index, strike_key, opt_match, expiry_str)
+            result = _option_lookup_table.get(key)
             if result is not None:
                 return result
-            result = _option_lookup_table.get((date_str, index, strike_key, opt_match, 
-                                               (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            # Try ±1 day expiry tolerance
+            result = _option_lookup_table.get(
+                (date_str, index, strike_key, opt_match,
+                 (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
             if result is not None:
                 return result
-            result = _option_lookup_table.get((date_str, index, strike_key, opt_match,
-                                               (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            result = _option_lookup_table.get(
+                (date_str, index, strike_key, opt_match,
+                 (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
             if result is not None:
                 return result
-            # If date is in range but not found, try loading on-demand
-            if _bulk_date_range and _bulk_date_range[0] <= date_str <= _bulk_date_range[1]:
-                _load_date_data_on_demand(date_str, index)
-                result = _option_lookup_table.get((date_str, index, strike_key, opt_match, expiry_str))
-                if result is not None:
-                    return result
+            # DEBUG: Log failed lookups
+            # print(f"[LOOKUP FAILED] key={key}, table_keys_sample={list(_option_lookup_table.keys())[:3]}")
             return None
 
-        # Fallback: old method
+        # Fallback: use lookup cache
         _build_option_lookup(date_str, index)
         lookup = _option_lookup_cache.get((date_str, index), {})
         result = lookup.get((strike_key, opt_match, expiry_str))
@@ -1865,7 +1869,12 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     try:
         if _bulk_loaded and _bulk_spot_df is not None and not _bulk_spot_df.empty:
             date_ts = pd.Timestamp(date_str)
-            spot_df = _bulk_spot_df[_bulk_spot_df['Symbol'] == index]
+            # Spot data may or may not have Symbol column - handle both
+            if 'Symbol' in _bulk_spot_df.columns:
+                spot_df = _bulk_spot_df[_bulk_spot_df['Symbol'] == index]
+            else:
+                # No Symbol column - use all rows
+                spot_df = _bulk_spot_df
         else:
             spot_df = get_strike_data(index, date_str, date_str)
 
@@ -2283,3 +2292,161 @@ def calculate_strike_advanced(date, index, spot_price, strike_interval, option_t
         'expiry': expiry,
         'premium': premium
     }
+
+
+# ============================================================================
+# PHASE 1: WRAPPER FUNCTIONS FOR BULK LOADING
+# ============================================================================
+# These thin wrappers delegate to services/data_loader.py bulk functions.
+# Engines should call these instead of the original functions for fast lookups.
+
+def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
+    """
+    Load all option data for symbol/date-range into memory ONCE.
+    Builds a pre-indexed O(1) lookup dict — NOT a raw DataFrame scan.
+    """
+    global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
+    global _option_lookup_table, _future_lookup_table, _spot_lookup_table
+
+    from services.data_loader import bulk_load as _bulk_load, get_bulk_options_df, get_bulk_spot_df
+
+    # If dict already built for this range AND has entries, skip all work
+    if (_bulk_loaded and _bulk_date_range == (from_date, to_date)
+            and _option_lookup_table and len(_option_lookup_table) > 0):
+        print(f"[BULK] O(1) dict already built: {len(_option_lookup_table):,} entries — skipping rebuild")
+        return {
+            "options_rows": len(_option_lookup_table),
+            "spot_rows": len(_spot_lookup_table),
+            "expiry_rows": 0,
+            "loaded_key": f"{symbol}:{from_date}:{to_date}"
+        }
+
+    result = _bulk_load(symbol, from_date, to_date)
+
+    # Build O(1) lookup dict from the Polars DataFrame
+    # Key: (date_str, symbol, strike_int, opt_type, expiry_str) -> close_price
+    options_df = get_bulk_options_df()
+    if options_df is not None and not options_df.is_empty():
+        _option_lookup_table.clear()
+        _future_lookup_table.clear()
+
+        # Convert to Python lists for fast iteration
+        dates      = options_df["Date"].dt.strftime("%Y-%m-%d").to_list()
+        symbols    = options_df["Symbol"].to_list()
+        strikes    = options_df["StrikePrice"].to_list()
+        opt_types  = options_df["OptionType"].to_list()
+        expiries   = options_df["ExpiryDate"].dt.strftime("%Y-%m-%d").to_list()
+        closes     = options_df["Close"].to_list()
+
+        for i in range(len(dates)):
+            opt_type = opt_types[i]
+            if opt_type not in ("CE", "PE"):
+                continue
+            key = (dates[i], symbols[i], int(round(strikes[i])), opt_type, expiries[i])
+            _option_lookup_table[key] = closes[i]
+
+        _bulk_bhav_df = None   # Don't keep raw DataFrame — dict is enough
+        _bulk_loaded = True
+        _bulk_date_range = (from_date, to_date)
+        print(f"[BULK] Built O(1) lookup dict: {len(_option_lookup_table):,} entries")
+
+    spot_df = get_bulk_spot_df()
+    if spot_df is not None and not spot_df.is_empty():
+        _spot_lookup_table.clear()
+        s_dates   = spot_df["Date"].dt.strftime("%Y-%m-%d").to_list()
+        s_closes  = spot_df["Close"].to_list()
+        for i in range(len(s_dates)):
+            _spot_lookup_table[(s_dates[i], symbol)] = s_closes[i]
+        _bulk_spot_df = None
+        print(f"[BULK] Built spot lookup dict: {len(_spot_lookup_table):,} entries")
+
+    return result
+
+
+def bulk_clear_options():
+    """
+    Clear base.py lookup dicts after a backtest completes.
+    Does NOT clear data_loader Polars cache — that stays in memory so
+    the next backtest for the same symbol/range skips the 120s DB reload.
+    Call bulk_force_clear() only when you genuinely need to free RAM.
+    """
+    global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
+
+    _bulk_bhav_df = None
+    _bulk_spot_df = None
+    _bulk_loaded = False
+    _bulk_date_range = None
+    _option_lookup_table.clear()
+    _future_lookup_table.clear()
+    _spot_lookup_table.clear()
+    # NOTE: data_loader Polars cache intentionally kept alive for re-use
+
+
+def bulk_force_clear():
+    """
+    Full wipe — clears both base.py dicts AND data_loader Polars cache.
+    Use only when switching symbol/date range or under memory pressure.
+    """
+    global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
+
+    from services.data_loader import bulk_clear as _bulk_clear
+    _bulk_clear()
+
+    _bulk_bhav_df = None
+    _bulk_spot_df = None
+    _bulk_loaded = False
+    _bulk_date_range = None
+    _option_lookup_table.clear()
+    _future_lookup_table.clear()
+    _spot_lookup_table.clear()
+
+
+def fast_get_option_premium(
+    date: str,
+    strike_price: float,
+    option_type: str,
+    expiry_date: str
+) -> float:
+    """
+    Fast in-memory lookup for option premium.
+    Uses bulk-loaded Polars DataFrame instead of DB query.
+    """
+    from services.data_loader import get_bulk_option_price as _get_price
+    return _get_price(date, strike_price, option_type, expiry_date)
+
+
+def fast_get_spot_price(date: str) -> float:
+    """
+    Fast in-memory lookup for spot price.
+    Uses bulk-loaded Polars DataFrame instead of DB query.
+    """
+    from services.data_loader import get_bulk_spot_price as _get_spot
+    return _get_spot(date)
+
+
+def fast_get_strikes_for_date(
+    date: str,
+    expiry_date: str,
+    option_type: str = None
+):
+    """
+    Fast in-memory lookup for all strikes for a date/expiry.
+    Returns Polars DataFrame for fast filtering.
+    """
+    from services.data_loader import get_bulk_strikes_for_date as _get_strikes
+    return _get_strikes(date, expiry_date, option_type)
+
+
+def fast_get_expiry_dates(from_date: str = None, to_date: str = None):
+    """
+    Fast in-memory lookup for expiry dates.
+    Uses bulk-loaded expiry calendar.
+    """
+    from services.data_loader import get_bulk_expiry_dates as _get_expiry
+    return _get_expiry(from_date, to_date)
+
+
+def is_bulk_data_loaded() -> bool:
+    """Check if bulk data is currently loaded."""
+    from services.data_loader import is_bulk_loaded
+    return is_bulk_loaded()
