@@ -7,7 +7,8 @@ export const DATA_UPLOAD_OPTIONS = [
 ];
 
 export const STR_FILTER_OPTIONS = [
-  { value: '5x1', label: 'STR 5x1' },
-  { value: '5x2', label: 'STR 5x2' },
-  { value: 'both', label: 'Both (5x1 + 5x2)' },
+  { value: '5x1', label: 'STR 5,1' },
+  { value: '5x2', label: 'STR 5,2' },
+  { value: 'base2', label: 'base2' },
+  { value: 'custom', label: 'Custom CSV' },
 ];

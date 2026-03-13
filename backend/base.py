@@ -1532,6 +1532,189 @@ def is_super_trend_sl_date(date_str: str, config: Any) -> bool:
 # END OF SUPER TREND FILTER
 # ============================================================================
 
+# ============================================================================
+# NEW FILTER SYSTEM - Date Range Filter for Backtest
+# ============================================================================
+
+def get_filter_segments(config: str) -> list:
+    """
+    Get filter segments for a given config.
+    
+    Args:
+        config: '5x1', '5x2', 'base2', or 'custom'
+    
+    Returns:
+        List of dicts with 'start' and 'end' keys (datetime.date objects)
+    """
+    if not config:
+        return []
+    
+    config = config.lower().strip()
+    
+    if config == 'base2':
+        return get_base2_segments()
+    elif config in ['5x1', '5x2']:
+        return get_super_trend_segments(config)
+    else:
+        return []
+
+
+def get_base2_segments() -> list:
+    """
+    Generate base2 filter - returns single segment covering entire DB date range.
+    This represents the full available data range.
+    
+    Returns:
+        List with single dict: [{'start': min_date, 'end': max_date}]
+    """
+    from repositories.market_data_repository import MarketDataRepository
+    from database import get_engine
+    
+    try:
+        repo = MarketDataRepository(get_engine())
+        date_range = repo.get_available_date_range()
+        
+        min_date = date_range.get('min_date')
+        max_date = date_range.get('max_date')
+        
+        if min_date and max_date:
+            return [{'start': min_date, 'end': max_date}]
+        return []
+    except Exception as e:
+        print(f"Error getting base2 segments: {e}")
+        return []
+
+
+def get_filter_segment_counts() -> dict:
+    """
+    Get count of segments for each available filter.
+    
+    Returns:
+        Dict: {'5x1': count, '5x2': count, 'base2': 1}
+    """
+    counts = {}
+    
+    # Get counts from DB for 5x1 and 5x2
+    for config in ['5x1', '5x2']:
+        segs = get_filter_segments(config)
+        counts[config] = len(segs)
+    
+    # base2 is always 1 segment (full range)
+    base2_segs = get_filter_segments('base2')
+    counts['base2'] = len(base2_segs)
+    
+    return counts
+
+
+# Date parser for CSV upload (matches migrate_filter.py)
+_DATE_FMTS = [
+    "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
+    "%Y/%m/%d", "%d-%b-%Y", "%d %b %Y", "%b %d %Y",
+    "%d-%B-%Y", "%d %B %Y", "%Y%m%d", "%d.%m.%Y",
+    "%m-%d-%Y", "%b-%d-%Y", "%B-%d-%Y", "%d%m%Y",
+    "%Y-%b-%d", "%d %b, %Y", "%b %d, %Y",
+    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+]
+
+_DATE_NULL_SET = frozenset([
+    "", "nan", "NaN", "None", "NaT", "nat", "N/A", "NA",
+    "n/a", "na", "-", "--", "0", "null", "NULL", "Null",
+    "0000-00-00", "00/00/0000", "00-00-0000",
+])
+
+
+def _parse_single_date(date_str: str):
+    """Parse a single date string trying multiple formats."""
+    if not date_str or str(date_str).strip() in _DATE_NULL_SET:
+        return None
+    
+    cleaned = str(date_str).strip()
+    
+    for fmt in _DATE_FMTS:
+        try:
+            return pd.to_datetime(cleaned, format=fmt).date()
+        except:
+            continue
+    
+    # Try with dayfirst=True as fallback
+    try:
+        return pd.to_datetime(cleaned, dayfirst=True).date()
+    except:
+        return None
+
+
+def parse_filter_csv(csv_content: str) -> list:
+    """
+    Parse uploaded CSV content for filter segments.
+    Supports both start/end and entry/exit column formats.
+    
+    Args:
+        csv_content: Raw CSV string
+    
+    Returns:
+        List of dicts: [{'start': date, 'end': date}, ...]
+    """
+    import io
+    
+    segments = []
+    
+    try:
+        # Try to read CSV
+        df = pd.read_csv(io.StringIO(csv_content), dtype=str, keep_default_na=False)
+        
+        if df.empty:
+            return []
+        
+        # Normalize column names
+        df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
+        
+        # Detect column format
+        start_col = None
+        end_col = None
+        
+        # Check for start/end format
+        start_aliases = ['start', 'start_date', 'startdt', 'from', 'from_date']
+        end_aliases = ['end', 'end_date', 'enddt', 'to', 'to_date']
+        
+        for col in df.columns:
+            if col in start_aliases or col.startswith('start'):
+                start_col = col
+            if col in end_aliases or col.startswith('end'):
+                end_col = col
+        
+        # If not found, check entry/exit format
+        if not start_col or not end_col:
+            entry_aliases = ['entry', 'entry_date', 'entrydt']
+            exit_aliases = ['exit', 'exit_date', 'exitdt']
+            
+            for col in df.columns:
+                if col in entry_aliases or col.startswith('entry'):
+                    start_col = col
+                if col in exit_aliases or col.startswith('exit'):
+                    end_col = col
+        
+        if not start_col or not end_col:
+            print(f"Could not detect date columns. Found: {df.columns}")
+            return []
+        
+        # Parse dates
+        for _, row in df.iterrows():
+            start_date = _parse_single_date(row.get(start_col))
+            end_date = _parse_single_date(row.get(end_col))
+            
+            if start_date and end_date:
+                # Ensure start <= end
+                if start_date > end_date:
+                    start_date, end_date = end_date, start_date
+                
+                segments.append({'start': start_date, 'end': end_date})
+        
+        return segments
+        
+    except Exception as e:
+        print(f"Error parsing filter CSV: {e}")
+        return []
+
 
 
 

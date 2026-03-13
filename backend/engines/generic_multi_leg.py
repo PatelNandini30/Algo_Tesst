@@ -399,6 +399,28 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
         print(f"STR Filter ON: {str_config_value}, {len(str_segments)} segments loaded")
     else:
         print("STR Filter OFF")
+    
+    # NEW: Date Range Filter
+    filter_config = params.get('filter_config', None)
+    filter_segments_custom = params.get('filter_segments', [])
+    
+    filter_enabled = filter_config is not None and filter_config != ''
+    filter_segments = []
+    if filter_enabled:
+        try:
+            from base import get_filter_segments
+            if filter_config == 'custom':
+                filter_segments = filter_segments_custom
+                print(f"Custom Filter ON: {len(filter_segments)} segments")
+            else:
+                filter_segments = get_filter_segments(filter_config)
+                print(f"Filter ON: {filter_config}, {len(filter_segments)} segments")
+        except Exception as e:
+            print(f"Warning: Error loading filter segments: {e}")
+            filter_enabled = False
+            filter_segments = []
+    else:
+        print("Filter OFF")
 
     # ========== PHASE 1: BULK LOAD DATA INTO MEMORY ==========
     print("⚡ PHASE 1: Bulk loading data into memory...")
@@ -459,6 +481,24 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                         f"{pd.Timestamp(active_segment['start']).strftime('%d-%m-%Y')} -> "
                         f"{pd.Timestamp(active_segment['end']).strftime('%d-%m-%Y')}"
                     )
+                
+                # NEW: Date Range Filter entry check
+                if filter_enabled and filter_segments:
+                    entry_ts = current_entry
+                    within_filter = False
+                    active_filter_segment = None
+                    
+                    for seg in filter_segments:
+                        seg_start = pd.Timestamp(seg['start'])
+                        seg_end = pd.Timestamp(seg['end'])
+                        if seg_start <= entry_ts <= seg_end:
+                            within_filter = True
+                            active_filter_segment = seg
+                            break
+                    
+                    if not within_filter:
+                        print(f"Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside filter segments")
+                        break
 
                 # Expiry for this trade/roll
                 trade_curr_expiry = _get_next_weekly_expiry_after(weekly_exp, current_entry)
@@ -484,6 +524,17 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                             break
                         effective_to_date = pd.Timestamp(last_trade_day)
                         exit_reason = "STR_Exit"
+                
+                # NEW: Date Range Filter exit adjustment
+                if filter_enabled and active_filter_segment is not None:
+                    filter_end = pd.Timestamp(active_filter_segment['end'])
+                    if filter_end < pd.Timestamp(effective_to_date):
+                        # Filter ends before the current effective exit
+                        last_trade_day = _get_last_trading_day_on_or_before(spot_df, filter_end)
+                        if last_trade_day is not None:
+                            effective_to_date = pd.Timestamp(last_trade_day)
+                            if exit_reason == "Expiry":
+                                exit_reason = "FILTER_END"
 
                 entry_row = spot_df[spot_df["Date"] == current_entry]
                 exit_row = spot_df[spot_df["Date"] == effective_to_date]

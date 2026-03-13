@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Response, Header
+from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
@@ -126,6 +126,96 @@ async def clear_cache():
     """Clear the backtest cache"""
     backtest_cache._cache.clear()
     return {"message": "Cache cleared"}
+
+
+@router.post("/upload-filter-csv")
+async def upload_filter_csv(file: UploadFile = File(...)):
+    """
+    Upload and parse a CSV file for filter segments.
+    Returns parsed segments (start_date, end_date) for use in backtest.
+    
+    Supports:
+    - Column formats: start_date/end_date OR entry_date/exit_date
+    - Date formats: All common formats (dd-mm-yyyy, mm/dd/yyyy, yyyy-mm-dd, etc.)
+    """
+    try:
+        import sys, os
+        _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _base_dir not in sys.path:
+            sys.path.insert(0, _base_dir)
+        from base import parse_filter_csv
+        
+        # Read file content
+        content = await file.read()
+        csv_content = content.decode('utf-8')
+        
+        # Parse CSV
+        segments = parse_filter_csv(csv_content)
+        
+        if not segments:
+            return {
+                "success": False,
+                "message": "No valid date ranges found in CSV. Please check the format.",
+                "segments": []
+            }
+        
+        # Convert dates to strings for JSON response
+        segments_str = [
+            {
+                "start": seg["start"].strftime("%Y-%m-%d") if seg["start"] else None,
+                "end": seg["end"].strftime("%Y-%m-%d") if seg["end"] else None
+            }
+            for seg in segments
+        ]
+        
+        return {
+            "success": True,
+            "message": f"Loaded {len(segments)} filter segments",
+            "segments": segments_str,
+            "count": len(segments)
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error parsing CSV: {str(e)}",
+            "segments": []
+        }
+
+
+@router.get("/filter-segments")
+async def get_filter_segments():
+    """
+    Get available filter segment counts.
+    Returns count of segments for each filter type.
+    """
+    try:
+        import sys, os
+        _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if _base_dir not in sys.path:
+            sys.path.insert(0, _base_dir)
+        from base import get_filter_segment_counts, load_super_trend_dates
+        
+        # Ensure STR data is loaded
+        load_super_trend_dates()
+        
+        counts = get_filter_segment_counts()
+        
+        return {
+            "success": True,
+            "filters": {
+                "5x1": {"count": counts.get("5x1", 0), "label": "STR 5,1"},
+                "5x2": {"count": counts.get("5x2", 0), "label": "STR 5,2"},
+                "base2": {"count": counts.get("base2", 0), "label": "base2"}
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e),
+            "filters": {}
+        }
 
 
 @router.get("/backtest/str-segments")
@@ -661,6 +751,8 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             'overall_target_type': params.get('overall_target_type'),
             'overall_target_value': params.get('overall_target_value'),
             'square_off_mode': square_off_mode,
+            'filter_config': params.get('filter_config'),
+            'filter_segments': params.get('filter_segments', []),
         }
         
         try:
@@ -677,6 +769,13 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
     # Default to generic_multi_leg
     # print("\n✓ Using generic_multi_leg engine\n")
     params["strategy"] = strategy_def
+    
+    # Add filter params if provided
+    if 'filter_config' not in params:
+        params['filter_config'] = params.get('filter', None)
+    if 'filter_segments' not in params:
+        params['filter_segments'] = params.get('filter_segments', [])
+    
     try:
         result = run_generic_multi_leg(params)
     finally:

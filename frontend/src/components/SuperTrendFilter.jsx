@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, Loader2, Info } from 'lucide-react';
+import { ChevronDown, Loader2, Info, Upload, FileText, X } from 'lucide-react';
 import Toggle from './ui/Toggle';
 import { STR_FILTER_OPTIONS } from './constants';
 
@@ -13,26 +13,15 @@ const parseSegments = (rawSegments = []) => {
     .sort((a, b) => a.start - b.start);
 };
 
-const intersectSegments = (aSegments, bSegments) => {
-  const result = [];
-  let i = 0;
-  let j = 0;
-  while (i < aSegments.length && j < bSegments.length) {
-    const start = new Date(Math.max(aSegments[i].start, bSegments[j].start));
-    const end = new Date(Math.min(aSegments[i].end, bSegments[j].end));
-    if (start <= end) {
-      result.push({ start, end });
-    }
-    if (aSegments[i].end < bSegments[j].end) i += 1;
-    else j += 1;
-  }
-  return result;
-};
-
 const formatDate = (date) => {
   if (!date) return '';
   const iso = date.toISOString().split('T')[0];
   return iso;
+};
+
+const formatDateDisplay = (date) => {
+  if (!date) return '';
+  return date.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' });
 };
 
 const SkeletonLine = () => (
@@ -46,6 +35,10 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [csvUploading, setCsvUploading] = useState(false);
+  const [csvFileName, setCsvFileName] = useState('');
+  const [customSegments, setCustomSegments] = useState([]);
+  const fileInputRef = useRef(null);
   const dropdownRef = useRef(null);
 
   const selectedOption = useMemo(
@@ -78,6 +71,58 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
     };
   };
 
+  // Handle CSV file upload
+  const handleCsvUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setCsvUploading(true);
+    setCsvFileName(file.name);
+    setError('');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const res = await fetch('/api/upload-filter-csv', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await res.json();
+
+      if (!data.success) {
+        throw new Error(data.message || 'Failed to parse CSV');
+      }
+
+      const parsed = parseSegments(data.segments || []);
+      setCustomSegments(parsed);
+      setSegments(parsed);
+      const summaryPayload = summarize(parsed);
+      setSummary(summaryPayload);
+
+      // Auto-select custom when CSV is uploaded
+      setSelected('custom');
+
+      onFilterChange?.({
+        enabled: true,
+        configId: 'custom',
+        configLabel: 'Custom CSV',
+        summary: summaryPayload,
+        segments: data.segments || [],
+      });
+    } catch (err) {
+      setError(err.message || 'Failed to upload CSV');
+      setCustomSegments([]);
+    } finally {
+      setCsvUploading(false);
+      // Reset file input
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
   useEffect(() => {
     if (!enabled) {
       setSummary(null);
@@ -87,6 +132,21 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
         configId: selected,
         configLabel: selectedOption.label,
         summary: null,
+        segments: [],
+      });
+      return;
+    }
+
+    // If custom is selected and we have custom segments, use them
+    if (selected === 'custom' && customSegments.length > 0) {
+      const summaryPayload = summarize(customSegments);
+      setSummary(summaryPayload);
+      onFilterChange?.({
+        enabled: true,
+        configId: 'custom',
+        configLabel: 'Custom CSV',
+        summary: summaryPayload,
+        segments: customSegments.map(s => ({ start: formatDate(s.start), end: formatDate(s.end) })),
       });
       return;
     }
@@ -95,45 +155,29 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
       setLoading(true);
       setError('');
       try {
-        if (selected === 'both') {
-          const [aRes, bRes] = await Promise.all([
-            fetch('/api/str-segments?config=5x1'),
-            fetch('/api/str-segments?config=5x2'),
-          ]);
-          if (!aRes.ok || !bRes.ok) {
-            throw new Error('Unable to load STR segments');
-          }
-          const aJson = await aRes.json();
-          const bJson = await bRes.json();
-          const aSegments = parseSegments(aJson?.['5x1'] ?? []);
-          const bSegments = parseSegments(bJson?.['5x2'] ?? []);
-          const intersected = intersectSegments(aSegments, bSegments);
-          setSegments(intersected);
-          const summaryPayload = summarize(intersected);
-          setSummary(summaryPayload);
-          onFilterChange?.({
-            enabled: true,
-            configId: 'both',
-            configLabel: selectedOption.label,
-            summary: summaryPayload,
-          });
-        } else {
-          const res = await fetch(`/api/str-segments?config=${selected}`);
-          if (!res.ok) throw new Error('Unable to load STR segments');
-          const data = await res.json();
-          const parsed = parseSegments(data?.[selected] ?? []);
-          setSegments(parsed);
-          const summaryPayload = summarize(parsed);
-          setSummary(summaryPayload);
-          onFilterChange?.({
-            enabled: true,
-            configId: selected,
-            configLabel: selectedOption.label,
-            summary: summaryPayload,
-          });
-        }
+        // Fetch filter counts
+        const res = await fetch('/api/filter-segments');
+        const data = await res.json();
+
+        // Use the filter config directly (5x1, 5x2, base2)
+        const filterRes = await fetch(`/api/str-segments?config=${selected}`);
+        if (!filterRes.ok) throw new Error('Unable to load filter segments');
+        
+        const filterData = await filterRes.json();
+        const parsed = parseSegments(filterData?.[selected] ?? []);
+        setSegments(parsed);
+        const summaryPayload = summarize(parsed);
+        setSummary(summaryPayload);
+
+        onFilterChange?.({
+          enabled: true,
+          configId: selected,
+          configLabel: selectedOption.label,
+          summary: summaryPayload,
+          segments: parsed.map(s => ({ start: formatDate(s.start), end: formatDate(s.end) })),
+        });
       } catch (err) {
-        setError(err.message || 'Failed to load STR segments.');
+        setError(err.message || 'Failed to load filter segments.');
         setSegments([]);
         setSummary(null);
         onFilterChange?.({
@@ -141,6 +185,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
           configId: selected,
           configLabel: selectedOption.label,
           summary: null,
+          segments: [],
         });
       } finally {
         setLoading(false);
@@ -148,26 +193,72 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
     };
 
     fetchSegments();
-  }, [enabled, selected, selectedOption.label, onFilterChange]);
+  }, [enabled, selected, selectedOption.label, customSegments, onFilterChange]);
 
   const badgeText = summary
-    ? `${summary.count} segments | ${formatDate(summary.range.from)} to ${formatDate(summary.range.to)}`
+    ? `${summary.count} segments | ${formatDateDisplay(summary.range.from)} to ${formatDateDisplay(summary.range.to)}`
     : 'No segments loaded yet';
 
   return (
-    <div className="bg-white shadow-sm border border-gray-200 rounded-xl p-4 space-y-4" style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+    <div className="bg-white shadow-sm border border-gray-200 rounded-xl p-4 space-y-3" style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-xs font-semibold uppercase tracking-widest text-gray-600 border-l-4 border-blue-600 pl-2">
-            SuperTrend Filter
+            Filter
           </span>
-          <Info size={14} className="text-gray-400" />
         </div>
         <Toggle enabled={enabled} onToggle={onToggle} size="sm" />
       </div>
 
+      {/* CSV Upload Button - Always visible when enabled */}
+      {enabled && (
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv"
+            onChange={handleCsvUpload}
+            className="hidden"
+            id="filter-csv-upload"
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={csvUploading}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-50"
+          >
+            {csvUploading ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Upload className="w-3.5 h-3.5" />
+            )}
+            Upload CSV
+          </button>
+          {csvFileName && (
+            <span className="flex items-center gap-1 text-xs text-green-600">
+              <FileText className="w-3 h-3" />
+              {csvFileName}
+              <button
+                type="button"
+                onClick={() => {
+                  setCsvFileName('');
+                  setCustomSegments([]);
+                  setSegments([]);
+                  setSummary(null);
+                }}
+                className="ml-1 hover:text-red-600"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          )}
+        </div>
+      )}
+
       {enabled && (
         <div className="space-y-3">
+          {/* Dropdown */}
           <div ref={dropdownRef} className="relative">
             <button
               type="button"
@@ -198,6 +289,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
             )}
           </div>
 
+          {/* Loading / Segments Display */}
           {loading ? (
             <div className="space-y-2">
               <div className="flex items-center gap-3 text-xs text-gray-500">
@@ -211,9 +303,6 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
               <span className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700 shadow-sm">
                 {badgeText}
               </span>
-              {summary && (
-                <span className="text-xs text-blue-500">Preview range enforced in results</span>
-              )}
             </div>
           )}
           {error && (
@@ -221,6 +310,20 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
           )}
         </div>
       )}
+
+      {/* Exit Rule Reminder - Always visible */}
+      <div className="pt-2 border-t border-gray-100">
+        <div className="flex items-center gap-1 text-xs text-gray-500">
+          <span className="font-medium">Exit:</span>
+          <span className="px-1.5 py-0.5 bg-red-50 text-red-600 rounded">SL</span>
+          <span>·</span>
+          <span className="px-1.5 py-0.5 bg-green-50 text-green-600 rounded">Target</span>
+          <span>·</span>
+          <span className="px-1.5 py-0.5 bg-orange-50 text-orange-600 rounded">Filter End</span>
+          <span>·</span>
+          <span className="px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded">Expiry</span>
+        </div>
+      </div>
     </div>
   );
 };

@@ -1109,6 +1109,45 @@ def run_algotest_backtest(params):
     else:
         _log("STR Filter OFF")
     
+    # ── NEW: Date Range Filter ──────────────────────────────────────────────────────
+    # filter_config: '5x1', '5x2', 'base2', 'custom', or None (disabled)
+    # filter_segments: list of {start, end} for custom CSV
+    filter_config = params.get('filter_config', None)
+    filter_segments_custom = params.get('filter_segments', [])
+    
+    filter_enabled = filter_config is not None and filter_config != ''
+    filter_segments = []
+    if filter_enabled:
+        # Import filter functions
+        try:
+            from base import get_filter_segments
+            if filter_config == 'custom':
+                # Use custom segments from CSV upload
+                filter_segments = filter_segments_custom
+                _log(f"Custom Filter ON: {len(filter_segments)} segments")
+            else:
+                # Use built-in filter (5x1, 5x2, base2)
+                filter_segments = get_filter_segments(filter_config)
+                _log(f"Filter ON: {filter_config}, segments={len(filter_segments)}")
+        except Exception as e:
+            _log(f"Warning: Error loading filter segments: {e}")
+            filter_enabled = False
+            filter_segments = []
+    else:
+        _log("Filter OFF")
+    
+    # Convert filter segments to timestamps for comparison
+    filter_segments_ts = []
+    if filter_enabled and filter_segments:
+        for seg in filter_segments:
+            try:
+                start = pd.Timestamp(seg['start'])
+                end = pd.Timestamp(seg['end'])
+                filter_segments_ts.append({'start': start, 'end': end})
+            except:
+                pass
+        _log(f"Filter segments loaded: {len(filter_segments_ts)}")
+    
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
     #   'max_loss'           → overall_sl_value is a fixed ₹ amount
@@ -1285,6 +1324,45 @@ def run_algotest_backtest(params):
                     _log(f"  STR exit adjusted: {exit_date}")
                 else:
                     base_exit_reason = 'Expiry'
+            
+            # ===== NEW: DATE RANGE FILTER ENTRY/EXIT =====
+            filter_exit_reason = None
+            if filter_enabled and filter_segments_ts:
+                # Check if entry is within any filter segment
+                entry_ts = pd.Timestamp(entry_date)
+                within_filter = False
+                active_segment = None
+                
+                for seg in filter_segments_ts:
+                    if seg['start'] <= entry_ts <= seg['end']:
+                        within_filter = True
+                        active_segment = seg
+                        break
+                
+                if not within_filter:
+                    _log(f"  Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
+                    continue
+                
+                # Calculate filter-adjusted exit
+                # Exit = min(expiry, filter_end, SL_hit, Target_hit)
+                # But SL/Target handled separately during trade
+                # Here we just set the max exit based on filter
+                filter_end_ts = active_segment['end']
+                expiry_ts = pd.Timestamp(expiry_date)
+                
+                # If filter ends before expiry, adjust exit
+                if filter_end_ts < expiry_ts:
+                    # Find last trading day on or before filter end
+                    filter_exit = _last_trading_day_on_or_before(trading_calendar, filter_end_ts)
+                    if filter_exit and pd.Timestamp(filter_exit) >= entry_ts:
+                        # Update exit date to filter end
+                        # But base_exit_reason stays same - SL/Target still takes priority
+                        _log(f"  Filter: exit adjusted to filter end {filter_exit.strftime('%Y-%m-%d') if hasattr(filter_exit, 'strftime') else filter_exit}")
+                        filter_exit_reason = 'FILTER_END'
+                    else:
+                        # Filter ends before entry - shouldn't happen but skip just in case
+                        _log(f"  Filter skip: filter ends before valid exit")
+                        continue
             
             # ========== STEP 7: GET ENTRY SPOT PRICE ==========
             # Get spot from database (use index price at entry_date)
