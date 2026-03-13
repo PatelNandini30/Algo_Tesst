@@ -123,7 +123,28 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
     }
   };
 
+  const prevFilterChangeRef = useRef(null);
+
   useEffect(() => {
+    // Prevent infinite loop by tracking if we already called onFilterChange
+    const filterState = {
+      enabled,
+      configId: selected,
+      configLabel: selectedOption.label,
+      segments: selected === 'custom' && customSegments.length > 0 
+        ? customSegments.map(s => ({ start: formatDate(s.start), end: formatDate(s.end) }))
+        : segments.map(s => ({ start: formatDate(s.start), end: formatDate(s.end) })),
+    };
+    
+    const prevState = prevFilterChangeRef.current;
+    const stateChanged = !prevState || 
+      prevState.enabled !== filterState.enabled || 
+      prevState.configId !== filterState.configId;
+    
+    prevFilterChangeRef.current = filterState;
+    
+    if (!stateChanged) return;
+    
     if (!enabled) {
       setSummary(null);
       setSegments([]);
@@ -193,7 +214,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
     };
 
     fetchSegments();
-  }, [enabled, selected, selectedOption.label, customSegments, onFilterChange]);
+  }, [enabled, selected, selectedOption.label, customSegments, segments]);
 
   const badgeText = summary
     ? `${summary.count} segments | ${formatDateDisplay(summary.range.from)} to ${formatDateDisplay(summary.range.to)}`
