@@ -120,8 +120,9 @@ const StrategyBuilder = () => {
   const [strFilter, setStrFilter] = useState({
     enabled: false,
     configId: '5x1',
-    configLabel: 'STR 5x1',
+    configLabel: 'STR 5,1',
     summary: null,
+    segments: [],
   });
   const [startDate, setStartDate] = useState('2025-02-20');
   const [endDate, setEndDate] = useState('2026-02-20');
