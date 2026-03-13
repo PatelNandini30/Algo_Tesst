@@ -6,3 +6,4 @@ echo Starting server...
 cd backend
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 @REM npm run dev -- --host
+@REM docker exec -it algotest-postgres psql -U algotest -d algotest
