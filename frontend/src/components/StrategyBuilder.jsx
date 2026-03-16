@@ -344,7 +344,7 @@ const StrategyBuilder = () => {
         const data = await res.json();
         setResults(data);
         if (strFilter.enabled && Array.isArray(data?.trades) && data.trades.length === 0) {
-          setError('No trades matched the SuperTrend filter for this date range. Try switching to STR 52 or adjusting the date range.');
+          setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
         }
       }
       else { const e = await res.json(); setError(e.detail || 'Backtest failed'); }

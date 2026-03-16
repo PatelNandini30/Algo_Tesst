@@ -186,35 +186,84 @@ async def upload_filter_csv(file: UploadFile = File(...)):
 @router.get("/filter-segments")
 async def get_filter_segments():
     """
-    Get available filter segment counts.
-    Returns count of segments for each filter type.
+    Get available filter segment metadata for each built-in filter.
+    Returns count, range, preview rows and the serialized segments for STR 5x1, 5x2 and base2.
     """
     try:
         import sys, os
         _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if _base_dir not in sys.path:
             sys.path.insert(0, _base_dir)
-        from base import get_filter_segment_counts, load_super_trend_dates
-        
-        # Ensure STR data is loaded
+        from base import (
+            get_filter_segments as base_get_filter_segments,
+            load_super_trend_dates,
+        )
+
+        # Ensure STR segments are loaded into memory so counts/range are accurate
         load_super_trend_dates()
-        
-        counts = get_filter_segment_counts()
-        
-        return {
-            "success": True,
-            "filters": {
-                "5x1": {"count": counts.get("5x1", 0), "label": "STR 5,1"},
-                "5x2": {"count": counts.get("5x2", 0), "label": "STR 5,2"},
-                "base2": {"count": counts.get("base2", 0), "label": "base2"}
+
+        filter_configs = [
+            ("5x1", "STR 5,1"),
+            ("5x2", "STR 5,2"),
+            ("base2", "base2"),
+        ]
+
+        filters = {}
+
+        def _serialize_segments(segments):
+            serialized = []
+            for seg in segments:
+                start = seg.get("start")
+                end = seg.get("end")
+                if not start or not end:
+                    continue
+                try:
+                    start_iso = start.strftime("%Y-%m-%d")
+                except Exception:
+                    start_iso = str(start)
+                try:
+                    end_iso = end.strftime("%Y-%m-%d")
+                except Exception:
+                    end_iso = str(end)
+                serialized.append({"start": start_iso, "end": end_iso})
+            return serialized
+
+        def _range_from_segments(serialized):
+            if not serialized:
+                return None
+            starts = [s["start"] for s in serialized]
+            ends = [s["end"] for s in serialized]
+            return {
+                "from": min(starts),
+                "to": max(ends),
             }
-        }
-        
+
+        for config_key, label in filter_configs:
+            segments = base_get_filter_segments(config_key)
+            serialized_segments = _serialize_segments(segments)
+            summary_range = _range_from_segments(serialized_segments)
+            display_range = None
+            if config_key == "base2":
+                display_range = "Full DB date range (engine resolves)"
+
+            filters[config_key] = {
+                "label": label,
+                "count": len(serialized_segments),
+                "segments": serialized_segments,
+                "preview": serialized_segments[:5],
+                "range": summary_range,
+                "display_range": display_range,
+            }
+
+        return {"success": True, "filters": filters}
+
     except Exception as e:
+        import traceback
         return {
             "success": False,
             "message": str(e),
-            "filters": {}
+            "filters": {},
+            "traceback": traceback.format_exc(),
         }
 
 
