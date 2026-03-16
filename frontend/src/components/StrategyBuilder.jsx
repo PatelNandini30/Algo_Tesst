@@ -334,7 +334,7 @@ const StrategyBuilder = () => {
 
     setLoading(true); setError(null);
     try {
-      const res = await fetch('/api/dynamic-backtest', {
+      const res = await fetch('/api/algotest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildPayload()),
