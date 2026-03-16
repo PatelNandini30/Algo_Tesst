@@ -132,6 +132,29 @@ const StrategyBuilder = () => {
   const [validationError, setValidationError] = useState(null);
   const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
 
+  const formatSummaryDateInput = (value) => {
+    if (!value) return null;
+    const parsed = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(parsed.getTime())) return null;
+    return parsed.toISOString().slice(0, 10);
+  };
+
+  useEffect(() => {
+    if (!strFilter.enabled || !strFilter.summary?.range) return;
+    const proposedStart = formatSummaryDateInput(strFilter.summary.range.from);
+    const proposedEnd = formatSummaryDateInput(strFilter.summary.range.to);
+    if (!proposedStart || !proposedEnd) return;
+    if (startDate === proposedStart && endDate === proposedEnd) return;
+    setStartDate(proposedStart);
+    setEndDate(proposedEnd);
+  }, [
+    strFilter.enabled,
+    strFilter.summary?.range?.from,
+    strFilter.summary?.range?.to,
+    startDate,
+    endDate,
+  ]);
+
   // Memoize static derived values so they don't rebuild on every keystroke
   const daysOptions = useMemo(
     () => expiryBasis === 'weekly' ? [0, 1, 2, 3, 4] : Array.from({ length: 25 }, (_, i) => i),
