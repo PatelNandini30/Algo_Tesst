@@ -1122,7 +1122,7 @@ def run_algotest_backtest(params):
     if filter_enabled:
         # Import filter functions
         try:
-            from base import get_filter_segments
+            from base import get_filter_segments, fmt_ddmmyyyy
             if filter_config == 'custom':
                 # Use custom segments from CSV upload
                 filter_segments = filter_segments_custom
@@ -1742,17 +1742,17 @@ def run_algotest_backtest(params):
             # ========== STEP 11: RECORD TRADE ==========
             # Log detailed exit information
             print(f"\n{'='*70}")
-            print(f"TRADE SUMMARY - Entry: {entry_date.strftime('%Y-%m-%d')}")
+            print(f"TRADE SUMMARY - Entry: {entry_date.strftime('%d-%m-%Y')}")
             print(f"{'='*70}")
             for li, tleg in enumerate(trade_legs):
                 leg_exit = per_leg_results[li] if per_leg_results else None
                 if leg_exit and leg_exit.get('triggered'):
-                    print(f"  Leg {li+1}: EXIT on {leg_exit['exit_date'].strftime('%Y-%m-%d')} "
+                    print(f"  Leg {li+1}: EXIT on {leg_exit['exit_date'].strftime('%d-%m-%Y')} "
                           f"- Reason: {leg_exit['exit_reason']} - P&L: ₹{tleg['pnl']:,.2f}")
                 else:
-                    print(f"  Leg {li+1}: EXIT on {exit_date.strftime('%Y-%m-%d')} "
+                    print(f"  Leg {li+1}: EXIT on {exit_date.strftime('%d-%m-%Y')} "
                           f"- Reason: SCHEDULED - P&L: ₹{tleg['pnl']:,.2f}")
-            print(f"  Trade Exit Date: {actual_exit_date.strftime('%Y-%m-%d')}")
+            print(f"  Trade Exit Date: {actual_exit_date.strftime('%d-%m-%Y')}")
             print(f"  Total P&L: ₹{total_pnl:,.2f}")
             print(f"{'='*70}\n")
             

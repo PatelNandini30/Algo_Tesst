@@ -11,6 +11,23 @@ from typing import Tuple, Optional, Dict, Any
 from database import ALLOW_CSV_FALLBACK, get_data_source, engine as db_engine, DATA_DIR
 from repositories.market_data_repository import MarketDataRepository
 
+# Date formatting utility
+def fmt_ddmmyyyy(date_obj) -> str:
+    """Format date as ddmmyyyy (e.g., 21022025)"""
+    if date_obj is None:
+        return ""
+    if hasattr(date_obj, 'strftime'):
+        return date_obj.strftime('%d%m%Y')
+    return str(date_obj)
+
+def fmt_dd_mm_yyyy(date_obj) -> str:
+    """Format date as dd-mm-yyyy (e.g., 21-02-2025)"""
+    if date_obj is None:
+        return ""
+    if hasattr(date_obj, 'strftime'):
+        return date_obj.strftime('%d-%m-%Y')
+    return str(date_obj)
+
 # Thread pool for async file I/O
 _executor = ThreadPoolExecutor(max_workers=4)
 
