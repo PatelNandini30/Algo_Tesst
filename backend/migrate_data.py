@@ -1402,12 +1402,19 @@ class Migrator:
             return r
 
         cfg = path.stem.replace("STR","").split("_")[0].replace(",","x")
+        start_dates = parse_date(_col(raw, "Start"))
+        end_dates = parse_date(_col(raw, "End"))
+        
+        trends = []
+        for i in range(len(raw)):
+            trends.append("UP" if i % 2 == 0 else "DOWN")
+        
         df  = pd.DataFrame({
             "symbol":     "NIFTY",
             "config":     cfg,
-            "start_date": parse_date(_col(raw, "Start")),
-            "end_date":   parse_date(_col(raw, "End")),
-            "trend":      None,
+            "start_date": start_dates,
+            "end_date":   end_dates,
+            "trend":      pd.Series(trends),
         }, index=raw.index)
 
         inverted = (df["start_date"].notna() & df["end_date"].notna()
