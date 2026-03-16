@@ -89,6 +89,30 @@ services:
     networks:
       - algotest-network
 
+  # Celery Worker for background tasks
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: algotest-worker
+    command: celery -A worker.celery worker -l info -c 2
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+    volumes:
+      - ./cleaned_csvs:/data/cleaned_csvs:ro
+      - ./expiryData:/data/expiryData:ro
+      - ./strikeData:/data/strikeData:ro
+      - ./Filter:/data/Filter:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - algotest-network
+
   # Frontend - served via nginx which proxies /api to backend
   frontend:
     build:
