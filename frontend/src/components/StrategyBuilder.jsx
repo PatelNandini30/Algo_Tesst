@@ -1,9 +1,30 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2 } from 'lucide-react';
+import { format, parse } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import CsvUpload from './CsvUpload';
 import SuperTrendFilter from './SuperTrendFilter';
 import Toggle from './ui/Toggle';
+
+// Format date for display (DD/MM/YYYY)
+const formatDateDisplay = (dateStr) => {
+  if (!dateStr) return '';
+  try {
+    return format(new Date(dateStr), 'dd/MM/yyyy');
+  } catch {
+    return dateStr;
+  }
+};
+
+// Parse DD/MM/YYYY to YYYY-MM-DD for input
+const parseDateInput = (displayStr) => {
+  if (!displayStr) return '';
+  try {
+    return format(parse(displayStr, 'dd/MM/yyyy', new Date()), 'yyyy-MM-dd');
+  } catch {
+    return displayStr;
+  }
+};
 
 const getLotSize = (index, tradeDate) => {
   const d = new Date(tradeDate);
@@ -1053,19 +1074,44 @@ const StrategyBuilder = () => {
               <div className="flex items-center gap-2">
                 <label className="text-xs text-gray-600">Start Date</label>
                 <input
-                  type="date"
-                  value={startDate}
-                  onChange={e => setStartDate(e.target.value)}
-                  className="h-8 px-2 border border-gray-300 rounded text-xs"
+                  type="text"
+                  placeholder="DD/MM/YYYY"
+                  value={formatDateDisplay(startDate)}
+                  onChange={e => {
+                    const parsed = parseDateInput(e.target.value);
+                    if (parsed) setStartDate(parsed);
+                  }}
+                  onBlur={e => {
+                    // Auto-format on blur
+                    if (e.target.value && !e.target.value.includes('/')) {
+                      const d = new Date(e.target.value);
+                      if (!isNaN(d.getTime())) {
+                        setStartDate(format(d, 'yyyy-MM-dd'));
+                      }
+                    }
+                  }}
+                  className="h-8 px-2 border border-gray-300 rounded text-xs w-28"
                 />
               </div>
               <div className="flex items-center gap-2">
                 <label className="text-xs text-gray-600">End Date</label>
                 <input
-                  type="date"
-                  value={endDate}
-                  onChange={e => setEndDate(e.target.value)}
-                  className="h-8 px-2 border border-gray-300 rounded text-xs"
+                  type="text"
+                  placeholder="DD/MM/YYYY"
+                  value={formatDateDisplay(endDate)}
+                  onChange={e => {
+                    const parsed = parseDateInput(e.target.value);
+                    if (parsed) setEndDate(parsed);
+                  }}
+                  onBlur={e => {
+                    if (e.target.value && !e.target.value.includes('/')) {
+                      const d = new Date(e.target.value);
+                      if (!isNaN(d.getTime())) {
+                        setEndDate(format(d, 'yyyy-MM-dd'));
+                      }
+                    }
+                  }}
+                  className="h-8 px-2 border border-gray-300 rounded text-xs w-28"
                 />
               </div>
             </div>
