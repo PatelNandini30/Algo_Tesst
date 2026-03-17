@@ -1908,7 +1908,7 @@ async def run_algotest_backtest_endpoint(request: dict):
             return obj
         
         def format_dates_in_trades(trades):
-            """Convert dates to DD/MM/YYYY format"""
+            """Convert dates to YYYY-MM-DD format"""
             date_fields = ['Entry Date', 'Exit Date', 'date', 'expiry_date', 'Entry Date ', 'Exit Date ']
             for trade in trades:
                 for key, value in trade.items():
@@ -1916,10 +1916,10 @@ async def run_algotest_backtest_endpoint(request: dict):
                         continue
                     # Check if it's a date-like value
                     if hasattr(value, 'strftime'):  # pandas Timestamp
-                        trade[key] = value.strftime('%d/%m/%Y')
+                        trade[key] = value.strftime('%Y-%m-%d')
                     elif isinstance(value, str) and 'T' in value:  # ISO string
                         try:
-                            trade[key] = pd.to_datetime(value).strftime('%d/%m/%Y')
+                            trade[key] = pd.to_datetime(value).strftime('%Y-%m-%d')
                         except:
                             pass
             return trades

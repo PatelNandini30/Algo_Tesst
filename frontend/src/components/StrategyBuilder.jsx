@@ -1,30 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2 } from 'lucide-react';
-import { format, parse } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import CsvUpload from './CsvUpload';
 import SuperTrendFilter from './SuperTrendFilter';
 import Toggle from './ui/Toggle';
-
-// Format date for display (DD/MM/YYYY)
-const formatDateDisplay = (dateStr) => {
-  if (!dateStr) return '';
-  try {
-    return format(new Date(dateStr), 'dd/MM/yyyy');
-  } catch {
-    return dateStr;
-  }
-};
-
-// Parse DD/MM/YYYY to YYYY-MM-DD for input
-const parseDateInput = (displayStr) => {
-  if (!displayStr) return '';
-  try {
-    return format(parse(displayStr, 'dd/MM/yyyy', new Date()), 'yyyy-MM-dd');
-  } catch {
-    return displayStr;
-  }
-};
 
 const getLotSize = (index, tradeDate) => {
   const d = new Date(tradeDate);
@@ -152,8 +131,6 @@ const StrategyBuilder = () => {
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
   const [elapsed, setElapsed] = useState(0);
-  const [startDateInput, setStartDateInput] = useState('');
-  const [endDateInput, setEndDateInput] = useState('');
   const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
 
   // Warm cache on date change - pre-loads data before user clicks Run
@@ -173,12 +150,6 @@ const StrategyBuilder = () => {
     const t = setInterval(() => setElapsed(s => s + 1), 1000);
     return () => clearInterval(t);
   }, [loading]);
-
-  // Sync display inputs with actual date values
-  useEffect(() => {
-    setStartDateInput(formatDateDisplay(startDate));
-    setEndDateInput(formatDateDisplay(endDate));
-  }, [startDate, endDate]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
@@ -1082,57 +1053,19 @@ const StrategyBuilder = () => {
               <div className="flex items-center gap-2">
                 <label className="text-xs text-gray-600">Start Date</label>
                 <input
-                  type="text"
-                  placeholder="DD/MM/YYYY"
-                  value={startDateInput}
-                  onChange={e => setStartDateInput(e.target.value)}
-                  onBlur={e => {
-                    const parsed = parseDateInput(e.target.value);
-                    if (parsed) {
-                      setStartDate(parsed);
-                    } else {
-                      setStartDateInput(formatDateDisplay(startDate));
-                    }
-                  }}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') {
-                      const parsed = parseDateInput(e.target.value);
-                      if (parsed) {
-                        setStartDate(parsed);
-                      } else {
-                        setStartDateInput(formatDateDisplay(startDate));
-                      }
-                    }
-                  }}
-                  className="h-8 px-2 border border-gray-300 rounded text-xs w-28"
+                  type="date"
+                  value={startDate}
+                  onChange={e => setStartDate(e.target.value)}
+                  className="h-8 px-2 border border-gray-300 rounded text-xs"
                 />
               </div>
               <div className="flex items-center gap-2">
                 <label className="text-xs text-gray-600">End Date</label>
                 <input
-                  type="text"
-                  placeholder="DD/MM/YYYY"
-                  value={endDateInput}
-                  onChange={e => setEndDateInput(e.target.value)}
-                  onBlur={e => {
-                    const parsed = parseDateInput(e.target.value);
-                    if (parsed) {
-                      setEndDate(parsed);
-                    } else {
-                      setEndDateInput(formatDateDisplay(endDate));
-                    }
-                  }}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') {
-                      const parsed = parseDateInput(e.target.value);
-                      if (parsed) {
-                        setEndDate(parsed);
-                      } else {
-                        setEndDateInput(formatDateDisplay(endDate));
-                      }
-                    }
-                  }}
-                  className="h-8 px-2 border border-gray-300 rounded text-xs w-28"
+                  type="date"
+                  value={endDate}
+                  onChange={e => setEndDate(e.target.value)}
+                  className="h-8 px-2 border border-gray-300 rounded text-xs"
                 />
               </div>
             </div>
