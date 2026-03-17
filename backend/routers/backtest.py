@@ -1907,9 +1907,27 @@ async def run_algotest_backtest_endpoint(request: dict):
                 return obj.tolist()
             return obj
         
+        def format_dates_in_trades(trades):
+            """Convert dates to DD-MM-YYYY format"""
+            date_fields = ['Entry Date', 'Exit Date', 'date', 'expiry_date', 'Entry Date ', 'Exit Date ']
+            for trade in trades:
+                for key, value in trade.items():
+                    if value is None:
+                        continue
+                    # Check if it's a date-like value
+                    if hasattr(value, 'strftime'):  # pandas Timestamp
+                        trade[key] = value.strftime('%d-%m-%Y')
+                    elif isinstance(value, str) and 'T' in value:  # ISO string
+                        try:
+                            trade[key] = pd.to_datetime(value).strftime('%d-%m-%Y')
+                        except:
+                            pass
+            return trades
+        
         # Convert to JSON
         trades_json = trades_df.to_dict('records') if not trades_df.empty else []
         trades_json = convert_numpy(trades_json)
+        trades_json = format_dates_in_trades(trades_json)
         
         summary = convert_numpy(summary)
         pivot = convert_numpy(pivot)
