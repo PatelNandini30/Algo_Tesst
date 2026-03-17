@@ -105,6 +105,20 @@ def get_engine():
     return _engine
 
 
+def reset_engine():
+    """Dispose and recreate the underlying engine (used after fatal connection errors)."""
+    global _engine
+    with _engine_lock:
+        if _engine is not None:
+            try:
+                _engine.dispose()
+            except Exception as exc:
+                logger.warning(f"[DB POOL] Failed to dispose engine: {exc}")
+        _engine = _get_engine()
+        logger.warning("[DB POOL] Engine reset invoked (operational error recovery)")
+    return _engine
+
+
 # For backwards compatibility
 engine = get_engine()
 

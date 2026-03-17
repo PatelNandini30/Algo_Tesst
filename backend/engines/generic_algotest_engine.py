@@ -1127,16 +1127,19 @@ def run_algotest_backtest(params):
                 # Use custom segments from CSV upload
                 filter_segments = filter_segments_custom
                 _log(f"Custom Filter ON: {len(filter_segments)} segments")
+                print(f"FILTER: Custom segments loaded ({len(filter_segments)} ranges)")
             else:
                 # Use built-in filter (5x1, 5x2, base2)
                 filter_segments = get_filter_segments(filter_config)
                 _log(f"Filter ON: {filter_config}, segments={len(filter_segments)}")
+                print(f"FILTER: {filter_config} segments loaded ({len(filter_segments)} ranges)")
         except Exception as e:
             _log(f"Warning: Error loading filter segments: {e}")
             filter_enabled = False
             filter_segments = []
     else:
         _log("Filter OFF")
+        print("FILTER: Disabled")
     
     # Convert filter segments to timestamps for comparison
     filter_segments_ts = []
@@ -1342,15 +1345,25 @@ def run_algotest_backtest(params):
                         break
                 
                 if not within_filter:
+                    print(f"FILTER SKIP: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
                     _log(f"  Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
                     continue
-                
+               
                 # Calculate filter-adjusted exit
                 # Exit = min(expiry, filter_end, SL_hit, Target_hit)
                 # But SL/Target handled separately during trade
                 # Here we just set the max exit based on filter
                 filter_end_ts = active_segment['end']
                 expiry_ts = pd.Timestamp(expiry_date)
+                seg_start_ts = active_segment['start']
+                seg_end_ts = active_segment['end']
+                duration_days = (seg_end_ts - seg_start_ts).days + 1
+                print(
+                    "FILTER ENTRY: "
+                    f"entry {entry_ts.strftime('%Y-%m-%d')} inside "
+                    f"{seg_start_ts.strftime('%Y-%m-%d')} → {seg_end_ts.strftime('%Y-%m-%d')} "
+                    f"({duration_days}d); expiry {expiry_ts.strftime('%Y-%m-%d')}"
+                )
                 
                 # If filter ends before expiry, adjust exit
                 if filter_end_ts < expiry_ts:
@@ -1359,10 +1372,18 @@ def run_algotest_backtest(params):
                     if filter_exit and pd.Timestamp(filter_exit) >= entry_ts:
                         # Update exit date to filter end
                         # But base_exit_reason stays same - SL/Target still takes priority
+                        filter_exit_ts = pd.Timestamp(filter_exit)
+                        print(
+                            "FILTER EXIT: "
+                            f"filter end {filter_end_ts.strftime('%Y-%m-%d')} → "
+                            f"last trading day {filter_exit_ts.strftime('%Y-%m-%d')} "
+                            f"(expiry {expiry_ts.strftime('%Y-%m-%d')})"
+                        )
                         _log(f"  Filter: exit adjusted to filter end {filter_exit.strftime('%Y-%m-%d') if hasattr(filter_exit, 'strftime') else filter_exit}")
                         filter_exit_reason = 'FILTER_END'
                     else:
                         # Filter ends before entry - shouldn't happen but skip just in case
+                        print("FILTER SKIP: filter ends before valid exit")
                         _log(f"  Filter skip: filter ends before valid exit")
                         continue
             

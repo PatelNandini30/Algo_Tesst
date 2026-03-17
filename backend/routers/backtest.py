@@ -2,8 +2,12 @@ from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
+# NOTE: keep FastAPI imports at top for readability
 from engines.generic_multi_leg import run_generic_multi_leg
 from engines.generic_algotest_engine import run_algotest_backtest
+from services.algotest_job import execute_algotest_job
+from worker.tasks import run_algotest_job
+from worker.celery import celery_app
 import sys
 import os
 import pandas as pd
@@ -1809,166 +1813,46 @@ async def export_summary_post(request: dict):
 @router.post("/algotest")
 async def run_algotest_backtest_endpoint(request: dict):
     """
-    NEW ENDPOINT: AlgoTest-style backtest
-
-    Optimized with:
-    - Redis caching for results
-    - Preloaded data using optimized data loader
-    - Memory caching for frequently accessed data
+    Legacy synchronous endpoint kept for backwards compatibility.
     """
-    try:
-        from engines.generic_algotest_engine import run_algotest_backtest
-        
-        # Import new optimization services
-        try:
-            from services.backtest_cache import get_backtest_cache
-            from services.data_memory_cache import get_memory_cache
-            redis_cache = get_backtest_cache()
-            memory_cache = get_memory_cache()
-            use_redis = redis_cache.is_available()
-        except Exception as e:
-            print(f"[CACHE] Service import failed: {e}")
-            use_redis = False
-        
-        # Get request parameters
-        from_date = request.get('from_date', request.get('date_from'))
-        to_date = request.get('to_date', request.get('date_to'))
-        index = request.get('index', 'NIFTY')
-        
-        print(f"🚀 BACKTEST: {index} from {from_date} to {to_date}")
-        
-        # Check Redis cache first
-        if use_redis:
-            cache_key = redis_cache.generate_key(
-                symbol=index,
-                from_date=from_date,
-                to_date=to_date,
-                strategy_config=request
-            )
-            cached_result = redis_cache.get(cache_key)
-            if cached_result:
-                print(f"⚡ REDIS CACHE HIT: {cache_key}")
-                return {
-                    "status": "success",
-                    "trades": cached_result.get("trades", []),
-                    "summary": cached_result.get("summary", {}),
-                    "pivot": cached_result.get("pivot", {}),
-                    "cached": True
-                }
-        
-        # Run load + backtest together in thread pool — keeps event loop free
-        def _load_and_run_algotest():
-            from base import bulk_load_options, bulk_clear_options
-            
-            # Map frontend field names to engine expected names
-            request_params = dict(request)
-            request_params['from_date'] = request_params.get('date_from', request_params.get('from_date'))
-            request_params['to_date'] = request_params.get('date_to', request_params.get('to_date'))
-            
-            try:
-                bulk_load_options(index, from_date, to_date)
-                print(f"   ✅ O(1) lookup dict ready")
-            except Exception as e:
-                print(f"[WARN] bulk_load_options: {e}")
-            try:
-                return run_algotest_backtest(request_params)
-            finally:
-                try:
-                    bulk_clear_options()
-                    print("[CLEANUP] Bulk data cleared from memory")
-                except Exception as e:
-                    print(f"[WARN] Failed to clear bulk data: {e}")
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_backtest_executor, execute_algotest_job, request)
+    return result
 
-        loop = asyncio.get_running_loop()
-        trades_df, summary, pivot = await loop.run_in_executor(
-            _backtest_executor, _load_and_run_algotest
-        )
-        
-        # Convert numpy types to Python types for JSON serialization
-        def convert_numpy(obj):
-            import numpy as np
-            if obj is None:
-                return None
-            elif isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.bool_):
-                return bool(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, dict):
-                return {str(k): convert_numpy(v) for k, v in obj.items()}
-            elif isinstance(obj, (list, tuple)):
-                return [convert_numpy(i) for i in obj]
-            elif hasattr(obj, 'item'):  # numpy scalar
-                return obj.item()
-            elif hasattr(obj, 'tolist'):  # numpy array
-                return obj.tolist()
-            return obj
-        
-        def format_dates_in_trades(trades):
-            """Convert dates to YYYY-MM-DD format"""
-            date_fields = ['Entry Date', 'Exit Date', 'date', 'expiry_date', 'Entry Date ', 'Exit Date ']
-            for trade in trades:
-                for key, value in trade.items():
-                    if value is None:
-                        continue
-                    # Check if it's a date-like value
-                    if hasattr(value, 'strftime'):  # pandas Timestamp
-                        trade[key] = value.strftime('%Y-%m-%d')
-                    elif isinstance(value, str) and 'T' in value:  # ISO string
-                        try:
-                            trade[key] = pd.to_datetime(value).strftime('%Y-%m-%d')
-                        except:
-                            pass
-            return trades
-        
-        # Convert to JSON
-        trades_json = trades_df.to_dict('records') if not trades_df.empty else []
-        trades_json = convert_numpy(trades_json)
-        trades_json = format_dates_in_trades(trades_json)
-        
-        summary = convert_numpy(summary)
-        pivot = convert_numpy(pivot)
-        
-        # Cache result in Redis
-        if use_redis:
-            result_data = {
-                "trades": trades_json,
-                "summary": summary,
-                "pivot": pivot
-            }
-            redis_cache.set(cache_key, result_data)
-            print(f"💾 CACHED: {cache_key}")
-        
-        return {
-            "status": "success",
-            "trades": trades_json,
-            "summary": summary,
-            "pivot": pivot,
-            "cached": False
-        }
-    
-    except Exception as e:
-        
-        def clean_error(obj):
-            if obj is None:
-                return None
-            elif isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.bool_):
-                return bool(obj)
-            elif isinstance(obj, dict):
-                return {str(k): clean_error(v) for k, v in obj.items()}
-            elif isinstance(obj, (list, tuple)):
-                return [clean_error(i) for i in obj]
-            return str(obj)
-        
-        return {
-            "status": "error",
-            "message": clean_error(str(e)),
-            "traceback": traceback.format_exc()
-        }
+
+@router.post("/algotest/jobs")
+async def queue_algotest_job(request: dict):
+    """
+    Enqueue an AlgoTest backtest to run asynchronously via Celery.
+    """
+    payload = dict(request or {})
+    print(f"🔁 QUEUED BACKTEST: {payload.get('index', 'NIFTY')} {payload.get('date_from')} → {payload.get('date_to')}")
+    task = run_algotest_job.apply_async(args=[payload])
+    return {"status": "queued", "job_id": task.id}
+
+
+@router.get("/algotest/jobs/{job_id}")
+async def get_algotest_job_status(job_id: str):
+    """
+    Check status/result of an async AlgoTest backtest job.
+    """
+    task = celery_app.AsyncResult(job_id)
+    state = task.state
+    info = task.result if task.state == "SUCCESS" else task.info
+    if state == "PENDING":
+        return {"status": "queued"}
+    if state in {"STARTED", "PROCESSING", "RETRY"}:
+        return {"status": "running", "meta": info or {"status": "Running..."}} 
+    if state == "SUCCESS":
+        result_payload = info or {}
+        if result_payload.get("status") == "error":
+            return {"status": "failed", "error": result_payload.get("message", "Backtest failed")}
+        return {"status": "completed", "result": result_payload}
+    if state == "FAILURE":
+        error = None
+        if isinstance(info, dict):
+            error = info.get("message") or info.get("error") or str(info)
+        else:
+            error = str(info)
+        return {"status": "failed", "error": error}
+    return {"status": state.lower(), "meta": info}

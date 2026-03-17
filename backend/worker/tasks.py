@@ -47,6 +47,21 @@ def run_backtest_task(self, params: dict):
 
 
 @celery_app.task(bind=True)
+def run_algotest_job(self, params: dict):
+    """Execute AlgoTest backtest via shared service."""
+    try:
+        self.update_state(state='PROCESSING', meta={'status': 'Running AlgoTest backtest'})
+        from services.algotest_job import execute_algotest_job
+        result = execute_algotest_job(params)
+        return result
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+
+@celery_app.task(bind=True)
 def load_data_task(self, data_type: str, source: str):
     """
     Load data from CSV to PostgreSQL in background.

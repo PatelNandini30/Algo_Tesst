@@ -1,9 +1,208 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2 } from 'lucide-react';
+import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import CsvUpload from './CsvUpload';
 import SuperTrendFilter from './SuperTrendFilter';
 import Toggle from './ui/Toggle';
+
+// Convert DD/MM/YYYY to YYYY-MM-DD for API
+const toApiDate = (displayStr) => {
+  if (!displayStr) return '';
+  try {
+    const d = parse(displayStr, 'dd/MM/yyyy', new Date());
+    if (!isValid(d)) return '';
+    return format(d, 'yyyy-MM-dd');
+  } catch {
+    return displayStr;
+  }
+};
+
+// Validate DD/MM/YYYY format
+const isValidDisplayDate = (dateStr) => {
+  if (!dateStr) return false;
+  try {
+    const d = parse(dateStr, 'dd/MM/yyyy', new Date());
+    return isValid(d);
+  } catch {
+    return false;
+  }
+};
+
+const DATE_YEAR_MIN = 1900;
+const DATE_YEAR_MAX = 2100;
+const DIGIT_LIMIT = 8;
+
+const hasValidDateParts = (yearStr, monthStr, dayStr) => {
+  if (!yearStr || !monthStr || !dayStr) return false;
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (year < DATE_YEAR_MIN || year > DATE_YEAR_MAX) return false;
+  if (month < 1 || month > 12) return false;
+  if (day < 1 || day > 31) return false;
+  const candidate = new Date(year, month - 1, day);
+  return (
+    !Number.isNaN(candidate.getTime()) &&
+    candidate.getUTCFullYear() === year &&
+    candidate.getUTCMonth() === month - 1 &&
+    candidate.getUTCDate() === day
+  );
+};
+
+const extractDigits = (value) => {
+  if (!value) return '';
+  return value.replace(/\D/g, '').slice(0, DIGIT_LIMIT);
+};
+
+const formatFromDigits = (digits) => {
+  if (!digits) return '';
+  const day = digits.slice(0, 2);
+  const month = digits.slice(2, 4);
+  const year = digits.slice(4, 8);
+  const segments = [];
+  if (day) segments.push(day);
+  if (digits.length > 2) segments.push(month);
+  if (digits.length > 4) segments.push(year);
+  return segments.join('/');
+};
+
+const countDigitsBefore = (value = '', position = 0) => {
+  return (value.slice(0, position).match(/\d/g) || []).length;
+};
+
+const caretPositionForDigitIndex = (digitIndex, digits) => {
+  const clampedIndex = Math.min(Math.max(digitIndex, 0), digits.length);
+  let position = clampedIndex;
+  if (digits.length > 2 && clampedIndex > 2) position += 1;
+  if (digits.length > 4 && clampedIndex > 4) position += 1;
+  return position;
+};
+
+const tryParseYearFirstDigits = (digits) => {
+  if (digits.length < 8) return null;
+  const year = digits.slice(0, 4);
+  const month = digits.slice(4, 6);
+  const day = digits.slice(6, 8);
+  if (!hasValidDateParts(year, month, day)) return null;
+  return `${day}${month}${year}`;
+};
+
+const normalizePastedDigits = (text) => {
+  const digitsOnly = text.replace(/\D/g, '').slice(0, DIGIT_LIMIT);
+  if (!digitsOnly) return '';
+  const yearFirst = tryParseYearFirstDigits(digitsOnly);
+  return yearFirst || digitsOnly;
+};
+
+const DateInput = ({ value, onChange, placeholder }) => {
+  const [localDigits, setLocalDigits] = useState(extractDigits(value));
+  const [localDisplay, setLocalDisplay] = useState(formatFromDigits(localDigits));
+  const [isFocused, setIsFocused] = useState(false);
+  const inputRef = useRef(null);
+  const lastCommittedRef = useRef(value || '');
+
+  useEffect(() => {
+    if (!isFocused) {
+      const nextDigits = extractDigits(value);
+      setLocalDigits(nextDigits);
+      setLocalDisplay(formatFromDigits(nextDigits));
+      lastCommittedRef.current = value || '';
+    }
+  }, [value, isFocused]);
+
+  const commitValue = useCallback(
+    (formatted) => {
+      if (formatted !== lastCommittedRef.current) {
+        lastCommittedRef.current = formatted;
+        onChange(formatted);
+      }
+      return formatted;
+    },
+    [onChange]
+  );
+
+  const updateDisplay = useCallback((digits, caretDigits) => {
+    const formatted = formatFromDigits(digits);
+    setLocalDigits(digits);
+    setLocalDisplay(formatted);
+    requestAnimationFrame(() => {
+      if (!inputRef.current) return;
+      const caret = caretPositionForDigitIndex(caretDigits, digits);
+      const bounded = Math.min(caret, formatted.length);
+      inputRef.current.setSelectionRange(bounded, bounded);
+    });
+    if (digits.length === DIGIT_LIMIT && hasValidDateParts(digits.slice(4, 8), digits.slice(2, 4), digits.slice(0, 2))) {
+      commitValue(formatted);
+    }
+    return formatted;
+  }, [commitValue]);
+
+  const handleChange = (e) => {
+    const rawValue = e.target.value;
+    const digitsBeforeCursor = countDigitsBefore(rawValue, e.target.selectionStart || 0);
+    const nextDigits = extractDigits(rawValue);
+    updateDisplay(nextDigits, digitsBeforeCursor);
+  };
+
+  const handleBlur = () => {
+    setIsFocused(false);
+    const formatted = formatFromDigits(localDigits);
+    setLocalDisplay(formatted);
+    commitValue(formatted);
+  };
+
+  const handleFocus = () => {
+    setIsFocused(true);
+  };
+
+  const handlePaste = (e) => {
+    const pasted = e.clipboardData?.getData('text') || '';
+    if (!pasted) return;
+    const nextDigits = normalizePastedDigits(pasted);
+    if (!nextDigits) return;
+    e.preventDefault();
+    updateDisplay(nextDigits, nextDigits.length);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const allowedKeys = new Set(['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Tab']);
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      inputRef.current?.blur();
+      return;
+    }
+    if (allowedKeys.has(e.key)) return;
+    if (/^\d$/.test(e.key)) {
+      if (localDigits.length >= DIGIT_LIMIT && e.target.selectionStart === e.target.selectionEnd) {
+        e.preventDefault();
+      }
+      return;
+    }
+    e.preventDefault();
+  };
+
+  return (
+    <input
+      ref={inputRef}
+      type="text"
+      placeholder={placeholder || 'DD/MM/YYYY'}
+      value={localDisplay}
+      onChange={handleChange}
+      onFocus={handleFocus}
+      onBlur={handleBlur}
+      onPaste={handlePaste}
+      onKeyDown={handleKeyDown}
+      className="h-8 px-3 border rounded text-sm w-36 font-mono transition-colors duration-150"
+      style={{
+        borderColor: isFocused ? '#2563eb' : '#d1d5db',
+        backgroundColor: '#ffffff',
+      }}
+    />
+  );
+};
 
 const getLotSize = (index, tradeDate) => {
   const d = new Date(tradeDate);
@@ -124,38 +323,117 @@ const StrategyBuilder = () => {
     summary: null,
     segments: [],
   });
-  const [startDate, setStartDate] = useState('2025-02-20');
-  const [endDate, setEndDate] = useState('2026-02-20');
+  const [startDate, setStartDate] = useState('20/02/2025');
+  const [endDate, setEndDate] = useState('20/02/2026');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
-  const [elapsed, setElapsed] = useState(0);
-  const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
+  const jobPollRef = useRef(null);
+  const [jobId, setJobId] = useState(null);
+  const [jobStatusLabel, setJobStatusLabel] = useState('');
+
+  // Validate date is in DD/MM/YYYY format
+  const isValidDate = (dateStr) => {
+    return isValidDisplayDate(dateStr);
+  };
+
+  const evaluateDateValidation = useCallback((nextStart, nextEnd) => {
+    const shouldValidateStart = !!nextStart?.trim();
+    const shouldValidateEnd = !!nextEnd?.trim();
+    const invalidStart = shouldValidateStart && !isValidDate(nextStart);
+    const invalidEnd = shouldValidateEnd && !isValidDate(nextEnd);
+    if (invalidStart || invalidEnd) {
+      setValidationError('Invalid date format. Use DD/MM/YYYY');
+    } else {
+      setValidationError(null);
+    }
+  }, [isValidDate]);
+
+  const handleStartDateChange = (formatted) => {
+    setStartDate(formatted);
+    evaluateDateValidation(formatted, endDate);
+  };
+
+  const handleEndDateChange = (formatted) => {
+    setEndDate(formatted);
+    evaluateDateValidation(startDate, formatted);
+  };
+
+  // Get API format dates (YYYY-MM-DD)
+  const getApiStartDate = () => toApiDate(startDate);
+  const getApiEndDate = () => toApiDate(endDate);
 
   // Warm cache on date change - pre-loads data before user clicks Run
   useEffect(() => {
-    if (!instrument || !startDate || !endDate) return;
-    // Fire-and-forget warm call - don't await, don't show loading state
+    if (!instrument || !isValidDate(startDate) || !isValidDate(endDate)) return;
     fetch('/api/warm-cache', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index: instrument, from_date: startDate, to_date: endDate }),
-    }).catch(() => {}); // silently ignore errors
+      body: JSON.stringify({ index: instrument, from_date: getApiStartDate(), to_date: getApiEndDate() }),
+    }).catch(() => {});
   }, [instrument, startDate, endDate]);
 
-  // Elapsed time counter
+  const stopJobPolling = useCallback(() => {
+    if (jobPollRef.current) {
+      clearInterval(jobPollRef.current);
+      jobPollRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
-    if (!loading) { setElapsed(0); return; }
-    const t = setInterval(() => setElapsed(s => s + 1), 1000);
-    return () => clearInterval(t);
-  }, [loading]);
+    return () => stopJobPolling();
+  }, [stopJobPolling]);
+
+  const pollJobStatus = useCallback((jobId) => {
+    stopJobPolling();
+    jobPollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/algotest/jobs/${jobId}`);
+        if (!res.ok) throw new Error('Job status fetch failed');
+        const data = await res.json();
+        if (data.status === 'completed') {
+          stopJobPolling();
+          setJobStatusLabel('');
+          setJobId(null);
+          setLoading(false);
+          const payload = data.result ?? data;
+          setResults(payload);
+          if (strFilter.enabled && Array.isArray(payload?.trades) && payload.trades.length === 0) {
+            setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
+          } else {
+            setError(null);
+          }
+          return;
+        }
+        if (data.status === 'failed') {
+          stopJobPolling();
+          setJobStatusLabel('');
+          setJobId(null);
+          setLoading(false);
+          setError(data.error || 'Backtest job failed');
+          return;
+        }
+        if (data.status === 'running') {
+          setJobStatusLabel(data.meta?.status || 'Running backtest…');
+        } else {
+          setJobStatusLabel('Queued…');
+        }
+      } catch (err) {
+        stopJobPolling();
+        setLoading(false);
+        setJobStatusLabel('');
+        setJobId(null);
+        setError('Unable to poll backtest job status.');
+      }
+    }, 1500);
+  }, [stopJobPolling]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
     const parsed = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(parsed.getTime())) return null;
-    return parsed.toISOString().slice(0, 10);
+    return format(parsed, 'dd/MM/yyyy');
   };
 
   useEffect(() => {
@@ -166,12 +444,14 @@ const StrategyBuilder = () => {
     if (startDate === proposedStart && endDate === proposedEnd) return;
     setStartDate(proposedStart);
     setEndDate(proposedEnd);
+    evaluateDateValidation(proposedStart, proposedEnd);
   }, [
     strFilter.enabled,
     strFilter.summary?.range?.from,
     strFilter.summary?.range?.to,
     startDate,
     endDate,
+    evaluateDateValidation,
   ]);
 
   // Memoize static derived values so they don't rebuild on every keystroke
@@ -335,8 +615,8 @@ const StrategyBuilder = () => {
       overall_sl_value: overallSLEnabled ? (overallSLValue === '' ? 0 : overallSLValue) : null,
       overall_target_type: overallTgtEnabled ? overallTgtType : null,
       overall_target_value: overallTgtEnabled ? (overallTgtValue === '' ? 0 : overallTgtValue) : null,
-      date_from: startDate,
-      date_to: endDate,
+      date_from: getApiStartDate(),
+      date_to: getApiEndDate(),
       expiry_type: expiryBasis.toUpperCase(),
       filter: strFilter.enabled ? strFilter.configId : null,
       filter_config: strFilter.enabled ? strFilter.configId : null,
@@ -351,8 +631,14 @@ const StrategyBuilder = () => {
   const runBacktest = useCallback(async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
     if (loading) return;  // guard: ignore clicks while already running
+    if (!isValidDate(startDate) || !isValidDate(endDate)) {
+      const msg = 'Invalid date format. Use DD/MM/YYYY';
+      setValidationError(msg);
+      setError(msg);
+      return;
+    }
+    setValidationError(null);
     
-    // Check for same-day expiry entry (Entry DTE = 0 and Exit DTE = 0)
     if (entryDaysBefore === 0 && exitDaysBefore === 0) {
       setError('Expiry day entry requires same-day spot data for accurate ATM/spot strike selection; results may differ when using previous close data.');
       setTimeout(() => setError(null), 1000);
@@ -369,36 +655,34 @@ const StrategyBuilder = () => {
       }
     }
 
-    // Cancel any previous in-flight request
-    if (abortRef.current) abortRef.current.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    setLoading(true); setError(null);
+    const payload = buildPayload();
+    stopJobPolling();
+    setLoading(true);
+    setError(null);
+    setResults(null);
     try {
-      const res = await fetch('/api/algotest', {
+      const res = await fetch('/api/algotest/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildPayload()),
-        signal: controller.signal,
+        body: JSON.stringify(payload),
       });
-      if (res.ok) {
-        const data = await res.json();
-        setResults(data);
-        if (strFilter.enabled && Array.isArray(data?.trades) && data.trades.length === 0) {
-          setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
-        }
+      if (!res.ok) {
+        const errorPayload = await res.json().catch(() => null);
+        throw new Error(errorPayload?.message || 'Failed to enqueue backtest job');
       }
-      else { const e = await res.json(); setError(e.detail || 'Backtest failed'); }
+      const data = await res.json();
+      if (!data?.job_id) {
+        throw new Error('Backtest job was not queued. Missing job ID.');
+      }
+      setJobId(data.job_id);
+      setJobStatusLabel('Queued…');
+      pollJobStatus(data.job_id);
     } catch (err) {
-      if (err.name !== 'AbortError') {
-        setError('Network error. Check if backend is running.');
-      }
-    } finally {
       setLoading(false);
-      abortRef.current = null;
+      setJobStatusLabel('');
+      setError(err.message || 'Backtest queue failed');
     }
-  }, [legs, loading, expiryBasis, buildPayload]);
+  }, [legs, loading, expiryBasis, buildPayload, pollJobStatus, stopJobPolling]);
 
   return (
     <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, sans-serif' }}>
@@ -1052,25 +1336,18 @@ const StrategyBuilder = () => {
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
                 <label className="text-xs text-gray-600">Start Date</label>
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={e => setStartDate(e.target.value)}
-                  className="h-8 px-2 border border-gray-300 rounded text-xs"
-                />
+                <DateInput value={startDate} onChange={handleStartDateChange} />
               </div>
               <div className="flex items-center gap-2">
                 <label className="text-xs text-gray-600">End Date</label>
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={e => setEndDate(e.target.value)}
-                  className="h-8 px-2 border border-gray-300 rounded text-xs"
-                />
+                <DateInput value={endDate} onChange={handleEndDateChange} />
               </div>
             </div>
           </div>
         </div>
+        {validationError && (
+          <div className="mt-2 text-xs text-red-600">{validationError}</div>
+        )}
 
         {/* Results */}
         {results && (
@@ -1110,7 +1387,6 @@ const StrategyBuilder = () => {
               <>
                 <Loader2 size={18} className="animate-spin" />
                 <span className="text-sm font-semibold">Running Backtest…</span>
-                {elapsed > 3 && <span className="text-xs opacity-75 ml-2">({elapsed}s)</span>}
               </>
             ) : (
               <>
@@ -1119,6 +1395,9 @@ const StrategyBuilder = () => {
               </>
             )}
           </button>
+          {jobStatusLabel && (
+            <div className="mt-2 text-xs text-center text-gray-600">{jobStatusLabel}</div>
+          )}
         </div>
       </div>
     </div>
