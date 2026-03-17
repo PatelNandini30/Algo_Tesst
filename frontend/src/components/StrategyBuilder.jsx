@@ -152,6 +152,8 @@ const StrategyBuilder = () => {
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
   const [elapsed, setElapsed] = useState(0);
+  const [startDateInput, setStartDateInput] = useState('');
+  const [endDateInput, setEndDateInput] = useState('');
   const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
 
   // Warm cache on date change - pre-loads data before user clicks Run
@@ -171,6 +173,12 @@ const StrategyBuilder = () => {
     const t = setInterval(() => setElapsed(s => s + 1), 1000);
     return () => clearInterval(t);
   }, [loading]);
+
+  // Sync display inputs with actual date values
+  useEffect(() => {
+    setStartDateInput(formatDateDisplay(startDate));
+    setEndDateInput(formatDateDisplay(endDate));
+  }, [startDate, endDate]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
@@ -1076,17 +1084,23 @@ const StrategyBuilder = () => {
                 <input
                   type="text"
                   placeholder="DD/MM/YYYY"
-                  value={formatDateDisplay(startDate)}
-                  onChange={e => {
-                    const parsed = parseDateInput(e.target.value);
-                    if (parsed) setStartDate(parsed);
-                  }}
+                  value={startDateInput}
+                  onChange={e => setStartDateInput(e.target.value)}
                   onBlur={e => {
-                    // Auto-format on blur
-                    if (e.target.value && !e.target.value.includes('/')) {
-                      const d = new Date(e.target.value);
-                      if (!isNaN(d.getTime())) {
-                        setStartDate(format(d, 'yyyy-MM-dd'));
+                    const parsed = parseDateInput(e.target.value);
+                    if (parsed) {
+                      setStartDate(parsed);
+                    } else {
+                      setStartDateInput(formatDateDisplay(startDate));
+                    }
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const parsed = parseDateInput(e.target.value);
+                      if (parsed) {
+                        setStartDate(parsed);
+                      } else {
+                        setStartDateInput(formatDateDisplay(startDate));
                       }
                     }
                   }}
@@ -1098,16 +1112,23 @@ const StrategyBuilder = () => {
                 <input
                   type="text"
                   placeholder="DD/MM/YYYY"
-                  value={formatDateDisplay(endDate)}
-                  onChange={e => {
-                    const parsed = parseDateInput(e.target.value);
-                    if (parsed) setEndDate(parsed);
-                  }}
+                  value={endDateInput}
+                  onChange={e => setEndDateInput(e.target.value)}
                   onBlur={e => {
-                    if (e.target.value && !e.target.value.includes('/')) {
-                      const d = new Date(e.target.value);
-                      if (!isNaN(d.getTime())) {
-                        setEndDate(format(d, 'yyyy-MM-dd'));
+                    const parsed = parseDateInput(e.target.value);
+                    if (parsed) {
+                      setEndDate(parsed);
+                    } else {
+                      setEndDateInput(formatDateDisplay(endDate));
+                    }
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const parsed = parseDateInput(e.target.value);
+                      if (parsed) {
+                        setEndDate(parsed);
+                      } else {
+                        setEndDateInput(formatDateDisplay(endDate));
                       }
                     }
                   }}
