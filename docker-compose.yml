@@ -1,7 +1,7 @@
 services:
   # PostgreSQL Database
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15-bullseye
     container_name: algotest-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-algotest}
@@ -36,7 +36,7 @@ services:
 
   # Redis for caching and queue
   redis:
-    image: redis:7-alpine
+    image: redis:7-bullseye
     container_name: algotest-redis
     ports:
       - "${REDIS_PORT:-6379}:6379"

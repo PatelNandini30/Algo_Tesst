@@ -1828,13 +1828,19 @@ async def run_algotest_backtest_endpoint(request: dict):
         # Run load + backtest together in thread pool — keeps event loop free
         def _load_and_run_algotest():
             from base import bulk_load_options, bulk_clear_options
+            
+            # Map frontend field names to engine expected names
+            request_params = dict(request)
+            request_params['from_date'] = request_params.get('date_from', request_params.get('from_date'))
+            request_params['to_date'] = request_params.get('date_to', request_params.get('to_date'))
+            
             try:
                 bulk_load_options(index, from_date, to_date)
                 print(f"   ✅ O(1) lookup dict ready")
             except Exception as e:
                 print(f"[WARN] bulk_load_options: {e}")
             try:
-                return run_algotest_backtest(request)
+                return run_algotest_backtest(request_params)
             finally:
                 try:
                     bulk_clear_options()
