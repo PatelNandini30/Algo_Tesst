@@ -128,6 +128,37 @@ async def clear_cache():
     return {"message": "Cache cleared"}
 
 
+@router.post("/warm-cache")
+async def warm_cache(request: dict):
+    """
+    Pre-load bulk data in background - makes actual backtest run faster.
+    Returns immediately while data loads in background thread.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from base import bulk_load_options
+    
+    symbol = request.get('index', request.get('symbol', 'NIFTY'))
+    from_date = request.get('from_date', request.get('date_from'))
+    to_date = request.get('to_date', request.get('date_to'))
+    
+    if not from_date or not to_date:
+        return {"status": "error", "message": "Missing from_date or to_date"}
+    
+    def _load():
+        try:
+            bulk_load_options(symbol, from_date, to_date)
+            return {"status": "warmed"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    
+    # Run in background thread, don't wait
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor.submit(_load)
+    
+    return {"status": "warming", "message": f"Pre-loading {symbol} {from_date} to {to_date}"}
+
+
 @router.post("/upload-filter-csv")
 async def upload_filter_csv(file: UploadFile = File(...)):
     """

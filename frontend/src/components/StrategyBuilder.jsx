@@ -130,7 +130,26 @@ const StrategyBuilder = () => {
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
   const abortRef = useRef(null);  // tracks in-flight fetch for cancellation
+
+  // Warm cache on date change - pre-loads data before user clicks Run
+  useEffect(() => {
+    if (!instrument || !startDate || !endDate) return;
+    // Fire-and-forget warm call - don't await, don't show loading state
+    fetch('/api/warm-cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ index: instrument, from_date: startDate, to_date: endDate }),
+    }).catch(() => {}); // silently ignore errors
+  }, [instrument, startDate, endDate]);
+
+  // Elapsed time counter
+  useEffect(() => {
+    if (!loading) { setElapsed(0); return; }
+    const t = setInterval(() => setElapsed(s => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [loading]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
@@ -1091,6 +1110,7 @@ const StrategyBuilder = () => {
               <>
                 <Loader2 size={18} className="animate-spin" />
                 <span className="text-sm font-semibold">Running Backtest…</span>
+                {elapsed > 3 && <span className="text-xs opacity-75 ml-2">({elapsed}s)</span>}
               </>
             ) : (
               <>

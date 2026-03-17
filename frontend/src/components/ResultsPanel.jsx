@@ -12,34 +12,35 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
 
-  // Group trades by Trade number for display (AlgoTest style)
+  // Group trades by Trade number for display (AlgoTest style) - O(n) using Map
   const groupedTrades = useMemo(() => {
     if (!trades || trades.length === 0) return [];
     
-    const groups = {};
+    const map = new Map();
     trades.forEach(trade => {
       const tradeNum = trade.Trade || trade.trade || 1;
-      if (!groups[tradeNum]) {
-        groups[tradeNum] = [];
+      if (!map.has(tradeNum)) {
+        map.set(tradeNum, []);
       }
-      groups[tradeNum].push(trade);
+      map.get(tradeNum).push(trade);
     });
     
-    // Convert to array and sort by trade number
-    return Object.entries(groups)
-      .map(([tradeNum, legs]) => ({
+    // Convert to array in single pass - preserves insertion order from Map
+    const result = [];
+    for (const [tradeNum, legs] of map.entries()) {
+      result.push({
         tradeNumber: parseInt(tradeNum),
         legs: legs,
-        // Use first leg's data for trade-level info
         entryDate: legs[0]['Entry Date'],
         exitDate: legs[0]['Exit Date'],
         entrySpot: legs[0]['Entry Spot'],
         exitSpot: legs[0]['Exit Spot'],
-        // Sum P&L across all legs for this trade
         totalPnl: legs.reduce((sum, leg) => sum + (leg['Net P&L'] || 0), 0),
         cumulative: legs[0].Cumulative || 0,
-      }))
-      .sort((a, b) => a.tradeNumber - b.tradeNumber);
+      });
+    }
+    // Already sorted by insertion order (which is by trade number since we iterate trades in order)
+    return result;
   }, [trades]);
 
   // Prepare chart data - USE GROUPED TRADES (one point per trade, not per leg)
