@@ -33,14 +33,19 @@ Usage:
     )
 """
 
+import hashlib
 import os
 import time
 import logging
 import pandas as pd
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 from collections import OrderedDict
 from functools import lru_cache
+from datetime import datetime, date
 
+import msgpack
+import redis
 import polars as pl
 from sqlalchemy import text
 
@@ -50,6 +55,166 @@ from database import get_engine
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+PARQUET_CACHE_DIR = "/tmp/parquet_cache"
+os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+
+_LOOKUP_CACHE_TTL = int(os.getenv("LOOKUP_CACHE_TTL", "86400"))
+_LOOKUP_KEY_PREFIX = "bulk"
+_FULL_RANGE_FROM = "2000-01-01"
+_FULL_RANGE_TO = "2026-12-31"
+_redis_client: Optional[redis.Redis] = None
+_full_range_loaded = False
+_full_range_symbol: Optional[str] = None
+
+def _get_redis_client() -> Optional[redis.Redis]:
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    if not redis_url:
+        return None
+
+    try:
+        client = redis.Redis.from_url(redis_url)
+        client.ping()
+        _redis_client = client
+        return client
+    except redis.RedisError as exc:
+        logger.warning("[REDIS] Unable to connect to cache: %s", exc)
+        return None
+
+
+def _lookup_cache_key(symbol: str, from_date: str, to_date: str) -> str:
+    normalized_symbol = symbol.upper()
+    return f"{_LOOKUP_KEY_PREFIX}:{normalized_symbol}:{from_date}:{to_date}"
+
+
+def load_lookup_cache_from_redis(
+    symbol: str,
+    from_date: str,
+    to_date: str
+) -> Optional[Dict[Tuple[str, str, int, str, str], float]]:
+    client = _get_redis_client()
+    if client is None:
+        return None
+
+    try:
+        raw = client.get(_lookup_cache_key(symbol, from_date, to_date))
+        if not raw:
+            return None
+
+        entries = msgpack.unpackb(raw, raw=False)
+        lookup: Dict[Tuple[str, str, int, str, str], float] = {}
+        for entry in entries:
+            if not entry or len(entry) != 6:
+                continue
+            key = (entry[0], entry[1], entry[2], entry[3], entry[4])
+            value = entry[5]
+            lookup[key] = value
+
+        return lookup
+    except (redis.RedisError, msgpack.exceptions.UnpackException) as exc:
+        logger.warning("[REDIS] Failed to load lookup cache: %s", exc)
+    except Exception as exc:  # pragma: no cover - guard against corrupted payloads
+        logger.warning("[REDIS] Corrupted lookup cache: %s", exc)
+    return None
+
+
+def store_lookup_cache_in_redis(
+    symbol: str,
+    from_date: str,
+    to_date: str,
+    lookup: Dict[Tuple[str, str, int, str, str], float]
+) -> None:
+    client = _get_redis_client()
+    if client is None or not lookup:
+        return
+
+    payload = [
+        [key[0], key[1], key[2], key[3], key[4], value]
+        for key, value in lookup.items()
+    ]
+    try:
+        packed = msgpack.packb(payload, use_bin_type=True)
+        client.set(
+            _lookup_cache_key(symbol, from_date, to_date),
+            packed,
+            ex=_LOOKUP_CACHE_TTL
+        )
+    except redis.RedisError as exc:
+        logger.warning("[REDIS] Failed to store lookup cache: %s", exc)
+
+
+def _full_range_cache_key(symbol: str) -> str:
+    normalized_symbol = symbol.upper()
+    return f"{_LOOKUP_KEY_PREFIX}:{normalized_symbol}:full"
+
+
+def _load_full_range_from_redis(symbol: str) -> Optional[pl.DataFrame]:
+    client = _get_redis_client()
+    if client is None:
+        return None
+
+    try:
+        raw = client.get(_full_range_cache_key(symbol))
+        if not raw:
+            return None
+
+        payload = msgpack.unpackb(raw, raw=False)
+        if not payload:
+            return None
+
+        return pl.DataFrame(payload)
+    except (redis.RedisError, msgpack.exceptions.UnpackException) as exc:
+        logger.warning("[REDIS] Failed to load full range cache: %s", exc)
+    except Exception as exc:
+        logger.warning("[REDIS] Corrupted full range cache: %s", exc)
+    return None
+
+
+def _store_full_range_in_redis(symbol: str, df: pl.DataFrame) -> None:
+    client = _get_redis_client()
+    if client is None or df is None or df.is_empty():
+        return
+
+    try:
+        df = df.with_columns([
+            pl.col("Date").dt.strftime("%Y-%m-%d"),
+            pl.col("ExpiryDate").dt.strftime("%Y-%m-%d")
+        ])
+        payload = [
+            {
+                key: (_serialize_cache_value(value) if value is not None else None)
+                for key, value in row.items()
+            }
+            for row in df.to_dicts()
+        ]
+        packed = msgpack.packb(payload, use_bin_type=True)
+        client.set(
+            _full_range_cache_key(symbol),
+            packed,
+            ex=_LOOKUP_CACHE_TTL
+        )
+        logger.debug("[REDIS] Stored full range cache for %s", symbol.upper())
+    except redis.RedisError as exc:
+        logger.warning("[REDIS] Failed to store full range cache: %s", exc)
+
+
+def _serialize_cache_value(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def _is_full_range_loaded(symbol: str) -> bool:
+    return (
+        _full_range_loaded
+        and _full_range_symbol == symbol.upper()
+        and _bulk_options_df is not None
+        and not _bulk_options_df.is_empty()
+    )
 
 
 class LRUCache:
@@ -855,80 +1020,114 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
 
     Returns dict with stats about loaded data.
     """
-    global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key
+    global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key, _full_range_loaded, _full_range_symbol
 
-    cache_key = f"{symbol}:{from_date}:{to_date}"
+    symbol_upper = symbol.upper()
+    cache_key = _full_range_cache_key(symbol_upper)
+    key = hashlib.md5(cache_key.encode()).hexdigest()
+    parquet_path = Path(PARQUET_CACHE_DIR) / f"{key}.parquet"
 
-    # Already loaded for this request? Skip.
-    if _bulk_loaded_key == cache_key and _bulk_options_df is not None:
-        logger.info(f"[BULK] Already loaded: {cache_key}")
-        return _get_bulk_stats()
+    if _is_full_range_loaded(symbol_upper):
+        logger.info(f"[BULK] Full range already loaded for {symbol_upper}")
+    else:
+        if parquet_path.exists():
+            age = time.time() - os.path.getmtime(parquet_path)
+            if age < 86400:
+                try:
+                    start_cache = time.perf_counter()
+                    _bulk_options_df = pl.read_parquet(parquet_path)
+                    _full_range_loaded = True
+                    _full_range_symbol = symbol_upper
+                    _bulk_loaded_key = cache_key
+                    elapsed_cache = time.perf_counter() - start_cache
+                    logger.info(f"[BULK] Loaded full range from Parquet cache in {elapsed_cache:.2f}s")
+                except Exception as exc:
+                    logger.warning(f"[BULK] Parquet cache load failed: {exc}")
 
-    logger.info(f"[BULK] Loading {symbol} {from_date} -> {to_date} ...")
+        if not _is_full_range_loaded(symbol_upper):
+            cached_df = _load_full_range_from_redis(symbol_upper)
+            if cached_df is not None:
+                _bulk_options_df = cached_df
+                _full_range_loaded = True
+                _full_range_symbol = symbol_upper
+                _bulk_loaded_key = cache_key
+                logger.info("[BULK] Loaded full range from Redis cache for %s", symbol_upper)
+
+    need_full_range_load = not _is_full_range_loaded(symbol_upper)
+    logger.info(
+        "[BULK] Loading %s %s -> %s (%s full range load)",
+        symbol_upper,
+        from_date,
+        to_date,
+        "forcing" if need_full_range_load else "using cache"
+    )
     start_time = time.perf_counter()
 
-    # FIX #4A: Clear per-date pandas cache in the engine so old slices don't linger
     try:
         from engines.generic_multi_leg import _bhav_pandas_cache
         _bhav_pandas_cache.clear()
         logger.debug("[BULK] Cleared bhav pandas cache")
     except Exception:
         pass  # engine not imported yet — that's fine
-    
-    # Import repository
+
     from repositories.market_data_repository import MarketDataRepository
     from database import get_engine
     from concurrent.futures import ThreadPoolExecutor
-    
+
     repo = MarketDataRepository(get_engine())
-    
-    # PARALLEL LOADING: Load options, spot, and expiry concurrently
-    logger.info("[BULK] Loading options, spot, expiry in parallel...")
-    
+
     with ThreadPoolExecutor(max_workers=3) as executor:
-        # Submit all loading tasks
-        options_future = executor.submit(repo.get_options_bulk, symbol, from_date, to_date)
-        spot_future = executor.submit(repo.get_spot_data, symbol, from_date, to_date)
-        expiry_future = executor.submit(repo.get_expiry_data, symbol, 'weekly')
-        
-        # Wait for all to complete
-        options_df = options_future.result()
+        options_future = (
+            executor.submit(repo.get_options_bulk, symbol_upper, _FULL_RANGE_FROM, _FULL_RANGE_TO)
+            if need_full_range_load else None
+        )
+        spot_future = executor.submit(repo.get_spot_data, symbol_upper, from_date, to_date)
+        expiry_future = executor.submit(repo.get_expiry_data, symbol_upper, "weekly")
+
+        options_df = options_future.result() if options_future else None
         spot_df = spot_future.result()
         expiry_df = expiry_future.result()
-    
-    if not options_df.empty:
-        _bulk_options_df = pl.from_pandas(options_df)
+
+    if options_df is not None and not options_df.empty:
+        pl_options = pl.from_pandas(options_df)
+        _bulk_options_df = pl_options
+        _full_range_loaded = True
+        _full_range_symbol = symbol_upper
+        _bulk_loaded_key = cache_key
         logger.info(f"[BULK] Loaded {len(_bulk_options_df)} option rows")
-    else:
+        try:
+            pl_options.write_parquet(parquet_path)
+            logger.info("[BULK] Saved to Parquet cache")
+        except Exception as exc:
+            logger.warning(f"[BULK] Failed to save Parquet cache: {exc}")
+        _store_full_range_in_redis(symbol_upper, pl_options)
+    elif options_df is None and _bulk_options_df is None:
         _bulk_options_df = pl.DataFrame()
-        logger.warning("[BULK] No option data returned!")
-    
-    # Load spot data in bulk
+        logger.warning("[BULK] No option data available (cache and DB)")
+
     logger.info("[BULK] Loading spot...")
-    # Process results from parallel loading
     if not spot_df.empty:
         _bulk_spot_df = pl.from_pandas(spot_df)
         logger.info(f"[BULK] Loaded {len(_bulk_spot_df)} spot rows")
     else:
         _bulk_spot_df = pl.DataFrame()
         logger.warning("[BULK] No spot data returned!")
-    
-    # Process expiry - filter by date range if provided
+
     if not expiry_df.empty:
+        filtered_expiry = expiry_df
         if from_date:
-            expiry_df = expiry_df[expiry_df['Current Expiry'] >= pd.to_datetime(from_date)]
+            filtered_expiry = filtered_expiry[filtered_expiry["Current Expiry"] >= pd.to_datetime(from_date)]
         if to_date:
-            expiry_df = expiry_df[expiry_df['Current Expiry'] <= pd.to_datetime(to_date)]
-        _bulk_expiry_df = pl.from_pandas(expiry_df)
+            filtered_expiry = filtered_expiry[filtered_expiry["Current Expiry"] <= pd.to_datetime(to_date)]
+        _bulk_expiry_df = pl.from_pandas(filtered_expiry)
         logger.info(f"[BULK] Loaded {len(_bulk_expiry_df)} expiry rows")
     else:
         _bulk_expiry_df = pl.DataFrame()
         logger.warning("[BULK] No expiry data returned!")
-    
-    _bulk_loaded_key = cache_key
+
     elapsed = time.perf_counter() - start_time
     logger.info(f"[BULK] Load complete in {elapsed:.2f}s")
-    
+
     return _get_bulk_stats()
 
 
@@ -947,12 +1146,14 @@ def bulk_clear():
     Clear bulk-loaded data from memory.
     MUST be called in try/finally to prevent memory leaks and stale data.
     """
-    global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key
+    global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key, _full_range_loaded, _full_range_symbol
     
     _bulk_options_df = None
     _bulk_spot_df = None
     _bulk_expiry_df = None
     _bulk_loaded_key = None
+    _full_range_loaded = False
+    _full_range_symbol = None
     
     logger.info("[BULK] Cleared bulk data from memory")
 

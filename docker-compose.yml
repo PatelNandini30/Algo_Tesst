@@ -14,9 +14,10 @@ services:
       - ./reports/sql:/data:ro
     command: >
       postgres
+      -c max_connections=200
       -c shared_buffers=2GB
       -c effective_cache_size=6GB
-      -c work_mem=64MB
+      -c work_mem=16MB
       -c maintenance_work_mem=512MB
       -c random_page_cost=1.1
       -c effective_io_concurrency=200
@@ -58,8 +59,22 @@ services:
     container_name: algotest-backend
     ports:
       - "${BACKEND_PORT:-8000}:8000"
+    command:
+      - uvicorn
+      - main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --loop
+      - uvloop
+      - --workers
+      - "1"
     environment:
+      - UVICORN_LOOP=uvloop
+      - UVICORN_WORKERS=1
       - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
+      - DB_STATEMENT_TIMEOUT=1800000
       - REDIS_URL=redis://redis:6379/0
       - DATA_DIR=/data
       - USE_POSTGRESQL=true
@@ -75,6 +90,7 @@ services:
       - ./expiryData:/data/expiryData:ro
       - ./strikeData:/data/strikeData:ro
       - ./Filter:/data/Filter:ro
+      - parquet_cache:/tmp/parquet_cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,13 +105,13 @@ services:
     networks:
       - algotest-network
 
-  # Celery Worker for background tasks
-  worker:
+  # Celery Worker for backtests
+  worker-backtests:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: algotest-worker
-    command: celery -A worker.celery worker -l info -c 2
+    container_name: algotest-worker-backtests
+    command: celery -A worker.celery worker -Q backtests -c 4 -l info
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
       - REDIS_URL=redis://redis:6379/0
@@ -105,6 +121,37 @@ services:
       - ./expiryData:/data/expiryData:ro
       - ./strikeData:/data/strikeData:ro
       - ./Filter:/data/Filter:ro
+      - parquet_cache:/tmp/parquet_cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A worker.celery inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - algotest-network
+
+  worker-uploads:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: algotest-worker-uploads
+    command: celery -A worker.celery worker -Q uploads -c 2 -l info
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+    volumes:
+      - ./cleaned_csvs:/data/cleaned_csvs:ro
+      - ./expiryData:/data/expiryData:ro
+      - ./strikeData:/data/strikeData:ro
+      - ./Filter:/data/Filter:ro
+      - parquet_cache:/tmp/parquet_cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,7 +178,7 @@ services:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/"]
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -139,9 +186,30 @@ services:
     networks:
       - algotest-network
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: algotest-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - algotest-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: algotest-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - algotest-network
+
 volumes:
   pgdata:
   redis_data:
+  parquet_cache:
 
 networks:
   algotest-network:

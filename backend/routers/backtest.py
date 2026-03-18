@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from engines.generic_multi_leg import run_generic_multi_leg
 from engines.generic_algotest_engine import run_algotest_backtest
 from services.algotest_job import execute_algotest_job
+from services.redis_cache import redis_cache as shared_redis_cache
 from worker.tasks import run_algotest_job
 from worker.celery import celery_app
 import sys
@@ -17,13 +18,14 @@ import json
 import threading
 import time
 import traceback
-
-# ADD THESE — after existing imports
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
 
-# Thread pool for running CPU-bound backtest without blocking FastAPI
+# Thread pool for async tasks (I/O/cache warming) and process pool for CPU-heavy backtests
 _backtest_executor = ThreadPoolExecutor(max_workers=3)
+_cpu_executor = ProcessPoolExecutor(
+    max_workers=max(2, min((os.cpu_count() or 4), 4))
+)
 
 # Simple in-memory cache for backtest results
 class BacktestCache:
@@ -34,14 +36,12 @@ class BacktestCache:
         self._ttl = ttl_seconds
     
     def _make_key(self, params: dict) -> str:
-        # Create a hash key from the request params
-        # Remove non-serializable items
-        serializable = {k: v for k, v in params.items() if k != 'strategy'}
+        """Hash the full params dict so strategy definitions aren't ignored."""
         try:
-            key_str = json.dumps(serializable, sort_keys=True, default=str)
-        except:
-            key_str = str(serializable)
-        return hashlib.md5(key_str.encode()).hexdigest()
+            key_str = json.dumps(params, sort_keys=True, default=str)
+        except Exception:
+            key_str = repr(params)
+        return hashlib.sha256(key_str.encode()).hexdigest()
     
     def get(self, params: dict) -> Optional[dict]:
         key = self._make_key(params)
@@ -125,6 +125,26 @@ except ImportError as e:
 router = APIRouter()
 
 
+def _run_generic_multi_leg_worker(params: dict):
+    """Worker entry point for ProcessPoolExecutor to keep FastAPI async."""
+    from base import bulk_load_options, bulk_clear_options
+
+    index = params.get("index", "NIFTY")
+    from_date = params.get("from_date") or params.get("date_from")
+    to_date = params.get("to_date") or params.get("date_to")
+
+    try:
+        if index and from_date and to_date:
+            bulk_load_options(index, from_date, to_date)
+        return run_generic_multi_leg(params)
+    finally:
+        try:
+            bulk_clear_options()
+            print("[CLEANUP] Bulk data cleared from memory")
+        except Exception as exc:
+            print(f"[WARN] Failed to clear bulk data: {exc}")
+
+
 @router.post("/clear-cache")
 async def clear_cache():
     """Clear the backtest cache"""
@@ -138,8 +158,6 @@ async def warm_cache(request: dict):
     Pre-load bulk data in background - makes actual backtest run faster.
     Returns immediately while data loads in background thread.
     """
-    import asyncio
-    from concurrent.futures import ThreadPoolExecutor
     from base import bulk_load_options
     
     symbol = request.get('index', request.get('symbol', 'NIFTY'))
@@ -155,10 +173,8 @@ async def warm_cache(request: dict):
             return {"status": "warmed"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
-    
-    # Run in background thread, don't wait
-    executor = ThreadPoolExecutor(max_workers=1)
-    executor.submit(_load)
+
+    _backtest_executor.submit(_load)
     
     return {"status": "warming", "message": f"Pre-loading {symbol} {from_date} to {to_date}"}
 
@@ -509,27 +525,13 @@ async def run_backtest_logic(request: BacktestRequest):
     }
     params["spot_adjustment_type"] = spot_adjustment_mapping.get(request.spot_adjustment_type, 0)
 
-    def _load_and_run():
-        # Bulk load + engine run together off the main thread.
-        # Keeps FastAPI event loop free during the 120s DB query.
-        from base import bulk_load_options, bulk_clear_options
-        try:
-            bulk_load_options(request.index, request.date_from, request.date_to)
-            print(f"   ✅ Data loader ready")
-        except Exception as e:
-            print(f"[WARN] bulk_load_options: {e}")
-        try:
-            return run_generic_multi_leg(params)
-        finally:
-            try:
-                bulk_clear_options()
-                print("[CLEANUP] Bulk data cleared from memory")
-            except Exception as e:
-                print(f"[WARN] Failed to clear bulk data: {e}")
-
     try:
         loop = asyncio.get_running_loop()
-        df, summary, pivot = await loop.run_in_executor(_backtest_executor, _load_and_run)
+        df, summary, pivot = await loop.run_in_executor(
+            _cpu_executor,
+            _run_generic_multi_leg_worker,
+            params
+        )
         
         # Prepare response (EXACT ENGINE OUTPUT)
         trades_list = df.to_dict('records') if not df.empty else []
@@ -913,7 +915,17 @@ async def dynamic_backtest(
     cache_params = request.copy()
     cache_params.pop('no_cache', None)
     
-    # Check cache first (skip if no_cache=True)
+    # Check Redis cache first (if configured)
+    if not no_cache and shared_redis_cache:
+        try:
+            cached_result = shared_redis_cache.get(cache_params)
+            if cached_result:
+                print("Returning redis cache hit")
+                return cached_result
+        except Exception as exc:
+            print(f"[REDIS] Cache read failed: {exc}")
+
+    # Check in-memory cache
     if not no_cache:
         cached_result = backtest_cache.get(cache_params)
         if cached_result is not None:
@@ -1326,13 +1338,19 @@ async def dynamic_backtest(
         params["spot_adjustment_type"] = spot_adjustment_mapping.get(request_obj.spot_adjustment_type, 0)
         
         # Pass original legs data for stopLoss/targetProfit extraction
-        params["original_legs"] = request_obj.legs
+        params["original_legs"] = [
+            leg if isinstance(leg, dict) else leg.model_dump()
+            for leg in request_obj.legs
+        ]
+        strategy_payload = strategy_def.model_dump()
         
         # Execute in thread pool — keeps FastAPI event loop free during 120s DB load
         loop = asyncio.get_running_loop()
         df, summary, pivot = await loop.run_in_executor(
-            _backtest_executor,
-            lambda: execute_strategy(strategy_def, params)
+            _cpu_executor,
+            _run_execute_strategy_worker,
+            strategy_payload,
+            params
         )
         
         # Prepare response with proper column mapping for frontend
@@ -1466,6 +1484,11 @@ async def dynamic_backtest(
         }
         
         # Cache the result
+        if not no_cache and shared_redis_cache:
+            try:
+                shared_redis_cache.set(cache_params, response_data)
+            except Exception as exc:
+                print(f"[REDIS] Cache write failed: {exc}")
         backtest_cache.set(cache_params, response_data)
         
         # DEBUG: Log what we're sending to frontend
@@ -1488,6 +1511,14 @@ async def dynamic_backtest(
         raise HTTPException(status_code=500, detail=str(e))
 
 # End of dynamic_backtest function
+
+
+def _run_execute_strategy_worker(strategy_payload: dict, params: dict):
+    """ProcessPool entry point for the dynamic strategy executor."""
+    from strategies.strategy_types import StrategyDefinition
+
+    strategy_def = StrategyDefinition.model_validate(strategy_payload)
+    return execute_strategy(strategy_def, params)
 
 
 @router.get("/export/trades")

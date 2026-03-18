@@ -1,6 +1,5 @@
 import logging
 import os
-from datetime import timedelta
 from typing import Optional
 
 import pandas as pd
@@ -11,26 +10,6 @@ from sqlalchemy.exc import OperationalError
 from database import reset_engine
 
 logger = logging.getLogger(__name__)
-
-_QUERY_CHUNK_DAYS = max(1, int(os.getenv("DB_QUERY_CHUNK_DAYS", "60")))
-
-
-def _chunk_date_ranges(from_date: str, to_date: str, chunk_days: int = _QUERY_CHUNK_DAYS):
-    start = pd.to_datetime(from_date)
-    end = pd.to_datetime(to_date)
-    if start > end:
-        return []
-    delta = timedelta(days=chunk_days)
-    current = start
-    ranges = []
-    while current <= end:
-        chunk_end = min(current + delta - timedelta(days=1), end)
-        ranges.append((
-            current.strftime("%Y-%m-%d"),
-            chunk_end.strftime("%Y-%m-%d")
-        ))
-        current = chunk_end + timedelta(days=1)
-    return ranges
 
 
 class MarketDataRepository:
@@ -114,21 +93,22 @@ class MarketDataRepository:
 
         from_date = from_date or "1900-01-01"
         to_date = to_date or "2099-12-31"
-        ranges = _chunk_date_ranges(from_date, to_date)
-        if not ranges:
-            return pd.DataFrame(columns=["Date", "Close"])
 
-        dfs = []
         try:
-            for chunk_start, chunk_end in ranges:
-                with self.engine.begin() as conn:
-                    chunk_df = pd.read_sql(q, conn, params={
+            dfs = []
+            with self.engine.begin() as conn:
+                for chunk in pd.read_sql(
+                    q,
+                    conn,
+                    params={
                         "symbol": symbol.upper(),
-                        "from_date": chunk_start,
-                        "to_date": chunk_end
-                    })
-                if not chunk_df.empty:
-                    dfs.append(chunk_df)
+                        "from_date": from_date,
+                        "to_date": to_date
+                    },
+                    chunksize=50_000
+                ):
+                    if not chunk.empty:
+                        dfs.append(chunk)
         except OperationalError as exc:
             logger.warning("Spot bulk fetch failed, resetting engine: %s", exc)
             reset_engine()

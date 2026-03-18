@@ -3,6 +3,10 @@ Startup script for backend server with proper import handling
 """
 import sys
 import os
+import uvloop
+
+# Ensure uvloop is installed before Uvicorn starts
+uvloop.install()
 
 # Add project root to Python path
 project_root = os.path.dirname(os.path.abspath(__file__))

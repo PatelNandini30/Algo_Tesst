@@ -10,6 +10,9 @@ COPY . .
 
 RUN mkdir -p /data/cleaned_csvs /data/expiryData /data/strikeData /data/Filter
 
+ENV UVICORN_LOOP=uvloop
+ENV UVICORN_WORKERS=1
+
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --loop $UVICORN_LOOP --workers $UVICORN_WORKERS"]

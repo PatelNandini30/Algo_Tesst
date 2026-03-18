@@ -101,32 +101,34 @@ class BacktestDataCache:
                 self.future_cache[date_str] = {}
                 self.spot_cache[date_str] = {}
             
-            # Build nested dict structure for O(1) lookups
-            for _, row in df.iterrows():
-                symbol = row['SYMBOL']
-                instrument = row['INSTRUMENT']
-                
-                if instrument == 'FUTIDX':
-                    # Future price
-                    self.future_cache[date_str][symbol] = row['CLOSE']
-                    
-                elif instrument in ['OPTIDX', 'OPTSTK']:
-                    # Option premium
-                    strike = float(row['STRIKE_PR'])
-                    option_type = row['OPTION_TYP']
-                    expiry = row['EXPIRY_DT']
-                    close_price = row['CLOSE']
-                    
-                    # Build nested structure: symbol -> strike -> option_type -> expiry -> premium
-                    if symbol not in self.option_cache[date_str]:
-                        self.option_cache[date_str][symbol] = {}
-                    if strike not in self.option_cache[date_str][symbol]:
-                        self.option_cache[date_str][symbol][strike] = {}
-                    if option_type not in self.option_cache[date_str][symbol][strike]:
-                        self.option_cache[date_str][symbol][strike][option_type] = {}
-                    
-                    self.option_cache[date_str][symbol][strike][option_type][expiry] = close_price
-            
+            # Build nested dict structure for O(1) lookups using vectorized Polars operations
+            pl_df = pl.from_pandas(df)
+            option_df = pl_df.filter(pl.col("INSTRUMENT").is_in(["OPTIDX", "OPTSTK"]))
+            future_df = pl_df.filter(pl.col("INSTRUMENT") == "FUTIDX")
+
+            if not option_df.is_empty():
+                symbols_l = option_df["SYMBOL"].to_list()
+                strikes_l = option_df["STRIKE_PR"].cast(pl.Float64).to_list()
+                option_types_l = option_df["OPTION_TYP"].to_list()
+                expiries_l = option_df["EXPIRY_DT"].dt.strftime("%Y-%m-%d").to_list()
+                closes_l = option_df["CLOSE"].cast(pl.Float64).to_list()
+
+                self.option_cache[date_str] = {
+                    (symbol, float(strike), option_type, expiry): close_price
+                    for symbol, strike, option_type, expiry, close_price in zip(
+                        symbols_l, strikes_l, option_types_l, expiries_l, closes_l
+                    )
+                    if symbol is not None and not pd.isna(strike) and option_type is not None
+                }
+            else:
+                self.option_cache[date_str] = {}
+
+            if not future_df.is_empty():
+                future_symbols = future_df["SYMBOL"].to_list()
+                future_closes = future_df["CLOSE"].cast(pl.Float64).to_list()
+                for symbol, close_price in zip(future_symbols, future_closes):
+                    if symbol:
+                        self.future_cache[date_str][symbol] = close_price
             # Load spot prices from strike data using existing get_strike_data function
             for symbol in symbols:
                 try:
@@ -158,10 +160,12 @@ class BacktestDataCache:
         Returns:
             Premium value or None if not found
         """
-        try:
-            return self.option_cache[date_str][symbol][strike][option_type][expiry]
-        except KeyError:
+        cache = self.option_cache.get(date_str)
+        if not cache:
             return None
+
+        key = (symbol, float(strike), option_type, expiry)
+        return cache.get(key)
     
     def get_future_price(self, date_str: str, symbol: str) -> Optional[float]:
         """
@@ -2540,7 +2544,13 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
     global _option_lookup_table, _future_lookup_table, _spot_lookup_table
 
-    from services.data_loader import bulk_load as _bulk_load, get_bulk_options_df, get_bulk_spot_df
+    from services.data_loader import (
+        bulk_load as _bulk_load,
+        get_bulk_options_df,
+        get_bulk_spot_df,
+        load_lookup_cache_from_redis,
+        store_lookup_cache_in_redis,
+    )
 
     # If dict already built for this range AND has entries, skip all work
     if (_bulk_loaded and _bulk_date_range == (from_date, to_date)
@@ -2555,35 +2565,45 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
 
     result = _bulk_load(symbol, from_date, to_date)
 
-    # FIX #1B: Build O(1) lookup dict using vectorized Polars ops + zip()
-    # Old code iterated millions of rows in pure Python (very slow).
-    # New code: filter CE/PE in Polars (vectorized C speed), then one zip pass.
-    options_df = get_bulk_options_df()
-    if options_df is not None and not options_df.is_empty():
-        _option_lookup_table.clear()
-        _future_lookup_table.clear()
-
-        # Filter to only CE/PE rows in Polars — vectorized, fast
-        opt_only = options_df.filter(pl.col("OptionType").is_in(["CE", "PE"]))
-
-        # Convert columns to Python lists in one shot (no per-row overhead)
-        dates_l    = opt_only["Date"].dt.strftime("%Y-%m-%d").to_list()
-        symbols_l  = opt_only["Symbol"].to_list()
-        strikes_l  = opt_only["StrikePrice"].cast(pl.Int64).to_list()
-        opt_l      = opt_only["OptionType"].to_list()
-        expiries_l = opt_only["ExpiryDate"].dt.strftime("%Y-%m-%d").to_list()
-        closes_l   = opt_only["Close"].to_list()
-
-        # Single-pass dict comprehension — much faster than loop + conditional
-        _option_lookup_table = {
-            (d, s, k, o, e): c
-            for d, s, k, o, e, c in zip(dates_l, symbols_l, strikes_l, opt_l, expiries_l, closes_l)
-        }
-
-        _bulk_bhav_df = None   # Don't keep raw DataFrame — dict is enough
+    lookup_loaded_from_redis = False
+    redis_lookup = load_lookup_cache_from_redis(symbol, from_date, to_date)
+    if redis_lookup:
+        _option_lookup_table = redis_lookup
+        _bulk_bhav_df = None
         _bulk_loaded = True
         _bulk_date_range = (from_date, to_date)
-        print(f"[BULK] Built O(1) lookup dict: {len(_option_lookup_table):,} entries")
+        lookup_loaded_from_redis = True
+        print(f"[BULK] Loaded O(1) lookup dict from Redis cache: {len(_option_lookup_table):,} entries")
+
+    # FIX #1B: Build O(1) lookup dict using vectorized Polars ops + zip()
+    if not lookup_loaded_from_redis:
+        options_df = get_bulk_options_df()
+        if options_df is not None and not options_df.is_empty():
+            _option_lookup_table.clear()
+            _future_lookup_table.clear()
+
+            # Filter to only CE/PE rows in Polars — vectorized, fast
+            opt_only = options_df.filter(pl.col("OptionType").is_in(["CE", "PE"]))
+
+            # Convert columns to Python lists in one shot (no per-row overhead)
+            dates_l    = opt_only["Date"].dt.strftime("%Y-%m-%d").to_list()
+            symbols_l  = opt_only["Symbol"].to_list()
+            strikes_l  = opt_only["StrikePrice"].cast(pl.Int64).to_list()
+            opt_l      = opt_only["OptionType"].to_list()
+            expiries_l = opt_only["ExpiryDate"].dt.strftime("%Y-%m-%d").to_list()
+            closes_l   = opt_only["Close"].to_list()
+
+            # Single-pass dict comprehension — much faster than loop + conditional
+            _option_lookup_table = {
+                (d, s, k, o, e): c
+                for d, s, k, o, e, c in zip(dates_l, symbols_l, strikes_l, opt_l, expiries_l, closes_l)
+            }
+
+            _bulk_bhav_df = None   # Don't keep raw DataFrame — dict is enough
+            _bulk_loaded = True
+            _bulk_date_range = (from_date, to_date)
+            print(f"[BULK] Built O(1) lookup dict: {len(_option_lookup_table):,} entries")
+            store_lookup_cache_in_redis(symbol, from_date, to_date, _option_lookup_table)
 
     spot_df = get_bulk_spot_df()
     if spot_df is not None and not spot_df.is_empty():

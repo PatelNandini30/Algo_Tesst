@@ -4,12 +4,15 @@ Celery tasks for background processing.
 import sys
 import os
 from datetime import datetime
+from pathlib import Path
 
 # Add backend to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from worker.celery import celery_app
+from services.upload_config import DATA_TYPE_METHODS
 from database import DATABASE_URL
+from migrate_data import Migrator
 from sqlalchemy import create_engine, text
 
 
@@ -88,6 +91,32 @@ def load_data_task(self, data_type: str, source: str):
         return {'status': 'completed', 'data_type': data_type}
     except Exception as e:
         return {'status': 'failed', 'error': str(e)}
+
+
+@celery_app.task(bind=True)
+def migrate_csv_task(self, temp_path: str, data_type: str, force: bool = False):
+    """Migrate an uploaded CSV via Migrator and delete the temp file."""
+    normalized = data_type.strip().lower()
+    method_name = DATA_TYPE_METHODS.get(normalized)
+    if method_name is None:
+        raise ValueError(f"Unknown data type for migration: {data_type}")
+
+    self.update_state(state='PROCESSING', meta={'status': f'Migrating {normalized}', 'progress': 0})
+    migrator = Migrator(force=force)
+    import_fn = getattr(migrator, method_name)
+
+    try:
+        result = import_fn(Path(temp_path))
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+    if result is None:
+        result = {}
+    result.setdefault('status', 'completed')
+    return result
 
 
 @celery_app.task

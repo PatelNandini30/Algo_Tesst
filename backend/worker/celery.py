@@ -5,7 +5,7 @@ import os
 from celery import Celery
 
 # Get Redis URL from environment
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
 # Create Celery app
 celery_app = Celery(
@@ -27,6 +27,13 @@ celery_app.conf.update(
     task_soft_time_limit=3000,  # 50 minutes soft limit
     worker_prefetch_multiplier=1,
     worker_concurrency=2,
+    broker_connection_retry_on_startup=True,
+    task_routes={
+        'worker.tasks.run_backtest_task': {'queue': 'backtests'},
+        'worker.tasks.run_algotest_job': {'queue': 'backtests'},
+        'worker.tasks.load_data_task': {'queue': 'uploads'},
+        'worker.tasks.migrate_csv_task': {'queue': 'uploads'},
+    },
 )
 
 

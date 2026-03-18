@@ -51,11 +51,11 @@ USE_POSTGRESQL = os.getenv("USE_POSTGRESQL", "true").lower() == "true"
 
 # Pool settings - reduced to prevent PostgreSQL "too many clients" errors
 # PostgreSQL default max_connections = 100, so pool + overflow should be <= 15
-POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))           # Persistent connections
-MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))        # Additional connections under load
+POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))           # Persistent connections
+MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "10"))        # Additional connections under load
 POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))     # Seconds to wait for connection
 POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))    # Recycle connections every 30 min
-STATEMENT_TIMEOUT = int(os.getenv("DB_STATEMENT_TIMEOUT", "300000"))  # 5 min query timeout
+STATEMENT_TIMEOUT = int(os.getenv("DB_STATEMENT_TIMEOUT", "1800000"))  # 5 min query timeout
 
 
 def _get_engine():

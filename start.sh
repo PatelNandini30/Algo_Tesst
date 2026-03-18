@@ -31,7 +31,7 @@ cd "$(dirname "$0")"
 # Stop any existing containers
 echo ""
 echo "[1/5] Stopping existing containers..."
-docker compose down 2>/dev/null
+docker compose down --remove-orphans 2>/dev/null
 
 # Free up required ports
 echo ""
