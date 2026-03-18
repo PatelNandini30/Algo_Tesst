@@ -846,22 +846,34 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
     """
     Load ALL option data for symbol/date-range into memory ONCE.
     This is the "on-ramp to the new highway" - call this before the engine loop.
-    
+
     After this call, all lookups happen in-memory (microseconds).
-    
+
+    FIX #4A: Clears the per-backtest bhav pandas cache in generic_multi_leg
+    at the start of each new load so stale date slices from a previous backtest
+    run never bleed into the new one.
+
     Returns dict with stats about loaded data.
     """
     global _bulk_options_df, _bulk_spot_df, _bulk_expiry_df, _bulk_loaded_key
-    
+
     cache_key = f"{symbol}:{from_date}:{to_date}"
-    
+
     # Already loaded for this request? Skip.
     if _bulk_loaded_key == cache_key and _bulk_options_df is not None:
         logger.info(f"[BULK] Already loaded: {cache_key}")
         return _get_bulk_stats()
-    
+
     logger.info(f"[BULK] Loading {symbol} {from_date} -> {to_date} ...")
     start_time = time.perf_counter()
+
+    # FIX #4A: Clear per-date pandas cache in the engine so old slices don't linger
+    try:
+        from engines.generic_multi_leg import _bhav_pandas_cache
+        _bhav_pandas_cache.clear()
+        logger.debug("[BULK] Cleared bhav pandas cache")
+    except Exception:
+        pass  # engine not imported yet — that's fine
     
     # Import repository
     from repositories.market_data_repository import MarketDataRepository

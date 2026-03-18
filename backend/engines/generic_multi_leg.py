@@ -62,17 +62,25 @@ except ImportError:
 
 
 def _get_next_weekly_expiry_after(weekly_exp: pd.DataFrame, entry_date: pd.Timestamp):
-    candidates = weekly_exp[weekly_exp["Current Expiry"] > entry_date].sort_values("Current Expiry")
-    if candidates.empty:
+    # FIX #3A: Use searchsorted instead of boolean filter + sort on every call.
+    # weekly_exp is already sorted by Current Expiry from load_expiry().
+    expiries = weekly_exp["Current Expiry"].values
+    idx = np.searchsorted(expiries, entry_date, side="right")
+    if idx >= len(expiries):
         return None
-    return candidates.iloc[0]["Current Expiry"]
+    return pd.Timestamp(expiries[idx])
 
 
-def _get_last_trading_day_on_or_before(spot_df: pd.DataFrame, target_date: pd.Timestamp):
-    candidates = spot_df[spot_df["Date"] <= target_date].sort_values("Date")
-    if candidates.empty:
+def _get_last_trading_day_on_or_before(spot_dates_arr, target_date: pd.Timestamp):
+    """
+    FIX #3A: Accepts a pre-extracted sorted numpy array of dates instead of
+    the full spot_df, and uses searchsorted for O(log n) lookup.
+    Old code did a full DataFrame filter + sort on every call.
+    """
+    idx = np.searchsorted(spot_dates_arr, target_date, side="right") - 1
+    if idx < 0:
         return None
-    return candidates.iloc[-1]["Date"]
+    return pd.Timestamp(spot_dates_arr[idx])
 
 
 def _same_segment(seg_a: Dict[str, Any], seg_b: Dict[str, Any]) -> bool:
@@ -194,29 +202,48 @@ def _select_strike_vectorized(available_strikes_df: pd.DataFrame, adjusted_spot:
     return None
 
 
+# FIX #3B: Per-date pandas cache — each unique date converts Polars→Pandas
+# exactly once per backtest run instead of once per trade entry/exit.
+_bhav_pandas_cache: dict = {}
+
+
 def _get_bhav_data(date: pd.Timestamp) -> pd.DataFrame:
     """
     Get bhavcopy data for a date - uses bulk-loaded in-memory data if available,
     falls back to load_bhavcopy DB query if not.
-    This is the KEY optimization: avoids 100+ DB queries inside the loop.
+
+    FIX #3B: Added per-date pandas cache so that entry and exit lookups for the
+    same date pay the Polars->Pandas conversion cost only once.
+    Old code called .to_pandas() on every entry AND exit — 700-1400 conversions
+    per backtest.  Now each unique date converts exactly once.
     """
     from base import is_bulk_data_loaded, fast_get_strikes_for_date
-    
+
     date_str = date.strftime("%Y-%m-%d")
-    
+
+    # Return cached slice immediately if available
+    cached = _bhav_pandas_cache.get(date_str)
+    if cached is not None:
+        return cached
+
     # Try to use bulk-loaded data first
     if is_bulk_data_loaded():
         try:
-            # Get all options for this date from bulk-loaded Polars DataFrame
             result = fast_get_strikes_for_date(date_str, None, None)
             if result is not None and not result.is_empty():
-                # Convert Polars to Pandas for compatibility with existing code
-                return result.to_pandas()
+                pd_result = result.to_pandas()
+                # Cache and evict if too large (keep last 20 unique dates)
+                _bhav_pandas_cache[date_str] = pd_result
+                if len(_bhav_pandas_cache) > 20:
+                    _bhav_pandas_cache.pop(next(iter(_bhav_pandas_cache)))
+                return pd_result
         except Exception as e:
             print(f"[WARN] Bulk lookup failed for {date_str}: {e}")
-    
+
     # Fallback to original DB query
-    return load_bhavcopy(date_str)
+    result = load_bhavcopy(date_str)
+    _bhav_pandas_cache[date_str] = result
+    return result
 
 
 def _process_trade_legs(
@@ -228,18 +255,18 @@ def _process_trade_legs(
     fut_expiry: pd.Timestamp,
     entry_spot: float,
 ):
-    # Use optimized data loading - the KEY fix for Phase 1
+    # Use optimized data loading - cached, no repeated Polars->Pandas conversion
     bhav_entry = _get_bhav_data(from_date)
-    bhav_exit = _get_bhav_data(to_date)
+    bhav_exit  = _get_bhav_data(to_date)
     if bhav_entry is None or bhav_exit is None:
         return []
 
     leg_rows = []
 
     for leg in strategy_def.legs:
-        leg_pnl = 0.0
+        leg_pnl         = 0.0
         leg_entry_price = None
-        leg_exit_price = None
+        leg_exit_price  = None
         selected_strike = None
 
         if leg.instrument == InstrumentType.OPTION:
@@ -249,81 +276,43 @@ def _process_trade_legs(
                 leg.strike_selection.spot_adjustment,
             )
 
-            option_mask = (
-                (bhav_entry["Instrument"] == "OPTIDX")
-                & (bhav_entry["Symbol"] == index_name)
-                & (bhav_entry["OptionType"] == leg.option_type.value)
-                & (
-                    (bhav_entry["ExpiryDate"] == curr_expiry)
-                    | (bhav_entry["ExpiryDate"] == curr_expiry - timedelta(days=1))
-                    | (bhav_entry["ExpiryDate"] == curr_expiry + timedelta(days=1))
-                )
-                & (bhav_entry["TurnOver"] > 0)
-            )
-
-            available_strikes = bhav_entry[option_mask]["StrikePrice"].unique()
-            available_strikes_series = pd.Series(available_strikes)
-            if available_strikes_series.empty:
-                continue
-
-            # OPTIMIZED: Use vectorized strike selection instead of row-by-row loop
-            # Pre-filter once to get all strikes with premiums
+            # FIX #3C: _get_all_strikes_for_expiry already applies the same
+            # Instrument/Symbol/OptionType/ExpiryDate±1 filter that option_mask
+            # was doing.  We no longer need the separate option_mask scan — use
+            # all_strikes_df for everything: strike selection AND entry price.
             all_strikes_df = _get_all_strikes_for_expiry(
                 bhav_entry, index_name, curr_expiry, leg.option_type.value
             )
-            
-            if not all_strikes_df.empty:
-                # Use vectorized selection
-                selected_strike = _select_strike_vectorized(
-                    all_strikes_df, adjusted_spot, leg.strike_selection
-                )
-            else:
-                # Fallback to old logic if bulk lookup didn't work
-                selected_strike = None
-                if leg.strike_selection.type == StrikeSelectionType.ATM:
-                    selected_strike = get_atm_strike(adjusted_spot, available_strikes_series)
-                elif leg.strike_selection.type == StrikeSelectionType.OTM_PERCENT:
-                    selected_strike = get_otm_strike(adjusted_spot, available_strikes_series, 
-                                                     leg.strike_selection.value, leg.option_type.value)
-                elif leg.strike_selection.type == StrikeSelectionType.ITM_PERCENT:
-                    selected_strike = get_itm_strike(adjusted_spot, available_strikes_series,
-                                                      leg.strike_selection.value, leg.option_type.value)
-                elif leg.strike_selection.type == StrikeSelectionType.SPOT:
-                    selected_strike = get_nearest_strike(adjusted_spot, available_strikes_series)
 
+            if all_strikes_df.empty:
+                continue
+
+            # Strike selection — vectorized
+            selected_strike = _select_strike_vectorized(
+                all_strikes_df, adjusted_spot, leg.strike_selection
+            )
             if selected_strike is None:
                 continue
 
-            entry_mask = bhav_entry[
-                (bhav_entry["Instrument"] == "OPTIDX")
-                & (bhav_entry["Symbol"] == index_name)
-                & (bhav_entry["OptionType"] == leg.option_type.value)
-                & (
-                    (bhav_entry["ExpiryDate"] == curr_expiry)
-                    | (bhav_entry["ExpiryDate"] == curr_expiry - timedelta(days=1))
-                    | (bhav_entry["ExpiryDate"] == curr_expiry + timedelta(days=1))
-                )
-                & (bhav_entry["StrikePrice"] == selected_strike)
-                & (bhav_entry["TurnOver"] > 0)
-            ]
-            if entry_mask.empty:
+            # FIX #3C: Pull entry price directly from already-filtered
+            # all_strikes_df — no new full-DataFrame mask scan needed.
+            strike_row = all_strikes_df[all_strikes_df["StrikePrice"] == selected_strike]
+            if strike_row.empty:
                 continue
-            leg_entry_price = entry_mask.iloc[0]["Close"]
+            leg_entry_price = strike_row.iloc[0]["Close"]
 
-            exit_mask = bhav_exit[
-                (bhav_exit["Instrument"] == "OPTIDX")
-                & (bhav_exit["Symbol"] == index_name)
-                & (bhav_exit["OptionType"] == leg.option_type.value)
-                & (
-                    (bhav_exit["ExpiryDate"] == curr_expiry)
-                    | (bhav_exit["ExpiryDate"] == curr_expiry - timedelta(days=1))
-                    | (bhav_exit["ExpiryDate"] == curr_expiry + timedelta(days=1))
-                )
-                & (bhav_exit["StrikePrice"] == selected_strike)
-            ]
-            if exit_mask.empty:
+            # Exit price still needs a scan on bhav_exit (different date)
+            # but we use _get_all_strikes_for_expiry to keep it consistent
+            # (single filter call instead of a multi-condition boolean mask).
+            exit_strikes_df = _get_all_strikes_for_expiry(
+                bhav_exit, index_name, curr_expiry, leg.option_type.value
+            )
+            if exit_strikes_df.empty:
                 continue
-            leg_exit_price = exit_mask.iloc[0]["Close"]
+            exit_row = exit_strikes_df[exit_strikes_df["StrikePrice"] == selected_strike]
+            if exit_row.empty:
+                continue
+            leg_exit_price = exit_row.iloc[0]["Close"]
 
             if leg.position == PositionType.BUY:
                 leg_pnl = round(leg_exit_price - leg_entry_price, 2)
@@ -361,7 +350,7 @@ def _process_trade_legs(
                 continue
 
             leg_entry_price = fut_entry_mask.iloc[0]["Close"]
-            leg_exit_price = fut_exit_mask.iloc[0]["Close"]
+            leg_exit_price  = fut_exit_mask.iloc[0]["Close"]
             if leg.position == PositionType.BUY:
                 leg_pnl = round(leg_exit_price - leg_entry_price, 2)
             else:
@@ -437,6 +426,26 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     weekly_exp = load_expiry(index_name, "weekly")
     monthly_exp = load_expiry(index_name, "monthly")
 
+    # FIX #3A: Pre-extract numpy arrays from DataFrames that are used in
+    # hot-path helper functions — avoids per-call DataFrame allocation.
+    spot_dates_arr    = spot_df["Date"].values                        # for _get_last_trading_day_on_or_before
+    spot_closes_arr   = spot_df["Close"].values                       # for O(1) spot price lookup
+    spot_dates_index  = {pd.Timestamp(d): i for i, d in enumerate(spot_dates_arr)}
+
+    # FIX #3D: Pre-build bisect arrays for filter_segments so the inner
+    # per-entry loop is O(log n) instead of O(segments).
+    import bisect as _bisect
+    if filter_enabled and filter_segments:
+        _fs_starts = [pd.Timestamp(s['start']) for s in filter_segments]
+        _fs_ends   = [pd.Timestamp(s['end'])   for s in filter_segments]
+    else:
+        _fs_starts = []
+        _fs_ends   = []
+
+    # FIX #3A: Pre-sort monthly_exp and extract values array once
+    monthly_exp_sorted   = monthly_exp.sort_values("Current Expiry").reset_index(drop=True)
+    monthly_exp_arr      = monthly_exp_sorted["Current Expiry"].values
+
     trades = []
 
     for w in range(len(weekly_exp)):
@@ -481,22 +490,15 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                         f"{pd.Timestamp(active_segment['start']).strftime('%d-%m-%Y')} -> "
                         f"{pd.Timestamp(active_segment['end']).strftime('%d-%m-%Y')}"
                     )
-                
-                # NEW: Date Range Filter entry check
-                if filter_enabled and filter_segments:
+
+                # FIX #3D: Date Range Filter — O(log n) bisect instead of O(n) loop
+                active_filter_segment = None
+                if filter_enabled and _fs_starts:
                     entry_ts = current_entry
-                    within_filter = False
-                    active_filter_segment = None
-                    
-                    for seg in filter_segments:
-                        seg_start = pd.Timestamp(seg['start'])
-                        seg_end = pd.Timestamp(seg['end'])
-                        if seg_start <= entry_ts <= seg_end:
-                            within_filter = True
-                            active_filter_segment = seg
-                            break
-                    
-                    if not within_filter:
+                    idx = _bisect.bisect_right(_fs_starts, entry_ts) - 1
+                    if idx >= 0 and entry_ts <= _fs_ends[idx]:
+                        active_filter_segment = filter_segments[idx]
+                    else:
                         print(f"Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside filter segments")
                         break
 
@@ -505,13 +507,11 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if trade_curr_expiry is None:
                     break
 
-                # Monthly expiry for futures legs
-                curr_monthly = monthly_exp[
-                    monthly_exp["Current Expiry"] >= trade_curr_expiry
-                ].sort_values("Current Expiry").reset_index(drop=True)
-                if curr_monthly.empty:
+                # FIX #3A: Replace monthly_exp filter+sort+reset_index with searchsorted
+                midx = np.searchsorted(monthly_exp_arr, trade_curr_expiry, side="left")
+                if midx >= len(monthly_exp_arr):
                     break
-                trade_fut_expiry = curr_monthly.iloc[0]["Current Expiry"]
+                trade_fut_expiry = pd.Timestamp(monthly_exp_arr[midx])
 
                 # Calendar exit competition: Expiry vs STR segment end
                 effective_to_date = trade_curr_expiry
@@ -519,30 +519,30 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if str_enabled and active_segment is not None:
                     seg_end = pd.Timestamp(active_segment["end"])
                     if seg_end < pd.Timestamp(trade_curr_expiry):
-                        last_trade_day = _get_last_trading_day_on_or_before(spot_df, seg_end)
+                        # FIX #3A: use pre-extracted array
+                        last_trade_day = _get_last_trading_day_on_or_before(spot_dates_arr, seg_end)
                         if last_trade_day is None:
                             break
                         effective_to_date = pd.Timestamp(last_trade_day)
                         exit_reason = "STR_Exit"
-                
-                # NEW: Date Range Filter exit adjustment
+
+                # Date Range Filter exit adjustment
                 if filter_enabled and active_filter_segment is not None:
                     filter_end = pd.Timestamp(active_filter_segment['end'])
                     if filter_end < pd.Timestamp(effective_to_date):
-                        # Filter ends before the current effective exit
-                        last_trade_day = _get_last_trading_day_on_or_before(spot_df, filter_end)
+                        last_trade_day = _get_last_trading_day_on_or_before(spot_dates_arr, filter_end)
                         if last_trade_day is not None:
                             effective_to_date = pd.Timestamp(last_trade_day)
                             if exit_reason == "Expiry":
                                 exit_reason = "FILTER_END"
 
-                entry_row = spot_df[spot_df["Date"] == current_entry]
-                exit_row = spot_df[spot_df["Date"] == effective_to_date]
-                if entry_row.empty or exit_row.empty:
+                # FIX #3A: O(1) spot price lookup via pre-built index dict
+                entry_idx = spot_dates_index.get(current_entry)
+                exit_idx  = spot_dates_index.get(effective_to_date)
+                if entry_idx is None or exit_idx is None:
                     break
-
-                entry_spot = entry_row.iloc[0]["Close"]
-                exit_spot = exit_row.iloc[0]["Close"]
+                entry_spot_price = float(spot_closes_arr[entry_idx])
+                exit_spot_price  = float(spot_closes_arr[exit_idx])
 
                 leg_rows = _process_trade_legs(
                     strategy_def=strategy_def,
@@ -551,7 +551,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     to_date=effective_to_date,
                     curr_expiry=pd.Timestamp(trade_curr_expiry),
                     fut_expiry=pd.Timestamp(trade_fut_expiry),
-                    entry_spot=entry_spot,
+                    entry_spot=entry_spot_price,
                 )
                 if not leg_rows:
                     break
@@ -569,9 +569,9 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                             "Qty": leg_row["Qty"],
                             "Entry Price": leg_row["Entry Price"],
                             "Exit Price": leg_row["Exit Price"],
-                            "Entry Spot": entry_spot,
-                            "Exit Spot": exit_spot,
-                            "Spot P&L": round(exit_spot - entry_spot, 2),
+                            "Entry Spot": entry_spot_price,
+                            "Exit Spot": exit_spot_price,
+                            "Spot P&L": round(exit_spot_price - entry_spot_price, 2),
                             "Future Expiry": trade_fut_expiry,
                             "Net P&L": leg_row["Net P&L"],
                             "Exit Reason": exit_reason if str_enabled else "",
@@ -583,10 +583,13 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if (not str_enabled) or exit_reason != "Expiry" or active_segment is None:
                     break
 
-                next_days = spot_df[spot_df["Date"] > effective_to_date].sort_values("Date")
-                if next_days.empty:
+                # FIX #3A: Use searchsorted on pre-extracted array instead of
+                # full DataFrame filter + sort to find next trading day
+                eff_ts = np.datetime64(effective_to_date)
+                nidx   = np.searchsorted(spot_dates_arr, eff_ts, side="right")
+                if nidx >= len(spot_dates_arr):
                     break
-                next_entry = pd.Timestamp(next_days.iloc[0]["Date"])
+                next_entry = pd.Timestamp(spot_dates_arr[nidx])
                 next_seg = get_active_str_segment(next_entry, str_config_value)
                 if not _same_segment(active_segment, next_seg):
                     break

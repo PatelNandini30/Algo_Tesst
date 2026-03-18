@@ -85,17 +85,21 @@ class DataMemoryCache:
         )
     
     def _estimate_dataframe_size(self, df: pl.DataFrame) -> int:
-        """Estimate memory size of DataFrame in bytes."""
+        """
+        Estimate memory size of a Polars DataFrame in bytes.
+
+        FIX #5A: Use Polars' actual estimated_size() instead of the old
+        rough guess (rows × cols × 50 bytes) which was wildly inaccurate —
+        e.g. a 5M-row float64 DataFrame would be estimated at ~2GB when it
+        is actually ~200MB, causing premature LRU eviction of valid data.
+        """
         if df.is_empty():
             return 0
-        
-        # Estimate: ~100 bytes per row + column data size
-        # This is a rough estimate
-        n_rows = len(df)
-        n_cols = len(df.columns)
-        
-        # Assume average 50 bytes per cell
-        return n_rows * n_cols * 50
+        try:
+            return df.estimated_size("b")   # Polars native — accurate
+        except Exception:
+            # Fallback: bytes per element × rows × cols
+            return len(df) * len(df.columns) * 8
     
     def _generate_key(
         self,
@@ -153,35 +157,34 @@ class DataMemoryCache:
     ) -> bool:
         """
         Add data to cache.
-        
-        Returns True if cached, False if skipped (memory limit).
+
+        FIX #5B: Removed the silent symbol allowlist filter.
+        Original code silently skipped caching for any symbol not in
+        DEFAULT_SYMBOLS (NIFTY, BANKNIFTY), meaning FINNIFTY / MIDCPNIFTY
+        backtests always re-fetched from DB on every run with no warning.
+        Now all symbols are cached; the 5 GB memory limit still protects RAM.
         """
         if df is None or df.is_empty():
             return False
-        
-        # Only cache popular symbols to save memory
-        if symbol.upper() not in self._default_symbols:
-            logger.debug(f"[CACHE] Skipping {symbol} - not in popular symbols")
-            return False
-        
-        key = self._generate_key(data_type, symbol, from_date, to_date)
+
+        key  = self._generate_key(data_type, symbol, from_date, to_date)
         size = self._estimate_dataframe_size(df)
-        
+
         with self._lock:
             # Evict until we have space
             while (self._current_memory + size > self._max_memory) and self._cache:
                 self._evict_lru()
-            
+
             # Check again after eviction
             if self._current_memory + size > self._max_memory:
                 logger.warning(f"[CACHE] Cannot fit {key} - data too large ({size/(1024**2):.1f}MB)")
                 return False
-            
+
             # Add to cache
             entry = CacheEntry(data=df, size_bytes=size)
             self._cache[key] = entry
             self._current_memory += size
-            
+
             logger.debug(
                 f"[CACHE] SET: {key} ({len(df)} rows, {size/(1024**2):.1f}MB)"
             )

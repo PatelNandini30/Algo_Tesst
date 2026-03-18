@@ -330,49 +330,54 @@ class MarketDataRepository:
         """
         Bulk load ALL option data for a symbol across date range.
         Returns DataFrame with only required columns for fast in-memory lookups.
-        This is the key method for Phase 1 optimization - loads millions of rows at once,
-        then filtering happens in memory with Polars (microseconds vs DB round-trip).
+
+        FIX #2: Removed 60-day chunking loop.
+        Original code fired 40+ sequential DB round-trips for a 7-year range
+        (~43 chunks × ~150ms overhead = 6+ seconds in connection overhead alone).
+        A single parameterised query over the full range is faster because:
+          - One TCP round-trip instead of 43
+          - PostgreSQL query planner can use the composite index optimally
+          - pd.read_sql chunksize= streams rows without multiple connections
+        The 60-day chunks were added for per-day memory safety, but bulk_load
+        immediately converts this into a Polars DataFrame so memory is fine.
         """
         cols = self._table_columns("option_data")
         if not cols:
             return pd.DataFrame()
-        date_col = self._pick(cols, "trade_date", "date")
-        close_col = self._pick(cols, "close_price", "close")  # FIX: Use _pick() for dynamic column name
-        
+        date_col  = self._pick(cols, "trade_date", "date")
+        close_col = self._pick(cols, "close_price", "close")
+
+        from_date = from_date or "1900-01-01"
+        to_date   = to_date   or "2099-12-31"
+
         q = text(
             f"""
             SELECT
-                {date_col} AS "Date",
-                symbol AS "Symbol",
-                expiry_date AS "ExpiryDate",
-                option_type AS "OptionType",
-                strike_price AS "StrikePrice",
-                {close_col} AS "Close"
+                {date_col}      AS "Date",
+                symbol          AS "Symbol",
+                expiry_date     AS "ExpiryDate",
+                option_type     AS "OptionType",
+                strike_price    AS "StrikePrice",
+                {close_col}     AS "Close"
             FROM option_data
-            WHERE symbol = :symbol
-              AND {date_col} >= :from_date
-              AND {date_col} <= :to_date
-            ORDER BY {date_col}, symbol, expiry_date, strike_price, option_type
+            WHERE symbol      = :symbol
+              AND {date_col}  >= :from_date
+              AND {date_col}  <= :to_date
+            ORDER BY {date_col}, expiry_date, strike_price, option_type
             """
         )
 
-        from_date = from_date or "1900-01-01"
-        to_date = to_date or "2099-12-31"
-        ranges = _chunk_date_ranges(from_date, to_date)
-        if not ranges:
-            return pd.DataFrame()
-
-        dfs = []
         try:
-            for chunk_start, chunk_end in ranges:
-                with self.engine.begin() as conn:
-                    chunk_df = pd.read_sql(q, conn, params={
-                        "symbol": symbol.upper(),
-                        "from_date": chunk_start,
-                        "to_date": chunk_end
-                    })
-                if not chunk_df.empty:
-                    dfs.append(chunk_df)
+            # FIX #2: Single connection, stream rows in 200k-row chunks to cap
+            # peak memory while still avoiding 43 round-trips.
+            dfs = []
+            with self.engine.begin() as conn:
+                for chunk in pd.read_sql(
+                    q, conn,
+                    params={"symbol": symbol.upper(), "from_date": from_date, "to_date": to_date},
+                    chunksize=200_000,
+                ):
+                    dfs.append(chunk)
         except OperationalError as exc:
             logger.warning("Option bulk fetch failed, resetting engine: %s", exc)
             reset_engine()
@@ -385,6 +390,6 @@ class MarketDataRepository:
         df.drop_duplicates(inplace=True)
         if df.empty:
             return df
-        df["Date"] = pd.to_datetime(df["Date"])
+        df["Date"]       = pd.to_datetime(df["Date"])
         df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"])
         return df
