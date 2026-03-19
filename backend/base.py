@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
 import polars as pl
+from polars.exceptions import InvalidOperationError
 from functools import lru_cache
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import math
 import os
 import asyncio
@@ -110,7 +111,7 @@ class BacktestDataCache:
                 symbols_l = option_df["SYMBOL"].to_list()
                 strikes_l = option_df["STRIKE_PR"].cast(pl.Float64).to_list()
                 option_types_l = option_df["OPTION_TYP"].to_list()
-                expiries_l = option_df["EXPIRY_DT"].dt.strftime("%Y-%m-%d").to_list()
+                expiries_l = _series_to_iso_date_list(option_df["EXPIRY_DT"])
                 closes_l = option_df["CLOSE"].cast(pl.Float64).to_list()
 
                 self.option_cache[date_str] = {
@@ -1692,6 +1693,27 @@ def _parse_single_date(date_str: str):
         return None
 
 
+def _to_iso_date(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return pd.Timestamp(value).strftime("%Y-%m-%d")
+        except Exception:
+            return value[:10]
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d")
+    except Exception:
+        return str(value)
+
+
+def _series_to_iso_date_list(series: pl.Series) -> list:
+    try:
+        return series.dt.strftime("%Y-%m-%d").to_list()
+    except InvalidOperationError:
+        return [_to_iso_date(v) or "" for v in series.to_list()]
+
+
 def parse_filter_csv(csv_content: str) -> list:
     """
     Parse uploaded CSV content for filter segments.
@@ -1758,13 +1780,42 @@ def parse_filter_csv(csv_content: str) -> list:
                 
                 segments.append({'start': start_date, 'end': end_date})
         
-        return segments
-        
+        return normalize_filter_segments(segments)
+
     except Exception as e:
         print(f"Error parsing filter CSV: {e}")
         return []
 
+def _normalize_filter_date(value) -> Optional[pd.Timestamp]:
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.normalize()
 
+
+def normalize_filter_segments(segments: list) -> list:
+    normalized: list = []
+    if not segments:
+        return normalized
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        start = _normalize_filter_date(seg.get('start'))
+        end = _normalize_filter_date(seg.get('end'))
+        if start is None or end is None:
+            continue
+        if start > end:
+            start, end = end, start
+        normalized.append({'start': start, 'end': end})
+
+    normalized.sort(key=lambda entry: entry['start'])
+    return normalized
 
 
 def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path='bhavcopy_data.db'):
@@ -2586,11 +2637,11 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
             opt_only = options_df.filter(pl.col("OptionType").is_in(["CE", "PE"]))
 
             # Convert columns to Python lists in one shot (no per-row overhead)
-            dates_l    = opt_only["Date"].dt.strftime("%Y-%m-%d").to_list()
+            dates_l    = _series_to_iso_date_list(opt_only["Date"])
             symbols_l  = opt_only["Symbol"].to_list()
             strikes_l  = opt_only["StrikePrice"].cast(pl.Int64).to_list()
             opt_l      = opt_only["OptionType"].to_list()
-            expiries_l = opt_only["ExpiryDate"].dt.strftime("%Y-%m-%d").to_list()
+            expiries_l = _series_to_iso_date_list(opt_only["ExpiryDate"])
             closes_l   = opt_only["Close"].to_list()
 
             # Single-pass dict comprehension — much faster than loop + conditional
@@ -2608,7 +2659,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     spot_df = get_bulk_spot_df()
     if spot_df is not None and not spot_df.is_empty():
         _spot_lookup_table.clear()
-        s_dates   = spot_df["Date"].dt.strftime("%Y-%m-%d").to_list()
+        s_dates   = _series_to_iso_date_list(spot_df["Date"])
         s_closes  = spot_df["Close"].to_list()
         _spot_lookup_table = {(d, symbol): c for d, c in zip(s_dates, s_closes)}
         _bulk_spot_df = None

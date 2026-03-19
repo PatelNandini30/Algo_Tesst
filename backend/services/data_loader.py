@@ -1078,7 +1078,7 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         options_future = (
-            executor.submit(repo.get_options_bulk, symbol_upper, _FULL_RANGE_FROM, _FULL_RANGE_TO)
+            executor.submit(repo.get_options_bulk, symbol_upper, from_date, to_date)
             if need_full_range_load else None
         )
         spot_future = executor.submit(repo.get_spot_data, symbol_upper, from_date, to_date)

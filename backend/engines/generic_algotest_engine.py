@@ -75,6 +75,8 @@ from base import (
     get_next_expiry_date,
     get_monthly_expiry_date,
     get_strike_data,
+    get_filter_segments,
+    normalize_filter_segments,
     # load_base2,  # Commented out - not using base2 filter
     load_bhavcopy,
     compute_analytics,
@@ -1122,15 +1124,14 @@ def run_algotest_backtest(params):
     if filter_enabled:
         # Import filter functions
         try:
-            from base import get_filter_segments, fmt_ddmmyyyy
             if filter_config == 'custom':
                 # Use custom segments from CSV upload
-                filter_segments = filter_segments_custom
+                filter_segments = normalize_filter_segments(filter_segments_custom)
                 _log(f"Custom Filter ON: {len(filter_segments)} segments")
                 print(f"FILTER: Custom segments loaded ({len(filter_segments)} ranges)")
             else:
                 # Use built-in filter (5x1, 5x2, base2)
-                filter_segments = get_filter_segments(filter_config)
+                filter_segments = normalize_filter_segments(get_filter_segments(filter_config))
                 _log(f"Filter ON: {filter_config}, segments={len(filter_segments)}")
                 print(f"FILTER: {filter_config} segments loaded ({len(filter_segments)} ranges)")
         except Exception as e:

@@ -1,10 +1,8 @@
 # Pandas 2.x compatibility - MUST be first before pandas is imported anywhere
-import asyncio
 import pandas as pd
 import uvloop
 uvloop.install()
 
-# Patch DataFrame.sort_values to handle 'by' keyword (removed in pandas 2.x)
 # Patch DataFrame.sort_values to handle 'by' keyword (removed in pandas 2.x)
 _orig_df_sort = pd.DataFrame.sort_values
 def _patched_df_sort(self, by=None, **kwargs):
@@ -22,18 +20,15 @@ def _patched_series_sort(self, by=None, **kwargs):
     return _orig_series_sort(self, **kwargs)
 pd.Series.sort_values = _patched_series_sort
 
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 import os
 import sys
+import psutil
+import redis as redis_lib
 
-from prometheus_fastapi_instrumentator import Instrumentator
-
-from base import bulk_load_options
 from database import get_pool_status
-from services.redis_cache import RedisBacktestCache, configure_cache
 
 # Add backend directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -43,11 +38,6 @@ from routers import backtest, expiry, strategies
 from routers.upload import router as upload_router
 
 # Create the FastAPI app
-REDIS_URL = os.getenv("REDIS_URL")
-BACKTEST_CACHE_TTL = int(os.getenv("BACKTEST_CACHE_TTL", "86400"))
-if REDIS_URL:
-    configure_cache(RedisBacktestCache(REDIS_URL, ttl=BACKTEST_CACHE_TTL))
-
 app = FastAPI(
     title="AlgoTest Clone API",
     version="1.0.0",
@@ -65,30 +55,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-Instrumentator().instrument(app).expose(app)
-
-_warm_executor = ThreadPoolExecutor(max_workers=1)
-
-
-@app.on_event("startup")
-async def warm_cache_on_startup():
-    async def _do_warm():
-        try:
-            await asyncio.sleep(5)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                _warm_executor,
-                bulk_load_options,
-                "NIFTY",
-                "2000-01-01",
-                "2026-12-31"
-            )
-            print("Startup cache warming complete")
-        except Exception as exc:
-            print(f"[STARTUP] Cache warming failed: {exc}")
-
-    asyncio.create_task(_do_warm())
 
 # Include routers
 app.include_router(backtest.router, prefix="/api", tags=["backtest"])
@@ -118,6 +84,40 @@ def health_check():
 @app.get("/health/db")
 def health_db():
     return {"database": get_pool_status()}
+
+@app.get("/health/stats")
+async def health_stats():
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    redis_status = {"status": "unavailable"}
+    redis_url = os.getenv("REDIS_URL")
+
+    if redis_url:
+        try:
+            client = redis_lib.Redis.from_url(redis_url)
+            info = client.info("memory")
+            redis_status = {
+                "used_memory_mb": round(info.get("used_memory", 0) / 1e6, 1),
+                "max_memory_mb": round(info.get("maxmemory", 0) / 1e6, 1),
+                "backtest_queue_depth": client.llen("backtests"),
+                "upload_queue_depth": client.llen("uploads"),
+            }
+        except Exception as exc:
+            redis_status = {"error": str(exc)}
+
+    return {
+        "host": {
+            "ram_total_gb": round(mem.total / 1e9, 2),
+            "ram_used_gb": round(mem.used / 1e9, 2),
+            "ram_free_gb": round(mem.available / 1e9, 2),
+            "ram_percent": mem.percent,
+            "swap_used_gb": round(swap.used / 1e9, 2),
+            "swap_percent": swap.percent,
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+        },
+        "redis": redis_status,
+        "status": "healthy",
+    }
 
 @app.get("/cache/stats")
 def cache_stats():

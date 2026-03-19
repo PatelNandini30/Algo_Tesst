@@ -92,4 +92,12 @@ echo ""
 echo "[5/5] Showing logs (Ctrl+C to stop watching)..."
 echo "=============================================="
 echo ""
-docker compose logs -f
+LOG_SERVICES=(
+  backend
+  worker-backtests
+  worker-uploads
+  frontend
+  postgres
+  redis
+)
+docker compose logs -f "${LOG_SERVICES[@]}"

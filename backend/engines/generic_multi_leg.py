@@ -33,6 +33,7 @@ try:
         load_bhavcopy,
         load_expiry,
         load_super_trend_dates,
+        normalize_filter_segments,
     )
 except ImportError as e:
     print(f"Failed to import from base: {e}")
@@ -399,10 +400,10 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
         try:
             from base import get_filter_segments
             if filter_config == 'custom':
-                filter_segments = filter_segments_custom
+                filter_segments = normalize_filter_segments(filter_segments_custom)
                 print(f"Custom Filter ON: {len(filter_segments)} segments")
             else:
-                filter_segments = get_filter_segments(filter_config)
+                filter_segments = normalize_filter_segments(get_filter_segments(filter_config))
                 print(f"Filter ON: {filter_config}, {len(filter_segments)} segments")
         except Exception as e:
             print(f"Warning: Error loading filter segments: {e}")

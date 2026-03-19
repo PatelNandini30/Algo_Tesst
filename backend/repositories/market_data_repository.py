@@ -4,12 +4,35 @@ from typing import Optional
 
 import pandas as pd
 import threading
+from datetime import datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from database import reset_engine
 
 logger = logging.getLogger(__name__)
+
+
+
+def _generate_date_chunks(from_date: str, to_date: str, days: int = 120):
+    try:
+        start = datetime.strptime(from_date, "%Y-%m-%d")
+    except Exception:
+        start = datetime.strptime("1900-01-01", "%Y-%m-%d")
+    try:
+        end = datetime.strptime(to_date, "%Y-%m-%d")
+    except Exception:
+        end = datetime.strptime("2099-12-31", "%Y-%m-%d")
+
+    if start > end:
+        start, end = end, start
+
+    current = start
+    while current <= end:
+        chunk_end = min(end, current + timedelta(days=days - 1))
+        yield current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")
+        current = chunk_end + timedelta(days=1)
+
 
 
 class MarketDataRepository:
@@ -348,16 +371,20 @@ class MarketDataRepository:
         )
 
         try:
-            # FIX #2: Single connection, stream rows in 200k-row chunks to cap
-            # peak memory while still avoiding 43 round-trips.
             dfs = []
             with self.engine.begin() as conn:
                 for chunk in pd.read_sql(
-                    q, conn,
-                    params={"symbol": symbol.upper(), "from_date": from_date, "to_date": to_date},
-                    chunksize=200_000,
+                    q,
+                    conn,
+                    params={
+                        "symbol": symbol.upper(),
+                        "from_date": from_date,
+                        "to_date": to_date,
+                    },
+                    chunksize=150_000,
                 ):
-                    dfs.append(chunk)
+                    if not chunk.empty:
+                        dfs.append(chunk)
         except OperationalError as exc:
             logger.warning("Option bulk fetch failed, resetting engine: %s", exc)
             reset_engine()

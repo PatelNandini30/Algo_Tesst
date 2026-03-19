@@ -1,8 +1,24 @@
+x-backend-env: &backend-env
+  DATABASE_URL: "postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}"
+  REDIS_URL: "redis://redis:6379/0"
+  DATA_DIR: /data
+  PYTHONUNBUFFERED: "1"
+  MALLOC_ARENA_MAX: "2"
+  DB_POOL_SIZE: "20"
+  DB_POOL_MAX_OVERFLOW: "10"
+  DB_POOL_TIMEOUT: "30"
+  DB_POOL_RECYCLE: "3600"
+x-backend-volumes: &backend-volumes
+  - ./cleaned_csvs:/data/cleaned_csvs:ro
+  - ./expiryData:/data/expiryData:ro
+  - ./strikeData:/data/strikeData:ro
+  - ./Filter:/data/Filter:ro
+  - parquet_cache:/tmp/parquet_cache
 services:
-  # PostgreSQL Database
   postgres:
     image: postgres:15-bullseye
     container_name: algotest-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-algotest}
       POSTGRES_USER: ${POSTGRES_USER:-algotest}
@@ -14,31 +30,49 @@ services:
       - ./reports/sql:/data:ro
     command: >
       postgres
-      -c max_connections=200
-      -c shared_buffers=2GB
-      -c effective_cache_size=6GB
-      -c work_mem=16MB
-      -c maintenance_work_mem=512MB
+      -c max_connections=100
+      -c shared_buffers=512MB
+      -c effective_cache_size=2GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=128MB
       -c random_page_cost=1.1
-      -c effective_io_concurrency=200
+      -c effective_io_concurrency=100
       -c max_worker_processes=4
       -c max_parallel_workers_per_gather=2
       -c max_parallel_workers=4
       -c checkpoint_completion_target=0.9
-      -c wal_buffers=16MB
+      -c wal_buffers=8MB
       -c default_statistics_target=100
+      -c log_min_duration_statement=1000
+      -c idle_in_transaction_session_timeout=600000
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotest}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 3500M
+          cpus: "2.0"
+        reservations:
+          memory: 1024M
     networks:
       - algotest-network
-
-  # Redis for caching and queue
   redis:
     image: redis:7-bullseye
     container_name: algotest-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 450mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+      --tcp-keepalive 60
+      --timeout 300
+    environment:
+      REDIS_PASSWORD: ""
     ports:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
@@ -48,15 +82,21 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+        reservations:
+          memory: 128M
     networks:
       - algotest-network
-
-  # Backend API
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: algotest-backend
+    restart: unless-stopped
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     command:
@@ -69,59 +109,60 @@ services:
       - --loop
       - uvloop
       - --workers
-      - "1"
+      - "2"
+      - --timeout-keep-alive
+      - "65"
+      - --no-server-header
     environment:
-      - UVICORN_LOOP=uvloop
-      - UVICORN_WORKERS=1
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
-      - DB_STATEMENT_TIMEOUT=1800000
-      - REDIS_URL=redis://redis:6379/0
-      - DATA_DIR=/data
-      - USE_POSTGRESQL=true
-      - ALLOW_CSV_FALLBACK=false
-      - PYTHONUNBUFFERED=1
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=${POSTGRES_DB:-algotest}
-      - POSTGRES_USER=${POSTGRES_USER:-algotest}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-algotest_password}
-    volumes:
-      - ./cleaned_csvs:/data/cleaned_csvs:ro
-      - ./expiryData:/data/expiryData:ro
-      - ./strikeData:/data/strikeData:ro
-      - ./Filter:/data/Filter:ro
-      - parquet_cache:/tmp/parquet_cache
+      <<: *backend-env
+      UVICORN_LOOP: uvloop
+      UVICORN_WORKERS: "2"
+      DB_STATEMENT_TIMEOUT: "1800000"
+      USE_POSTGRESQL: "true"
+      ALLOW_CSV_FALLBACK: "false"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-algotest}
+      POSTGRES_USER: ${POSTGRES_USER:-algotest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
+    volumes: *backend-volumes
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; r=urllib.request.urlopen('http://localhost:8000/health'); print(r.read())"]
       interval: 30s
-      timeout: 10s
+      timeout: 20s
       retries: 3
-      start_period: 15s
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.5"
+        reservations:
+          memory: 256M
     networks:
       - algotest-network
-
-  # Celery Worker for backtests
   worker-backtests:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: algotest-worker-backtests
-    command: celery -A worker.celery worker -Q backtests -c 4 -l info
-    environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
-      - REDIS_URL=redis://redis:6379/0
-      - DATA_DIR=/data
-    volumes:
-      - ./cleaned_csvs:/data/cleaned_csvs:ro
-      - ./expiryData:/data/expiryData:ro
-      - ./strikeData:/data/strikeData:ro
-      - ./Filter:/data/Filter:ro
-      - parquet_cache:/tmp/parquet_cache
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery worker
+      -Q backtests
+      -c 3
+      -l info
+      --max-memory-per-child=600000
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+    environment: *backend-env
+    volumes: *backend-volumes
     depends_on:
       postgres:
         condition: service_healthy
@@ -133,25 +174,32 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 3000M
+          cpus: "4.0"
+        reservations:
+          memory: 512M
     networks:
       - algotest-network
-
   worker-uploads:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: algotest-worker-uploads
-    command: celery -A worker.celery worker -Q uploads -c 2 -l info
-    environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}
-      - REDIS_URL=redis://redis:6379/0
-      - DATA_DIR=/data
-    volumes:
-      - ./cleaned_csvs:/data/cleaned_csvs:ro
-      - ./expiryData:/data/expiryData:ro
-      - ./strikeData:/data/strikeData:ro
-      - ./Filter:/data/Filter:ro
-      - parquet_cache:/tmp/parquet_cache
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery worker
+      -Q uploads
+      -c 2
+      -l info
+      --max-memory-per-child=400000
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+    environment: *backend-env
+    volumes: *backend-volumes
     depends_on:
       postgres:
         condition: service_healthy
@@ -163,54 +211,48 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1000M
+          cpus: "1.0"
+        reservations:
+          memory: 256M
     networks:
       - algotest-network
-
-  # Frontend - served via nginx which proxies /api to backend
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: algotest-frontend
+    restart: unless-stopped
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     depends_on:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      test: ["CMD-SHELL", "pkill -0 nginx || exit 1"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
     networks:
       - algotest-network
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: algotest-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-    networks:
-      - algotest-network
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: algotest-grafana
-    ports:
-      - "3001:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    networks:
-      - algotest-network
-
 volumes:
   pgdata:
   redis_data:
   parquet_cache:
-
 networks:
   algotest-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

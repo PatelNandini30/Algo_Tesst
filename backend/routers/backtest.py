@@ -20,6 +20,9 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Thread pool for async tasks (I/O/cache warming) and process pool for CPU-heavy backtests
 _backtest_executor = ThreadPoolExecutor(max_workers=3)
@@ -1868,8 +1871,14 @@ async def get_algotest_job_status(job_id: str):
     Check status/result of an async AlgoTest backtest job.
     """
     task = celery_app.AsyncResult(job_id)
-    state = task.state
-    info = task.result if task.state == "SUCCESS" else task.info
+    info = None
+    try:
+        state = task.state
+        info = task.result if state == "SUCCESS" else task.info
+    except ValueError as exc:
+        logger.warning("Malformed Celery metadata for job %s: %s", job_id, exc)
+        state = "FAILURE"
+        info = {"error": "Task metadata corrupted"}
     if state == "PENDING":
         return {"status": "queued"}
     if state in {"STARTED", "PROCESSING", "RETRY"}:
