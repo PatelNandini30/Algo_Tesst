@@ -4,7 +4,7 @@ Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
 
 # Set DEBUG = True to enable verbose logging for debugging
-DEBUG = False
+DEBUG = True
 
 def _log(*args, **kwargs):
     """Helper to print only when DEBUG is True"""
@@ -1124,16 +1124,27 @@ def run_algotest_backtest(params):
     if filter_enabled:
         # Import filter functions
         try:
+            from base import get_filter_segments
             if filter_config == 'custom':
-                # Use custom segments from CSV upload
-                filter_segments = normalize_filter_segments(filter_segments_custom)
+                # Use custom segments from CSV upload - don't normalize, use as-is
+                filter_segments = filter_segments_custom
                 _log(f"Custom Filter ON: {len(filter_segments)} segments")
                 print(f"FILTER: Custom segments loaded ({len(filter_segments)} ranges)")
+                if filter_segments:
+                    for i, seg in enumerate(filter_segments[:5]):
+                        print(f"  Segment {i+1}: {seg}")
+                    if len(filter_segments) > 5:
+                        print(f"  ... and {len(filter_segments) - 5} more segments")
             else:
                 # Use built-in filter (5x1, 5x2, base2)
-                filter_segments = normalize_filter_segments(get_filter_segments(filter_config))
+                filter_segments = get_filter_segments(filter_config)
                 _log(f"Filter ON: {filter_config}, segments={len(filter_segments)}")
                 print(f"FILTER: {filter_config} segments loaded ({len(filter_segments)} ranges)")
+                if filter_segments:
+                    for i, seg in enumerate(filter_segments[:3]):
+                        print(f"  Segment {i+1}: start={seg.get('start')}, end={seg.get('end')}")
+                    if len(filter_segments) > 3:
+                        print(f"  ... and {len(filter_segments) - 3} more segments")
         except Exception as e:
             _log(f"Warning: Error loading filter segments: {e}")
             filter_enabled = False
@@ -1333,6 +1344,8 @@ def run_algotest_backtest(params):
             
             # ===== NEW: DATE RANGE FILTER ENTRY/EXIT =====
             filter_exit_reason = None
+            trade_segment_end = None  # Store segment end for exit monitoring
+            
             if filter_enabled and filter_segments_ts:
                 # Check if entry is within any filter segment
                 entry_ts = pd.Timestamp(entry_date)
@@ -1349,13 +1362,10 @@ def run_algotest_backtest(params):
                     print(f"FILTER SKIP: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
                     _log(f"  Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
                     continue
-               
-                # Calculate filter-adjusted exit
-                # Exit = min(expiry, filter_end, SL_hit, Target_hit)
-                # But SL/Target handled separately during trade
-                # Here we just set the max exit based on filter
-                filter_end_ts = active_segment['end']
-                expiry_ts = pd.Timestamp(expiry_date)
+                
+                # Store segment_end for FILTER_END check in exit loop
+                trade_segment_end = active_segment['end']
+                
                 seg_start_ts = active_segment['start']
                 seg_end_ts = active_segment['end']
                 duration_days = (seg_end_ts - seg_start_ts).days + 1
@@ -1363,30 +1373,8 @@ def run_algotest_backtest(params):
                     "FILTER ENTRY: "
                     f"entry {entry_ts.strftime('%Y-%m-%d')} inside "
                     f"{seg_start_ts.strftime('%Y-%m-%d')} → {seg_end_ts.strftime('%Y-%m-%d')} "
-                    f"({duration_days}d); expiry {expiry_ts.strftime('%Y-%m-%d')}"
+                    f"({duration_days}d); expiry {pd.Timestamp(expiry_date).strftime('%Y-%m-%d')}"
                 )
-                
-                # If filter ends before expiry, adjust exit
-                if filter_end_ts < expiry_ts:
-                    # Find last trading day on or before filter end
-                    filter_exit = _last_trading_day_on_or_before(trading_calendar, filter_end_ts)
-                    if filter_exit and pd.Timestamp(filter_exit) >= entry_ts:
-                        # Update exit date to filter end
-                        # But base_exit_reason stays same - SL/Target still takes priority
-                        filter_exit_ts = pd.Timestamp(filter_exit)
-                        print(
-                            "FILTER EXIT: "
-                            f"filter end {filter_end_ts.strftime('%Y-%m-%d')} → "
-                            f"last trading day {filter_exit_ts.strftime('%Y-%m-%d')} "
-                            f"(expiry {expiry_ts.strftime('%Y-%m-%d')})"
-                        )
-                        _log(f"  Filter: exit adjusted to filter end {filter_exit.strftime('%Y-%m-%d') if hasattr(filter_exit, 'strftime') else filter_exit}")
-                        filter_exit_reason = 'FILTER_END'
-                    else:
-                        # Filter ends before entry - shouldn't happen but skip just in case
-                        print("FILTER SKIP: filter ends before valid exit")
-                        _log(f"  Filter skip: filter ends before valid exit")
-                        continue
             
             # ========== STEP 7: GET ENTRY SPOT PRICE ==========
             # Get spot from database (use index price at entry_date)
@@ -1758,6 +1746,22 @@ def run_algotest_backtest(params):
                 actual_exit_date = max(valid_dates) if valid_dates else exit_date
             else:
                 actual_exit_date = exit_date
+            
+            # ===== FILTER_END CHECK ===== 
+            # If filter is enabled and segment end arrives before scheduled exit,
+            # exit on segment end date with reason FILTER_END
+            if trade_segment_end is not None:
+                # Get the last trading day on or before segment end
+                filter_exit_day = _last_trading_day_on_or_before(trading_calendar, trade_segment_end)
+                if filter_exit_day is not None:
+                    # Compare with actual exit date (SL/TARGET might have fired earlier)
+                    if filter_exit_day < actual_exit_date:
+                        print(f"FILTER EXIT: segment end {trade_segment_end.strftime('%Y-%m-%d')} → last trading day {filter_exit_day.strftime('%Y-%m-%d')} (before scheduled exit {actual_exit_date.strftime('%Y-%m-%d')})")
+                        actual_exit_date = filter_exit_day
+                        filter_exit_reason = 'FILTER_END'
+                    elif filter_exit_day == actual_exit_date:
+                        # Same day as scheduled exit - don't override, use existing reason
+                        pass
 
             exit_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
 
@@ -1786,7 +1790,7 @@ def run_algotest_backtest(params):
                 'exit_dte':        exit_dte,
                 'entry_spot':      entry_spot,
                 'exit_spot':       exit_spot,
-                'exit_reason':     sl_reason or base_exit_reason,
+                'exit_reason':     sl_reason or filter_exit_reason or base_exit_reason,
                 'str_segment':     str_segment_label if str_enabled else '',
                 'legs':            trade_legs,
                 'total_pnl':       total_pnl,
@@ -2027,10 +2031,25 @@ def run_algotest_backtest(params):
             continue
     
     # ========== STEP 11: CONVERT TO DATAFRAME ==========
+    # Filter out trades with no legs (skipped due to missing option data)
+    all_trades = [t for t in all_trades if t.get('legs')]
+    
+    # DEBUG: Check what's in trades
+    if all_trades:
+        first_trade = all_trades[0]
+        print(f"DEBUG: First trade has {len(first_trade.get('legs', []))} legs")
+        print(f"DEBUG: First trade legs: {first_trade.get('legs')[:1] if first_trade.get('legs') else 'NONE'}")
+    
     print(f"\n{'='*60}")
     print(f"BACKTEST COMPLETE")
     print(f"{'='*60}")
     print(f"Total Trades: {len(all_trades)}")
+    
+    if all_trades:
+        first_trade_date = all_trades[0].get('entry_date', 'N/A')
+        last_trade_date = all_trades[-1].get('entry_date', 'N/A')
+        print(f"First trade entry: {first_trade_date}")
+        print(f"Last trade entry: {last_trade_date}")
     
     if not all_trades:
         print("No trades executed - returning empty results")
@@ -2040,84 +2059,101 @@ def run_algotest_backtest(params):
     # But we'll aggregate them back for analytics
     trades_flat = []
     trade_counter = 0
+    flatten_errors = []
     for trade_idx, trade in enumerate(all_trades, 1):
         entry_spot_val = trade['entry_spot']
         per_leg_res    = trade.get('per_leg_results')  # None if no SL/Target configured
 
         # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
-        for leg in trade['legs']:
-            leg_num = leg['leg_number']
-            li      = leg_num - 1  # 0-based index
+        for leg_idx, leg in enumerate(trade['legs']):
+            try:
+                leg_num = leg['leg_number']
+                li      = leg_num - 1  # 0-based index
 
-            # ── Resolve per-leg exit date & reason ────────────────────────────
-            # In partial mode different legs can exit on different dates.
-            # In complete / overall-SL mode all legs share the same date.
-            if per_leg_res is not None and li < len(per_leg_res):
-                leg_exit_date   = per_leg_res[li].get('exit_date') or trade['exit_date']
-                leg_exit_reason = per_leg_res[li].get('exit_reason', 'SCHEDULED')
-            else:
-                leg_exit_date   = trade['exit_date']
-                leg_exit_reason = trade.get('exit_reason', 'SCHEDULED')
+                # ── Resolve per-leg exit date & reason ────────────────────────────
+                # In partial mode different legs can exit on different dates.
+                # In complete / overall-SL mode all legs share the same date.
+                if per_leg_res is not None and li < len(per_leg_res):
+                    leg_exit_date   = per_leg_res[li].get('exit_date') or trade['exit_date']
+                    leg_exit_reason = per_leg_res[li].get('exit_reason', 'SCHEDULED')
+                else:
+                    leg_exit_date   = trade['exit_date']
+                    leg_exit_reason = trade.get('exit_reason', 'SCHEDULED')
 
-            # ── Exit spot price taken from the leg's own exit date ─────────────
-            # Each leg may exit on a different day (partial mode), so we fetch
-            # the spot price for that specific exit date.
-            leg_exit_spot = get_spot_price_from_db(leg_exit_date, trade.get('index', 'NIFTY'))
-            if leg_exit_spot is None:
-                leg_exit_spot = trade.get('exit_spot', entry_spot_val)
+                # ── Exit spot price taken from the leg's own exit date ─────────────
+                # Each leg may exit on a different day (partial mode), so we fetch
+                # the spot price for that specific exit date.
+                leg_exit_spot = get_spot_price_from_db(leg_exit_date, trade.get('index', 'NIFTY'))
+                if leg_exit_spot is None:
+                    leg_exit_spot = trade.get('exit_spot', entry_spot_val)
 
-            # ── Entry / Exit price (premium for options, price for futures) ────
-            if leg['segment'] == 'FUTURE':
-                option_type = 'FUT'
-                position    = leg['position']
-                strike      = ''
-                entry_price = leg['entry_price']
-                # Use early_exit_date's price if the leg was triggered early
-                exit_price  = leg.get('exit_price', 0)
-            else:
-                option_type = leg['option_type']
-                position    = leg['position']
-                strike      = leg['strike']
-                entry_price = leg['entry_premium']
-                # exit_premium is always updated to the correct exit date's market price:
-                #   • for triggered legs: set during the SL/TGT recalc block above
-                #   • for scheduled legs: set during initial options processing
-                exit_price  = leg.get('exit_premium', 0)
+                # ── Entry / Exit price (premium for options, price for futures) ────
+                if leg['segment'] == 'FUTURE':
+                    option_type = 'FUT'
+                    position    = leg['position']
+                    strike      = ''
+                    entry_price = leg['entry_price']
+                    # Use early_exit_date's price if the leg was triggered early
+                    exit_price  = leg.get('exit_price', 0)
+                else:
+                    option_type = leg['option_type']
+                    position    = leg['position']
+                    strike      = leg['strike']
+                    entry_price = leg['entry_premium']
+                    # exit_premium is always updated to the correct exit date's market price:
+                    #   • for triggered legs: set during the SL/TGT recalc block above
+                    #   • for scheduled legs: set during initial options processing
+                    exit_price  = leg.get('exit_premium', 0)
 
-            leg_pnl  = leg['pnl']
-            lots     = leg.get('lots', 1)
-            lot_size = leg.get('lot_size', 65)
-            qty      = lots * lot_size
+                    leg_pnl  = leg["pnl"]
+                    lots     = leg.get("lots", 1)
+                    lot_size = leg.get("lot_size", 65)
+                    qty      = lots * lot_size
 
-            # % P&L — based on Entry Spot: (Points P&L / Entry Spot) * 100
-            entry_spot_val = trade.get('entry_spot', 0)
-            pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
+                    # % P&L — based on Entry Spot
+                    entry_spot_val = trade.get("entry_spot", 0)
+                    pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
 
-            row = {
-                'Trade':        trade_idx,
-                'Leg':          leg_num,
-                'Index':        trade_counter + leg_num,
-                'Entry Date':   trade['entry_date'],
-                'Exit Date':    leg_exit_date,          # per-leg (differs in partial mode)
-                'Type':         option_type,
-                'Strike':       strike,
-                'B/S':          position,
-                'Qty':          qty,
-                'Entry Price':  entry_price,
-                'Exit Price':   exit_price,             # correct price for this leg's exit date
-                'Entry Spot':   entry_spot_val,
-                'Exit Spot':    leg_exit_spot,          # spot on this leg's exit date
-                'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if leg_exit_spot and entry_spot_val else 0,
-                'Future Expiry': trade['expiry_date'],
-                'Net P&L':      leg_pnl,
-                '% P&L':        pct_pnl,
-                'Exit Reason':  leg_exit_reason,        # per-leg reason
-                'STR Segment':  trade.get('str_segment', ''),
-            }
+                    row = {
+                        'Trade':        trade_idx,
+                        'Leg':          leg_num,
+                        'Index':        trade_counter + leg_num,
+                        'Entry Date':   trade['entry_date'],
+                        'Exit Date':    leg_exit_date,          # per-leg (differs in partial mode)
+                        'Type':         option_type,
+                        'Strike':       strike,
+                        'B/S':          position,
+                        'Qty':          qty,
+                        'Entry Price':  entry_price,
+                        'Exit Price':   exit_price,             # correct price for this leg's exit date
+                        'Entry Spot':   entry_spot_val,
+                        'Exit Spot':    leg_exit_spot,          # spot on this leg's exit date
+                        'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if leg_exit_spot and entry_spot_val else 0,
+                        'Future Expiry': trade['expiry_date'],
+                        'Net P&L':      leg_pnl,
+                        '% P&L':        pct_pnl,
+                        'Exit Reason':  leg_exit_reason,        # per-leg reason
+                        'STR Segment':  trade.get('str_segment', ''),
+                        }
 
-            trades_flat.append(row)
+                    trades_flat.append(row)
+            except Exception as e:
+                flatten_errors.append(f"Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
+                continue
 
         trade_counter += len(trade['legs'])
+    
+    # DEBUG: Print flatten results
+    print(f"DEBUG FLATTEN: Created {len(trades_flat)} rows from {len(all_trades)} trades")
+    if flatten_errors:
+        print(f"DEBUG FLATTEN ERRORS (first 5): {flatten_errors[:5]}")
+    if not trades_flat and all_trades:
+        # Inspect first trade structure
+        first = all_trades[0]
+        print(f"DEBUG: First trade keys: {list(first.keys())}")
+        print(f"DEBUG: First trade legs type: {type(first.get('legs'))}, len: {len(first.get('legs', []))}")
+        if first.get('legs'):
+            print(f"DEBUG: First leg keys: {list(first['legs'][0].keys())}")
     
     trades_df = pd.DataFrame(trades_flat)
     

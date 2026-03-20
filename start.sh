@@ -28,6 +28,34 @@ fi
 # Navigate to project directory
 cd "$(dirname "$0")"
 
+# Check if containers are already healthy
+echo ""
+echo "[0/5] Checking existing containers..."
+ALL_HEALTHY=true
+for container in backend frontend postgres redis worker-backtests worker-uploads; do
+    status=$(docker compose ps -q $container 2>/dev/null)
+    if [ ! -z "$status" ]; then
+        health=$(docker inspect --format='{{.State.Health.Status}}' $container 2>/dev/null)
+        if [ "$health" = "healthy" ]; then
+            echo "  $container: healthy"
+        else
+            echo "  $container: not healthy (will restart)"
+            ALL_HEALTHY=false
+        fi
+    else
+        echo "  $container: not running (will start)"
+        ALL_HEALTHY=false
+    fi
+done
+
+# Only stop containers if not all are healthy
+if [ "$ALL_HEALTHY" = "true" ]; then
+    echo ""
+    echo "All containers are healthy! Skipping restart."
+    echo "To force restart, run: docker compose down && docker compose up -d"
+    exit 0
+fi
+
 # Stop any existing containers
 echo ""
 echo "[1/5] Stopping existing containers..."

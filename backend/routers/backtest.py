@@ -21,8 +21,21 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_date(value: Any) -> str:
+    if not value:
+        return ''
+    value = str(value).strip()
+    for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d']:
+        try:
+            return datetime.strptime(value, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return value
 
 # Thread pool for async tasks (I/O/cache warming) and process pool for CPU-heavy backtests
 _backtest_executor = ThreadPoolExecutor(max_workers=3)
@@ -387,6 +400,10 @@ class BacktestRequest(BaseModel):
     protection: bool = False
     protection_pct: float = 1.0
     
+    # Filter segments (MUST be in cache key!)
+    filter_config: Optional[str] = None
+    filter_segments: List[Dict[str, Any]] = []
+    
     # Cache control
     no_cache: bool = False
 
@@ -464,6 +481,9 @@ async def run_backtest_logic(request: BacktestRequest):
     """
     # Check Redis cache first
     cache_params = request.model_dump()
+    cache_params['date_from'] = _normalize_date(cache_params.get('date_from'))
+    cache_params['date_to'] = _normalize_date(cache_params.get('date_to'))
+
     if not request.no_cache:
         try:
             from services.backtest_cache import get_backtest_cache
@@ -471,21 +491,25 @@ async def run_backtest_logic(request: BacktestRequest):
             if redis_cache.is_available():
                 cache_key = redis_cache.generate_key(
                     symbol=request.index,
-                    from_date=request.date_from,
-                    to_date=request.date_to,
+                    from_date=cache_params['date_from'],
+                    to_date=cache_params['date_to'],
                     strategy_config=cache_params
                 )
                 cached_result = redis_cache.get(cache_key)
                 if cached_result:
                     print(f"⚡ REDIS CACHE HIT")
+                    cached_result.setdefault('meta', {})['_cache_hit'] = True
+                    cached_result['_cache_hit'] = True
                     return cached_result
-        except:
+        except Exception:
             pass
     
     # Check in-memory cache
     if not request.no_cache:
         cached_result = backtest_cache.get(cache_params)
         if cached_result is not None:
+            cached_result.setdefault('meta', {})['_cache_hit'] = True
+            cached_result['_cache_hit'] = True
             return cached_result
     
     print(f"🚀 FAST LOAD: {request.index} {request.date_from} to {request.date_to}")
@@ -588,7 +612,8 @@ async def run_backtest_logic(request: BacktestRequest):
             pivot=PivotData(headers=pivot.get("headers", []), rows=pivot.get("rows", [])),
             log=[]
         )
-        
+        response.meta["_cache_hit"] = False
+       
         # Store result in Redis cache for future requests
         if not request.no_cache:
             try:
@@ -600,6 +625,7 @@ async def run_backtest_logic(request: BacktestRequest):
                     "summary": summary if summary else {},
                     "pivot": pivot
                 }
+                result_data["_cache_hit"] = False
                 redis_cache.set(cache_key, result_data, ttl=86400)  # 24hr TTL
                 print(f"💾 Stored result in Redis cache")
             except Exception as e:
@@ -917,6 +943,10 @@ async def dynamic_backtest(
     # Create cache key from request (exclude no_cache flag from key)
     cache_params = request.copy()
     cache_params.pop('no_cache', None)
+
+    for date_field in ['from_date', 'to_date', 'date_from', 'date_to']:
+        if date_field in cache_params:
+            cache_params[date_field] = _normalize_date(cache_params[date_field])
     
     # Check Redis cache first (if configured)
     if not no_cache and shared_redis_cache:
@@ -924,6 +954,8 @@ async def dynamic_backtest(
             cached_result = shared_redis_cache.get(cache_params)
             if cached_result:
                 print("Returning redis cache hit")
+                cached_result.setdefault('meta', {})['_cache_hit'] = True
+                cached_result['_cache_hit'] = True
                 return cached_result
         except Exception as exc:
             print(f"[REDIS] Cache read failed: {exc}")
@@ -933,6 +965,8 @@ async def dynamic_backtest(
         cached_result = backtest_cache.get(cache_params)
         if cached_result is not None:
             print("Returning cached result")
+            cached_result.setdefault('meta', {})['_cache_hit'] = True
+            cached_result['_cache_hit'] = True
             return cached_result
     
      # ADD THIS - Log what frontend sends
@@ -1485,7 +1519,9 @@ async def dynamic_backtest(
             "drawdown": drawdown_data,
             "log": []
         }
-        
+        response_data["meta"]["_cache_hit"] = False
+        response_data["_cache_hit"] = False
+
         # Cache the result
         if not no_cache and shared_redis_cache:
             try:

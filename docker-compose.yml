@@ -28,12 +28,13 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./reports/sql:/data:ro
+    shm_size: '256mb'
     command: >
       postgres
       -c max_connections=100
-      -c shared_buffers=512MB
+      -c shared_buffers=256MB
       -c effective_cache_size=2GB
-      -c work_mem=32MB
+      -c work_mem=16MB
       -c maintenance_work_mem=128MB
       -c random_page_cost=1.1
       -c effective_io_concurrency=100
@@ -45,6 +46,7 @@ services:
       -c default_statistics_target=100
       -c log_min_duration_statement=1000
       -c idle_in_transaction_session_timeout=600000
+      -c statement_timeout=120000
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotest}"]
       interval: 10s

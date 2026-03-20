@@ -2023,6 +2023,11 @@ def get_expiry_dates(symbol: str = "NIFTY", expiry_type: str = "weekly", from_da
     # Load expiry data
     expiry_df = load_expiry(symbol, expiry_type)
     
+    # If empty and user asked for weekly, fallback to monthly
+    # This handles pre-2019 dates where NIFTY weekly options didn't exist
+    if expiry_df.empty and expiry_type.upper() == 'WEEKLY':
+        expiry_df = load_expiry(symbol, 'monthly')
+    
     # Apply date filters if provided
     if from_date:
         from_date = pd.to_datetime(from_date)
@@ -2616,15 +2621,33 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
 
     result = _bulk_load(symbol, from_date, to_date)
 
+    # Check Redis cache, but verify it covers the FULL requested range
     lookup_loaded_from_redis = False
-    redis_lookup = load_lookup_cache_from_redis(symbol, from_date, to_date)
-    if redis_lookup:
-        _option_lookup_table = redis_lookup
-        _bulk_bhav_df = None
-        _bulk_loaded = True
-        _bulk_date_range = (from_date, to_date)
-        lookup_loaded_from_redis = True
-        print(f"[BULK] Loaded O(1) lookup dict from Redis cache: {len(_option_lookup_table):,} entries")
+    options_df = get_bulk_options_df()
+    if options_df is not None and not options_df.is_empty():
+        min_date = str(options_df["Date"].min())
+        max_date = str(options_df["Date"].max())
+        if min_date <= from_date and max_date >= to_date:
+            # DataFrame covers the full requested range
+            _option_lookup_table.clear()
+            _future_lookup_table.clear()
+            opt_only = options_df.filter(pl.col("OptionType").is_in(["CE", "PE"]))
+            dates_l    = _series_to_iso_date_list(opt_only["Date"])
+            symbols_l  = opt_only["Symbol"].to_list()
+            strikes_l  = opt_only["StrikePrice"].cast(pl.Int64).to_list()
+            opt_l      = opt_only["OptionType"].to_list()
+            expiries_l = _series_to_iso_date_list(opt_only["ExpiryDate"])
+            closes_l   = opt_only["Close"].to_list()
+            _option_lookup_table = {
+                (d, s, k, o, e): c
+                for d, s, k, o, e, c in zip(dates_l, symbols_l, strikes_l, opt_l, expiries_l, closes_l)
+            }
+            _bulk_bhav_df = None
+            _bulk_loaded = True
+            _bulk_date_range = (from_date, to_date)
+            lookup_loaded_from_redis = True
+            print(f"[BULK] Built O(1) lookup dict from loaded data: {len(_option_lookup_table):,} entries")
+            print(f"[BULK] Data range: {min_date} to {max_date} (requested: {from_date} to {to_date})")
 
     # FIX #1B: Build O(1) lookup dict using vectorized Polars ops + zip()
     if not lookup_loaded_from_redis:

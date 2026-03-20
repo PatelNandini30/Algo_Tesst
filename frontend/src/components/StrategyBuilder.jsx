@@ -436,15 +436,72 @@ const StrategyBuilder = () => {
     return format(parsed, 'dd/MM/yyyy');
   };
 
+  // When filter is toggled ON, automatically set date range to filter's start/end
+  // Limit to last 5 years to avoid memory/disk issues
+  const prevFilterEnabledRef = useRef(false);
+  const lastAutoDateRef = useRef(null);
+  const [showFullRange, setShowFullRange] = useState(false);
+  useEffect(() => {
+    if (strFilter.enabled && !prevFilterEnabledRef.current && strFilter.summary?.range) {
+      const filterStart = formatSummaryDateInput(strFilter.summary.range.from);
+      const filterEnd = formatSummaryDateInput(strFilter.summary.range.to);
+      
+      // Check if filter range is larger than 5 years
+      const filterStartDate = new Date(strFilter.summary.range.from);
+      const fiveYearsAgo = new Date();
+      fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
+      const needsLimited = filterStartDate < fiveYearsAgo;
+      
+      if (needsLimited && !showFullRange) {
+        // Use 5 years ago as start
+        const proposedStart = formatSummaryDateInput(fiveYearsAgo.toISOString().split('T')[0]);
+        if (proposedStart && filterEnd) {
+          setStartDate(proposedStart);
+          setEndDate(filterEnd);
+          lastAutoDateRef.current = `${proposedStart}|${filterEnd}`;
+          evaluateDateValidation(proposedStart, filterEnd);
+        }
+      } else {
+        // Use full filter range
+        if (filterStart && filterEnd) {
+          setStartDate(filterStart);
+          setEndDate(filterEnd);
+          lastAutoDateRef.current = `${filterStart}|${filterEnd}`;
+          evaluateDateValidation(filterStart, filterEnd);
+        }
+      }
+    }
+    prevFilterEnabledRef.current = strFilter.enabled;
+    // Reset showFullRange when filter is disabled
+    if (!strFilter.enabled) {
+      setShowFullRange(false);
+    }
+  }, [strFilter.enabled, strFilter.summary?.range, evaluateDateValidation, showFullRange]);
+
+  // Also update dates when range changes (e.g., different filter config selected)
   useEffect(() => {
     if (!strFilter.enabled || !strFilter.summary?.range) return;
-    const proposedStart = formatSummaryDateInput(strFilter.summary.range.from);
-    const proposedEnd = formatSummaryDateInput(strFilter.summary.range.to);
-    if (!proposedStart || !proposedEnd) return;
-    if (startDate === proposedStart && endDate === proposedEnd) return;
+    
+    const filterStart = formatSummaryDateInput(strFilter.summary.range.from);
+    const filterEnd = formatSummaryDateInput(strFilter.summary.range.to);
+    
+    const filterStartDate = new Date(strFilter.summary.range.from);
+    const fiveYearsAgo = new Date();
+    fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
+    const needsLimited = filterStartDate < fiveYearsAgo;
+    
+    const proposedStart = (needsLimited && !showFullRange) 
+      ? formatSummaryDateInput(fiveYearsAgo.toISOString().split('T')[0])
+      : filterStart;
+    
+    if (!proposedStart || !filterEnd) return;
+    // Only auto-update if dates haven't been manually changed (compare with last auto-set values)
+    const currentAutoKey = `${proposedStart}|${filterEnd}`;
+    if (lastAutoDateRef.current === currentAutoKey) return;
     setStartDate(proposedStart);
-    setEndDate(proposedEnd);
-    evaluateDateValidation(proposedStart, proposedEnd);
+    setEndDate(filterEnd);
+    lastAutoDateRef.current = currentAutoKey;
+    evaluateDateValidation(proposedStart, filterEnd);
   }, [
     strFilter.enabled,
     strFilter.summary?.range?.from,
@@ -452,6 +509,7 @@ const StrategyBuilder = () => {
     startDate,
     endDate,
     evaluateDateValidation,
+    showFullRange,
   ]);
 
   // Memoize static derived values so they don't rebuild on every keystroke
@@ -1343,6 +1401,22 @@ const StrategyBuilder = () => {
                 <DateInput value={endDate} onChange={handleEndDateChange} />
               </div>
             </div>
+            {strFilter.enabled && strFilter.summary?.range && (() => {
+              const filterStart = new Date(strFilter.summary.range.from);
+              const fiveYearsAgo = new Date();
+              fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
+              const needsLimited = filterStart < fiveYearsAgo;
+              if (!needsLimited) return null;
+              return (
+                <button
+                  type="button"
+                  onClick={() => setShowFullRange(true)}
+                  className="px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors"
+                >
+                  Load Full Range ({formatSummaryDateInput(strFilter.summary.range.from)} → {formatSummaryDateInput(strFilter.summary.range.to)})
+                </button>
+              );
+            })()}
           </div>
         </div>
         {validationError && (

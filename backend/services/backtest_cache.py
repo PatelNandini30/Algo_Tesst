@@ -98,18 +98,23 @@ class BacktestCache:
     
     def _serialize_result(self, result: Dict[str, Any]) -> str:
         """Serialize backtest result to JSON."""
-        # Convert pandas DataFrames to dict
         serialized = {}
-        
+
+        trades_data = None
         if "trades_df" in result and result["trades_df"] is not None:
-            serialized["trades"] = result["trades_df"].to_dict(orient="records")
-        
+            trades_data = result["trades_df"].to_dict(orient="records")
+        elif "trades" in result and result["trades"] is not None:
+            trades_data = result["trades"]
+
+        if trades_data is not None:
+            serialized["trades"] = trades_data
+
         if "summary" in result:
             serialized["summary"] = result["summary"]
-        
+
         if "pivot" in result:
             serialized["pivot"] = result["pivot"]
-        
+
         return json.dumps(serialized, default=str)
     
     def _deserialize_result(self, data: str) -> Optional[Dict[str, Any]]:
@@ -119,7 +124,9 @@ class BacktestCache:
             result = {}
             
             if "trades" in parsed:
-                result["trades_df"] = pd.DataFrame(parsed["trades"])
+                trades = parsed["trades"]
+                result["trades"] = trades
+                result["trades_df"] = pd.DataFrame(trades)
             
             if "summary" in parsed:
                 result["summary"] = parsed["summary"]
@@ -140,24 +147,42 @@ class BacktestCache:
         strategy_config: Dict[str, Any] = None
     ) -> str:
         """
-        Generate cache key from parameters.
-        
-        Key format: backtest:{symbol}:{from_date}:{to_date}:{strategy_hash}
+        Generate collision-resistant cache key.
+        Uses full SHA256 of ALL params combined.
+        Any change to any parameter = different key = fresh calculation.
         """
-        parts = [
-            "backtest",
-            symbol.upper(),
-            from_date,
-            to_date
-        ]
-        
-        if strategy_config:
-            # Generate hash from strategy config
-            config_str = json.dumps(strategy_config, sort_keys=True, default=str)
-            config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
-            parts.append(config_hash)
-        
-        return ":".join(parts)
+        def normalize_date(d: Any) -> str:
+            if not d:
+                return ''
+            d = str(d).strip()
+            for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d']:
+                try:
+                    from datetime import datetime
+                    return datetime.strptime(d, fmt).strftime('%Y-%m-%d')
+                except ValueError:
+                    continue
+            return d
+
+        from_date_norm = normalize_date(from_date)
+        to_date_norm = normalize_date(to_date)
+
+        key_payload = {
+            'symbol': symbol.upper() if symbol else '',
+            'from_date': from_date_norm,
+            'to_date': to_date_norm,
+            'config': strategy_config or {}
+        }
+
+        if isinstance(key_payload['config'], dict):
+            config_copy = dict(key_payload['config'])
+            for field in ['no_cache', 'request_id', 'timestamp', 'user_id']:
+                config_copy.pop(field, None)
+            key_payload['config'] = config_copy
+
+        key_str = json.dumps(key_payload, sort_keys=True, default=str)
+        full_hash = hashlib.sha256(key_str.encode()).hexdigest()
+
+        return f"backtest:{symbol.upper() if symbol else ''}:{from_date_norm}:{to_date_norm}:{full_hash}"
     
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         """

@@ -1014,9 +1014,9 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
 
     After this call, all lookups happen in-memory (microseconds).
 
-    FIX #4A: Clears the per-backtest bhav pandas cache in generic_multi_leg
-    at the start of each new load so stale date slices from a previous backtest
-    run never bleed into the new one.
+    FIX: Always validate that cached data covers the FULL requested date range.
+    Previously, if data was "loaded" for a symbol, it would skip DB queries even
+    if the cached data only covered a smaller range (e.g., 2025 only instead of 2024-2026).
 
     Returns dict with stats about loaded data.
     """
@@ -1027,8 +1027,19 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
     key = hashlib.md5(cache_key.encode()).hexdigest()
     parquet_path = Path(PARQUET_CACHE_DIR) / f"{key}.parquet"
 
-    if _is_full_range_loaded(symbol_upper):
-        logger.info(f"[BULK] Full range already loaded for {symbol_upper}")
+    cached_data_valid = False
+    
+    if _is_full_range_loaded(symbol_upper) and _bulk_options_df is not None:
+        # Validate cached data covers the requested date range
+        min_date = str(_bulk_options_df["Date"].min())
+        max_date = str(_bulk_options_df["Date"].max())
+        if min_date <= from_date and max_date >= to_date:
+            logger.info(f"[BULK] Full range already loaded for {symbol_upper} ({min_date} to {max_date})")
+            cached_data_valid = True
+        else:
+            logger.info(f"[BULK] Cached data ({min_date} to {max_date}) doesn't cover requested range ({from_date} to {to_date}) - reloading")
+            _full_range_loaded = False
+            _bulk_options_df = None
     else:
         if parquet_path.exists():
             age = time.time() - os.path.getmtime(parquet_path)
@@ -1040,26 +1051,44 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
                     _full_range_symbol = symbol_upper
                     _bulk_loaded_key = cache_key
                     elapsed_cache = time.perf_counter() - start_cache
-                    logger.info(f"[BULK] Loaded full range from Parquet cache in {elapsed_cache:.2f}s")
+                    logger.info(f"[BULK] Loaded from Parquet cache in {elapsed_cache:.2f}s")
+                    
+                    # Verify Parquet data covers requested range
+                    if _bulk_options_df is not None and not _bulk_options_df.is_empty():
+                        min_date = str(_bulk_options_df["Date"].min())
+                        max_date = str(_bulk_options_df["Date"].max())
+                        if min_date > from_date or max_date < to_date:
+                            logger.info(f"[BULK] Parquet data ({min_date} to {max_date}) doesn't cover requested range ({from_date} to {to_date}) - will reload from DB")
+                            _full_range_loaded = False
+                            _bulk_options_df = None
+                        else:
+                            cached_data_valid = True
                 except Exception as exc:
                     logger.warning(f"[BULK] Parquet cache load failed: {exc}")
 
         if not _is_full_range_loaded(symbol_upper):
             cached_df = _load_full_range_from_redis(symbol_upper)
-            if cached_df is not None:
-                _bulk_options_df = cached_df
-                _full_range_loaded = True
-                _full_range_symbol = symbol_upper
-                _bulk_loaded_key = cache_key
-                logger.info("[BULK] Loaded full range from Redis cache for %s", symbol_upper)
+            if cached_df is not None and not cached_df.is_empty():
+                # Verify Redis data covers requested range
+                min_date = str(cached_df["Date"].min())
+                max_date = str(cached_df["Date"].max())
+                if min_date <= from_date and max_date >= to_date:
+                    _bulk_options_df = cached_df
+                    _full_range_loaded = True
+                    _full_range_symbol = symbol_upper
+                    _bulk_loaded_key = cache_key
+                    cached_data_valid = True
+                    logger.info("[BULK] Loaded from Redis cache for %s (%s to %s)", symbol_upper, min_date, max_date)
+                else:
+                    logger.info("[BULK] Redis data (%s to %s) doesn't cover requested range (%s to %s) - will reload", min_date, max_date, from_date, to_date)
 
-    need_full_range_load = not _is_full_range_loaded(symbol_upper)
+    need_full_range_load = not cached_data_valid
     logger.info(
-        "[BULK] Loading %s %s -> %s (%s full range load)",
+        "[BULK] Loading %s %s -> %s (%s)",
         symbol_upper,
         from_date,
         to_date,
-        "forcing" if need_full_range_load else "using cache"
+        "FORCING DB LOAD" if need_full_range_load else "using cache"
     )
     start_time = time.perf_counter()
 
