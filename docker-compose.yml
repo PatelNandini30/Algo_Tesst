@@ -13,7 +13,7 @@ x-backend-volumes: &backend-volumes
   - ./expiryData:/data/expiryData:ro
   - ./strikeData:/data/strikeData:ro
   - ./Filter:/data/Filter:ro
-  - parquet_cache:/tmp/parquet_cache
+  - /tmp/algo_parquet_cache:/tmp/parquet_cache
 services:
   postgres:
     image: postgres:15-bullseye
@@ -58,7 +58,7 @@ services:
           memory: 3500M
           cpus: "2.0"
         reservations:
-          memory: 1024M
+          memory: 3072M
     networks:
       - algotest-network
   redis:
@@ -111,9 +111,9 @@ services:
       - --loop
       - uvloop
       - --workers
-      - "2"
+      - "1"
       - --timeout-keep-alive
-      - "65"
+      - "300"
       - --no-server-header
     environment:
       <<: *backend-env
@@ -142,7 +142,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1024M
+          memory: 3072M
           cpus: "1.5"
         reservations:
           memory: 256M
@@ -157,13 +157,15 @@ services:
     command: >
       celery -A worker.celery worker
       -Q backtests
-      -c 3
-      -l info
+      -c 4
+      -l warning
       --max-memory-per-child=600000
       --without-gossip
       --without-mingle
       --without-heartbeat
-    environment: *backend-env
+    environment:
+      <<: *backend-env
+      BACKTEST_WORKERS: "4"
     volumes: *backend-volumes
     depends_on:
       postgres:
@@ -179,7 +181,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3000M
+          memory: 4000M
           cpus: "4.0"
         reservations:
           memory: 512M
@@ -252,6 +254,11 @@ volumes:
   pgdata:
   redis_data:
   parquet_cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /tmp/algo_parquet_cache
 networks:
   algotest-network:
     driver: bridge

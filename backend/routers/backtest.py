@@ -143,22 +143,15 @@ router = APIRouter()
 
 def _run_generic_multi_leg_worker(params: dict):
     """Worker entry point for ProcessPoolExecutor to keep FastAPI async."""
-    from base import bulk_load_options, bulk_clear_options
+    from base import bulk_load_options
 
     index = params.get("index", "NIFTY")
     from_date = params.get("from_date") or params.get("date_from")
     to_date = params.get("to_date") or params.get("date_to")
 
-    try:
-        if index and from_date and to_date:
-            bulk_load_options(index, from_date, to_date)
-        return run_generic_multi_leg(params)
-    finally:
-        try:
-            bulk_clear_options()
-            print("[CLEANUP] Bulk data cleared from memory")
-        except Exception as exc:
-            print(f"[WARN] Failed to clear bulk data: {exc}")
+    if index and from_date and to_date:
+        bulk_load_options(index, from_date, to_date)
+    return run_generic_multi_leg(params)
 
 
 @router.post("/clear-cache")
@@ -497,7 +490,6 @@ async def run_backtest_logic(request: BacktestRequest):
                 )
                 cached_result = redis_cache.get(cache_key)
                 if cached_result:
-                    print(f"⚡ REDIS CACHE HIT")
                     cached_result.setdefault('meta', {})['_cache_hit'] = True
                     cached_result['_cache_hit'] = True
                     return cached_result
@@ -512,8 +504,6 @@ async def run_backtest_logic(request: BacktestRequest):
             cached_result['_cache_hit'] = True
             return cached_result
     
-    print(f"🚀 FAST LOAD: {request.index} {request.date_from} to {request.date_to}")
-
     # Convert frontend parameters to engine format (STRICT MAPPING)
     params = {
         # Core parameters
@@ -626,15 +616,13 @@ async def run_backtest_logic(request: BacktestRequest):
                     "pivot": pivot
                 }
                 result_data["_cache_hit"] = False
-                redis_cache.set(cache_key, result_data, ttl=86400)  # 24hr TTL
-                print(f"💾 Stored result in Redis cache")
+                redis_cache.set(cache_key, result_data, ttl=86400)
             except Exception as e:
-                print(f"[WARN] Failed to cache to Redis: {e}")
+                pass
         
         return response
         
     except Exception as e:
-        print(f"Error in backtest endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -698,9 +686,7 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
     """
     Execute a strategy using the AlgoTest engine for DTE-based positional strategies
     """
-    # DEBUG: Print what params we received
-    print(f"\n>>> execute_strategy received params: {list(params.keys())}")
-    print(f">>> strategy_type: {params.get('strategy_type')}")
+
     # Normalize DTE values before passing to the AlgoTest engine so it always receives integers.
     def _coerce_int(value, default):
         try:
@@ -710,8 +696,6 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
 
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2)
     exit_dte = _coerce_int(params.get('exit_dte', 0), 0)
-    print(f">>> entry_dte: {entry_dte}")
-    print(f">>> exit_dte: {exit_dte}")
     
     # PRELOAD DATA FOR PERFORMANCE
     # bulk_load_options builds the O(1) lookup dict — called from thread pool (never blocks main loop)
@@ -719,30 +703,16 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
     from_date = params.get('from_date') or params.get('date_from')
     to_date = params.get('to_date') or params.get('date_to')
     index = params.get('index', 'NIFTY')
-    print(f"🚀 PRELOAD CHECK 3: from_date={from_date}, to_date={to_date}, index={index}")
+
     if from_date and to_date:
         bulk_load_options(index, from_date, to_date)
     
     # Check if positional strategy with entry_dte/exit_dte
     is_positional = params.get('strategy_type') == 'positional' or ('entry_dte' in params and 'exit_dte' in params)
     
-    print(f">>> is_positional: {is_positional}")
-    
     if is_positional:
-        print("\nUsing AlgoTest engine (DTE-based positional strategy)\n")
-
-        # Build AlgoTest params
         expiry_type = params.get('expiry_type', 'WEEKLY')
-        
-        # Build legs config
         original_legs = params.get('original_legs', [])
-        print(f"\n>>> DEBUG: original_legs count = {len(original_legs)}")
-        if original_legs:
-            print(f">>> DEBUG: First original leg keys: {list(original_legs[0].keys())}")
-            if 'stopLoss' in original_legs[0]:
-                print(f">>> DEBUG: First leg has stopLoss: {original_legs[0]['stopLoss']}")
-            else:
-                print(f">>> DEBUG: First leg does NOT have stopLoss")
         
         legs_config = []
         for idx, leg in enumerate(strategy_def.legs):
@@ -818,17 +788,14 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
                         upper_val = getattr(strike_sel, 'upper', None) or getattr(strike_sel, 'premium_max', None)
                         leg_config['lower'] = lower_val
                         leg_config['upper'] = upper_val
-                        print(f"  >>> PREMIUM_RANGE: lower={lower_val}, upper={upper_val}")
                     elif 'PREMIUM_GTE' in strike_type or 'PREMIUM_GE' in strike_type or 'PREMIUM >=' in strike_type:
                         leg_config['strike_selection'] = 'PREMIUM_GTE'
                         leg_config['strike_selection_type'] = 'PREMIUM_GTE'
                         leg_config['premium'] = strike_sel.premium or strike_sel.value
-                        print(f"  >>> PREMIUM_GTE: premium={leg_config['premium']}")
                     elif 'PREMIUM_LTE' in strike_type or 'PREMIUM_LE' in strike_type or 'PREMIUM <=' in strike_type:
                         leg_config['strike_selection'] = 'PREMIUM_LTE'
                         leg_config['strike_selection_type'] = 'PREMIUM_LTE'
                         leg_config['premium'] = strike_sel.premium or strike_sel.value
-                        print(f"  >>> PREMIUM_LTE: premium={leg_config['premium']}")
                     else:
                         leg_config['strike_selection'] = 'ATM'
                 else:
@@ -841,17 +808,13 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             # Copy stopLoss from original leg if present
             if 'stopLoss' in original_leg and isinstance(original_leg['stopLoss'], dict):
                 leg_config['stopLoss'] = original_leg['stopLoss']
-                print(f"  Leg {idx+1}: Copying stopLoss from request: {original_leg['stopLoss']}")
             
-            # Copy targetProfit from original leg if present
             if 'targetProfit' in original_leg and isinstance(original_leg['targetProfit'], dict):
                 leg_config['targetProfit'] = original_leg['targetProfit']
-                print(f"  Leg {idx+1}: Copying targetProfit from request: {original_leg['targetProfit']}")
             
             legs_config.append(leg_config)
         
         square_off_mode = params.get('square_off_mode', 'partial')
-        print(f"\n>>> DEBUG: square_off_mode from params = '{square_off_mode}'")
         
         algotest_params = {
             'index': params.get('index', 'NIFTY'),
@@ -876,9 +839,8 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
             try:
                 from base import bulk_clear_options
                 bulk_clear_options()
-                print("[CLEANUP] Bulk data cleared from memory")
-            except Exception as e:
-                print(f"[WARN] Failed to clear bulk data: {e}")
+            except Exception:
+                pass
         return result
     
     # Default to generic_multi_leg
@@ -897,9 +859,8 @@ def execute_strategy(strategy_def: StrategyDefinition, params: Dict[str, Any]) -
         try:
             from base import bulk_clear_options
             bulk_clear_options()
-            print("[CLEANUP] Bulk data cleared from memory")
-        except Exception as e:
-            print(f"[WARN] Failed to clear bulk data: {e}")
+        except Exception:
+            pass
     return result
 
 
@@ -953,18 +914,16 @@ async def dynamic_backtest(
         try:
             cached_result = shared_redis_cache.get(cache_params)
             if cached_result:
-                print("Returning redis cache hit")
                 cached_result.setdefault('meta', {})['_cache_hit'] = True
                 cached_result['_cache_hit'] = True
                 return cached_result
-        except Exception as exc:
-            print(f"[REDIS] Cache read failed: {exc}")
+        except Exception:
+            pass
 
     # Check in-memory cache
     if not no_cache:
         cached_result = backtest_cache.get(cache_params)
         if cached_result is not None:
-            print("Returning cached result")
             cached_result.setdefault('meta', {})['_cache_hit'] = True
             cached_result['_cache_hit'] = True
             return cached_result
@@ -1021,7 +980,6 @@ async def dynamic_backtest(
             # TRANSFORMATION: Handle AlgoTest format
             # Check if this is AlgoTest format (has 'segment' field instead of 'instrument')
             if 'segment' in req_leg and 'instrument' not in req_leg:
-                print(f"Detected AlgoTest format, transforming...")
                 
                 # Map segment to instrument
                 segment_map = {"options": "Option", "futures": "Future", "option": "Option", "future": "Future"}
@@ -1144,8 +1102,6 @@ async def dynamic_backtest(
                 if segment_map.get(segment) == "Option":
                     req_leg["option_type"] = option_type_map.get(option_type_val, "CE")
                     req_leg["expiry_type"] = expiry_map.get(expiry, "Weekly")
-                
-                print(f"Transformed to: {req_leg}")
             
             # Validate instrument type
             instrument_str = req_leg.get("instrument", "")
@@ -1526,8 +1482,8 @@ async def dynamic_backtest(
         if not no_cache and shared_redis_cache:
             try:
                 shared_redis_cache.set(cache_params, response_data)
-            except Exception as exc:
-                print(f"[REDIS] Cache write failed: {exc}")
+            except Exception:
+                pass
         backtest_cache.set(cache_params, response_data)
         
         # DEBUG: Log what we're sending to frontend
@@ -1544,9 +1500,6 @@ async def dynamic_backtest(
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-        error_msg = f"Error in dynamic backtest endpoint: {str(e)}\n{traceback.format_exc()}"
-        print(error_msg)
         raise HTTPException(status_code=500, detail=str(e))
 
 # End of dynamic_backtest function
@@ -1896,7 +1849,6 @@ async def queue_algotest_job(request: dict):
     Enqueue an AlgoTest backtest to run asynchronously via Celery.
     """
     payload = dict(request or {})
-    print(f"🔁 QUEUED BACKTEST: {payload.get('index', 'NIFTY')} {payload.get('date_from')} → {payload.get('date_to')}")
     task = run_algotest_job.apply_async(args=[payload])
     return {"status": "queued", "job_id": task.id}
 

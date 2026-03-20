@@ -29,6 +29,8 @@ celery_app.conf.update(
     task_soft_time_limit=3000,  # 50 minutes soft limit
     worker_prefetch_multiplier=1,
     broker_connection_retry_on_startup=True,
+    broker_connection_retry=True,
+    broker_connection_max_retries=3,
     task_routes={
         'worker.tasks.run_backtest_task': {'queue': 'backtests'},
         'worker.tasks.run_algotest_job': {'queue': 'backtests'},

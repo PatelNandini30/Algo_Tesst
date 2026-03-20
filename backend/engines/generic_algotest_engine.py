@@ -4,7 +4,7 @@ Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
 
 # Set DEBUG = True to enable verbose logging for debugging
-DEBUG = True
+DEBUG = False
 
 def _log(*args, **kwargs):
     """Helper to print only when DEBUG is True"""
@@ -16,6 +16,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import sys
 import os
+import time
 
 
 def get_lot_size(index, entry_date):
@@ -349,34 +350,22 @@ def _copy_sl_tgt_to_leg(leg_dict, leg_src):
     if 'stopLoss' in leg_src and isinstance(leg_src['stopLoss'], dict):
         leg_dict['stop_loss']      = leg_src['stopLoss'].get('value')
         leg_dict['stop_loss_type'] = _normalize_sl_tgt_type(leg_src['stopLoss'].get('mode'))
-        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Stop Loss configured - "
-              f"value={leg_dict['stop_loss']}, type={leg_dict['stop_loss_type']} "
-              f"(from stopLoss dict)")
     elif leg_src.get('stop_loss') is not None:
         leg_dict['stop_loss']      = leg_src['stop_loss']
         leg_dict['stop_loss_type'] = _normalize_sl_tgt_type(leg_src.get('stop_loss_type'))
-        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Stop Loss configured - "
-              f"value={leg_dict['stop_loss']}, type={leg_dict['stop_loss_type']} "
-              f"(from flat keys)")
     else:
         leg_dict['stop_loss']      = None
         leg_dict['stop_loss_type'] = 'pct'
-        print(f"  ✗ Leg {leg_dict.get('leg_number', '?')}: No Stop Loss configured")
 
     if 'targetProfit' in leg_src and isinstance(leg_src['targetProfit'], dict):
         leg_dict['target']      = leg_src['targetProfit'].get('value')
         leg_dict['target_type'] = _normalize_sl_tgt_type(leg_src['targetProfit'].get('mode'))
-        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Target configured - "
-              f"value={leg_dict['target']}, type={leg_dict['target_type']}")
     elif leg_src.get('target') is not None:
         leg_dict['target']      = leg_src['target']
         leg_dict['target_type'] = _normalize_sl_tgt_type(leg_src.get('target_type'))
-        print(f"  ✓ Leg {leg_dict.get('leg_number', '?')}: Target configured - "
-              f"value={leg_dict['target']}, type={leg_dict['target_type']}")
     else:
         leg_dict['target']      = None
         leg_dict['target_type'] = 'pct'
-        print(f"  ✗ Leg {leg_dict.get('leg_number', '?')}: No Target configured")
 
 
 def _apply_overall_sl_to_per_leg(per_leg_results, overall_date, overall_reason, n_legs, scheduled_exit_date=None):
@@ -451,7 +440,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
     if not has_any_sl_target:
         return None
     
-    print(f"\n>>> check_leg_stop_loss_target: square_off_mode = '{square_off_mode}'")
+
 
     # All trading days between entry (exclusive) and planned exit (inclusive)
     holding_days = trading_calendar[
@@ -489,11 +478,6 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             if sl_val is None and tgt_val is None:
                 continue  # No SL/Target for this leg
             
-            # Log what we're checking (only when SL/Target is configured)
-            if sl_val is not None or tgt_val is not None:
-                print(f"    Checking Leg {li+1} on {check_date.strftime('%Y-%m-%d')}: "
-                      f"SL={sl_val} ({sl_type}), Target={tgt_val} ({tgt_type})")
-
             position = leg['position']
             lot_size = leg.get('lot_size', get_lot_size(index, entry_date))
             lots     = leg.get('lots', 1)
@@ -620,20 +604,9 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
 
             if hit_sl or hit_tgt:
                 reason = 'STOP_LOSS' if hit_sl else 'TARGET'
-                # ALWAYS log when SL/Target triggers (even when DEBUG=False)
-                print(f"      {'🛑' if hit_sl else '✅'} Leg {li+1} {reason} on "
-                      f"{check_date.strftime('%Y-%m-%d')} "
-                      f"| Mode: {sl_type if hit_sl else tgt_type} "
-                      f"| Threshold: {sl_val if hit_sl else tgt_val} "
-                      f"| adverse_pct={adverse_pct:.2f}% "
-                      f"| adverse_pts={adverse_premium_pts:.2f} "
-                      f"| adverse_spot_pts={adverse_spot_pts:.2f} "
-                      f"| adverse_spot_pct={adverse_spot_pct:.2f}%")
                 newly_triggered_this_day.append((li, check_date, reason))
 
-        # ── Apply triggers based on square_off_mode ──
         if newly_triggered_this_day:
-            print(f"    >>> Applying square_off_mode='{square_off_mode}' for {len(newly_triggered_this_day)} triggered leg(s)")
             if square_off_mode == 'complete':
                 trigger_date   = newly_triggered_this_day[0][1]
                 trigger_reason = newly_triggered_this_day[0][2]
@@ -1092,7 +1065,7 @@ def run_algotest_backtest(params):
         try:
             return int(value)
         except (TypeError, ValueError):
-            print(f"  WARNING: {label} DTE '{value}' is not a valid integer; defaulting to {default}")
+
             return default
 
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
@@ -1117,7 +1090,7 @@ def run_algotest_backtest(params):
     filter_config = params.get('filter_config', None)
     filter_segments_custom = params.get('filter_segments', [])
     
-    _log(f"DEBUG: filter_config = {repr(filter_config)}, filter_segments_custom = {len(filter_segments_custom)}")
+
     
     filter_enabled = filter_config is not None and filter_config != ''
     filter_segments = []
@@ -1129,29 +1102,16 @@ def run_algotest_backtest(params):
                 # Use custom segments from CSV upload - don't normalize, use as-is
                 filter_segments = filter_segments_custom
                 _log(f"Custom Filter ON: {len(filter_segments)} segments")
-                print(f"FILTER: Custom segments loaded ({len(filter_segments)} ranges)")
-                if filter_segments:
-                    for i, seg in enumerate(filter_segments[:5]):
-                        print(f"  Segment {i+1}: {seg}")
-                    if len(filter_segments) > 5:
-                        print(f"  ... and {len(filter_segments) - 5} more segments")
             else:
                 # Use built-in filter (5x1, 5x2, base2)
                 filter_segments = get_filter_segments(filter_config)
                 _log(f"Filter ON: {filter_config}, segments={len(filter_segments)}")
-                print(f"FILTER: {filter_config} segments loaded ({len(filter_segments)} ranges)")
-                if filter_segments:
-                    for i, seg in enumerate(filter_segments[:3]):
-                        print(f"  Segment {i+1}: start={seg.get('start')}, end={seg.get('end')}")
-                    if len(filter_segments) > 3:
-                        print(f"  ... and {len(filter_segments) - 3} more segments")
         except Exception as e:
             _log(f"Warning: Error loading filter segments: {e}")
             filter_enabled = False
             filter_segments = []
     else:
         _log("Filter OFF")
-        print("FILTER: Disabled")
     
     # Convert filter segments to timestamps for comparison
     filter_segments_ts = []
@@ -1192,89 +1152,45 @@ def run_algotest_backtest(params):
         overall_target_value = _legacy_tgt_pct
 
     square_off_mode = params.get('square_off_mode', 'partial')  # 'partial' | 'complete'
-    print(f"\n>>> ENGINE: square_off_mode = '{square_off_mode}' (type: {type(square_off_mode)})")
-
 
     # Re-entry settings (for both Weekly and Monthly strategies)
-    # If trade exits before expiry due to SL/Target:
-    # - re_entry_enabled: whether to allow re-entry after SL/Target trigger
-    # - re_entry_max: maximum number of re-entries allowed per expiry
-    re_entry_enabled = params.get('re_entry_enabled', False)  # Default: DISABLED - set True to enable
-    re_entry_max = params.get('re_entry_max', 20)  # Default: max 20 re-entries per expiry
+    re_entry_enabled = params.get('re_entry_enabled', False)
+    re_entry_max = params.get('re_entry_max', 20)
 
-    print(f"\n{'='*60}")
-    print(f"ALGOTEST-STYLE BACKTEST")
-    print(f"{'='*60}")
-    print(f"Index: {index}")
-    print(f"Date Range: {from_date} to {to_date}")
-    print(f"Expiry Type: {expiry_type}")
-    print(f"Entry DTE: {entry_dte} (days before expiry)")
-    print(f"Exit DTE: {exit_dte} (days before expiry)")
-    print(f"Overall SL:  type={overall_sl_type}, value={overall_sl_value}")
-    print(f"Overall TGT: type={overall_target_type}, value={overall_target_value}")
-    print(f"Re-entry: enabled={re_entry_enabled}, max_per_expiry={re_entry_max}")
-    print(f"Legs: {len(legs_config)}")
-    print(f"{'='*60}\n")
-
-    
     # ========== STEP 2: LOAD DATA FROM CSV (like generic_multi_leg) ==========
-    print("Loading spot data from CSV...")
+    t_spot = time.perf_counter()
     spot_df = get_strike_data(index, from_date, to_date)
-    print(f"  Loaded {len(spot_df)} spot records\n")
     
     # Create trading calendar from spot data
     trading_calendar = spot_df[['Date']].drop_duplicates().sort_values('Date').reset_index(drop=True)
     trading_calendar.columns = ['date']
-    print(f"  Trading calendar: {len(trading_calendar)} trading days\n")
     
-    # NOTE: base2 filter removed - using all trading days
-    print("  Using all trading days (base2 filter disabled)\n")
-    
-    print("Loading expiry dates...")
     if expiry_day_of_week is not None:
-        # Use custom expiry days
         expiry_dates = get_custom_expiry_dates(index, expiry_day_of_week, from_date, to_date)
-        # Create a dataframe similar to the standard one
         expiry_df = pd.DataFrame({'Current Expiry': expiry_dates})
-        print(f"  Loaded {len(expiry_df)} custom expiries (Day {expiry_day_of_week})\n")
     else:
-        # Use standard expiry dates
         if expiry_type.upper() == 'WEEKLY':
             expiry_df = get_expiry_dates(index, 'weekly', from_date, to_date)
         else:  # MONTHLY
             expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
-        print(f"  Loaded {len(expiry_df)} standard expiries\n")
     
     # ========== STEP 3: SPOT ADJUSTMENT FILTERING ==========
     spot_adjustment_type = params.get('spot_adjustment_type', 0)
     spot_adjustment = params.get('spot_adjustment', 1.0)
     
     if spot_adjustment_type != 0:
-        print(f"Applying spot adjustment filter...")
-        print(f"  Type: {['None', 'Rises', 'Falls', 'RisesOrFalls'][spot_adjustment_type]}")
-        print(f"  Threshold: {spot_adjustment}%\n")
-        
-        # Build intervals based on spot movement
         intervals = build_intervals(spot_df, spot_adjustment_type, spot_adjustment)
-        print(f"  Generated {len(intervals)} trading intervals\n")
-        
-        # Filter expiry dates to only those within valid intervals
         valid_expiries = []
         for expiry_row in expiry_df.itertuples():
-            expiry_date = expiry_row[1]  # Current Expiry column
-            
-            # Check if this expiry falls within any valid interval
+            expiry_date = expiry_row[1]
             for interval_start, interval_end in intervals:
                 if interval_start <= expiry_date <= interval_end:
                     valid_expiries.append(expiry_row)
                     break
         
-        # Update expiry_df to only include valid expiries
         if valid_expiries:
             expiry_df = pd.DataFrame(valid_expiries, columns=expiry_df.columns)
-            print(f"  Filtered to {len(expiry_df)} expiries (from {len(expiry_df) + len(expiry_df.index) - len(valid_expiries)} total)\n")
         else:
-            print(f"  WARNING: No expiries match spot adjustment criteria - no trades will be executed\n")
             return pd.DataFrame(), {}, {}
     
     # ========== STEP 4: INITIALIZE RESULTS ==========
@@ -1282,9 +1198,8 @@ def run_algotest_backtest(params):
     strike_interval = get_strike_interval(index)
     
     # ========== STEP 4: LOOP THROUGH EXPIRIES ==========
-    if DEBUG:
-        print("Processing expiries...\n")
-    
+    t_loop = time.perf_counter()
+    n_expiries = len(expiry_df)
     for expiry_idx, expiry_row in expiry_df.iterrows():
         expiry_date = expiry_row['Current Expiry']
         
@@ -1359,22 +1274,10 @@ def run_algotest_backtest(params):
                         break
                 
                 if not within_filter:
-                    print(f"FILTER SKIP: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
                     _log(f"  Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
                     continue
                 
-                # Store segment_end for FILTER_END check in exit loop
                 trade_segment_end = active_segment['end']
-                
-                seg_start_ts = active_segment['start']
-                seg_end_ts = active_segment['end']
-                duration_days = (seg_end_ts - seg_start_ts).days + 1
-                print(
-                    "FILTER ENTRY: "
-                    f"entry {entry_ts.strftime('%Y-%m-%d')} inside "
-                    f"{seg_start_ts.strftime('%Y-%m-%d')} → {seg_end_ts.strftime('%Y-%m-%d')} "
-                    f"({duration_days}d); expiry {pd.Timestamp(expiry_date).strftime('%Y-%m-%d')}"
-                )
             
             # ========== STEP 7: GET ENTRY SPOT PRICE ==========
             # Get spot from database (use index price at entry_date)
@@ -1606,10 +1509,7 @@ def run_algotest_backtest(params):
                     leg_result = per_leg_results[li]
                     actual_leg_exit_date = leg_result['exit_date']
                     
-                    # Only recalculate if exit date changed from scheduled
                     if actual_leg_exit_date != exit_date:
-                        print(f"      🔄 Leg {li+1}: Recalculating exit premium for early exit on {actual_leg_exit_date.strftime('%Y-%m-%d')}")
-                        
                         if tleg.get('segment') == 'OPTION':
                             # Recalculate option exit premium
                             new_exit_premium = get_option_premium_from_db(
@@ -1634,8 +1534,6 @@ def run_algotest_backtest(params):
                                     tleg['pnl'] = (new_exit_premium - entry_premium) * lots * lot_size
                                 else:  # SELL
                                     tleg['pnl'] = (entry_premium - new_exit_premium) * lots * lot_size
-                                
-                                print(f"         Old exit premium: {old_exit_premium}, New: {new_exit_premium}, New P&L: ₹{tleg['pnl']:,.2f}")
                         
                         elif tleg.get('segment') == 'FUTURE':
                             # Recalculate future exit price
@@ -1659,8 +1557,6 @@ def run_algotest_backtest(params):
                                     tleg['pnl'] = (new_exit_price - entry_price) * lots * lot_size
                                 else:  # SELL
                                     tleg['pnl'] = (entry_price - new_exit_price) * lots * lot_size
-                                
-                                print(f"         Old exit price: {old_exit_price}, New: {new_exit_price}, New P&L: ₹{tleg['pnl']:,.2f}")
 
 
             # ========== STEP 8D: OVERALL SL / TARGET CHECK ==========
@@ -1751,37 +1647,17 @@ def run_algotest_backtest(params):
             # If filter is enabled and segment end arrives before scheduled exit,
             # exit on segment end date with reason FILTER_END
             if trade_segment_end is not None:
-                # Get the last trading day on or before segment end
                 filter_exit_day = _last_trading_day_on_or_before(trading_calendar, trade_segment_end)
                 if filter_exit_day is not None:
-                    # Compare with actual exit date (SL/TARGET might have fired earlier)
                     if filter_exit_day < actual_exit_date:
-                        print(f"FILTER EXIT: segment end {trade_segment_end.strftime('%Y-%m-%d')} → last trading day {filter_exit_day.strftime('%Y-%m-%d')} (before scheduled exit {actual_exit_date.strftime('%Y-%m-%d')})")
                         actual_exit_date = filter_exit_day
                         filter_exit_reason = 'FILTER_END'
                     elif filter_exit_day == actual_exit_date:
-                        # Same day as scheduled exit - don't override, use existing reason
                         pass
 
             exit_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
 
             # ========== STEP 11: RECORD TRADE ==========
-            # Log detailed exit information
-            print(f"\n{'='*70}")
-            print(f"TRADE SUMMARY - Entry: {entry_date.strftime('%d-%m-%Y')}")
-            print(f"{'='*70}")
-            for li, tleg in enumerate(trade_legs):
-                leg_exit = per_leg_results[li] if per_leg_results else None
-                if leg_exit and leg_exit.get('triggered'):
-                    print(f"  Leg {li+1}: EXIT on {leg_exit['exit_date'].strftime('%d-%m-%Y')} "
-                          f"- Reason: {leg_exit['exit_reason']} - P&L: ₹{tleg['pnl']:,.2f}")
-                else:
-                    print(f"  Leg {li+1}: EXIT on {exit_date.strftime('%d-%m-%Y')} "
-                          f"- Reason: SCHEDULED - P&L: ₹{tleg['pnl']:,.2f}")
-            print(f"  Trade Exit Date: {actual_exit_date.strftime('%d-%m-%Y')}")
-            print(f"  Total P&L: ₹{total_pnl:,.2f}")
-            print(f"{'='*70}\n")
-            
             trade_record = {
                 'entry_date':      entry_date,
                 'exit_date':       actual_exit_date,
@@ -2034,25 +1910,7 @@ def run_algotest_backtest(params):
     # Filter out trades with no legs (skipped due to missing option data)
     all_trades = [t for t in all_trades if t.get('legs')]
     
-    # DEBUG: Check what's in trades
-    if all_trades:
-        first_trade = all_trades[0]
-        print(f"DEBUG: First trade has {len(first_trade.get('legs', []))} legs")
-        print(f"DEBUG: First trade legs: {first_trade.get('legs')[:1] if first_trade.get('legs') else 'NONE'}")
-    
-    print(f"\n{'='*60}")
-    print(f"BACKTEST COMPLETE")
-    print(f"{'='*60}")
-    print(f"Total Trades: {len(all_trades)}")
-    
-    if all_trades:
-        first_trade_date = all_trades[0].get('entry_date', 'N/A')
-        last_trade_date = all_trades[-1].get('entry_date', 'N/A')
-        print(f"First trade entry: {first_trade_date}")
-        print(f"Last trade entry: {last_trade_date}")
-    
     if not all_trades:
-        print("No trades executed - returning empty results")
         return pd.DataFrame(), {}, {}
     
     # Flatten for DataFrame - Create rows for EACH leg (AlgoTest format)
@@ -2143,23 +2001,12 @@ def run_algotest_backtest(params):
 
         trade_counter += len(trade['legs'])
     
-    # DEBUG: Print flatten results
-    print(f"DEBUG FLATTEN: Created {len(trades_flat)} rows from {len(all_trades)} trades")
-    if flatten_errors:
-        print(f"DEBUG FLATTEN ERRORS (first 5): {flatten_errors[:5]}")
-    if not trades_flat and all_trades:
-        # Inspect first trade structure
-        first = all_trades[0]
-        print(f"DEBUG: First trade keys: {list(first.keys())}")
-        print(f"DEBUG: First trade legs type: {type(first.get('legs'))}, len: {len(first.get('legs', []))}")
-        if first.get('legs'):
-            print(f"DEBUG: First leg keys: {list(first['legs'][0].keys())}")
-    
+    t_loop = time.perf_counter() - t_loop
+    t_agg = time.perf_counter()
     trades_df = pd.DataFrame(trades_flat)
     
     # ========== AGGREGATE LEGS INTO TRADES FOR ANALYTICS ==========
     if trades_df.empty:
-        print("No trade legs to aggregate - returning empty results")
         return pd.DataFrame(), {}, {}
     
     # Group by Trade number and sum P&L to get one row per trade
@@ -2180,23 +2027,7 @@ def run_algotest_backtest(params):
     )
     
     # ========== STEP 12: COMPUTE ANALYTICS (ADDS CUMULATIVE, PEAK, DD, %DD) ==========
-    if DEBUG:
-        print(f"Computing analytics on {len(trades_aggregated)} trades...")
-    
-    # Call compute_analytics on AGGREGATED trades (one row per trade)
-    # This adds: Cumulative, Peak, DD, %DD columns
-    # And returns enhanced summary with CAGR, Max DD, etc.
     trades_aggregated, summary = compute_analytics(trades_aggregated)
-    
-    print(f"\n{'='*60}")
-    print(f"ANALYTICS COMPLETE")
-    print(f"{'='*60}")
-    print(f"Total P&L: ₹{summary.get('total_pnl', 0):,.2f}")
-    print(f"Win Rate: {summary.get('win_pct', 0):.2f}%")
-    print(f"CAGR: {summary.get('cagr_options', 0):.2f}%")
-    print(f"Max Drawdown: {summary.get('max_dd_pct', 0):.2f}%")
-    print(f"CAR/MDD: {summary.get('car_mdd', 0):.2f}")
-    print(f"{'='*60}\n")
     
     # ========== MERGE ANALYTICS BACK TO DETAILED TRADES ==========
     # Merge Cumulative, Peak, DD, %DD from aggregated back to detailed leg-by-leg DataFrame
@@ -2208,6 +2039,22 @@ def run_algotest_backtest(params):
     # print(f"DEBUG: First row Cumulative: {trades_df.iloc[0]['Cumulative'] if 'Cumulative' in trades_df.columns else 'MISSING'}")
     
     # ========== STEP 13: BUILD PIVOT TABLE ==========
+    t_pivot = time.perf_counter()
     pivot = build_pivot(trades_aggregated, 'Exit Date')
+    
+    t_total = time.perf_counter() - t_spot
+    
+    # Print timing summary (only if not too fast — avoid log spam)
+    if t_total > 0.5:
+        t_agg_actual = t_agg - t_loop
+        t_analytics = t_pivot - t_agg
+        t_pivot_actual = t_total - t_pivot
+        print(f"[PERF] {index} {from_date}→{to_date} | "
+              f"spot={time.perf_counter()-t_spot:.2f}s | "
+              f"loop({n_expiries} exps)={t_loop:.2f}s | "
+              f"agg={t_agg_actual:.2f}s | "
+              f"analytics={t_analytics:.2f}s | "
+              f"pivot={t_pivot_actual:.2f}s | "
+              f"TOTAL={t_total:.2f}s")
     
     return trades_df, summary, pivot

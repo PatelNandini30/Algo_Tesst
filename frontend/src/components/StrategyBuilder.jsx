@@ -18,6 +18,9 @@ const toApiDate = (displayStr) => {
   }
 };
 
+const getApiStartDate = (startDate) => toApiDate(startDate);
+const getApiEndDate = (endDate) => toApiDate(endDate);
+
 // Validate DD/MM/YYYY format
 const isValidDisplayDate = (dateStr) => {
   if (!dateStr) return false;
@@ -360,20 +363,6 @@ const StrategyBuilder = () => {
     evaluateDateValidation(startDate, formatted);
   };
 
-  // Get API format dates (YYYY-MM-DD)
-  const getApiStartDate = () => toApiDate(startDate);
-  const getApiEndDate = () => toApiDate(endDate);
-
-  // Warm cache on date change - pre-loads data before user clicks Run
-  useEffect(() => {
-    if (!instrument || !isValidDate(startDate) || !isValidDate(endDate)) return;
-    fetch('/api/warm-cache', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index: instrument, from_date: getApiStartDate(), to_date: getApiEndDate() }),
-    }).catch(() => {});
-  }, [instrument, startDate, endDate]);
-
   const stopJobPolling = useCallback(() => {
     if (jobPollRef.current) {
       clearInterval(jobPollRef.current);
@@ -673,8 +662,8 @@ const StrategyBuilder = () => {
       overall_sl_value: overallSLEnabled ? (overallSLValue === '' ? 0 : overallSLValue) : null,
       overall_target_type: overallTgtEnabled ? overallTgtType : null,
       overall_target_value: overallTgtEnabled ? (overallTgtValue === '' ? 0 : overallTgtValue) : null,
-      date_from: getApiStartDate(),
-      date_to: getApiEndDate(),
+      date_from: getApiStartDate(startDate),
+      date_to: getApiEndDate(endDate),
       expiry_type: expiryBasis.toUpperCase(),
       filter: strFilter.enabled ? strFilter.configId : null,
       filter_config: strFilter.enabled ? strFilter.configId : null,
@@ -724,13 +713,22 @@ const StrategyBuilder = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+
+      if (res.status === 504) {
+        setLoading(false);
+        setJobStatusLabel('');
+        setError('Server is busy. Please wait 30 seconds and try again.');
+        return;
+      }
+
       if (!res.ok) {
         const errorPayload = await res.json().catch(() => null);
-        throw new Error(errorPayload?.message || 'Failed to enqueue backtest job');
+        throw new Error(errorPayload?.message || `Server error (${res.status})`);
       }
+
       const data = await res.json();
       if (!data?.job_id) {
-        throw new Error('Backtest job was not queued. Missing job ID.');
+        throw new Error('No job ID returned. Please try again.');
       }
       setJobId(data.job_id);
       setJobStatusLabel('Queued…');

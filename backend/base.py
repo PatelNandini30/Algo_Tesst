@@ -63,8 +63,6 @@ class BacktestDataCache:
             end_date: End date in YYYY-MM-DD format
             symbols: List of symbols to load (e.g., ['NIFTY', 'BANKNIFTY'])
         """
-        print(f"🚀 Pre-loading data from {start_date} to {end_date} for {symbols}...")
-        
         start = datetime.strptime(start_date, '%Y-%m-%d')
         end = datetime.strptime(end_date, '%Y-%m-%d')
         current = start
@@ -75,12 +73,8 @@ class BacktestDataCache:
             dates_to_load.append(date_str)
             current += timedelta(days=1)
         
-        loaded_count = 0
         for date_str in dates_to_load:
-            if self._load_date_data(date_str, symbols):
-                loaded_count += 1
-        
-        print(f"✅ Pre-loaded {loaded_count}/{len(dates_to_load)} dates into cache")
+            self._load_date_data(date_str, symbols)
         
     def _load_date_data(self, date_str: str, symbols: list) -> bool:
         """Load data for a single date into cache using existing load_bhavcopy function."""
@@ -261,13 +255,12 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
         try:
             pg_df = _repo.get_spot_data(symbol=symbol, from_date=from_date, to_date=to_date)
             return pg_df.reset_index(drop=True)
-        except Exception as exc:
+        except Exception:
             if not ALLOW_CSV_FALLBACK:
-                raise RuntimeError("PostgreSQL strike data lookup failed and CSV fallback is disabled.") from exc
-            print("Postgres strike lookup failed; falling back to CSV.")
+                raise RuntimeError("PostgreSQL strike data lookup failed and CSV fallback is disabled.")
 
-    if not ALLOW_CSV_FALLBACK:
-        raise RuntimeError("CSV fallback is disabled; strike data must be loaded from PostgreSQL.")
+        if not ALLOW_CSV_FALLBACK:
+            raise RuntimeError("CSV fallback is disabled; strike data must be loaded from PostgreSQL.")
 
     # Handle different capitalization formats for symbol
     possible_filenames = [
@@ -327,7 +320,7 @@ def load_expiry(index: str, expiry_type: str) -> pd.DataFrame:
         except Exception as exc:
             if not ALLOW_CSV_FALLBACK:
                 raise RuntimeError("PostgreSQL expiry lookup failed and CSV fallback is disabled.") from exc
-            print("Postgres expiry lookup failed; falling back to CSV.")
+            pass
 
     if not ALLOW_CSV_FALLBACK:
         raise RuntimeError("CSV fallback is disabled; expiry calendar must be sourced from PostgreSQL.")
@@ -408,7 +401,7 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
         except Exception as exc:
             if not ALLOW_CSV_FALLBACK:
                 raise RuntimeError("PostgreSQL bhavcopy lookup failed and CSV fallback is disabled.") from exc
-            print("Postgres bhavcopy lookup failed; falling back to CSV.")
+            pass
 
     if not ALLOW_CSV_FALLBACK:
         raise RuntimeError("CSV fallback disabled; bhavcopy data must be sourced from PostgreSQL.")
@@ -1252,14 +1245,10 @@ def preload_all_data(from_date: str, to_date: str, symbols: list):
     """
     if symbols:
         primary_symbol = symbols[0] if isinstance(symbols, list) else symbols
-        print(f"🔧 PRELOAD: Loading {primary_symbol} data for {from_date} to {to_date}")
         try:
-            result = bulk_load_options(primary_symbol, from_date, to_date)
-            print(f"   ✅ Preload complete: {result}")
-        except Exception as e:
-            print(f"   ⚠️  Preload failed: {e}")
-    
-    print(f"   ✅ SMART CACHE enabled!")
+            bulk_load_options(primary_symbol, from_date, to_date)
+        except Exception:
+            pass
 
 
 def _build_option_lookup(date_str: str, index: str):
@@ -1447,7 +1436,7 @@ def load_super_trend_dates(force_reload: bool = False):
                     segments.append({"start": start_dt, "end": end_dt})
                 segments.sort(key=lambda s: s["start"])
                 loaded[config_key] = segments
-                print(f"Loaded {len(segments)} STR segments for {config_key} (postgres)")
+                pass
 
             _super_trend_segments = loaded
             # FIX #1A: Build bisect index arrays once
@@ -1459,7 +1448,7 @@ def load_super_trend_dates(force_reload: bool = False):
         except Exception as exc:
             if not ALLOW_CSV_FALLBACK:
                 raise RuntimeError("PostgreSQL super-trend lookup failed and CSV fallback is disabled.") from exc
-            print("Postgres super-trend lookup failed; falling back to CSV.")
+            pass
 
     if not ALLOW_CSV_FALLBACK:
         raise RuntimeError("CSV fallback disabled; super-trend segments must be loaded from PostgreSQL.")
@@ -1473,7 +1462,6 @@ def load_super_trend_dates(force_reload: bool = False):
         segments = []
         try:
             if not os.path.exists(file_path):
-                print(f"Warning: STR file not found for {config_key}: {file_path}")
                 loaded[config_key] = []
                 continue
 
@@ -1481,7 +1469,6 @@ def load_super_trend_dates(force_reload: bool = False):
             df.columns = [str(c).strip() for c in df.columns]
 
             if "Start" not in df.columns or "End" not in df.columns:
-                print(f"Warning: STR file missing Start/End columns for {config_key}: {file_path}")
                 loaded[config_key] = []
                 continue
 
@@ -1498,10 +1485,8 @@ def load_super_trend_dates(force_reload: bool = False):
 
             segments.sort(key=lambda s: s["start"])
             loaded[config_key] = segments
-            print(f"Loaded {len(segments)} STR segments for {config_key}")
 
-        except Exception as e:
-            print(f"Warning: Could not read STR file for {config_key}: {file_path}. Error: {e}")
+        except Exception:
             loaded[config_key] = []
 
     _super_trend_segments = loaded
@@ -1630,8 +1615,7 @@ def get_base2_segments() -> list:
         if min_date and max_date:
             return [{'start': min_date, 'end': max_date}]
         return []
-    except Exception as e:
-        print(f"Error getting base2 segments: {e}")
+    except Exception:
         return []
 
 
@@ -1765,7 +1749,6 @@ def parse_filter_csv(csv_content: str) -> list:
                     end_col = col
         
         if not start_col or not end_col:
-            print(f"Could not detect date columns. Found: {df.columns}")
             return []
         
         # Parse dates
@@ -1782,8 +1765,7 @@ def parse_filter_csv(csv_content: str) -> list:
         
         return normalize_filter_segments(segments)
 
-    except Exception as e:
-        print(f"Error parsing filter CSV: {e}")
+    except Exception:
         return []
 
 def _normalize_filter_date(value) -> Optional[pd.Timestamp]:
@@ -2367,24 +2349,17 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
         return None
     
     # Print ALL strikes with premiums for debugging
-    print(f"         ALL strikes with premiums: {[(s['strike'], s['premium']) for s in strikes_data[:15]]}")
-    
     # Filter by premium range
     in_range = [s for s in strikes_data if min_premium <= s['premium'] <= max_premium]
     
     if not in_range:
-        print(f"         WARNING: No strikes found with premium between {min_premium} and {max_premium}")
         return None
-    
-    print(f"         Found {len(in_range)} strikes in range: {[(s['strike'], s['premium']) for s in in_range[:10]]}")
     
     # Calculate ATM strike for distance comparison
     atm_strike = round(spot_price / strike_interval) * strike_interval
     
     # Select strike closest to ATM from valid strikes in range
     best = min(in_range, key=lambda x: abs(x['strike'] - atm_strike))
-    
-    print(f"         Selected strike {best['strike']} (premium={best['premium']:.2f}, ATM={atm_strike})")
     return best['strike']
 
 
@@ -2423,17 +2398,11 @@ def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot
     )
     
     if not strikes_data:
-        print(f"         WARNING: No strikes data available for closest premium")
         return None
-    
-    print(f"         Searching for strike with premium closest to {target_premium}")
-    print(f"         Available strikes: {len(strikes_data)}, showing first 5: {[(s['strike'], s['premium']) for s in strikes_data[:5]]}")
     
     # Find strikes with minimum premium distance
     min_diff = min(abs(s['premium'] - target_premium) for s in strikes_data)
     candidates = [s for s in strikes_data if abs(s['premium'] - target_premium) == min_diff]
-    
-    print(f"         Found {len(candidates)} candidate(s) with min difference {min_diff:.2f}: {[(s['strike'], s['premium']) for s in candidates]}")
     
     # Deterministic tie-breaking: AlgoTest style
     # For CE: prefer HIGHER strike (more premium, more downside protection)
@@ -2446,7 +2415,6 @@ def calculate_strike_from_closest_premium(date, index, expiry, option_type, spot
         # PE: prefer lower strike
         closest = min(candidates, key=lambda x: x['strike'])
     
-    print(f"         Selected strike {closest['strike']} (premium={closest['premium']:.2f}, target={target_premium})")
     return closest['strike']
 
 
@@ -2592,10 +2560,6 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     """
     Load all option data for symbol/date-range into memory ONCE.
     Builds a pre-indexed O(1) lookup dict — NOT a raw DataFrame scan.
-
-    FIX #1B: Dict is now built via a vectorized Polars filter + zip()
-    comprehension instead of a row-by-row Python for-loop.
-    For 5-10M rows this reduces dict-build time from ~60s to ~3-5s.
     """
     global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
     global _option_lookup_table, _future_lookup_table, _spot_lookup_table
@@ -2608,16 +2572,23 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         store_lookup_cache_in_redis,
     )
 
-    # If dict already built for this range AND has entries, skip all work
-    if (_bulk_loaded and _bulk_date_range == (from_date, to_date)
+    import pandas as pd
+
+    requested_from = pd.to_datetime(from_date)
+    requested_to   = pd.to_datetime(to_date)
+
+    if (_bulk_loaded and _bulk_date_range is not None
             and _option_lookup_table and len(_option_lookup_table) > 0):
-        print(f"[BULK] O(1) dict already built: {len(_option_lookup_table):,} entries — skipping rebuild")
-        return {
-            "options_rows": len(_option_lookup_table),
-            "spot_rows": len(_spot_lookup_table),
-            "expiry_rows": 0,
-            "loaded_key": f"{symbol}:{from_date}:{to_date}"
-        }
+        loaded_from, loaded_to = _bulk_date_range
+        loaded_from = pd.to_datetime(loaded_from)
+        loaded_to   = pd.to_datetime(loaded_to)
+        if loaded_from <= requested_from and loaded_to >= requested_to:
+            return {
+                "options_rows": len(_option_lookup_table),
+                "spot_rows": len(_spot_lookup_table),
+                "expiry_rows": 0,
+                "loaded_key": f"{symbol}:{from_date}:{to_date}"
+            }
 
     result = _bulk_load(symbol, from_date, to_date)
 
@@ -2646,9 +2617,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
             lookup_loaded_from_redis = True
-            print(f"[BULK] Built O(1) lookup dict from loaded data: {len(_option_lookup_table):,} entries")
-            print(f"[BULK] Data range: {min_date} to {max_date} (requested: {from_date} to {to_date})")
-
+            pass
     # FIX #1B: Build O(1) lookup dict using vectorized Polars ops + zip()
     if not lookup_loaded_from_redis:
         options_df = get_bulk_options_df()
@@ -2676,7 +2645,6 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
             _bulk_bhav_df = None   # Don't keep raw DataFrame — dict is enough
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
-            print(f"[BULK] Built O(1) lookup dict: {len(_option_lookup_table):,} entries")
             store_lookup_cache_in_redis(symbol, from_date, to_date, _option_lookup_table)
 
     spot_df = get_bulk_spot_df()
@@ -2686,7 +2654,6 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         s_closes  = spot_df["Close"].to_list()
         _spot_lookup_table = {(d, symbol): c for d, c in zip(s_dates, s_closes)}
         _bulk_spot_df = None
-        print(f"[BULK] Built spot lookup dict: {len(_spot_lookup_table):,} entries")
 
     return result
 

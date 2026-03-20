@@ -35,8 +35,7 @@ try:
         load_super_trend_dates,
         normalize_filter_segments,
     )
-except ImportError as e:
-    print(f"Failed to import from base: {e}")
+except ImportError:
     raise
 
 try:
@@ -238,8 +237,8 @@ def _get_bhav_data(date: pd.Timestamp) -> pd.DataFrame:
                 if len(_bhav_pandas_cache) > 20:
                     _bhav_pandas_cache.pop(next(iter(_bhav_pandas_cache)))
                 return pd_result
-        except Exception as e:
-            print(f"[WARN] Bulk lookup failed for {date_str}: {e}")
+        except Exception:
+            pass
 
     # Fallback to original DB query
     result = load_bhavcopy(date_str)
@@ -386,9 +385,6 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     if str_enabled:
         load_super_trend_dates()
         str_segments = get_super_trend_segments(str_config_value)
-        print(f"STR Filter ON: {str_config_value}, {len(str_segments)} segments loaded")
-    else:
-        print("STR Filter OFF")
     
     # NEW: Date Range Filter
     filter_config = params.get('filter_config', None)
@@ -401,26 +397,18 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
             from base import get_filter_segments
             if filter_config == 'custom':
                 filter_segments = normalize_filter_segments(filter_segments_custom)
-                print(f"Custom Filter ON: {len(filter_segments)} segments")
             else:
                 filter_segments = normalize_filter_segments(get_filter_segments(filter_config))
-                print(f"Filter ON: {filter_config}, {len(filter_segments)} segments")
-        except Exception as e:
-            print(f"Warning: Error loading filter segments: {e}")
+        except Exception:
             filter_enabled = False
             filter_segments = []
-    else:
-        print("Filter OFF")
 
     # ========== PHASE 1: BULK LOAD DATA INTO MEMORY ==========
-    print("⚡ PHASE 1: Bulk loading data into memory...")
     try:
         from base import bulk_load_options
         bulk_stats = bulk_load_options(index_name, from_date, to_date)
-        print(f"   ✅ Bulk load complete: {bulk_stats['options_rows']} options, {bulk_stats['spot_rows']} spot, {bulk_stats['expiry_rows']} expiries")
-    except Exception as e:
-        print(f"   ⚠️  Bulk load failed: {e}")
-        print("   Falling back to per-row queries (slower)...")
+    except Exception:
+        pass
 
     # Data load
     spot_df = get_strike_data(index_name, params["from_date"], params["to_date"]).sort_values("Date").reset_index(drop=True)
@@ -485,7 +473,6 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if str_enabled:
                     active_segment = get_active_str_segment(current_entry, str_config_value)
                     if active_segment is None:
-                        print(f"STR skip: {current_entry.strftime('%Y-%m-%d')}")
                         break
                     str_segment_str = (
                         f"{pd.Timestamp(active_segment['start']).strftime('%d-%m-%Y')} -> "
@@ -500,7 +487,6 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     if idx >= 0 and entry_ts <= _fs_ends[idx]:
                         active_filter_segment = filter_segments[idx]
                     else:
-                        print(f"Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside filter segments")
                         break
 
                 # Expiry for this trade/roll
