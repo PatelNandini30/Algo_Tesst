@@ -110,7 +110,34 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         try:
-            bulk_load_options(index, from_date, to_date)
+            # If STR filter is enabled, shrink the load range to only
+            # the dates covered by active segments — avoids loading
+            # the full 18-year history when only 20% of it is needed.
+            effective_from = from_date
+            effective_to = to_date
+            super_trend_config = str(payload.get('super_trend_config', 'None'))
+            if super_trend_config in ('5x1', '5x2'):
+                try:
+                    from base import load_super_trend_dates, get_super_trend_segments
+                    import pandas as pd
+                    load_super_trend_dates()
+                    segments = get_super_trend_segments(super_trend_config)
+                    if segments:
+                        user_from = pd.to_datetime(from_date)
+                        user_to = pd.to_datetime(to_date)
+                        seg_dates = []
+                        for seg in segments:
+                            seg_start = pd.to_datetime(seg.get('start') or seg.get('Start'))
+                            seg_end = pd.to_datetime(seg.get('end') or seg.get('End'))
+                            if seg_end >= user_from and seg_start <= user_to:
+                                seg_dates.append(seg_start)
+                                seg_dates.append(seg_end)
+                        if seg_dates:
+                            effective_from = max(min(seg_dates), user_from).strftime('%Y-%m-%d')
+                            effective_to = min(max(seg_dates), user_to).strftime('%Y-%m-%d')
+                except Exception:
+                    pass  # fall back to full range on any error
+            bulk_load_options(index, effective_from, effective_to)
         except OperationalError:
             traceback.print_exc()
             reset_engine()
@@ -168,11 +195,44 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         else:
             all_trades = _convert_numpy(_format_dates(all_trades))
 
+        import json
+
+        def _make_json_safe(obj):
+            """Recursively convert any non-JSON-serializable objects."""
+            import pandas as pd
+            if obj is None:
+                return None
+            if isinstance(obj, pd.DataFrame):
+                return _make_json_safe(obj.to_dict('records'))
+            if isinstance(obj, pd.Series):
+                return _make_json_safe(obj.tolist())
+            if isinstance(obj, dict):
+                return {str(k): _make_json_safe(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_make_json_safe(i) for i in obj]
+            if hasattr(obj, 'strftime'):
+                return obj.strftime('%d/%m/%Y')
+            if hasattr(obj, 'item'):
+                try:
+                    return obj.item()
+                except Exception:
+                    pass
+            if hasattr(obj, 'tolist'):
+                try:
+                    return _make_json_safe(obj.tolist())
+                except Exception:
+                    pass
+            try:
+                json.dumps(obj)
+                return obj
+            except (TypeError, ValueError):
+                return str(obj)
+
         result_payload = {
             'status': 'success',
-            'trades': all_trades,
-            'summary': _convert_numpy(result_summary),
-            'pivot': _convert_numpy(result_pivot),
+            'trades': _make_json_safe(all_trades),
+            'summary': _make_json_safe(_convert_numpy(result_summary)),
+            'pivot': _make_json_safe(_convert_numpy(result_pivot)),
             'cached': False,
         }
 

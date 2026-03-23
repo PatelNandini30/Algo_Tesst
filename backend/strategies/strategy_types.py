@@ -42,6 +42,7 @@ class StrikeSelectionType(str, Enum):
     STRIKE_TYPE = "Strike Type"  # Specific strike value
     OTM_PERCENT = "OTM %"  # Out of the money by percentage
     ITM_PERCENT = "ITM %"  # In the money by percentage
+    SYNTHETIC_FUTURE = "Synthetic Future"  # Strike with min |CE - PE|
 
 class StrikeType(str, Enum):
     """Specific strike selection types"""

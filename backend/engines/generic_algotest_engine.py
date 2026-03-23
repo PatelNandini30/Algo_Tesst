@@ -189,6 +189,13 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         'PREMIUM_LTE':     'PREMIUM_LTE',
         'PREMIUMLTE':      'PREMIUM_LTE',
         'PREMIUM <=':      'PREMIUM_LTE',
+        'STRADDLEWIDTH':   'STRADDLE_WIDTH',
+        'STRADDLE_WIDTH':  'STRADDLE_WIDTH',
+        'STRADDLE':       'STRADDLE_WIDTH',
+        'SYNTHETICFUTURE': 'SYNTHETIC_FUTURE',
+        'SYNTHETIC_FUTURE': 'SYNTHETIC_FUTURE',
+        'SYNTHETIC':      'SYNTHETIC_FUTURE',
+        'SYNTHETIC_LONG': 'SYNTHETIC_FUTURE',
     }
     strike_sel_type = _type_aliases.get(strike_sel_type, strike_sel_type)
     
@@ -297,6 +304,43 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             best = min(qualifying, key=lambda x: (abs(x['premium'] - float(max_prem)), abs(x['strike'] - atm_strike), x['strike']))
         _log(f"      PREMIUM_LTE <= {max_prem} → strike={best['strike']} (premium={best['premium']:.2f}, closest to target, ATM={atm_strike})")
         return best['strike']
+
+    # ── STRADDLE WIDTH: ATM + 0.5 × (CE − PE), round to nearest 50 ──────────────
+    if strike_sel_type == 'STRADDLE_WIDTH':
+        atm_strike = round(entry_spot / strike_interval) * strike_interval
+        ce_price = get_option_premium_from_db(entry_date, index, atm_strike, 'CE', expiry_date)
+        pe_price = get_option_premium_from_db(entry_date, index, atm_strike, 'PE', expiry_date)
+        
+        if ce_price is not None and pe_price is not None:
+            shift = (ce_price - pe_price) / 2
+            shifted = round((atm_strike + shift) / 50) * 50  # Round to nearest 50
+            _log(f"      STRADDLE_WIDTH: ATM={atm_strike}, CE={ce_price}, PE={pe_price}, shift={shift:.2f} → {shifted}")
+            return shifted
+        _log(f"      STRADDLE_WIDTH: Missing CE/PE data, fallback to ATM={atm_strike}")
+        return atm_strike
+
+    # ── SYNTHETIC FUTURE: Find strike where |CE - PE| is minimum ────────────────
+    if strike_sel_type == 'SYNTHETIC_FUTURE':
+        all_strikes = get_all_strikes_with_premiums(
+            date_str, index, expiry_date, 'CE', entry_spot, strike_interval
+        )
+        if not all_strikes:
+            return atm_strike
+        
+        min_diff = float('inf')
+        best_strike = atm_strike
+        
+        for s in all_strikes:
+            ce_price = s['premium']
+            pe_price = get_option_premium_from_db(entry_date, index, s['strike'], 'PE', expiry_date)
+            if pe_price is not None:
+                diff = abs(ce_price - pe_price)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_strike = s['strike']
+        
+        _log(f"      SYNTHETIC_FUTURE: best_strike={best_strike}, min_diff={min_diff:.2f}")
+        return best_strike
 
     # ── ATM / ITM / OTM string ─────────────────────────────────────────────────
     sel_str = strike_sel
@@ -2012,7 +2056,7 @@ def run_algotest_backtest(params):
 
         trade_counter += len(trade['legs'])
     
-    t_loop = time.perf_counter() - t_loop
+    t_loop_elapsed = time.perf_counter() - t_loop
     t_agg = time.perf_counter()
     trades_df = pd.DataFrame(trades_flat)
     
@@ -2032,10 +2076,9 @@ def run_algotest_backtest(params):
     }).reset_index()
     
     # Calculate Trade-level % P&L = Total Points P&L / Entry Spot * 100
-    trades_aggregated['% P&L'] = trades_aggregated.apply(
-        lambda row: round(row['Net P&L'] / row['Entry Spot'] * 100, 2) if row['Entry Spot'] else 0, 
-        axis=1
-    )
+    trades_aggregated['% P&L'] = (
+        (trades_aggregated['Net P&L'] / trades_aggregated['Entry Spot'].replace(0, float('nan'))) * 100
+    ).round(2).fillna(0)
     
     # ========== STEP 12: COMPUTE ANALYTICS (ADDS CUMULATIVE, PEAK, DD, %DD) ==========
     trades_aggregated, summary = compute_analytics(trades_aggregated)
@@ -2057,12 +2100,12 @@ def run_algotest_backtest(params):
     
     # Print timing summary (only if not too fast — avoid log spam)
     if t_total > 0.5:
-        t_agg_actual = t_agg - t_loop
-        t_analytics = t_pivot - t_agg
+        t_agg_actual = t_pivot - t_agg
+        t_analytics = time.perf_counter() - t_pivot
         t_pivot_actual = t_total - t_pivot
         print(f"[PERF] {index} {from_date}→{to_date} | "
-              f"spot={time.perf_counter()-t_spot:.2f}s | "
-              f"loop({n_expiries} exps)={t_loop:.2f}s | "
+              f"spot={t_loop_elapsed:.2f}s | "
+              f"loop({n_expiries} exps)={t_loop_elapsed:.2f}s | "
               f"agg={t_agg_actual:.2f}s | "
               f"analytics={t_analytics:.2f}s | "
               f"pivot={t_pivot_actual:.2f}s | "

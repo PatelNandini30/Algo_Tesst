@@ -953,7 +953,7 @@ def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
 
         yearly_data.append({
             'year':          year,
-            'monthly_pnl':   monthly_pnl,
+            'monthly_pnl':   monthly_pnl.to_dict() if hasattr(monthly_pnl, 'to_dict') else dict(monthly_pnl),
             'total_pnl':     round(total_pnl, 2),
             'max_dd':        round(max_dd, 2),
             'days_for_mdd':  days_for_mdd,
@@ -1193,6 +1193,8 @@ _bulk_date_range = None
 _option_lookup_table = {}  # (date, symbol, strike, opt_type, expiry) -> premium
 _future_lookup_table = {}  # (date, symbol, expiry) -> future_price
 _spot_lookup_table   = {}  # (date, symbol) -> spot_price
+# Pre-partitioned per-date Polars slices for fast lookups
+_bulk_bhav_by_date: dict = {}
 # O(1) guard — replaces the O(n) key scan in _load_date_data_on_demand
 _loaded_on_demand_dates: set = set()
 
@@ -1256,42 +1258,73 @@ def preload_all_data(from_date: str, to_date: str, symbols: list):
 def _build_option_lookup(date_str: str, index: str):
     """
     Index all options for a date+index into a fast dict.
-    Uses bulk preloaded data if available, otherwise falls back to per-date loading.
+    Uses pre-partitioned per-date Polars sub-DataFrames for O(1) date access.
     """
     cache_key = (date_str, index)
     if cache_key in _option_lookup_cache:
         return
 
     try:
-        if _bulk_loaded and _bulk_bhav_df is not None and not _bulk_bhav_df.empty:
-            date_ts = pd.Timestamp(date_str)
-            bhav_df = _bulk_bhav_df[
-                (_bulk_bhav_df['Date'] == date_ts) & 
-                (_bulk_bhav_df['Symbol'] == index)
-            ].copy()
-        else:
-            bhav_df = load_bhavcopy(date_str)
-        
+        import polars as pl
+        # Fast path: use pre-partitioned dict
+        if _bulk_loaded and _bulk_bhav_by_date:
+            date_df = _bulk_bhav_by_date.get(date_str)
+            if date_df is None or date_df.is_empty():
+                _option_lookup_cache[cache_key] = {}
+                return
+            opt_df = date_df.filter(
+                (pl.col("Symbol") == index) &
+                (pl.col("OptionType").is_in(["CE", "PE"]))
+            )
+            if opt_df.is_empty():
+                _option_lookup_cache[cache_key] = {}
+                return
+            strikes  = opt_df["StrikePrice"].cast(pl.Int64).to_list()
+            types    = opt_df["OptionType"].to_list()
+            expiries = opt_df["ExpiryDate"].cast(pl.Date).cast(pl.Utf8).to_list()
+            closes   = opt_df["Close"].to_list()
+            _option_lookup_cache[cache_key] = {
+                (s, t, e): c for s, t, e, c in zip(strikes, types, expiries, closes)
+            }
+            return
+        # Medium path: full Polars DataFrame scan (fallback)
+        if _bulk_loaded and _bulk_bhav_df is not None and hasattr(_bulk_bhav_df, 'filter'):
+            date_val = pd.Timestamp(date_str).date()
+            opt_df = _bulk_bhav_df.filter(
+                (pl.col("Date").cast(pl.Date) == date_val) &
+                (pl.col("Symbol") == index) &
+                (pl.col("OptionType").is_in(["CE", "PE"]))
+            )
+            if opt_df.is_empty():
+                _option_lookup_cache[cache_key] = {}
+                return
+            strikes  = opt_df["StrikePrice"].cast(pl.Int64).to_list()
+            types    = opt_df["OptionType"].to_list()
+            expiries = opt_df["ExpiryDate"].cast(pl.Date).cast(pl.Utf8).to_list()
+            closes   = opt_df["Close"].to_list()
+            _option_lookup_cache[cache_key] = {
+                (s, t, e): c for s, t, e, c in zip(strikes, types, expiries, closes)
+            }
+            return
+        # Slow path: load from DB per date
+        bhav_df = load_bhavcopy(date_str)
         if bhav_df is None or bhav_df.empty:
             _option_lookup_cache[cache_key] = {}
             return
-
         filtered = bhav_df[bhav_df['Symbol'] == index].copy()
-        opt_df = filtered[filtered['OptionType'].str.upper().isin(['CE', 'PE'])].copy()
-        if not opt_df.empty:
-            strikes  = opt_df['StrikePrice'].apply(lambda x: int(round(float(x)))).tolist()
-            types    = opt_df['OptionType'].str.upper().tolist()
-            expiries = pd.to_datetime(opt_df['ExpiryDate']).dt.strftime('%Y-%m-%d').tolist()
-            closes   = opt_df['Close'].astype(float).tolist()
-            lookup   = {(s, t, e): c for s, t, e, c in zip(strikes, types, expiries, closes)}
+        opt_df_pd = filtered[filtered['OptionType'].str.upper().isin(['CE', 'PE'])].copy()
+        if not opt_df_pd.empty:
+            strikes  = opt_df_pd['StrikePrice'].apply(lambda x: int(round(float(x)))).tolist()
+            types    = opt_df_pd['OptionType'].str.upper().tolist()
+            expiries = pd.to_datetime(opt_df_pd['ExpiryDate']).dt.strftime('%Y-%m-%d').tolist()
+            closes   = opt_df_pd['Close'].astype(float).tolist()
+            _option_lookup_cache[cache_key] = {
+                (s, t, e): c for s, t, e, c in zip(strikes, types, expiries, closes)
+            }
         else:
-            lookup = {}
-
-        _option_lookup_cache[cache_key] = lookup
-
+            _option_lookup_cache[cache_key] = {}
     except Exception:
         _option_lookup_cache[cache_key] = {}
-
 
 def _build_future_lookup(date_str: str, index: str):
     """
@@ -1718,23 +1751,17 @@ def parse_filter_csv(csv_content: str) -> list:
     """
     import io
     
-    segments = []
-    
     try:
-        # Try to read CSV
         df = pd.read_csv(io.StringIO(csv_content), dtype=str, keep_default_na=False)
         
         if df.empty:
             return []
         
-        # Normalize column names
         df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
         
-        # Detect column format
         start_col = None
         end_col = None
         
-        # Check for start/end format
         start_aliases = ['start', 'start_date', 'startdt', 'from', 'from_date']
         end_aliases = ['end', 'end_date', 'enddt', 'to', 'to_date']
         
@@ -1744,7 +1771,6 @@ def parse_filter_csv(csv_content: str) -> list:
             if col in end_aliases or col.startswith('end'):
                 end_col = col
         
-        # If not found, check entry/exit format
         if not start_col or not end_col:
             entry_aliases = ['entry', 'entry_date', 'entrydt']
             exit_aliases = ['exit', 'exit_date', 'exitdt']
@@ -1758,17 +1784,18 @@ def parse_filter_csv(csv_content: str) -> list:
         if not start_col or not end_col:
             return []
         
-        # Parse dates
-        for _, row in df.iterrows():
-            start_date = _parse_single_date(row.get(start_col))
-            end_date = _parse_single_date(row.get(end_col))
-            
-            if start_date and end_date:
-                # Ensure start <= end
-                if start_date > end_date:
-                    start_date, end_date = end_date, start_date
-                
-                segments.append({'start': start_date, 'end': end_date})
+        start_series = pd.to_datetime(df[start_col], dayfirst=True, errors='coerce')
+        end_series = pd.to_datetime(df[end_col], dayfirst=True, errors='coerce')
+        
+        valid_mask = start_series.notna() & end_series.notna()
+        
+        start_dates = start_series[valid_mask].dt.date.tolist()
+        end_dates = end_series[valid_mask].dt.date.tolist()
+        
+        for i, (start_date, end_date) in enumerate(zip(start_dates, end_dates)):
+            if start_date > end_date:
+                start_date, end_date = end_date, start_date
+            segments.append({'start': start_date, 'end': end_date})
         
         return normalize_filter_segments(segments)
 
@@ -1833,25 +1860,23 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
 
         strike_key = int(round(float(strike)))
 
-        # O(1) dict lookup — built during bulk_load_options()
-        if _bulk_loaded and _option_lookup_table:
-            key = (date_str, index, strike_key, opt_match, expiry_str)
-            result = _option_lookup_table.get(key)
+        # Use lazy per-date cache instead of a 7M-entry dict
+        if _bulk_loaded:
+            # Use per-date cache — built lazily from Polars DataFrame
+            # Uses ~50MB instead of 5GB for the full history
+            _build_option_lookup(date_str, index)
+            lookup = _option_lookup_cache.get((date_str, index), {})
+            result = lookup.get((strike_key, opt_match, expiry_str))
             if result is not None:
                 return result
-            # Try ±1 day expiry tolerance
-            result = _option_lookup_table.get(
-                (date_str, index, strike_key, opt_match,
-                 (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            result = lookup.get((strike_key, opt_match,
+                (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
             if result is not None:
                 return result
-            result = _option_lookup_table.get(
-                (date_str, index, strike_key, opt_match,
-                 (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+            result = lookup.get((strike_key, opt_match,
+                (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
             if result is not None:
                 return result
-            # DEBUG: Log failed lookups
-            # print(f"[LOOKUP FAILED] key={key}, table_keys_sample={list(_option_lookup_table.keys())[:3]}")
             return None
 
         # Fallback: use lookup cache
@@ -2606,53 +2631,35 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         min_date = str(options_df["Date"].min())
         max_date = str(options_df["Date"].max())
         if min_date <= from_date and max_date >= to_date:
-            # DataFrame covers the full requested range
+            # Skip building 7M-entry dict — use lazy per-date cache instead
             _option_lookup_table.clear()
             _future_lookup_table.clear()
-            opt_only = options_df.filter(pl.col("OptionType").is_in(["CE", "PE"]))
-            dates_l    = _series_to_iso_date_list(opt_only["Date"])
-            symbols_l  = opt_only["Symbol"].to_list()
-            strikes_l  = opt_only["StrikePrice"].cast(pl.Int64).to_list()
-            opt_l      = opt_only["OptionType"].to_list()
-            expiries_l = _series_to_iso_date_list(opt_only["ExpiryDate"])
-            closes_l   = opt_only["Close"].to_list()
-            _option_lookup_table = {
-                (d, s, k, o, e): c
-                for d, s, k, o, e, c in zip(dates_l, symbols_l, strikes_l, opt_l, expiries_l, closes_l)
-            }
-            _bulk_bhav_df = None
+            _option_lookup_cache.clear()
+            # Keep Polars DataFrame in _bulk_bhav_df for per-date slicing
+            _bulk_bhav_df = options_df  # Keep as Polars — faster filtering
+            # Pre-partition by date string for O(1) lookup in _build_option_lookup
+            _bulk_bhav_by_date.clear()
+            for date_val, sub_df in options_df.partition_by("Date", as_dict=True).items():
+                _bulk_bhav_by_date[str(date_val)[:10]] = sub_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
             lookup_loaded_from_redis = True
-            pass
     # FIX #1B: Build O(1) lookup dict using vectorized Polars ops + zip()
     if not lookup_loaded_from_redis:
         options_df = get_bulk_options_df()
         if options_df is not None and not options_df.is_empty():
+            # Skip building 7M-entry dict — use lazy per-date cache instead
             _option_lookup_table.clear()
             _future_lookup_table.clear()
-
-            # Filter to only CE/PE rows in Polars — vectorized, fast
-            opt_only = options_df.filter(pl.col("OptionType").is_in(["CE", "PE"]))
-
-            # Convert columns to Python lists in one shot (no per-row overhead)
-            dates_l    = _series_to_iso_date_list(opt_only["Date"])
-            symbols_l  = opt_only["Symbol"].to_list()
-            strikes_l  = opt_only["StrikePrice"].cast(pl.Int64).to_list()
-            opt_l      = opt_only["OptionType"].to_list()
-            expiries_l = _series_to_iso_date_list(opt_only["ExpiryDate"])
-            closes_l   = opt_only["Close"].to_list()
-
-            # Single-pass dict comprehension — much faster than loop + conditional
-            _option_lookup_table = {
-                (d, s, k, o, e): c
-                for d, s, k, o, e, c in zip(dates_l, symbols_l, strikes_l, opt_l, expiries_l, closes_l)
-            }
-
-            _bulk_bhav_df = None   # Don't keep raw DataFrame — dict is enough
+            _option_lookup_cache.clear()
+            # Keep Polars DataFrame in _bulk_bhav_df for per-date slicing
+            _bulk_bhav_df = options_df  # Keep as Polars — faster filtering
+            # Pre-partition by date string for O(1) lookup in _build_option_lookup
+            _bulk_bhav_by_date.clear()
+            for date_val, sub_df in options_df.partition_by("Date", as_dict=True).items():
+                _bulk_bhav_by_date[str(date_val)[:10]] = sub_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
-            store_lookup_cache_in_redis(symbol, from_date, to_date, _option_lookup_table)
 
     spot_df = get_bulk_spot_df()
     if spot_df is not None and not spot_df.is_empty():
@@ -2679,6 +2686,7 @@ def bulk_clear_options():
     _bulk_loaded = False
     _bulk_date_range = None
     _option_lookup_table.clear()
+    _bulk_bhav_by_date.clear()
     _future_lookup_table.clear()
     _spot_lookup_table.clear()
     _loaded_on_demand_dates.clear()
@@ -2700,6 +2708,7 @@ def bulk_force_clear():
     _bulk_loaded = False
     _bulk_date_range = None
     _option_lookup_table.clear()
+    _bulk_bhav_by_date.clear()
     _future_lookup_table.clear()
     _spot_lookup_table.clear()
 
