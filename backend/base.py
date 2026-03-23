@@ -1191,8 +1191,10 @@ _bulk_date_range = None
 
 # HIGH-PERFORMANCE CACHE: Pre-indexed lookup tables
 _option_lookup_table = {}  # (date, symbol, strike, opt_type, expiry) -> premium
-_future_lookup_table = {}   # (date, symbol, expiry) -> future_price
-_spot_lookup_table = {}     # (date, symbol) -> spot_price
+_future_lookup_table = {}  # (date, symbol, expiry) -> future_price
+_spot_lookup_table   = {}  # (date, symbol) -> spot_price
+# O(1) guard — replaces the O(n) key scan in _load_date_data_on_demand
+_loaded_on_demand_dates: set = set()
 
 
 def _load_bhavcopy_range_csv(from_date: str, to_date: str, symbols: list) -> pd.DataFrame:
@@ -1275,14 +1277,15 @@ def _build_option_lookup(date_str: str, index: str):
             return
 
         filtered = bhav_df[bhav_df['Symbol'] == index].copy()
-        lookup = {}
-        for _, row in filtered.iterrows():
-            opt_type = str(row.get('OptionType', '')).upper()
-            if opt_type not in ('CE', 'PE'):
-                continue
-            strike  = int(round(float(row['StrikePrice'])))
-            expiry  = pd.Timestamp(row['ExpiryDate']).strftime('%Y-%m-%d')
-            lookup[(strike, opt_type, expiry)] = float(row['Close'])
+        opt_df = filtered[filtered['OptionType'].str.upper().isin(['CE', 'PE'])].copy()
+        if not opt_df.empty:
+            strikes  = opt_df['StrikePrice'].apply(lambda x: int(round(float(x)))).tolist()
+            types    = opt_df['OptionType'].str.upper().tolist()
+            expiries = pd.to_datetime(opt_df['ExpiryDate']).dt.strftime('%Y-%m-%d').tolist()
+            closes   = opt_df['Close'].astype(float).tolist()
+            lookup   = {(s, t, e): c for s, t, e, c in zip(strikes, types, expiries, closes)}
+        else:
+            lookup = {}
 
         _option_lookup_cache[cache_key] = lookup
 
@@ -1318,10 +1321,12 @@ def _build_future_lookup(date_str: str, index: str):
             (bhav_df['Instrument'].str.upper().str.contains('FUT', na=False))
         ].copy()
 
-        lookup = {}
-        for _, row in filtered.iterrows():
-            expiry = pd.Timestamp(row['ExpiryDate']).strftime('%Y-%m-%d')
-            lookup[expiry] = float(row['Close'])
+        if not filtered.empty:
+            expiries = pd.to_datetime(filtered['ExpiryDate']).dt.strftime('%Y-%m-%d').tolist()
+            closes   = filtered['Close'].astype(float).tolist()
+            lookup = {e: c for e, c in zip(expiries, closes)}
+        else:
+            lookup = {}
 
         _future_lookup_cache[cache_key] = lookup
 
@@ -1342,6 +1347,7 @@ def clear_fast_lookup_caches():
     _option_lookup_table.clear()
     _future_lookup_table.clear()
     _spot_lookup_table.clear()
+    _loaded_on_demand_dates.clear()
     _bulk_bhav_df = None
     _bulk_spot_df = None
     _bulk_loaded = False
@@ -1427,16 +1433,17 @@ def load_super_trend_dates(force_reload: bool = False):
         try:
             for config_key in ("5x1", "5x2"):
                 df = _repo.get_super_trend_segments(config=config_key, symbol="NIFTY")
-                segments = []
-                for _, row in df.iterrows():
-                    start_dt = pd.Timestamp(row["start_date"]).to_pydatetime()
-                    end_dt = pd.Timestamp(row["end_date"]).to_pydatetime()
-                    if end_dt < start_dt:
-                        continue
-                    segments.append({"start": start_dt, "end": end_dt})
-                segments.sort(key=lambda s: s["start"])
+                if df.empty:
+                    loaded[config_key] = []
+                    continue
+                starts = pd.to_datetime(df["start_date"]).tolist()
+                ends   = pd.to_datetime(df["end_date"]).tolist()
+                segments = [
+                    {"start": s.to_pydatetime(), "end": e.to_pydatetime()}
+                    for s, e in zip(starts, ends) if e >= s
+                ]
+                segments.sort(key=lambda seg: seg["start"])
                 loaded[config_key] = segments
-                pass
 
             _super_trend_segments = loaded
             # FIX #1A: Build bisect index arrays once
@@ -1869,44 +1876,44 @@ def _load_date_data_on_demand(date_str: str, index: str):
     """Load data for a specific date and index, build lookup tables."""
     if not _bulk_loaded:
         return
-    
-    # Check if already loaded for this date
-    if any(key[0] == date_str and key[1] == index for key in _option_lookup_table.keys()):
+
+    # O(1) set check — old code scanned every key in a million-entry dict
+    if (date_str, index) in _loaded_on_demand_dates:
         return
-    
+    _loaded_on_demand_dates.add((date_str, index))
+
     try:
         # Load data for just this date from PostgreSQL
         df = _repo.get_bhavcopy_bulk(date_str, date_str, [index])
         if df is None or df.empty:
             return
         
-        # Build lookup entries
-        for _, row in df.iterrows():
-            try:
-                symbol = row['Symbol']
-                instrument = str(row.get('Instrument', '')).upper()
-                opt_type = str(row.get('OptionType', '')).upper()
-                strike = int(round(float(row.get('StrikePrice', 0))))
-                expiry = pd.Timestamp(row['ExpiryDate']).strftime('%Y-%m-%d')
-                close = float(row['Close'])
-                
-                if opt_type in ('CE', 'PE'):
-                    _option_lookup_table[(date_str, symbol, strike, opt_type, expiry)] = close
-                elif 'FUT' in instrument:
-                    _future_lookup_table[(date_str, symbol, expiry)] = close
-            except:
-                continue
-        
-        # Also load spot data
+        # Vectorized build — no per-row Python objects
+        df['_inst'] = df.get('Instrument', '').astype(str).str.upper()
+        df['_opt']  = df.get('OptionType',  '').astype(str).str.upper()
+        df['_strk'] = df['StrikePrice'].apply(lambda x: int(round(float(x))))
+        df['_exp']  = pd.to_datetime(df['ExpiryDate']).dt.strftime('%Y-%m-%d')
+        df['_cls']  = df['Close'].astype(float)
+
+        opt_rows = df[df['_opt'].isin(['CE', 'PE'])]
+        for sym, strk, opt, exp, cls in zip(
+            opt_rows['Symbol'], opt_rows['_strk'],
+            opt_rows['_opt'],   opt_rows['_exp'], opt_rows['_cls']
+        ):
+            _option_lookup_table[(date_str, sym, strk, opt, exp)] = cls
+
+        fut_rows = df[df['_inst'].str.contains('FUT', na=False)]
+        for sym, exp, cls in zip(fut_rows['Symbol'], fut_rows['_exp'], fut_rows['_cls']):
+            _future_lookup_table[(date_str, sym, exp)] = cls
+
+        # Spot data
         spot_df = _repo.get_spot_data_bulk([index], date_str, date_str)
         if spot_df is not None and not spot_df.empty:
-            for _, row in spot_df.iterrows():
-                try:
-                    symbol = row['Symbol']
-                    close = float(row['Close'])
-                    _spot_lookup_table[(date_str, symbol)] = close
-                except:
-                    continue
+            for sym, cls in zip(
+                spot_df['Symbol'].tolist(),
+                spot_df['Close'].astype(float).tolist()
+            ):
+                _spot_lookup_table[(date_str, sym)] = cls
                     
     except Exception as e:
         pass  # Silently fail - will use fallback
@@ -2674,6 +2681,7 @@ def bulk_clear_options():
     _option_lookup_table.clear()
     _future_lookup_table.clear()
     _spot_lookup_table.clear()
+    _loaded_on_demand_dates.clear()
     # NOTE: data_loader Polars cache intentionally kept alive for re-use
 
 

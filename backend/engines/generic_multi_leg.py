@@ -64,8 +64,10 @@ except ImportError:
 def _get_next_weekly_expiry_after(weekly_exp: pd.DataFrame, entry_date: pd.Timestamp):
     # FIX #3A: Use searchsorted instead of boolean filter + sort on every call.
     # weekly_exp is already sorted by Current Expiry from load_expiry().
-    expiries = weekly_exp["Current Expiry"].values
-    idx = np.searchsorted(expiries, entry_date, side="right")
+    # Cast to datetime64[ns] so numpy can compare against pd.Timestamp correctly.
+    expiries = weekly_exp["Current Expiry"].values.astype("datetime64[ns]")
+    entry_ts = np.datetime64(entry_date, "ns")
+    idx = np.searchsorted(expiries, entry_ts, side="right")
     if idx >= len(expiries):
         return None
     return pd.Timestamp(expiries[idx])
@@ -77,10 +79,12 @@ def _get_last_trading_day_on_or_before(spot_dates_arr, target_date: pd.Timestamp
     the full spot_df, and uses searchsorted for O(log n) lookup.
     Old code did a full DataFrame filter + sort on every call.
     """
-    idx = np.searchsorted(spot_dates_arr, target_date, side="right") - 1
+    arr = spot_dates_arr.astype("datetime64[ns]") if spot_dates_arr.dtype != np.dtype("datetime64[ns]") else spot_dates_arr
+    target_ts = np.datetime64(target_date, "ns")
+    idx = np.searchsorted(arr, target_ts, side="right") - 1
     if idx < 0:
         return None
-    return pd.Timestamp(spot_dates_arr[idx])
+    return pd.Timestamp(arr[idx])
 
 
 def _same_segment(seg_a: Dict[str, Any], seg_b: Dict[str, Any]) -> bool:
@@ -417,7 +421,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
 
     # FIX #3A: Pre-extract numpy arrays from DataFrames that are used in
     # hot-path helper functions — avoids per-call DataFrame allocation.
-    spot_dates_arr    = spot_df["Date"].values                        # for _get_last_trading_day_on_or_before
+    spot_dates_arr    = spot_df["Date"].values.astype("datetime64[ns]")                        # for _get_last_trading_day_on_or_before
     spot_closes_arr   = spot_df["Close"].values                       # for O(1) spot price lookup
     spot_dates_index  = {pd.Timestamp(d): i for i, d in enumerate(spot_dates_arr)}
 
@@ -433,7 +437,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
 
     # FIX #3A: Pre-sort monthly_exp and extract values array once
     monthly_exp_sorted   = monthly_exp.sort_values("Current Expiry").reset_index(drop=True)
-    monthly_exp_arr      = monthly_exp_sorted["Current Expiry"].values
+    monthly_exp_arr      = monthly_exp_sorted["Current Expiry"].values.astype("datetime64[ns]")
 
     trades = []
 
@@ -495,7 +499,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                     break
 
                 # FIX #3A: Replace monthly_exp filter+sort+reset_index with searchsorted
-                midx = np.searchsorted(monthly_exp_arr, trade_curr_expiry, side="left")
+                midx = np.searchsorted(monthly_exp_arr, np.datetime64(trade_curr_expiry, "ns"), side="left")
                 if midx >= len(monthly_exp_arr):
                     break
                 trade_fut_expiry = pd.Timestamp(monthly_exp_arr[midx])
@@ -572,7 +576,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
 
                 # FIX #3A: Use searchsorted on pre-extracted array instead of
                 # full DataFrame filter + sort to find next trading day
-                eff_ts = np.datetime64(effective_to_date)
+                eff_ts = np.datetime64(effective_to_date, "ns")
                 nidx   = np.searchsorted(spot_dates_arr, eff_ts, side="right")
                 if nidx >= len(spot_dates_arr):
                     break

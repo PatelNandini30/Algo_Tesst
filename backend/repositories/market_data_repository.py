@@ -118,9 +118,9 @@ class MarketDataRepository:
         to_date = to_date or "2099-12-31"
 
         try:
-            dfs = []
+            # Spot data is ~250 rows/year — single query is always faster
             with self.engine.begin() as conn:
-                for chunk in pd.read_sql(
+                df = pd.read_sql(
                     q,
                     conn,
                     params={
@@ -128,19 +128,15 @@ class MarketDataRepository:
                         "from_date": from_date,
                         "to_date": to_date
                     },
-                    chunksize=50_000
-                ):
-                    if not chunk.empty:
-                        dfs.append(chunk)
+                )
         except OperationalError as exc:
             logger.warning("Spot bulk fetch failed, resetting engine: %s", exc)
             reset_engine()
             raise
 
-        if not dfs:
+        if df is None or df.empty:
             return pd.DataFrame(columns=["Date", "Close"])
 
-        df = pd.concat(dfs, ignore_index=True)
         df.drop_duplicates(inplace=True)
         if df.empty:
             return pd.DataFrame(columns=["Date", "Close"])

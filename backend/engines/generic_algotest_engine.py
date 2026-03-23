@@ -95,18 +95,22 @@ from base import (
 
 def _last_trading_day_on_or_before(trading_calendar_df, target_date):
     target_ts = pd.Timestamp(target_date)
-    rows = trading_calendar_df[trading_calendar_df['date'] <= target_ts].sort_values('date')
-    if rows.empty:
+    arr = trading_calendar_df['date'].values.astype('datetime64[ns]')
+    ts = np.datetime64(target_ts, 'ns')
+    idx = np.searchsorted(arr, ts, side='right') - 1
+    if idx < 0:
         return None
-    return rows.iloc[-1]['date']
+    return pd.Timestamp(arr[idx])
 
 
 def _next_trading_day_after(trading_calendar_df, target_date):
     target_ts = pd.Timestamp(target_date)
-    rows = trading_calendar_df[trading_calendar_df['date'] > target_ts].sort_values('date')
-    if rows.empty:
+    arr = trading_calendar_df['date'].values.astype('datetime64[ns]')
+    ts = np.datetime64(target_ts, 'ns')
+    idx = np.searchsorted(arr, ts, side='right')
+    if idx >= len(arr):
         return None
-    return rows.iloc[0]['date']
+    return pd.Timestamp(arr[idx])
 
 
 
@@ -442,11 +446,13 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
     
 
 
-    # All trading days between entry (exclusive) and planned exit (inclusive)
-    holding_days = trading_calendar[
-        (trading_calendar['date'] > entry_date) &
-        (trading_calendar['date'] <= exit_date)
-    ]['date'].tolist()
+    # O(log n) searchsorted instead of full DataFrame boolean scan
+    _tc_arr = trading_calendar['date'].values.astype('datetime64[ns]')
+    _entry_ns = np.datetime64(pd.Timestamp(entry_date), 'ns')
+    _exit_ns  = np.datetime64(pd.Timestamp(exit_date),  'ns')
+    _lo = np.searchsorted(_tc_arr, _entry_ns, side='right')
+    _hi = np.searchsorted(_tc_arr, _exit_ns, side='right')
+    holding_days = trading_calendar.iloc[_lo:_hi]['date'].tolist()
 
     # Per-leg tracking: once a leg is triggered it stays triggered
     leg_results = [
@@ -845,10 +851,13 @@ def check_overall_stop_loss_target(
     sl_is_underlying  = _sl_ntype  in ('underlying_pts', 'underlying_pct')
     tgt_is_underlying = _tgt_ntype in ('underlying_pts', 'underlying_pct')
 
-    holding_days = trading_calendar[
-        (trading_calendar['date'] > entry_date) &
-        (trading_calendar['date'] <= exit_date)
-    ]['date'].tolist()
+    # O(log n) searchsorted instead of full DataFrame boolean scan
+    _tc_arr = trading_calendar['date'].values.astype('datetime64[ns]')
+    _entry_ns = np.datetime64(pd.Timestamp(entry_date), 'ns')
+    _exit_ns  = np.datetime64(pd.Timestamp(exit_date),  'ns')
+    _lo = np.searchsorted(_tc_arr, _entry_ns, side='right')
+    _hi = np.searchsorted(_tc_arr, _exit_ns, side='right')
+    holding_days = trading_calendar.iloc[_lo:_hi]['date'].tolist()
 
     # Build set of leg indices that have already exited (for partial mode)
     closed_leg_indices = set()
@@ -1164,6 +1173,8 @@ def run_algotest_backtest(params):
     # Create trading calendar from spot data
     trading_calendar = spot_df[['Date']].drop_duplicates().sort_values('Date').reset_index(drop=True)
     trading_calendar.columns = ['date']
+    # Pre-build sorted numpy array for O(log n) searchsorted lookups
+    trading_calendar_arr = trading_calendar['date'].values.astype('datetime64[ns]')
     
     if expiry_day_of_week is not None:
         expiry_dates = get_custom_expiry_dates(index, expiry_day_of_week, from_date, to_date)

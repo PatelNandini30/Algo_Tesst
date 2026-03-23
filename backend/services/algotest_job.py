@@ -145,11 +145,34 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             trades_df, summary, pivot = run_algotest_backtest(payload)
             all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
 
-        all_trades = _convert_numpy(_format_dates(all_trades))
+        # Re-compute summary and pivot from the collected trades
+        # so the frontend receives full analytics, not just raw trades.
+        result_summary = {}
+        result_pivot = {"headers": [], "rows": []}
+        if all_trades:
+            try:
+                import pandas as pd
+                from base import compute_analytics, build_pivot
+                trades_df = pd.DataFrame(all_trades)
+                # Restore datetime columns for analytics
+                for col in ['Entry Date', 'Exit Date']:
+                    if col in trades_df.columns:
+                        trades_df[col] = pd.to_datetime(
+                            trades_df[col], dayfirst=True, errors='coerce'
+                        )
+                trades_df, result_summary = compute_analytics(trades_df)
+                result_pivot = build_pivot(trades_df, "Future Expiry")
+                all_trades = _convert_numpy(_format_dates(trades_df.to_dict('records')))
+            except Exception:
+                pass
+        else:
+            all_trades = _convert_numpy(_format_dates(all_trades))
 
         result_payload = {
             'status': 'success',
             'trades': all_trades,
+            'summary': _convert_numpy(result_summary),
+            'pivot': _convert_numpy(result_pivot),
             'cached': False,
         }
 

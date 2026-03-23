@@ -28,6 +28,7 @@ celery_app.conf.update(
     task_time_limit=3600,  # 1 hour max
     task_soft_time_limit=3000,  # 50 minutes soft limit
     worker_prefetch_multiplier=1,
+    worker_max_tasks_per_child=50,   # recycle workers to prevent Pandas/Polars memory fragmentation
     broker_connection_retry_on_startup=True,
     broker_connection_retry=True,
     broker_connection_max_retries=3,
