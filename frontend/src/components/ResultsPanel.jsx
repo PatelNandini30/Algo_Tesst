@@ -162,11 +162,21 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
     if (!dateStr) return '';
     try {
       // Handle dd-mm-yyyy format from backend
-      const parts = dateStr.split('-');
-      if (parts.length === 3) {
-        const day = parseInt(parts[0]);
-        const month = parseInt(parts[1]) - 1;
-        const year = parseInt(parts[2]);
+      const dashParts = dateStr.split('-');
+      if (dashParts.length === 3) {
+        const day = parseInt(dashParts[0]);
+        const month = parseInt(dashParts[1]) - 1;
+        const year = parseInt(dashParts[2]);
+        const date = new Date(year, month, day);
+        const monthName = date.toLocaleString('en-US', { month: 'short' });
+        return `${day} ${monthName} ${year}`;
+      }
+      // Handle dd/mm/yyyy format from backend
+      const slashParts = dateStr.split('/');
+      if (slashParts.length === 3) {
+        const day = parseInt(slashParts[0]);
+        const month = parseInt(slashParts[1]) - 1;
+        const year = parseInt(slashParts[2]);
         const date = new Date(year, month, day);
         const monthName = date.toLocaleString('en-US', { month: 'short' });
         return `${day} ${monthName} ${year}`;

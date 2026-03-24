@@ -2,7 +2,9 @@ import logging
 import os
 from typing import Optional
 
+import msgpack
 import pandas as pd
+import redis
 import threading
 from datetime import datetime, timedelta
 from sqlalchemy import text
@@ -43,25 +45,30 @@ class MarketDataRepository:
 
     _trading_calendar_cache_df: Optional[pd.DataFrame] = None
     _trading_calendar_cache_lock = threading.Lock()
+    _columns_cache: dict = {}
+    _columns_cache_lock = threading.Lock()
 
     def __init__(self, engine):
         self.engine = engine
-        self._columns_cache = {}
 
     def _table_columns(self, table_name: str):
-        if table_name in self._columns_cache:
-            return self._columns_cache[table_name]
-        q = text(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = :t
-            """
-        )
-        with self.engine.begin() as conn:
-            cols = {r[0] for r in conn.execute(q, {"t": table_name}).fetchall()}
-        self._columns_cache[table_name] = cols
-        return cols
+        cls = self.__class__
+        if table_name in cls._columns_cache:
+            return cls._columns_cache[table_name]
+        with cls._columns_cache_lock:
+            if table_name in cls._columns_cache:
+                return cls._columns_cache[table_name]
+            q = text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = :t
+                """
+            )
+            with self.engine.begin() as conn:
+                cols = {r[0] for r in conn.execute(q, {"t": table_name}).fetchall()}
+            cls._columns_cache[table_name] = cols
+            return cols
 
     def _pick(self, cols: set, preferred: str, fallback: str):
         return preferred if preferred in cols else fallback
@@ -81,7 +88,6 @@ class MarketDataRepository:
                 option_type AS "OptionType",
                 strike_price AS "StrikePrice",
                 {close_col} AS "Close",
-                turnover AS "TurnOver",
                 {date_col} AS "Date"
             FROM option_data
             WHERE {date_col} = :d
@@ -199,6 +205,10 @@ class MarketDataRepository:
         Get all trading dates in a date range.
         Uses spot_data table first (smaller), falls back to option_data if needed.
         """
+        cls = self.__class__
+        if cls._trading_calendar_cache_df is not None:
+            return self._filter_trading_calendar(from_date, to_date)
+
         # First try spot_data (much smaller table)
         cols = self._table_columns("spot_data")
         if cols:
@@ -212,11 +222,20 @@ class MarketDataRepository:
                 """
             )
             try:
+                # Load the FULL spot_data calendar (no date filter) into class cache
+                q_full = text(
+                    f"""
+                    SELECT DISTINCT {date_col} AS date
+                    FROM spot_data
+                    ORDER BY {date_col}
+                    """
+                )
                 with self.engine.begin() as conn:
-                    df = pd.read_sql(q, conn, params={"from_date": from_date, "to_date": to_date})
-                if not df.empty:
-                    df["date"] = pd.to_datetime(df["date"])
-                    return df
+                    df_full = pd.read_sql(q_full, conn)
+                if not df_full.empty:
+                    df_full["date"] = pd.to_datetime(df_full["date"])
+                    cls._trading_calendar_cache_df = df_full
+                    return self._filter_trading_calendar(from_date, to_date)
             except Exception as e:
                 print(f"[WARN] spot_data query failed: {e}")
         
@@ -229,10 +248,24 @@ class MarketDataRepository:
         return self._filter_trading_calendar(from_date, to_date)
 
     def _ensure_trading_calendar_cache(self, date_col: str):
-        if self.__class__._trading_calendar_cache_df is not None:
+        cls = self.__class__
+        if cls._trading_calendar_cache_df is not None:
             return
+        redis_client = None
+        redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        try:
+            redis_client = redis.Redis.from_url(redis_url)
+            cached = redis_client.get("trading_calendar:full")
+            if cached:
+                records = msgpack.unpackb(cached, raw=False)
+                df = pd.DataFrame(records)
+                df["date"] = pd.to_datetime(df["date"])
+                cls._trading_calendar_cache_df = df
+                return
+        except Exception:
+            pass
         with self.__class__._trading_calendar_cache_lock:
-            if self.__class__._trading_calendar_cache_df is not None:
+            if cls._trading_calendar_cache_df is not None:
                 return
             q = text(
                 f"""
@@ -248,6 +281,25 @@ class MarketDataRepository:
                 return
             df["date"] = pd.to_datetime(df["date"])
             self.__class__._trading_calendar_cache_df = df
+            if redis_client:
+                try:
+                    redis_client.setex(
+                        "trading_calendar:full",
+                        86400,
+                        msgpack.packb(
+                            [
+                                {
+                                    "date": row["date"].strftime("%Y-%m-%d")
+                                    if hasattr(row["date"], "strftime")
+                                    else str(row["date"])
+                                }
+                                for row in df.to_dict("records")
+                            ],
+                            use_bin_type=True,
+                        ),
+                    )
+                except Exception:
+                    pass
 
     def _filter_trading_calendar(self, from_date: str, to_date: str) -> pd.DataFrame:
         df = self.__class__._trading_calendar_cache_df
@@ -278,7 +330,6 @@ class MarketDataRepository:
                 option_type AS "OptionType",
                 strike_price AS "StrikePrice",
                 {close_col} AS "Close",
-                turnover AS "TurnOver",
                 {date_col} AS "Date"
             FROM option_data
             WHERE {date_col} >= :from_date

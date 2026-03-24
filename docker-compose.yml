@@ -1,3 +1,34 @@
+# ============================================================
+# Tuned for: HP 280 Pro G6 Microtower
+#   CPU  : Intel i5-10500  (6C/12T, 3.1–4.5 GHz)
+#   RAM  : 16 GB DDR4-3200 (2×8 GB)
+#   DISK : 1 TB TOSHIBA DT01ACA1  ← spinning HDD, NOT SSD
+#   OS   : Ubuntu (Linux)
+#   Swap : 11 GB (also on HDD — DO NOT LET ANYTHING TOUCH IT)
+#
+# Memory budget (hard limits must never trigger swap):
+#   postgres         : 3500M  (shared_buffers 512MB — safe for HDD)
+#   redis            :  700M
+#   backend          : 2500M
+#   worker-backtests : 3500M
+#   worker-uploads   :  500M
+#   frontend         :  200M
+#   ─────────────────────────────
+#   Total hard limit : 10,900M
+#   OS + kernel      : ~1,500M
+#   Headroom/cache   : ~3,600M  ← HDD needs large OS page cache
+#   ─────────────────────────────
+#   Grand total      : ~16,000M  ✓ fits with buffer
+#
+# HDD-specific Postgres tuning:
+#   - random_page_cost=4.0   (HDD random I/O is 4x more expensive than seq)
+#   - effective_io_concurrency=2  (NOT 100 — HDD can't do parallel I/O)
+#   - shared_buffers=512MB   (keep more in Postgres cache to avoid disk reads)
+#   - effective_cache_size=2GB  (realistic for 16GB with HDD)
+#   - work_mem=32MB          (low — 6 parallel workers × 32MB = 192MB max)
+#   - max_parallel_workers=2  (HDD bottleneck means more workers = slower)
+# ============================================================
+
 x-backend-env: &backend-env
   DATABASE_URL: "postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@postgres:5432/${POSTGRES_DB:-algotest}"
   REDIS_URL: "redis://redis:6379/0"
@@ -8,12 +39,16 @@ x-backend-env: &backend-env
   DB_POOL_MAX_OVERFLOW: "5"
   DB_POOL_TIMEOUT: "30"
   DB_POOL_RECYCLE: "3600"
+  # Cap in-process bulk_load so backend+worker never OOM on 16GB HDD server
+  BULK_LOAD_MAX_MEMORY_MB: "1500"
+
 x-backend-volumes: &backend-volumes
   - ./cleaned_csvs:/data/cleaned_csvs:ro
   - ./expiryData:/data/expiryData:ro
   - ./strikeData:/data/strikeData:ro
   - ./Filter:/data/Filter:ro
-  - /tmp/algo_parquet_cache:/tmp/parquet_cache
+  - parquet_cache:/tmp/parquet_cache
+
 services:
   postgres:
     image: postgres:15-bullseye
@@ -28,25 +63,25 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./reports/sql:/data:ro
-    shm_size: '3gb'
+    shm_size: '512mb'
     command: >
       postgres
-      -c max_connections=100
-      -c shared_buffers=1GB
-      -c effective_cache_size=6GB
-      -c work_mem=128MB
-      -c maintenance_work_mem=512MB
-      -c random_page_cost=1.1
-      -c effective_io_concurrency=100
-      -c max_worker_processes=4
-      -c max_parallel_workers_per_gather=2
-      -c max_parallel_workers=4
+      -c max_connections=50
+      -c shared_buffers=512MB
+      -c effective_cache_size=2GB
+      -c work_mem=32MB
+      -c maintenance_work_mem=256MB
+      -c random_page_cost=4.0
+      -c effective_io_concurrency=2
+      -c max_worker_processes=2
+      -c max_parallel_workers_per_gather=1
+      -c max_parallel_workers=2
       -c checkpoint_completion_target=0.9
-      -c wal_buffers=64MB
+      -c wal_buffers=32MB
       -c default_statistics_target=100
-      -c log_min_duration_statement=1000
+      -c log_min_duration_statement=2000
       -c idle_in_transaction_session_timeout=600000
-      -c statement_timeout=120000
+      -c statement_timeout=1800000
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-algotest}"]
       interval: 10s
@@ -55,19 +90,20 @@ services:
     deploy:
       resources:
         limits:
-          memory: 5000M
+          memory: 3500M
           cpus: "2.0"
         reservations:
-          memory: 3500M
+          memory: 1500M
     networks:
       - algotest-network
+
   redis:
     image: redis:7-bullseye
     container_name: algotest-redis
     restart: unless-stopped
     command: >
       redis-server
-      --maxmemory 1500mb
+      --maxmemory 500mb
       --maxmemory-policy allkeys-lru
       --save ""
       --appendonly no
@@ -87,12 +123,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1700M
+          memory: 700M
           cpus: "0.5"
         reservations:
-          memory: 128M
+          memory: 64M
     networks:
       - algotest-network
+
   backend:
     build:
       context: ./backend
@@ -118,7 +155,7 @@ services:
     environment:
       <<: *backend-env
       UVICORN_LOOP: uvloop
-      UVICORN_WORKERS: "2"
+      UVICORN_WORKERS: "1"
       DB_STATEMENT_TIMEOUT: "1800000"
       USE_POSTGRESQL: "true"
       ALLOW_CSV_FALLBACK: "false"
@@ -142,12 +179,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 5120M
-          cpus: "1.5"
+          memory: 2500M
+          cpus: "2.0"
         reservations:
           memory: 256M
     networks:
       - algotest-network
+
   worker-backtests:
     build:
       context: ./backend
@@ -159,13 +197,14 @@ services:
       --queues=backtests
       --concurrency=1
       -l warning
-      --max-memory-per-child=600000
+      --max-memory-per-child=300000
       --without-gossip
       --without-mingle
       --without-heartbeat
     environment:
       <<: *backend-env
       BACKTEST_WORKERS: "1"
+      BULK_LOAD_MAX_MEMORY_MB: "1500"
     volumes: *backend-volumes
     depends_on:
       postgres:
@@ -179,14 +218,15 @@ services:
       retries: 3
       start_period: 30s
     deploy:
-        resources:
-          limits:
-            memory: 8000M
-            cpus: "4.0"
-          reservations:
-            memory: 512M
+      resources:
+        limits:
+          memory: 3500M
+          cpus: "4.0"
+        reservations:
+          memory: 512M
     networks:
       - algotest-network
+
   worker-uploads:
     build:
       context: ./backend
@@ -196,9 +236,9 @@ services:
     command: >
       celery -A worker.celery worker
       -Q uploads
-      -c 2
+      -c 1
       -l info
-      --max-memory-per-child=400000
+      --max-memory-per-child=300000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -218,12 +258,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1000M
-          cpus: "1.0"
+          memory: 500M
+          cpus: "0.5"
         reservations:
-          memory: 256M
+          memory: 128M
     networks:
       - algotest-network
+
   frontend:
     build:
       context: ./frontend
@@ -244,12 +285,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 200M
           cpus: "0.5"
         reservations:
           memory: 64M
     networks:
       - algotest-network
+
 volumes:
   pgdata:
   redis_data:
@@ -259,6 +301,7 @@ volumes:
       type: none
       o: bind
       device: /tmp/algo_parquet_cache
+
 networks:
   algotest-network:
     driver: bridge

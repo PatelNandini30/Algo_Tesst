@@ -305,17 +305,43 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         _log(f"      PREMIUM_LTE <= {max_prem} → strike={best['strike']} (premium={best['premium']:.2f}, closest to target, ATM={atm_strike})")
         return best['strike']
 
-    # ── STRADDLE WIDTH: ATM + 0.5 × (CE − PE), round to nearest 50 ──────────────
+    # ── STRADDLE WIDTH: ATM ± (multiplier × (ATM CE + ATM PE)) ────────────────
     if strike_sel_type == 'STRADDLE_WIDTH':
         atm_strike = round(entry_spot / strike_interval) * strike_interval
+
+        multiplier = float(
+            leg_config.get('straddle_multiplier')
+            or leg_config.get('straddle_width_value')
+            or leg_config.get('sw_multiplier')
+            or (strike_sel.get('value') if isinstance(strike_sel, dict) else None)
+            or 0.5
+        )
+        direction = str(
+            leg_config.get('straddle_direction')
+            or leg_config.get('sw_direction')
+            or (strike_sel.get('direction') if isinstance(strike_sel, dict) else None)
+            or '+'
+        ).strip()
+
         ce_price = get_option_premium_from_db(entry_date, index, atm_strike, 'CE', expiry_date)
         pe_price = get_option_premium_from_db(entry_date, index, atm_strike, 'PE', expiry_date)
-        
+
         if ce_price is not None and pe_price is not None:
-            shift = (ce_price - pe_price) / 2
-            shifted = round((atm_strike + shift) / 50) * 50  # Round to nearest 50
-            _log(f"      STRADDLE_WIDTH: ATM={atm_strike}, CE={ce_price}, PE={pe_price}, shift={shift:.2f} → {shifted}")
-            return shifted
+            straddle_price = ce_price + pe_price
+            shift = multiplier * straddle_price
+            if direction == '-':
+                raw_strike = atm_strike - shift
+            else:
+                raw_strike = atm_strike + shift
+            final_strike = round(raw_strike / strike_interval) * strike_interval
+            _log(
+                f"      STRADDLE_WIDTH: ATM={atm_strike}, CE={ce_price}, "
+                f"PE={pe_price}, straddle={straddle_price:.2f}, "
+                f"multiplier={multiplier}, direction={direction}, "
+                f"shift={shift:.2f} → {final_strike}"
+            )
+            return final_strike
+
         _log(f"      STRADDLE_WIDTH: Missing CE/PE data, fallback to ATM={atm_strike}")
         return atm_strike
 
@@ -1968,6 +1994,20 @@ def run_algotest_backtest(params):
     if not all_trades:
         return pd.DataFrame(), {}, {}
     
+    # Pre-fetch exit spot prices to avoid repeated DB calls
+    _all_exit_dates = set()
+    for t in all_trades:
+        _all_exit_dates.add(str(t.get('exit_date', '')))
+        per_leg = t.get('per_leg_results') or []
+        for plr in per_leg:
+            _all_exit_dates.add(str(plr.get('exit_date', '')))
+    _exit_spot_cache = {}
+    for _ed in _all_exit_dates:
+        if _ed:
+            _sp = get_spot_price_from_db(_ed, index)
+            if _sp is not None:
+                _exit_spot_cache[_ed] = _sp
+
     # Flatten for DataFrame - Create rows for EACH leg (AlgoTest format)
     # But we'll aggregate them back for analytics
     trades_flat = []
@@ -1996,60 +2036,56 @@ def run_algotest_backtest(params):
                 # ── Exit spot price taken from the leg's own exit date ─────────────
                 # Each leg may exit on a different day (partial mode), so we fetch
                 # the spot price for that specific exit date.
-                leg_exit_spot = get_spot_price_from_db(leg_exit_date, trade.get('index', 'NIFTY'))
+                leg_exit_spot = _exit_spot_cache.get(str(leg_exit_date))
                 if leg_exit_spot is None:
                     leg_exit_spot = trade.get('exit_spot', entry_spot_val)
 
                 # ── Entry / Exit price (premium for options, price for futures) ────
+                # ── Entry / Exit price (premium for options, price for futures) ────
                 if leg['segment'] == 'FUTURE':
-                    option_type = 'FUT'
+                    leg_option_type = 'FUT'
                     position    = leg['position']
                     strike      = ''
-                    entry_price = leg['entry_price']
-                    # Use early_exit_date's price if the leg was triggered early
+                    entry_price = leg.get('entry_price', 0)
                     exit_price  = leg.get('exit_price', 0)
+                    leg_pnl     = leg.get('pnl', leg.get('total_pnl', 0))
                 else:
-                    option_type = leg['option_type']
+                    leg_option_type = leg['option_type']
                     position    = leg['position']
                     strike      = leg['strike']
                     entry_price = leg['entry_premium']
-                    # exit_premium is always updated to the correct exit date's market price:
-                    #   • for triggered legs: set during the SL/TGT recalc block above
-                    #   • for scheduled legs: set during initial options processing
                     exit_price  = leg.get('exit_premium', 0)
+                    leg_pnl     = leg['pnl']
 
-                    leg_pnl  = leg["pnl"]
-                    lots     = leg.get("lots", 1)
-                    lot_size = leg.get("lot_size", 65)
-                    qty      = lots * lot_size
+                lots        = leg.get('lots', 1)
+                lot_size    = leg.get('lot_size', 65)
+                qty         = lots * lot_size
+                entry_spot_val = trade.get('entry_spot', 0)
+                pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
 
-                    # % P&L — based on Entry Spot
-                    entry_spot_val = trade.get("entry_spot", 0)
-                    pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
+                row = {
+                    'Trade':        trade_idx,
+                    'Leg':          leg_num,
+                    'Index':        trade_counter + leg_num,
+                    'Entry Date':   trade['entry_date'],
+                    'Exit Date':    leg_exit_date,
+                    'Type':         leg_option_type,
+                    'Strike':       strike,
+                    'B/S':          position,
+                    'Qty':          qty,
+                    'Entry Price':  entry_price,
+                    'Exit Price':   exit_price,
+                    'Entry Spot':   entry_spot_val,
+                    'Exit Spot':    leg_exit_spot,
+                    'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if leg_exit_spot and entry_spot_val else 0,
+                    'Future Expiry': trade['expiry_date'],
+                    'Net P&L':      leg_pnl,
+                    '% P&L':        pct_pnl,
+                    'Exit Reason':  leg_exit_reason,
+                    'STR Segment':  trade.get('str_segment', ''),
+                }
 
-                    row = {
-                        'Trade':        trade_idx,
-                        'Leg':          leg_num,
-                        'Index':        trade_counter + leg_num,
-                        'Entry Date':   trade['entry_date'],
-                        'Exit Date':    leg_exit_date,          # per-leg (differs in partial mode)
-                        'Type':         option_type,
-                        'Strike':       strike,
-                        'B/S':          position,
-                        'Qty':          qty,
-                        'Entry Price':  entry_price,
-                        'Exit Price':   exit_price,             # correct price for this leg's exit date
-                        'Entry Spot':   entry_spot_val,
-                        'Exit Spot':    leg_exit_spot,          # spot on this leg's exit date
-                        'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if leg_exit_spot and entry_spot_val else 0,
-                        'Future Expiry': trade['expiry_date'],
-                        'Net P&L':      leg_pnl,
-                        '% P&L':        pct_pnl,
-                        'Exit Reason':  leg_exit_reason,        # per-leg reason
-                        'STR Segment':  trade.get('str_segment', ''),
-                        }
-
-                    trades_flat.append(row)
+                trades_flat.append(row)
             except Exception as e:
                 flatten_errors.append(f"Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
                 continue
@@ -2096,18 +2132,18 @@ def run_algotest_backtest(params):
     t_pivot = time.perf_counter()
     pivot = build_pivot(trades_aggregated, 'Exit Date')
     
-    t_total = time.perf_counter() - t_spot
-    
+    t_end = time.perf_counter()
+    t_total = t_end - t_spot
+
     # Print timing summary (only if not too fast — avoid log spam)
     if t_total > 0.5:
         t_agg_actual = t_pivot - t_agg
-        t_analytics = time.perf_counter() - t_pivot
-        t_pivot_actual = t_total - t_pivot
+        t_pivot_actual = t_end - t_pivot
+        t_analytics_actual = t_pivot - t_agg
         print(f"[PERF] {index} {from_date}→{to_date} | "
-              f"spot={t_loop_elapsed:.2f}s | "
-              f"loop({n_expiries} exps)={t_loop_elapsed:.2f}s | "
-              f"agg={t_agg_actual:.2f}s | "
-              f"analytics={t_analytics:.2f}s | "
+              f"data_load={t_loop - t_spot:.2f}s | "
+              f"loop({n_expiries} exps)={t_agg - t_loop:.2f}s | "
+              f"agg+analytics={t_agg_actual:.2f}s | "
               f"pivot={t_pivot_actual:.2f}s | "
               f"TOTAL={t_total:.2f}s")
     

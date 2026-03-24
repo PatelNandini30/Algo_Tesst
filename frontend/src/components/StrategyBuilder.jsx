@@ -301,6 +301,8 @@ const StrategyBuilder = () => {
     premium_value: 0,
     premium_min: 0,
     premium_max: 0,
+    straddle_multiplier: 0.5,
+    straddle_direction: '+',
   });
 
   const [overallSLEnabled, setOverallSLEnabled] = useState(false);
@@ -569,8 +571,18 @@ const StrategyBuilder = () => {
       re_entry_target_enabled: false, re_entry_target_mode: 'RE_ASAP', re_entry_target_count: 1,
       re_entry_sl_enabled: false, re_entry_sl_mode: 'RE_ASAP', re_entry_sl_count: 1,
       simple_momentum_enabled: false, simple_momentum_mode: 'POINTS_UP', simple_momentum_value: 0,
+      straddle_multiplier: draftLeg.straddle_multiplier ?? 0.5,
+      straddle_direction: draftLeg.straddle_direction ?? '+',
     }]);
-    setDraftLeg(prev => ({ ...prev, strike_type: 'atm', premium_value: 0, premium_min: 0, premium_max: 0 }));
+    setDraftLeg(prev => ({
+      ...prev,
+      strike_type: 'atm',
+      premium_value: 0,
+      premium_min: 0,
+      premium_max: 0,
+      straddle_multiplier: 0.5,
+      straddle_direction: '+',
+    }));
   };
   const addLeg = addLegFromDraft;
 
@@ -593,6 +605,10 @@ const StrategyBuilder = () => {
           upper: l.premium_max,
         },
       };
+      if (l.strike_criteria === 'straddle_width') {
+        leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
+        leg.straddle_direction = l.straddle_direction ?? '+';
+      }
 
       // Target Profit - only send if enabled AND value is set
       if (l.target_enabled && l.target_value != null && l.target_value > 0) {
@@ -1117,6 +1133,30 @@ const StrategyBuilder = () => {
                       <option value="closest_delta">Closest Delta</option>
                       <option value="delta_range">Delta Range</option>
                     </select>
+                    {draftLeg.strike_criteria === 'straddle_width' && (
+                      <div className="flex items-center gap-1 mt-2 text-xs text-gray-600">
+                        <span className="text-xs text-gray-500 whitespace-nowrap">ATM Strike</span>
+                        <select
+                          value={draftLeg.straddle_direction ?? '+'}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, straddle_direction: e.target.value }))}
+                          className="h-6 px-2 border border-gray-300 rounded text-xs bg-white"
+                        >
+                          <option value="+">+</option>
+                          <option value="-">-</option>
+                        </select>
+                        <span className="text-xs text-gray-500">(</span>
+                        <input
+                          type="number"
+                          value={draftLeg.straddle_multiplier ?? 0.5}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, straddle_multiplier: parseFloat(e.target.value) || 0 }))}
+                          step="0.1"
+                          min="0"
+                          max="10"
+                          className="w-16 h-6 px-2 border border-gray-300 rounded text-xs text-center"
+                        />
+                        <span className="text-xs text-gray-500 whitespace-nowrap">× ATM Straddle Price )</span>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1179,6 +1219,11 @@ const StrategyBuilder = () => {
                       </div>
 
                       <div className="p-3 space-y-3">
+                        {leg.strike_criteria === 'straddle_width' && (
+                          <div className="text-xs text-gray-500 px-1">
+                            Straddle Width: ATM {leg.straddle_direction ?? '+'} ({leg.straddle_multiplier ?? 0.5} × Straddle)
+                          </div>
+                        )}
                         {/* Basic fields */}
                         <div className="flex flex-wrap items-end gap-3">
                           <div>
@@ -1251,6 +1296,30 @@ const StrategyBuilder = () => {
                                   <option value="closest_delta">Closest Delta</option>
                                   <option value="delta_range">Delta Range</option>
                                 </select>
+                                {leg.strike_criteria === 'straddle_width' && (
+                                  <div className="flex items-center gap-1 mt-2 text-xs text-gray-600">
+                                    <span className="text-xs text-gray-500 whitespace-nowrap">ATM Strike</span>
+                                    <select
+                                      value={leg.straddle_direction ?? '+'}
+                                      onChange={e => updateLeg(leg.id, 'straddle_direction', e.target.value)}
+                                      className="h-6 px-2 border border-gray-300 rounded text-xs bg-white"
+                                    >
+                                      <option value="+">+</option>
+                                      <option value="-">-</option>
+                                    </select>
+                                    <span className="text-xs text-gray-500">(</span>
+                                    <input
+                                      type="number"
+                                      value={leg.straddle_multiplier ?? 0.5}
+                                      onChange={e => updateLeg(leg.id, 'straddle_multiplier', parseFloat(e.target.value) || 0)}
+                                      step="0.1"
+                                      min="0"
+                                      max="10"
+                                      className="w-16 h-6 px-2 border border-gray-300 rounded text-xs text-center"
+                                    />
+                                    <span className="text-xs text-gray-500 whitespace-nowrap">× ATM Straddle Price )</span>
+                                  </div>
+                                )}
                               </div>
                               <div>
                                 <label className="block text-xs text-gray-500 mb-1">Strike Type</label>

@@ -4,19 +4,15 @@ from typing import Dict, Any, List, Optional, Tuple
 # NOTE: keep FastAPI imports at top for readability
 from engines.generic_algotest_engine import run_algotest_backtest
 from services.algotest_job import execute_algotest_job
-from services.redis_cache import redis_cache as shared_redis_cache
+from services.backtest_cache import get_backtest_cache as _get_result_cache
 from worker.tasks import run_algotest_job
 from worker.celery import celery_app
 import sys
 import os
 import pandas as pd
 import numpy as np
-import hashlib
-import json
-import threading
-import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
 import logging
 from datetime import datetime
@@ -37,45 +33,8 @@ def _normalize_date(value: Any) -> str:
 
 # Thread pool for async tasks (I/O/cache warming) and process pool for CPU-heavy backtests
 _backtest_executor = ThreadPoolExecutor(max_workers=3)
-
-# Simple in-memory cache for backtest results
-class BacktestCache:
-    def __init__(self, max_size=100, ttl_seconds=3600):
-        self._cache: Dict[str, tuple] = {}
-        self._lock = threading.Lock()
-        self._max_size = max_size
-        self._ttl = ttl_seconds
-    
-    def _make_key(self, params: dict) -> str:
-        """Hash the full params dict so strategy definitions aren't ignored."""
-        try:
-            key_str = json.dumps(params, sort_keys=True, default=str)
-        except Exception:
-            key_str = repr(params)
-        return hashlib.sha256(key_str.encode()).hexdigest()
-    
-    def get(self, params: dict) -> Optional[dict]:
-        key = self._make_key(params)
-        with self._lock:
-            if key in self._cache:
-                result, timestamp = self._cache[key]
-                if time.time() - timestamp < self._ttl:
-                    return result
-                else:
-                    del self._cache[key]
-        return None
-    
-    def set(self, params: dict, result: dict):
-        key = self._make_key(params)
-        with self._lock:
-            if len(self._cache) >= self._max_size:
-                # Remove oldest entry
-                oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k][1])
-                del self._cache[oldest_key]
-            self._cache[key] = (result, time.time())
-
-# Global cache instance
-backtest_cache = BacktestCache(max_size=50, ttl_seconds=1800)  # 30 min cache
+_BACKTEST_PROCESS_WORKERS = min(4, max(1, os.cpu_count() or 1))
+_backtest_process_executor = ProcessPoolExecutor(max_workers=_BACKTEST_PROCESS_WORKERS)
 
 # Add the parent directory to the path to import engines
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -139,7 +98,8 @@ router = APIRouter()
 @router.post("/clear-cache")
 async def clear_cache():
     """Clear the backtest cache"""
-    backtest_cache._cache.clear()
+    cache = _get_result_cache()
+    cache.clear_all()
     return {"message": "Cache cleared"}
 
 
@@ -379,13 +339,22 @@ async def export_summary(strategy_id: str):
     return response
 
 
+def _run_algotest_job_process(payload: dict) -> dict:
+    """Helper executed inside the ProcessPoolExecutor."""
+    return execute_algotest_job(payload)
+
+
 @router.post("/algotest")
 async def run_algotest_backtest_endpoint(request: dict):
     """
     Legacy synchronous endpoint kept for backwards compatibility.
     """
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(_backtest_executor, execute_algotest_job, request)
+    result = await loop.run_in_executor(
+        _backtest_process_executor,
+        _run_algotest_job_process,
+        request,
+    )
     return result
 
 

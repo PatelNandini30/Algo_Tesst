@@ -5,7 +5,7 @@ from typing import Optional
 import msgpack
 import redis
 
-
+# DEPRECATED: use services.backtest_cache instead
 class RedisBacktestCache:
     """
     Lightweight Redis cache for backtest results using msgpack serialization.
@@ -59,7 +59,7 @@ class RedisBacktestCache:
         except redis.RedisError:
             self._available = False
 
-
+# DEPRECATED: use services.backtest_cache instead
 redis_cache: Optional[RedisBacktestCache] = None
 
 

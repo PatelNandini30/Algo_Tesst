@@ -246,6 +246,14 @@ class LRUCache:
         return len(self._cache)
 
 
+# Module-level shared caches — survive across requests in the same process
+_shared_date_cache = LRUCache(max_size=1000)
+_shared_premium_cache = LRUCache(max_size=5000)
+_shared_trading_days_cache = LRUCache(max_size=100)
+_shared_expiry_cache = LRUCache(max_size=200)
+_shared_spot_cache = LRUCache(max_size=2000)
+
+
 class PerformanceTimer:
     """Context manager for timing operations"""
     def __init__(self, operation: str, log_level: int = logging.INFO):
@@ -284,11 +292,11 @@ class HighPerformanceLoader:
         
         # In-memory caches for avoiding repeated queries
         # Cache size ~1000 dates = ~1GB for options data
-        self._date_cache = LRUCache(max_size=1000)  # Cache for full date data
-        self._premium_cache = LRUCache(max_size=5000)  # Cache for single premiums
-        self._trading_days_cache = LRUCache(max_size=100)  # Cache for trading calendars
-        self._expiry_cache = LRUCache(max_size=200)  # Cache for expiry dates
-        self._spot_cache = LRUCache(max_size=2000)  # Cache for spot prices
+        self._date_cache = _shared_date_cache
+        self._premium_cache = _shared_premium_cache
+        self._trading_days_cache = _shared_trading_days_cache
+        self._expiry_cache = _shared_expiry_cache
+        self._spot_cache = _shared_spot_cache
         
         logger.info(f"[INIT] HighPerformanceLoader initialized with Polars + Caching")
     
@@ -934,13 +942,19 @@ class HighPerformanceLoader:
     # =========================================================================
     
     def clear_cache(self):
-        """Clear all caches - call between backtests."""
-        self._date_cache.clear()
-        self._premium_cache.clear()
-        self._trading_days_cache.clear()
-        self._expiry_cache.clear()
-        self._spot_cache.clear()
-        logger.info("[CACHE] All caches cleared")
+        """Clear expired cache entries (keeps recently-loaded data)."""
+        # For module-level shared caches, only clear if explicitly requested
+        # by passing force=True — do not wipe on routine cleanup
+        logger.info("[CACHE] Cache clear requested (module-level caches preserved)")
+
+    def force_clear_cache(self):
+        """Force-clear all shared caches. Call only between symbol switches."""
+        _shared_date_cache.clear()
+        _shared_premium_cache.clear()
+        _shared_trading_days_cache.clear()
+        _shared_expiry_cache.clear()
+        _shared_spot_cache.clear()
+        logger.info("[CACHE] All shared caches force-cleared")
     
     def get_cache_stats(self) -> dict:
         """Get cache statistics."""

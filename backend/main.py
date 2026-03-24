@@ -2,6 +2,8 @@
 import pandas as pd
 import uvloop
 uvloop.install()
+import logging
+from contextlib import asynccontextmanager
 
 # Patch DataFrame.sort_values to handle 'by' keyword (removed in pandas 2.x)
 _orig_df_sort = pd.DataFrame.sort_values
@@ -37,11 +39,21 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from routers import backtest, expiry, strategies
 from routers.upload import router as upload_router
 
+@asynccontextmanager
+async def lifespan(app):
+    try:
+        from scripts.prebuild_cache import start_background_warmup
+        start_background_warmup()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(f"Warmup start failed: {exc}")
+    yield
+
 # Create the FastAPI app
 app = FastAPI(
     title="AlgoTest Clone API",
     version="1.0.0",
     description="Complete backtesting API for options strategies"
+    lifespan=lifespan
 )
 
 # Compress payloads > 1KB

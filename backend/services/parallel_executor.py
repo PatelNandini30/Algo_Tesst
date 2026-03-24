@@ -25,10 +25,11 @@ Usage:
     combined = executor.combine_results(results)
 """
 
+import importlib
 import os
 import logging
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 # Configuration
-DEFAULT_WORKERS = int(os.getenv("MAX_WORKERS", str(mp.cpu_count())))  # Use all cores
+DEFAULT_WORKERS = min(mp.cpu_count(), 2)
 
 
 @dataclass
@@ -62,6 +63,50 @@ class BacktestResult:
     error: Optional[str] = None
 
 
+def _load_backtest_func(func_path: str) -> Callable:
+    module_name, _, func_name = func_path.rpartition('.')
+    module = importlib.import_module(module_name)
+    return getattr(module, func_name)
+
+
+def _run_single_backtest_worker(chunk_dict: dict, backtest_func_path: str) -> BacktestResult:
+    chunk = BacktestChunk(
+        chunk_id=chunk_dict["chunk_id"],
+        params=chunk_dict["params"],
+        from_date=chunk_dict["from_date"],
+        to_date=chunk_dict["to_date"],
+    )
+    backtest_func = _load_backtest_func(backtest_func_path)
+
+    try:
+        logger.info(
+            f"[PARALLEL] Running chunk {chunk.chunk_id}: "
+            f"{chunk.from_date} to {chunk.to_date}"
+        )
+        params = chunk.params.copy()
+        params["from_date"] = chunk.from_date
+        params["to_date"] = chunk.to_date
+
+        trades_df, summary, pivot = backtest_func(params)
+        return BacktestResult(
+            chunk_id=chunk.chunk_id,
+            trades_df=trades_df,
+            summary=summary,
+            pivot=pivot,
+            success=True
+        )
+    except Exception as e:
+        logger.error(f"[PARALLEL] Chunk {chunk.chunk_id} failed: {e}")
+        return BacktestResult(
+            chunk_id=chunk.chunk_id,
+            trades_df=pd.DataFrame(),
+            summary={},
+            pivot={},
+            success=False,
+            error=str(e)
+        )
+
+
 class ParallelExecutor:
     """
     Parallel backtest executor.
@@ -73,8 +118,8 @@ class ParallelExecutor:
     """
     
     def __init__(self, max_workers: int = DEFAULT_WORKERS):
-        self._max_workers = max_workers
-        logger.info(f"[PARALLEL] Initialized with {max_workers} workers")
+        self._max_workers = min(max_workers, int(os.getenv("MAX_PARALLEL_WORKERS", "2")))
+        logger.info(f"[PARALLEL] Initialized with {self._max_workers} workers")
     
     def _generate_month_chunks(
         self,
@@ -110,49 +155,6 @@ class ParallelExecutor:
         logger.info(f"[PARALLEL] Generated {len(chunks)} monthly chunks")
         return chunks
     
-    def _run_single_backtest(
-        self,
-        chunk: BacktestChunk,
-        backtest_func: Callable
-    ) -> BacktestResult:
-        """
-        Run single backtest chunk.
-        
-        This is called in parallel for each chunk.
-        """
-        try:
-            logger.info(
-                f"[PARALLEL] Running chunk {chunk.chunk_id}: "
-                f"{chunk.from_date} to {chunk.to_date}"
-            )
-            
-            # Update params with date range
-            params = chunk.params.copy()
-            params["from_date"] = chunk.from_date
-            params["to_date"] = chunk.to_date
-            
-            # Run backtest
-            trades_df, summary, pivot = backtest_func(params)
-            
-            return BacktestResult(
-                chunk_id=chunk.chunk_id,
-                trades_df=trades_df,
-                summary=summary,
-                pivot=pivot,
-                success=True
-            )
-            
-        except Exception as e:
-            logger.error(f"[PARALLEL] Chunk {chunk.chunk_id} failed: {e}")
-            return BacktestResult(
-                chunk_id=chunk.chunk_id,
-                trades_df=pd.DataFrame(),
-                summary={},
-                pivot={},
-                success=False,
-                error=str(e)
-            )
-    
     def run_by_month(
         self,
         params: Dict[str, Any],
@@ -178,11 +180,19 @@ class ParallelExecutor:
         
         logger.info(f"[PARALLEL] Starting {len(chunks)} parallel backtests...")
         
-        # Use ThreadPoolExecutor for I/O-bound work
-        # Use ProcessPoolExecutor for CPU-bound work
-        with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+        backtest_func_path = f"{backtest_func.__module__}.{backtest_func.__name__}"
+        with ProcessPoolExecutor(max_workers=self._max_workers) as executor:
             futures = {
-                executor.submit(self._run_single_backtest, chunk, backtest_func): chunk
+                executor.submit(
+                    _run_single_backtest_worker,
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "params": chunk.params,
+                        "from_date": chunk.from_date,
+                        "to_date": chunk.to_date,
+                    },
+                    backtest_func_path
+                ): chunk
                 for chunk in chunks
             }
             
@@ -190,16 +200,15 @@ class ParallelExecutor:
                 result = future.result()
                 results.append(result)
         
-        # Sort by chunk_id
         results.sort(key=lambda x: x.chunk_id)
-        
         success_count = sum(1 for r in results if r.success)
         logger.info(
             f"[PARALLEL] Completed: {success_count}/{len(results)} successful"
         )
         
         return results
-    
+
+
     def combine_results(
         self,
         results: List[BacktestResult]
