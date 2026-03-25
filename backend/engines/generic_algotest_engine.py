@@ -1150,17 +1150,23 @@ def run_algotest_backtest(params):
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
     exit_dte = _coerce_int(params.get('exit_dte', 0), 0, 'Exit')
     legs_config = params.get('legs', [])
-    super_trend_config = params.get('super_trend_config', 'None')
-    if hasattr(super_trend_config, 'value'):
-        super_trend_config = super_trend_config.value
-    super_trend_config = str(super_trend_config)
+    _raw_stc = (
+        params.get('super_trend_config')
+        or params.get('filter_config')
+        or 'None'
+    )
+    if hasattr(_raw_stc, 'value'):
+        _raw_stc = _raw_stc.value
+    super_trend_config = str(_raw_stc).strip()
     str_enabled = super_trend_config in ('5x1', '5x2')
     str_segments = []
     if str_enabled:
         load_super_trend_dates()
         str_segments = get_super_trend_segments(super_trend_config)
+        print(f"[STR DEBUG] super_trend_config={super_trend_config}, str_enabled={str_enabled}, segments={len(str_segments)}")
         _log(f"STR Filter ON: {super_trend_config}, segments={len(str_segments)}")
     else:
+        print(f"[STR DEBUG] super_trend_config={super_trend_config}, str_enabled={str_enabled} - FILTER OFF")
         _log("STR Filter OFF")
     
     # ── NEW: Date Range Filter ──────────────────────────────────────────────────────
@@ -1168,39 +1174,42 @@ def run_algotest_backtest(params):
     # filter_segments: list of {start, end} for custom CSV
     filter_config = params.get('filter_config', None)
     filter_segments_custom = params.get('filter_segments', [])
-    
 
-    
-    filter_enabled = filter_config is not None and filter_config != ''
+    _block_b_config = filter_config if not str_enabled else None
+    filter_enabled = (
+        _block_b_config is not None
+        and str(_block_b_config).strip() != ''
+        and str(_block_b_config).strip() not in ('5x1', '5x2')
+    )
+
+    print(f"[FILTER DEBUG] filter_config={filter_config}, str_enabled={str_enabled}, block_b_active={filter_enabled}, custom_segments={len(filter_segments_custom)}")
+
     filter_segments = []
     if filter_enabled:
-        # Import filter functions
         try:
             from base import get_filter_segments
-            if filter_config == 'custom':
-                # Use custom segments from CSV upload - don't normalize, use as-is
+            if str(_block_b_config).strip() == 'custom':
                 filter_segments = filter_segments_custom
                 _log(f"Custom Filter ON: {len(filter_segments)} segments")
             else:
-                # Use built-in filter (5x1, 5x2, base2)
-                filter_segments = get_filter_segments(filter_config)
-                _log(f"Filter ON: {filter_config}, segments={len(filter_segments)}")
+                filter_segments = get_filter_segments(str(_block_b_config).strip())
+                _log(f"Filter ON: {_block_b_config}, segments={len(filter_segments)}")
         except Exception as e:
             _log(f"Warning: Error loading filter segments: {e}")
             filter_enabled = False
             filter_segments = []
     else:
-        _log("Filter OFF")
-    
-    # Convert filter segments to timestamps for comparison
+        _log("Filter OFF (handled by STR path or disabled)")
+
     filter_segments_ts = []
     if filter_enabled and filter_segments:
         for seg in filter_segments:
             try:
-                start = pd.Timestamp(seg['start'])
-                end = pd.Timestamp(seg['end'])
-                filter_segments_ts.append({'start': start, 'end': end})
-            except:
+                filter_segments_ts.append({
+                    'start': pd.Timestamp(seg['start']),
+                    'end':   pd.Timestamp(seg['end']),
+                })
+            except Exception:
                 pass
         _log(f"Filter segments loaded: {len(filter_segments_ts)}")
     
@@ -1322,21 +1331,23 @@ def run_algotest_backtest(params):
             if str_enabled:
                 str_segment = get_active_str_segment(entry_date, super_trend_config)
                 if str_segment is None:
-                    _log(f"  STR skip: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} outside segments")
+                    _log(f"  STR SKIP: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} NOT in any STR segment")
                     continue
                 seg_start = pd.Timestamp(str_segment['start'])
                 seg_end = pd.Timestamp(str_segment['end'])
                 str_segment_label = f"{seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}"
+                _log(f"  STR MATCH: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} in segment {str_segment_label}")
                 if seg_end < pd.Timestamp(exit_date):
                     str_exit = _last_trading_day_on_or_before(trading_calendar, seg_end)
                     if str_exit is None or pd.Timestamp(str_exit) < pd.Timestamp(entry_date):
-                        _log("  STR skip: no valid trading day on/before segment end")
+                        _log("  STR SKIP: no valid trading day on/before segment end")
                         continue
                     exit_date = pd.Timestamp(str_exit)
                     base_exit_reason = 'STR_Exit'
-                    _log(f"  STR exit adjusted: {exit_date}")
+                    _log(f"  STR EXIT at segment end: {exit_date}")
                 else:
                     base_exit_reason = 'Expiry'
+                    _log(f"  STR EXIT at expiry: {exit_date}")
             
             # ===== NEW: DATE RANGE FILTER ENTRY/EXIT =====
             filter_exit_reason = None
@@ -2066,7 +2077,7 @@ def run_algotest_backtest(params):
                 row = {
                     'Trade':        trade_idx,
                     'Leg':          leg_num,
-                    'Index':        trade_counter + leg_num,
+                    'Index':        trade_idx,
                     'Entry Date':   trade['entry_date'],
                     'Exit Date':    leg_exit_date,
                     'Type':         leg_option_type,

@@ -52,7 +52,7 @@ async def lifespan(app):
 app = FastAPI(
     title="AlgoTest Clone API",
     version="1.0.0",
-    description="Complete backtesting API for options strategies"
+    description="Complete backtesting API for options strategies",
     lifespan=lifespan
 )
 

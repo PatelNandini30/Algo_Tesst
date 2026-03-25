@@ -56,8 +56,12 @@ from database import get_engine
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PARQUET_CACHE_DIR = "/tmp/parquet_cache"
-os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+PARQUET_CACHE_DIR = Path(os.getenv("PARQUET_CACHE_DIR", "/tmp/parquet_cache"))
+PARQUET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    PARQUET_CACHE_DIR.chmod(0o777)
+except Exception:
+    pass
 
 _LOOKUP_CACHE_TTL = int(os.getenv("LOOKUP_CACHE_TTL", "86400"))
 _LOOKUP_KEY_PREFIX = "bulk"

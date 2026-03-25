@@ -154,13 +154,20 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     if seg_dates:
                         effective_from = max(min(seg_dates), user_from).strftime('%Y-%m-%d')
                         effective_to = min(max(seg_dates), user_to).strftime('%Y-%m-%d')
-            except Exception:
+                    print(f"[STR FILTER] Segments: {len(segments)}, Effective range: {effective_from} → {effective_to}")
+            except Exception as e:
+                print(f"[STR FILTER] Error: {e}")
                 pass  # fall back to full range on any error
+        
+        # Update payload with effective date range for the engine
+        payload['from_date'] = effective_from
+        payload['to_date'] = effective_to
 
         n_workers = int(os.environ.get("BACKTEST_WORKERS", "1"))
         expiry_type = payload.get('expiry_type', 'WEEKLY')
 
-        expiry_df = get_expiry_dates(index, expiry_type.lower(), from_date, to_date)
+        print(f"[DATE RANGE] User: {from_date} → {to_date}, Effective: {effective_from} → {effective_to}")
+        expiry_df = get_expiry_dates(index, expiry_type.lower(), effective_from, effective_to)
 
         all_trades = []
 
@@ -230,7 +237,6 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             print(f"[DEBUG] Using engine summary: {result_summary}")
         if all_trades and engine_summary is None:
             try:
-                import pandas as pd
                 from base import compute_analytics, build_pivot
                 trades_df = pd.DataFrame(all_trades)
                 print(f"[DEBUG] Trades columns: {list(trades_df.columns)[:10]}")
@@ -248,7 +254,6 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 result_pivot = build_pivot(trades_df, "Future Expiry")
                 all_trades = _convert_numpy(_format_dates(trades_df.to_dict('records')))
             except Exception as e:
-                import traceback
                 print(f"[ERROR] compute_analytics failed: {e}")
                 traceback.print_exc()
                 result_summary = {}

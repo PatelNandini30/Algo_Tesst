@@ -151,8 +151,18 @@ async def upload_filter_csv(file: UploadFile = File(...)):
         content = await file.read()
         csv_content = content.decode('utf-8')
         
+        print(f"[CSV UPLOAD] filename: {file.filename}, content length: {len(csv_content)}")
+        print(f"[CSV UPLOAD] first 200 chars: {csv_content[:200]}")
+        
         # Parse CSV
-        segments = parse_filter_csv(csv_content)
+        try:
+            segments = parse_filter_csv(csv_content)
+            print(f"[CSV UPLOAD] parsed segments: {len(segments)}")
+        except Exception as parse_err:
+            print(f"[CSV UPLOAD] parse error: {parse_err}")
+            import traceback
+            traceback.print_exc()
+            segments = []
         
         if not segments:
             return {
