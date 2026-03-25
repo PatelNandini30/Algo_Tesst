@@ -1150,14 +1150,13 @@ def run_algotest_backtest(params):
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
     exit_dte = _coerce_int(params.get('exit_dte', 0), 0, 'Exit')
     legs_config = params.get('legs', [])
-    _raw_stc = (
-        params.get('super_trend_config')
-        or params.get('filter_config')
-        or 'None'
-    )
+    # Read super_trend_config ONLY from its dedicated key.
+    # Never fall back to filter_config — they are separate concepts.
+    _raw_stc = params.get('super_trend_config') or 'None'
     if hasattr(_raw_stc, 'value'):
         _raw_stc = _raw_stc.value
     super_trend_config = str(_raw_stc).strip()
+    # Treat the string literal "None" as disabled
     str_enabled = super_trend_config in ('5x1', '5x2')
     str_segments = []
     if str_enabled:
@@ -1173,16 +1172,23 @@ def run_algotest_backtest(params):
     # filter_config: '5x1', '5x2', 'base2', 'custom', or None (disabled)
     # filter_segments: list of {start, end} for custom CSV
     filter_config = params.get('filter_config', None)
-    filter_segments_custom = params.get('filter_segments', [])
+    filter_segments_custom = params.get('filter_segments', []) or []
 
-    _block_b_config = filter_config if not str_enabled else None
-    filter_enabled = (
-        _block_b_config is not None
-        and str(_block_b_config).strip() != ''
-        and str(_block_b_config).strip() not in ('5x1', '5x2')
-    )
-
-    print(f"[FILTER DEBUG] filter_config={filter_config}, str_enabled={str_enabled}, block_b_active={filter_enabled}, custom_segments={len(filter_segments_custom)}")
+    # The date-range filter (Block B) is MUTUALLY EXCLUSIVE with STR filter (Block A).
+    # - If STR is enabled: Block B is always off (STR handles date gating)
+    # - If STR is off: Block B activates only for 'custom' or 'base2' configs
+    # - '5x1' and '5x2' configs are STR-only — they must never activate Block B
+    if str_enabled:
+        _block_b_config = None
+        filter_enabled = False
+    else:
+        _fc = str(filter_config).strip() if filter_config is not None else ''
+        # Only enable Block B for custom CSV upload or base2.
+        # '5x1'/'5x2' belong to STR path only — reject them here.
+        filter_enabled = _fc in ('custom', 'base2') and (
+            _fc != 'custom' or len(filter_segments_custom) > 0
+        )
+        _block_b_config = filter_config if filter_enabled else None
 
     filter_segments = []
     if filter_enabled:
@@ -1286,718 +1292,819 @@ def run_algotest_backtest(params):
     # ========== STEP 4: INITIALIZE RESULTS ==========
     all_trades = []
     strike_interval = get_strike_interval(index)
-    
-    # ========== STEP 4: LOOP THROUGH EXPIRIES ==========
-    t_loop = time.perf_counter()
-    n_expiries = len(expiry_df)
+    schedule = []
     for expiry_idx, expiry_row in expiry_df.iterrows():
         expiry_date = expiry_row['Current Expiry']
-        
-        _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
-        
+        entry_date = calculate_trading_days_before_expiry(
+            expiry_date=expiry_date,
+            days_before=entry_dte,
+            trading_calendar_df=trading_calendar
+        )
+        exit_date = calculate_trading_days_before_expiry(
+            expiry_date=expiry_date,
+            days_before=exit_dte,
+            trading_calendar_df=trading_calendar
+        )
+
+        if entry_date is None or exit_date is None:
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
+            _log("  WARNING: Missing entry or exit date; skipping expiry")
+            continue
+
+        # Extra safety: ensure both dates are Timestamps before comparison
         try:
-            # ========== STEP 5: CALCULATE ENTRY DATE ==========
-            entry_date = calculate_trading_days_before_expiry(
-                expiry_date=expiry_date,
-                days_before=entry_dte,
-                trading_calendar_df=trading_calendar
-            )
-            
-            _log(f"  Entry Date (DTE={entry_dte}): {entry_date}")
-            
-            # ========== STEP 6: CALCULATE EXIT DATE ==========
-            exit_date = calculate_trading_days_before_expiry(
-                expiry_date=expiry_date,
-                days_before=exit_dte,
-                trading_calendar_df=trading_calendar
-            )
-            
-            _log(f"  Exit Date (DTE={exit_dte}): {exit_date}")
-            
-            # Validate entry before exit
-            if entry_date > exit_date:
-                _log(f"  WARNING: Entry after exit - skipping")
-                continue
+            entry_date = pd.Timestamp(entry_date)
+            exit_date = pd.Timestamp(exit_date)
+        except Exception:
+            continue
 
-            # Skip same-day entry=exit: with EOD data entry_price == exit_price → 0 P&L
-            if entry_date == exit_date:
-                _log(f"  INFO: Entry == Exit ({entry_date}) — zero-holding trade skipped")
-                continue
+        if entry_date > exit_date:
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
+            _log(f"  WARNING: Entry ({entry_date}) after exit ({exit_date}) - skipping")
+            continue
 
-            # ===== STR ENTRY/EXIT FILTERING =====
-            str_segment = None
-            str_segment_label = ''
-            base_exit_reason = 'SCHEDULED'
-            if str_enabled:
-                str_segment = get_active_str_segment(entry_date, super_trend_config)
-                if str_segment is None:
-                    _log(f"  STR SKIP: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} NOT in any STR segment")
+        if entry_date == exit_date:
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
+            _log(f"  INFO: Entry == Exit ({entry_date}) — zero-holding trade skipped")
+            continue
+
+        schedule.append({
+            'expiry_idx': expiry_idx,
+            'expiry_date': expiry_date,
+            'entry_date': entry_date,
+            'exit_date': exit_date,
+        })
+
+    if not schedule:
+        return pd.DataFrame(), {}, {}
+
+    _log(f"Schedule entries constructed: {len(schedule)}")
+
+    segments = []
+    if str_enabled:
+        if not str_segments:
+            _log("STR Filter ON but no segments found - exiting")
+            return pd.DataFrame(), {}, {}
+        _log(f"DEBUG: Building {len(str_segments)} STR segments")
+        if schedule:
+            _log(f"DEBUG: Schedule has {len(schedule)} entries, first entry: {schedule[0]['entry_date']}")
+        for seg in str_segments:
+            seg_start = pd.Timestamp(seg['start'])
+            seg_end = pd.Timestamp(seg['end'])
+            # Count how many schedule entries fall in this segment
+            matching = sum(1 for rec in schedule if seg_start <= pd.Timestamp(rec['entry_date']) <= seg_end) if schedule else 0
+            _log(f"DEBUG: STR segment {seg_start.date()} -> {seg_end.date()}: {matching} matching entries")
+            segments.append({
+                'start': seg_start,
+                'end': seg_end,
+                'label': f"{seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}",
+                'type': 'STR',
+                'raw_segment': seg,
+            })
+    elif filter_enabled and filter_segments_ts:
+        for seg in filter_segments_ts:
+            seg_start = seg['start']
+            seg_end = seg['end']
+            segments.append({
+                'start': seg_start,
+                'end': seg_end,
+                'label': f"Filter {seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}",
+                'type': 'FILTER',
+            })
+    else:
+        fallback_start = pd.Timestamp(trading_calendar['date'].min())
+        fallback_end = pd.Timestamp(trading_calendar['date'].max())
+        segments.append({
+            'start': fallback_start,
+            'end': fallback_end,
+            'label': f"Global {fallback_start.strftime('%d-%m-%Y')} -> {fallback_end.strftime('%d-%m-%Y')}",
+            'type': 'GLOBAL',
+        })
+
+    segments.sort(key=lambda s: s['start'])
+    segment_records = []
+    total_entries = 0
+    for segment in segments:
+        seg_start = segment['start']
+        seg_end = segment['end']
+        seg_entries = []
+        for rec in schedule:
+            if rec.get('entry_date') is None or rec.get('exit_date') is None:
+                continue
+            entry_ts = pd.Timestamp(rec['entry_date'])
+            if entry_ts < seg_start or entry_ts > seg_end:
+                continue
+            exit_ts = pd.Timestamp(rec['exit_date'])
+            clamped_exit = False
+            if exit_ts > seg_end:
+                clamped_exit = True
+                last_day = _last_trading_day_on_or_before(trading_calendar, seg_end)
+                if last_day is None or pd.Timestamp(last_day) < entry_ts:
                     continue
-                seg_start = pd.Timestamp(str_segment['start'])
-                seg_end = pd.Timestamp(str_segment['end'])
-                str_segment_label = f"{seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}"
-                _log(f"  STR MATCH: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} in segment {str_segment_label}")
-                if seg_end < pd.Timestamp(exit_date):
-                    str_exit = _last_trading_day_on_or_before(trading_calendar, seg_end)
-                    if str_exit is None or pd.Timestamp(str_exit) < pd.Timestamp(entry_date):
-                        _log("  STR SKIP: no valid trading day on/before segment end")
-                        continue
-                    exit_date = pd.Timestamp(str_exit)
-                    base_exit_reason = 'STR_Exit'
-                    _log(f"  STR EXIT at segment end: {exit_date}")
-                else:
-                    base_exit_reason = 'Expiry'
-                    _log(f"  STR EXIT at expiry: {exit_date}")
-            
-            # ===== NEW: DATE RANGE FILTER ENTRY/EXIT =====
-            filter_exit_reason = None
-            trade_segment_end = None  # Store segment end for exit monitoring
-            
-            if filter_enabled and filter_segments_ts:
-                # Check if entry is within any filter segment
-                entry_ts = pd.Timestamp(entry_date)
-                within_filter = False
-                active_segment = None
-                
-                for seg in filter_segments_ts:
-                    if seg['start'] <= entry_ts <= seg['end']:
-                        within_filter = True
-                        active_segment = seg
-                        break
-                
-                if not within_filter:
-                    _log(f"  Filter skip: entry {entry_ts.strftime('%Y-%m-%d')} outside all filter segments")
-                    continue
-                
-                trade_segment_end = active_segment['end']
-            
-            # ========== STEP 7: GET ENTRY SPOT PRICE ==========
-            # Get spot from database (use index price at entry_date)
-            entry_spot = get_spot_price_from_db(entry_date, index)
-            
-            if entry_spot is None:
-                _log(f"  WARNING: No spot data for {entry_date} - skipping")
-                continue
-            
-            _log(f"  Entry Spot: {entry_spot}")
-            
-            # ========== STEP 8: PROCESS EACH LEG ==========
-            trade_legs = []
-            
-            for leg_idx, leg_config in enumerate(legs_config):
-                _log(f"\n    Processing Leg {leg_idx + 1}...")
-                
-                # ========== CONVERT LEG FORMAT ==========
-                # Handle both simple format (from users) and full format (from router)
-                # Simple: {'action': 'sell', 'strike': 'ATM', 'opt_type': 'CE', 'premium': 0}
-                # Full:   {'segment': 'OPTIONS', 'position': 'SELL', 'lots': 1, 'option_type': 'CE', 'strike_selection': 'ATM'}
-                if 'segment' not in leg_config:
-                    # Simple format - convert to full format
-                    leg_config['segment'] = 'OPTIONS'
-                    leg_config['position'] = str(leg_config.get('action', leg_config.get('position', 'SELL'))).upper()
-                    leg_config['lots'] = leg_config.get('lots', 1)
-                    leg_config['option_type'] = leg_config.get('opt_type', leg_config.get('option_type', 'CE'))
-                    leg_config['strike_selection'] = leg_config.get('strike', leg_config.get('strike_selection', 'ATM'))
-                
-                segment = leg_config['segment']
-                position = leg_config['position']
-                lots = leg_config['lots']
-                
-                if segment == 'FUTURES':
-                    # ========== FUTURES LEG ==========
-                    _log(f"      Type: FUTURE")
-                    _log(f"      Position: {position}")
-                    
-                    # Get future expiry
-                    future_expiry = expiry_date  # Use same expiry for simplicity
-                    
-                    # Get entry price
-                    entry_price = get_future_price_from_db(
-                        date=entry_date.strftime('%Y-%m-%d'),
-                        index=index,
-                        expiry=future_expiry.strftime('%Y-%m-%d')
-                    )
-                    
-                    if entry_price is None:
-                        _log(f"      WARNING: No future price - skipping leg")
-                        continue
-                    
-                    _log(f"      Entry Price: {entry_price}")
-                    
-                    # Get exit price
-                    exit_price = get_future_price_from_db(
-                        date=exit_date.strftime('%Y-%m-%d'),
-                        index=index,
-                        expiry=future_expiry.strftime('%Y-%m-%d')
-                    )
-                    
-                    if exit_price is None:
-                        _log(f"      WARNING: No exit price - using entry")
-                        exit_price = entry_price
-                    
-                    _log(f"      Exit Price: {exit_price}")
-                    
-                    # Calculate P&L with correct lot size
-                    lot_size = get_lot_size(index, entry_date)
-                    
-                    if position == 'BUY':
-                        leg_pnl = (exit_price - entry_price) * lots * lot_size
-                    else:  # SELL
-                        leg_pnl = (entry_price - exit_price) * lots * lot_size
-                    
-                    _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
-                    
-                    trade_legs.append({
-                        'leg_number': leg_idx + 1,
-                        'segment': 'FUTURE',
-                        'position': position,
-                        'lots': lots,
-                        'lot_size': lot_size,  # Store lot_size for DataFrame
-                        'entry_price': entry_price,
-                        'exit_price': exit_price,
-                        'pnl': leg_pnl
-                    })
-                
-                else:  # OPTIONS
-                    # ========== OPTIONS LEG ==========
-                    option_type = leg_config['option_type']
-                    strike_selection = leg_config['strike_selection']
-                    
-                    _log(f"      Type: OPTION")
-                    _log(f"      Option Type: {option_type}")
-                    _log(f"      Position: {position}")
-                    _log(f"      Strike Selection: {strike_selection}")
-                    _log(f"      DEBUG: Full leg_config keys: {list(leg_config.keys())}")
-                    _log(f"      DEBUG: leg_config['strike_selection'] = {leg_config.get('strike_selection')}")
-                    _log(f"      DEBUG: leg_config['strike_selection_type'] = {leg_config.get('strike_selection_type')}")
-                    
-                    # ========== CALCULATE STRIKE ==========
-                    # Routes through _resolve_strike which handles ALL criteria:
-                    # ATM/ITM/OTM, Premium Range, Closest Premium, Premium >=, Premium <=
-                    # Uses entry_date bhavcopy (= previous-day close) matching AlgoTest.
-                    strike = _resolve_strike(
-                        leg_config=leg_config,
-                        entry_date=entry_date,
-                        entry_spot=entry_spot,
-                        expiry_date=expiry_date,
-                        strike_interval=strike_interval,
-                        index=index,
-                    )
+                exit_ts = pd.Timestamp(last_day)
+            seg_entries.append({
+                'segment': segment,
+                'entry_date': rec['entry_date'],
+                'exit_date': exit_ts,
+                'expiry_date': rec['expiry_date'],
+                'clamped_exit': clamped_exit,
+            })
+        segment_records.append({
+            'segment': segment,
+            'entries': seg_entries,
+        })
+        total_entries += len(seg_entries)
 
-                    if strike is None:
-                        _log(f"      WARNING: No qualifying strike found for leg {leg_idx+1} — skipping")
-                        continue
+    if total_entries == 0:
+        _log("No trades after applying segment filters - exiting")
+        return pd.DataFrame(), {}, {}
 
-                    _log(f"      Calculated Strike: {strike}")
-                    
-                    # Get entry premium
-                    entry_premium = get_option_premium_from_db(
-                        date=entry_date.strftime('%Y-%m-%d'),
-                        index=index,
-                        strike=strike,
-                        option_type=option_type,
-                        expiry=expiry_date.strftime('%Y-%m-%d')
-                    )
-                    
-                    if entry_premium is None:
-                        _log(f"      WARNING: No entry premium - skipping leg")
+    for seg_scope in segment_records:
+        segment = seg_scope['segment']
+        # Handle case where segment might be a string instead of dict
+        if not isinstance(segment, dict):
+            _log(f"WARNING: segment is not a dict: {segment}, type: {type(segment)}")
+            continue
+        count = len(seg_scope['entries'])
+        _log(f"[SEGMENT] {segment.get('label', 'N/A')} ({segment.get('start', 'N/A')} -> {segment.get('end', 'N/A')}), entries={count}")
+    
+    # ========== STEP 4: LOOP THROUGH SEGMENTED SCHEDULE ==========
+    t_loop = time.perf_counter()
+    trade_id = 0
+    for seg_scope in segment_records:
+        segment = seg_scope['segment']
+        for entry_idx, trade_entry in enumerate(seg_scope['entries'], 1):
+            entry_date = trade_entry['entry_date']
+            exit_date = trade_entry['exit_date']
+            expiry_date = trade_entry['expiry_date']
+            clamped_exit = trade_entry['clamped_exit']
+            trade_id += 1
+            _log(f"--- Segment {segment['label']} | Trade {trade_id}/{total_entries} ---")
+            _log(f"  Segment window: {segment['start'].strftime('%Y-%m-%d')} -> {segment['end'].strftime('%Y-%m-%d')}")
+            _log(f"  Entry Date: {entry_date} | Exit Date: {exit_date}")
+            _log(f"[TRADE] id={trade_id} | segment={segment['label']} | "
+                 f"segment_window={segment['start'].strftime('%Y-%m-%d')} → {segment['end'].strftime('%Y-%m-%d')} | "
+                 f"entry={pd.Timestamp(entry_date).strftime('%Y-%m-%d')} | "
+                 f"exit={pd.Timestamp(exit_date).strftime('%Y-%m-%d')}")
+
+            try:
+                str_segment = None
+                str_segment_label = ''
+                base_exit_reason = 'SCHEDULED'
+                filter_exit_reason = 'FILTER_END' if segment['type'] == 'FILTER' and clamped_exit else None
+                trade_segment_end = segment['end'] if segment['type'] == 'FILTER' else None
+
+                if str_enabled:
+                    str_segment = segment.get('raw_segment') or get_active_str_segment(entry_date, super_trend_config)
+                    if str_segment is None:
+                        _log(f"  STR SKIP: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} NOT in any STR segment")
                         continue
-                    
-                    _log(f"      Entry Premium: {entry_premium}")
-                    
-                    # ========== GET EXIT PREMIUM ==========
-                    # CRITICAL FIX: Always try to fetch MARKET premium first,
-                    # regardless of whether exit is at expiry or before.
-                    # AlgoTest uses actual closing prices even on expiry day.
-                    # Only fall back to intrinsic value if market data is missing.
-                    
-                    exit_premium = get_option_premium_from_db(
-                        date=exit_date.strftime('%Y-%m-%d'),
-                        index=index,
-                        strike=strike,
-                        option_type=option_type,
-                        expiry=expiry_date.strftime('%Y-%m-%d')
-                    )
-                    
-                    if exit_premium is not None:
-                        # Market data found — use it
-                        _log(f"      SUCCESS: Exit Premium (market data): {exit_premium}")
+                    seg_start = pd.Timestamp(str_segment['start'])
+                    seg_end = pd.Timestamp(str_segment['end'])
+                    str_segment_label = f"{seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}"
+                    _log(f"  STR MATCH: entry {pd.Timestamp(entry_date).strftime('%Y-%m-%d')} in segment {str_segment_label}")
+                    if clamped_exit:
+                        base_exit_reason = 'STR_Exit'
+                        _log(f"  STR EXIT at segment end: {pd.Timestamp(exit_date).strftime('%Y-%m-%d')}")
                     else:
-                        # Market data missing — fallback to intrinsic value
-                        _log(f"      WARNING: No market data found for exit - calculating intrinsic value")
-                        
-                        exit_spot = get_spot_price_from_db(exit_date, index)
-                        if exit_spot is None:
-                            _log(f"      WARNING: No exit spot data - using entry spot")
-                            exit_spot = entry_spot
-                        
-                        exit_premium = calculate_intrinsic_value(
-                            spot=exit_spot,
-                            strike=strike,
-                            option_type=option_type
+                        base_exit_reason = 'Expiry'
+                        _log(f"  STR EXIT at expiry: {pd.Timestamp(exit_date).strftime('%Y-%m-%d')}")
+                elif segment['type'] == 'FILTER':
+                    _log(f"  Filter segment active: entry falls inside {segment['label']}")
+            
+                # ========== STEP 7: GET ENTRY SPOT PRICE ==========
+                # Get spot from database (use index price at entry_date)
+                entry_spot = get_spot_price_from_db(entry_date, index)
+            
+                if entry_spot is None:
+                    _log(f"  WARNING: No spot data for {entry_date} - skipping")
+                    continue
+            
+                _log(f"  Entry Spot: {entry_spot}")
+            
+                # ========== STEP 8: PROCESS EACH LEG ==========
+                trade_legs = []
+            
+                for leg_idx, leg_config in enumerate(legs_config):
+                    _log(f"\n    Processing Leg {leg_idx + 1}...")
+
+                    # ========== CONVERT LEG FORMAT ==========
+                    # Handle both simple format (from users) and full format (from router)
+                    # Simple: {'action': 'sell', 'strike': 'ATM', 'opt_type': 'CE', 'premium': 0}
+                    # Full:   {'segment': 'OPTIONS', 'position': 'SELL', 'lots': 1, 'option_type': 'CE', 'strike_selection': 'ATM'}
+                    if 'segment' not in leg_config:
+                        # Simple format — normalise into a COPY so we don't mutate params
+                        leg_config = dict(leg_config)   # shallow copy — safe, dicts are flat here
+                        leg_config['segment'] = 'OPTIONS'
+                        leg_config['position'] = str(leg_config.get('action', leg_config.get('position', 'SELL'))).upper()
+                        leg_config['lots'] = leg_config.get('lots', 1)
+                        leg_config['option_type'] = leg_config.get('opt_type', leg_config.get('option_type', 'CE'))
+                        leg_config['strike_selection'] = leg_config.get('strike', leg_config.get('strike_selection', 'ATM'))
+
+                    # Rename to leg_segment to avoid shadowing the outer segment dict
+                    leg_segment = leg_config['segment']
+                    position = leg_config['position']
+                    lots = int(leg_config.get('lots', 1))
+
+                    if leg_segment == 'FUTURES':
+                        # ========== FUTURES LEG ==========
+                        _log(f"      Type: FUTURE")
+                        _log(f"      Position: {position}")
+
+                        # Get future expiry
+                        future_expiry = expiry_date  # Use same expiry for simplicity
+
+                        # Get entry price
+                        entry_price = get_future_price_from_db(
+                            date=entry_date.strftime('%Y-%m-%d'),
+                            index=index,
+                            expiry=future_expiry.strftime('%Y-%m-%d')
                         )
-                        
-                        _log(f"      Exit Spot Price: {exit_spot}")
-                        _log(f"      Strike Price: {strike}")
+
+                        if entry_price is None:
+                            _log(f"      WARNING: No future price - skipping leg")
+                            continue
+
+                        _log(f"      Entry Price: {entry_price}")
+
+                        # Get exit price
+                        exit_price = get_future_price_from_db(
+                            date=exit_date.strftime('%Y-%m-%d'),
+                            index=index,
+                            expiry=future_expiry.strftime('%Y-%m-%d')
+                        )
+
+                        if exit_price is None:
+                            _log(f"      WARNING: No exit price - using entry")
+                            exit_price = entry_price
+
+                        _log(f"      Exit Price: {exit_price}")
+
+                        # Calculate P&L with correct lot size
+                        lot_size = get_lot_size(index, entry_date)
+
+                        if position == 'BUY':
+                            leg_pnl = (exit_price - entry_price) * lots * lot_size
+                        else:  # SELL
+                            leg_pnl = (entry_price - exit_price) * lots * lot_size
+
+                        _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
+
+                        trade_legs.append({
+                            'leg_number': leg_idx + 1,
+                            'segment': 'FUTURE',
+                            'position': position,
+                            'lots': lots,
+                            'lot_size': lot_size,  # Store lot_size for DataFrame
+                            'entry_price': entry_price,
+                            'exit_price': exit_price,
+                            'pnl': leg_pnl
+                        })
+
+                    else:  # OPTIONS
+                        # ========== OPTIONS LEG ==========
+                        option_type = leg_config['option_type']
+                        strike_selection = leg_config['strike_selection']
+
+                        _log(f"      Type: OPTION")
                         _log(f"      Option Type: {option_type}")
-                        
-                        if option_type.upper() == 'CE':
-                            intrinsic_calc = f"max(0, {exit_spot} - {strike}) = max(0, {exit_spot - strike})"
-                        else:  # PE
-                            intrinsic_calc = f"max(0, {strike} - {exit_spot}) = max(0, {strike - exit_spot})"
-                        
-                        _log(f"      🧮 Intrinsic Value Calculation: {intrinsic_calc}")
-                        _log(f"      💰 Exit Premium (intrinsic): {exit_premium}")
-                        
-                        if exit_premium == 0:
-                            _log(f"      INFO: Option expired WORTHLESS (OTM)")
-                    
-                    # Calculate P&L with correct lot size based on index and entry date
-                    lot_size = get_lot_size(index, entry_date)
-                    
-                    if position == 'BUY':
-                        leg_pnl = (exit_premium - entry_premium) * lots * lot_size
-                    else:  # SELL
-                        leg_pnl = (entry_premium - exit_premium) * lots * lot_size
-                    
-                    _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
-                    
-                    trade_legs.append({
-                        'leg_number': leg_idx + 1,
-                        'segment': 'OPTION',
-                        'option_type': option_type,
-                        'strike': strike,
-                        'position': position,
-                        'lots': lots,
-                        'lot_size': lot_size,  # Store lot_size for DataFrame
-                        'entry_premium': entry_premium,
-                        'exit_premium': exit_premium,
-                        'pnl': leg_pnl
-                    })
-            
-            # ========== STEP 8B: ATTACH PER-LEG SL/TARGET CONFIG ==========
-            for li, tleg in enumerate(trade_legs):
-                lsrc = legs_config[li] if li < len(legs_config) else {}
-                _copy_sl_tgt_to_leg(tleg, lsrc)
+                        _log(f"      Position: {position}")
+                        _log(f"      Strike Selection: {strike_selection}")
+                        _log(f"      DEBUG: Full leg_config keys: {list(leg_config.keys())}")
+                        _log(f"      DEBUG: leg_config['strike_selection'] = {leg_config.get('strike_selection')}")
+                        _log(f"      DEBUG: leg_config['strike_selection_type'] = {leg_config.get('strike_selection_type')}")
 
-            # ========== STEP 8C: PER-LEG SL/TARGET CHECK ==========
-            # partial  – only triggered legs exit early; others hold to exit_date
-            # complete – first trigger causes ALL remaining legs to exit same day
-            per_leg_results = check_leg_stop_loss_target(
-                entry_date=entry_date,
-                exit_date=exit_date,
-                expiry_date=expiry_date,
-                entry_spot=entry_spot,
-                legs_config=trade_legs,
-                index=index,
-                trading_calendar=trading_calendar,
-                square_off_mode=square_off_mode,
-            )
-            
-            # ========== STEP 8C-2: UPDATE EXIT PREMIUMS BASED ON PER-LEG EXIT DATES ==========
-            # If per-leg stop loss triggered, recalculate exit premiums using actual exit dates
-            if per_leg_results is not None:
-                for li, tleg in enumerate(trade_legs):
-                    leg_result = per_leg_results[li]
-                    actual_leg_exit_date = leg_result['exit_date']
-                    
-                    if actual_leg_exit_date != exit_date:
-                        if tleg.get('segment') == 'OPTION':
-                            # Recalculate option exit premium
-                            new_exit_premium = get_option_premium_from_db(
-                                date=actual_leg_exit_date.strftime('%Y-%m-%d'),
-                                index=index,
-                                strike=tleg['strike'],
-                                option_type=tleg['option_type'],
-                                expiry=expiry_date.strftime('%Y-%m-%d')
-                            )
-                            
-                            if new_exit_premium is not None:
-                                old_exit_premium = tleg['exit_premium']
-                                tleg['exit_premium'] = new_exit_premium
-                                
-                                # Recalculate P&L
-                                position = tleg['position']
-                                entry_premium = tleg['entry_premium']
-                                lots = tleg['lots']
-                                lot_size = tleg['lot_size']
-                                
-                                if position == 'BUY':
-                                    tleg['pnl'] = (new_exit_premium - entry_premium) * lots * lot_size
-                                else:  # SELL
-                                    tleg['pnl'] = (entry_premium - new_exit_premium) * lots * lot_size
-                        
-                        elif tleg.get('segment') == 'FUTURE':
-                            # Recalculate future exit price
-                            new_exit_price = get_future_price_from_db(
-                                date=actual_leg_exit_date.strftime('%Y-%m-%d'),
-                                index=index,
-                                expiry=expiry_date.strftime('%Y-%m-%d')
-                            )
-                            
-                            if new_exit_price is not None:
-                                old_exit_price = tleg['exit_price']
-                                tleg['exit_price'] = new_exit_price
-                                
-                                # Recalculate P&L
-                                position = tleg['position']
-                                entry_price = tleg['entry_price']
-                                lots = tleg['lots']
-                                lot_size = tleg['lot_size']
-                                
-                                if position == 'BUY':
-                                    tleg['pnl'] = (new_exit_price - entry_price) * lots * lot_size
-                                else:  # SELL
-                                    tleg['pnl'] = (entry_price - new_exit_price) * lots * lot_size
-
-
-            # ========== STEP 8D: OVERALL SL / TARGET CHECK ==========
-            # Monitors combined portfolio ₹ P&L over FULL holding window.
-            # Not clipped by per-leg exits: in partial mode other legs stay live.
-            overall_sl_triggered_date   = None
-            overall_sl_triggered_reason = None
-
-            if overall_sl_value is not None or overall_target_value is not None:
-                sl_threshold_rs  = compute_overall_sl_threshold(
-                    trade_legs, overall_sl_type, overall_sl_value)
-                tgt_threshold_rs = compute_overall_target_threshold(
-                    trade_legs, overall_target_type, overall_target_value)
-                _log(f"  Overall thresholds: SL=₹{sl_threshold_rs}  TGT=₹{tgt_threshold_rs}")
-                overall_sl_triggered_date, overall_sl_triggered_reason = (
-                    check_overall_stop_loss_target(
-                        entry_date=entry_date,
-                        exit_date=exit_date,
-                        expiry_date=expiry_date,
-                        trade_legs=trade_legs,
-                        index=index,
-                        trading_calendar=trading_calendar,
-                        sl_threshold_rs=sl_threshold_rs,
-                        tgt_threshold_rs=tgt_threshold_rs,
-                        per_leg_results=per_leg_results,
-                        overall_sl_type=overall_sl_type,
-                        overall_target_type=overall_target_type,
-                    )
-                )
-
-            # ========== STEP 8E: MERGE OVERALL SL → PER-LEG RESULTS ==========
-            # Overall SL overrides any per-leg exit that would happen LATER.
-            # Earlier per-leg exits are preserved.
-            if overall_sl_triggered_date is not None:
-                _log(f"  ⚡ OVERALL {overall_sl_triggered_reason} on "
-                     f"{overall_sl_triggered_date.strftime('%Y-%m-%d')}")
-                per_leg_results = _apply_overall_sl_to_per_leg(
-                    per_leg_results,
-                    overall_sl_triggered_date,
-                    overall_sl_triggered_reason,
-                    len(trade_legs),
-                    scheduled_exit_date=exit_date,
-                )
-
-            # ========== STEP 8F: RECALCULATE EXIT PRICES FOR TRIGGERED LEGS ==
-            # For EVERY triggered leg (per-leg SL/TGT or overall SL), re-fetch
-            # the market price at leg_exit_date and recompute P&L.
-            lot_size_for_pnl = get_lot_size(index, entry_date)
-            sl_reason        = None
-            any_early        = False
-
-            if per_leg_results is not None:
-                for li, tleg in enumerate(trade_legs):
-                    res = per_leg_results[li]
-                    if res['triggered']:
-                        any_early = True
-                        leg_exit_date = res['exit_date']
-                        _log(f"  ⚡ Leg {li+1}: exit={leg_exit_date.strftime('%Y-%m-%d')} "
-                             f"reason={res['exit_reason']}")
-                        _recalc_leg_pnl(
-                            tleg=tleg,
-                            leg_exit_date=leg_exit_date,
-                            index=index,
+                        # ========== CALCULATE STRIKE ==========
+                        # Routes through _resolve_strike which handles ALL criteria:
+                        # ATM/ITM/OTM, Premium Range, Closest Premium, Premium >=, Premium <=
+                        # Uses entry_date bhavcopy (= previous-day close) matching AlgoTest.
+                        strike = _resolve_strike(
+                            leg_config=leg_config,
+                            entry_date=entry_date,
+                            entry_spot=entry_spot,
                             expiry_date=expiry_date,
-                            lot_size=lot_size_for_pnl,
-                            fallback_spot=entry_spot,
-                        )
-                        tleg['exit_reason'] = res['exit_reason']
-
-                if any_early:
-                    first_t = next((r for r in per_leg_results if r['triggered']), None)
-                    sl_reason = first_t['exit_reason'] if first_t else None
-
-            # ========== STEP 9: TOTAL P&L ==========
-            total_pnl = sum(leg['pnl'] for leg in trade_legs)
-            _log(f"  Total P&L: ₹{total_pnl:,.2f}")
-
-            # ========== STEP 10: TRADE-LEVEL EXIT DATE ==========
-            # Partial mode: legs exit on different days — trade closes when the
-            # last leg closes. Use max() over all valid per-leg exit dates.
-            if per_leg_results is not None:
-                valid_dates = [r['exit_date'] for r in per_leg_results if r.get('exit_date') is not None]
-                actual_exit_date = max(valid_dates) if valid_dates else exit_date
-            else:
-                actual_exit_date = exit_date
-            
-            # ===== FILTER_END CHECK ===== 
-            # If filter is enabled and segment end arrives before scheduled exit,
-            # exit on segment end date with reason FILTER_END
-            if trade_segment_end is not None:
-                filter_exit_day = _last_trading_day_on_or_before(trading_calendar, trade_segment_end)
-                if filter_exit_day is not None:
-                    if filter_exit_day < actual_exit_date:
-                        actual_exit_date = filter_exit_day
-                        filter_exit_reason = 'FILTER_END'
-                    elif filter_exit_day == actual_exit_date:
-                        pass
-
-            exit_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
-
-            # ========== STEP 11: RECORD TRADE ==========
-            trade_record = {
-                'entry_date':      entry_date,
-                'exit_date':       actual_exit_date,
-                'expiry_date':     expiry_date,
-                'entry_dte':       entry_dte,
-                'exit_dte':        exit_dte,
-                'entry_spot':      entry_spot,
-                'exit_spot':       exit_spot,
-                'exit_reason':     sl_reason or filter_exit_reason or base_exit_reason,
-                'str_segment':     str_segment_label if str_enabled else '',
-                'legs':            trade_legs,
-                'total_pnl':       total_pnl,
-                'square_off_mode': square_off_mode,
-                'per_leg_results': per_leg_results,
-                'index':           index,
-            }
-
-            all_trades.append(trade_record)
-
-            # ========== RE-ENTRY LOGIC ==========
-            # When a per-leg SL/TGT triggered early, re-enter next trading day
-            # with fresh strikes per same criteria, hold until exit_date.
-            # Chains up to re_entry_max times.
-            #
-            # IMPORTANT: Re-entry is ONLY triggered by per-leg SL/Target.
-            # OVERALL_SL / OVERALL_TARGET end the trade for the entire expiry — NO re-entry.
-            if re_entry_enabled:
-                _SL_TGT_REASONS = {
-                    # Per-leg reasons only — OVERALL exits do NOT trigger re-entry
-                    'STOP_LOSS', 'TARGET',
-                    'COMPLETE_STOP_LOSS', 'COMPLETE_TARGET',
-                }
-
-                def _is_sl_tgt_exit(reason_str):
-                    if not reason_str:
-                        return False
-                    return reason_str.split('[')[0].strip() in _SL_TGT_REASONS
-
-                def _is_overall_exit(reason_str):
-                    if not reason_str:
-                        return False
-                    base = reason_str.split('[')[0].strip()
-                    return base in ('OVERALL_SL', 'OVERALL_TARGET')
-
-                # Guard: if trade-level exit was OVERALL, skip re-entry entirely
-                if _is_overall_exit(sl_reason):
-                    pass  # no re-entry after overall exit
-                else:
-                    # Re-entry triggers on the EARLIEST per-leg SL/TGT exit before exit_date
-                    earliest_trigger = None
-                    if per_leg_results:
-                        for r in per_leg_results:
-                            if (r['triggered']
-                                    and _is_sl_tgt_exit(r['exit_reason'])
-                                    and r['exit_date'] < exit_date):
-                                if earliest_trigger is None or r['exit_date'] < earliest_trigger:
-                                    earliest_trigger = r['exit_date']
-
-                    re_entry_count  = 0
-                    re_trigger_date = earliest_trigger  # None → no re-entry
-
-                    while re_trigger_date is not None and re_entry_count < re_entry_max:
-                        future_days = trading_calendar[
-                            trading_calendar['date'] > re_trigger_date
-                        ]['date'].tolist()
-                        if not future_days:
-                            break
-
-                        re_entry_date = future_days[0]
-                        if re_entry_date >= exit_date:
-                            break
-
-                        re_entry_spot = get_spot_price_from_db(re_entry_date, index)
-                        if re_entry_spot is None:
-                            break
-
-                        re_lot_size   = get_lot_size(index, re_entry_date)
-                        re_trade_legs = []
-                        re_ok         = True
-
-                        for rli, rlc in enumerate(legs_config):
-                            rseg = rlc['segment']
-                            rpos = rlc['position']
-                            rlts = rlc['lots']
-
-                            if rseg == 'FUTURES':
-                                rep = get_future_price_from_db(
-                                    date=re_entry_date.strftime('%Y-%m-%d'),
-                                    index=index,
-                                    expiry=expiry_date.strftime('%Y-%m-%d'),
-                                )
-                                if rep is None:
-                                    re_ok = False; break
-                                rxp = get_future_price_from_db(
-                                    date=exit_date.strftime('%Y-%m-%d'),
-                                    index=index,
-                                    expiry=expiry_date.strftime('%Y-%m-%d'),
-                                ) or rep
-                                rpnl = ((rxp - rep) if rpos == 'BUY' else (rep - rxp)) * rlts * re_lot_size
-                                re_leg = {
-                                    'leg_number': rli + 1, 'segment': 'FUTURE',
-                                    'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
-                                    'entry_price': rep, 'exit_price': rxp, 'pnl': rpnl,
-                                }
-                            else:  # OPTIONS — same strike criteria as initial entry
-                                ropt = rlc.get('option_type', 'CE')
-                                rstk = _resolve_strike(
-                                    leg_config=rlc,
-                                    entry_date=re_entry_date,
-                                    entry_spot=re_entry_spot,
-                                    expiry_date=expiry_date,
-                                    strike_interval=strike_interval,
-                                    index=index,
-                                )
-                                if rstk is None:
-                                    re_ok = False; break
-                                rep2 = get_option_premium_from_db(
-                                    date=re_entry_date.strftime('%Y-%m-%d'),
-                                    index=index, strike=rstk, option_type=ropt,
-                                    expiry=expiry_date.strftime('%Y-%m-%d'),
-                                )
-                                if rep2 is None:
-                                    re_ok = False; break
-                                rxp2 = get_option_premium_from_db(
-                                    date=exit_date.strftime('%Y-%m-%d'),
-                                    index=index, strike=rstk, option_type=ropt,
-                                    expiry=expiry_date.strftime('%Y-%m-%d'),
-                                )
-                                if rxp2 is None:
-                                    s2   = get_spot_price_from_db(exit_date, index) or re_entry_spot
-                                    rxp2 = calculate_intrinsic_value(spot=s2, strike=rstk, option_type=ropt)
-                                rpnl2 = ((rxp2 - rep2) if rpos == 'BUY' else (rep2 - rxp2)) * rlts * re_lot_size
-                                re_leg = {
-                                    'leg_number': rli + 1, 'segment': 'OPTION',
-                                    'option_type': ropt, 'strike': rstk,
-                                    'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
-                                    'entry_premium': rep2, 'exit_premium': rxp2, 'pnl': rpnl2,
-                                }
-
-                            _copy_sl_tgt_to_leg(re_leg, rlc)
-                            re_trade_legs.append(re_leg)
-
-                        if not re_ok or not re_trade_legs:
-                            break
-
-                        # Per-leg SL/TGT for this re-entry
-                        re_per_leg = check_leg_stop_loss_target(
-                            entry_date=re_entry_date,
-                            exit_date=exit_date,
-                            expiry_date=expiry_date,
-                            entry_spot=re_entry_spot,
-                            legs_config=re_trade_legs,
+                            strike_interval=strike_interval,
                             index=index,
-                            trading_calendar=trading_calendar,
-                            square_off_mode=square_off_mode,
                         )
 
-                        # Overall SL/TGT for this re-entry
-                        re_sl_thr  = compute_overall_sl_threshold(
-                            re_trade_legs, overall_sl_type, overall_sl_value)
-                        re_tgt_thr = compute_overall_target_threshold(
-                            re_trade_legs, overall_target_type, overall_target_value)
-                        re_ovr_date, re_ovr_reason = check_overall_stop_loss_target(
-                            entry_date=re_entry_date,
+                        if strike is None:
+                            _log(f"      WARNING: No qualifying strike found for leg {leg_idx+1} — skipping")
+                            continue
+
+                        _log(f"      Calculated Strike: {strike}")
+
+                        # Get entry premium
+                        entry_premium = get_option_premium_from_db(
+                            date=entry_date.strftime('%Y-%m-%d'),
+                            index=index,
+                            strike=strike,
+                            option_type=option_type,
+                            expiry=expiry_date.strftime('%Y-%m-%d')
+                        )
+
+                        if entry_premium is None:
+                            _log(f"      WARNING: No entry premium - skipping leg")
+                            continue
+
+                        _log(f"      Entry Premium: {entry_premium}")
+
+                        # ========== GET EXIT PREMIUM ==========
+                        # CRITICAL FIX: Always try to fetch MARKET premium first,
+                        # regardless of whether exit is at expiry or before.
+                        # AlgoTest uses actual closing prices even on expiry day.
+                        # Only fall back to intrinsic value if market data is missing.
+
+                        exit_premium = get_option_premium_from_db(
+                            date=exit_date.strftime('%Y-%m-%d'),
+                            index=index,
+                            strike=strike,
+                            option_type=option_type,
+                            expiry=expiry_date.strftime('%Y-%m-%d')
+                        )
+
+                        if exit_premium is not None:
+                            # Market data found — use it
+                            _log(f"      SUCCESS: Exit Premium (market data): {exit_premium}")
+                        else:
+                            # Market data missing — fallback to intrinsic value
+                            _log(f"      WARNING: No market data found for exit - calculating intrinsic value")
+
+                            exit_spot = get_spot_price_from_db(exit_date, index)
+                            if exit_spot is None:
+                                _log(f"      WARNING: No exit spot data - using entry spot")
+                                exit_spot = entry_spot
+
+                            exit_premium = calculate_intrinsic_value(
+                                spot=exit_spot,
+                                strike=strike,
+                                option_type=option_type
+                            )
+
+                            _log(f"      Exit Spot Price: {exit_spot}")
+                            _log(f"      Strike Price: {strike}")
+                            _log(f"      Option Type: {option_type}")
+
+                            if option_type.upper() == 'CE':
+                                intrinsic_calc = f"max(0, {exit_spot} - {strike}) = max(0, {exit_spot - strike})"
+                            else:  # PE
+                                intrinsic_calc = f"max(0, {strike} - {exit_spot}) = max(0, {strike - exit_spot})"
+
+                            _log(f"      🧮 Intrinsic Value Calculation: {intrinsic_calc}")
+                            _log(f"      💰 Exit Premium (intrinsic): {exit_premium}")
+
+                            if exit_premium == 0:
+                                _log(f"      INFO: Option expired WORTHLESS (OTM)")
+
+                        # Calculate P&L with correct lot size based on index and entry date
+                        lot_size = get_lot_size(index, entry_date)
+
+                        if position == 'BUY':
+                            leg_pnl = (exit_premium - entry_premium) * lots * lot_size
+                        else:  # SELL
+                            leg_pnl = (entry_premium - exit_premium) * lots * lot_size
+
+                        _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
+
+                        trade_legs.append({
+                            'leg_number': leg_idx + 1,
+                            'segment': 'OPTION',
+                            'option_type': option_type,
+                            'strike': strike,
+                            'position': position,
+                            'lots': lots,
+                            'lot_size': lot_size,  # Store lot_size for DataFrame
+                            'entry_premium': entry_premium,
+                            'exit_premium': exit_premium,
+                            'pnl': leg_pnl
+                        })
+            
+                # Guard: if all legs were skipped (no data), don't record this trade
+                if not trade_legs:
+                    _log(f"  SKIP: no legs resolved for expiry {expiry_date} - missing option data")
+                    continue
+
+                # ========== STEP 8B: ATTACH PER-LEG SL/TARGET CONFIG ==========
+                for li, tleg in enumerate(trade_legs):
+                    lsrc = legs_config[li] if li < len(legs_config) else {}
+                    _copy_sl_tgt_to_leg(tleg, lsrc)
+
+                # ========== STEP 8C: PER-LEG SL/TARGET CHECK ==========
+                # partial  – only triggered legs exit early; others hold to exit_date
+                # complete – first trigger causes ALL remaining legs to exit same day
+                per_leg_results = check_leg_stop_loss_target(
+                    entry_date=entry_date,
+                    exit_date=exit_date,
+                    expiry_date=expiry_date,
+                    entry_spot=entry_spot,
+                    legs_config=trade_legs,
+                    index=index,
+                    trading_calendar=trading_calendar,
+                    square_off_mode=square_off_mode,
+                )
+            
+                # ========== STEP 8C-2: UPDATE EXIT PREMIUMS BASED ON PER-LEG EXIT DATES ==========
+                # If per-leg stop loss triggered, recalculate exit premiums using actual exit dates
+                if per_leg_results is not None:
+                    for li, tleg in enumerate(trade_legs):
+                        leg_result = per_leg_results[li]
+                        actual_leg_exit_date = leg_result['exit_date']
+                    
+                        if actual_leg_exit_date != exit_date:
+                            if tleg.get('segment') == 'OPTION':
+                                # Recalculate option exit premium
+                                new_exit_premium = get_option_premium_from_db(
+                                    date=actual_leg_exit_date.strftime('%Y-%m-%d'),
+                                    index=index,
+                                    strike=tleg['strike'],
+                                    option_type=tleg['option_type'],
+                                    expiry=expiry_date.strftime('%Y-%m-%d')
+                                )
+                            
+                                if new_exit_premium is not None:
+                                    old_exit_premium = tleg['exit_premium']
+                                    tleg['exit_premium'] = new_exit_premium
+                                
+                                    # Recalculate P&L
+                                    position = tleg['position']
+                                    entry_premium = tleg['entry_premium']
+                                    lots = tleg['lots']
+                                    lot_size = tleg['lot_size']
+                                
+                                    if position == 'BUY':
+                                        tleg['pnl'] = (new_exit_premium - entry_premium) * lots * lot_size
+                                    else:  # SELL
+                                        tleg['pnl'] = (entry_premium - new_exit_premium) * lots * lot_size
+                        
+                            elif tleg.get('segment') == 'FUTURE':
+                                # Recalculate future exit price
+                                new_exit_price = get_future_price_from_db(
+                                    date=actual_leg_exit_date.strftime('%Y-%m-%d'),
+                                    index=index,
+                                    expiry=expiry_date.strftime('%Y-%m-%d')
+                                )
+                            
+                                if new_exit_price is not None:
+                                    old_exit_price = tleg['exit_price']
+                                    tleg['exit_price'] = new_exit_price
+                                
+                                    # Recalculate P&L
+                                    position = tleg['position']
+                                    entry_price = tleg['entry_price']
+                                    lots = tleg['lots']
+                                    lot_size = tleg['lot_size']
+                                
+                                    if position == 'BUY':
+                                        tleg['pnl'] = (new_exit_price - entry_price) * lots * lot_size
+                                    else:  # SELL
+                                        tleg['pnl'] = (entry_price - new_exit_price) * lots * lot_size
+
+
+                # ========== STEP 8D: OVERALL SL / TARGET CHECK ==========
+                # Monitors combined portfolio ₹ P&L over FULL holding window.
+                # Not clipped by per-leg exits: in partial mode other legs stay live.
+                overall_sl_triggered_date   = None
+                overall_sl_triggered_reason = None
+
+                if overall_sl_value is not None or overall_target_value is not None:
+                    sl_threshold_rs  = compute_overall_sl_threshold(
+                        trade_legs, overall_sl_type, overall_sl_value)
+                    tgt_threshold_rs = compute_overall_target_threshold(
+                        trade_legs, overall_target_type, overall_target_value)
+                    _log(f"  Overall thresholds: SL=₹{sl_threshold_rs}  TGT=₹{tgt_threshold_rs}")
+                    overall_sl_triggered_date, overall_sl_triggered_reason = (
+                        check_overall_stop_loss_target(
+                            entry_date=entry_date,
                             exit_date=exit_date,
                             expiry_date=expiry_date,
-                            trade_legs=re_trade_legs,
+                            trade_legs=trade_legs,
                             index=index,
                             trading_calendar=trading_calendar,
-                            sl_threshold_rs=re_sl_thr,
-                            tgt_threshold_rs=re_tgt_thr,
-                            per_leg_results=re_per_leg,
+                            sl_threshold_rs=sl_threshold_rs,
+                            tgt_threshold_rs=tgt_threshold_rs,
+                            per_leg_results=per_leg_results,
                             overall_sl_type=overall_sl_type,
                             overall_target_type=overall_target_type,
                         )
+                    )
 
-                        if re_ovr_date is not None:
-                            re_per_leg = _apply_overall_sl_to_per_leg(
-                                re_per_leg, re_ovr_date, re_ovr_reason, len(re_trade_legs),
-                                scheduled_exit_date=exit_date,
+                # ========== STEP 8E: MERGE OVERALL SL → PER-LEG RESULTS ==========
+                # Overall SL overrides any per-leg exit that would happen LATER.
+                # Earlier per-leg exits are preserved.
+                if overall_sl_triggered_date is not None:
+                    _log(f"  ⚡ OVERALL {overall_sl_triggered_reason} on "
+                         f"{overall_sl_triggered_date.strftime('%Y-%m-%d')}")
+                    per_leg_results = _apply_overall_sl_to_per_leg(
+                        per_leg_results,
+                        overall_sl_triggered_date,
+                        overall_sl_triggered_reason,
+                        len(trade_legs),
+                        scheduled_exit_date=exit_date,
+                    )
+
+                # ========== STEP 8F: RECALCULATE EXIT PRICES FOR TRIGGERED LEGS ==
+                # For EVERY triggered leg (per-leg SL/TGT or overall SL), re-fetch
+                # the market price at leg_exit_date and recompute P&L.
+                lot_size_for_pnl = get_lot_size(index, entry_date)
+                sl_reason        = None
+                any_early        = False
+
+                if per_leg_results is not None:
+                    for li, tleg in enumerate(trade_legs):
+                        res = per_leg_results[li]
+                        if res['triggered']:
+                            any_early = True
+                            leg_exit_date = res['exit_date']
+                            _log(f"  ⚡ Leg {li+1}: exit={leg_exit_date.strftime('%Y-%m-%d')} "
+                                 f"reason={res['exit_reason']}")
+                            _recalc_leg_pnl(
+                                tleg=tleg,
+                                leg_exit_date=leg_exit_date,
+                                index=index,
+                                expiry_date=expiry_date,
+                                lot_size=lot_size_for_pnl,
+                                fallback_spot=entry_spot,
+                            )
+                            tleg['exit_reason'] = res['exit_reason']
+
+                    if any_early:
+                        first_t = next((r for r in per_leg_results if r['triggered']), None)
+                        sl_reason = first_t['exit_reason'] if first_t else None
+
+                # ========== STEP 9: TOTAL P&L ==========
+                total_pnl = sum(leg['pnl'] for leg in trade_legs)
+                _log(f"  Total P&L: ₹{total_pnl:,.2f}")
+
+                # ========== STEP 10: TRADE-LEVEL EXIT DATE ==========
+                # Partial mode: legs exit on different days — trade closes when the
+                # last leg closes. Use max() over all valid per-leg exit dates.
+                if per_leg_results is not None:
+                    valid_dates = [r['exit_date'] for r in per_leg_results if r.get('exit_date') is not None]
+                    actual_exit_date = max(valid_dates) if valid_dates else exit_date
+                else:
+                    actual_exit_date = exit_date
+            
+                # ===== FILTER_END CHECK ===== 
+                # If filter is enabled and segment end arrives before scheduled exit,
+                # exit on segment end date with reason FILTER_END
+                if trade_segment_end is not None:
+                    filter_exit_day = _last_trading_day_on_or_before(trading_calendar, trade_segment_end)
+                    if filter_exit_day is not None:
+                        if filter_exit_day < actual_exit_date:
+                            actual_exit_date = filter_exit_day
+                            filter_exit_reason = 'FILTER_END'
+                        elif filter_exit_day == actual_exit_date:
+                            pass
+
+                exit_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
+
+                # ========== STEP 11: RECORD TRADE ==========
+                trade_record = {
+                    'entry_date':      entry_date,
+                    'exit_date':       actual_exit_date,
+                    'expiry_date':     expiry_date,
+                    'entry_dte':       entry_dte,
+                    'exit_dte':        exit_dte,
+                    'entry_spot':      entry_spot,
+                    'exit_spot':       exit_spot,
+                    'exit_reason':     sl_reason or filter_exit_reason or base_exit_reason,
+                    'str_segment':     str_segment_label if str_enabled else '',
+                    'legs':            trade_legs,
+                    'total_pnl':       total_pnl,
+                    'square_off_mode': square_off_mode,
+                    'per_leg_results': per_leg_results,
+                    'index':           index,
+                }
+
+                all_trades.append(trade_record)
+
+                # ========== RE-ENTRY LOGIC ==========
+                # When a per-leg SL/TGT triggered early, re-enter next trading day
+                # with fresh strikes per same criteria, hold until exit_date.
+                # Chains up to re_entry_max times.
+                #
+                # IMPORTANT: Re-entry is ONLY triggered by per-leg SL/Target.
+                # OVERALL_SL / OVERALL_TARGET end the trade for the entire expiry — NO re-entry.
+                if re_entry_enabled:
+                    _SL_TGT_REASONS = {
+                        # Per-leg reasons only — OVERALL exits do NOT trigger re-entry
+                        'STOP_LOSS', 'TARGET',
+                        'COMPLETE_STOP_LOSS', 'COMPLETE_TARGET',
+                    }
+
+                    def _is_sl_tgt_exit(reason_str):
+                        if not reason_str:
+                            return False
+                        return reason_str.split('[')[0].strip() in _SL_TGT_REASONS
+
+                    def _is_overall_exit(reason_str):
+                        if not reason_str:
+                            return False
+                        base = reason_str.split('[')[0].strip()
+                        return base in ('OVERALL_SL', 'OVERALL_TARGET')
+
+                    # Guard: if trade-level exit was OVERALL, skip re-entry entirely
+                    if _is_overall_exit(sl_reason):
+                        pass  # no re-entry after overall exit
+                    else:
+                        # Re-entry triggers on the EARLIEST per-leg SL/TGT exit before exit_date
+                        earliest_trigger = None
+                        if per_leg_results:
+                            for r in per_leg_results:
+                                if (r['triggered']
+                                        and _is_sl_tgt_exit(r['exit_reason'])
+                                        and r['exit_date'] < exit_date):
+                                    if earliest_trigger is None or r['exit_date'] < earliest_trigger:
+                                        earliest_trigger = r['exit_date']
+
+                        re_entry_count  = 0
+                        re_trigger_date = earliest_trigger  # None → no re-entry
+
+                        while re_trigger_date is not None and re_entry_count < re_entry_max:
+                            future_days = trading_calendar[
+                                trading_calendar['date'] > re_trigger_date
+                            ]['date'].tolist()
+                            if not future_days:
+                                break
+
+                            re_entry_date = future_days[0]
+                            if re_entry_date >= exit_date:
+                                break
+
+                            re_entry_spot = get_spot_price_from_db(re_entry_date, index)
+                            if re_entry_spot is None:
+                                break
+
+                            re_lot_size   = get_lot_size(index, re_entry_date)
+                            re_trade_legs = []
+                            re_ok         = True
+
+                            for rli, rlc in enumerate(legs_config):
+                                rseg = rlc['segment']
+                                rpos = rlc['position']
+                                rlts = rlc['lots']
+
+                                if rseg == 'FUTURES':
+                                    rep = get_future_price_from_db(
+                                        date=re_entry_date.strftime('%Y-%m-%d'),
+                                        index=index,
+                                        expiry=expiry_date.strftime('%Y-%m-%d'),
+                                    )
+                                    if rep is None:
+                                        re_ok = False; break
+                                    rxp = get_future_price_from_db(
+                                        date=exit_date.strftime('%Y-%m-%d'),
+                                        index=index,
+                                        expiry=expiry_date.strftime('%Y-%m-%d'),
+                                    ) or rep
+                                    rpnl = ((rxp - rep) if rpos == 'BUY' else (rep - rxp)) * rlts * re_lot_size
+                                    re_leg = {
+                                        'leg_number': rli + 1, 'segment': 'FUTURE',
+                                        'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
+                                        'entry_price': rep, 'exit_price': rxp, 'pnl': rpnl,
+                                    }
+                                else:  # OPTIONS — same strike criteria as initial entry
+                                    ropt = rlc.get('option_type', 'CE')
+                                    rstk = _resolve_strike(
+                                        leg_config=rlc,
+                                        entry_date=re_entry_date,
+                                        entry_spot=re_entry_spot,
+                                        expiry_date=expiry_date,
+                                        strike_interval=strike_interval,
+                                        index=index,
+                                    )
+                                    if rstk is None:
+                                        re_ok = False; break
+                                    rep2 = get_option_premium_from_db(
+                                        date=re_entry_date.strftime('%Y-%m-%d'),
+                                        index=index, strike=rstk, option_type=ropt,
+                                        expiry=expiry_date.strftime('%Y-%m-%d'),
+                                    )
+                                    if rep2 is None:
+                                        re_ok = False; break
+                                    rxp2 = get_option_premium_from_db(
+                                        date=exit_date.strftime('%Y-%m-%d'),
+                                        index=index, strike=rstk, option_type=ropt,
+                                        expiry=expiry_date.strftime('%Y-%m-%d'),
+                                    )
+                                    if rxp2 is None:
+                                        s2   = get_spot_price_from_db(exit_date, index) or re_entry_spot
+                                        rxp2 = calculate_intrinsic_value(spot=s2, strike=rstk, option_type=ropt)
+                                    rpnl2 = ((rxp2 - rep2) if rpos == 'BUY' else (rep2 - rxp2)) * rlts * re_lot_size
+                                    re_leg = {
+                                        'leg_number': rli + 1, 'segment': 'OPTION',
+                                        'option_type': ropt, 'strike': rstk,
+                                        'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
+                                        'entry_premium': rep2, 'exit_premium': rxp2, 'pnl': rpnl2,
+                                    }
+
+                                _copy_sl_tgt_to_leg(re_leg, rlc)
+                                re_trade_legs.append(re_leg)
+
+                            if not re_ok or not re_trade_legs:
+                                break
+
+                            # Per-leg SL/TGT for this re-entry
+                            re_per_leg = check_leg_stop_loss_target(
+                                entry_date=re_entry_date,
+                                exit_date=exit_date,
+                                expiry_date=expiry_date,
+                                entry_spot=re_entry_spot,
+                                legs_config=re_trade_legs,
+                                index=index,
+                                trading_calendar=trading_calendar,
+                                square_off_mode=square_off_mode,
                             )
 
-                        # Recalculate P&L for triggered re-entry legs
-                        re_sl_reason    = None
-                        re_next_trigger = None
-                        re_lot_sz_pnl   = get_lot_size(index, re_entry_date)
+                            # Overall SL/TGT for this re-entry
+                            re_sl_thr  = compute_overall_sl_threshold(
+                                re_trade_legs, overall_sl_type, overall_sl_value)
+                            re_tgt_thr = compute_overall_target_threshold(
+                                re_trade_legs, overall_target_type, overall_target_value)
+                            re_ovr_date, re_ovr_reason = check_overall_stop_loss_target(
+                                entry_date=re_entry_date,
+                                exit_date=exit_date,
+                                expiry_date=expiry_date,
+                                trade_legs=re_trade_legs,
+                                index=index,
+                                trading_calendar=trading_calendar,
+                                sl_threshold_rs=re_sl_thr,
+                                tgt_threshold_rs=re_tgt_thr,
+                                per_leg_results=re_per_leg,
+                                overall_sl_type=overall_sl_type,
+                                overall_target_type=overall_target_type,
+                            )
 
-                        if re_per_leg is not None:
-                            for rli2, rtleg in enumerate(re_trade_legs):
-                                rres = re_per_leg[rli2]
-                                if rres['triggered']:
-                                    _recalc_leg_pnl(
-                                        tleg=rtleg,
-                                        leg_exit_date=rres['exit_date'],
-                                        index=index,
-                                        expiry_date=expiry_date,
-                                        lot_size=re_lot_sz_pnl,
-                                        fallback_spot=re_entry_spot,
-                                    )
-                                    rtleg['exit_reason'] = rres['exit_reason']
-                                    # Only per-leg SL/TGT triggers chaining (not OVERALL)
-                                    if (_is_sl_tgt_exit(rres['exit_reason'])
-                                            and rres['exit_date'] < exit_date):
-                                        if re_next_trigger is None or rres['exit_date'] < re_next_trigger:
-                                            re_next_trigger = rres['exit_date']
+                            if re_ovr_date is not None:
+                                re_per_leg = _apply_overall_sl_to_per_leg(
+                                    re_per_leg, re_ovr_date, re_ovr_reason, len(re_trade_legs),
+                                    scheduled_exit_date=exit_date,
+                                )
 
-                            first_re = next((r for r in re_per_leg if r['triggered']), None)
-                            re_sl_reason = first_re['exit_reason'] if first_re else None
+                            # Recalculate P&L for triggered re-entry legs
+                            re_sl_reason    = None
+                            re_next_trigger = None
+                            re_lot_sz_pnl   = get_lot_size(index, re_entry_date)
 
-                        re_total_pnl = sum(l['pnl'] for l in re_trade_legs)
-                        if re_per_leg is not None:
-                            valid_re_dates = [r['exit_date'] for r in re_per_leg if r.get('exit_date') is not None]
-                            re_actual_exit = max(valid_re_dates) if valid_re_dates else exit_date
-                        else:
-                            re_actual_exit = exit_date
-                        re_exit_spot   = get_spot_price_from_db(re_actual_exit, index) or re_entry_spot
-                        re_suffix      = f'[RE{re_entry_count + 1}]'
-                        re_exit_reason = (re_sl_reason or 'SCHEDULED') + re_suffix
+                            if re_per_leg is not None:
+                                for rli2, rtleg in enumerate(re_trade_legs):
+                                    rres = re_per_leg[rli2]
+                                    if rres['triggered']:
+                                        _recalc_leg_pnl(
+                                            tleg=rtleg,
+                                            leg_exit_date=rres['exit_date'],
+                                            index=index,
+                                            expiry_date=expiry_date,
+                                            lot_size=re_lot_sz_pnl,
+                                            fallback_spot=re_entry_spot,
+                                        )
+                                        rtleg['exit_reason'] = rres['exit_reason']
+                                        # Only per-leg SL/TGT triggers chaining (not OVERALL)
+                                        if (_is_sl_tgt_exit(rres['exit_reason'])
+                                                and rres['exit_date'] < exit_date):
+                                            if re_next_trigger is None or rres['exit_date'] < re_next_trigger:
+                                                re_next_trigger = rres['exit_date']
 
-                        all_trades.append({
-                            'entry_date':      re_entry_date,
-                            'exit_date':       re_actual_exit,
-                            'expiry_date':     expiry_date,
-                            'entry_dte':       entry_dte,
-                            'exit_dte':        exit_dte,
-                            'entry_spot':      re_entry_spot,
-                            'exit_spot':       re_exit_spot,
-                            'exit_reason':     re_exit_reason,
-                            'legs':            re_trade_legs,
-                            'total_pnl':       re_total_pnl,
-                            'square_off_mode': square_off_mode,
-                            'per_leg_results': re_per_leg,
-                            'index':           index,
-                        })
-                        re_entry_count += 1
+                                first_re = next((r for r in re_per_leg if r['triggered']), None)
+                                re_sl_reason = first_re['exit_reason'] if first_re else None
 
-                        # Chain: only if re-entry itself hit a per-leg SL/TGT (not OVERALL)
-                        re_ovr_exit = re_ovr_date is not None  # OVERALL fired on this re-entry
-                        if re_next_trigger is not None and re_next_trigger > re_trigger_date and not re_ovr_exit:
-                            re_trigger_date = re_next_trigger
-                        else:
-                            break
+                            re_total_pnl = sum(l['pnl'] for l in re_trade_legs)
+                            if re_per_leg is not None:
+                                valid_re_dates = [r['exit_date'] for r in re_per_leg if r.get('exit_date') is not None]
+                                re_actual_exit = max(valid_re_dates) if valid_re_dates else exit_date
+                            else:
+                                re_actual_exit = exit_date
+                            re_exit_spot   = get_spot_price_from_db(re_actual_exit, index) or re_entry_spot
+                            re_suffix      = f'[RE{re_entry_count + 1}]'
+                            re_exit_reason = (re_sl_reason or 'SCHEDULED') + re_suffix
 
-        except Exception as e:
+                            all_trades.append({
+                                'entry_date':      re_entry_date,
+                                'exit_date':       re_actual_exit,
+                                'expiry_date':     expiry_date,
+                                'entry_dte':       entry_dte,
+                                'exit_dte':        exit_dte,
+                                'entry_spot':      re_entry_spot,
+                                'exit_spot':       re_exit_spot,
+                                'exit_reason':     re_exit_reason,
+                                'legs':            re_trade_legs,
+                                'total_pnl':       re_total_pnl,
+                                'square_off_mode': square_off_mode,
+                                'per_leg_results': re_per_leg,
+                                'index':           index,
+                            })
+                            re_entry_count += 1
 
-            # print(f"  ERROR: {str(e)}\n")
-            continue
-    
+                            # Chain: only if re-entry itself hit a per-leg SL/TGT (not OVERALL)
+                            re_ovr_exit = re_ovr_date is not None  # OVERALL fired on this re-entry
+                            if re_next_trigger is not None and re_next_trigger > re_trigger_date and not re_ovr_exit:
+                                re_trigger_date = re_next_trigger
+                            else:
+                                break
+
+            except Exception as e:
+
+                # print(f"  ERROR: {str(e)}\n")
+                continue
     # ========== STEP 11: CONVERT TO DATAFRAME ==========
     # Filter out trades with no legs (skipped due to missing option data)
     all_trades = [t for t in all_trades if t.get('legs')]

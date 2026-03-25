@@ -1811,21 +1811,17 @@ def parse_filter_csv(csv_content: str) -> list:
             try:
                 df = pd.read_csv(io.StringIO(csv_content), dtype=str, keep_default_na=False, sep=sep)
                 if len(df.columns) >= 2:
-                    print(f"[CSV DEBUG] Successfully parsed with separator: {repr(sep)}, columns: {df.columns.tolist()}")
                     break
-            except Exception as e:
-                print(f"[CSV DEBUG] Failed with separator {repr(sep)}: {e}")
+            except Exception:
                 continue
         else:
             # Fallback to default
             df = pd.read_csv(io.StringIO(csv_content), dtype=str, keep_default_na=False)
         
         if df is None or df.empty:
-            print("[CSV DEBUG] DataFrame is empty or None")
             return []
         
         df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
-        print(f"[CSV DEBUG] Normalized columns: {df.columns.tolist()}")
         
         start_col = None
         end_col = None
@@ -1850,21 +1846,12 @@ def parse_filter_csv(csv_content: str) -> list:
                     end_col = col
         
         if not start_col or not end_col:
-            print(f"[CSV DEBUG] start_col={start_col}, end_col={end_col} - columns not found")
             return []
-        
-        print(f"[CSV DEBUG] Parsing dates from columns: {start_col}, {end_col}")
-        print(f"[CSV DEBUG] Raw start values: {df[start_col].head().tolist()}")
-        print(f"[CSV DEBUG] Raw end values: {df[end_col].head().tolist()}")
         
         start_series = pd.to_datetime(df[start_col], dayfirst=True, errors='coerce')
         end_series = pd.to_datetime(df[end_col], dayfirst=True, errors='coerce')
         
-        print(f"[CSV DEBUG] Parsed start: {start_series.head().tolist()}")
-        print(f"[CSV DEBUG] Parsed end: {end_series.head().tolist()}")
-        
         valid_mask = start_series.notna() & end_series.notna()
-        print(f"[CSV DEBUG] Valid mask: {valid_mask.tolist()}, valid count: {valid_mask.sum()}")
         
         start_dates = start_series[valid_mask].dt.date.tolist()
         end_dates = end_series[valid_mask].dt.date.tolist()
@@ -1895,20 +1882,14 @@ def _normalize_filter_date(value) -> Optional[pd.Timestamp]:
 def normalize_filter_segments(segments: list) -> list:
     normalized: list = []
     if not segments:
-        print("[CSV DEBUG] normalize_filter_segments: segments is empty or None")
         return normalized
 
-    print(f"[CSV DEBUG] normalize_filter_segments: input segments = {segments}")
-    
     for seg in segments:
         if not isinstance(seg, dict):
-            print(f"[CSV DEBUG] skipping non-dict: {seg}")
             continue
         start = _normalize_filter_date(seg.get('start'))
         end = _normalize_filter_date(seg.get('end'))
-        print(f"[CSV DEBUG] seg={seg}, start={start}, end={end}")
         if start is None or end is None:
-            print(f"[CSV DEBUG] skipping: start or end is None")
             continue
         if start > end:
             start, end = end, start

@@ -88,6 +88,28 @@ def _format_dates(trades: Any) -> Any:
         return trades
 
 
+def _reindex_trades(trades: list):
+    """
+    Reassign unique trade/index numbers so chunked results don't reuse 'Trade' values.
+    """
+    trade_counter = 0
+    for row in trades:
+        leg_val = row.get('Leg') or row.get('leg')
+        try:
+            leg_num = int(leg_val)
+        except (TypeError, ValueError):
+            leg_num = None
+
+        # Start a new trade when we see leg #1 (or when leg info is missing)
+        if leg_num == 1 or leg_num is None:
+            trade_counter += 1
+
+        row['Trade'] = trade_counter
+        row['Index'] = trade_counter
+
+    return trades
+
+
 def _run_backtest_chunk(args: tuple) -> list:
     """Run backtest for a subset of expiry dates. Must be top-level for pickling."""
     params, chunk_dates = args
@@ -216,14 +238,27 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         chunk_payload['from_date'] = chunk_from
                         chunk_payload['to_date'] = chunk_to
                         c_df, c_summary, c_pivot = run_algotest_backtest(chunk_payload)
-                        if c_df is not None and not c_df.empty:
+                        chunk_count = len(c_df) if c_df is not None and not c_df.empty else 0
+                        if chunk_count > 0:
                             all_chunk_trades.extend(c_df.to_dict('records'))
-                        print(f"[CHUNK] {chunk_from} → {chunk_to}: {len(c_df) if c_df is not None else 0} trades")
+                            if c_summary:
+                                engine_summary = c_summary
+                            if c_pivot:
+                                engine_pivot = c_pivot
+                        expiry_type_used = chunk_payload.get('expiry_type', 'WEEKLY')
+                        print(f"[CHUNK] {chunk_from} → {chunk_to}: {chunk_count} trades (expiry_type={expiry_type_used})")
                     except Exception as chunk_err:
                         print(f"[CHUNK ERROR] {chunk_from} → {chunk_to}: {chunk_err}")
                         traceback.print_exc()
                         continue
                 all_trades = all_chunk_trades
+                if not all_trades:
+                    engine_summary = None
+                    engine_pivot = None
+
+        # Reindex trades so multi-chunk runs produce unique trade numbers
+        if all_trades:
+            _reindex_trades(all_trades)
 
         # Re-compute summary and pivot from the collected trades
         # so the frontend receives full analytics, not just raw trades.
