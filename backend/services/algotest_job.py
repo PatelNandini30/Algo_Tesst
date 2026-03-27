@@ -137,12 +137,13 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     to_date = payload.get('to_date')
 
     redis_cache = None
-    use_cache = False
+    use_cache = False  # DEBUG: Disabled cache to trace issues
     cache_key = None
 
     try:
         redis_cache = get_backtest_cache()
-        if redis_cache.is_available():
+        # Cache disabled for debugging
+        if False and redis_cache.is_available():
             use_cache = True
             cache_key = redis_cache.generate_key(symbol=index, from_date=from_date, to_date=to_date, strategy_config=payload)
             cached = redis_cache.get(cache_key)
@@ -191,6 +192,11 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
 
         print(f"[DATE RANGE] User: {from_date} → {to_date}, Effective: {effective_from} → {effective_to}")
         expiry_df = get_expiry_dates(index, expiry_type.lower(), effective_from, effective_to)
+        
+        print(f"[DEBUG] expiry_df: {type(expiry_df)}, len={len(expiry_df) if expiry_df is not None else 'None'}")
+        if expiry_df is not None and not expiry_df.empty:
+            print(f"[DEBUG] First expiry: {expiry_df.iloc[0]['Current Expiry']}")
+            print(f"[DEBUG] Last expiry: {expiry_df.iloc[-1]['Current Expiry']}")
 
         all_trades = []
 
@@ -222,8 +228,13 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             span_years = (to_dt - from_dt).days / 365.25
             if span_years <= _BULK_LOAD_CHUNK_YEARS:
                 bulk_load_options(index, effective_from, effective_to)
+                print(f"[DEBUG] Calling run_algotest_backtest with from={effective_from}, to={effective_to}")
                 trades_df, engine_summary, engine_pivot = run_algotest_backtest(payload)
+                print(f"[DEBUG] Backtest returned: type={type(trades_df)}, len={len(trades_df) if trades_df is not None else 'None'}, empty={trades_df.empty if trades_df is not None else 'N/A'}")
                 all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
+                print(f"[DEBUG] Single chunk: trades_df={type(trades_df)}, len={len(trades_df) if trades_df is not None else 'None'}")
+                all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
+                print(f"[DEBUG] all_trades from single chunk: {len(all_trades)}")
                 if engine_summary is None:
                     engine_summary = {}
                 if engine_pivot is None:
@@ -240,6 +251,10 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         chunk_payload['to_date'] = chunk_to
                         c_df, c_summary, c_pivot = run_algotest_backtest(chunk_payload)
                         chunk_count = len(c_df) if c_df is not None and not c_df.empty else 0
+                        print(f"[DEBUG] chunk {chunk_from}→{chunk_to}: c_df type={type(c_df)}, count={chunk_count}")
+                        if c_df is not None and not c_df.empty:
+                            print(f"[DEBUG] c_df columns: {list(c_df.columns)[:5]}")
+                            print(f"[DEBUG] c_df first row: {c_df.iloc[0].to_dict() if len(c_df) > 0 else 'empty'}")
                         if chunk_count > 0:
                             all_chunk_trades.extend(c_df.to_dict('records'))
                             if c_summary:
@@ -253,6 +268,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         traceback.print_exc()
                         continue
                 all_trades = all_chunk_trades
+                print(f"[DEBUG] Total all_chunk_trades collected: {len(all_chunk_trades)}")
                 if not all_trades:
                     engine_summary = None
                     engine_pivot = None
@@ -352,6 +368,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 # Fallback: convert to string representation
                 return str(obj)
 
+        print(f"[DEBUG] Before JSON safe: result_summary={result_summary}")
+        print(f"[DEBUG] result_summary types: {[(k, type(v)) for k, v in result_summary.items()]}")
+        
         result_payload = {
             'status': 'success',
             'trades': _make_json_safe(all_trades),
@@ -359,6 +378,8 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             'pivot': _make_json_safe(result_pivot),
             'cached': False,
         }
+        
+        print(f"[DEBUG] After JSON safe: payload.summary={result_payload.get('summary')}")
 
         if use_cache and redis_cache and cache_key:
             redis_cache.set(cache_key, result_payload)

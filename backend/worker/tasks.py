@@ -66,15 +66,28 @@ def run_algotest_job(self, params: dict):
 
 
 def _sanitize_result(value):
-    if isinstance(value, pd.DataFrame):
-        return value.to_dict('records')
-    if isinstance(value, pd.Series):
-        return value.to_dict()
-    if isinstance(value, dict):
-        return {k: _sanitize_result(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_sanitize_result(v) for v in value]
-    return value
+    """Convert Celery result to JSON-safe structure."""
+    import pandas as pd
+    import numpy as np
+    
+    try:
+        if isinstance(value, pd.DataFrame):
+            return value.to_dict('records')
+        if isinstance(value, pd.Series):
+            return value.to_dict()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.integer, np.floating)):
+            return value.item()
+        
+        if isinstance(value, dict):
+            return {k: _sanitize_result(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize_result(item) for item in value]
+        
+        return value
+    except Exception:
+        return value
 
 
 @celery_app.task(bind=True)
