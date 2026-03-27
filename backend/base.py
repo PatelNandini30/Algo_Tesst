@@ -1853,6 +1853,11 @@ def parse_filter_csv(csv_content: str) -> list:
         
         valid_mask = start_series.notna() & end_series.notna()
         
+        # Log raw values for debugging
+        print(f"[CSV PARSE DEBUG] start_col={start_col}, end_col={end_col}")
+        print(f"[CSV PARSE DEBUG] raw starts: {df[start_col].tolist()[:5]}")
+        print(f"[CSV PARSE DEBUG] raw ends: {df[end_col].tolist()[:5]}")
+        
         start_dates = start_series[valid_mask].dt.date.tolist()
         end_dates = end_series[valid_mask].dt.date.tolist()
         

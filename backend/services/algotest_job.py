@@ -147,7 +147,8 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             cache_key = redis_cache.generate_key(symbol=index, from_date=from_date, to_date=to_date, strategy_config=payload)
             cached = redis_cache.get(cache_key)
             if cached:
-                return {**cached, 'cached': True}
+                sanitized = {k: v for k, v in cached.items() if k != 'trades_df'}
+                return {**sanitized, 'cached': True}
     except Exception:
         use_cache = False
 

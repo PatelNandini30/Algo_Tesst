@@ -14,6 +14,7 @@ from services.upload_config import DATA_TYPE_METHODS
 from database import DATABASE_URL
 from migrate_data import Migrator
 from sqlalchemy import create_engine, text
+import pandas as pd
 
 
 @celery_app.task(bind=True)
@@ -56,12 +57,24 @@ def run_algotest_job(self, params: dict):
         self.update_state(state='PROCESSING', meta={'status': 'Running AlgoTest backtest'})
         from services.algotest_job import execute_algotest_job
         result = execute_algotest_job(params)
-        return result
+        return _sanitize_result(result)
     except Exception as e:
-        return {
+        return _sanitize_result({
             'status': 'error',
             'message': str(e)
-        }
+        })
+
+
+def _sanitize_result(value):
+    if isinstance(value, pd.DataFrame):
+        return value.to_dict('records')
+    if isinstance(value, pd.Series):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return {k: _sanitize_result(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_result(v) for v in value]
+    return value
 
 
 @celery_app.task(bind=True)

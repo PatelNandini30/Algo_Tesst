@@ -1188,9 +1188,11 @@ def run_algotest_backtest(params):
         filter_enabled = _fc in ('custom', 'base2') and (
             _fc != 'custom' or len(filter_segments_custom) > 0
         )
+        print(f"[FILTER DEBUG] filter_config={filter_config}, _fc={_fc}, filter_enabled={filter_enabled}, custom_segments_count={len(filter_segments_custom)}")
         _block_b_config = filter_config if filter_enabled else None
 
     filter_segments = []
+    filter_segments_ts = []
     if filter_enabled:
         try:
             from base import get_filter_segments
@@ -1221,7 +1223,7 @@ def run_algotest_backtest(params):
     filter_entry_mode = str(
         params.get('filter_entry_mode', 'dte')
     ).lower().strip()
-    fixed_entry_mode = (filter_entry_mode == 'fixed') and str_enabled
+    fixed_entry_mode = (filter_entry_mode == 'fixed') and (str_enabled or filter_enabled)
     
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -1367,15 +1369,15 @@ def run_algotest_backtest(params):
                 'raw_segment': seg,
             })
     elif filter_enabled and filter_segments_ts:
-        for seg in filter_segments_ts:
-            seg_start = seg['start']
-            seg_end = seg['end']
-            segments.append({
-                'start': seg_start,
-                'end': seg_end,
-                'label': f"Filter {seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}",
-                'type': 'FILTER',
-            })
+                for seg in filter_segments_ts:
+                    seg_start = seg['start']
+                    seg_end = seg['end']
+                    segments.append({
+                        'start': seg_start,
+                        'end': seg_end,
+                        'label': f"{seg_start.strftime('%d-%m-%Y')} -> {seg_end.strftime('%d-%m-%Y')}",
+                        'type': 'FILTER',
+                    })
     else:
         fallback_start = pd.Timestamp(trading_calendar['date'].min())
         fallback_end = pd.Timestamp(trading_calendar['date'].max())
@@ -1400,9 +1402,11 @@ def run_algotest_backtest(params):
             for rec in schedule:
                 if rec.get('entry_date') is None or rec.get('exit_date') is None:
                     continue
+                entry_ts  = pd.Timestamp(rec['entry_date'])
                 exit_ts   = pd.Timestamp(rec['exit_date'])
                 expiry_ts = pd.Timestamp(rec['expiry_date'])
-                if (seg_start <= exit_ts <= seg_end or
+                if (seg_start <= entry_ts <= seg_end or
+                        seg_start <= exit_ts <= seg_end or
                         seg_start <= expiry_ts <= seg_end):
                     seg_expiries.append(rec)
 
@@ -1527,9 +1531,14 @@ def run_algotest_backtest(params):
             try:
                 str_segment = None
                 str_segment_label = ''
-                base_exit_reason = 'SCHEDULED'
-                filter_exit_reason = 'FILTER_END' if segment['type'] == 'FILTER' and clamped_exit else None
+                base_exit_reason = 'Expiry'
+                exit_ts = pd.Timestamp(exit_date)
+                filter_exit_reason = None
                 trade_segment_end = segment['end'] if segment['type'] == 'FILTER' else None
+                if segment['type'] == 'FILTER' and trade_segment_end is not None:
+                    seg_end_ts = pd.Timestamp(trade_segment_end)
+                    if exit_ts >= seg_end_ts:
+                        filter_exit_reason = 'FILTER_END'
 
                 if str_enabled:
                     str_segment = segment.get('raw_segment') or get_active_str_segment(entry_date, super_trend_config)
@@ -1548,6 +1557,8 @@ def run_algotest_backtest(params):
                         _log(f"  STR EXIT at expiry: {pd.Timestamp(exit_date).strftime('%Y-%m-%d')}")
                 elif segment['type'] == 'FILTER':
                     _log(f"  Filter segment active: entry falls inside {segment['label']}")
+                    base_exit_reason = 'FILTER_END' if clamped_exit else 'Expiry'
+                    str_segment_label = segment.get('label', '')
             
                 # ========== STEP 7: GET ENTRY SPOT PRICE ==========
                 # Get spot from database (use index price at entry_date)
@@ -1925,12 +1936,10 @@ def run_algotest_backtest(params):
                 # exit on segment end date with reason FILTER_END
                 if trade_segment_end is not None:
                     filter_exit_day = _last_trading_day_on_or_before(trading_calendar, trade_segment_end)
-                    if filter_exit_day is not None:
-                        if filter_exit_day < actual_exit_date:
-                            actual_exit_date = filter_exit_day
-                            filter_exit_reason = 'FILTER_END'
-                        elif filter_exit_day == actual_exit_date:
-                            pass
+                    if (filter_exit_day is not None and
+                            filter_exit_day <= actual_exit_date):
+                        actual_exit_date = filter_exit_day
+                        filter_exit_reason = 'FILTER_END'
 
                 exit_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
 
@@ -1944,7 +1953,8 @@ def run_algotest_backtest(params):
                     'entry_spot':      entry_spot,
                     'exit_spot':       exit_spot,
                     'exit_reason':     sl_reason or filter_exit_reason or base_exit_reason,
-                    'str_segment':     str_segment_label if str_enabled else '',
+                    'str_segment':     str_segment_label,
+                    'segment':         segment,
                     'legs':            trade_legs,
                     'total_pnl':       total_pnl,
                     'square_off_mode': square_off_mode,
@@ -2258,6 +2268,9 @@ def run_algotest_backtest(params):
                 entry_spot_val = trade.get('entry_spot', 0)
                 pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
 
+                segment_meta = trade.get('segment') or {}
+                segment_type = segment_meta.get('type')
+                segment_column_name = 'Filter Segment' if segment_type == 'FILTER' else 'STR Segment'
                 row = {
                     'Trade':        trade_idx,
                     'Leg':          leg_num,
@@ -2277,8 +2290,8 @@ def run_algotest_backtest(params):
                     'Net P&L':      leg_pnl,
                     '% P&L':        pct_pnl,
                     'Exit Reason':  leg_exit_reason,
-                    'STR Segment':  trade.get('str_segment', ''),
                 }
+                row[segment_column_name] = trade.get('str_segment', '')
 
                 trades_flat.append(row)
             except Exception as e:
