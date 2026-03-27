@@ -327,6 +327,7 @@ const StrategyBuilder = () => {
     configLabel: 'STR 5,1',
     summary: null,
     segments: [],
+    entryMode: 'dte',
   });
   const [startDate, setStartDate] = useState('20/02/2025');
   const [endDate, setEndDate] = useState('20/02/2026');
@@ -337,6 +338,7 @@ const StrategyBuilder = () => {
   const jobPollRef = useRef(null);
   const [jobId, setJobId] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
+  const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
 
   // Validate date is in DD/MM/YYYY format
   const isValidDate = (dateStr) => {
@@ -367,7 +369,7 @@ const StrategyBuilder = () => {
 
   const stopJobPolling = useCallback(() => {
     if (jobPollRef.current) {
-      clearInterval(jobPollRef.current);
+      clearTimeout(jobPollRef.current);
       jobPollRef.current = null;
     }
   }, []);
@@ -378,17 +380,26 @@ const StrategyBuilder = () => {
 
   const pollJobStatus = useCallback((jobId) => {
     stopJobPolling();
-    jobPollRef.current = setInterval(async () => {
+    setJobState('queued');
+    const intervalMs = 1500;
+
+    const fetchStatus = async () => {
       try {
         const res = await fetch(`/api/algotest/jobs/${jobId}`);
         if (!res.ok) throw new Error('Job status fetch failed');
         const data = await res.json();
+
         if (data.status === 'completed') {
+          setJobState('completed');
           stopJobPolling();
           setJobStatusLabel('');
           setJobId(null);
           setLoading(false);
-          const payload = data.result ?? data;
+          const payload = data.result;
+          if (!payload) {
+            setError('Backtest completed without a result payload.');
+            return;
+          }
           setResults(payload);
           if (strFilter.enabled && Array.isArray(payload?.trades) && payload.trades.length === 0) {
             setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
@@ -397,7 +408,9 @@ const StrategyBuilder = () => {
           }
           return;
         }
+
         if (data.status === 'failed') {
+          setJobState('idle');
           stopJobPolling();
           setJobStatusLabel('');
           setJobId(null);
@@ -405,20 +418,28 @@ const StrategyBuilder = () => {
           setError(data.error || 'Backtest job failed');
           return;
         }
+
         if (data.status === 'running') {
+          setJobState('running');
           setJobStatusLabel(data.meta?.status || 'Running backtest…');
         } else {
+          setJobState('queued');
           setJobStatusLabel('Queued…');
         }
+
+        jobPollRef.current = setTimeout(fetchStatus, intervalMs);
       } catch (err) {
+        setJobState('idle');
         stopJobPolling();
         setLoading(false);
         setJobStatusLabel('');
         setJobId(null);
         setError('Unable to poll backtest job status.');
       }
-    }, 1500);
-  }, [stopJobPolling]);
+    };
+
+    jobPollRef.current = setTimeout(fetchStatus, 0);
+  }, [stopJobPolling, strFilter.configLabel, strFilter.enabled]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
@@ -685,6 +706,7 @@ const StrategyBuilder = () => {
       filter_config: strFilter.enabled ? strFilter.configId : null,
       filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
       super_trend_config: (strFilter.enabled && strFilter.configId !== 'custom') ? strFilter.configId : 'None',
+      filter_entry_mode: strFilter.enabled ? (strFilter.entryMode || 'dte') : 'dte',
       str_filter: strFilter.enabled
         ? { enabled: true, config: strFilter.configId }
         : { enabled: false },

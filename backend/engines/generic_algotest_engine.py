@@ -1207,7 +1207,6 @@ def run_algotest_backtest(params):
     else:
         _log("Filter OFF (handled by STR path or disabled)")
 
-    filter_segments_ts = []
     if filter_enabled and filter_segments:
         for seg in filter_segments:
             try:
@@ -1218,6 +1217,11 @@ def run_algotest_backtest(params):
             except Exception:
                 pass
         _log(f"Filter segments loaded: {len(filter_segments_ts)}")
+
+    filter_entry_mode = str(
+        params.get('filter_entry_mode', 'dte')
+    ).lower().strip()
+    fixed_entry_mode = (filter_entry_mode == 'fixed') and str_enabled
     
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -1292,6 +1296,7 @@ def run_algotest_backtest(params):
     # ========== STEP 4: INITIALIZE RESULTS ==========
     all_trades = []
     strike_interval = get_strike_interval(index)
+    n_expiries = len(expiry_df)
     schedule = []
     for expiry_idx, expiry_row in expiry_df.iterrows():
         expiry_date = expiry_row['Current Expiry']
@@ -1384,31 +1389,103 @@ def run_algotest_backtest(params):
     segments.sort(key=lambda s: s['start'])
     segment_records = []
     total_entries = 0
+
     for segment in segments:
         seg_start = segment['start']
-        seg_end = segment['end']
+        seg_end   = segment['end']
         seg_entries = []
-        for rec in schedule:
-            if rec.get('entry_date') is None or rec.get('exit_date') is None:
-                continue
-            entry_ts = pd.Timestamp(rec['entry_date'])
-            if entry_ts < seg_start or entry_ts > seg_end:
-                continue
-            exit_ts = pd.Timestamp(rec['exit_date'])
-            clamped_exit = False
-            if exit_ts > seg_end:
-                clamped_exit = True
-                last_day = _last_trading_day_on_or_before(trading_calendar, seg_end)
-                if last_day is None or pd.Timestamp(last_day) < entry_ts:
+
+        if fixed_entry_mode:
+            seg_expiries = []
+            for rec in schedule:
+                if rec.get('entry_date') is None or rec.get('exit_date') is None:
                     continue
-                exit_ts = pd.Timestamp(last_day)
-            seg_entries.append({
-                'segment': segment,
-                'entry_date': rec['entry_date'],
-                'exit_date': exit_ts,
-                'expiry_date': rec['expiry_date'],
-                'clamped_exit': clamped_exit,
-            })
+                exit_ts   = pd.Timestamp(rec['exit_date'])
+                expiry_ts = pd.Timestamp(rec['expiry_date'])
+                if (seg_start <= exit_ts <= seg_end or
+                        seg_start <= expiry_ts <= seg_end):
+                    seg_expiries.append(rec)
+
+            seg_expiries.sort(key=lambda r: pd.Timestamp(r['expiry_date']))
+
+            if not seg_expiries:
+                segment_records.append({'segment': segment, 'entries': []})
+                continue
+
+            first_entry_ts = _next_trading_day_after(
+                trading_calendar,
+                seg_start - pd.Timedelta(days=1)
+            )
+            if first_entry_ts is None or first_entry_ts > seg_end:
+                segment_records.append({'segment': segment, 'entries': []})
+                continue
+
+            current_entry_ts = first_entry_ts
+
+            for rec in seg_expiries:
+                exit_ts   = pd.Timestamp(rec['exit_date'])
+                expiry_ts = pd.Timestamp(rec['expiry_date'])
+
+                if exit_ts < current_entry_ts:
+                    if expiry_ts >= current_entry_ts:
+                        exit_ts = expiry_ts
+                    else:
+                        continue
+
+                clamped_exit = False
+                if exit_ts > seg_end:
+                    last_day = _last_trading_day_on_or_before(
+                        trading_calendar, seg_end
+                    )
+                    if last_day is None or pd.Timestamp(last_day) < current_entry_ts:
+                        break
+                    exit_ts = pd.Timestamp(last_day)
+                    clamped_exit = True
+
+                if current_entry_ts >= exit_ts:
+                    nxt = _next_trading_day_after(trading_calendar, exit_ts)
+                    if nxt is not None:
+                        current_entry_ts = nxt
+                    continue
+
+                seg_entries.append({
+                    'segment':      segment,
+                    'entry_date':   current_entry_ts,
+                    'exit_date':    exit_ts,
+                    'expiry_date':  rec['expiry_date'],
+                    'clamped_exit': clamped_exit,
+                })
+
+                nxt = _next_trading_day_after(trading_calendar, exit_ts)
+                if nxt is None or nxt > seg_end:
+                    break
+                current_entry_ts = nxt
+
+        else:
+            for rec in schedule:
+                if rec.get('entry_date') is None or rec.get('exit_date') is None:
+                    continue
+                entry_ts = pd.Timestamp(rec['entry_date'])
+                if entry_ts < seg_start or entry_ts > seg_end:
+                    continue
+                exit_ts = pd.Timestamp(rec['exit_date'])
+                clamped_exit = False
+                if exit_ts > seg_end:
+                    clamped_exit = True
+                    last_day = _last_trading_day_on_or_before(
+                        trading_calendar, seg_end
+                    )
+                    if last_day is None or pd.Timestamp(last_day) < entry_ts:
+                        continue
+                    exit_ts = pd.Timestamp(last_day)
+                seg_entries.append({
+                    'segment':      segment,
+                    'entry_date':   rec['entry_date'],
+                    'exit_date':    exit_ts,
+                    'expiry_date':  rec['expiry_date'],
+                    'clamped_exit': clamped_exit,
+                })
+
         segment_records.append({
             'segment': segment,
             'entries': seg_entries,
@@ -2257,10 +2334,13 @@ def run_algotest_backtest(params):
     if t_total > 0.5:
         t_agg_actual = t_pivot - t_agg
         t_pivot_actual = t_end - t_pivot
-        t_analytics_actual = t_pivot - t_agg
+        try:
+            n_exp = len(expiry_df)
+        except:
+            n_exp = 'N/A'
         print(f"[PERF] {index} {from_date}→{to_date} | "
               f"data_load={t_loop - t_spot:.2f}s | "
-              f"loop({n_expiries} exps)={t_agg - t_loop:.2f}s | "
+              f"loop({n_exp} exps)={t_agg - t_loop:.2f}s | "
               f"agg+analytics={t_agg_actual:.2f}s | "
               f"pivot={t_pivot_actual:.2f}s | "
               f"TOTAL={t_total:.2f}s")

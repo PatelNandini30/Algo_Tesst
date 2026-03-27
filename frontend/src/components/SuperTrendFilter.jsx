@@ -40,6 +40,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const [uploadError, setUploadError] = useState('');
   const fileInputRef = useRef(null);
   const dropdownRef = useRef(null);
+  const [entryMode, setEntryMode] = useState('dte');
 
   const selectedOption = useMemo(
     () => STR_FILTER_OPTIONS.find(opt => opt.value === selected) ?? STR_FILTER_OPTIONS[0],
@@ -167,20 +168,22 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
       configLabel: selectedOption.label,
       summary: enabled ? summaryPayload : null,
       segments: payloadSegments,
+      entryMode,
     };
 
     const prevState = prevFilterChangeRef.current;
     const stateChanged = !prevState ||
       prevState.enabled !== filterState.enabled ||
       prevState.configId !== filterState.configId ||
-      prevState.segments !== filterState.segments;
+      prevState.segments !== filterState.segments ||
+      prevState.entryMode !== filterState.entryMode;
 
     prevFilterChangeRef.current = filterState;
 
     if (!stateChanged) return;
 
     onFilterChange?.(filterState);
-  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, onFilterChange]);
+  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, entryMode, onFilterChange]);
 
   const previewRows = useMemo(() => {
     if (!enabled) return [];
@@ -330,6 +333,32 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                 Filter is enabled but no segments were loaded — zero trades will be executed. {selected === 'custom' ? 'Upload a CSV or try a different filter.' : 'Check the database or try another config.'}
               </p>
             )}
+
+            {/* Entry Mode */}
+            <div className="space-y-1.5">
+              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                Entry Mode
+              </p>
+              <div className="relative">
+                <select
+                  value={entryMode}
+                  onChange={e => setEntryMode(e.target.value)}
+                  className="w-full appearance-none rounded-lg border border-blue-200 bg-blue-50 pl-4 pr-9 py-2 text-sm font-medium text-blue-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-400 cursor-pointer transition-colors duration-200 hover:border-blue-400"
+                >
+                  <option value="dte">DTE Entry — N days before each expiry</option>
+                  <option value="fixed">Fixed Entry — Pinned to segment start</option>
+                </select>
+                <ChevronDown
+                  size={14}
+                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-blue-500"
+                />
+              </div>
+              <p className="text-[11px] text-gray-500 leading-relaxed">
+                {entryMode === 'dte'
+                  ? 'Enter N days before each expiry within the segment. Current behaviour — unchanged.'
+                  : 'Enter on segment start date, then re-enter the next trading day after each exit. Stays active throughout the segment with no gap.'}
+              </p>
+            </div>
 
             {previewRows.length > 0 && (
               <div className="space-y-1 text-[11px] text-gray-600">

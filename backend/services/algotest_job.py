@@ -265,38 +265,56 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         result_summary = {}
         result_pivot = {"headers": [], "rows": []}
         
-        # Use the summary computed by the engine if available
-        if engine_summary is not None:
-            result_summary = engine_summary
-            result_pivot = engine_pivot if engine_pivot else result_pivot
-            print(f"[DEBUG] Using engine summary: {result_summary}")
-        if all_trades and engine_summary is None:
+        # Always recompute analytics from combined trades when we have multiple chunks
+        # (engine_summary only reflects the last chunk's trades)
+        if all_trades and len(all_trades) > 0:
             try:
                 from base import compute_analytics, build_pivot
                 trades_df = pd.DataFrame(all_trades)
-                print(f"[DEBUG] Trades columns: {list(trades_df.columns)[:10]}")
-                print(f"[DEBUG] Net P&L column present: {'Net P&L' in trades_df.columns}")
-                if 'Net P&L' in trades_df.columns:
-                    print(f"[DEBUG] Net P&L sample values: {trades_df['Net P&L'].head().tolist()}")
-                # Restore datetime columns for analytics
+
+                # Restore datetime columns before aggregation
                 for col in ['Entry Date', 'Exit Date']:
                     if col in trades_df.columns:
                         trades_df[col] = pd.to_datetime(
                             trades_df[col], dayfirst=True, errors='coerce'
                         )
-                trades_df, result_summary = compute_analytics(trades_df)
+
+                # Skip aggregation - trades are already properly indexed
+                # The _reindex_trades call above ensures unique Trade IDs
+                trades_aggregated = trades_df
+
+                if 'Net P&L' in trades_aggregated.columns:
+                    print(f"[DEBUG] Net P&L sample: "
+                          f"{trades_aggregated['Net P&L'].head().tolist()}")
+
+                trades_aggregated, result_summary = compute_analytics(trades_aggregated)
                 print(f"[DEBUG] Result summary: {result_summary}")
-                result_pivot = build_pivot(trades_df, "Future Expiry")
-                all_trades = _convert_numpy(_format_dates(trades_df.to_dict('records')))
+                result_pivot = build_pivot(trades_aggregated, "Exit Date")
+
+                all_trades = _convert_numpy(
+                    _format_dates(trades_df.to_dict('records'))
+                )
+
             except Exception as e:
                 print(f"[ERROR] compute_analytics failed: {e}")
                 traceback.print_exc()
                 result_summary = {}
                 try:
                     trades_df = pd.DataFrame(all_trades)
-                    if 'Net P&L' in trades_df.columns or 'net_pnl' in trades_df.columns:
-                        pnl_col = 'Net P&L' if 'Net P&L' in trades_df.columns else 'net_pnl'
-                        pnl_vals = pd.to_numeric(trades_df[pnl_col], errors='coerce').fillna(0)
+                    if ('Trade' in trades_df.columns and
+                            trades_df['Trade'].nunique() < len(trades_df)):
+                        fallback_df = trades_df.groupby(
+                            'Trade', sort=False
+                        ).agg({'Net P&L': 'sum'}).reset_index()
+                    else:
+                        fallback_df = trades_df
+
+                    pnl_col = ('Net P&L' if 'Net P&L' in fallback_df.columns
+                               else 'net_pnl')
+                    if pnl_col in fallback_df.columns:
+                        pnl_vals = pd.to_numeric(
+                            fallback_df[pnl_col], errors='coerce'
+                        ).fillna(0)
                         wins = pnl_vals[pnl_vals > 0]
                         losses = pnl_vals[pnl_vals < 0]
                         result_summary = {
@@ -308,9 +326,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             'max_win': round(wins.max(), 2) if len(wins) > 0 else 0,
                             'max_loss': round(losses.min(), 2) if len(losses) > 0 else 0,
                         }
-                        print(f"[DEBUG] Fallback summary computed: {result_summary}")
+                        print(f"[DEBUG] Fallback summary: {result_summary}")
                 except Exception as fallback_error:
-                    print(f"[ERROR] Fallback summary also failed: {fallback_error}")
+                    print(f"[ERROR] Fallback summary failed: {fallback_error}")
         else:
             all_trades = _convert_numpy(_format_dates(all_trades))
 
@@ -319,6 +337,13 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         def _make_json_safe(obj):
             """Convert result to JSON-safe structure using orjson (handles numpy natively)."""
             try:
+                import pandas as _pd
+
+                if isinstance(obj, _pd.DataFrame):
+                    obj = obj.to_dict('records')
+                elif isinstance(obj, _pd.Series):
+                    obj = obj.to_dict()
+
                 # orjson serialises numpy int/float/bool, datetime, UUID natively
                 # Round-trip through JSON to get a plain Python structure
                 return orjson.loads(orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS))
