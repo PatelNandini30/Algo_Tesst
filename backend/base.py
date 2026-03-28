@@ -717,8 +717,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     # High-water mark (peak equity)
     df['Peak'] = df['Cumulative'].cummax()
 
-    # Rupee drawdown (always ≤ 0)
-    df['DD'] = np.where(df['Peak'] > df['Cumulative'], df['Cumulative'] - df['Peak'], 0)
+    # Rupee drawdown = Cumulative - Peak (positive when in drawdown)
+    df['DD'] = np.where(df['Peak'] > df['Cumulative'], df['Peak'] - df['Cumulative'], 0)
 
     # Percentage drawdown relative to the peak equity
     df['%DD'] = np.where(
@@ -811,8 +811,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         cagr = round(-100.0, 2)  # total wipeout
 
     # ── DRAWDOWN SUMMARY ─────────────────────────────────────────────────────
-    max_dd_pct = float(df['%DD'].min())                    # most negative %DD
-    max_dd_pts = round(float(df['DD'].min()), 2)           # deepest rupee DD
+    max_dd_pct = float(df['%DD'].max())                    # largest %DD (most positive since DD is now positive)
+    max_dd_pts = round(float(df['DD'].max()), 2)          # deepest rupee DD (max since DD is now positive)
 
     # Duration of overall max drawdown (calendar days from peak to trough)
     mdd_duration   = 0
@@ -820,8 +820,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     mdd_end_date   = None
     mdd_trade_number = None
 
-    if max_dd_pts < 0:
-        trough_idx  = df['DD'].idxmin()
+    if max_dd_pts > 0:
+        trough_idx  = df['DD'].idxmax()
         trough_date = pd.to_datetime(df.loc[trough_idx, exit_date_col])
         
         # Trade number where max drawdown occurred (1-indexed for display)

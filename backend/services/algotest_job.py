@@ -4,6 +4,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict
 
+import numpy as np
 import orjson
 import pandas as pd
 from sqlalchemy.exc import OperationalError
@@ -334,14 +335,60 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         ).fillna(0)
                         wins = pnl_vals[pnl_vals > 0]
                         losses = pnl_vals[pnl_vals < 0]
+                        win_count = len(wins)
+                        loss_count = len(losses)
+                        count = len(pnl_vals)
+                        
+                        avg_win = round(wins.mean(), 2) if win_count > 0 else 0
+                        avg_loss = round(losses.mean(), 2) if loss_count > 0 else 0
+                        expectancy = (avg_win * win_count / count - avg_loss * loss_count / count) if count > 0 else 0
+                        reward_to_risk = abs(avg_win / avg_loss) if avg_loss != 0 else 0
+                        
+                        cumulative = pnl_vals.cumsum()
+                        peak = cumulative.cummax()
+                        dd = np.where(peak > cumulative, cumulative - peak, 0)
+                        max_dd_pts = round(abs(dd.min()), 2) if len(dd) > 0 else 0
+                        
+                        initial_capital = 100000.0
+                        final_capital = initial_capital + pnl_vals.sum()
+                        if len(fallback_df) > 1 and 'Entry Date' in fallback_df.columns:
+                            dates = pd.to_datetime(fallback_df['Entry Date'], dayfirst=True, errors='coerce')
+                            if dates.notna().any():
+                                n_years = (dates.max() - dates.min()).days / 365.25
+                                n_years = max(n_years, 0.01)
+                                cagr_options = round(100 * ((final_capital / initial_capital) ** (1 / n_years) - 1), 2) if initial_capital > 0 else 0
+                            else:
+                                cagr_options = 0
+                        else:
+                            cagr_options = 0
+                        
+                        car_mdd = round(cagr_options / abs(max_dd_pts) * 100, 2) if max_dd_pts > 0 else 0
+                        
                         result_summary = {
                             'total_pnl': round(pnl_vals.sum(), 2),
-                            'count': len(pnl_vals),
-                            'win_pct': round(100 * len(wins) / len(pnl_vals), 2) if len(pnl_vals) > 0 else 0,
-                            'avg_win': round(wins.mean(), 2) if len(wins) > 0 else 0,
-                            'avg_loss': round(losses.mean(), 2) if len(losses) > 0 else 0,
-                            'max_win': round(wins.max(), 2) if len(wins) > 0 else 0,
-                            'max_loss': round(losses.min(), 2) if len(losses) > 0 else 0,
+                            'count': count,
+                            'win_pct': round(100 * win_count / count, 2) if count > 0 else 0,
+                            'loss_pct': round(100 * loss_count / count, 2) if count > 0 else 0,
+                            'avg_win': avg_win,
+                            'avg_loss': avg_loss,
+                            'max_win': round(wins.max(), 2) if win_count > 0 else 0,
+                            'max_loss': round(losses.min(), 2) if loss_count > 0 else 0,
+                            'avg_profit_per_trade': round(pnl_vals.mean(), 2),
+                            'expectancy': round(expectancy, 2),
+                            'reward_to_risk': round(reward_to_risk, 2),
+                            'cagr_options': cagr_options,
+                            'max_dd_pts': max_dd_pts,
+                            'car_mdd': car_mdd,
+                            'recovery_factor': round(pnl_vals.sum() / max_dd_pts, 2) if max_dd_pts > 0 else 0,
+                            'max_win_streak': 0,
+                            'max_loss_streak': 0,
+                            'mdd_duration_days': 0,
+                            'mdd_start_date': '',
+                            'mdd_end_date': '',
+                            'mdd_trade_number': None,
+                            'cagr_spot': 0,
+                            'spot_change': 0,
+                            'profit_factor': round(wins.sum() / abs(losses.sum()), 2) if losses.sum() != 0 else 0,
                         }
                         print(f"[DEBUG] Fallback summary: {result_summary}")
                 except Exception as fallback_error:
@@ -378,6 +425,12 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             'pivot': _make_json_safe(result_pivot),
             'cached': False,
         }
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[SUMMARY_DEBUG] result_summary has {len(result_summary)} keys: {list(result_summary.keys())}")
+        logger.warning(f"[SUMMARY_DEBUG] total_pnl value: {result_summary.get('total_pnl')}")
+        logger.warning(f"[SUMMARY_DEBUG] cagr_options value: {result_summary.get('cagr_options')}")
         
         print(f"[DEBUG] After JSON safe: payload.summary={result_payload.get('summary')}")
 
