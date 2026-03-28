@@ -8,6 +8,7 @@ import { Download, X } from 'lucide-react';
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) => {
   if (!results) return null;
 
+  console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
   const { trades = [], summary = {}, pivot = {} } = results;
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;

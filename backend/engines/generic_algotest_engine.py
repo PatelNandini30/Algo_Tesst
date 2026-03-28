@@ -6,6 +6,15 @@ Matches AlgoTest behavior exactly with DTE-based entry/exit
 # Set DEBUG = True to enable verbose logging for debugging
 DEBUG = False
 
+_EARLY_EXIT_REASONS = {
+    'STOP_LOSS',
+    'TARGET',
+    'COMPLETE_STOP_LOSS',
+    'COMPLETE_TARGET',
+    'OVERALL_SL',
+    'OVERALL_TARGET',
+}
+
 def _log(*args, **kwargs):
     """Helper to print only when DEBUG is True"""
     if DEBUG:
@@ -1224,6 +1233,10 @@ def run_algotest_backtest(params):
         params.get('filter_entry_mode', 'dte')
     ).lower().strip()
     fixed_entry_mode = (filter_entry_mode == 'fixed') and (str_enabled or filter_enabled)
+    if filter_entry_mode == 'fixed' and not fixed_entry_mode:
+        print("[WARN] filter_entry_mode='fixed' requested but no active filter/STR — falling back to DTE mode. "
+              f"(str_enabled={str_enabled}, filter_enabled={filter_enabled}, "
+              f"filter_config={filter_config})")
     
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -1398,16 +1411,15 @@ def run_algotest_backtest(params):
         seg_entries = []
 
         if fixed_entry_mode:
+            # Collect every expiry whose expiry_date falls on or after seg_start.
+            # Do NOT filter by DTE entry_date — in Fixed mode the first entry is
+            # always forced to seg_start regardless of where the DTE entry falls.
             seg_expiries = []
             for rec in schedule:
                 if rec.get('entry_date') is None or rec.get('exit_date') is None:
                     continue
-                entry_ts  = pd.Timestamp(rec['entry_date'])
-                exit_ts   = pd.Timestamp(rec['exit_date'])
                 expiry_ts = pd.Timestamp(rec['expiry_date'])
-                if (seg_start <= entry_ts <= seg_end or
-                        seg_start <= exit_ts <= seg_end or
-                        seg_start <= expiry_ts <= seg_end):
+                if expiry_ts >= seg_start:
                     seg_expiries.append(rec)
 
             seg_expiries.sort(key=lambda r: pd.Timestamp(r['expiry_date']))
@@ -1416,40 +1428,51 @@ def run_algotest_backtest(params):
                 segment_records.append({'segment': segment, 'entries': []})
                 continue
 
+            # Forced first entry: first trading day on or after seg_start
             first_entry_ts = _next_trading_day_after(
                 trading_calendar,
                 seg_start - pd.Timedelta(days=1)
             )
-            if first_entry_ts is None or first_entry_ts > seg_end:
+            if first_entry_ts is None:
                 segment_records.append({'segment': segment, 'entries': []})
                 continue
 
-            current_entry_ts = first_entry_ts
+            current_entry_ts = pd.Timestamp(first_entry_ts)
+            if current_entry_ts > seg_end:
+                segment_records.append({'segment': segment, 'entries': []})
+                continue
 
-            for rec in seg_expiries:
-                exit_ts   = pd.Timestamp(rec['exit_date'])
+            schedule_idx = 0
+            while schedule_idx < len(seg_expiries):
+                # Advance until we find the next expiry whose expiry_date is > current_entry
+                while (schedule_idx < len(seg_expiries) and
+                       pd.Timestamp(seg_expiries[schedule_idx]['expiry_date']) <= current_entry_ts):
+                    schedule_idx += 1
+
+                if schedule_idx >= len(seg_expiries):
+                    break
+
+                rec = seg_expiries[schedule_idx]
                 expiry_ts = pd.Timestamp(rec['expiry_date'])
 
-                if exit_ts < current_entry_ts:
-                    if expiry_ts >= current_entry_ts:
-                        exit_ts = expiry_ts
-                    else:
-                        continue
+                scheduled_exit_ts = pd.Timestamp(rec['exit_date'])
+                if scheduled_exit_ts <= current_entry_ts:
+                    exit_ts = expiry_ts  # exit window has passed, hold to expiry
+                else:
+                    exit_ts = scheduled_exit_ts
 
                 clamped_exit = False
                 if exit_ts > seg_end:
                     last_day = _last_trading_day_on_or_before(
                         trading_calendar, seg_end
                     )
-                    if last_day is None or pd.Timestamp(last_day) < current_entry_ts:
+                    if last_day is None or pd.Timestamp(last_day) <= current_entry_ts:
                         break
                     exit_ts = pd.Timestamp(last_day)
                     clamped_exit = True
 
-                if current_entry_ts >= exit_ts:
-                    nxt = _next_trading_day_after(trading_calendar, exit_ts)
-                    if nxt is not None:
-                        current_entry_ts = nxt
+                if current_entry_ts > exit_ts:
+                    schedule_idx += 1
                     continue
 
                 seg_entries.append({
@@ -1460,10 +1483,39 @@ def run_algotest_backtest(params):
                     'clamped_exit': clamped_exit,
                 })
 
-                nxt = _next_trading_day_after(trading_calendar, exit_ts)
-                if nxt is None or nxt > seg_end:
+                prev_exit_ts = exit_ts
+                schedule_idx += 1
+
+                next_entry_ts = None
+                temp_idx = schedule_idx
+                while temp_idx < len(seg_expiries):
+                    candidate          = seg_expiries[temp_idx]
+                    candidate_entry    = pd.Timestamp(candidate['entry_date'])
+                    candidate_expiry   = pd.Timestamp(candidate['expiry_date'])
+
+                    if candidate_expiry <= prev_exit_ts:
+                        temp_idx += 1
+                        continue
+
+                    if candidate_entry < seg_start or candidate_entry > seg_end:
+                        temp_idx += 1
+                        continue
+
+                    if candidate_entry <= prev_exit_ts:
+                        temp_idx += 1
+                        continue
+
+                    next_entry_ts = candidate_entry
+                    schedule_idx  = temp_idx
                     break
-                current_entry_ts = nxt
+
+                if next_entry_ts is None:
+                    break
+
+                current_entry_ts = next_entry_ts
+
+                if current_entry_ts > seg_end:
+                    break
 
         else:
             for rec in schedule:
@@ -1915,7 +1967,13 @@ def run_algotest_backtest(params):
                             tleg['exit_reason'] = res['exit_reason']
 
                     if any_early:
-                        first_t = next((r for r in per_leg_results if r['triggered']), None)
+                        first_t = next(
+                            (r for r in per_leg_results
+                             if r['triggered']
+                             and r.get('exit_reason', '').split('[')[0].strip()
+                                in _EARLY_EXIT_REASONS),
+                            None
+                        )
                         sl_reason = first_t['exit_reason'] if first_t else None
 
                 # ========== STEP 9: TOTAL P&L ==========
@@ -1931,16 +1989,6 @@ def run_algotest_backtest(params):
                 else:
                     actual_exit_date = exit_date
             
-                # ===== FILTER_END CHECK ===== 
-                # If filter is enabled and segment end arrives before scheduled exit,
-                # exit on segment end date with reason FILTER_END
-                if trade_segment_end is not None:
-                    filter_exit_day = _last_trading_day_on_or_before(trading_calendar, trade_segment_end)
-                    if (filter_exit_day is not None and
-                            filter_exit_day <= actual_exit_date):
-                        actual_exit_date = filter_exit_day
-                        filter_exit_reason = 'FILTER_END'
-
                 exit_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
 
                 # ========== STEP 11: RECORD TRADE ==========

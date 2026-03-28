@@ -396,6 +396,7 @@ const StrategyBuilder = () => {
           setJobId(null);
           setLoading(false);
           const payload = data.result;
+          console.log('[pollJobStatus] payload:', JSON.stringify(payload).slice(0, 500));
           if (!payload) {
             setError('Backtest completed without a result payload.');
             return;

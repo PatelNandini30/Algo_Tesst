@@ -296,11 +296,6 @@ volumes:
   pgdata:
   redis_data:
   parquet_cache:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: /tmp/algo_parquet_cache
 
 networks:
   algotest-network:
