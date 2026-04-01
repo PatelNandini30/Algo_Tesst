@@ -1665,6 +1665,16 @@ def run_algotest_backtest(params):
     # ========== STEP 4: LOOP THROUGH SEGMENTED SCHEDULE ==========
     t_loop = time.perf_counter()
     trade_id = 0
+    
+    # ========== Series A & B Accumulators ==========
+    # Series A: Spot-Anchored (absolute index points)
+    cumulative = None          # will be set from first trade's entry spot
+    peak = None                # running max of cumulative
+    
+    # Series B: Index-Based (compound geometric growth from 100)
+    cumulative_index = 100.0   # starts at exactly 100, before any trade
+    peak_index = 100.0         # running max of cumulative_index
+    
     for seg_scope in segment_records:
         segment = seg_scope['segment']
         for entry_idx, trade_entry in enumerate(seg_scope['entries'], 1):
@@ -2141,6 +2151,48 @@ def run_algotest_backtest(params):
                 _log(f"  Total P&L: ₹{total_pnl:,.2f}")
                 _log(f"  CE P&L: {total_ce_pnl:.2f}, PE P&L: {total_pe_pnl:.2f}, Net P&L: {total_ce_pnl + total_pe_pnl:.2f}")
 
+                # ========== Series A & B Calculations ==========
+                # Net P&L in points (no quantity multiplication)
+                net_pnl = total_ce_pnl + total_pe_pnl
+                
+                # Net P&L % as decimal (Net P&L / Entry Spot)
+                net_pnl_pct = net_pnl / entry_spot if entry_spot != 0 else 0
+                
+                # ========== Series A: Spot-Anchored (absolute index points) ==========
+                if cumulative is None:
+                    # First trade: anchor to first trade's entry spot
+                    cumulative = entry_spot + net_pnl
+                else:
+                    cumulative = cumulative + net_pnl
+                
+                # Peak: running maximum of Cumulative
+                if peak is None:
+                    peak = cumulative
+                else:
+                    peak = max(peak, cumulative)
+                
+                # DD: Cumulative - Peak (zero or negative)
+                dd = cumulative - peak
+                
+                # %DD: (DD / Peak) * 100
+                pct_dd = (dd / peak) * 100 if peak != 0 else 0
+                
+                # ========== Series B: Index-Based (compound geometric growth from 100) ==========
+                # Cumulative Index: compound multiplication
+                cumulative_index = cumulative_index * (1 + net_pnl_pct)
+                
+                # Peak Index: running maximum of Cumulative Index
+                peak_index = max(peak_index, cumulative_index)
+                
+                # DD Index: Cumulative Index - Peak Index (zero or negative)
+                dd_index = cumulative_index - peak_index
+                
+                # %DD Index: DD Index / Peak Index (decimal, NOT multiplied by 100)
+                pct_dd_index = (dd_index / peak_index) if peak_index != 0 else 0
+                
+                _log(f"  Series A - Cumulative: {cumulative:.2f}, Peak: {peak:.2f}, DD: {dd:.2f}, %DD: {pct_dd:.2f}")
+                _log(f"  Series B - CumIndex: {cumulative_index:.6f}, PeakIndex: {peak_index:.6f}, DDIndex: {dd_index:.6f}, %DDIndex: {pct_dd_index:.6f}")
+
                 # ========== STEP 10: TRADE-LEVEL EXIT DATE ==========
                 # Partial mode: legs exit on different days — trade closes when the
                 # last leg closes. Use max() over all valid per-leg exit dates.
@@ -2168,6 +2220,18 @@ def run_algotest_backtest(params):
                     'total_pnl':       total_pnl,
                     'total_ce_pnl':    total_ce_pnl,
                     'total_pe_pnl':    total_pe_pnl,
+                    'net_pnl':         net_pnl,
+                    'net_pnl_pct':     net_pnl_pct,
+                    # Series A: Spot-Anchored
+                    'cumulative':      cumulative,
+                    'peak':            peak,
+                    'dd':              dd,
+                    'pct_dd':          pct_dd,
+                    # Series B: Index-Based (for charts)
+                    'cumulative_index': cumulative_index,
+                    'peak_index':      peak_index,
+                    'dd_index':        dd_index,
+                    'pct_dd_index':    pct_dd_index,
                     'square_off_mode': square_off_mode,
                     'per_leg_results': per_leg_results,
                     'index':           index,
@@ -2368,6 +2432,26 @@ def run_algotest_backtest(params):
                             re_total_pnl = sum(l['pnl'] for l in re_trade_legs)
                             re_total_ce_pnl = sum(l.get('ce_pnl', 0) for l in re_trade_legs)
                             re_total_pe_pnl = sum(l.get('pe_pnl', 0) for l in re_trade_legs)
+                            
+                            # Re-entry Series A & B calculations
+                            re_net_pnl = re_total_ce_pnl + re_total_pe_pnl
+                            re_net_pnl_pct = re_net_pnl / re_entry_spot if re_entry_spot != 0 else 0
+                            
+                            # Series A
+                            if cumulative is None:
+                                cumulative = re_entry_spot + re_net_pnl
+                            else:
+                                cumulative = cumulative + re_net_pnl
+                            peak = max(peak, cumulative) if peak else cumulative
+                            dd = cumulative - peak
+                            pct_dd = (dd / peak) * 100 if peak != 0 else 0
+                            
+                            # Series B
+                            cumulative_index = cumulative_index * (1 + re_net_pnl_pct)
+                            peak_index = max(peak_index, cumulative_index)
+                            dd_index = cumulative_index - peak_index
+                            pct_dd_index = (dd_index / peak_index) if peak_index != 0 else 0
+                            
                             if re_per_leg is not None:
                                 valid_re_dates = [r['exit_date'] for r in re_per_leg if r.get('exit_date') is not None]
                                 re_actual_exit = max(valid_re_dates) if valid_re_dates else exit_date
@@ -2390,6 +2474,16 @@ def run_algotest_backtest(params):
                                 'total_pnl':       re_total_pnl,
                                 'total_ce_pnl':    re_total_ce_pnl,
                                 'total_pe_pnl':    re_total_pe_pnl,
+                                'net_pnl':         re_net_pnl,
+                                'net_pnl_pct':     re_net_pnl_pct,
+                                'cumulative':      cumulative,
+                                'peak':            peak,
+                                'dd':              dd,
+                                'pct_dd':          pct_dd,
+                                'cumulative_index': cumulative_index,
+                                'peak_index':      peak_index,
+                                'dd_index':        dd_index,
+                                'pct_dd_index':    pct_dd_index,
                                 'square_off_mode': square_off_mode,
                                 'per_leg_results': re_per_leg,
                                 'index':           index,
@@ -2495,6 +2589,12 @@ def run_algotest_backtest(params):
                 # % P&L = (Net P&L / Entry Spot) * 100 - now using points-based Net P&L
                 pct_pnl = round((leg_pnl / entry_spot_val) * 100, 2) if entry_spot_val else 0
                 
+                # Get trade-level values (Series B - compound index for CSV)
+                trade_cumulative_index = round(trade.get('cumulative_index', 100.0), 6)
+                trade_peak_index = round(trade.get('peak_index', 100.0), 6)
+                trade_dd_index = round(trade.get('dd_index', 0), 6)
+                trade_pct_dd_index = round(trade.get('pct_dd_index', 0), 8)
+                
                 row = {
                     'Trade':        trade_idx,
                     'Leg':          leg_num,
@@ -2515,6 +2615,10 @@ def run_algotest_backtest(params):
                     'PE P&L':       pe_pnl_val,
                     'Net P&L':      leg_pnl,
                     '% P&L':        pct_pnl,
+                    'Cumulative':   trade_cumulative_index,
+                    'Peak':         trade_peak_index,
+                    'DD':           trade_dd_index,
+                    '%DD':          trade_pct_dd_index,
                     'Exit Reason':  leg_exit_reason,
                 }
                 row[segment_column_name] = trade.get('str_segment', '')
@@ -2557,8 +2661,15 @@ def run_algotest_backtest(params):
     
     # ========== MERGE ANALYTICS BACK TO DETAILED TRADES ==========
     # Merge Cumulative, Peak, DD, %DD from aggregated back to detailed leg-by-leg DataFrame
+    # NOTE: trades_flat already has 'Cumulative' from Series B (compound index), so we need to
+    # preserve it by renaming the analytics columns to avoid collision
     analytics_cols = ['Trade', 'Cumulative', 'Peak', 'DD', '%DD']
-    trades_aggregated_subset = trades_aggregated[analytics_cols]
+    trades_aggregated_subset = trades_aggregated[analytics_cols].rename(columns={
+        'Cumulative': 'Cumulative_SeriesA',
+        'Peak': 'Peak_SeriesA',
+        'DD': 'DD_SeriesA',
+        '%DD': 'PctDD_SeriesA'
+    })
     trades_df = trades_df.merge(trades_aggregated_subset, on='Trade', how='left')
     
     # print(f"\nDEBUG: trades_df columns after merge: {list(trades_df.columns)}")

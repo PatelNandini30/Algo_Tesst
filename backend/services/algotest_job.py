@@ -234,12 +234,27 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 print(f"[DEBUG] Backtest returned: type={type(trades_df)}, len={len(trades_df) if trades_df is not None else 'None'}, empty={trades_df.empty if trades_df is not None else 'N/A'}")
                 all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
                 print(f"[DEBUG] Single chunk: trades_df={type(trades_df)}, len={len(trades_df) if trades_df is not None else 'None'}")
-                all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
                 print(f"[DEBUG] all_trades from single chunk: {len(all_trades)}")
                 if engine_summary is None:
                     engine_summary = {}
                 if engine_pivot is None:
                     engine_pivot = {"headers": [], "rows": []}
+                
+                # Compute analytics for single chunk to add Cumulative/Peak/DD/%DD
+                if all_trades and len(all_trades) > 0:
+                    try:
+                        from base import compute_analytics, build_pivot
+                        trades_agg = pd.DataFrame(all_trades)
+                        for col in ['Entry Date', 'Exit Date']:
+                            if col in trades_agg.columns:
+                                trades_agg[col] = pd.to_datetime(trades_agg[col], dayfirst=True, errors='coerce')
+                        trades_agg, result_summary = compute_analytics(trades_agg)
+                        result_pivot = build_pivot(trades_agg, "Exit Date")
+                        all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
+                        engine_summary = result_summary
+                        engine_pivot = result_pivot
+                    except Exception as e:
+                        print(f"[WARN] compute_analytics for single chunk failed: {e}")
             else:
                 all_chunk_trades = []
                 engine_summary = None
@@ -309,8 +324,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 print(f"[DEBUG] Result summary: {result_summary}")
                 result_pivot = build_pivot(trades_aggregated, "Exit Date")
 
+                # Use trades_aggregated (with Cumulative/Peak/DD/%DD from compute_analytics) for export
                 all_trades = _convert_numpy(
-                    _format_dates(trades_df.to_dict('records'))
+                    _format_dates(trades_aggregated.to_dict('records'))
                 )
 
             except Exception as e:

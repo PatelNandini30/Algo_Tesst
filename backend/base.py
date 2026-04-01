@@ -706,29 +706,59 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     # Sort by entry date to guarantee chronological order
     df = df.sort_values(entry_date_col).reset_index(drop=True)
 
-    # ── CORE EQUITY CURVE ────────────────────────────────────────────────────
-    # Cumulative = Entry Spot of Trade 1 + Net P&L of Trade 1
-    # Trade N: Cumulative = Cumulative of Trade (N-1) + Net P&L of Trade N
-    # Using Entry Spot as initial capital reference (points-based)
-    first_entry_spot = df['Entry Spot'].iloc[0] if 'Entry Spot' in df.columns and len(df) > 0 else 0
-    df['Cumulative'] = first_entry_spot + df[pnl_col].cumsum()
+    # ── Check if Series B (compound index) already exists ────────────────────────
+    # If Cumulative already exists and starts around 100, preserve it (Series B)
+    has_series_b = (
+        'Cumulative' in df.columns and 
+        len(df) > 0 and 
+        pd.notna(df['Cumulative'].iloc[0]) and 
+        90 <= df['Cumulative'].iloc[0] <= 110
+    )
+    
+    if has_series_b:
+        # Preserve Series B - compound index starting at ~100
+        pass  # Keep existing Cumulative, Peak, DD, %DD values
+    else:
+        # ── CORE EQUITY CURVE ────────────────────────────────────────────────────
+        # Cumulative = Entry Spot of Trade 1 + Net P&L of Trade 1
+        # Trade N: Cumulative = Cumulative of Trade (N-1) + Net P&L of Trade N
+        # Using Entry Spot as initial capital reference (points-based)
+        first_entry_spot = df['Entry Spot'].iloc[0] if 'Entry Spot' in df.columns and len(df) > 0 else 0
+        df['Cumulative'] = first_entry_spot + df[pnl_col].cumsum()
+    
+    # ── Calculate Series B: Compound Return Index (always, from Net P&L %) ─────
+    # Start at 100, compound each trade by (1 + net_pnl_pct)
+    cumulative_index = 100.0
+    peak_index = 100.0
+    
+    net_pnl_pct = (df[pnl_col] / df['Entry Spot'].replace(0, np.nan)) * 100
+    
+    cumulative_series = []
+    peak_series = []
+    dd_series = []
+    pct_dd_series = []
+    
+    for i in range(len(df)):
+        pnl_pct = net_pnl_pct.iloc[i] if pd.notna(net_pnl_pct.iloc[i]) else 0
+        cumulative_index = cumulative_index * (1 + pnl_pct / 100)
+        peak_index = max(peak_index, cumulative_index)
+        dd_index = cumulative_index - peak_index
+        pct_dd = (dd_index / peak_index * 100) if peak_index != 0 else 0
+        
+        cumulative_series.append(round(cumulative_index, 6))
+        peak_series.append(round(peak_index, 6))
+        dd_series.append(round(dd_index, 6))
+        pct_dd_series.append(round(pct_dd, 6))
+    
+    # Override with Series B values (compound index)
+    df['Cumulative'] = cumulative_series
+    df['Peak'] = peak_series
+    df['DD'] = dd_series
+    df['%DD'] = pct_dd_series
     
     # Get initial capital for CAGR calculation only
     # Use default capital of 1 lakh (100000) as initial trading capital
     initial_capital = 100000.0
-
-    # High-water mark (peak equity)
-    df['Peak'] = df['Cumulative'].cummax()
-
-    # Drawdown in points = Cumulative - Peak (negative when in drawdown)
-    df['DD'] = df['Cumulative'] - df['Peak']  # Can be negative (drawdown) or 0
-
-    # Percentage drawdown relative to the peak equity
-    df['%DD'] = np.where(
-        df['Peak'] != 0,
-        np.round(100.0 * df['DD'] / df['Peak'], 2),
-        0.0
-    )
 
     # ── BASIC STATS ──────────────────────────────────────────────────────────
     # Ensure pnl_col values are numeric

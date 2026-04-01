@@ -37,7 +37,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         entrySpot: legs[0]['Entry Spot'],
         exitSpot: legs[0]['Exit Spot'],
         totalPnl: legs.reduce((sum, leg) => sum + (leg['Net P&L'] || 0), 0),
-        cumulative: legs[0].Cumulative || 0,
+        // Series B - compound index (base 100)
+        cumulative: legs[0].cumulative_index || legs[0].cumulative || 100.0,
+        peak: legs[0].peak_index || legs[0].peak || 100.0,
+        dd: legs[0].dd_index || legs[0].dd || 0,
+        pct_dd: legs[0].pct_dd_index || legs[0]['%DD'] || 0,
       });
     }
     // Already sorted by insertion order (which is by trade number since we iterate trades in order)
@@ -45,13 +49,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   }, [trades]);
 
   // Prepare chart data - USE GROUPED TRADES (one point per trade, not per leg)
+  // Use Series B (compound index starting from 100) for equity curve
   const equityData = useMemo(() => {
     if (!groupedTrades || groupedTrades.length === 0) return [];
     
     return groupedTrades.map((group, index) => ({
       index: index + 1,
       date: group.exitDate || `Trade ${index + 1}`,
-      cumulative: group.cumulative || 0,
+      // Use compound index (Series B) starting from 100
+      cumulative: group.cumulative || 100.0,
       pnl: group.totalPnl || 0
     }));
   }, [groupedTrades]);
@@ -60,8 +66,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     if (!groupedTrades || groupedTrades.length === 0) return [];
     
     return groupedTrades.map((group, index) => {
-      // Get DD from first leg (all legs in a trade have same DD value)
-      const dd = group.legs[0]?.DD || group.legs[0]?.dd || 0;
+      // Use DD % from backend - already has correct sign (negative for drawdown)
+      const dd = group.pct_dd || 0;
       return {
         index: index + 1,
         date: group.exitDate || `Trade ${index + 1}`,
@@ -323,7 +329,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     stroke="#9ca3af"
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
-                    tickFormatter={(value) => `₹${(value/1000).toFixed(0)}k`}
+                    tickFormatter={(value) => value.toFixed(1)}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area 
@@ -363,8 +369,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     stroke="#9ca3af"
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
-                    tickFormatter={(value) => `₹${(value/1000).toFixed(0)}k`}
-                    domain={['dataMin', 0]}
+                    tickFormatter={(value) => `${value.toFixed(1)}%`}
+                    domain={[0, 'auto']}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area 
