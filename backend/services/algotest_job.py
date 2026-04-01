@@ -402,11 +402,22 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             """Convert result to JSON-safe structure using orjson (handles numpy natively)."""
             try:
                 import pandas as _pd
+                import numpy as np
 
                 if isinstance(obj, _pd.DataFrame):
                     obj = obj.to_dict('records')
                 elif isinstance(obj, _pd.Series):
                     obj = obj.to_dict()
+                elif isinstance(obj, dict):
+                    new_obj = {}
+                    for k, v in obj.items():
+                        if isinstance(v, (np.integer, np.floating)):
+                            new_obj[k] = float(v) if isinstance(v, np.floating) else int(v)
+                        elif isinstance(v, dict):
+                            new_obj[k] = _make_json_safe(v)
+                        else:
+                            new_obj[k] = v
+                    return new_obj
 
                 # orjson serialises numpy int/float/bool, datetime, UUID natively
                 # Round-trip through JSON to get a plain Python structure

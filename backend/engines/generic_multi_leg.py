@@ -563,7 +563,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                             "Entry Spot": entry_spot_price,
                             "Exit Spot": exit_spot_price,
                             "Spot P&L": round(exit_spot_price - entry_spot_price, 2),
-                            "Future Expiry": trade_fut_expiry,
+                            "Next Expiry": trade_fut_expiry,
                             "Net P&L": leg_row["Net P&L"],
                             "Exit Reason": exit_reason if str_enabled else "",
                             "STR Segment": str_segment_str if str_enabled else "",

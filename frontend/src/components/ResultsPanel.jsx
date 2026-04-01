@@ -5,7 +5,7 @@ import {
 } from 'recharts';
 import { Download, X } from 'lucide-react';
 
-const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) => {
+const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
 
   console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
@@ -108,29 +108,57 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
   const exportToCSV = () => {
     if (!trades || trades.length === 0) return;
     
-    // Add P&L column to each trade if not present (calculated like in the display table)
-    const tradesWithPnL = trades.map(trade => {
-      const position = (trade['B/S'] || '').toLowerCase();
-      const entryPrice = parseFloat(trade['Entry Price']) || 0;
-      const exitPrice = parseFloat(trade['Exit Price']) || 0;
-      const qty = parseInt(trade['Qty']) || 65;
-      
-      const pointsPnl = position === 'sell' 
-        ? entryPrice - exitPrice 
-        : exitPrice - entryPrice;
-      const actualPnl = pointsPnl * qty;
-      
-      return {
-        ...trade,
-        'P&L': actualPnl
-      };
+    // Check what columns are needed based on data
+    const hasCalls = trades.some(t => (t['Type'] || '').toLowerCase() === 'call');
+    const hasPuts = trades.some(t => (t['Type'] || '').toLowerCase() === 'put');
+    const hasStrSegment = showStrSegment && trades.some(t => t['STR Segment'] && t['STR Segment'] !== '');
+    const hasFutures = trades.some(t => (t['Type'] || '').toLowerCase() === 'fut');
+    
+    // Build dynamic key order based on what data exists
+    let keyOrder = [
+      'Trade', 'Leg', 'Index', 'Entry Date', 'Exit Date', 'Entry Spot', 'Exit Spot', 'Spot P&L',
+      'Type', 'Strike', 'B/S', 'Qty', 'Entry Price', 'Exit Price'
+    ];
+    
+    // Add CE P&L only if calls exist
+    if (hasCalls) keyOrder.push('CE P&L');
+    
+    // Add PE P&L only if puts exist
+    if (hasPuts) keyOrder.push('PE P&L');
+    
+    // Add Expiry column (always show)
+    keyOrder = [...keyOrder, 'Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Exit Reason', 'Expiry'];
+    
+    // Add STR Segment only if STR filter was enabled AND has non-empty values
+    if (hasStrSegment) keyOrder.push('STR Segment');
+    
+    // Create a set of columns to exclude if not needed
+    const conditionalExclude = new Set();
+    if (!hasCalls) conditionalExclude.add('CE P&L');
+    if (!hasPuts) conditionalExclude.add('PE P&L');
+    if (!hasStrSegment) conditionalExclude.add('STR Segment');
+    
+    // Reorder columns - only include columns that should be shown
+    const cleanedTrades = trades.map(trade => {
+      const reordered = {};
+      // First add columns in our key order
+      for (const key of keyOrder) {
+        if (trade.hasOwnProperty(key) && !conditionalExclude.has(key)) {
+          reordered[key] = trade[key];
+        }
+      }
+      return reordered;
     });
     
-    const headers = Object.keys(tradesWithPnL[0]).join(',');
-    const rows = tradesWithPnL.map(trade => 
-      Object.values(trade).map(val => 
-        typeof val === 'string' && val.includes(',') ? `"${val}"` : val
-      ).join(',')
+    const headers = Object.keys(cleanedTrades[0]).join(',');
+    const rows = cleanedTrades.map(trade => 
+      Object.values(trade).map(val => {
+        // Handle numeric values - round to 2 decimal places to avoid floating point errors
+        if (typeof val === 'number' && !Number.isInteger(val)) {
+          return Math.round(val * 100) / 100;
+        }
+        return typeof val === 'string' && val.includes(',') ? `"${val}"` : val;
+      }).join(',')
     );
     const csv = [headers, ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -139,6 +167,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
     a.href = url;
     a.download = `backtest_${new Date().toISOString().split('T')[0]}.csv`;
     a.click();
+    window.URL.revokeObjectURL(url);
   };
 
   const CustomTooltip = ({ active, payload }) => {
@@ -506,15 +535,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
                       <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Date</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Spot</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Spot</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Spot P&L</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Type</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Strike</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">B/S</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">P&L</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Points P&L</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Net P&L</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">% P&L</th>
                     </tr>
                   </thead>
@@ -553,13 +580,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
                             
-                            const spotPnl = leg['Spot P&L'] || (group.exitSpot - group.entrySpot) || 0;
-                            
                             const pointsPnl = position.toLowerCase() === 'sell' 
                               ? entryPrice - exitPrice
                               : exitPrice - entryPrice;
-                            
-                            const actualPnl = pointsPnl * qty;
                             
                             const percentPnl = group.entrySpot !== 0 
                               ? (pointsPnl / group.entrySpot) * 100
@@ -579,9 +602,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
                                   <>
                                     <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
                                     <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.exitSpot || 0).toFixed(2)}</td>
-                                    <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>
-                                      {spotPnl.toFixed(2)}
-                                    </td>
                                   </>
                                 ) : null}
                                 <td className="px-3 py-2 text-xs text-gray-700">{optionType}</td>
@@ -590,11 +610,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo }) 
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{qty}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{entryPrice.toFixed(2)}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{exitPrice.toFixed(2)}</td>
-                                <td className={`px-3 py-2 text-xs text-right ${actualPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {actualPnl >= 0 ? '+' : ''}{actualPnl.toFixed(2)}
-                                </td>
                                 <td className={`px-3 py-2 text-xs text-right ${pointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {pointsPnl.toFixed(2)}
+                                  {pointsPnl >= 0 ? '+' : ''}{pointsPnl.toFixed(2)}
                                 </td>
                                 <td className={`px-3 py-2 text-xs text-right ${percentPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                   {percentPnl.toFixed(2)}%

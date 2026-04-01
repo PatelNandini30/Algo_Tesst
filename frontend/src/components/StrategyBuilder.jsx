@@ -290,6 +290,25 @@ const StrategyBuilder = () => {
   const [trailSLTarget, setTrailSLTarget] = useState('all_legs');
   const [legs, setLegs] = useState([]);
 
+  const [spotAdjustmentEnabled, setSpotAdjustmentEnabled] = useState(false);
+  const [spotAdjustmentDirection, setSpotAdjustmentDirection] = useState('rise');
+  const [spotAdjustmentValue, setSpotAdjustmentValue] = useState(1.0);
+  const [spotAdjustmentUnits, setSpotAdjustmentUnits] = useState('percent');
+  const [spotAdjustmentShowInfo, setSpotAdjustmentShowInfo] = useState(true);
+
+  const clampSpotAdjustmentValue = useCallback((value) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) {
+      return 0.25;
+    }
+    return Math.min(5, Math.max(0.25, numeric));
+  }, []);
+
+  const normalizedSpotAdjustmentValue = useMemo(
+    () => clampSpotAdjustmentValue(spotAdjustmentValue),
+    [clampSpotAdjustmentValue, spotAdjustmentValue]
+  );
+
   const [draftLeg, setDraftLeg] = useState({
     segment: 'options',
     position: 'sell',
@@ -329,6 +348,7 @@ const StrategyBuilder = () => {
     segments: [],
     entryMode: 'dte',
   });
+  const [strSegments, setStrSegments] = useState({ '5x1': [], '5x2': [] });
   const [startDate, setStartDate] = useState('20/02/2025');
   const [endDate, setEndDate] = useState('20/02/2026');
   const [loading, setLoading] = useState(false);
@@ -339,6 +359,49 @@ const StrategyBuilder = () => {
   const [jobId, setJobId] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
+
+  const latestEntrySpot = useMemo(() => {
+    const firstTrade = results?.trades?.[0];
+    if (!firstTrade) return null;
+    const value = firstTrade.entry_spot ?? firstTrade.entrySpot ?? firstTrade['Entry Spot'];
+    const parsed = value != null ? Number(value) : null;
+    return Number.isFinite(parsed) ? parsed : null;
+  }, [results]);
+
+  const spotAdjustmentHelperText = useMemo(() => {
+    const entrySpot = latestEntrySpot ?? 10791;
+    const entryFormatted = entrySpot.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const thresholdLabel = Number.isInteger(normalizedSpotAdjustmentValue)
+      ? normalizedSpotAdjustmentValue.toFixed(0)
+      : normalizedSpotAdjustmentValue.toFixed(2);
+    const riseTarget =
+      spotAdjustmentUnits === 'percent'
+        ? entrySpot * (1 + normalizedSpotAdjustmentValue / 100)
+        : entrySpot + normalizedSpotAdjustmentValue;
+    const fallTarget =
+      spotAdjustmentUnits === 'percent'
+        ? entrySpot * (1 - normalizedSpotAdjustmentValue / 100)
+        : entrySpot - normalizedSpotAdjustmentValue;
+    const formatNumber = (val) => val.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const riseFormatted = formatNumber(riseTarget);
+    const fallFormatted = formatNumber(fallTarget);
+
+    if (spotAdjustmentUnits === 'percent') {
+      if (spotAdjustmentDirection === 'both') {
+        return `Exits if spot moves ±${thresholdLabel}% from entry`;
+      }
+      const directionLabel = spotAdjustmentDirection === 'rise' ? 'rise target' : 'fall target';
+      const targetValue = spotAdjustmentDirection === 'rise' ? riseFormatted : fallFormatted;
+      return `e.g. entry ${entryFormatted} → ${directionLabel} ${targetValue} at ${thresholdLabel}%`;
+    }
+
+    if (spotAdjustmentDirection === 'both') {
+      return `Exits if spot moves ±${thresholdLabel} pts from entry`;
+    }
+    const directionLabel = spotAdjustmentDirection === 'rise' ? 'rise target' : 'fall target';
+    const targetValue = spotAdjustmentDirection === 'rise' ? riseFormatted : fallFormatted;
+    return `e.g. entry ${entryFormatted} → ${directionLabel} ${targetValue} pts`;
+  }, [latestEntrySpot, normalizedSpotAdjustmentValue, spotAdjustmentDirection, spotAdjustmentUnits]);
 
   // Validate date is in DD/MM/YYYY format
   const isValidDate = (dateStr) => {
@@ -694,6 +757,11 @@ const StrategyBuilder = () => {
       square_off_mode: squareOffMode,
       trail_sl_breakeven: trailSLBreakeven,
       trail_sl_target: trailSLTarget,
+      spot_adjustment_enabled: spotAdjustmentEnabled,
+      spot_adjustment_direction: spotAdjustmentDirection,
+      spot_adjustment_pct: normalizedSpotAdjustmentValue,
+      spot_adjustment_units: spotAdjustmentUnits,
+      spot_adjustment_use_entry_close: true,
       legs: legsPayload,
       // Overall SL/TGT - send flat structure with correct field names expected by backend
       overall_sl_type: overallSLEnabled ? overallSLType : null,
@@ -918,6 +986,80 @@ const StrategyBuilder = () => {
                   onToggle={() => setStrFilter(prev => ({ ...prev, enabled: !prev.enabled }))}
                   onFilterChange={(payload) => setStrFilter(prev => ({ ...prev, ...payload }))}
                 />
+                <div className="flex items-center justify-between py-2">
+                  <div className="flex items-center gap-1">
+                    <span className="text-xs text-gray-600">Spot Adjustment</span>
+                    <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Uses the same entry spot as strike selection (previous day close). Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach." />
+                  </div>
+                  <Toggle
+                    enabled={spotAdjustmentEnabled}
+                    onToggle={() => setSpotAdjustmentEnabled(v => !v)}
+                    size="sm"
+                  />
+                </div>
+                {spotAdjustmentEnabled && (
+                  <div className="space-y-2 pl-2">
+                    <div className="flex items-center gap-2">
+                      <SegBtn
+                        options={[
+                          { value: 'rise', label: '↑ Rise' },
+                          { value: 'fall', label: '↓ Fall' },
+                          { value: 'both', label: '↕ Both' },
+                        ]}
+                        value={spotAdjustmentDirection}
+                        onChange={setSpotAdjustmentDirection}
+                        size="sm"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-gray-500">Units</span>
+                      <SegBtn
+                        options={[
+                          { value: 'percent', label: '% Percent' },
+                          { value: 'points', label: 'Pts' },
+                        ]}
+                        value={spotAdjustmentUnits}
+                        onChange={setSpotAdjustmentUnits}
+                        size="sm"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="w-20 text-xs font-medium text-gray-600">Threshold</span>
+                      <input
+                        type="number"
+                        min={0.25}
+                        max={5}
+                        step={0.25}
+                        value={spotAdjustmentValue}
+                        onChange={e => {
+                          const nextValue = e.target.value;
+                          if (nextValue === '') {
+                            setSpotAdjustmentValue('');
+                            return;
+                          }
+                          const numeric = Number(nextValue);
+                          setSpotAdjustmentValue(Number.isNaN(numeric) ? '' : numeric);
+                        }}
+                        onBlur={() => setSpotAdjustmentValue(prev => clampSpotAdjustmentValue(prev))}
+                        className="h-10 flex-1 border border-gray-300 rounded text-sm px-2"
+                      />
+                      <span className="text-xs font-medium text-gray-500">
+                        {spotAdjustmentUnits === 'percent' ? '%' : 'pts'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-gray-500">Show target info</span>
+                      <Toggle
+                        enabled={spotAdjustmentShowInfo}
+                        onToggle={() => setSpotAdjustmentShowInfo(v => !v)}
+                        size="sm"
+                      />
+                    </div>
+                    {spotAdjustmentShowInfo && (
+                      <p className="text-xs text-gray-500">{spotAdjustmentHelperText}</p>
+                    )}
+                  </div>
+                )}
             </div>
           </div>
 
@@ -1526,6 +1668,7 @@ const StrategyBuilder = () => {
               onClose={() => setResults(null)}
               showCloseButton={false}
               filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
+              showStrSegment={strFilter.enabled}
             />
           </div>
         )}

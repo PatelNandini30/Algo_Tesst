@@ -707,8 +707,11 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df = df.sort_values(entry_date_col).reset_index(drop=True)
 
     # ── CORE EQUITY CURVE ────────────────────────────────────────────────────
-    # Cumulative = running sum of P&L (no initial capital added)
-    df['Cumulative'] = df[pnl_col].cumsum()
+    # Cumulative = Entry Spot of Trade 1 + Net P&L of Trade 1
+    # Trade N: Cumulative = Cumulative of Trade (N-1) + Net P&L of Trade N
+    # Using Entry Spot as initial capital reference (points-based)
+    first_entry_spot = df['Entry Spot'].iloc[0] if 'Entry Spot' in df.columns and len(df) > 0 else 0
+    df['Cumulative'] = first_entry_spot + df[pnl_col].cumsum()
     
     # Get initial capital for CAGR calculation only
     # Use default capital of 1 lakh (100000) as initial trading capital
@@ -717,14 +720,14 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     # High-water mark (peak equity)
     df['Peak'] = df['Cumulative'].cummax()
 
-    # Rupee drawdown = Cumulative - Peak (positive when in drawdown)
-    df['DD'] = np.where(df['Peak'] > df['Cumulative'], df['Peak'] - df['Cumulative'], 0)
+    # Drawdown in points = Cumulative - Peak (negative when in drawdown)
+    df['DD'] = df['Cumulative'] - df['Peak']  # Can be negative (drawdown) or 0
 
     # Percentage drawdown relative to the peak equity
     df['%DD'] = np.where(
-        df['DD'] == 0,
-        0.0,
-        np.round(100.0 * df['DD'] / df['Peak'], 2)
+        df['Peak'] != 0,
+        np.round(100.0 * df['DD'] / df['Peak'], 2),
+        0.0
     )
 
     # ── BASIC STATS ──────────────────────────────────────────────────────────
