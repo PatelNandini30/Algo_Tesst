@@ -4,7 +4,7 @@ Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
 
 # Set DEBUG = True to enable verbose logging for debugging
-DEBUG = False
+DEBUG = True
 
 _EARLY_EXIT_REASONS = {
     'STOP_LOSS',
@@ -99,7 +99,13 @@ from base import (
     get_active_str_segment,
     preload_all_data,
     clear_fast_lookup_caches,
+    _resolve_nearest_future_expiry,
+    _resolve_nearest_future_expiry_after,
+    _resolve_futures_expiry_by_preference,
+    resolve_futures_pnl_with_rollover,
 )
+
+from services.data_loader import get_loader
 
 
 def _last_trading_day_on_or_before(trading_calendar_df, target_date):
@@ -510,13 +516,17 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
             tleg['pe_pnl'] = tleg['pnl']
 
     else:  # FUTURE
+        check_expiry = _resolve_nearest_future_expiry(index, leg_exit_date)
+        if check_expiry is None:
+            check_expiry = tleg.get('futures_expiry')
         new_exit = get_future_price_from_db(
             date=leg_exit_date.strftime('%Y-%m-%d'),
             index=index,
-            expiry=expiry_date.strftime('%Y-%m-%d'),
+            expiry=check_expiry,
         ) or tleg['entry_price']
         ep = tleg['entry_price']
         tleg['exit_price']      = new_exit
+        tleg['futures_expiry']  = check_expiry
         tleg['early_exit_date'] = leg_exit_date
         
         # P&L in POINTS (no quantity multiplication)
@@ -673,10 +683,13 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             option_type = leg.get('option_type', 'CE')  # safe default for underlying_* checks
 
             if segment in ('FUTURES', 'FUTURE'):
+                check_expiry = _resolve_nearest_future_expiry(index, check_date)
+                if check_expiry is None:
+                    check_expiry = leg.get('futures_expiry')
                 current_price = get_future_price_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
-                    expiry=expiry_date.strftime('%Y-%m-%d')
+                    expiry=check_expiry
                 )
                 if current_price is None:
                     continue
@@ -1098,10 +1111,13 @@ def check_overall_stop_loss_target(
                 if entry_price is None:
                     continue
 
+                check_expiry = _resolve_nearest_future_expiry(index, check_date)
+                if check_expiry is None:
+                    check_expiry = leg.get('futures_expiry')
                 current_price = get_future_price_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
-                    expiry=expiry_date.strftime('%Y-%m-%d')
+                    expiry=check_expiry
                 )
 
                 if current_price is None:
@@ -1367,6 +1383,9 @@ def run_algotest_backtest(params):
         overall_target_value = _legacy_tgt_pct
 
     square_off_mode = params.get('square_off_mode', 'partial')  # 'partial' | 'complete'
+    underlying_type = str(params.get('underlying', 'cash') or 'cash').lower().strip()
+    if underlying_type not in ('cash', 'futures'):
+        underlying_type = 'cash'
 
     spot_adjustment_enabled = bool(params.get('spot_adjustment_enabled', False))
     spot_adjustment_direction = str(params.get('spot_adjustment_direction', 'rise') or 'rise').lower().strip()
@@ -1723,12 +1742,22 @@ def run_algotest_backtest(params):
                     base_exit_reason = 'FILTER_END' if clamped_exit else 'Expiry'
                     str_segment_label = segment.get('label', '')
             
-                # ========== STEP 7: GET ENTRY SPOT PRICE ==========
-                # Get spot from database (use index price at entry_date)
-                entry_spot = get_spot_price_from_db(entry_date, index)
-            
+                # ========== STEP 7: GET ENTRY SPOT / UNDERLYING PRICE ==========
+                # By default we use index spot, but Mode B requests futures entry spot
+                if underlying_type == 'futures':
+                    entry_spot = get_future_price_from_db(
+                        entry_date,
+                        index,
+                        expiry=None,
+                    )
+                    if entry_spot is None:
+                        _log(f"  WARNING: No futures price for {entry_date} - falling back to spot")
+                        entry_spot = get_spot_price_from_db(entry_date, index)
+                else:
+                    entry_spot = get_spot_price_from_db(entry_date, index)
+
                 if entry_spot is None:
-                    _log(f"  WARNING: No spot data for {entry_date} - skipping")
+                    _log(f"  WARNING: No spot/futures price for {entry_date} - skipping")
                     continue
 
                 _log(f"  Entry Spot: {entry_spot}")
@@ -1782,41 +1811,34 @@ def run_algotest_backtest(params):
                     lots = int(leg_config.get('lots', 1))
 
                     if leg_segment == 'FUTURES':
-                        # ========== FUTURES LEG ==========
                         _log(f"      Type: FUTURE")
                         _log(f"      Position: {position}")
+                        lot_size = get_lot_size(index, entry_date)
+                        futures_expiry_pref = str(leg_config.get('expiry', 'monthly') or 'monthly').lower().strip()
+                        if futures_expiry_pref in ('next_monthly', 'next_month', 'mid_month'):
+                            futures_expiry_pref = 'next_monthly'
+                        else:
+                            futures_expiry_pref = 'monthly'
 
-                        # Get future expiry
-                        future_expiry = expiry_date  # Use same expiry for simplicity
-
-                        # Get entry price
-                        entry_price = get_future_price_from_db(
-                            date=entry_date.strftime('%Y-%m-%d'),
+                        entry_price, exit_price, _fut_expiry_str = resolve_futures_pnl_with_rollover(
+                            entry_date=entry_date,
+                            exit_date=exit_date,
                             index=index,
-                            expiry=future_expiry.strftime('%Y-%m-%d')
+                            position=position,
+                            preference=futures_expiry_pref,
                         )
 
                         if entry_price is None:
-                            _log(f"      WARNING: No future price - skipping leg")
+                            _log(f"      WARNING: No futures price for entry {entry_date} - skipping leg")
                             continue
 
-                        _log(f"      Entry Price: {entry_price}")
-
-                        # Get exit price
-                        exit_price = get_future_price_from_db(
-                            date=exit_date.strftime('%Y-%m-%d'),
-                            index=index,
-                            expiry=future_expiry.strftime('%Y-%m-%d')
-                        )
-
                         if exit_price is None:
-                            _log(f"      WARNING: No exit price - using entry")
+                            _log(f"      WARNING: No exit futures price - using entry price")
                             exit_price = entry_price
 
+                        _log(f"      Entry Price: {entry_price} (contract expiry: {_fut_expiry_str})")
                         _log(f"      Exit Price: {exit_price}")
 
-                        # Calculate P&L in POINTS (no quantity multiplication)
-                        # Futures BUY: (Exit - Entry), Futures SELL: (Entry - Exit)
                         if position == 'BUY':
                             leg_pnl = exit_price - entry_price
                         else:  # SELL
@@ -1833,8 +1855,9 @@ def run_algotest_backtest(params):
                             'entry_price': entry_price,
                             'exit_price': exit_price,
                             'pnl': leg_pnl,
-                            'ce_pnl': 0,  # No CE/PE for futures
-                            'pe_pnl': 0
+                            'ce_pnl': 0,
+                            'pe_pnl': 0,
+                            'futures_expiry': _fut_expiry_str,
                         })
 
                     else:  # OPTIONS
@@ -2039,18 +2062,21 @@ def run_algotest_backtest(params):
                                         tleg['pe_pnl'] = tleg['pnl']
                         
                             elif tleg.get('segment') == 'FUTURE':
-                                # Recalculate future exit price
+                                early_exit_expiry = _resolve_nearest_future_expiry(
+                                    index=index,
+                                    date=actual_leg_exit_date,
+                                ) or tleg.get('futures_expiry')
                                 new_exit_price = get_future_price_from_db(
                                     date=actual_leg_exit_date.strftime('%Y-%m-%d'),
                                     index=index,
-                                    expiry=expiry_date.strftime('%Y-%m-%d')
+                                    expiry=early_exit_expiry
                                 )
                             
                                 if new_exit_price is not None:
                                     old_exit_price = tleg['exit_price']
                                     tleg['exit_price'] = new_exit_price
+                                    tleg['futures_expiry'] = early_exit_expiry
                                 
-                                    # Recalculate P&L in POINTS (no quantity multiplication)
                                     position = tleg['position']
                                     entry_price = tleg['entry_price']
                                 
@@ -2059,7 +2085,6 @@ def run_algotest_backtest(params):
                                     else:  # SELL
                                         tleg['pnl'] = entry_price - new_exit_price
                                     
-                                    # No CE/PE for futures
                                     tleg['ce_pnl'] = 0
                                     tleg['pe_pnl'] = 0
 
@@ -2147,13 +2172,18 @@ def run_algotest_backtest(params):
                 # Calculate CE P&L and PE P&L (in points, no quantity)
                 total_ce_pnl = sum(leg.get('ce_pnl', 0) for leg in trade_legs)
                 total_pe_pnl = sum(leg.get('pe_pnl', 0) for leg in trade_legs)
+                total_fut_pnl = sum(
+                    leg.get('pnl', 0)
+                    for leg in trade_legs
+                    if leg.get('segment') == 'FUTURE'
+                )
                 
                 _log(f"  Total P&L: ₹{total_pnl:,.2f}")
-                _log(f"  CE P&L: {total_ce_pnl:.2f}, PE P&L: {total_pe_pnl:.2f}, Net P&L: {total_ce_pnl + total_pe_pnl:.2f}")
+                _log(f"  CE P&L: {total_ce_pnl:.2f}, PE P&L: {total_pe_pnl:.2f}, FUT P&L: {total_fut_pnl:.2f}, Net P&L: {total_ce_pnl + total_pe_pnl + total_fut_pnl:.2f}")
 
                 # ========== Series A & B Calculations ==========
                 # Net P&L in points (no quantity multiplication)
-                net_pnl = total_ce_pnl + total_pe_pnl
+                net_pnl = total_ce_pnl + total_pe_pnl + total_fut_pnl
                 
                 # Net P&L % as decimal (Net P&L / Entry Spot)
                 net_pnl_pct = net_pnl / entry_spot if entry_spot != 0 else 0
@@ -2220,6 +2250,7 @@ def run_algotest_backtest(params):
                     'total_pnl':       total_pnl,
                     'total_ce_pnl':    total_ce_pnl,
                     'total_pe_pnl':    total_pe_pnl,
+                    'total_fut_pnl':   total_fut_pnl,
                     'net_pnl':         net_pnl,
                     'net_pnl_pct':     net_pnl_pct,
                     # Series A: Spot-Anchored
@@ -2306,23 +2337,28 @@ def run_algotest_backtest(params):
                                 rlts = rlc['lots']
 
                                 if rseg == 'FUTURES':
-                                    rep = get_future_price_from_db(
-                                        date=re_entry_date.strftime('%Y-%m-%d'),
+                                    re_fut_pref = str(rlc.get('expiry', 'monthly') or 'monthly').lower().strip()
+                                    if re_fut_pref in ('next_monthly', 'next_month', 'mid_month'):
+                                        re_fut_pref = 'next_monthly'
+                                    else:
+                                        re_fut_pref = 'monthly'
+                                    rep, rxp, re_fut_expiry = resolve_futures_pnl_with_rollover(
+                                        entry_date=re_entry_date,
+                                        exit_date=exit_date,
                                         index=index,
-                                        expiry=expiry_date.strftime('%Y-%m-%d'),
+                                        position=rpos,
+                                        preference=re_fut_pref,
                                     )
                                     if rep is None:
                                         re_ok = False; break
-                                    rxp = get_future_price_from_db(
-                                        date=exit_date.strftime('%Y-%m-%d'),
-                                        index=index,
-                                        expiry=expiry_date.strftime('%Y-%m-%d'),
-                                    ) or rep
-                                    rpnl = ((rxp - rep) if rpos == 'BUY' else (rep - rxp)) * rlts * re_lot_size
+                                    if rxp is None:
+                                        rxp = rep
+                                    rpnl = (rxp - rep) if rpos == 'BUY' else (rep - rxp)
                                     re_leg = {
                                         'leg_number': rli + 1, 'segment': 'FUTURE',
                                         'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
                                         'entry_price': rep, 'exit_price': rxp, 'pnl': rpnl,
+                                        'futures_expiry': re_fut_expiry,
                                     }
                                 else:  # OPTIONS — same strike criteria as initial entry
                                     ropt = rlc.get('option_type', 'CE')
@@ -2351,7 +2387,7 @@ def run_algotest_backtest(params):
                                     if rxp2 is None:
                                         s2   = get_spot_price_from_db(exit_date, index) or re_entry_spot
                                         rxp2 = calculate_intrinsic_value(spot=s2, strike=rstk, option_type=ropt)
-                                    rpnl2 = ((rxp2 - rep2) if rpos == 'BUY' else (rep2 - rxp2)) * rlts * re_lot_size
+                                    rpnl2 = (rxp2 - rep2) if rpos == 'BUY' else (rep2 - rxp2)
                                     re_leg = {
                                         'leg_number': rli + 1, 'segment': 'OPTION',
                                         'option_type': ropt, 'strike': rstk,
@@ -2432,9 +2468,12 @@ def run_algotest_backtest(params):
                             re_total_pnl = sum(l['pnl'] for l in re_trade_legs)
                             re_total_ce_pnl = sum(l.get('ce_pnl', 0) for l in re_trade_legs)
                             re_total_pe_pnl = sum(l.get('pe_pnl', 0) for l in re_trade_legs)
-                            
+                            re_total_fut_pnl = sum(
+                                l.get('pnl', 0) for l in re_trade_legs if l.get('segment') == 'FUTURE'
+                            )
+                           
                             # Re-entry Series A & B calculations
-                            re_net_pnl = re_total_ce_pnl + re_total_pe_pnl
+                            re_net_pnl = re_total_ce_pnl + re_total_pe_pnl + re_total_fut_pnl
                             re_net_pnl_pct = re_net_pnl / re_entry_spot if re_entry_spot != 0 else 0
                             
                             # Series A
@@ -2474,6 +2513,7 @@ def run_algotest_backtest(params):
                                 'total_pnl':       re_total_pnl,
                                 'total_ce_pnl':    re_total_ce_pnl,
                                 'total_pe_pnl':    re_total_pe_pnl,
+                                'total_fut_pnl':   re_total_fut_pnl,
                                 'net_pnl':         re_net_pnl,
                                 'net_pnl_pct':     re_net_pnl_pct,
                                 'cumulative':      cumulative,
@@ -2554,7 +2594,9 @@ def run_algotest_backtest(params):
                 if leg_exit_spot is None:
                     leg_exit_spot = trade.get('exit_spot', entry_spot_val)
 
-                # ── Entry / Exit price (premium for options, price for futures) ────
+                # ── Check if trade has any options legs (for Spot columns visibility) ─
+                has_options_leg = any(l.get('segment') != 'FUTURE' for l in trade['legs'])
+
                 # ── Entry / Exit price (premium for options, price for futures) ────
                 if leg['segment'] == 'FUTURE':
                     leg_option_type = 'FUT'
@@ -2565,6 +2607,7 @@ def run_algotest_backtest(params):
                     leg_pnl     = leg.get('pnl', leg.get('total_pnl', 0))
                     ce_pnl_val  = 0
                     pe_pnl_val  = 0
+                    fut_pnl_val = leg_pnl
                 else:
                     leg_option_type = leg['option_type']
                     position    = leg['position']
@@ -2575,25 +2618,43 @@ def run_algotest_backtest(params):
                     # CE P&L and PE P&L in points (no quantity)
                     ce_pnl_val  = leg.get('ce_pnl', 0)
                     pe_pnl_val  = leg.get('pe_pnl', 0)
+                    fut_pnl_val = 0
 
-                lots        = leg.get('lots', 1)
-                lot_size    = leg.get('lot_size', 65)
-                qty         = lots * lot_size
-                entry_spot_val = trade.get('entry_spot', 0)
-                pct_pnl = round(leg_pnl / entry_spot_val * 100, 2) if entry_spot_val else 0
+                lots          = leg.get('lots', 1)
+                lot_size      = leg.get('lot_size', 65)
+                qty           = lots * lot_size
+                
+                # ── Trade-level P&L (sum of all legs) for Net P&L and % P&L ────────
+                # Get trade-level totals (already calculated in trade record)
+                trade_total_ce_pnl = trade.get('total_ce_pnl', 0)
+                trade_total_pe_pnl = trade.get('total_pe_pnl', 0)
+                trade_total_fut_pnl = trade.get('total_fut_pnl', 0)
+                trade_net_pnl = trade.get('net_pnl', 0)  # in points (no qty)
+                
+                # Net P&L = points only (no quantity multiplication)
+                net_pnl_points = trade_net_pnl
+                
+                # % P&L = (Trade Net P&L / Trade Entry Spot) * 100
+                # Using entry_spot as base since that's what AlgoTest uses
+                pct_base = entry_spot_val if entry_spot_val else entry_price
+                pct_pnl = round((trade_net_pnl / pct_base) * 100, 2) if pct_base else 0
 
                 segment_meta = trade.get('segment') or {}
                 segment_type = segment_meta.get('type')
                 segment_column_name = 'Filter Segment' if segment_type == 'FILTER' else 'STR Segment'
                 
-                # % P&L = (Net P&L / Entry Spot) * 100 - now using points-based Net P&L
-                pct_pnl = round((leg_pnl / entry_spot_val) * 100, 2) if entry_spot_val else 0
-                
+                # % P&L = (Net P&L / Entry Price) * 100 (entry price = premium for options, futures price for futures)
+                # pct_pnl already computed above
+
                 # Get trade-level values (Series B - compound index for CSV)
                 trade_cumulative_index = round(trade.get('cumulative_index', 100.0), 6)
                 trade_peak_index = round(trade.get('peak_index', 100.0), 6)
                 trade_dd_index = round(trade.get('dd_index', 0), 6)
                 trade_pct_dd_index = round(trade.get('pct_dd_index', 0), 8)
+                
+                # ── Show/Hide Spot columns based on leg type ──────────────────────
+                # If only futures legs, hide Entry/Exit Spot and Spot P&L
+                show_spot_cols = has_options_leg
                 
                 row = {
                     'Trade':        trade_idx,
@@ -2607,13 +2668,22 @@ def run_algotest_backtest(params):
                     'Qty':          qty,
                     'Entry Price':  entry_price,
                     'Exit Price':   exit_price,
-                    'Entry Spot':   entry_spot_val,
-                    'Exit Spot':    leg_exit_spot,
-                    'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if leg_exit_spot and entry_spot_val else 0,
-                    'Expiry': trade['expiry_date'],
+                    'Entry Spot':   entry_spot_val if show_spot_cols else '',
+                    'Exit Spot':    leg_exit_spot if show_spot_cols else '',
+                    'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if show_spot_cols and leg_exit_spot and entry_spot_val else '',
+                    'Expiry':       (
+                        leg.get('futures_expiry') 
+                        if leg.get('segment') == 'FUTURE' 
+                        else (
+                            trade['expiry_date'].strftime('%Y-%m-%d') 
+                            if hasattr(trade['expiry_date'], 'strftime') 
+                            else str(trade['expiry_date'])[:10]
+                        )
+                    ),
                     'CE P&L':       ce_pnl_val,
                     'PE P&L':       pe_pnl_val,
-                    'Net P&L':      leg_pnl,
+                    'FUT P&L':      fut_pnl_val,
+                    'Net P&L':      net_pnl_rupees,
                     '% P&L':        pct_pnl,
                     'Cumulative':   trade_cumulative_index,
                     'Peak':         trade_peak_index,
@@ -2647,11 +2717,17 @@ def run_algotest_backtest(params):
         'Spot P&L': 'first',
         'CE P&L': 'sum',      # Sum CE P&L across all legs
         'PE P&L': 'sum',      # Sum PE P&L across all legs
+        'FUT P&L': 'sum',     # Sum Future P&L across all legs
         'Net P&L': 'sum',    # Sum P&L across all legs
         'Exit Reason': 'first'
     }).reset_index()
     
     # Calculate Trade-level % P&L = Total Points P&L / Entry Spot * 100
+    trades_aggregated['Net P&L'] = (
+        trades_aggregated['CE P&L'] +
+        trades_aggregated['PE P&L'] +
+        trades_aggregated['FUT P&L']
+    )
     trades_aggregated['% P&L'] = (
         (trades_aggregated['Net P&L'] / trades_aggregated['Entry Spot'].replace(0, float('nan'))) * 100
     ).round(2).fillna(0)

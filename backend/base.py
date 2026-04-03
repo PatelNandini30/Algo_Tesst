@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Optional, Dict, Any
 from database import ALLOW_CSV_FALLBACK, get_data_source, engine as db_engine, DATA_DIR
 from repositories.market_data_repository import MarketDataRepository
+from services.data_loader import get_loader
 
 # Date formatting utility
 def fmt_ddmmyyyy(date_obj) -> str:
@@ -2047,12 +2048,159 @@ def _load_date_data_on_demand(date_str: str, index: str):
         pass  # Silently fail - will use fallback
 
 
-def get_future_price_from_db(date, index, expiry, db_path='bhavcopy_data.db'):
+def _resolve_nearest_future_expiry(index: str, date) -> Optional[str]:
+    try:
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        loader = get_loader()
+        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
+        if futures_df is None or futures_df.is_empty():
+            return None
+        date_ts = pd.Timestamp(date_str)
+        filtered = futures_df.filter(
+            pl.col("expiry_date") >= pl.lit(date_ts)
+        )
+        target_df = filtered if not filtered.is_empty() else futures_df
+        if target_df.is_empty():
+            return None
+        expiry_raw = target_df["expiry_date"][0]
+        expiry_ts = pd.Timestamp(expiry_raw)
+        return expiry_ts.strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _resolve_nearest_future_expiry_after(index: str, date, min_expiry_after) -> Optional[str]:
+    try:
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        min_expiry_ts = pd.Timestamp(min_expiry_after)
+        loader = get_loader()
+        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
+        if futures_df is None or futures_df.is_empty():
+            return None
+        filtered = futures_df.filter(
+            pl.col("expiry_date") > pl.lit(min_expiry_ts)
+        )
+        if filtered.is_empty():
+            return None
+        expiry_raw = filtered["expiry_date"][0]
+        expiry_ts = pd.Timestamp(expiry_raw)
+        return expiry_ts.strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def _resolve_futures_expiry_by_preference(index: str, date, preference='monthly') -> Optional[str]:
+    try:
+        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        loader = get_loader()
+        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
+        if futures_df is None or futures_df.is_empty():
+            return None
+
+        date_ts = pd.Timestamp(date_str)
+        filtered = futures_df.filter(
+            pl.col("expiry_date") >= pl.lit(date_ts)
+        )
+        if filtered.is_empty():
+            filtered = futures_df
+        if filtered.is_empty():
+            return None
+
+        if preference == 'next_monthly' and len(filtered) >= 2:
+            expiry_raw = filtered["expiry_date"][1]
+        else:
+            expiry_raw = filtered["expiry_date"][0]
+
+        expiry_ts = pd.Timestamp(expiry_raw)
+        return expiry_ts.strftime('%Y-%m-%d')
+    except Exception:
+        return None
+
+
+def resolve_futures_pnl_with_rollover(entry_date, exit_date, index, position, preference='monthly'):
+    """
+    Resolve futures entry/exit prices handling contract rollover at monthly expiry.
+
+    When a monthly futures contract expires DURING the holding period
+    (entry_date < futures_expiry < exit_date), this function:
+      1. Exits the entry contract at its expiry day close price
+      2. Enters the next-month contract at that same day's close price
+      3. Continues tracking the next-month contract through exit_date
+
+    Returns:
+        tuple: (entry_price, exit_price, final_futures_expiry_str)
+    """
+    entry_date_ts = pd.Timestamp(entry_date)
+    exit_date_ts = pd.Timestamp(exit_date)
+
+    entry_expiry_str = _resolve_futures_expiry_by_preference(index, entry_date_ts, preference)
+    if not entry_expiry_str:
+        return None, None, None
+
+    entry_price = get_future_price_from_db(entry_date_ts.strftime('%Y-%m-%d'), index, expiry=entry_expiry_str)
+    if entry_price is None:
+        return None, None, None
+
+    entry_expiry_ts = pd.Timestamp(entry_expiry_str)
+
+    if entry_expiry_ts >= exit_date_ts:
+        exit_price = get_future_price_from_db(exit_date_ts.strftime('%Y-%m-%d'), index, expiry=entry_expiry_str)
+        if exit_price is None:
+            exit_price = entry_price
+        return entry_price, exit_price, entry_expiry_str
+
+    roll_date_ts = entry_expiry_ts
+    roll_price_old = get_future_price_from_db(roll_date_ts.strftime('%Y-%m-%d'), index, expiry=entry_expiry_str)
+    if roll_price_old is None:
+        roll_price_old = get_future_price_from_db(
+            (roll_date_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d'),
+            index,
+            expiry=entry_expiry_str
+        )
+    if roll_price_old is None:
+        roll_price_old = entry_price
+
+    next_expiry_str = _resolve_nearest_future_expiry_after(
+        index=index,
+        date=roll_date_ts,
+        min_expiry_after=entry_expiry_ts
+    )
+
+    if not next_expiry_str:
+        return entry_price, roll_price_old, entry_expiry_str
+
+    next_expiry_ts = pd.Timestamp(next_expiry_str)
+
+    roll_price_new = get_future_price_from_db(roll_date_ts.strftime('%Y-%m-%d'), index, expiry=next_expiry_str)
+    if roll_price_new is None:
+        roll_price_new = roll_price_old
+
+    if next_expiry_ts >= exit_date_ts:
+        exit_price = get_future_price_from_db(exit_date_ts.strftime('%Y-%m-%d'), index, expiry=next_expiry_str)
+        if exit_price is None:
+            exit_price = roll_price_new
+        return entry_price, exit_price, next_expiry_str
+
+    final_expiry_str = _resolve_nearest_future_expiry(index, exit_date_ts)
+    if not final_expiry_str:
+        return entry_price, roll_price_new, next_expiry_str
+
+    exit_price = get_future_price_from_db(exit_date_ts.strftime('%Y-%m-%d'), index, expiry=final_expiry_str)
+    if exit_price is None:
+        exit_price = roll_price_new
+
+    return entry_price, exit_price, final_expiry_str
+
+def get_future_price_from_db(date, index, expiry=None, db_path='bhavcopy_data.db'):
     """
     HIGH-PERFORMANCE: O(1) lookup with on-demand loading.
     """
     try:
         date_str   = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        if expiry is None:
+            expiry = _resolve_nearest_future_expiry(index, date_str)
+            if expiry is None:
+                return None
         expiry_ts  = pd.Timestamp(expiry)
         expiry_str = expiry_ts.strftime('%Y-%m-%d')
 
@@ -2087,6 +2235,21 @@ def get_future_price_from_db(date, index, expiry, db_path='bhavcopy_data.db'):
         result = lookup.get((expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
         if result is not None:
             return result
+
+        # Final fallback: use data_loader directly (handles Redis cache, on-demand DB queries)
+        from services.data_loader import get_loader
+        loader = get_loader()
+        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
+        if futures_df is not None and not futures_df.is_empty():
+            date_ts = pd.Timestamp(date_str)
+            filtered = futures_df.filter(pl.col("expiry_date") >= date_ts)
+            target_df = filtered if not filtered.is_empty() else futures_df
+            if not target_df.is_empty():
+                for row in target_df.iter_rows():
+                    exp = row[0]  # expiry_date is first column
+                    exp_str = exp.strftime('%Y-%m-%d') if hasattr(exp, 'strftime') else str(exp)[:10]
+                    if exp_str == expiry_str or (pd.Timestamp(exp_str) - expiry_ts).days in (-1, 0, 1):
+                        return float(row[1])  # close is second column
 
         return None
 

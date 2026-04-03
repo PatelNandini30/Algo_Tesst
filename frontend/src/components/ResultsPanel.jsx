@@ -128,9 +128,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     
     // Add CE P&L only if calls exist
     if (hasCalls) keyOrder.push('CE P&L');
-    
+
     // Add PE P&L only if puts exist
     if (hasPuts) keyOrder.push('PE P&L');
+    if (hasFutures) keyOrder.push('FUT P&L');
     
     // Add Expiry column (always show)
     keyOrder = [...keyOrder, 'Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Exit Reason', 'Expiry'];
@@ -142,6 +143,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const conditionalExclude = new Set();
     if (!hasCalls) conditionalExclude.add('CE P&L');
     if (!hasPuts) conditionalExclude.add('PE P&L');
+    if (!hasFutures) conditionalExclude.add('FUT P&L');
     if (!hasStrSegment) conditionalExclude.add('STR Segment');
     
     // Reorder columns - only include columns that should be shown

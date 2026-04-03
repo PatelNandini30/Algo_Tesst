@@ -253,22 +253,30 @@ const SegBtn = ({ options, value, onChange, size = 'md' }) => {
   
   return (
     <div className="inline-flex rounded border border-gray-300 overflow-hidden">
-      {options.map((opt, i) => (
-        <button
-          key={opt.value}
-          type="button"
-          onClick={() => onChange(opt.value)}
-          className={`${sizeClasses} font-medium transition-colors ${
-            i < options.length - 1 ? 'border-r border-gray-300' : ''
-          } ${
-            value === opt.value
-              ? 'bg-blue-600 text-white border-blue-600'
-              : 'bg-white text-gray-700 hover:bg-gray-50'
-          }`}
-        >
-          {opt.label}
-        </button>
-      ))}
+      {options.map((opt, i) => {
+        const disabled = Boolean(opt.disabled);
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            onClick={() => {
+              if (disabled) return;
+              onChange(opt.value);
+            }}
+            className={`${sizeClasses} font-medium transition-colors ${
+              i < options.length - 1 ? 'border-r border-gray-300' : ''
+            } ${
+              disabled
+                ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                : value === opt.value
+                  ? 'bg-blue-600 text-white border-blue-600'
+                  : 'bg-white text-gray-700 hover:bg-gray-50'
+            }`}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
     </div>
   );
 };
@@ -289,6 +297,20 @@ const StrategyBuilder = () => {
   const [trailSLBreakeven, setTrailSLBreakeven] = useState(false);
   const [trailSLTarget, setTrailSLTarget] = useState('all_legs');
   const [legs, setLegs] = useState([]);
+
+  const hasFuturesLeg = useMemo(
+    () => legs.some(l => l.segment === 'futures'),
+    [legs]
+  );
+  const handleUnderlyingChange = useCallback(
+    (value) => {
+      if (value === 'cash' && hasFuturesLeg) {
+        return;
+      }
+      setUnderlying(value);
+    },
+    [hasFuturesLeg, setUnderlying]
+  );
 
   const [spotAdjustmentEnabled, setSpotAdjustmentEnabled] = useState(false);
   const [spotAdjustmentDirection, setSpotAdjustmentDirection] = useState('rise');
@@ -631,13 +653,13 @@ const StrategyBuilder = () => {
 
   // Validate expiry mismatch
   const validateExpiry = () => {
-    if (expiryBasis === 'monthly') {
-      const weeklyLegs = legs.filter(l => l.expiry === 'weekly');
-      if (weeklyLegs.length > 0) {
-        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
-        setValidationError(`Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`);
-        return false;
-      }
+  if (expiryBasis === 'monthly') {
+    const weeklyLegs = legs.filter(l => l.segment !== 'futures' && l.expiry === 'weekly');
+    if (weeklyLegs.length > 0) {
+      const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
+      setValidationError(`Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`);
+      return false;
+    }
     }
     setValidationError(null);
     return true;
@@ -659,6 +681,9 @@ const StrategyBuilder = () => {
       straddle_multiplier: draftLeg.straddle_multiplier ?? 0.5,
       straddle_direction: draftLeg.straddle_direction ?? '+',
     }]);
+    if (draftLeg.segment === 'futures') {
+      setUnderlying('futures');
+    }
     setDraftLeg(prev => ({
       ...prev,
       strike_type: 'atm',
@@ -676,23 +701,30 @@ const StrategyBuilder = () => {
 
   const buildPayload = () => {
     const legsPayload = legs.map(l => {
+      const segmentType = (l.segment || '').toLowerCase();
       const leg = {
-        segment: l.segment.toUpperCase(),
+        segment: segmentType.toUpperCase(),
         position: l.position.toUpperCase(),
         lots: l.lot || 1,
-        option_type: l.option_type.toUpperCase(),
-        expiry: l.expiry.toUpperCase(),
-        strike_selection: {
+      };
+
+      if (segmentType === 'options') {
+        leg.option_type = l.option_type.toUpperCase();
+        leg.expiry = l.expiry.toUpperCase();
+        leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
           strike_type: l.strike_type.toUpperCase(),
           premium: l.premium_value,
           lower: l.premium_min,
           upper: l.premium_max,
-        },
-      };
-      if (l.strike_criteria === 'straddle_width') {
-        leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
-        leg.straddle_direction = l.straddle_direction ?? '+';
+        };
+        if (l.strike_criteria === 'straddle_width') {
+          leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
+          leg.straddle_direction = l.straddle_direction ?? '+';
+        }
+      }
+      if (segmentType === 'futures') {
+        leg.expiry = (l.expiry || 'monthly').toLowerCase();
       }
 
       // Target Profit - only send if enabled AND value is set
@@ -800,7 +832,7 @@ const StrategyBuilder = () => {
     }
     
     if (expiryBasis === 'monthly') {
-      const weeklyLegs = legs.filter(l => l.expiry === 'weekly');
+      const weeklyLegs = legs.filter(l => l.segment !== 'futures' && l.expiry === 'weekly');
       if (weeklyLegs.length > 0) {
         const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
         const msg = `Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`;
@@ -918,9 +950,12 @@ const StrategyBuilder = () => {
                 <div>
                   <label className="block text-xs font-medium text-gray-600 mb-2">Underlying</label>
                   <SegBtn
-                    options={[{ value: 'cash', label: 'Cash' }, { value: 'futures', label: 'Futures' }]}
+                    options={[
+                      { value: 'cash', label: 'Cash', disabled: hasFuturesLeg },
+                      { value: 'futures', label: 'Futures' },
+                    ]}
                     value={underlying}
-                    onChange={setUnderlying}
+                    onChange={handleUnderlyingChange}
                   />
                 </div>
 
@@ -1222,7 +1257,11 @@ const StrategyBuilder = () => {
                   <SegBtn
                     options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }]}
                     value={draftLeg.segment}
-                    onChange={v => setDraftLeg(prev => ({ ...prev, segment: v }))}
+                    onChange={v => setDraftLeg(prev => ({
+                      ...prev,
+                      segment: v,
+                      expiry: v === 'futures' ? 'monthly' : prev.expiry,
+                    }))}
                   />
                 </div>
 
@@ -1395,7 +1434,14 @@ const StrategyBuilder = () => {
                             <label className="block text-xs text-gray-500 mb-1">Segment</label>
                             <SegBtn size="sm"
                               options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
-                              value={leg.segment} onChange={v => updateLeg(leg.id, 'segment', v)} />
+                              value={leg.segment}
+                              onChange={v => {
+                                updateLeg(leg.id, 'segment', v);
+                                if (v === 'futures' && leg.expiry === 'weekly') {
+                                  updateLeg(leg.id, 'expiry', 'monthly');
+                                }
+                              }}
+                            />
                           </div>
                           <div>
                             <label className="block text-xs text-gray-500 mb-1">Lots</label>
