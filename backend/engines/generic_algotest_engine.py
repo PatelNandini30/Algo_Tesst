@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 import sys
 import os
 import time
+import traceback
 
 
 def get_lot_size(index, entry_date):
@@ -2538,14 +2539,24 @@ def run_algotest_backtest(params):
                                 break
 
             except Exception as e:
-
-                # print(f"  ERROR: {str(e)}\n")
+                print(f"  ERROR: {str(e)}")
+                traceback.print_exc()
                 continue
+    
+    print(f"[DEBUG] After main loop: all_trades has {len(all_trades)} items")
+    if all_trades:
+        print(f"[DEBUG] Sample trade: entry_date={all_trades[0].get('entry_date')}, legs={len(all_trades[0].get('legs', []))}")
+    
     # ========== STEP 11: CONVERT TO DATAFRAME ==========
     # Filter out trades with no legs (skipped due to missing option data)
     all_trades = [t for t in all_trades if t.get('legs')]
+    _log(f"[DEBUG] all_trades after filtering: {len(all_trades)}")
+    if all_trades:
+        _log(f"[DEBUG] First trade keys: {list(all_trades[0].keys())}")
+        _log(f"[DEBUG] First trade legs: {all_trades[0].get('legs')}")
     
     if not all_trades:
+        _log("[DEBUG] all_trades is empty after filtering!")
         return pd.DataFrame(), {}, {}
     
     # Pre-fetch exit spot prices to avoid repeated DB calls
@@ -2567,6 +2578,7 @@ def run_algotest_backtest(params):
     trades_flat = []
     trade_counter = 0
     flatten_errors = []
+    _log(f"[DEBUG] Starting flatten loop for {len(all_trades)} trades")
     for trade_idx, trade in enumerate(all_trades, 1):
         entry_spot_val = trade['entry_spot']
         per_leg_res    = trade.get('per_leg_results')  # None if no SL/Target configured
@@ -2596,6 +2608,8 @@ def run_algotest_backtest(params):
 
                 # ── Check if trade has any options legs (for Spot columns visibility) ─
                 has_options_leg = any(l.get('segment') != 'FUTURE' for l in trade['legs'])
+                has_fut_leg = any(l.get('segment') == 'FUTURE' for l in trade['legs'])
+                _log(f"[DEBUG] Trade {trade_idx}: has_fut_leg={has_fut_leg}, leg segment={leg.get('segment')}")
 
                 # ── Entry / Exit price (premium for options, price for futures) ────
                 if leg['segment'] == 'FUTURE':
@@ -2604,7 +2618,12 @@ def run_algotest_backtest(params):
                     strike      = ''
                     entry_price = leg.get('entry_price', 0)
                     exit_price  = leg.get('exit_price', 0)
-                    leg_pnl     = leg.get('pnl', leg.get('total_pnl', 0))
+                    fut_entry_price = entry_price
+                    fut_exit_price = exit_price
+                    leg_pnl     = leg.get('pnl')
+                    if leg_pnl is None:
+                        direction = -1 if position == 'BUY' else 1
+                        leg_pnl = direction * (entry_price - exit_price)
                     ce_pnl_val  = 0
                     pe_pnl_val  = 0
                     fut_pnl_val = leg_pnl
@@ -2614,6 +2633,8 @@ def run_algotest_backtest(params):
                     strike      = leg['strike']
                     entry_price = leg['entry_premium']
                     exit_price  = leg.get('exit_premium', 0)
+                    fut_entry_price = ''
+                    fut_exit_price = ''
                     leg_pnl     = leg['pnl']
                     # CE P&L and PE P&L in points (no quantity)
                     ce_pnl_val  = leg.get('ce_pnl', 0)
@@ -2662,15 +2683,17 @@ def run_algotest_backtest(params):
                     'Index':        trade_idx,
                     'Entry Date':   trade['entry_date'],
                     'Exit Date':    leg_exit_date,
-                    'Type':         leg_option_type,
-                    'Strike':       strike,
-                    'B/S':          position,
-                    'Qty':          qty,
-                    'Entry Price':  entry_price,
-                    'Exit Price':   exit_price,
-                    'Entry Spot':   entry_spot_val if show_spot_cols else '',
-                    'Exit Spot':    leg_exit_spot if show_spot_cols else '',
-                    'Spot P&L':     round(leg_exit_spot - entry_spot_val, 2) if show_spot_cols and leg_exit_spot and entry_spot_val else '',
+                'Type':         leg_option_type,
+                'Strike':       strike,
+                'B/S':          position,
+                'Qty':          qty,
+                'Entry Price':  entry_price,
+                'Exit Price':   exit_price,
+                'Entry Spot':   entry_spot_val if entry_spot_val is not None else np.nan,
+                'Exit Spot':    leg_exit_spot if leg_exit_spot is not None else np.nan,
+                'Spot P&L':     (round(leg_exit_spot - entry_spot_val, 2)
+                                 if show_spot_cols and leg_exit_spot is not None and entry_spot_val is not None
+                                 else np.nan),
                     'Expiry':       (
                         leg.get('futures_expiry') 
                         if leg.get('segment') == 'FUTURE' 
@@ -2683,7 +2706,9 @@ def run_algotest_backtest(params):
                     'CE P&L':       ce_pnl_val,
                     'PE P&L':       pe_pnl_val,
                     'FUT P&L':      fut_pnl_val,
-                    'Net P&L':      net_pnl_rupees,
+                    'FUT Entry Price': fut_entry_price if leg.get('segment') == 'FUTURE' else '',
+                    'FUT Exit Price': fut_exit_price if leg.get('segment') == 'FUTURE' else '',
+                    'Net P&L':      net_pnl_points,
                     '% P&L':        pct_pnl,
                     'Cumulative':   trade_cumulative_index,
                     'Peak':         trade_peak_index,
@@ -2692,20 +2717,29 @@ def run_algotest_backtest(params):
                     'Exit Reason':  leg_exit_reason,
                 }
                 row[segment_column_name] = trade.get('str_segment', '')
+                if leg.get('segment') == 'FUTURE':
+                    _log(f"[DEBUG] Adding FUT columns: segment={leg.get('segment')}, entry={fut_entry_price}, exit={fut_exit_price}")
 
                 trades_flat.append(row)
             except Exception as e:
                 flatten_errors.append(f"Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
+                print(f"[DEBUG] ERROR in flatten: Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
                 continue
 
         trade_counter += len(trade['legs'])
     
     t_loop_elapsed = time.perf_counter() - t_loop
     t_agg = time.perf_counter()
+    
+    print(f"[DEBUG] flatten: {len(all_trades)} trades, {len(trades_flat)} rows, errors: {flatten_errors}")
+    if not trades_flat:
+        print(f"[DEBUG] trades_flat is empty! all_trades had {len(all_trades)} items")
     trades_df = pd.DataFrame(trades_flat)
+    print(f"[DEBUG] trades_df created: {len(trades_df)} rows, cols: {list(trades_df.columns)[:10]}")
     
     # ========== AGGREGATE LEGS INTO TRADES FOR ANALYTICS ==========
     if trades_df.empty:
+        _log("[DEBUG] trades_df is empty after DataFrame creation!")
         return pd.DataFrame(), {}, {}
     
     # Group by Trade number and sum P&L to get one row per trade
@@ -2718,6 +2752,8 @@ def run_algotest_backtest(params):
         'CE P&L': 'sum',      # Sum CE P&L across all legs
         'PE P&L': 'sum',      # Sum PE P&L across all legs
         'FUT P&L': 'sum',     # Sum Future P&L across all legs
+        'FUT Entry Price': 'first',  # Keep futures entry price
+        'FUT Exit Price': 'first',    # Keep futures exit price
         'Net P&L': 'sum',    # Sum P&L across all legs
         'Exit Reason': 'first'
     }).reset_index()
@@ -2728,8 +2764,16 @@ def run_algotest_backtest(params):
         trades_aggregated['PE P&L'] +
         trades_aggregated['FUT P&L']
     )
+
+    spot_column = 'Entry Spot' if 'Entry Spot' in trades_aggregated else 'entry_spot'
+    numeric_cols = ['Spot P&L', 'CE P&L', 'PE P&L', 'FUT P&L', 'FUT Entry Price', 'FUT Exit Price', spot_column, 'Exit Spot', 'Net P&L']
+    for col in numeric_cols:
+        if col in trades_aggregated.columns:
+            trades_aggregated[col] = pd.to_numeric(trades_aggregated[col], errors='coerce')
+
+    spot_series = trades_aggregated[spot_column]
     trades_aggregated['% P&L'] = (
-        (trades_aggregated['Net P&L'] / trades_aggregated['Entry Spot'].replace(0, float('nan'))) * 100
+        (trades_aggregated['Net P&L'] / spot_series.replace(0, float('nan'))) * 100
     ).round(2).fillna(0)
     
     # ========== STEP 12: COMPUTE ANALYTICS (ADDS CUMULATIVE, PEAK, DD, %DD) ==========
@@ -2774,3 +2818,5 @@ def run_algotest_backtest(params):
               f"TOTAL={t_total:.2f}s")
     
     return trades_df, summary, pivot
+
+# Add debug at the very end

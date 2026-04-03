@@ -707,6 +707,15 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     # Sort by entry date to guarantee chronological order
     df = df.sort_values(entry_date_col).reset_index(drop=True)
 
+    spot_cols = ['Entry Spot', 'Exit Spot', 'Spot P&L']
+    for col in spot_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].replace('', np.nan), errors='coerce')
+
+    entry_spot_series = df['Entry Spot'] if 'Entry Spot' in df.columns else pd.Series(np.nan, index=df.index)
+    entry_spot_nonzero = entry_spot_series.replace(0, np.nan)
+    initial_entry_spot = entry_spot_series.iloc[0] if not entry_spot_series.empty else np.nan
+
     # ── Check if Series B (compound index) already exists ────────────────────────
     # If Cumulative already exists and starts around 100, preserve it (Series B)
     has_series_b = (
@@ -715,7 +724,6 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         pd.notna(df['Cumulative'].iloc[0]) and 
         90 <= df['Cumulative'].iloc[0] <= 110
     )
-    
     if has_series_b:
         # Preserve Series B - compound index starting at ~100
         pass  # Keep existing Cumulative, Peak, DD, %DD values
@@ -724,7 +732,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         # Cumulative = Entry Spot of Trade 1 + Net P&L of Trade 1
         # Trade N: Cumulative = Cumulative of Trade (N-1) + Net P&L of Trade N
         # Using Entry Spot as initial capital reference (points-based)
-        first_entry_spot = df['Entry Spot'].iloc[0] if 'Entry Spot' in df.columns and len(df) > 0 else 0
+        first_entry_spot = initial_entry_spot if pd.notna(initial_entry_spot) else 0
         df['Cumulative'] = first_entry_spot + df[pnl_col].cumsum()
     
     # ── Calculate Series B: Compound Return Index (always, from Net P&L %) ─────
@@ -732,7 +740,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     cumulative_index = 100.0
     peak_index = 100.0
     
-    net_pnl_pct = (df[pnl_col] / df['Entry Spot'].replace(0, np.nan)) * 100
+    net_pnl_pct = (df[pnl_col] / entry_spot_nonzero) * 100
     
     cumulative_series = []
     peak_series = []
@@ -835,7 +843,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     n_years    = max((end_date - start_date).days / 365.0, 0.01)
 
     # Use Entry Spot of first trade as Initial Capital
-    initial_capital = float(df.iloc[0]['Entry Spot'])
+    initial_capital = float(initial_entry_spot) if pd.notna(initial_entry_spot) else 0.0
     final_capital = initial_capital + total_pnl
 
     # Calculate CAGR
@@ -884,13 +892,19 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     recovery_factor = round(total_pnl / abs(max_dd_pts), 2) if max_dd_pts != 0 else 0
 
     # ── SPOT COMPARISON METRICS ─────────────────────────────────────────────────
-    spot_chg = round(df['Spot P&L'].sum(), 2) if 'Spot P&L' in df.columns else 0
+    if 'Spot P&L' in df.columns:
+        spot_series_safe = pd.to_numeric(df['Spot P&L'].replace('', np.nan), errors='coerce')
+        spot_chg = round(spot_series_safe.sum(skipna=True), 2)
+    else:
+        spot_chg = 0
 
     # CAGR(Spot) - if just held the index (Buy & Hold)
     # CAGR = ((Final Spot / Initial Spot) ^ (1/Years) - 1) * 100
     if 'Entry Spot' in df.columns and 'Exit Spot' in df.columns:
-        initial_spot = float(df.iloc[0]['Entry Spot'])
-        final_spot = float(df.iloc[-1]['Exit Spot'])
+        initial_spot_val = df.iloc[0]['Entry Spot']
+        final_spot_val = df.iloc[-1]['Exit Spot']
+        initial_spot = float(initial_spot_val) if pd.notna(initial_spot_val) else 0.0
+        final_spot = float(final_spot_val) if pd.notna(final_spot_val) else 0.0
         if n_years > 0 and initial_spot > 0 and final_spot > 0:
             cagr_spot = round(100 * ((final_spot / initial_spot) ** (1.0 / n_years) - 1), 2)
         else:
