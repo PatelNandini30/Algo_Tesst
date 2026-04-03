@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { 
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer 
@@ -8,6 +8,13 @@ import { Download, X } from 'lucide-react';
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
 
+  useEffect(() => {
+    console.log('[ResultsPanel] mounted (single instance check)');
+    return () => {
+      console.log('[ResultsPanel] unmounted');
+    };
+  }, []);
+  
   console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
   const { trades = [], summary = {}, pivot = {} } = results;
   const [currentPage, setCurrentPage] = useState(1);
@@ -113,76 +120,65 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   // Export CSV
   const exportToCSV = () => {
     if (!trades || trades.length === 0) return;
-    
-    // Check what columns are needed based on data
-    const hasCalls = trades.some(t => (t['Type'] || '').toLowerCase() === 'call');
-    const hasPuts = trades.some(t => (t['Type'] || '').toLowerCase() === 'put');
-    const hasStrSegment = showStrSegment && trades.some(t => t['STR Segment'] && t['STR Segment'] !== '');
-    const hasFutures = trades.some(t => (t['Type'] || '').toLowerCase() === 'fut');
-    
-    // Build dynamic key order based on what data exists
-    let keyOrder = [
-      'Trade', 'Leg', 'Index', 'Entry Date', 'Exit Date', 'Entry Spot', 'Exit Spot', 'Spot P&L',
-      'Type', 'Strike', 'B/S', 'Qty', 'Entry Price', 'Exit Price'
-    ];
-    
-    // Add CE P&L only if calls exist
-    if (hasCalls) keyOrder.push('CE P&L');
 
-    // Add PE P&L only if puts exist
-    if (hasPuts) keyOrder.push('PE P&L');
-    if (hasFutures) {
-      keyOrder.push('FUT P&L');
-      keyOrder.push('FUT Entry Price');
-      keyOrder.push('FUT Exit Price');
-    }
-    
-    // Add Expiry column (always show)
-    keyOrder = [...keyOrder, 'Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Exit Reason', 'Expiry'];
-    
-    // Add STR Segment only if STR filter was enabled AND has non-empty values
-    if (hasStrSegment) keyOrder.push('STR Segment');
-    
-    // Create a set of columns to exclude if not needed
-    const conditionalExclude = new Set();
-    if (!hasCalls) conditionalExclude.add('CE P&L');
-    if (!hasPuts) conditionalExclude.add('PE P&L');
-    if (!hasFutures) {
-      conditionalExclude.add('FUT P&L');
-      conditionalExclude.add('FUT Entry Price');
-      conditionalExclude.add('FUT Exit Price');
-    }
-    if (!hasStrSegment) conditionalExclude.add('STR Segment');
-    
-    // Reorder columns - only include columns that should be shown
+    const hasCalls = trades.some(t => (t['Type'] || '').toUpperCase() === 'CALL');
+    const hasPuts = trades.some(t => (t['Type'] || '').toUpperCase() === 'PUT');
+    const hasFutures = trades.some(t => (t['Type'] || '').toUpperCase() === 'FUT');
+    const hasStrSegment = showStrSegment &&
+      trades.some(t => t['STR Segment'] && t['STR Segment'] !== '');
+
+    const keyOrder = [
+      'Trade', 'Leg', 'Index',
+      'Entry Date', 'Exit Date',
+      'Entry Spot', 'Exit Spot', 'Spot P&L',
+      'Type', 'Strike', 'B/S', 'Qty',
+      'Entry Price', 'Exit Price',
+      ...(hasFutures ? ['FUT Entry Price', 'FUT Exit Price'] : []),
+      ...(hasCalls ? ['CE P&L'] : []),
+      ...(hasPuts ? ['PE P&L'] : []),
+      ...(hasFutures ? ['FUT P&L'] : []),
+      'Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Exit Reason', 'Expiry',
+      ...(hasStrSegment ? ['STR Segment'] : [])
+    ];
+
     const cleanedTrades = trades.map(trade => {
-      const reordered = {};
-      // First add columns in our key order
+      const row = {};
       for (const key of keyOrder) {
-        if (trade.hasOwnProperty(key) && !conditionalExclude.has(key)) {
-          reordered[key] = trade[key];
+        let val = trade[key];
+        if (
+          val === null ||
+          val === undefined ||
+          (typeof val === 'number' && isNaN(val)) ||
+          val === 'NaN'
+        ) {
+          val = '';
         }
+        row[key] = val;
       }
-      return reordered;
+      return row;
     });
-    
+
     const headers = Object.keys(cleanedTrades[0]).join(',');
-    const rows = cleanedTrades.map(trade => 
+    const rows = cleanedTrades.map(trade =>
       Object.values(trade).map(val => {
-        // Handle numeric values - round to 2 decimal places to avoid floating point errors
         if (typeof val === 'number' && !Number.isInteger(val)) {
           return Math.round(val * 100) / 100;
         }
-        return typeof val === 'string' && val.includes(',') ? `"${val}"` : val;
+        if (typeof val === 'string' && (val.includes(',') || val.includes('"'))) {
+          return `"${val.replace(/"/g, '""')}"`;
+        }
+        return val;
       }).join(',')
     );
     const csv = [headers, ...rows].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `backtest_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
   };
 
@@ -239,9 +235,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   };
 
   return (
-    <div className={showCloseButton ? "fixed inset-0 bg-black bg-opacity-60 z-50 overflow-y-auto" : ""}>
-      <div className={showCloseButton ? "min-h-screen px-4 py-6" : ""}>
-        <div className={showCloseButton ? "max-w-[1400px] mx-auto bg-white rounded-xl shadow-2xl" : "bg-white rounded-xl shadow-md"}>
+    <div className={showCloseButton 
+      ? "fixed inset-0 bg-black bg-opacity-60 z-50"
+      : "relative w-full"
+    }>
+      <div className="h-full overflow-y-auto">
+        <div
+          className={`${showCloseButton ? "max-w-[1400px] mx-auto min-h-screen px-4 py-6" : "w-full mx-auto"} bg-white rounded-xl shadow-2xl`}
+        >
           {/* Header */}
           <div className="flex justify-between items-center px-6 py-5 border-b border-gray-200">
           <div>
@@ -317,6 +318,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             {/* Equity Curve */}
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <h3 className="text-base font-bold text-gray-800 mb-4">Equity Curve (Cumulative P&L)</h3>
+              <div style={{ position: 'relative', zIndex: 0 }}>
               <ResponsiveContainer width="100%" height={300}>
                 <AreaChart data={equityData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
@@ -349,14 +351,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     strokeWidth={2}
                     fill="url(#colorEquity)" 
                     name="Cumulative P&L"
+                    isAnimationActive={false}
                   />
                 </AreaChart>
               </ResponsiveContainer>
+              </div>
             </div>
 
             {/* Drawdown */}
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <h3 className="text-base font-bold text-gray-800 mb-4">Drawdown</h3>
+              <div style={{ position: 'relative', zIndex: 0 }}>
               <ResponsiveContainer width="100%" height={260}>
                 <AreaChart data={drawdownData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
@@ -390,9 +395,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     strokeWidth={2}
                     fill="url(#colorDrawdown)" 
                     name="Drawdown"
+                    isAnimationActive={false}
                   />
                 </AreaChart>
               </ResponsiveContainer>
+              </div>
             </div>
 
             {/* Monthly Returns */}
@@ -566,23 +573,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       const actualTradeNum = (currentPage - 1) * itemsPerPage + groupIdx + 1;
                       
                       // Calculate totals for summary row
-                      const totalPointsPnl = group.legs.reduce((sum, leg) => {
-                        const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
-                        const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || 0;
-                        const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || 0;
-                        const pointsPnl = position.toLowerCase() === 'sell' ? entryPrice - exitPrice : exitPrice - entryPrice;
-                        return sum + pointsPnl;
-                      }, 0);
-                      
-                      const totalPnl = group.legs.reduce((sum, leg) => {
-                        const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
-                        const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || 65;
-                        const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || 0;
-                        const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || 0;
-                        const pointsPnl = position.toLowerCase() === 'sell' ? entryPrice - exitPrice : exitPrice - entryPrice;
-                        return sum + (pointsPnl * qty);
-                      }, 0);
-                      
                       return (
                         <React.Fragment key={group.tradeNumber}>
                           {/* Leg rows */}
@@ -595,14 +585,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
-                            
-                            const pointsPnl = position.toLowerCase() === 'sell' 
-                              ? entryPrice - exitPrice
-                              : exitPrice - entryPrice;
-                            
-                            const percentPnl = group.entrySpot !== 0 
-                              ? (pointsPnl / group.entrySpot) * 100
-                              : 0;
+                            const legNetPnlPoints = parseFloat(leg['Net P&L']) || 0;
+                            const legPercentPnl = parseFloat(leg['% P&L']) || 0;
                             
                             return (
                               <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-gray-200 ${groupIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
@@ -626,42 +610,35 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{qty}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{entryPrice.toFixed(2)}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{exitPrice.toFixed(2)}</td>
-                                <td className={`px-3 py-2 text-xs text-right ${pointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {pointsPnl >= 0 ? '+' : ''}{pointsPnl.toFixed(2)}
+                                <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                  {legNetPnlPoints >= 0 ? '+' : ''}{legNetPnlPoints.toFixed(2)}
                                 </td>
-                                <td className={`px-3 py-2 text-xs text-right ${percentPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {percentPnl.toFixed(2)}%
+                                <td className={`px-3 py-2 text-xs text-right ${legPercentPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                  {legPercentPnl >= 0 ? '+' : ''}{legPercentPnl.toFixed(2)}%
                                 </td>
                               </tr>
                             );
                           })}
                           
                           {/* Summary Row - Only show for multi-leg trades */}
-                          {group.legs.length > 1 && (
-                          <tr className="border-b-2 border-gray-300 bg-slate-50">
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className="px-3 py-2"></td>
-                            <td className={`px-3 py-2 text-right text-xs ${totalPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}
-                            </td>
-                            <td className={`px-3 py-2 text-right text-xs ${totalPointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {totalPointsPnl >= 0 ? '+' : ''}{totalPointsPnl.toFixed(2)}
-                            </td>
-                            <td className={`px-3 py-2 text-right text-xs ${totalPointsPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                              {group.entrySpot !== 0 ? ((totalPointsPnl / group.entrySpot) * 100).toFixed(2) + '%' : '0.00%'}
-                            </td>
-                          </tr>
-                          )}
+                          {group.legs.length > 1 && (() => {
+                            // Always compute aggregate values from legs instead of relying on first leg
+                            const tradeNetPnlPoints = group.legs.reduce((sum, leg) => {
+                              return sum + (parseFloat(leg['Net P&L']) || 0);
+                            }, 0);
+                            const tradePctPnl = parseFloat(group.legs[0]['% P&L']) || 0;
+                            return (
+                              <tr className="border-b-2 border-gray-300 bg-slate-100">
+                                <td colSpan={9}></td>
+                                <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                                  {tradeNetPnlPoints >= 0 ? '+' : ''}{tradeNetPnlPoints.toFixed(2)}
+                                </td>
+                                <td className={`px-3 py-2 text-right text-xs font-bold ${tradePctPnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                                  {tradePctPnl >= 0 ? '+' : ''}{tradePctPnl.toFixed(2)}%
+                                </td>
+                              </tr>
+                            );
+                          })()}
                         </React.Fragment>
                       );
                     })}

@@ -2633,8 +2633,8 @@ def run_algotest_backtest(params):
                     strike      = leg['strike']
                     entry_price = leg['entry_premium']
                     exit_price  = leg.get('exit_premium', 0)
-                    fut_entry_price = ''
-                    fut_exit_price = ''
+                    fut_entry_price = np.nan
+                    fut_exit_price = np.nan
                     leg_pnl     = leg['pnl']
                     # CE P&L and PE P&L in points (no quantity)
                     ce_pnl_val  = leg.get('ce_pnl', 0)
@@ -2656,9 +2656,11 @@ def run_algotest_backtest(params):
                 net_pnl_points = trade_net_pnl
                 
                 # % P&L = (Trade Net P&L / Trade Entry Spot) * 100
-                # Using entry_spot as base since that's what AlgoTest uses
-                pct_base = entry_spot_val if entry_spot_val else entry_price
-                pct_pnl = round((trade_net_pnl / pct_base) * 100, 2) if pct_base else 0
+                if pd.notna(entry_spot_val) and float(entry_spot_val) > 1000:
+                    pct_pnl = round((trade_net_pnl / float(entry_spot_val)) * 100, 2)
+                else:
+                    pct_pnl = 0.0
+                    _log(f"  WARNING: Invalid entry_spot_val={entry_spot_val} for Trade {trade_idx} — %P&L set to 0")
 
                 segment_meta = trade.get('segment') or {}
                 segment_type = segment_meta.get('type')
@@ -2752,8 +2754,8 @@ def run_algotest_backtest(params):
         'CE P&L': 'sum',      # Sum CE P&L across all legs
         'PE P&L': 'sum',      # Sum PE P&L across all legs
         'FUT P&L': 'sum',     # Sum Future P&L across all legs
-        'FUT Entry Price': 'first',  # Keep futures entry price
-        'FUT Exit Price': 'first',    # Keep futures exit price
+        'FUT Entry Price': lambda grp: next((v for v in grp if pd.notna(v) and v != ''), np.nan),
+        'FUT Exit Price': lambda grp: next((v for v in grp if pd.notna(v) and v != ''), np.nan),
         'Net P&L': 'sum',    # Sum P&L across all legs
         'Exit Reason': 'first'
     }).reset_index()

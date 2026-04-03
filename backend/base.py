@@ -741,6 +741,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     peak_index = 100.0
     
     net_pnl_pct = (df[pnl_col] / entry_spot_nonzero) * 100
+    net_pnl_pct_series = net_pnl_pct.copy()
     
     cumulative_series = []
     peak_series = []
@@ -853,8 +854,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         cagr = round(-100.0, 2)  # total wipeout
 
     # ── DRAWDOWN SUMMARY ─────────────────────────────────────────────────────
-    max_dd_pct = float(df['%DD'].max())                    # largest %DD (most positive since DD is now positive)
-    max_dd_pts = round(float(df['DD'].max()), 2)          # deepest rupee DD (max since DD is now positive)
+    max_dd_pct = float(df['%DD'].min())                    # most negative %DD
+    max_dd_pts = round(float(df['DD'].min()), 2)          # deepest rupee DD (most negative point drawdown)
 
     # Duration of overall max drawdown (calendar days from peak to trough)
     mdd_duration   = 0
@@ -862,8 +863,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     mdd_end_date   = None
     mdd_trade_number = None
 
-    if max_dd_pts > 0:
-        trough_idx  = df['DD'].idxmax()
+    if max_dd_pts < 0:
+        trough_idx  = df['DD'].idxmin()
         trough_date = pd.to_datetime(df.loc[trough_idx, exit_date_col])
         
         # Trade number where max drawdown occurred (1-indexed for display)
@@ -898,6 +899,18 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     else:
         spot_chg = 0
 
+    # Expectancy uses Net P&L % instead of raw points
+    wins_pct_series = net_pnl_pct_series[df[pnl_col] > 0]
+    losses_pct_series = net_pnl_pct_series[df[pnl_col] < 0]
+    avg_win_pct = float(wins_pct_series.mean()) if len(wins_pct_series) > 0 else 0.0
+    avg_loss_pct = float(losses_pct_series.mean()) if len(losses_pct_series) > 0 else 0.0
+    w_decimal = win_pct / 100.0
+    l_decimal = loss_pct / 100.0
+    if avg_loss_pct != 0:
+        expectancy = round((avg_win_pct / abs(avg_loss_pct)) * w_decimal - l_decimal, 4)
+    else:
+        expectancy = 0.0
+
     # CAGR(Spot) - if just held the index (Buy & Hold)
     # CAGR = ((Final Spot / Initial Spot) ^ (1/Years) - 1) * 100
     if 'Entry Spot' in df.columns and 'Exit Spot' in df.columns:
@@ -923,6 +936,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "max_loss":              max_loss,
         "avg_profit_per_trade":  avg_profit_per_trade,
         "expectancy":            expectancy,
+        "avg_win_pct":           round(avg_win_pct, 4),
+        "avg_loss_pct":          round(avg_loss_pct, 4),
         "reward_to_risk":        reward_to_risk,
         "profit_factor":         profit_factor,
         "cagr_options":          cagr,
