@@ -377,6 +377,7 @@ const StrategyBuilder = () => {
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
   const [validationError, setValidationError] = useState(null);
+  const [trailSLWarning, setTrailSLWarning] = useState(null);
   const jobPollRef = useRef(null);
   const [jobId, setJobId] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
@@ -841,11 +842,45 @@ const StrategyBuilder = () => {
       }
     }
 
+    const trailSLWarnings = legs.reduce((acc, leg, idx) => {
+      if (!leg.trail_sl_enabled) return acc;
+      const triggerVal = Number(leg.trail_sl_trigger);
+      const moveVal = Number(leg.trail_sl_move);
+      if (!Number.isFinite(triggerVal) || !Number.isFinite(moveVal)) return acc;
+      if (triggerVal > 0 && moveVal > 0 && triggerVal < moveVal) {
+        acc.push(`Leg ${idx + 1}`);
+      }
+      return acc;
+    }, []);
+    if (trailSLWarnings.length > 0) {
+      const warningLegs = trailSLWarnings.join(', ');
+      console.warn(`Trail SL X < Y on ${warningLegs}: results may differ from live.`);
+      setTrailSLWarning(`Trail SL: X < Y on ${warningLegs} — backtest may not match live trading.`);
+    } else {
+      setTrailSLWarning(null);
+    }
+
+    const tslWithoutSLLegs = legs.reduce((acc, leg, idx) => {
+      if (!leg.trail_sl_enabled) return acc;
+      const hasStopLoss = leg.stop_loss_enabled && Number(leg.stop_loss_value) > 0;
+      if (!hasStopLoss) {
+        acc.push(`Leg-${idx + 1}`);
+      }
+      return acc;
+    }, []);
+    const tslMissingSLMessage = tslWithoutSLLegs.length > 0
+      ? `Fix ${tslWithoutSLLegs.join(', ')}: Leg Stop Loss value should be set for Leg Trail SL`
+      : null;
+
     const payload = buildPayload();
     stopJobPolling();
     setLoading(true);
     setError(null);
     setResults(null);
+    if (tslMissingSLMessage) {
+      setError(tslMissingSLMessage);
+      setTimeout(() => setError(null), 3000);
+    }
     try {
       const res = await fetch('/api/algotest/jobs', {
         method: 'POST',
@@ -1408,6 +1443,18 @@ const StrategyBuilder = () => {
                   <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wide">Legs <span className="font-normal text-gray-400 ml-1">({legs.length}/6)</span></h3>
                 </div>
                 <div className="p-3 space-y-3">
+                  {trailSLWarning && (
+                    <div className="flex items-start gap-2 px-4 py-2 bg-yellow-50 border border-yellow-300 rounded-lg text-xs text-yellow-800 mb-2">
+                      <AlertTriangle size={14} className="text-yellow-600 mt-0.5 flex-shrink-0" />
+                      <span className="flex-1">{trailSLWarning}</span>
+                      <button
+                        onClick={() => setTrailSLWarning(null)}
+                        className="text-yellow-500 hover:text-yellow-700 font-bold ml-1"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )}
                   {legs.map((leg, idx) => (
                     <div key={leg.id} className="border border-gray-200 rounded-lg overflow-hidden">
                       <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 py-2 flex items-center justify-between border-b border-blue-200">

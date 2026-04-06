@@ -9,6 +9,7 @@ DEBUG = True
 _EARLY_EXIT_REASONS = {
     'STOP_LOSS',
     'TARGET',
+    'TRAIL_SL',
     'COMPLETE_STOP_LOSS',
     'COMPLETE_TARGET',
     'OVERALL_SL',
@@ -564,6 +565,45 @@ def _copy_sl_tgt_to_leg(leg_dict, leg_src):
         leg_dict['target_type'] = 'pct'
 
 
+def _copy_trail_sl_to_leg(leg_dict, leg_src):
+    """
+    Parse trailSL config from frontend payload into per-leg dict.
+
+    Frontend sends:
+        leg.trailSL = { mode: 'POINTS'|'PERCENT', trigger: X, move: Y }
+
+    Internal keys added to leg_dict:
+        trail_sl_enabled  : bool
+        trail_sl_mode     : 'points' | 'pct'
+        trail_sl_trigger  : float  (X — favorable move quantum)
+        trail_sl_move     : float  (Y — SL shift per trigger)
+    """
+    tsl = leg_src.get('trailSL') or leg_src.get('trail_sl') or {}
+
+    if isinstance(tsl, dict) and tsl:
+        raw_mode = str(tsl.get('mode', 'POINTS')).upper()
+        mode = 'pct' if raw_mode in ('PERCENT', 'PCT', '%') else 'points'
+        trigger = tsl.get('trigger') or tsl.get('x') or 0
+        move    = tsl.get('move')    or tsl.get('y') or 0
+
+        try:
+            trigger_val = float(trigger)
+            move_val = float(move)
+        except (TypeError, ValueError):
+            trigger_val = 0.0
+            move_val = 0.0
+
+        if trigger_val > 0 and move_val > 0:
+            leg_dict['trail_sl_enabled'] = True
+            leg_dict['trail_sl_mode']    = mode
+            leg_dict['trail_sl_trigger'] = trigger_val
+            leg_dict['trail_sl_move']    = move_val
+        else:
+            leg_dict['trail_sl_enabled'] = False
+    else:
+        leg_dict['trail_sl_enabled'] = False
+
+
 def _apply_overall_sl_to_per_leg(per_leg_results, overall_date, overall_reason, n_legs, scheduled_exit_date=None):
     """
     Override per_leg_results with overall SL/TGT date for any leg whose exit
@@ -579,7 +619,7 @@ def _apply_overall_sl_to_per_leg(per_leg_results, overall_date, overall_reason, 
         per_leg_results = [
             {'triggered': False,
              'exit_date': scheduled_exit_date,
-             'exit_reason': 'SCHEDULED'}
+             'exit_reason': 'EXPIRY'}
             for _ in range(n_legs)
         ]
     for i, r in enumerate(per_leg_results):
@@ -630,7 +670,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
     """
     # Quick exit: nothing to check
     has_any_sl_target = any(
-        (lg.get('stop_loss') is not None or lg.get('target') is not None)
+        (lg.get('stop_loss') is not None or lg.get('target') is not None or lg.get('trail_sl_enabled'))
         for lg in legs_config
     )
     if not has_any_sl_target:
@@ -651,10 +691,62 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
         {
             'triggered': False,
             'exit_date': exit_date,
-            'exit_reason': 'SCHEDULED',
+            'exit_reason': 'EXPIRY',
         }
         for _ in legs_config
     ]
+
+    tsl_state = {}
+    for li, leg in enumerate(legs_config):
+        if not leg.get('trail_sl_enabled'):
+            continue
+        segment = (leg.get('segment') or 'OPTION').upper()
+        entry_prem = leg.get('entry_price') if segment in ('FUTURES', 'FUTURE') else leg.get('entry_premium')
+        if entry_prem is None:
+            continue
+        position = (leg.get('position') or 'SELL').upper()
+        tsl_mode = str(leg.get('trail_sl_mode') or 'points').lower()
+        try:
+            X_raw = float(leg.get('trail_sl_trigger', 0))
+            Y_raw = float(leg.get('trail_sl_move', 0))
+        except (TypeError, ValueError):
+            continue
+        if X_raw <= 0 or Y_raw <= 0:
+            continue
+        if tsl_mode == 'pct':
+            base = abs(entry_prem)
+            if base <= 0:
+                continue
+            X_pts = base * (X_raw / 100.0)
+            Y_pts = base * (Y_raw / 100.0)
+        else:
+            X_pts = X_raw
+            Y_pts = Y_raw
+        if X_pts <= 0 or Y_pts <= 0:
+            continue
+        sl_val = leg.get('stop_loss')
+        sl_type = _normalize_sl_tgt_type(leg.get('stop_loss_type', 'pct'))
+        sl_pts = None
+        if sl_val is not None:
+            sl_abs = abs(sl_val)
+            if sl_type == 'pct':
+                base = abs(entry_prem)
+                if base:
+                    sl_pts = base * (sl_abs / 100.0)
+            elif sl_type == 'points':
+                sl_pts = sl_abs
+        if sl_pts is None:
+            sl_pts = X_pts
+        current_sl_level = (entry_prem + sl_pts) if position == 'SELL' else (entry_prem - sl_pts)
+        tsl_state[li] = {
+            'X_pts': X_pts,
+            'Y_pts': Y_pts,
+            'sl_pts': sl_pts,
+            'best_prem': entry_prem,
+            'current_sl_level': current_sl_level,
+            'triggers_fired': 0,
+            'entry_prem': entry_prem,
+        }
 
     for check_date in holding_days:
         all_triggered = all(r['triggered'] for r in leg_results)
@@ -673,8 +765,8 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             tgt_val  = leg.get('target')
             tgt_type = _normalize_sl_tgt_type(leg.get('target_type', 'pct'))
 
-            if sl_val is None and tgt_val is None:
-                continue  # No SL/Target for this leg
+            if sl_val is None and tgt_val is None and not leg.get('trail_sl_enabled'):
+                continue  # No SL/Target/Trail-SL for this leg
             
             position = leg['position']
             lot_size = leg.get('lot_size', get_lot_size(index, entry_date))
@@ -682,6 +774,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
 
             segment = leg.get('segment', 'OPTION')
             option_type = leg.get('option_type', 'CE')  # safe default for underlying_* checks
+            cp = None
 
             if segment in ('FUTURES', 'FUTURE'):
                 check_expiry = _resolve_nearest_future_expiry(index, check_date)
@@ -699,6 +792,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                 if entry_price is None:
                     continue
 
+                cp = current_price
                 # For FUTURES: premium_move = current - entry (positive = rose)
                 premium_move = current_price - entry_price
                 # Adverse move: SELL hurts when price rises; BUY hurts when price falls
@@ -725,6 +819,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                 if current_premium is None:
                     continue
 
+                cp = current_premium
                 entry_premium = leg.get('entry_premium')
                 if entry_premium is None:
                     continue
@@ -773,8 +868,9 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             # ── Evaluate STOP LOSS ────────────────────────────────────────────
             # SL fires when the position has moved ADVERSELY beyond the threshold.
             # All thresholds are stored as positive numbers.
+            skip_plain_sl = leg.get('trail_sl_enabled') and (li in tsl_state)
             hit_sl = False
-            if sl_val is not None:
+            if sl_val is not None and not skip_plain_sl:
                 sl_abs = abs(sl_val)
                 if sl_type == 'pct':
                     # e.g. sl=50 → exit when position is down 50% of entry premium
@@ -803,9 +899,46 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                 elif tgt_type == 'underlying_pct':
                     hit_tgt = (-adverse_spot_pct) >= tgt_abs
 
+            # ── Trail SL Evaluation ──────────────────────────────────────────
+            hit_tsl = False
+            if leg.get('trail_sl_enabled') and li in tsl_state and cp is not None:
+                ts = tsl_state[li]
+                X_pts = ts['X_pts']
+                Y_pts = ts['Y_pts']
+                entry_prem = ts['entry_prem']
+                if X_pts > 0 and Y_pts > 0:
+                    if position == 'SELL':
+                        if cp < ts['best_prem']:
+                            ts['best_prem'] = cp
+                        favorable_move = entry_prem - ts['best_prem']
+                        new_triggers = int(favorable_move / X_pts) if X_pts > 0 else 0
+                        if new_triggers > ts['triggers_fired']:
+                            delta_triggers = new_triggers - ts['triggers_fired']
+                            ts['triggers_fired'] = new_triggers
+                            ts['current_sl_level'] -= delta_triggers * Y_pts
+                            _log(f"    [TSL] Leg {li+1} SELL: favorable_move={favorable_move:.2f}, triggers={new_triggers}, new SL level={ts['current_sl_level']:.2f}")
+                        if cp >= ts['current_sl_level']:
+                            hit_tsl = True
+                            _log(f"    [TSL] Leg {li+1} SELL: FIRED. current={cp:.2f} >= SL={ts['current_sl_level']:.2f}")
+                    else:
+                        if cp > ts['best_prem']:
+                            ts['best_prem'] = cp
+                        favorable_move = ts['best_prem'] - entry_prem
+                        new_triggers = int(favorable_move / X_pts) if X_pts > 0 else 0
+                        if new_triggers > ts['triggers_fired']:
+                            delta_triggers = new_triggers - ts['triggers_fired']
+                            ts['triggers_fired'] = new_triggers
+                            ts['current_sl_level'] += delta_triggers * Y_pts
+                            _log(f"    [TSL] Leg {li+1} BUY: favorable_move={favorable_move:.2f}, triggers={new_triggers}, new SL level={ts['current_sl_level']:.2f}")
+                        if cp <= ts['current_sl_level']:
+                            hit_tsl = True
+                            _log(f"    [TSL] Leg {li+1} BUY: FIRED. current={cp:.2f} <= SL={ts['current_sl_level']:.2f}")
+
             if hit_sl or hit_tgt:
                 reason = 'STOP_LOSS' if hit_sl else 'TARGET'
                 newly_triggered_this_day.append((li, check_date, reason))
+            elif hit_tsl:
+                newly_triggered_this_day.append((li, check_date, 'TRAIL_SL'))
 
         if newly_triggered_this_day:
             if square_off_mode == 'complete':
@@ -2008,6 +2141,7 @@ def run_algotest_backtest(params):
                 for li, tleg in enumerate(trade_legs):
                     lsrc = legs_config[li] if li < len(legs_config) else {}
                     _copy_sl_tgt_to_leg(tleg, lsrc)
+                    _copy_trail_sl_to_leg(tleg, lsrc)
 
                 # ========== STEP 8C: PER-LEG SL/TARGET CHECK ==========
                 # partial  – only triggered legs exit early; others hold to exit_date
@@ -2281,7 +2415,7 @@ def run_algotest_backtest(params):
                 if re_entry_enabled:
                     _SL_TGT_REASONS = {
                         # Per-leg reasons only — OVERALL exits do NOT trigger re-entry
-                        'STOP_LOSS', 'TARGET',
+                        'STOP_LOSS', 'TARGET', 'TRAIL_SL',
                         'COMPLETE_STOP_LOSS', 'COMPLETE_TARGET',
                     }
 
@@ -2397,6 +2531,7 @@ def run_algotest_backtest(params):
                                     }
 
                                 _copy_sl_tgt_to_leg(re_leg, rlc)
+                                _copy_trail_sl_to_leg(re_leg, rlc)
                                 re_trade_legs.append(re_leg)
 
                             if not re_ok or not re_trade_legs:
@@ -2499,7 +2634,7 @@ def run_algotest_backtest(params):
                                 re_actual_exit = exit_date
                             re_exit_spot   = get_spot_price_from_db(re_actual_exit, index) or re_entry_spot
                             re_suffix      = f'[RE{re_entry_count + 1}]'
-                            re_exit_reason = (re_sl_reason or 'SCHEDULED') + re_suffix
+                            re_exit_reason = (re_sl_reason or 'EXPIRY') + re_suffix
 
                             all_trades.append({
                                 'entry_date':      re_entry_date,
@@ -2594,10 +2729,10 @@ def run_algotest_backtest(params):
                 # In complete / overall-SL mode all legs share the same date.
                 if per_leg_res is not None and li < len(per_leg_res):
                     leg_exit_date   = per_leg_res[li].get('exit_date') or trade['exit_date']
-                    leg_exit_reason = per_leg_res[li].get('exit_reason', 'SCHEDULED')
+                    leg_exit_reason = per_leg_res[li].get('exit_reason', 'EXPIRY')
                 else:
                     leg_exit_date   = trade['exit_date']
-                    leg_exit_reason = trade.get('exit_reason', 'SCHEDULED')
+                    leg_exit_reason = trade.get('exit_reason', 'EXPIRY')
 
                 # ── Exit spot price taken from the leg's own exit date ─────────────
                 # Each leg may exit on a different day (partial mode), so we fetch

@@ -626,10 +626,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const tradeNetPnlPoints = group.legs.reduce((sum, leg) => {
                               return sum + (parseFloat(leg['Net P&L']) || 0);
                             }, 0);
-                            const tradePctPnl = parseFloat(group.legs[0]['% P&L']) || 0;
+                            const INITIAL_CAPITAL = 100000;
+                            const tradePctPnl = group.entrySpot && group.entrySpot > 0
+                              ? (tradeNetPnlPoints / group.entrySpot) * 100
+                              : 0;
                             return (
                               <tr className="border-b-2 border-gray-300 bg-slate-100">
-                                <td colSpan={9}></td>
+                                <td colSpan={7}></td>
                                 <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-green-700' : 'text-red-700'}`}>
                                   {tradeNetPnlPoints >= 0 ? '+' : ''}{tradeNetPnlPoints.toFixed(2)}
                                 </td>
