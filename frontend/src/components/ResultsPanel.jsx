@@ -85,26 +85,31 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
   // Calculate stats
   const stats = useMemo(() => {
-    const totalPnL = summary.total_pnl || 0;
-    const initialCapital = 100000; // Default initial capital used in backend
-    const totalPnLPct = (totalPnL / initialCapital) * 100;
-    
+    const finalCumulative = groupedTrades.length > 0
+      ? (groupedTrades[groupedTrades.length - 1]?.cumulative || 100)
+      : 100;
+    const totalPnLPct = finalCumulative - 100;
+    const totalTrades = groupedTrades.length;
+
     return {
-      totalPnL: totalPnL,
-      totalPnLPct: totalPnLPct,
-      totalTrades: summary.count || trades.length || 0,
+      totalPnLPct,
+      totalTrades,
       winRate: summary.win_pct || 0,
       lossPct: summary.loss_pct || 0,
       cagr: summary.cagr_options || 0,
-      maxDD: summary.max_dd_pts || 0,
+      maxDDPct: summary.max_dd_pct ?? 0,
+      maxDDPts: summary.max_dd_pts || 0,
       carMdd: summary.car_mdd || 0,
+      recoveryFactor: summary.recovery_factor || 0,
+      expectancy: summary.expectancy || 0,
+      rewardToRisk: summary.reward_to_risk || 0,
+      avgWinPct: summary.avg_win_pct || 0,
+      avgLossPct: summary.avg_loss_pct || 0,
       avgWin: summary.avg_win || 0,
       avgLoss: summary.avg_loss || 0,
       maxWin: summary.max_win || 0,
       maxLoss: summary.max_loss || 0,
       avgProfitPerTrade: summary.avg_profit_per_trade || 0,
-      expectancy: summary.expectancy || 0,
-      rewardToRisk: summary.reward_to_risk || 0,
       maxWinStreak: summary.max_win_streak || 0,
       maxLossStreak: summary.max_loss_streak || 0,
       mddDuration: summary.mdd_duration_days || 0,
@@ -112,9 +117,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       mddEndDate: summary.mdd_end_date || '',
       mddTradeNumber: summary.mdd_trade_number || null,
       cagrSpot: summary.cagr_spot || 0,
-      recoveryFactor: summary.recovery_factor || 0
     };
-  }, [summary, trades]);
+  }, [summary, groupedTrades]);
 
 
   // Export CSV
@@ -301,7 +305,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Max DD</p>
               <p className="text-2xl font-bold text-red-600">
-                ₹{stats.maxDD.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                {stats.maxDDPct.toFixed(2)}%
               </p>
             </div>
             
@@ -454,7 +458,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2 text-xs">
                 <div className="border-b border-gray-200 pb-2">
                   <p className="font-bold text-gray-900 mb-0.5">Overall Profit</p>
-                  <p className="font-normal text-gray-900">₹{stats.totalPnL.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                  <p className="font-normal text-gray-900">
+                    {stats.totalPnLPct >= 0 ? '+' : ''}{stats.totalPnLPct.toFixed(2)}%
+                  </p>
                 </div>
                 
                 <div className="border-b border-gray-200 pb-2">
@@ -464,7 +470,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 
                 <div className="border-b border-gray-200 pb-2">
                   <p className="font-bold text-gray-900 mb-0.5">Average Profit per Trade</p>
-                  <p className="font-normal text-gray-900">₹{stats.avgProfitPerTrade.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                  <p className="font-normal text-gray-900">
+                    {stats.avgWinPct >= 0 ? '+' : ''}{Math.abs(stats.avgWinPct).toFixed(2)}%
+                  </p>
                 </div>
                 
                 <div className="border-b border-gray-200 pb-2">
@@ -479,12 +487,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 
                 <div className="border-b border-gray-200 pb-2">
                   <p className="font-bold text-gray-900 mb-0.5">Average Profit on Winning Trades</p>
-                  <p className="font-normal text-gray-900">₹{Math.abs(stats.avgWin).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                  <p className="font-normal text-gray-900">+{Math.abs(stats.avgWinPct).toFixed(2)}%</p>
                 </div>
                 
                 <div className="border-b border-gray-200 pb-2">
                   <p className="font-bold text-gray-900 mb-0.5">Average Loss on Losing Trades</p>
-                  <p className="font-normal text-gray-900">₹{stats.avgLoss.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                  <p className="font-normal text-gray-900">{stats.avgLossPct.toFixed(2)}%</p>
                 </div>
                 
                 <div className="border-b border-gray-200 pb-2">
@@ -499,7 +507,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 
                 <div className="border-b border-gray-200 pb-2">
                   <p className="font-bold text-gray-900 mb-0.5">Max Drawdown</p>
-                  <p className="font-normal text-gray-900">₹{stats.maxDD.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                  <p className="font-normal text-gray-900">{stats.maxDDPct.toFixed(2)}%</p>
                 </div>
                 
                 <div className="border-b border-gray-200 pb-2">
