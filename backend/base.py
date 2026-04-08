@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 import polars as pl
@@ -13,6 +14,8 @@ from typing import Tuple, Optional, Dict, Any
 from database import ALLOW_CSV_FALLBACK, get_data_source, engine as db_engine, DATA_DIR
 from repositories.market_data_repository import MarketDataRepository
 from services.data_loader import get_loader
+
+logger = logging.getLogger(__name__)
 
 # Date formatting utility
 def fmt_ddmmyyyy(date_obj) -> str:
@@ -321,6 +324,12 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     if not pd.api.types.is_datetime64_any_dtype(df['Date']):
         df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
     
+    # Filter by instrument type if column exists (guards against FUT data leaking into spot data)
+    instrument_col = next((col for col in df.columns if str(col).strip().lower() == 'instrument'), None)
+    if instrument_col is not None:
+        inst_series = df[instrument_col].astype(str).str.upper().str.strip()
+        df = df[inst_series.isin({'UNDIDX', 'INDEX'})]
+
     # Filter by date range
     from_dt = pd.to_datetime(from_date)
     to_dt = pd.to_datetime(to_date)
@@ -657,7 +666,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     Columns added to df
     -------------------
-    Cumulative  : Initial Capital + running sum of Net P&L (uses Entry Spot as capital)
+    Cumulative  : Initial Capital + running sum of Trade Net P&L (uses Entry Spot as capital)
     Peak        : running high-water mark of Cumulative
     DD          : Cumulative - Peak when Peak > Cumulative, else 0 (rupee drawdown)
     %DD         : DD / Peak * 100 when DD != 0, else 0
@@ -704,7 +713,6 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     entry_date_col = 'Entry Date'
     exit_date_col  = 'Exit Date'
 
-    # Sort by entry date to guarantee chronological order
     df = df.sort_values(entry_date_col).reset_index(drop=True)
 
     spot_cols = ['Entry Spot', 'Exit Spot', 'Spot P&L']
@@ -712,103 +720,112 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].replace('', np.nan), errors='coerce')
 
-    entry_spot_series = df['Entry Spot'] if 'Entry Spot' in df.columns else pd.Series(np.nan, index=df.index)
+    trade_key = None
+    if 'Trade' in df.columns and entry_date_col in df.columns:
+        trade_key = ['Trade', entry_date_col]
+    elif 'Trade' in df.columns:
+        trade_key = ['Trade']
+
+    trade_pnl_col = 'Trade Net P&L'
+    if trade_key:
+        agg_dict = {
+            pnl_col: 'sum',
+            entry_date_col: 'first',
+            exit_date_col: 'first',
+        }
+        for col in ['Entry Spot', 'Exit Spot', 'Spot P&L']:
+            if col in df.columns:
+                agg_dict[col] = 'first'
+        trade_df = (
+            df.groupby(trade_key, sort=False, as_index=False)
+              .agg(agg_dict)
+        )
+        trade_df = trade_df.rename(columns={pnl_col: trade_pnl_col})
+    else:
+        trade_df = df[[pnl_col, entry_date_col, exit_date_col]].copy()
+        trade_df = trade_df.rename(columns={pnl_col: trade_pnl_col})
+        trade_df['Entry Spot'] = df['Entry Spot'] if 'Entry Spot' in df.columns else np.nan
+        trade_df['Exit Spot'] = df['Exit Spot'] if 'Exit Spot' in df.columns else np.nan
+        trade_df['Spot P&L'] = df['Spot P&L'] if 'Spot P&L' in df.columns else np.nan
+
+    _adf = trade_df.sort_values(entry_date_col).reset_index(drop=True)
+
+    entry_spot_series = _adf['Entry Spot'] if 'Entry Spot' in _adf.columns else pd.Series(np.nan, index=_adf.index)
     entry_spot_nonzero = entry_spot_series.replace(0, np.nan)
     initial_entry_spot = entry_spot_series.iloc[0] if not entry_spot_series.empty else np.nan
 
-    # ── Check if Series B (compound index) already exists ────────────────────────
-    # If Cumulative already exists and starts around 100, preserve it (Series B)
     has_series_b = (
-        'Cumulative' in df.columns and 
-        len(df) > 0 and 
-        pd.notna(df['Cumulative'].iloc[0]) and 
-        90 <= df['Cumulative'].iloc[0] <= 110
+        'Cumulative' in _adf.columns and
+        len(_adf) > 0 and
+        pd.notna(_adf['Cumulative'].iloc[0]) and
+        90 <= _adf['Cumulative'].iloc[0] <= 110
     )
-    if has_series_b:
-        # Preserve Series B - compound index starting at ~100
-        pass  # Keep existing Cumulative, Peak, DD, %DD values
-    else:
-        # ── CORE EQUITY CURVE ────────────────────────────────────────────────────
-        # Cumulative = Entry Spot of Trade 1 + Net P&L of Trade 1
-        # Trade N: Cumulative = Cumulative of Trade (N-1) + Net P&L of Trade N
-        # Using Entry Spot as initial capital reference (points-based)
+    if not has_series_b:
         first_entry_spot = initial_entry_spot if pd.notna(initial_entry_spot) else 0
-        df['Cumulative'] = first_entry_spot + df[pnl_col].cumsum()
-    
-    # ── Calculate Series B: Compound Return Index (always, from Net P&L %) ─────
-    # Start at 100, compound each trade by (1 + net_pnl_pct)
+        _adf = _adf.copy()
+        _adf['Cumulative'] = first_entry_spot + _adf[trade_pnl_col].cumsum()
+
     cumulative_index = 100.0
     peak_index = 100.0
-    
-    net_pnl_pct = (df[pnl_col] / entry_spot_nonzero) * 100
+
+    net_pnl_pct = (_adf[trade_pnl_col] / entry_spot_nonzero) * 100
     net_pnl_pct_series = net_pnl_pct.copy()
-    
+
     cumulative_series = []
     peak_series = []
     dd_series = []
     pct_dd_series = []
-    
-    for i in range(len(df)):
+
+    for i in range(len(_adf)):
         pnl_pct = net_pnl_pct.iloc[i] if pd.notna(net_pnl_pct.iloc[i]) else 0
         cumulative_index = cumulative_index * (1 + pnl_pct / 100)
         peak_index = max(peak_index, cumulative_index)
         dd_index = cumulative_index - peak_index
         pct_dd = (dd_index / peak_index * 100) if peak_index != 0 else 0
-        
         cumulative_series.append(round(cumulative_index, 6))
         peak_series.append(round(peak_index, 6))
         dd_series.append(round(dd_index, 6))
         pct_dd_series.append(round(pct_dd, 6))
-    
-    # Override with Series B values (compound index)
-    df['Cumulative'] = cumulative_series
-    df['Peak'] = peak_series
-    df['DD'] = dd_series
-    df['%DD'] = pct_dd_series
-    
-    # Get initial capital for CAGR calculation only
-    # Use default capital of 1 lakh (100000) as initial trading capital
-    initial_capital = 100000.0
 
-    # ── BASIC STATS ──────────────────────────────────────────────────────────
-    # Ensure pnl_col values are numeric
-    df[pnl_col] = pd.to_numeric(df[pnl_col], errors='coerce').fillna(0)
-    
-    total_pnl  = round(df[pnl_col].sum(), 2)
-    count      = len(df)
-    wins       = df[df[pnl_col] > 0]
-    losses     = df[df[pnl_col] < 0]
+    _adf = _adf.copy()
+    _adf['Cumulative'] = cumulative_series
+    _adf['Peak'] = peak_series
+    _adf['DD'] = dd_series
+    _adf['%DD'] = pct_dd_series
+    _adf['% P&L'] = net_pnl_pct_series.values
+
+    _adf[trade_pnl_col] = pd.to_numeric(_adf[trade_pnl_col], errors='coerce').fillna(0)
+
+    total_pnl  = round(_adf[trade_pnl_col].sum(), 2)
+    count      = len(_adf)
+    wins       = _adf[_adf[trade_pnl_col] > 0]
+    losses     = _adf[_adf[trade_pnl_col] < 0]
     win_count  = len(wins)
     loss_count = len(losses)
 
     win_pct  = round(win_count  / count * 100, 2) if count > 0 else 0
     loss_pct = round(loss_count / count * 100, 2) if count > 0 else 0
-    avg_win  = round(wins[pnl_col].mean(),   2) if win_count  > 0 else 0
-    avg_loss = round(losses[pnl_col].mean(), 2) if loss_count > 0 else 0
-    max_win  = round(wins[pnl_col].max(),    2) if win_count  > 0 else 0
-    max_loss = round(losses[pnl_col].min(),  2) if loss_count > 0 else 0
+    avg_win  = round(wins[trade_pnl_col].mean(),   2) if win_count  > 0 else 0
+    avg_loss = round(losses[trade_pnl_col].mean(), 2) if loss_count > 0 else 0
+    max_win  = round(wins[trade_pnl_col].max(),    2) if win_count  > 0 else 0
+    max_loss = round(losses[trade_pnl_col].min(),  2) if loss_count > 0 else 0
     avg_profit_per_trade = round(total_pnl / count, 2) if count > 0 else 0
 
-    # Reward-to-risk ratio  (|avg_win| / |avg_loss|)
     reward_to_risk = round(abs(avg_win) / abs(avg_loss), 2) if avg_loss != 0 else 0
 
-    # Profit Factor = Gross Profit / |Gross Loss|
-    gross_profit = round(wins[pnl_col].sum(), 2) if win_count > 0 else 0
-    gross_loss_val = losses[pnl_col].sum() if loss_count > 0 else 0
+    gross_profit = round(wins[trade_pnl_col].sum(), 2) if win_count > 0 else 0
+    gross_loss_val = losses[trade_pnl_col].sum() if loss_count > 0 else 0
     if pd.isna(gross_loss_val):
         gross_loss_val = 0
     gross_loss = round(abs(gross_loss_val), 2)
-    
-    # If all trades are wins (no losses), profit factor is N/A or infinite
+
     if gross_loss == 0 and gross_profit > 0:
-        profit_factor = 999.99  # All winning trades
+        profit_factor = 999.99
     elif gross_loss == 0 and gross_profit == 0:
         profit_factor = 0
     else:
         profit_factor = round(gross_profit / gross_loss, 2)
 
-    # Expectancy  = (win_rate * avg_win  +  loss_rate * avg_loss) / |avg_loss|
-    # (AlgoTest's formula from their "Expectancy Ratio" display)
     if avg_loss != 0:
         expectancy = round(
             ((avg_win / abs(avg_loss)) * win_pct - (100 - win_pct)) / 100, 2
@@ -816,12 +833,11 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     else:
         expectancy = 0
 
-    # ── WIN / LOSS STREAKS ────────────────────────────────────────────────────
     max_win_streak  = 0
     max_loss_streak = 0
     cur_win  = 0
     cur_loss = 0
-    for pnl in df[pnl_col]:
+    for pnl in _adf[trade_pnl_col]:
         if pnl > 0:
             cur_win  += 1
             cur_loss  = 0
@@ -833,75 +849,52 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         else:
             cur_win = cur_loss = 0
 
-    # ── CAGR ──────────────────────────────────────────────────────────────────
-    # CAGR = ((Final Capital / Initial Capital) ^ (1/Years) - 1) * 100
-    # Where:
-    #   - Initial Capital = First trade's Entry Spot
-    #   - Final Capital = Initial Capital + Total P&L
-    #   - Years = Total Calendar Days / 365
-    start_date = pd.to_datetime(df[entry_date_col].min())
-    end_date   = pd.to_datetime(df[exit_date_col].max())
+    start_date = pd.to_datetime(_adf[entry_date_col].min())
+    end_date   = pd.to_datetime(_adf[exit_date_col].max())
     n_years    = max((end_date - start_date).days / 365.0, 0.01)
 
-    # Use Entry Spot of first trade as Initial Capital
     initial_capital = float(initial_entry_spot) if pd.notna(initial_entry_spot) else 0.0
     final_capital = initial_capital + total_pnl
-
-    # Calculate CAGR
     if initial_capital > 0 and final_capital > 0:
         cagr = round(100.0 * ((final_capital / initial_capital) ** (1.0 / n_years) - 1), 2)
     else:
-        cagr = round(-100.0, 2)  # total wipeout
+        cagr = round(-100.0, 2)
 
-    # ── DRAWDOWN SUMMARY ─────────────────────────────────────────────────────
-    max_dd_pct = float(df['%DD'].min())                    # most negative %DD
-    max_dd_pts = round(float(df['DD'].min()), 2)          # deepest rupee DD (most negative point drawdown)
+    max_dd_pct = float(_adf['%DD'].min())
+    max_dd_pts = round(float(_adf['DD'].min()), 2)
 
-    # Duration of overall max drawdown (calendar days from peak to trough)
     mdd_duration   = 0
     mdd_start_date = None
     mdd_end_date   = None
     mdd_trade_number = None
 
     if max_dd_pts < 0:
-        trough_idx  = df['DD'].idxmin()
-        trough_date = pd.to_datetime(df.loc[trough_idx, exit_date_col])
-        
-        # Trade number where max drawdown occurred (1-indexed for display)
+        trough_idx  = _adf['DD'].idxmin()
+        trough_date = pd.to_datetime(_adf.loc[trough_idx, exit_date_col])
         mdd_trade_number = int(trough_idx) + 1
-
-        # Find the peak date = last trade where Cumulative == Peak before trough
-        pre_trough  = df.loc[:trough_idx]
-        peak_val    = df.loc[trough_idx, 'Peak']
+        pre_trough  = _adf.loc[:trough_idx]
+        peak_val    = _adf.loc[trough_idx, 'Peak']
         peak_candidates = pre_trough[pre_trough['Cumulative'] >= peak_val]
         if not peak_candidates.empty:
-            peak_date = pd.to_datetime(
-                peak_candidates.iloc[-1][exit_date_col]
-            )
+            peak_date = pd.to_datetime(peak_candidates.iloc[-1][exit_date_col])
         else:
-            peak_date = pd.to_datetime(df.loc[0, exit_date_col])
+            peak_date = pd.to_datetime(_adf.loc[0, exit_date_col])
 
         mdd_duration   = (trough_date - peak_date).days
         mdd_start_date = peak_date.strftime('%Y-%m-%d')
         mdd_end_date   = trough_date.strftime('%Y-%m-%d')
 
-    # ── RATIO METRICS ────────────────────────────────────────────────────────
-    # CAR/MDD  =  CAGR / |Max DD %|   (annualised return per unit of drawdown)
     car_mdd = round(cagr / abs(max_dd_pct), 2) if max_dd_pct != 0 else 0
-
-    # Recovery Factor  =  Total P&L / |Max DD rupees|
     recovery_factor = round(total_pnl / abs(max_dd_pts), 2) if max_dd_pts != 0 else 0
 
-    # ── SPOT COMPARISON METRICS ─────────────────────────────────────────────────
     if 'Spot P&L' in df.columns:
-        spot_series_safe = pd.to_numeric(df['Spot P&L'].replace('', np.nan), errors='coerce')
+        spot_series_safe = pd.to_numeric(_adf['Spot P&L'].replace('', np.nan), errors='coerce')
         spot_chg = round(spot_series_safe.sum(skipna=True), 2)
     else:
         spot_chg = 0
 
-    # Expectancy uses Net P&L % instead of raw points
-    wins_pct_series = net_pnl_pct_series[df[pnl_col] > 0]
-    losses_pct_series = net_pnl_pct_series[df[pnl_col] < 0]
+    wins_pct_series = net_pnl_pct_series[_adf[trade_pnl_col] > 0]
+    losses_pct_series = net_pnl_pct_series[_adf[trade_pnl_col] < 0]
     avg_win_pct = float(wins_pct_series.mean()) if len(wins_pct_series) > 0 else 0.0
     avg_loss_pct = float(losses_pct_series.mean()) if len(losses_pct_series) > 0 else 0.0
     w_decimal = win_pct / 100.0
@@ -911,11 +904,9 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     else:
         expectancy = 0.0
 
-    # CAGR(Spot) - if just held the index (Buy & Hold)
-    # CAGR = ((Final Spot / Initial Spot) ^ (1/Years) - 1) * 100
     if 'Entry Spot' in df.columns and 'Exit Spot' in df.columns:
-        initial_spot_val = df.iloc[0]['Entry Spot']
-        final_spot_val = df.iloc[-1]['Exit Spot']
+        initial_spot_val = _adf.iloc[0]['Entry Spot']
+        final_spot_val = _adf.iloc[-1]['Exit Spot']
         initial_spot = float(initial_spot_val) if pd.notna(initial_spot_val) else 0.0
         final_spot = float(final_spot_val) if pd.notna(final_spot_val) else 0.0
         if n_years > 0 and initial_spot > 0 and final_spot > 0:
@@ -955,7 +946,21 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "cagr_spot":             cagr_spot,
     }
 
+    analytics_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+    if trade_key:
+        analytics_map = _adf.set_index(trade_key)[analytics_cols]
+        df = df.join(analytics_map, on=trade_key)
+    else:
+        for col in analytics_cols:
+            if col in _adf.columns:
+                df[col] = _adf[col].values
+
+    if 'Entry Spot' in df.columns:
+        entry_spot_leg = pd.to_numeric(df['Entry Spot'].replace('', np.nan), errors='coerce').replace(0, np.nan)
+        df['% P&L'] = ((df[pnl_col] / entry_spot_leg) * 100).round(4)
+
     return df, summary
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2225,7 +2230,7 @@ def get_future_price_from_db(date, index, expiry=None, db_path='bhavcopy_data.db
     HIGH-PERFORMANCE: O(1) lookup with on-demand loading.
     """
     try:
-        date_str   = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        date_str   = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)[:10]
         if expiry is None:
             expiry = _resolve_nearest_future_expiry(index, date_str)
             if expiry is None:
@@ -2447,16 +2452,24 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     """
     HIGH-PERFORMANCE: O(1) lookup using pre-built instant lookup table.
     """
-    date_str  = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
-    cache_key = (date_str, index)
+    # Bug fix 1: strip time component from string dates ("2025-01-06 00:00:00" → "2025-01-06")
+    if hasattr(date, 'strftime'):
+        date_str = date.strftime('%Y-%m-%d')
+    else:
+        date_str = str(date)[:10]  # take only the date part
 
-    # Check old cache first
-    if cache_key in _spot_lookup_cache:
-        return _spot_lookup_cache[cache_key]
+    # Bug fix 2: normalise symbol casing for consistent lookup keys
+    index_upper = str(index).upper()
+    cache_key = (date_str, index_upper)
+
+    # Check old cache first — but skip cached None so a post-bulk_load call can succeed
+    cached = _spot_lookup_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     # HIGH-PERFORMANCE: Use instant lookup table
     if _bulk_loaded and _spot_lookup_table:
-        val = _spot_lookup_table.get((date_str, index))
+        val = _spot_lookup_table.get((date_str, index_upper))
         if val is not None:
             _spot_lookup_cache[cache_key] = val
             return val
@@ -2506,7 +2519,7 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     except Exception:
         pass
 
-    _spot_lookup_cache[cache_key] = None
+    # Do NOT cache None — a subsequent call after bulk_load should be able to succeed
     return None
 
 
@@ -2963,7 +2976,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         _spot_lookup_table.clear()
         s_dates   = _series_to_iso_date_list(spot_df["Date"])
         s_closes  = spot_df["Close"].to_list()
-        _spot_lookup_table = {(d, symbol): c for d, c in zip(s_dates, s_closes)}
+        _spot_lookup_table = {(d, symbol.upper()): c for d, c in zip(s_dates, s_closes)}
         _bulk_spot_df = None
 
     return result

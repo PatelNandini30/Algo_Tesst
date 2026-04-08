@@ -4,6 +4,8 @@ Handles arbitrary multi-leg strategies that don't map to existing engines.
 Calculates P&L per leg and aggregates across all legs.
 """
 
+import logging
+import math
 import os
 import sys
 from datetime import timedelta
@@ -11,6 +13,11 @@ from typing import Any, Dict, Tuple, Optional
 
 import pandas as pd
 import numpy as np
+
+logger = logging.getLogger(__name__)
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+_DEBUG_FUT_LOG_LIMIT = 3
+_debug_fut_log_count = 0
 
 # Add backend to path for direct imports
 backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -259,6 +266,7 @@ def _process_trade_legs(
     fut_expiry: pd.Timestamp,
     entry_spot: float,
 ):
+    global _debug_fut_log_count
     # Use optimized data loading - cached, no repeated Polars->Pandas conversion
     bhav_entry = _get_bhav_data(from_date)
     bhav_exit  = _get_bhav_data(to_date)
@@ -355,6 +363,34 @@ def _process_trade_legs(
 
             leg_entry_price = fut_entry_mask.iloc[0]["Close"]
             leg_exit_price  = fut_exit_mask.iloc[0]["Close"]
+            if (
+                entry_spot is not None and
+                not math.isnan(entry_spot) and
+                leg_entry_price is not None and
+                not math.isnan(leg_entry_price)
+            ):
+                if entry_spot == leg_entry_price:
+                    logger.warning(
+                        "Entry spot equals FUT entry price for %s on %s: spot=%.2f, fut=%.2f — "
+                        "spot data may be incorrect (should differ due to futures basis).",
+                        index_name,
+                        from_date.strftime("%Y-%m-%d"),
+                        entry_spot,
+                        leg_entry_price,
+                    )
+                    assert entry_spot != leg_entry_price, (
+                        f"Entry spot {entry_spot} matches FUT entry price {leg_entry_price} "
+                        f"for {index_name} on {from_date.strftime('%Y-%m-%d')}."
+                    )
+            if DEBUG and _debug_fut_log_count < _DEBUG_FUT_LOG_LIMIT:
+                logger.debug(
+                    "FUT entry check #%d: entry_date=%s, entry_spot=%.2f, fut_entry=%.2f",
+                    _debug_fut_log_count + 1,
+                    from_date.strftime("%Y-%m-%d"),
+                    entry_spot,
+                    leg_entry_price,
+                )
+                _debug_fut_log_count += 1
             if leg.position == PositionType.BUY:
                 leg_pnl = round(leg_exit_price - leg_entry_price, 2)
             else:
@@ -416,6 +452,22 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
 
     # Data load
     spot_df = get_strike_data(index_name, params["from_date"], params["to_date"]).sort_values("Date").reset_index(drop=True)
+    if spot_df.empty:
+        logger.warning("spot_df is empty for %s (%s → %s)", index_name, params["from_date"], params["to_date"])
+    else:
+        sample_rows = spot_df.loc[:, ["Date", "Close"]].head(5)
+        logger.info("spot_df sample for %s: %s", index_name, sample_rows.to_dict("records"))
+        jan_mask = (
+            (spot_df["Date"].dt.year == 2025) &
+            (spot_df["Date"].dt.month == 1)
+        )
+        if jan_mask.any():
+            jan_avg = spot_df.loc[jan_mask, "Close"].mean()
+            if jan_avg > 23700:
+                logger.warning(
+                    "WARNING: spot_df may contain futures prices, not spot index closes (Jan 2025 avg %.2f)",
+                    jan_avg,
+                )
     weekly_exp = load_expiry(index_name, "weekly")
     monthly_exp = load_expiry(index_name, "monthly")
 
@@ -440,6 +492,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     monthly_exp_arr      = monthly_exp_sorted["Current Expiry"].values.astype("datetime64[ns]")
 
     trades = []
+    global_trade_counter = 0
 
     for w in range(len(weekly_exp)):
         prev_expiry = weekly_exp.iloc[w]["Previous Expiry"]
@@ -451,9 +504,10 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
         if len(filtered_data) < 2:
             continue
 
+        spot_adj_type = params.get("spot_adjustment_type") or 0
         intervals = build_intervals(
             filtered_data,
-            params.get("spot_adjustment_type", 0),
+            spot_adj_type,
             params.get("spot_adjustment", 1),
         )
         if not intervals:
@@ -547,10 +601,16 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if not leg_rows:
                     break
 
+                global_trade_counter += 1
+                current_trade_num = global_trade_counter
                 trade_index_label = _format_trade_index(base_trade_number, roll_count)
-                for leg_row in leg_rows:
+                spot_pnl = round(exit_spot_price - entry_spot_price, 2)
+                for leg_index, leg_row in enumerate(leg_rows):
+                    is_future_leg = leg_row["Type"] == "FUT"
                     trades.append(
                         {
+                            "Trade": current_trade_num,
+                            "Leg": leg_index + 1,
                             "Index": trade_index_label,
                             "Entry Date": current_entry,
                             "Exit Date": effective_to_date,
@@ -562,8 +622,9 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                             "Exit Price": leg_row["Exit Price"],
                             "Entry Spot": entry_spot_price,
                             "Exit Spot": exit_spot_price,
-                            "Spot P&L": round(exit_spot_price - entry_spot_price, 2),
+                            "Spot P&L": spot_pnl,
                             "Next Expiry": trade_fut_expiry,
+                            "Future Expiry": trade_fut_expiry,
                             "Net P&L": leg_row["Net P&L"],
                             "Exit Reason": exit_reason if str_enabled else "",
                             "STR Segment": str_segment_str if str_enabled else "",

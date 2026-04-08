@@ -27,23 +27,25 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const map = new Map();
     trades.forEach(trade => {
       const tradeNum = trade.Trade || trade.trade || 1;
-      if (!map.has(tradeNum)) {
-        map.set(tradeNum, []);
+      const compositeKey = String(tradeNum);
+      if (!map.has(compositeKey)) {
+        map.set(compositeKey, []);
       }
-      map.get(tradeNum).push(trade);
+      map.get(compositeKey).push(trade);
     });
     
     // Convert to array in single pass - preserves insertion order from Map
     const result = [];
-    for (const [tradeNum, legs] of map.entries()) {
+    for (const [groupKey, legs] of map.entries()) {
+      const tradeNumPart = groupKey.split('||')[0];
       result.push({
-        tradeNumber: parseInt(tradeNum),
+        tradeNumber: parseInt(tradeNumPart, 10) || 0,
         legs: legs,
         entryDate: legs[0]['Entry Date'],
         exitDate: legs[0]['Exit Date'],
         entrySpot: legs[0]['Entry Spot'],
         exitSpot: legs[0]['Exit Spot'],
-        totalPnl: legs.reduce((sum, leg) => sum + (leg['Net P&L'] || 0), 0),
+        totalPnl: legs[0]['Net P&L'] || 0,
         // Series B - compound index (base 100)
         cumulative: legs[0].cumulative_index || legs[0].cumulative || 100.0,
         peak: legs[0].peak_index || legs[0].peak || 100.0,
@@ -137,7 +139,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Entry Spot', 'Exit Spot', 'Spot P&L',
       'Type', 'Strike', 'B/S', 'Qty',
       'Entry Price', 'Exit Price',
-      ...(hasFutures ? ['FUT Entry Price', 'FUT Exit Price'] : []),
       ...(hasCalls ? ['CE P&L'] : []),
       ...(hasPuts ? ['PE P&L'] : []),
       ...(hasFutures ? ['FUT P&L'] : []),
@@ -578,11 +579,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   </thead>
                   <tbody>
                     {groupedTrades.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage).map((group, groupIdx) => {
-                      const actualTradeNum = (currentPage - 1) * itemsPerPage + groupIdx + 1;
                       
                       // Calculate totals for summary row
                       return (
-                        <React.Fragment key={group.tradeNumber}>
+                        <React.Fragment key={`${group.tradeNumber}_${group.entryDate || ''}`}>
                           {/* Leg rows */}
                           {group.legs.map((leg, legIdx) => {
                             const isFirstLeg = legIdx === 0;
@@ -600,7 +600,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-gray-200 ${groupIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
                                 {isFirstLeg ? (
                                   <>
-                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{actualTradeNum}</td>
+                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.legs[0]['Index'] || group.tradeNumber}</td>
                                     <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
                                   </>
                                 ) : null}

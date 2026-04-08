@@ -1877,18 +1877,11 @@ def run_algotest_backtest(params):
                     str_segment_label = segment.get('label', '')
             
                 # ========== STEP 7: GET ENTRY SPOT / UNDERLYING PRICE ==========
-                # By default we use index spot, but Mode B requests futures entry spot
-                if underlying_type == 'futures':
-                    entry_spot = get_future_price_from_db(
-                        entry_date,
-                        index,
-                        expiry=None,
-                    )
-                    if entry_spot is None:
-                        _log(f"  WARNING: No futures price for {entry_date} - falling back to spot")
-                        entry_spot = get_spot_price_from_db(entry_date, index)
-                else:
-                    entry_spot = get_spot_price_from_db(entry_date, index)
+                # Entry Spot is always the cash/spot index close price.
+                # It is used as the reference price for % P&L and display.
+                # The underlying_type ('futures'/'cash') only affects how trade
+                # P&L is calculated (via FUT Entry/Exit Price), not this reference.
+                entry_spot = get_spot_price_from_db(entry_date, index)
 
                 if entry_spot is None:
                     _log(f"  WARNING: No spot/futures price for {entry_date} - skipping")
@@ -1954,13 +1947,54 @@ def run_algotest_backtest(params):
                         else:
                             futures_expiry_pref = 'monthly'
 
-                        entry_price, exit_price, _fut_expiry_str = resolve_futures_pnl_with_rollover(
+                        fut_result = resolve_futures_pnl_with_rollover(
                             entry_date=entry_date,
                             exit_date=exit_date,
                             index=index,
                             position=position,
                             preference=futures_expiry_pref,
                         )
+
+                        fut_segments = []
+                        if isinstance(fut_result, list):
+                            fut_segments = fut_result
+                        elif fut_result is not None:
+                            fut_segments = [fut_result]
+
+                        # Normalize to tuples (entry_price, exit_price, expiry)
+                        normalized_segments = [
+                            (seg[0], seg[1], seg[2])
+                            for seg in fut_segments
+                            if seg and len(seg) >= 3
+                        ]
+
+                        entry_price = None
+                        exit_price = None
+                        _fut_expiry_str = None
+
+                        if normalized_segments:
+                            entry_price = next(
+                                (seg[0] for seg in normalized_segments if seg[0] is not None),
+                                None
+                            )
+                            exit_price = next(
+                                (seg[1] for seg in reversed(normalized_segments) if seg[1] is not None),
+                                None
+                            )
+                            _fut_expiry_str = next(
+                                (seg[2] for seg in reversed(normalized_segments) if seg[2]),
+                                normalized_segments[-1][2]
+                            )
+                            if len(normalized_segments) > 1:
+                                _log(f"      INFO: Aggregated {len(normalized_segments)} futures segments for rollover")
+
+                        if entry_price is None and normalized_segments:
+                            entry_price = normalized_segments[0][0]
+                        if exit_price is None and normalized_segments:
+                            exit_price = normalized_segments[-1][1]
+
+                        if exit_price is None:
+                            exit_price = entry_price
 
                         if entry_price is None:
                             _log(f"      WARNING: No futures price for entry {entry_date} - skipping leg")
@@ -2815,23 +2849,24 @@ def run_algotest_backtest(params):
                 show_spot_cols = has_options_leg
                 
                 row = {
-                    'Trade':        trade_idx,
-                    'Leg':          leg_num,
-                    'Index':        trade_idx,
-                    'Entry Date':   trade['entry_date'],
-                    'Exit Date':    leg_exit_date,
-                'Type':         leg_option_type,
-                'Strike':       strike,
-                'B/S':          position,
-                'Qty':          qty,
-                'Entry Price':  entry_price,
-                'Exit Price':   exit_price,
-                'Entry Spot':   entry_spot_val if entry_spot_val is not None else np.nan,
-                'Exit Spot':    leg_exit_spot if leg_exit_spot is not None else np.nan,
-                'Spot P&L':     (round(leg_exit_spot - entry_spot_val, 2)
-                                 if show_spot_cols and leg_exit_spot is not None and entry_spot_val is not None
-                                 else np.nan),
-                    'Expiry':       (
+                    'Trade':          trade_idx,
+                    'Leg':            leg_num,
+                    'Index':          trade_idx,
+                    'Entry Date':     trade['entry_date'],
+                    'Exit Date':      trade['exit_date'],
+                    'Leg Exit Date':  leg_exit_date,
+                    'Type':           leg_option_type,
+                    'Strike':         strike,
+                    'B/S':            position,
+                    'Qty':            qty,
+                    'Entry Price':    entry_price,
+                    'Exit Price':     exit_price,
+                    'Entry Spot':     entry_spot_val if entry_spot_val is not None else np.nan,
+                    'Exit Spot':      leg_exit_spot if leg_exit_spot is not None else np.nan,
+                    'Spot P&L':       (round(leg_exit_spot - entry_spot_val, 2)
+                                      if show_spot_cols and leg_exit_spot is not None and entry_spot_val is not None
+                                      else np.nan),
+                    'Expiry':         (
                         leg.get('futures_expiry') 
                         if leg.get('segment') == 'FUTURE' 
                         else (
@@ -2840,18 +2875,18 @@ def run_algotest_backtest(params):
                             else str(trade['expiry_date'])[:10]
                         )
                     ),
-                    'CE P&L':       ce_pnl_val,
-                    'PE P&L':       pe_pnl_val,
-                    'FUT P&L':      fut_pnl_val,
+                    'CE P&L':         ce_pnl_val,
+                    'PE P&L':         pe_pnl_val,
+                    'FUT P&L':        fut_pnl_val,
                     'FUT Entry Price': fut_entry_price if leg.get('segment') == 'FUTURE' else '',
-                    'FUT Exit Price': fut_exit_price if leg.get('segment') == 'FUTURE' else '',
-                    'Net P&L':      net_pnl_points,
-                    '% P&L':        pct_pnl,
-                    'Cumulative':   trade_cumulative_index,
-                    'Peak':         trade_peak_index,
-                    'DD':           trade_dd_index,
-                    '%DD':          trade_pct_dd_index,
-                    'Exit Reason':  leg_exit_reason,
+                    'FUT Exit Price':  fut_exit_price if leg.get('segment') == 'FUTURE' else '',
+                    'Net P&L':        net_pnl_points,
+                    '% P&L':          pct_pnl,
+                    'Cumulative':     trade_cumulative_index,
+                    'Peak':           trade_peak_index,
+                    'DD':             trade_dd_index,
+                    '%DD':            trade_pct_dd_index,
+                    'Exit Reason':    leg_exit_reason,
                 }
                 row[segment_column_name] = trade.get('str_segment', '')
                 if leg.get('segment') == 'FUTURE':
@@ -2871,6 +2906,20 @@ def run_algotest_backtest(params):
     print(f"[DEBUG] flatten: {len(all_trades)} trades, {len(trades_flat)} rows, errors: {flatten_errors}")
     if not trades_flat:
         print(f"[DEBUG] trades_flat is empty! all_trades had {len(all_trades)} items")
+
+    # Reassign trade numbers so every logical trade (signaled by Leg == 1) increments the counter.
+    trade_counter = 0
+    for row in trades_flat:
+        leg_val = row.get('Leg')
+        try:
+            leg_num = int(leg_val)
+        except (TypeError, ValueError):
+            leg_num = None
+        if leg_num == 1 or leg_num is None:
+            trade_counter += 1
+        row['Trade'] = trade_counter
+        row['Index'] = trade_counter
+
     trades_df = pd.DataFrame(trades_flat)
     print(f"[DEBUG] trades_df created: {len(trades_df)} rows, cols: {list(trades_df.columns)[:10]}")
     
