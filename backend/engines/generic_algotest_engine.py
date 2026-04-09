@@ -1564,6 +1564,7 @@ def run_algotest_backtest(params):
     
     # ========== STEP 4: INITIALIZE RESULTS ==========
     all_trades = []
+    trade_id_counter = 0
     strike_interval = get_strike_interval(index)
     n_expiries = len(expiry_df)
     schedule = []
@@ -2437,6 +2438,8 @@ def run_algotest_backtest(params):
                     'index':           index,
                 }
 
+                trade_id_counter += 1
+                trade_record['trade_id'] = f"{trade_id_counter}"
                 all_trades.append(trade_record)
 
                 # ========== RE-ENTRY LOGIC ==========
@@ -2670,6 +2673,8 @@ def run_algotest_backtest(params):
                             re_suffix      = f'[RE{re_entry_count + 1}]'
                             re_exit_reason = (re_sl_reason or 'EXPIRY') + re_suffix
 
+                            trade_id_counter += 1
+                            re_trade_id = f"{trade_id_counter}"
                             all_trades.append({
                                 'entry_date':      re_entry_date,
                                 'exit_date':       re_actual_exit,
@@ -2697,6 +2702,7 @@ def run_algotest_backtest(params):
                                 'square_off_mode': square_off_mode,
                                 'per_leg_results': re_per_leg,
                                 'index':           index,
+                                'trade_id':        re_trade_id,
                             })
                             re_entry_count += 1
 
@@ -2745,10 +2751,10 @@ def run_algotest_backtest(params):
     # Flatten for DataFrame - Create rows for EACH leg (AlgoTest format)
     # But we'll aggregate them back for analytics
     trades_flat = []
-    trade_counter = 0
     flatten_errors = []
     _log(f"[DEBUG] Starting flatten loop for {len(all_trades)} trades")
     for trade_idx, trade in enumerate(all_trades, 1):
+        trade_id = trade.get('trade_id', trade_idx)
         entry_spot_val = trade['entry_spot']
         per_leg_res    = trade.get('per_leg_results')  # None if no SL/Target configured
 
@@ -2814,19 +2820,19 @@ def run_algotest_backtest(params):
                 lot_size      = leg.get('lot_size', 65)
                 qty           = lots * lot_size
                 
-                # ── Trade-level P&L (sum of all legs) for Net P&L and % P&L ────────
-                # Get trade-level totals (already calculated in trade record)
+                # ── Per-leg P&L for display (each row now shows its own result)
+                # Keep trade-level net_pnl for later aggregation, but percent P&L
+                # should be based on the per-leg value that we already computed.
                 trade_total_ce_pnl = trade.get('total_ce_pnl', 0)
                 trade_total_pe_pnl = trade.get('total_pe_pnl', 0)
                 trade_total_fut_pnl = trade.get('total_fut_pnl', 0)
                 trade_net_pnl = trade.get('net_pnl', 0)  # in points (no qty)
-                
-                # Net P&L = points only (no quantity multiplication)
-                net_pnl_points = trade_net_pnl
-                
-                # % P&L = (Trade Net P&L / Trade Entry Spot) * 100
+
+                net_pnl_points = leg_pnl if leg_pnl is not None else 0
+
+                # % P&L = (Leg P&L / Trade Entry Spot) * 100
                 if pd.notna(entry_spot_val) and float(entry_spot_val) > 1000:
-                    pct_pnl = round((trade_net_pnl / float(entry_spot_val)) * 100, 2)
+                    pct_pnl = round((net_pnl_points / float(entry_spot_val)) * 100, 2)
                 else:
                     pct_pnl = 0.0
                     _log(f"  WARNING: Invalid entry_spot_val={entry_spot_val} for Trade {trade_idx} — %P&L set to 0")
@@ -2849,9 +2855,9 @@ def run_algotest_backtest(params):
                 show_spot_cols = has_options_leg
                 
                 row = {
-                    'Trade':          trade_idx,
+                    'Trade':          trade_id,
                     'Leg':            leg_num,
-                    'Index':          trade_idx,
+                    'Index':          trade_id,
                     'Entry Date':     trade['entry_date'],
                     'Exit Date':      trade['exit_date'],
                     'Leg Exit Date':  leg_exit_date,
@@ -2898,27 +2904,12 @@ def run_algotest_backtest(params):
                 print(f"[DEBUG] ERROR in flatten: Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
                 continue
 
-        trade_counter += len(trade['legs'])
-    
     t_loop_elapsed = time.perf_counter() - t_loop
     t_agg = time.perf_counter()
     
     print(f"[DEBUG] flatten: {len(all_trades)} trades, {len(trades_flat)} rows, errors: {flatten_errors}")
     if not trades_flat:
         print(f"[DEBUG] trades_flat is empty! all_trades had {len(all_trades)} items")
-
-    # Reassign trade numbers so every logical trade (signaled by Leg == 1) increments the counter.
-    trade_counter = 0
-    for row in trades_flat:
-        leg_val = row.get('Leg')
-        try:
-            leg_num = int(leg_val)
-        except (TypeError, ValueError):
-            leg_num = None
-        if leg_num == 1 or leg_num is None:
-            trade_counter += 1
-        row['Trade'] = trade_counter
-        row['Index'] = trade_counter
 
     trades_df = pd.DataFrame(trades_flat)
     print(f"[DEBUG] trades_df created: {len(trades_df)} rows, cols: {list(trades_df.columns)[:10]}")

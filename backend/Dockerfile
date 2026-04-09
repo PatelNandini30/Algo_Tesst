@@ -3,6 +3,8 @@ WORKDIR /wheels
 
 COPY requirements.txt .
 RUN pip wheel --no-cache-dir \
+        --timeout 120 \
+        --retries 5 \
         --trusted-host pypi.org \
         --trusted-host files.pythonhosted.org \
         --trusted-host pypi.python.org \
@@ -14,6 +16,8 @@ WORKDIR /app
 COPY requirements.txt .
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir \
+        --timeout 120 \
+        --retries 5 \
         --trusted-host pypi.org \
         --trusted-host files.pythonhosted.org \
         --trusted-host pypi.python.org \

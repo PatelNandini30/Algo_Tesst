@@ -92,18 +92,39 @@ def _format_dates(trades: Any) -> Any:
 def _reindex_trades(trades: list):
     """
     Reassign unique trade/index numbers so chunked results don't reuse 'Trade' values.
-    """
-    trade_counter = 0
-    for row in trades:
-        leg_val = row.get('Leg') or row.get('leg')
-        try:
-            leg_num = int(leg_val)
-        except (TypeError, ValueError):
-            leg_num = None
 
-        # Start a new trade when we see leg #1 (or when leg info is missing)
-        if leg_num == 1 or leg_num is None:
+    Uses the engine-assigned Trade ID (set before this function runs) to detect
+    trade boundaries, then maps them to sequential integers 1, 2, 3...
+
+    The old approach (increment on Leg==1) breaks for re-entry trades that only
+    re-enter a single non-first leg (e.g. a FUT roll with Leg=2 and no Leg=1),
+    causing those rows to be merged under the previous trade's number.
+    """
+    if not trades:
+        return trades
+
+    # Sort by original engine Trade ID then Leg so legs are in predictable order.
+    try:
+        trades.sort(key=lambda r: (
+            int(str(r.get('Trade', 0) or 0)),
+            int(str(r.get('Leg',  0) or 0)),
+        ))
+    except Exception:
+        pass  # if sorting fails keep original order
+
+    trade_counter = 0
+    prev_orig_id = None
+
+    for row in trades:
+        try:
+            orig_id = int(str(row.get('Trade', 0) or 0))
+        except (TypeError, ValueError):
+            orig_id = None
+
+        # New sequential trade whenever the engine-assigned ID changes
+        if orig_id != prev_orig_id:
             trade_counter += 1
+            prev_orig_id = orig_id
 
         row['Trade'] = trade_counter
         row['Index'] = trade_counter

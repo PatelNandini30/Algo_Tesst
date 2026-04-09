@@ -552,11 +552,39 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if trade_curr_expiry is None:
                     break
 
-                # FIX #3A: Replace monthly_exp filter+sort+reset_index with searchsorted
+                # Find the monthly futures contract for this trade's FUT leg.
                 midx = np.searchsorted(monthly_exp_arr, np.datetime64(trade_curr_expiry, "ns"), side="left")
                 if midx >= len(monthly_exp_arr):
                     break
                 trade_fut_expiry = pd.Timestamp(monthly_exp_arr[midx])
+
+                # ── FUTURES ROLL LOGIC ───────────────────────────────────────────
+                # Market reality: when weekly_expiry == monthly_expiry (last week
+                # of the month), the current month futures contract expires the
+                # same day as the options. On that day the contract is illiquid,
+                # bid-ask spreads blow out, and the hedge breaks down.
+                #
+                # Professional practice: always trade the NEXT month's futures
+                # contract during expiry week.
+                #
+                # Entry  → open next-month FUT on trade entry date
+                # Exit   → close next-month FUT on the same weekly expiry date
+                #           (we do NOT hold to the FUT's own expiry; we simply
+                #            read next-month contract price on the options exit day)
+                #
+                # Example — Trade 4 (entry 27-Jan-2025, expiry 30-Jan-2025):
+                #   OLD: Jan FUT  (illiquid on its own expiry day)
+                #   NEW: Feb FUT  (liquid; read Feb contract price on 30-Jan close)
+                if trade_curr_expiry == trade_fut_expiry:
+                    next_midx = midx + 1
+                    if next_midx < len(monthly_exp_arr):
+                        trade_fut_expiry = pd.Timestamp(monthly_exp_arr[next_midx])
+                        logger.debug(
+                            "FUT roll: weekly==monthly (%s) -> using next month FUT expiry %s",
+                            trade_curr_expiry.strftime("%Y-%m-%d"),
+                            trade_fut_expiry.strftime("%Y-%m-%d"),
+                        )
+                    # else: last data point — keep current month, better than skipping
 
                 # Calendar exit competition: Expiry vs STR segment end
                 effective_to_date = trade_curr_expiry

@@ -20,40 +20,71 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
 
-  // Group trades by Trade number for display (AlgoTest style) - O(n) using Map
+  // Two-pass grouping:
+  // Pass 1 — find the canonical (first-seen) Entry Date per Trade number.
+  // Pass 2 — rows whose Entry Date matches the canonical go into the main
+  //           trade group; rows with a DIFFERENT Entry Date are rolled/
+  //           continuation legs and get their own display group so they are
+  //           never merged with the original trade.
+  // Within each group, duplicate Leg numbers are deduplicated (last row wins).
   const groupedTrades = useMemo(() => {
     if (!trades || trades.length === 0) return [];
-    
-    const map = new Map();
+
+    // Pass 1: canonical entry date per Trade number
+    const canonicalEntryByTrade = new Map();
     trades.forEach(trade => {
-      const tradeNum = trade.Trade || trade.trade || 1;
-      const compositeKey = String(tradeNum);
-      if (!map.has(compositeKey)) {
-        map.set(compositeKey, []);
+      const tradeNum = String(trade.Trade || trade.trade || 1);
+      const entryDate = trade['Entry Date'] || '';
+      if (!canonicalEntryByTrade.has(tradeNum)) {
+        canonicalEntryByTrade.set(tradeNum, entryDate);
       }
-      map.get(compositeKey).push(trade);
     });
-    
-    // Convert to array in single pass - preserves insertion order from Map
+
+    // Pass 2: build groups
+    const groupMap = new Map(); // groupKey → { legs: Map(legNum → row), firstRow, tradeNum }
+    trades.forEach(trade => {
+      const tradeNum = String(trade.Trade || trade.trade || 1);
+      const legNum   = String(trade.Leg  || trade.leg  || 1);
+      const entryDate = trade['Entry Date'] || '';
+      const canonical = canonicalEntryByTrade.get(tradeNum) || entryDate;
+
+      const groupKey = entryDate === canonical
+        ? tradeNum
+        : `rolled_${tradeNum}_${entryDate}`;
+
+      if (!groupMap.has(groupKey)) {
+        groupMap.set(groupKey, { legs: new Map(), firstRow: trade, tradeNum });
+      }
+      // Last row for a given Leg number wins (deduplication)
+      groupMap.get(groupKey).legs.set(legNum, trade);
+    });
+
     const result = [];
-    for (const [groupKey, legs] of map.entries()) {
-      const tradeNumPart = groupKey.split('||')[0];
+    for (const [groupKey, { legs, firstRow, tradeNum }] of groupMap.entries()) {
+      const legsArr = Array.from(legs.values());
       result.push({
-        tradeNumber: parseInt(tradeNumPart, 10) || 0,
-        legs: legs,
-        entryDate: legs[0]['Entry Date'],
-        exitDate: legs[0]['Exit Date'],
-        entrySpot: legs[0]['Entry Spot'],
-        exitSpot: legs[0]['Exit Spot'],
-        totalPnl: legs[0]['Net P&L'] || 0,
-        // Series B - compound index (base 100)
-        cumulative: legs[0].cumulative_index || legs[0].cumulative || 100.0,
-        peak: legs[0].peak_index || legs[0].peak || 100.0,
-        dd: legs[0].dd_index || legs[0].dd || 0,
-        pct_dd: legs[0].pct_dd_index || legs[0]['%DD'] || 0,
+        tradeNumber: parseInt(tradeNum, 10) || 0,
+        groupKey,
+        legs: legsArr,
+        entryDate:  firstRow['Entry Date'],
+        exitDate:   firstRow['Exit Date'],
+        entrySpot:  parseFloat(firstRow['Entry Spot']) || 0,
+        exitSpot:   parseFloat(firstRow['Exit Spot'])  || 0,
+        totalPnl:   firstRow['Net P&L'] || 0,
+        cumulative: firstRow.cumulative_index || firstRow.cumulative || 100.0,
+        peak:       firstRow.peak_index || firstRow.peak || 100.0,
+        dd:         firstRow.dd_index || firstRow.dd || 0,
+        pct_dd:     firstRow.pct_dd_index || firstRow['%DD'] || 0,
       });
     }
-    // Already sorted by insertion order (which is by trade number since we iterate trades in order)
+
+    result.sort((a, b) => {
+      const dateA = a.entryDate || '';
+      const dateB = b.entryDate || '';
+      if (dateA < dateB) return -1;
+      if (dateA > dateB) return 1;
+      return a.tradeNumber - b.tradeNumber;
+    });
     return result;
   }, [trades]);
 
@@ -582,7 +613,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       
                       // Calculate totals for summary row
                       return (
-                        <React.Fragment key={`${group.tradeNumber}_${group.entryDate || ''}`}>
+                        <React.Fragment key={group.groupKey}>
                           {/* Leg rows */}
                           {group.legs.map((leg, legIdx) => {
                             const isFirstLeg = legIdx === 0;
@@ -593,8 +624,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
-                            const legNetPnlPoints = parseFloat(leg['Net P&L']) || 0;
-                            const legPercentPnl = parseFloat(leg['% P&L']) || 0;
+                            // Per-leg P&L: CE P&L for options, FUT P&L for futures.
+                            // Net P&L and % P&L columns hold the trade-level total
+                            // (stamped on every row) — must NOT be used per leg.
+                            const isFutLeg = (leg['Type'] || '').toUpperCase() === 'FUT';
+                            const legNetPnlPoints = isFutLeg
+                              ? (parseFloat(leg['FUT P&L']) || 0)
+                              : (parseFloat(leg['CE P&L']) || parseFloat(leg['PE P&L']) || 0);
+                            const entrySpotForPct = parseFloat(leg['Entry Spot']) || 0;
+                            const legPercentPnl = entrySpotForPct > 1000
+                              ? (legNetPnlPoints / entrySpotForPct) * 100
+                              : 0;
                             
                             return (
                               <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-gray-200 ${groupIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
@@ -630,17 +670,25 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                           
                           {/* Summary Row - Only show for multi-leg trades */}
                           {group.legs.length > 1 && (() => {
-                            // Always compute aggregate values from legs instead of relying on first leg
+                            // Sum per-leg individual P&L columns.
+                            // DO NOT sum Net P&L — it is the trade total repeated on every row.
                             const tradeNetPnlPoints = group.legs.reduce((sum, leg) => {
-                              return sum + (parseFloat(leg['Net P&L']) || 0);
+                              return sum +
+                                (parseFloat(leg['CE P&L'])  || 0) +
+                                (parseFloat(leg['PE P&L'])  || 0) +
+                                (parseFloat(leg['FUT P&L']) || 0);
                             }, 0);
-                            const INITIAL_CAPITAL = 100000;
-                            const tradePctPnl = group.entrySpot && group.entrySpot > 0
+                            const tradePctPnl = group.entrySpot > 1000
                               ? (tradeNetPnlPoints / group.entrySpot) * 100
                               : 0;
+                            // Summary row comes AFTER the rowSpan ends, so ALL 13 columns
+                            // must be filled. Empty span = 13 total - 2 P&L cols = 11.
+                            // (The old value of 7 wrongly subtracted the 4 rowSpanned cols,
+                            // which pushed Net P&L into the B/S column and % P&L into Qty.)
+                            const emptyCellSpan = 11;
                             return (
                               <tr className="border-b-2 border-gray-300 bg-slate-100">
-                                <td colSpan={7}></td>
+                                <td colSpan={emptyCellSpan}></td>
                                 <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-green-700' : 'text-red-700'}`}>
                                   {tradeNetPnlPoints >= 0 ? '+' : ''}{tradeNetPnlPoints.toFixed(2)}
                                 </td>

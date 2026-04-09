@@ -947,9 +947,11 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     }
 
     analytics_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+    df = df.drop(columns=analytics_cols, errors='ignore')
     if trade_key:
-        analytics_map = _adf.set_index(trade_key)[analytics_cols]
-        df = df.join(analytics_map, on=trade_key)
+        analytics_map = _adf.set_index(trade_key)[analytics_cols].reset_index()
+        df = pd.merge(df, analytics_map, how='left', on=trade_key, suffixes=('', '_analytics'))
+        df = df.drop(columns=[col for col in df.columns if col.endswith('_analytics')], errors='ignore')
     else:
         for col in analytics_cols:
             if col in _adf.columns:
