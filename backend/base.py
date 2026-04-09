@@ -720,11 +720,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].replace('', np.nan), errors='coerce')
 
-    trade_key = None
-    if 'Trade' in df.columns and entry_date_col in df.columns:
-        trade_key = ['Trade', entry_date_col]
-    elif 'Trade' in df.columns:
-        trade_key = ['Trade']
+    trade_key = ['Trade'] if 'Trade' in df.columns else None
 
     trade_pnl_col = 'Trade Net P&L'
     if trade_key:

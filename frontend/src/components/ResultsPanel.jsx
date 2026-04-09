@@ -180,10 +180,43 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       ...(hasStrSegment ? ['STR Segment'] : [])
     ];
 
+    // Recompute trade-level Net P&L and % P&L (sum CE/PE/FUT) so export matches UI
+    const grouped = new Map();
+    trades.forEach(trade => {
+      const tradeNum = String(trade.Trade || trade.trade || 1);
+      if (!grouped.has(tradeNum)) grouped.set(tradeNum, []);
+      grouped.get(tradeNum).push(trade);
+    });
+
+    const tradeMetrics = {};
+    grouped.forEach((legs, tradeNum) => {
+      let total = 0;
+      const entrySpot = parseFloat(legs[0]['Entry Spot']) || 0;
+      legs.forEach(leg => {
+        total += (parseFloat(leg['CE P&L']) || 0)
+               + (parseFloat(leg['PE P&L']) || 0)
+               + (parseFloat(leg['FUT P&L']) || 0);
+      });
+      const pct = entrySpot > 0 ? (total / entrySpot) * 100 : 0;
+      tradeMetrics[tradeNum] = {
+        net: total,
+        pct,
+      };
+    });
+
     const cleanedTrades = trades.map(trade => {
       const row = {};
       for (const key of keyOrder) {
-        let val = trade[key];
+        let val;
+        if (key === 'Net P&L') {
+          const t = tradeMetrics[String(trade.Trade || trade.trade || 1)];
+          val = t ? t.net : 0;
+        } else if (key === '% P&L') {
+          const t = tradeMetrics[String(trade.Trade || trade.trade || 1)];
+          val = t ? t.pct : 0;
+        } else {
+          val = trade[key];
+        }
         if (
           val === null ||
           val === undefined ||
