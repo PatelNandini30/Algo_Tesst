@@ -2759,10 +2759,10 @@ def run_algotest_backtest(params):
         per_leg_res    = trade.get('per_leg_results')  # None if no SL/Target configured
 
         # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
-        for leg_idx, leg in enumerate(trade['legs']):
-            try:
-                leg_num = leg['leg_number']
-                li      = leg_num - 1  # 0-based index
+                for leg_idx, leg in enumerate(trade['legs']):
+                    try:
+                        leg_num = leg['leg_number']
+                        li      = leg_num - 1  # 0-based index
 
                 # ── Resolve per-leg exit date & reason ────────────────────────────
                 # In partial mode different legs can exit on different dates.
@@ -2820,17 +2820,19 @@ def run_algotest_backtest(params):
                 lot_size      = leg.get('lot_size', 65)
                 qty           = lots * lot_size
                 
-                # ── Per-leg P&L for display (each row now shows its own result)
-                # Keep trade-level net_pnl for later aggregation, but percent P&L
-                # should be based on the per-leg value that we already computed.
+                # ── Per-leg P&L for display (each row shows individual leg values)
+                # Respect trade totals on the first leg row for Net P&L/% P&L.
                 trade_total_ce_pnl = trade.get('total_ce_pnl', 0)
                 trade_total_pe_pnl = trade.get('total_pe_pnl', 0)
                 trade_total_fut_pnl = trade.get('total_fut_pnl', 0)
-                trade_net_pnl = trade.get('net_pnl', 0)  # in points (no qty)
+                trade_net_pnl = trade.get('net_pnl', 0)  # trade-level total
 
-                net_pnl_points = leg_pnl if leg_pnl is not None else 0
+                is_first_leg = leg_idx == 0
+                if is_first_leg:
+                    net_pnl_points = trade_net_pnl
+                else:
+                    net_pnl_points = leg_pnl if leg_pnl is not None else 0
 
-                # % P&L = (Leg P&L / Trade Entry Spot) * 100
                 if pd.notna(entry_spot_val) and float(entry_spot_val) > 1000:
                     pct_pnl = round((net_pnl_points / float(entry_spot_val)) * 100, 2)
                 else:

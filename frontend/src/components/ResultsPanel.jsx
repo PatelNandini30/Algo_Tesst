@@ -79,11 +79,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     }
 
     result.sort((a, b) => {
+      if (a.tradeNumber !== b.tradeNumber) {
+        return a.tradeNumber - b.tradeNumber;
+      }
       const dateA = a.entryDate || '';
       const dateB = b.entryDate || '';
       if (dateA < dateB) return -1;
       if (dateA > dateB) return 1;
-      return a.tradeNumber - b.tradeNumber;
+      return 0;
     });
     return result;
   }, [trades]);
