@@ -845,8 +845,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         else:
             cur_win = cur_loss = 0
 
-    start_date = pd.to_datetime(_adf[entry_date_col].min())
-    end_date   = pd.to_datetime(_adf[exit_date_col].max())
+    start_date = pd.to_datetime(_adf[entry_date_col].min(), dayfirst=True)
+    end_date   = pd.to_datetime(_adf[exit_date_col].max(), dayfirst=True)
     n_years    = max((end_date - start_date).days / 365.0, 0.01)
 
     initial_capital = float(initial_entry_spot) if pd.notna(initial_entry_spot) else 0.0
@@ -866,15 +866,15 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     if max_dd_pts < 0:
         trough_idx  = _adf['DD'].idxmin()
-        trough_date = pd.to_datetime(_adf.loc[trough_idx, exit_date_col])
+        trough_date = pd.to_datetime(_adf.loc[trough_idx, exit_date_col], dayfirst=True)
         mdd_trade_number = int(trough_idx) + 1
         pre_trough  = _adf.loc[:trough_idx]
         peak_val    = _adf.loc[trough_idx, 'Peak']
         peak_candidates = pre_trough[pre_trough['Cumulative'] >= peak_val]
         if not peak_candidates.empty:
-            peak_date = pd.to_datetime(peak_candidates.iloc[-1][exit_date_col])
+            peak_date = pd.to_datetime(peak_candidates.iloc[-1][exit_date_col], dayfirst=True)
         else:
-            peak_date = pd.to_datetime(_adf.loc[0, exit_date_col])
+            peak_date = pd.to_datetime(_adf.loc[0, exit_date_col], dayfirst=True)
 
         mdd_duration   = (trough_date - peak_date).days
         mdd_start_date = peak_date.strftime('%Y-%m-%d')
@@ -992,7 +992,7 @@ def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
     exit_date_col = 'Exit Date' if 'Exit Date' in df.columns else 'exit_date'
 
     df = df.sort_values(exit_date_col).reset_index(drop=True)
-    df[exit_date_col] = pd.to_datetime(df[exit_date_col])
+    df[exit_date_col] = pd.to_datetime(df[exit_date_col], dayfirst=True)
 
     # ── Build GLOBAL cumulative curve (same as compute_analytics) ────────────
     df['_Global_Cumulative'] = df['Net P&L'].cumsum()

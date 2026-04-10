@@ -70,7 +70,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         exitDate:   firstRow['Exit Date'],
         entrySpot:  parseFloat(firstRow['Entry Spot']) || 0,
         exitSpot:   parseFloat(firstRow['Exit Spot'])  || 0,
-        totalPnl:   firstRow['Net P&L'] || 0,
+        totalPnl:   parseFloat(firstRow['Net P&L']) || 0,
         cumulative: firstRow.cumulative_index || firstRow.cumulative || 100.0,
         peak:       firstRow.peak_index || firstRow.peak || 100.0,
         dd:         firstRow.dd_index || firstRow.dd || 0,
@@ -164,8 +164,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const hasCalls = trades.some(t => (t['Type'] || '').toUpperCase() === 'CALL');
     const hasPuts = trades.some(t => (t['Type'] || '').toUpperCase() === 'PUT');
     const hasFutures = trades.some(t => (t['Type'] || '').toUpperCase() === 'FUT');
-    const hasStrSegment = showStrSegment &&
-      trades.some(t => t['STR Segment'] && t['STR Segment'] !== '');
+    const hasStrSegment = showStrSegment && trades.some(t => t['STR Segment'] && t['STR Segment'] !== '');
+
+    const TRADE_LEVEL_COLS = new Set(['Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD']);
 
     const keyOrder = [
       'Trade', 'Leg', 'Index',
@@ -176,47 +177,78 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       ...(hasCalls ? ['CE P&L'] : []),
       ...(hasPuts ? ['PE P&L'] : []),
       ...(hasFutures ? ['FUT P&L'] : []),
-      'Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Exit Reason', 'Expiry',
-      ...(hasStrSegment ? ['STR Segment'] : [])
+      'Net P&L', '% P&L',
+      'Cumulative', 'Peak', 'DD', '%DD',
+      'Exit Reason', 'Expiry',
+      ...(hasStrSegment ? ['STR Segment'] : []),
     ];
 
-    // Recompute trade-level Net P&L and % P&L (sum CE/PE/FUT) so export matches UI
-    const grouped = new Map();
-    trades.forEach(trade => {
-      const tradeNum = String(trade.Trade || trade.trade || 1);
-      if (!grouped.has(tradeNum)) grouped.set(tradeNum, []);
-      grouped.get(tradeNum).push(trade);
+    const sortedTrades = [...trades].sort((a, b) => {
+      const tA = parseInt(a.Trade || a.trade || 1, 10);
+      const tB = parseInt(b.Trade || b.trade || 1, 10);
+      if (tA !== tB) return tA - tB;
+      const lA = parseInt(a.Leg || a.leg || 1, 10);
+      const lB = parseInt(b.Leg || b.leg || 1, 10);
+      return lA - lB;
+    });
+
+    const groupedByTrade = {};
+    sortedTrades.forEach(trade => {
+      const key = String(trade.Trade || trade.trade || 1);
+      if (!groupedByTrade[key]) groupedByTrade[key] = [];
+      groupedByTrade[key].push(trade);
     });
 
     const tradeMetrics = {};
-    grouped.forEach((legs, tradeNum) => {
-      let total = 0;
+    Object.entries(groupedByTrade).forEach(([key, legs]) => {
       const entrySpot = parseFloat(legs[0]['Entry Spot']) || 0;
-      legs.forEach(leg => {
-        total += (parseFloat(leg['CE P&L']) || 0)
-               + (parseFloat(leg['PE P&L']) || 0)
-               + (parseFloat(leg['FUT P&L']) || 0);
-      });
-      const pct = entrySpot > 0 ? (total / entrySpot) * 100 : 0;
-      tradeMetrics[tradeNum] = {
-        net: total,
-        pct,
+      const net = legs.reduce((sum, leg) => {
+        return sum +
+          (parseFloat(leg['CE P&L']) || 0) +
+          (parseFloat(leg['PE P&L']) || 0) +
+          (parseFloat(leg['FUT P&L']) || 0);
+      }, 0);
+      const pct = entrySpot > 0 ? (net / entrySpot) * 100 : 0;
+      tradeMetrics[key] = {
+        net: +net.toFixed(2),
+        pct: +pct.toFixed(2),
+        cumulative: legs[0]['Cumulative'] ?? '',
+        peak: legs[0]['Peak'] ?? '',
+        dd: legs[0]['DD'] ?? '',
+        pctDd: legs[0]['%DD'] ?? '',
       };
     });
 
-    const cleanedTrades = trades.map(trade => {
+    const writtenTrades = new Set();
+
+    const cleanedTrades = sortedTrades.map(trade => {
+      const tradeKey = String(trade.Trade || trade.trade || 1);
+      const isFirstLeg = !writtenTrades.has(tradeKey);
+      if (isFirstLeg) writtenTrades.add(tradeKey);
+
+      const metrics = tradeMetrics[tradeKey] || {};
       const row = {};
+
       for (const key of keyOrder) {
         let val;
-        if (key === 'Net P&L') {
-          const t = tradeMetrics[String(trade.Trade || trade.trade || 1)];
-          val = t ? t.net : 0;
-        } else if (key === '% P&L') {
-          const t = tradeMetrics[String(trade.Trade || trade.trade || 1)];
-          val = t ? t.pct : 0;
+
+        if (TRADE_LEVEL_COLS.has(key)) {
+          if (!isFirstLeg) {
+            val = '';
+          } else {
+            if (key === 'Net P&L') val = metrics.net;
+            else if (key === '% P&L') val = metrics.pct;
+            else if (key === 'Cumulative') val = metrics.cumulative;
+            else if (key === 'Peak') val = metrics.peak;
+            else if (key === 'DD') val = metrics.dd;
+            else if (key === '%DD') val = metrics.pctDd;
+          }
+        } else if (key === 'Index') {
+          val = parseInt(trade.Trade || trade.trade || 1, 10);
         } else {
           val = trade[key];
         }
+
         if (
           val === null ||
           val === undefined ||
@@ -225,23 +257,26 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         ) {
           val = '';
         }
+        if (typeof val === 'number' && !Number.isInteger(val)) {
+          val = Math.round(val * 100) / 100;
+        }
+
         row[key] = val;
       }
+
       return row;
     });
 
-    const headers = Object.keys(cleanedTrades[0]).join(',');
-    const rows = cleanedTrades.map(trade =>
-      Object.values(trade).map(val => {
-        if (typeof val === 'number' && !Number.isInteger(val)) {
-          return Math.round(val * 100) / 100;
-        }
-        if (typeof val === 'string' && (val.includes(',') || val.includes('"'))) {
-          return `"${val.replace(/"/g, '""')}"`;
-        }
-        return val;
-      }).join(',')
-    );
+    const escape = (value) => {
+      const text = String(value ?? '');
+      if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+        return `"${text.replace(/"/g, '""')}"`;
+      }
+      return text;
+    };
+
+    const headers = keyOrder.join(',');
+    const rows = cleanedTrades.map(row => keyOrder.map(key => escape(row[key])).join(','));
     const csv = [headers, ...rows].join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = window.URL.createObjectURL(blob);
