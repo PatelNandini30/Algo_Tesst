@@ -2759,10 +2759,10 @@ def run_algotest_backtest(params):
         per_leg_res    = trade.get('per_leg_results')  # None if no SL/Target configured
 
         # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
-                for leg_idx, leg in enumerate(trade['legs']):
-                    try:
-                        leg_num = leg['leg_number']
-                        li      = leg_num - 1  # 0-based index
+        for leg_idx, leg in enumerate(trade['legs']):
+            try:
+                leg_num = leg['leg_number']
+                li      = leg_num - 1  # 0-based index
 
                 # ── Resolve per-leg exit date & reason ────────────────────────────
                 # In partial mode different legs can exit on different dates.
