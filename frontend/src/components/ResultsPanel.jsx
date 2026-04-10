@@ -70,11 +70,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         exitDate:   firstRow['Exit Date'],
         entrySpot:  parseFloat(firstRow['Entry Spot']) || 0,
         exitSpot:   parseFloat(firstRow['Exit Spot'])  || 0,
-        totalPnl:   parseFloat(firstRow['Net P&L']) || 0,
-        cumulative: firstRow.cumulative_index || firstRow.cumulative || 100.0,
-        peak:       firstRow.peak_index || firstRow.peak || 100.0,
-        dd:         firstRow.dd_index || firstRow.dd || 0,
-        pct_dd:     firstRow.pct_dd_index || firstRow['%DD'] || 0,
+        totalPnl:   parseFloat(firstRow['Net P&L']) ?? 0,
+        cumulative: parseFloat(firstRow['Cumulative']) ?? 100.0,
+        peak:       parseFloat(firstRow['Peak']) ?? 100.0,
+        dd:         parseFloat(firstRow['DD']) ?? 0,
+        pct_dd:     parseFloat(firstRow['%DD']) ?? 0,
       });
     }
 
@@ -99,9 +99,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     return groupedTrades.map((group, index) => ({
       index: index + 1,
       date: group.exitDate || `Trade ${index + 1}`,
-      // Use compound index (Series B) starting from 100
-      cumulative: group.cumulative || 100.0,
-      pnl: group.totalPnl || 0
+      cumulative: group.cumulative ?? 100.0,
+      pnl: group.totalPnl ?? 0
     }));
   }, [groupedTrades]);
 
@@ -109,8 +108,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     if (!groupedTrades || groupedTrades.length === 0) return [];
     
     return groupedTrades.map((group, index) => {
-      // Use DD % from backend - already has correct sign (negative for drawdown)
-      const dd = group.pct_dd || 0;
+      const dd = group.pct_dd ?? 0;
       return {
         index: index + 1,
         date: group.exitDate || `Trade ${index + 1}`,
@@ -122,7 +120,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   // Calculate stats
   const stats = useMemo(() => {
     const finalCumulative = groupedTrades.length > 0
-      ? (groupedTrades[groupedTrades.length - 1]?.cumulative || 100)
+      ? (groupedTrades[groupedTrades.length - 1]?.cumulative ?? 100)
       : 100;
     const totalPnLPct = finalCumulative - 100;
     const totalTrades = groupedTrades.length;
@@ -294,13 +292,23 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       return (
         <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 shadow-xl">
           <p className="text-xs text-gray-400 mb-1">{payload[0]?.payload?.date}</p>
-          {payload.map((entry, index) => (
-            <p key={index} className="text-sm font-medium" style={{ color: entry.color }}>
-              {entry.name}: {entry.name.includes('%') 
-                ? `${entry.value?.toFixed(2)}%`
-                : `₹${entry.value?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`}
-            </p>
-          ))}
+          {payload.map((entry, index) => {
+            const dataKey = entry.dataKey || '';
+            const value = entry.value;
+            let formatted;
+            if (dataKey === 'drawdown') {
+              formatted = `${value?.toFixed(2)}%`;
+            } else if (dataKey === 'cumulative') {
+              formatted = `${value?.toFixed(2)}`;
+            } else {
+              formatted = `₹${value?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+            }
+            return (
+              <p key={index} className="text-sm font-medium" style={{ color: entry.color }}>
+                {entry.name}: {formatted}
+              </p>
+            );
+          })}
         </div>
       );
     }
@@ -492,7 +500,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
                     tickFormatter={(value) => `${value.toFixed(1)}%`}
-                    domain={[0, 'auto']}
+                    domain={['auto', 0]}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area 
