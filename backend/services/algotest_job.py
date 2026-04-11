@@ -269,8 +269,18 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         for col in ['Entry Date', 'Exit Date']:
                             if col in trades_agg.columns:
                                 trades_agg[col] = pd.to_datetime(trades_agg[col], dayfirst=True, errors='coerce')
+
+                        # Preserve engine-computed cumulative series before compute_analytics overwrites them
+                        _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+                        _saved_agg = {col: trades_agg[col].copy() for col in _cum_cols if col in trades_agg.columns}
+
                         trades_agg, result_summary = compute_analytics(trades_agg)
                         result_pivot = build_pivot(trades_agg, "Exit Date")
+
+                        # Restore correct additive-from-100 series
+                        for col, saved in _saved_agg.items():
+                            trades_agg[col] = saved
+
                         all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
                         engine_summary = result_summary
                         engine_pivot = result_pivot
@@ -341,11 +351,19 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     print(f"[DEBUG] Net P&L sample: "
                           f"{trades_aggregated['Net P&L'].head().tolist()}")
 
+                # Preserve engine-computed cumulative before compute_analytics drops and rewrites them
+                _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+                _saved_final = {col: trades_aggregated[col].copy() for col in _cum_cols if col in trades_aggregated.columns}
+
                 trades_aggregated, result_summary = compute_analytics(trades_aggregated)
                 print(f"[DEBUG] Result summary: {result_summary}")
                 result_pivot = build_pivot(trades_aggregated, "Exit Date")
 
-                # Use trades_aggregated (with Cumulative/Peak/DD/%DD from compute_analytics) for export
+                # Restore correct additive-from-100 series (compute_analytics overwrites these)
+                for col, saved in _saved_final.items():
+                    trades_aggregated[col] = saved
+
+                # Export with correct cumulative values restored
                 all_trades = _convert_numpy(
                     _format_dates(trades_aggregated.to_dict('records'))
                 )
@@ -432,6 +450,20 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     print(f"[ERROR] Fallback summary failed: {fallback_error}")
         else:
             all_trades = _convert_numpy(_format_dates(all_trades))
+
+        # Ensure missing Cumulative/Peak/DD/%DD on Leg 2+ rows are explicit None (→ JSON null).
+        # float NaN from pandas survives _convert_numpy and causes parseFloat(NaN) in JS,
+        # which the ?? 100.0 fallback cannot catch (NaN is not null/undefined).
+        for row in all_trades:
+            for k in ('Cumulative', 'Peak', 'DD', '%DD'):
+                v = row.get(k)
+                if v is not None:
+                    try:
+                        f = float(v)
+                        if f != f:  # NaN check: NaN is the only float where f != f
+                            row[k] = None
+                    except (TypeError, ValueError):
+                        row[k] = None
 
         import json
 

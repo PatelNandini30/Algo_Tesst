@@ -62,19 +62,38 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const result = [];
     for (const [groupKey, { legs, firstRow, tradeNum }] of groupMap.entries()) {
       const legsArr = Array.from(legs.values());
+
+      // Leg 1 is the only row the backend populates Cumulative/Peak/DD/%DD on.
+      // firstRow is the first-encountered row which may be Leg 2+ if the trades
+      // array arrives out of leg order — so always look up Leg '1' explicitly.
+      const leg1Row = legs.get('1') || legs.get(1) ||
+        legsArr.slice().sort((a, b) =>
+          parseInt(a.Leg || a.leg || 1, 10) - parseInt(b.Leg || b.leg || 1, 10)
+        )[0] || firstRow;
+
+      const rawCumulative = leg1Row['Cumulative'];
+      const rawPeak       = leg1Row['Peak'];
+      const rawDd         = leg1Row['DD'];
+      const rawPctDd      = leg1Row['%DD'];
+
       result.push({
         tradeNumber: parseInt(tradeNum, 10) || 0,
         groupKey,
         legs: legsArr,
-        entryDate:  firstRow['Entry Date'],
-        exitDate:   firstRow['Exit Date'],
-        entrySpot:  parseFloat(firstRow['Entry Spot']) || 0,
-        exitSpot:   parseFloat(firstRow['Exit Spot'])  || 0,
-        totalPnl:   parseFloat(firstRow['Net P&L']) ?? 0,
-        cumulative: parseFloat(firstRow['Cumulative']) ?? 100.0,
-        peak:       parseFloat(firstRow['Peak']) ?? 100.0,
-        dd:         parseFloat(firstRow['DD']) ?? 0,
-        pct_dd:     parseFloat(firstRow['%DD']) ?? 0,
+        entryDate:  leg1Row['Entry Date'],
+        exitDate:   leg1Row['Exit Date'],
+        entrySpot:  parseFloat(leg1Row['Entry Spot']) || 0,
+        exitSpot:   parseFloat(leg1Row['Exit Spot'])  || 0,
+        totalPnl:   parseFloat(leg1Row['Net P&L']) || 0,
+        cumulative: (rawCumulative !== '' && rawCumulative != null && !isNaN(parseFloat(rawCumulative)))
+          ? parseFloat(rawCumulative)
+          : null,   // null so connectNulls can bridge it; equityData fallbacks to 100.0
+        peak:   (rawPeak !== '' && rawPeak != null && !isNaN(parseFloat(rawPeak)))
+          ? parseFloat(rawPeak) : null,
+        dd:     (rawDd !== '' && rawDd != null && !isNaN(parseFloat(rawDd)))
+          ? parseFloat(rawDd) : null,
+        pct_dd: (rawPctDd !== '' && rawPctDd != null && !isNaN(parseFloat(rawPctDd)))
+          ? parseFloat(rawPctDd) : null,
       });
     }
 
@@ -95,24 +114,35 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   // Use Series B (compound index starting from 100) for equity curve
   const equityData = useMemo(() => {
     if (!groupedTrades || groupedTrades.length === 0) return [];
-    
-    return groupedTrades.map((group, index) => ({
-      index: index + 1,
-      date: group.exitDate || `Trade ${index + 1}`,
-      cumulative: group.cumulative ?? 100.0,
-      pnl: group.totalPnl ?? 0
-    }));
+
+    return groupedTrades.map((group, index) => {
+      // null means Leg 1 data was unavailable — pass null so connectNulls bridges the gap
+      // rather than inserting a fake 100.0 spike that visually breaks the chart.
+      const cum = (group.cumulative !== null && group.cumulative !== undefined)
+        ? group.cumulative
+        : null;
+      return {
+        index: index + 1,
+        date: group.exitDate || `Trade ${index + 1}`,
+        cumulative: cum,
+        pnl: group.totalPnl ?? 0,
+      };
+    });
   }, [groupedTrades]);
 
   const drawdownData = useMemo(() => {
     if (!groupedTrades || groupedTrades.length === 0) return [];
-    
+
     return groupedTrades.map((group, index) => {
-      const dd = group.pct_dd ?? 0;
+      // null means Leg 1 data was unavailable — pass null so connectNulls bridges the gap.
+      // pct_dd from backend is a percentage (e.g. -0.31), never multiply by 100 here.
+      const dd = (group.pct_dd !== null && group.pct_dd !== undefined)
+        ? group.pct_dd
+        : null;
       return {
         index: index + 1,
         date: group.exitDate || `Trade ${index + 1}`,
-        drawdown: dd
+        drawdown: dd,
       };
     });
   }, [groupedTrades]);
@@ -207,13 +237,25 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           (parseFloat(leg['FUT P&L']) || 0);
       }, 0);
       const pct = entrySpot > 0 ? (net / entrySpot) * 100 : 0;
+      const rawCumulative = legs[0]['Cumulative'];
+      const rawPeak       = legs[0]['Peak'];
+      const rawDd         = legs[0]['DD'];
+      const rawPctDd      = legs[0]['%DD'];
       tradeMetrics[key] = {
         net: +net.toFixed(2),
         pct: +pct.toFixed(2),
-        cumulative: legs[0]['Cumulative'] ?? '',
-        peak: legs[0]['Peak'] ?? '',
-        dd: legs[0]['DD'] ?? '',
-        pctDd: legs[0]['%DD'] ?? '',
+        cumulative: rawCumulative !== '' && rawCumulative != null && !isNaN(parseFloat(rawCumulative))
+          ? parseFloat(rawCumulative)
+          : '',
+        peak: rawPeak !== '' && rawPeak != null && !isNaN(parseFloat(rawPeak))
+          ? parseFloat(rawPeak)
+          : '',
+        dd: rawDd !== '' && rawDd != null && !isNaN(parseFloat(rawDd))
+          ? parseFloat(rawDd)
+          : '',
+        pctDd: rawPctDd !== '' && rawPctDd != null && !isNaN(parseFloat(rawPctDd))
+          ? parseFloat(rawPctDd)
+          : '',
       };
     });
 
@@ -459,14 +501,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     tickFormatter={(value) => value.toFixed(1)}
                   />
                   <Tooltip content={<CustomTooltip />} />
-                  <Area 
-                    type="monotone" 
-                    dataKey="cumulative" 
-                    stroke="#3b82f6" 
+                  <Area
+                    type="monotone"
+                    dataKey="cumulative"
+                    stroke="#3b82f6"
                     strokeWidth={2}
-                    fill="url(#colorEquity)" 
+                    fill="url(#colorEquity)"
                     name="Cumulative P&L"
                     isAnimationActive={false}
+                    connectNulls={true}
                   />
                 </AreaChart>
               </ResponsiveContainer>
@@ -503,14 +546,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     domain={['auto', 0]}
                   />
                   <Tooltip content={<CustomTooltip />} />
-                  <Area 
+                  <Area
                     type="monotone"
-                    dataKey="drawdown" 
-                    stroke="#ef4444" 
+                    dataKey="drawdown"
+                    stroke="#ef4444"
                     strokeWidth={2}
-                    fill="url(#colorDrawdown)" 
+                    fill="url(#colorDrawdown)"
                     name="Drawdown"
                     isAnimationActive={false}
+                    connectNulls={true}
                   />
                 </AreaChart>
               </ResponsiveContainer>

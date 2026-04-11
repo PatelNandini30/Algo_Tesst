@@ -750,6 +750,14 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     entry_spot_nonzero = entry_spot_series.replace(0, np.nan)
     initial_entry_spot = entry_spot_series.iloc[0] if not entry_spot_series.empty else np.nan
 
+    net_pnl_pct = (_adf[trade_pnl_col] / entry_spot_nonzero) * 100
+    net_pnl_pct_series = net_pnl_pct.copy()
+
+    cumulative_series = []
+    peak_series = []
+    dd_series = []
+    pct_dd_series = []
+
     has_series_b = (
         'Cumulative' in _adf.columns and
         len(_adf) > 0 and
@@ -761,27 +769,24 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         _adf = _adf.copy()
         _adf['Cumulative'] = first_entry_spot + _adf[trade_pnl_col].cumsum()
 
-    cumulative_index = 100.0
-    peak_index = 100.0
-
-    net_pnl_pct = (_adf[trade_pnl_col] / entry_spot_nonzero) * 100
-    net_pnl_pct_series = net_pnl_pct.copy()
-
-    cumulative_series = []
-    peak_series = []
-    dd_series = []
-    pct_dd_series = []
-
-    for i in range(len(_adf)):
-        pnl_pct = net_pnl_pct.iloc[i] if pd.notna(net_pnl_pct.iloc[i]) else 0
-        cumulative_index = cumulative_index * (1 + pnl_pct / 100)
-        peak_index = max(peak_index, cumulative_index)
-        dd_index = cumulative_index - peak_index
-        pct_dd = (dd_index / peak_index * 100) if peak_index != 0 else 0
-        cumulative_series.append(round(cumulative_index, 6))
-        peak_series.append(round(peak_index, 6))
-        dd_series.append(round(dd_index, 6))
-        pct_dd_series.append(round(pct_dd, 6))
+    if has_series_b:
+        cumulative_series = _adf['Cumulative'].astype(float).fillna(100.0).tolist()
+        peak_series = _adf['Peak'].astype(float).fillna(100.0).tolist() if 'Peak' in _adf.columns else cumulative_series
+        dd_series = _adf['DD'].astype(float).fillna(0.0).tolist() if 'DD' in _adf.columns else [0.0] * len(_adf)
+        pct_dd_series = _adf['%DD'].astype(float).fillna(0.0).tolist() if '%DD' in _adf.columns else [0.0] * len(_adf)
+    else:
+        cumulative_index = 100.0
+        peak_index = 100.0
+        for i in range(len(_adf)):
+            pnl_pct = net_pnl_pct.iloc[i] if pd.notna(net_pnl_pct.iloc[i]) else 0
+            cumulative_index = cumulative_index * (1 + pnl_pct / 100)
+            peak_index = max(peak_index, cumulative_index)
+            dd_index = cumulative_index - peak_index
+            pct_dd = (dd_index / peak_index * 100) if peak_index != 0 else 0
+            cumulative_series.append(round(cumulative_index, 6))
+            peak_series.append(round(peak_index, 6))
+            dd_series.append(round(dd_index, 6))
+            pct_dd_series.append(round(pct_dd, 6))
 
     _adf = _adf.copy()
     _adf['Cumulative'] = cumulative_series
