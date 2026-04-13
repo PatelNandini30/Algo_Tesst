@@ -5,6 +5,34 @@ import {
 } from 'recharts';
 import { Download, X } from 'lucide-react';
 
+const EXIT_REASON_COLORS = {
+  Expiry: '#6c757d',
+  STOP_LOSS: '#e53e3e',
+  TARGET: '#38a169',
+  TRAIL_SL: '#d69e2e',
+  STR_Exit: '#805ad5',
+  FILTER_END: '#3182ce',
+  FUT_ROLL_ON_EXPIRY: '#0078ff',
+  FUT_ROLL_N_DAYS_BEFORE_EXPIRY: '#0078ff',
+  FUT_ROLL_LAST_WEEK_BEFORE_EXPIRY: '#0078ff',
+  default: '#4a5568',
+};
+
+const renderExitReasonBadge = (reason) => {
+  if (!reason) {
+    return <span className="text-xs text-gray-400">—</span>;
+  }
+  const color = EXIT_REASON_COLORS[reason] || EXIT_REASON_COLORS.default;
+  return (
+    <span
+      className="px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wide"
+      style={{ backgroundColor: color, color: '#fff' }}
+    >
+      {reason}
+    </span>
+  );
+};
+
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
 
@@ -832,6 +860,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Roll Cost</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Reason</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Net P&L</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">% P&L</th>
                     </tr>
@@ -852,6 +882,16 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
+                            const rollCostRaw = leg['Roll Cost'] ?? leg['RollCost'] ?? leg['roll_cost'] ?? leg.roll_cost;
+                            const rollCostVal = rollCostRaw === null || rollCostRaw === undefined ? null : Number(rollCostRaw);
+                            const rollCostCell = (rollCostVal === null || Number.isNaN(rollCostVal) || rollCostVal === 0)
+                              ? <span className="text-xs text-gray-400">—</span>
+                              : (
+                                <span style={{ color: rollCostVal > 0 ? '#e53e3e' : '#38a169', fontWeight: 600 }}>
+                                  {rollCostVal > 0 ? '+' : ''}{rollCostVal.toFixed(2)}
+                                </span>
+                              );
+                            const exitReason = leg['Exit Reason'] || leg['exit_reason'] || leg.ExitReason || '';
                             // Per-leg P&L: CE P&L for options, FUT P&L for futures.
                             // Net P&L and % P&L columns hold the trade-level total
                             // (stamped on every row) — must NOT be used per leg.
@@ -886,6 +926,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{qty}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{entryPrice.toFixed(2)}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{exitPrice.toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-right text-gray-700">{rollCostCell}</td>
+                                <td className="px-3 py-2 text-xs text-gray-700">{renderExitReasonBadge(exitReason)}</td>
                                 <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                   {legNetPnlPoints >= 0 ? '+' : ''}{legNetPnlPoints.toFixed(2)}
                                 </td>
@@ -909,11 +951,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const tradePctPnl = group.entrySpot > 1000
                               ? (tradeNetPnlPoints / group.entrySpot) * 100
                               : 0;
-                            // Summary row comes AFTER the rowSpan ends, so ALL 13 columns
-                            // must be filled. Empty span = 13 total - 2 P&L cols = 11.
+                            // Summary row comes AFTER the rowSpan ends, so ALL 15 columns
+                            // must be filled. Empty span = 15 total - 2 P&L cols = 13.
                             // (The old value of 7 wrongly subtracted the 4 rowSpanned cols,
                             // which pushed Net P&L into the B/S column and % P&L into Qty.)
-                            const emptyCellSpan = 11;
+                            const emptyCellSpan = 13;
                             return (
                               <tr className="border-b-2 border-gray-300 bg-slate-100">
                                 <td colSpan={emptyCellSpan}></td>
