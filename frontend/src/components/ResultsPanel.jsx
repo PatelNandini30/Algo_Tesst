@@ -795,10 +795,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
 
             <div className="space-y-4">
-              <PerformanceMetrics summary={summary} />
               <div className="grid gap-4 lg:grid-cols-2">
-                <EquityCurve data={equityCurveData} />
-                <MonthlyPnlHeatmap pivot={pivot} />
+                {/* Equity Curve placeholder - will be added later */}
+                <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
+                  <h3 className="text-base font-bold text-gray-800 mb-4">Equity Curve</h3>
+                  <p className="text-gray-500 text-sm">Chart unavailable</p>
+                </div>
+                {/* Monthly P&L placeholder - will be added later */}
+                <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
+                  <h3 className="text-base font-bold text-gray-800 mb-4">Monthly P&L</h3>
+                  <p className="text-gray-500 text-sm">Chart unavailable</p>
+                </div>
               </div>
             </div>
 
