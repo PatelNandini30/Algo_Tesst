@@ -4,10 +4,6 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine
 } from 'recharts';
 import { Download, X } from 'lucide-react';
-import EquityCurve from './EquityCurve';
-import PerformanceMetrics from './PerformanceMetrics';
-import MonthlyPnlHeatmap from './MonthlyPnlHeatmap';
-import TradeLog from './TradeLog';
 
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
@@ -21,9 +17,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   
   console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
   const { trades = [], summary = {}, pivot = {} } = results;
-  const returns = results?.returns || {};
   const warnings = results?.warnings || [];
-  const costBreakdown = returns.cost_breakdown || {};
   const filteredWarnings = warnings.filter(Boolean);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
@@ -560,44 +554,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               </p>
             </div>
           </div>
-
-          {returns.total_cost !== undefined && results.meta?.cost_model_enabled && (
-            <div className="mt-3 bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
-              <div className="flex flex-wrap items-center gap-2 mb-3">
-                <h3 className="text-sm font-semibold text-gray-800">Cost report</h3>
-                <span className="text-[11px] text-gray-500">(backend-imposed)</span>
-              </div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div>
-                  <p className="text-[11px] text-gray-500 uppercase">Gross P&L</p>
-                  <p className="text-lg font-semibold text-gray-800">₹{(returns.gross_pnl || 0).toFixed(2)}</p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-gray-500 uppercase">Net P&L</p>
-                  <p className="text-lg font-semibold text-gray-800">₹{(returns.net_pnl ?? 0).toFixed(2)}</p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-gray-500 uppercase">Total cost</p>
-                  <p className="text-lg font-semibold text-gray-800">₹{(returns.total_cost || 0).toFixed(2)}</p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-gray-500 uppercase">Cost drag</p>
-                  <p className="text-lg font-semibold text-gray-800">{(returns.cost_drag_pct || 0).toFixed(2)}%</p>
-                </div>
-              </div>
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4 text-xs">
-                {['brokerage', 'stt', 'exchange', 'gst', 'sebi', 'stamp_duty', 'slippage'].map((key) => (
-                  <div key={key} className="bg-gray-50 rounded-lg p-2">
-                    <p className="text-[10px] text-gray-500 uppercase">{key.replace('_', ' ')}</p>
-                    <p className="text-sm font-semibold text-gray-800">₹{(costBreakdown[key] || 0).toFixed(2)}</p>
-                  </div>
-                ))}
-              </div>
-              <p className="mt-2 text-[11px] text-gray-500">
-                Cost reconciliation is enforced: gross − total_cost = net to ₹0.01 tolerance.
-              </p>
-            </div>
-          )}
 
           {/* Charts */}
           <div className="p-6 space-y-6 bg-gray-50">
