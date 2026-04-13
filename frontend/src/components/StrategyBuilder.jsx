@@ -699,6 +699,7 @@ const StrategyBuilder = () => {
 
   const removeLeg = (id) => setLegs(prev => prev.filter(l => l.id !== id));
   const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => l.id === id ? { ...l, [field]: value } : l));
+  const handleLegChange = (legIndex, nextLeg) => setLegs(prev => prev.map((leg, idx) => idx === legIndex ? { ...leg, ...nextLeg } : leg));
 
   const buildPayload = () => {
     const legsPayload = legs.map(l => {
@@ -726,6 +727,14 @@ const StrategyBuilder = () => {
       }
       if (segmentType === 'futures') {
         leg.expiry = (l.expiry || 'monthly').toLowerCase();
+        Object.assign(leg, {
+          fut_exit_mode: l.fut_exit_mode || 'ON_EXPIRY',
+          fut_n_days: l.fut_n_days ?? 5,
+          fut_with_filter: l.fut_with_filter !== false,
+          fut_sl_override: l.fut_sl_override !== false,
+          fut_target_override: l.fut_target_override !== false,
+          fut_with_spot_adj: l.fut_with_spot_adj !== false,
+        });
       }
 
       // Target Profit - only send if enabled AND value is set
@@ -1267,6 +1276,9 @@ const StrategyBuilder = () => {
                             className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
                           />
                         </div>
+                        {leg.segment === 'futures' && (
+                          <FuturesRolloverConfig leg={leg} legIndex={idx} onLegChange={handleLegChange} />
+                        )}
                       </div>
                     </div>
                   )}
@@ -1803,5 +1815,131 @@ const StrategyBuilder = () => {
     </div>
   );
 };
+
+const FuturesRolloverConfig = ({ leg, legIndex, onLegChange }) => {
+  const exitMode = leg.fut_exit_mode || 'ON_EXPIRY';
+
+  const handleChange = (field, value) => {
+    onLegChange(legIndex, { ...leg, [field]: value });
+  };
+
+  return (
+    <div className="futures-rollover-config" style={{
+      marginTop: 12,
+      padding: "10px 14px",
+      background: "rgba(0, 120, 255, 0.06)",
+      border: "1px solid rgba(0, 120, 255, 0.20)",
+      borderRadius: 8,
+    }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#0078ff", marginBottom: 10, letterSpacing: 1 }}>
+        ⚙ FUTURES EXIT & ROLLOVER
+      </div>
+
+      <div className="config-row" style={{ marginBottom: 10 }}>
+        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>
+          Exit Trigger
+        </label>
+        <select
+          value={exitMode}
+          onChange={(e) => handleChange("fut_exit_mode", e.target.value)}
+          style={{ width: "100%", padding: "5px 8px", borderRadius: 6, fontSize: 12 }}
+        >
+          <option value="ON_EXPIRY">On Monthly Expiry Day</option>
+          <option value="N_DAYS_BEFORE_EXPIRY">N Days Before Expiry</option>
+          <option value="LAST_WEEK_BEFORE_EXPIRY">Last 5 Trading Days Before Expiry (Expiry Week)</option>
+        </select>
+      </div>
+
+      {exitMode === "N_DAYS_BEFORE_EXPIRY" && (
+        <div className="config-row" style={{ marginBottom: 10 }}>
+          <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>
+            Days Before Expiry (1–15)
+          </label>
+          <input
+            type="number"
+            min={1}
+            max={15}
+            value={leg.fut_n_days ?? 5}
+            onChange={(e) => handleChange("fut_n_days", parseInt(e.target.value, 10) || 5)}
+            style={{ width: 80, padding: "5px 8px", borderRadius: 6, fontSize: 12 }}
+          />
+          <span style={{ fontSize: 11, color: "#aaa", marginLeft: 8 }}>
+            e.g. 5 → exit 5 calendar days before last Thursday
+          </span>
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 6 }}>
+        <ToggleOption
+          label="Respect Filter on Roll"
+          tooltip="If ON: futures rollover respects the active STR/date filter — don't roll into a new month if filter is inactive. If OFF: always roll regardless of filter."
+          checked={leg.fut_with_filter !== false}
+          onChange={(v) => handleChange("fut_with_filter", v)}
+        />
+        <ToggleOption
+          label="SL Cancels Rollover"
+          tooltip="If SL is hit during the futures hold period, close everything and skip rollover into next month."
+          checked={leg.fut_sl_override !== false}
+          onChange={(v) => handleChange("fut_sl_override", v)}
+        />
+        <ToggleOption
+          label="Target Cancels Rollover"
+          tooltip="If Target is hit, close everything and skip rollover."
+          checked={leg.fut_target_override !== false}
+          onChange={(v) => handleChange("fut_target_override", v)}
+        />
+        <ToggleOption
+          label="Spot Adj on Roll"
+          tooltip="Apply spot adjustment at the rollover entry date."
+          checked={leg.fut_with_spot_adj !== false}
+          onChange={(v) => handleChange("fut_with_spot_adj", v)}
+        />
+      </div>
+
+      <div style={{
+        marginTop: 10,
+        padding: "6px 10px",
+        background: "rgba(255, 180, 0, 0.07)",
+        borderRadius: 6,
+        fontSize: 11,
+        color: "#b8860b",
+        lineHeight: 1.6,
+      }}>
+        ℹ Roll Cost = Next-month entry price − Current-month exit price.<br />
+        In contango (normal): positive roll cost (debit for longs, credit for shorts).<br />
+        Shown separately in the trade sheet under "Roll Cost" column.
+      </div>
+    </div>
+  );
+};
+
+const ToggleOption = ({ label, tooltip, checked, onChange }) => (
+  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+    <div
+      onClick={() => onChange(!checked)}
+      style={{
+        width: 32,
+        height: 16,
+        borderRadius: 8,
+        background: checked ? "#0078ff" : "#ccc",
+        position: "relative",
+        cursor: "pointer",
+        transition: "background 0.2s",
+      }}
+    >
+      <div style={{
+        position: "absolute",
+        width: 12,
+        height: 12,
+        borderRadius: "50%",
+        background: "#fff",
+        top: 2,
+        left: checked ? 18 : 2,
+        transition: "left 0.2s",
+      }} />
+    </div>
+    <span style={{ fontSize: 11, color: "#555" }} title={tooltip}>{label}</span>
+  </div>
+);
 
 export default StrategyBuilder;
