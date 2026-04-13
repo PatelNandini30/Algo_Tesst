@@ -1,9 +1,13 @@
 import React, { useMemo, useState, useEffect } from 'react';
-import { 
+import {
   AreaChart, Area, BarChart, Bar,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer 
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine
 } from 'recharts';
 import { Download, X } from 'lucide-react';
+import EquityCurve from './EquityCurve';
+import PerformanceMetrics from './PerformanceMetrics';
+import MonthlyPnlHeatmap from './MonthlyPnlHeatmap';
+import TradeLog from './TradeLog';
 
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
@@ -17,6 +21,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   
   console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
   const { trades = [], summary = {}, pivot = {} } = results;
+  const returns = results?.returns || {};
+  const warnings = results?.warnings || [];
+  const costBreakdown = returns.cost_breakdown || {};
+  const filteredWarnings = warnings.filter(Boolean);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
 
@@ -40,7 +48,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       }
     });
 
-    // Pass 2: build groups
+    // Pass 2: build groups (only main trades, skip rolled/continuation trades)
     const groupMap = new Map(); // groupKey → { legs: Map(legNum → row), firstRow, tradeNum }
     trades.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
@@ -48,9 +56,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       const entryDate = trade['Entry Date'] || '';
       const canonical = canonicalEntryByTrade.get(tradeNum) || entryDate;
 
-      const groupKey = entryDate === canonical
-        ? tradeNum
-        : `rolled_${tradeNum}_${entryDate}`;
+      // Skip rolled/continuation trades - only include main trades with canonical entry date
+      if (entryDate !== canonical) {
+        return;
+      }
+
+      const groupKey = tradeNum;
 
       if (!groupMap.has(groupKey)) {
         groupMap.set(groupKey, { legs: new Map(), firstRow: trade, tradeNum });
@@ -189,6 +200,34 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       };
     });
   }, [groupedTrades]);
+
+  // equityCurveData — use backend equity_curve if available, else fall back to grouped trades data
+  const equityCurveData = useMemo(() => {
+    if (results.equity_curve && results.equity_curve.length) return results.equity_curve;
+    return equityData.map(point => ({
+      date: point.date,
+      net_cumulative: point.cumulative,
+      gross_cumulative: point.cumulative,
+    }));
+  }, [results.equity_curve, equityData]);
+
+  // Pre-compute Y-axis domains so they are stable across renders
+  const equityDomain = useMemo(() => {
+    const vals = equityData.map(d => d.cumulative).filter(v => v != null && !isNaN(v));
+    if (vals.length === 0) return [90, 110];
+    const lo = Math.max(0, Math.floor(Math.min(...vals) - 5));
+    const hi = Math.ceil(Math.max(...vals) + 2);
+    return [lo, hi];
+  }, [equityData]);
+
+  const drawdownDomain = useMemo(() => {
+    const vals = drawdownData.map(d => d.drawdown).filter(v => v != null && !isNaN(v));
+    const ddMin = vals.length > 0 ? Math.min(...vals) : -1;
+    // Add 10% headroom below the minimum; keep max at 0.5 so the zero line
+    // is slightly below the top edge and always visible.
+    const lo = ddMin >= 0 ? -1 : Math.floor(ddMin * 1.15 * 10) / 10;
+    return [lo, 0.5];
+  }, [drawdownData]);
 
   // Calculate stats
   const stats = useMemo(() => {
@@ -476,6 +515,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           </div>
 
           {/* Summary Cards */}
+          {filteredWarnings.length > 0 && (
+            <div className="mb-3 px-4 py-2 rounded-lg border border-yellow-300 bg-yellow-50 text-xs text-yellow-800">
+              {filteredWarnings.map((msg, idx) => (
+                <p key={`${msg}-${idx}`} className="leading-tight">
+                  ⚠️ {msg}
+                </p>
+              ))}
+            </div>
+          )}
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6 bg-gradient-to-br from-gray-50 to-gray-100">
             <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
               <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Total P&L</p>
@@ -513,19 +561,50 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
           </div>
 
+          {returns.total_cost !== undefined && results.meta?.cost_model_enabled && (
+            <div className="mt-3 bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
+              <div className="flex flex-wrap items-center gap-2 mb-3">
+                <h3 className="text-sm font-semibold text-gray-800">Cost report</h3>
+                <span className="text-[11px] text-gray-500">(backend-imposed)</span>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                  <p className="text-[11px] text-gray-500 uppercase">Gross P&L</p>
+                  <p className="text-lg font-semibold text-gray-800">₹{(returns.gross_pnl || 0).toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-gray-500 uppercase">Net P&L</p>
+                  <p className="text-lg font-semibold text-gray-800">₹{(returns.net_pnl ?? 0).toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-gray-500 uppercase">Total cost</p>
+                  <p className="text-lg font-semibold text-gray-800">₹{(returns.total_cost || 0).toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-[11px] text-gray-500 uppercase">Cost drag</p>
+                  <p className="text-lg font-semibold text-gray-800">{(returns.cost_drag_pct || 0).toFixed(2)}%</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mt-4 text-xs">
+                {['brokerage', 'stt', 'exchange', 'gst', 'sebi', 'stamp_duty', 'slippage'].map((key) => (
+                  <div key={key} className="bg-gray-50 rounded-lg p-2">
+                    <p className="text-[10px] text-gray-500 uppercase">{key.replace('_', ' ')}</p>
+                    <p className="text-sm font-semibold text-gray-800">₹{(costBreakdown[key] || 0).toFixed(2)}</p>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-2 text-[11px] text-gray-500">
+                Cost reconciliation is enforced: gross − total_cost = net to ₹0.01 tolerance.
+              </p>
+            </div>
+          )}
+
           {/* Charts */}
           <div className="p-6 space-y-6 bg-gray-50">
             {/* Equity Curve */}
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <h3 className="text-base font-bold text-gray-800 mb-4">Equity Curve (Cumulative P&L)</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
-              {(() => {
-                const validCum = equityData.map(d => d.cumulative).filter(v => v != null);
-                const eMin = validCum.length > 0 ? Math.min(...validCum) : 95;
-                const eMax = validCum.length > 0 ? Math.max(...validCum) : 105;
-                const domainMin = Math.max(0, Math.floor(eMin - 5));
-                const domainMax = Math.ceil(eMax + 2);
-                return (
               <ResponsiveContainer width="100%" height={300}>
                 <AreaChart data={equityData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
@@ -549,7 +628,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
                     tickFormatter={(value) => value.toFixed(1)}
-                    domain={[domainMin, domainMax]}
+                    domain={equityDomain}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area
@@ -561,12 +640,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     name="Cumulative P&L"
                     isAnimationActive={false}
                     connectNulls={true}
-                    baseValue={domainMin}
+                    baseValue={equityDomain[0]}
                   />
                 </AreaChart>
               </ResponsiveContainer>
-                );
-              })()}
               </div>
             </div>
 
@@ -574,11 +651,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <h3 className="text-base font-bold text-gray-800 mb-4">Drawdown</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
-              {(() => {
-                const ddVals = drawdownData.map(d => d.drawdown).filter(v => v != null && !isNaN(v));
-                const ddMin = ddVals.length > 0 ? Math.min(...ddVals) : -1;
-                const ddDomainMin = ddMin >= 0 ? -1 : Math.floor(ddMin * 1.1 * 10) / 10;
-                return (
               <ResponsiveContainer width="100%" height={260}>
                 <AreaChart data={drawdownData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
@@ -602,9 +674,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
                     tickFormatter={(value) => `${value.toFixed(1)}%`}
-                    domain={[ddDomainMin, 0]}
+                    domain={drawdownDomain}
                   />
                   <Tooltip content={<CustomTooltip />} />
+                  {/* Zero baseline — visible even during periods of zero drawdown */}
+                  <ReferenceLine y={0} stroke="#9ca3af" strokeWidth={1} />
                   <Area
                     type="monotone"
                     dataKey="drawdown"
@@ -618,8 +692,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   />
                 </AreaChart>
               </ResponsiveContainer>
-                );
-              })()}
               </div>
             </div>
 
@@ -763,6 +835,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   <p className="font-bold text-gray-900 mb-0.5">Max trades in any drawdown</p>
                   <p className="font-normal text-gray-900">{stats.mddTradeNumber || 'N/A'}</p>
                 </div>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <PerformanceMetrics summary={summary} />
+              <div className="grid gap-4 lg:grid-cols-2">
+                <EquityCurve data={equityCurveData} />
+                <MonthlyPnlHeatmap pivot={pivot} />
               </div>
             </div>
 
