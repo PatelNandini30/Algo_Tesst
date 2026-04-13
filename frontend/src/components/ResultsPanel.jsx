@@ -66,10 +66,20 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       // Leg 1 is the only row the backend populates Cumulative/Peak/DD/%DD on.
       // firstRow is the first-encountered row which may be Leg 2+ if the trades
       // array arrives out of leg order — so always look up Leg '1' explicitly.
-      const leg1Row = legs.get('1') || legs.get(1) ||
-        legsArr.slice().sort((a, b) =>
-          parseInt(a.Leg || a.leg || 1, 10) - parseInt(b.Leg || b.leg || 1, 10)
-        )[0] || firstRow;
+      // Try string '1', integer 1, then sort by leg number ascending and pick
+      // the row that actually has Cumulative populated (most reliable signal).
+      const sortedLegsAsc = legsArr.slice().sort((a, b) =>
+        parseInt(a.Leg || a.leg || 1, 10) - parseInt(b.Leg || b.leg || 1, 10)
+      );
+      // Prefer the row that has Cumulative populated, fallback to lowest leg number
+      const leg1Row =
+        sortedLegsAsc.find(r =>
+          r['Cumulative'] !== '' && r['Cumulative'] != null && !isNaN(parseFloat(r['Cumulative']))
+        ) ||
+        legs.get('1') ||
+        legs.get(1) ||
+        sortedLegsAsc[0] ||
+        firstRow;
 
       const rawCumulative = leg1Row['Cumulative'];
       const rawPeak       = leg1Row['Peak'];
@@ -115,12 +125,28 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const equityData = useMemo(() => {
     if (!groupedTrades || groupedTrades.length === 0) return [];
 
+    let lastCumulative = 100;
+
     return groupedTrades.map((group, index) => {
-      // null means Leg 1 data was unavailable — pass null so connectNulls bridges the gap
-      // rather than inserting a fake 100.0 spike that visually breaks the chart.
-      const cum = (group.cumulative !== null && group.cumulative !== undefined)
-        ? group.cumulative
-        : null;
+      // Scan ALL legs for the first populated cumulative value —
+      // the backend stamps it on Leg 1 but may arrive on any leg when
+      // multiple legs are present and data is unsorted.
+      let cum = group.cumulative;
+      if (cum === null || cum === undefined) {
+        for (const leg of group.legs) {
+          const raw = leg['Cumulative'];
+          if (raw !== '' && raw != null && !isNaN(parseFloat(raw))) {
+            cum = parseFloat(raw);
+            break;
+          }
+        }
+      }
+      // Carry forward previous cumulative value to maintain chart continuity
+      if (cum === null || cum === undefined) {
+        cum = lastCumulative;
+      } else {
+        lastCumulative = cum;
+      }
       return {
         index: index + 1,
         date: group.exitDate || `Trade ${index + 1}`,
@@ -133,16 +159,33 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const drawdownData = useMemo(() => {
     if (!groupedTrades || groupedTrades.length === 0) return [];
 
+    let lastDd = null;
+
     return groupedTrades.map((group, index) => {
-      // null means Leg 1 data was unavailable — pass null so connectNulls bridges the gap.
+      // Scan ALL legs for the first populated %DD value — same as equityData fix.
+      // Fall back to null (not 0) so connectNulls bridges gaps instead of
+      // injecting fake zero spikes that visually break the chart.
+      let dd = group.pct_dd;
+      if (dd === null || dd === undefined) {
+        for (const leg of group.legs) {
+          const raw = leg['%DD'];
+          if (raw !== '' && raw != null && !isNaN(parseFloat(raw))) {
+            dd = parseFloat(raw);
+            break;
+          }
+        }
+      }
+      // Carry forward previous drawdown value to maintain chart continuity
+      if (dd === null || dd === undefined) {
+        dd = lastDd;
+      } else {
+        lastDd = dd;
+      }
       // pct_dd from backend is a percentage (e.g. -0.31), never multiply by 100 here.
-      const dd = (group.pct_dd !== null && group.pct_dd !== undefined)
-        ? group.pct_dd
-        : null;
       return {
         index: index + 1,
         date: group.exitDate || `Trade ${index + 1}`,
-        drawdown: dd,
+        drawdown: (dd !== null && dd !== undefined) ? dd : null,
       };
     });
   }, [groupedTrades]);
@@ -476,6 +519,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <h3 className="text-base font-bold text-gray-800 mb-4">Equity Curve (Cumulative P&L)</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
+              {(() => {
+                const validCum = equityData.map(d => d.cumulative).filter(v => v != null);
+                const eMin = validCum.length > 0 ? Math.min(...validCum) : 95;
+                const eMax = validCum.length > 0 ? Math.max(...validCum) : 105;
+                const domainMin = Math.max(0, Math.floor(eMin - 5));
+                const domainMax = Math.ceil(eMax + 2);
+                return (
               <ResponsiveContainer width="100%" height={300}>
                 <AreaChart data={equityData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
@@ -485,8 +535,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
-                  <XAxis 
-                    dataKey="date" 
+                  <XAxis
+                    dataKey="date"
                     stroke="#9ca3af"
                     tick={{ fontSize: 10, fill: '#6b7280' }}
                     tickLine={false}
@@ -494,11 +544,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     interval="preserveStartEnd"
                     minTickGap={50}
                   />
-                  <YAxis 
+                  <YAxis
                     stroke="#9ca3af"
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
                     tickFormatter={(value) => value.toFixed(1)}
+                    domain={[domainMin, domainMax]}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area
@@ -510,9 +561,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     name="Cumulative P&L"
                     isAnimationActive={false}
                     connectNulls={true}
+                    baseValue={domainMin}
                   />
                 </AreaChart>
               </ResponsiveContainer>
+                );
+              })()}
               </div>
             </div>
 
@@ -520,6 +574,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <h3 className="text-base font-bold text-gray-800 mb-4">Drawdown</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
+              {(() => {
+                const ddVals = drawdownData.map(d => d.drawdown).filter(v => v != null && !isNaN(v));
+                const ddMin = ddVals.length > 0 ? Math.min(...ddVals) : -1;
+                const ddDomainMin = ddMin >= 0 ? -1 : Math.floor(ddMin * 1.1 * 10) / 10;
+                return (
               <ResponsiveContainer width="100%" height={260}>
                 <AreaChart data={drawdownData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
@@ -529,8 +588,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
-                  <XAxis 
-                    dataKey="date" 
+                  <XAxis
+                    dataKey="date"
                     stroke="#9ca3af"
                     tick={{ fontSize: 10, fill: '#6b7280' }}
                     tickLine={false}
@@ -538,12 +597,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     interval="preserveStartEnd"
                     minTickGap={50}
                   />
-                  <YAxis 
+                  <YAxis
                     stroke="#9ca3af"
                     tick={{ fontSize: 11, fill: '#6b7280' }}
                     tickLine={false}
                     tickFormatter={(value) => `${value.toFixed(1)}%`}
-                    domain={['auto', 0]}
+                    domain={[ddDomainMin, 0]}
                   />
                   <Tooltip content={<CustomTooltip />} />
                   <Area
@@ -555,9 +614,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     name="Drawdown"
                     isAnimationActive={false}
                     connectNulls={true}
+                    baseValue={0}
                   />
                 </AreaChart>
               </ResponsiveContainer>
+                );
+              })()}
               </div>
             </div>
 
