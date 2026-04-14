@@ -221,11 +221,11 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   );
 
   return (
-    <div className="bg-white shadow-sm border border-gray-200 rounded-xl p-4 space-y-3" style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+    <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3" style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold uppercase tracking-widest text-gray-600 border-l-4 border-blue-600 pl-2">
+          <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
             Filter
           </span>
         </div>
@@ -247,7 +247,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={csvUploading}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-50 border border-gray-200 rounded-lg hover:bg-gray-100 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-secondary bg-hover border border-default rounded-lg hover:bg-base transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {csvUploading ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -257,7 +257,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
               Upload CSV
             </button>
             {csvFileName && (
-              <span className="flex items-center gap-1 text-xs text-green-600">
+              <span className="flex items-center gap-1 text-xs text-profit">
                 <FileText className="w-3 h-3" />
                 {csvFileName}
                 <button
@@ -268,7 +268,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                     setUploadError('');
                     setSelected('5x1');
                   }}
-                  className="ml-1 hover:text-red-600"
+                  className="ml-1 hover:text-loss"
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -276,7 +276,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
             )}
           </div>
           {uploadError && (
-            <p className="text-xs text-red-600">{uploadError}</p>
+            <p className="text-xs text-loss">{uploadError}</p>
           )}
 
           <div className="space-y-3">
@@ -284,13 +284,13 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
               <button
                 type="button"
                 onClick={() => setDropdownOpen(v => !v)}
-                className="w-full flex items-center justify-between rounded-lg border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 shadow-sm hover:border-blue-400 transition duration-200"
+                className="w-full flex items-center justify-between rounded-lg border border-blue-200 bg-hover px-4 py-2 text-sm font-medium text-blue-700 shadow-sm hover:border-blue-400 transition duration-200"
               >
                 <span>{selectedOption.label}</span>
                 <ChevronDown size={16} />
               </button>
               {dropdownOpen && (
-                <div className="absolute z-20 mt-1 w-full rounded-lg border border-gray-200 bg-white shadow-lg">
+                <div className="absolute z-20 mt-1 w-full rounded-lg border border-default bg-surface shadow-lg">
                   {STR_FILTER_OPTIONS.map(opt => (
                     <button
                       key={opt.value}
@@ -300,7 +300,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                         setDropdownOpen(false);
                       }}
                       className={`w-full text-left px-4 py-3 text-sm transition-colors ${
-                        opt.value === selected ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-50'
+                        opt.value === selected ? 'bg-accent text-inverse text-white' : 'text-secondary hover:bg-hover'
                       }`}
                     >
                       {opt.label}
@@ -311,18 +311,18 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
             </div>
 
             <div className="flex items-center gap-2">
-              {catalogLoading && <Loader2 className="text-blue-600 animate-spin" size={16} />}
-              <span className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700 shadow-sm">
+              {catalogLoading && <Loader2 className="text-accent animate-spin" size={16} />}
+              <span className="rounded-full border border-subtle bg-hover px-3 py-1 text-xs font-semibold text-blue-700 shadow-sm">
                 {badgeText}
               </span>
             </div>
             {catalogError && (
-              <div className="flex flex-wrap items-center gap-2 text-xs text-red-600">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-loss">
                 <span>{catalogError}</span>
                 <button
                   type="button"
                   onClick={fetchFilterCatalog}
-                  className="text-red-500 underline underline-offset-2"
+                  className="text-loss underline underline-offset-2"
                 >
                   Retry
                 </button>
@@ -336,24 +336,24 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
 
             {/* Entry Mode */}
             <div className="space-y-1.5">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+              <p className="text-xs font-semibold text-muted uppercase tracking-wide">
                 Entry Mode
               </p>
               <div className="relative">
                 <select
                   value={entryMode}
                   onChange={e => setEntryMode(e.target.value)}
-                  className="w-full appearance-none rounded-lg border border-blue-200 bg-blue-50 pl-4 pr-9 py-2 text-sm font-medium text-blue-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-400 cursor-pointer transition-colors duration-200 hover:border-blue-400"
+                  className="w-full appearance-none rounded-lg border border-blue-200 bg-hover pl-4 pr-9 py-2 text-sm font-medium text-blue-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-400 cursor-pointer transition-colors duration-200 hover:border-blue-400"
                 >
                   <option value="dte">DTE Entry — N days before each expiry</option>
                   <option value="fixed">Fixed Entry — Pinned to segment start</option>
                 </select>
                 <ChevronDown
                   size={14}
-                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-blue-500"
+                  className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-accent"
                 />
               </div>
-              <p className="text-[11px] text-gray-500 leading-relaxed">
+              <p className="text-[11px] text-muted leading-relaxed">
                 {entryMode === 'dte'
                   ? 'Enter N days before each expiry within the segment. Current behaviour — unchanged.'
                   : 'Enter on segment start date, then re-enter the next trading day after each exit. Stays active throughout the segment with no gap.'}
@@ -361,12 +361,12 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
             </div>
 
             {previewRows.length > 0 && (
-              <div className="space-y-1 text-[11px] text-gray-600">
-                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Segment preview</p>
+              <div className="space-y-1 text-[11px] text-secondary">
+                <p className="text-xs font-semibold text-muted uppercase tracking-wide">Segment preview</p>
                 {previewRows.map((row, idx) => (
-                  <div key={`preview-${selected}-${idx}`} className="flex items-center justify-between text-gray-700">
+                  <div key={`preview-${selected}-${idx}`} className="flex items-center justify-between text-secondary">
                     <span>{row.start}</span>
-                    <span className="text-gray-400">→</span>
+                    <span className="text-muted">→</span>
                     <span>{row.end}</span>
                   </div>
                 ))}
@@ -374,7 +374,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
             )}
 
             {selected === 'custom' && (
-              <div className="text-[11px] text-gray-500 space-y-1">
+              <div className="text-[11px] text-muted space-y-1">
                 <p>CSV requires exactly two columns: start/start_date/startdt/from/from_date or entry/entry_date/entrydt, plus the matching end/exit column.</p>
                 <p>Supported formats: DD-MM-YYYY, YYYY-MM-DD, MM/DD/YYYY, DD/MM/YYYY, YYYY/MM/DD, DD-Mon-YYYY, YYYYMMDD.</p>
               </div>

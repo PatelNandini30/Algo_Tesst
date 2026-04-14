@@ -17,10 +17,10 @@ const Toggle = ({ enabled, onToggle, size = 'md' }) => {
       type="button"
       onClick={onToggle}
       className={`relative inline-flex ${sizeClasses} flex-shrink-0 items-center rounded-full transition-colors duration-200 focus:outline-none ${
-        enabled ? 'bg-blue-600' : 'bg-gray-300'
+        enabled ? 'bg-accent text-inverse' : 'bg-gray-300'
       }`}
     >
-      <span className={`inline-block ${dotClasses} transform rounded-full bg-white shadow transition-transform duration-200 ${translateClasses}`} />
+      <span className={`inline-block ${dotClasses} transform rounded-full bg-surface shadow transition-transform duration-200 ${translateClasses}`} />
     </button>
   );
 };

@@ -7,40 +7,44 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Primary Brand Colors
-        primary: {
-          50: '#eff6ff',
-          100: '#dbeafe',
-          200: '#bfdbfe',
-          300: '#93c5fd',
-          400: '#60a5fa',
-          500: '#3b82f6',
-          600: '#2563eb',
-          700: '#1d4ed8',
-          800: '#1e40af',
-          900: '#1e3a8a',
-        },
-        // Dark Mode Background
-        dark: {
-          bg: '#0f172a',
-          card: '#1e293b',
-          hover: '#334155',
-          border: '#475569',
-        },
-        // Semantic Colors
-        success: '#10b981',
-        warning: '#f59e0b',
-        error: '#ef4444',
-        info: '#3b82f6',
-        // Financial Data Colors
-        profit: '#22c55e',
-        loss: '#ef4444',
-        neutral: '#6b7280',
+        // Tailwind mappings to our CSS variables
+        base: 'var(--bg-base)',
+        surface: 'var(--bg-surface)',
+        elevated: 'var(--bg-elevated)',
+        hover: 'var(--bg-hover)',
+        active: 'var(--bg-active)',
+        input: 'var(--bg-input)',
+        
+        // Borders
+        subtle: 'var(--border-subtle)',
+        default: 'var(--border-default)',
+        strong: 'var(--border-strong)',
+        'accent-border': 'var(--border-accent)',
+        
+        // Text
+        primary: 'var(--text-primary)',
+        secondary: 'var(--text-secondary)',
+        muted: 'var(--text-muted)',
+        inverse: 'var(--text-inverse)',
+        
+        // Semantic Data
+        profit: 'var(--profit)',
+        'profit-dim': 'var(--profit-dim)',
+        'profit-bg': 'var(--profit-bg)',
+        loss: 'var(--loss)',
+        'loss-dim': 'var(--loss-dim)',
+        'loss-bg': 'var(--loss-bg)',
+        warning: 'var(--warning)',
+        'warning-bg': 'var(--warning-bg)',
+        
+        // Accent/Brand
+        accent: 'var(--accent)',
+        'accent-dim': 'var(--accent-dim)',
+        'accent-bg': 'var(--accent-bg)',
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
-        display: ['Poppins', 'sans-serif'],
+        mono: ['DM Mono', 'JetBrains Mono', 'monospace'],
       },
       boxShadow: {
         'card': '0 2px 8px rgba(0, 0, 0, 0.08)',

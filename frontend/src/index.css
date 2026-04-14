@@ -1,14 +1,65 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  /* Backgrounds */
+  --bg-base: #f4f6f8;          /* App background (light gray) */
+  --bg-surface: #ffffff;       /* Cards, panels */
+  --bg-elevated: #ffffff;      /* Modals, dropdowns */
+  --bg-hover: #f0f2f5;         /* Row hover */
+  --bg-active: #e6f0fa;        /* Selected/active */
+  --bg-input: #ffffff;         /* Input fields */
+
+  /* Borders */
+  --border-subtle: #eaecf0;    /* Barely visible dividers */
+  --border-default: #d0d5dd;   /* Standard borders */
+  --border-strong: #98a2b3;    /* Emphasized borders */
+  --border-accent: #3d6bff;    /* Focus rings, active */
+
+  /* Text */
+  --text-primary: #101828;     /* Main content (near black) */
+  --text-secondary: #475467;   /* Labels, sublabels */
+  --text-muted: #98a2b3;       /* Placeholders, disabled */
+  --text-inverse: #ffffff;     /* Text on dark backgrounds (buttons) */
+
+  /* Semantic - Financial (adjusted for light mode) */
+  --profit: #059669;           /* Emerald green */
+  --profit-dim: #10b981;       /* Hover state */
+  --profit-bg: rgba(5, 150, 105, 0.08);
+  --profit-border: rgba(5, 150, 105, 0.25);
+  
+  --loss: #dc2626;             /* Vivid red */
+  --loss-dim: #ef4444;
+  --loss-bg: rgba(220, 38, 38, 0.08);
+  --loss-border: rgba(220, 38, 38, 0.25);
+  
+  --warning: #d97706;          /* Amber */
+  --warning-bg: rgba(245, 158, 11, 0.12);
+
+  /* Accent / Brand */
+  --accent: #2563eb;           /* Electric blue */
+  --accent-dim: #3b82f6;
+  --accent-bg: rgba(37, 99, 235, 0.08);
+  --accent-glow: rgba(37, 99, 235, 0.3);
+
+  /* Chart colors */
+  --chart-equity: #2563eb;     /* Equity curve line */
+  --chart-drawdown: #dc2626;   /* Drawdown fill */
+  --chart-grid: #eaecf0;       /* Chart gridlines */
+  --chart-pnl-bar-pos: #10b981;
+  --chart-pnl-bar-neg: #ef4444;
+}
+
 body {
-  background-color: #F8FAFC;
+  background-color: var(--bg-base);
   font-family: 'Inter', system-ui, sans-serif;
-  color: #0f172a;
+  color: var(--text-primary);
 }
 
 #root {
   min-height: 100vh;
-  background-color: #F8FAFC;
+  background-color: var(--bg-base);
 }

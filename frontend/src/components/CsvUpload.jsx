@@ -110,28 +110,28 @@ const CsvUpload = () => {
   }, [status]);
 
   return (
-    <div className="bg-white border border-gray-200 shadow-sm rounded-xl p-5 space-y-5" style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+    <div className="bg-surface border border-default shadow-sm rounded-xl p-5 space-y-5" style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
       <div className="flex items-center gap-3">
-        <Database size={20} className="text-blue-600" />
+        <Database size={20} className="text-accent" />
         <div>
-          <p className="text-xs font-semibold tracking-[0.2em] text-gray-600 uppercase">Data Import</p>
-          <p className="text-sm text-gray-500">Feed CSV files into PostgreSQL</p>
+          <p className="text-xs font-semibold tracking-[0.2em] text-secondary uppercase">Data Import</p>
+          <p className="text-sm text-muted">Feed CSV files into PostgreSQL</p>
         </div>
       </div>
 
       <div>
-        <p className="text-xs font-semibold text-gray-500 mb-2">Target table</p>
+        <p className="text-xs font-semibold text-muted mb-2">Target table</p>
         <div ref={dropdownRef} className="relative">
           <button
             type="button"
             onClick={() => setMenuOpen(v => !v)}
-            className="w-full flex items-center justify-between rounded-md border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700 hover:border-blue-300 transition duration-200"
+            className="w-full flex items-center justify-between rounded-md border border-blue-200 bg-hover px-4 py-2 text-sm font-semibold text-blue-700 hover:border-blue-300 transition duration-200"
           >
             <span>{selectedTable.label}</span>
-            <ChevronDown size={16} className="text-blue-500" />
+            <ChevronDown size={16} className="text-accent" />
           </button>
           {menuOpen && (
-            <div className="absolute z-20 mt-2 w-full rounded-lg border border-gray-200 bg-white shadow-lg">
+            <div className="absolute z-20 mt-2 w-full rounded-lg border border-default bg-surface shadow-lg">
               {DATA_UPLOAD_OPTIONS.map(opt => (
                 <button
                   key={opt.value}
@@ -141,7 +141,7 @@ const CsvUpload = () => {
                     setMenuOpen(false);
                   }}
                   className={`w-full px-4 py-2 text-left text-sm transition ${
-                    opt.value === selectedTable.value ? 'bg-blue-600 text-white' : 'text-gray-700 hover:bg-gray-50'
+                    opt.value === selectedTable.value ? 'bg-accent text-inverse text-white' : 'text-secondary hover:bg-hover'
                   }`}
                 >
                   {opt.label}
@@ -155,11 +155,11 @@ const CsvUpload = () => {
       <div
         onDragOver={(e) => { e.preventDefault(); }}
         onDrop={handleDrop}
-        className="relative flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-300 bg-white px-4 py-6 text-center transition duration-200 hover:border-blue-500 hover:bg-blue-50 cursor-pointer"
+        className="relative flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-strong bg-surface px-4 py-6 text-center transition duration-200 hover:border-blue-500 hover:bg-hover cursor-pointer"
       >
-        <UploadCloud size={32} className="text-blue-500" />
-        <p className="text-sm font-semibold text-gray-700">Drop CSV files here or click to browse</p>
-        <p className="text-xs text-gray-500">Only .csv files are accepted</p>
+        <UploadCloud size={32} className="text-accent" />
+        <p className="text-sm font-semibold text-secondary">Drop CSV files here or click to browse</p>
+        <p className="text-xs text-muted">Only .csv files are accepted</p>
         <input
           ref={inputRef}
           type="file"
@@ -168,14 +168,14 @@ const CsvUpload = () => {
           onChange={(e) => handleFileSelect(e.target.files?.[0] ?? null)}
         />
         {file && (
-          <div className="text-xs text-gray-600 mt-2">
+          <div className="text-xs text-secondary mt-2">
             <strong>{file.name}</strong> · {formatBytes(file.size)}
           </div>
         )}
       </div>
 
       <div className="flex items-center justify-between">
-        <p className="text-xs font-semibold text-gray-600">Force re-import (overwrite existing)</p>
+        <p className="text-xs font-semibold text-secondary">Force re-import (overwrite existing)</p>
         <Toggle enabled={force} onToggle={() => setForce(v => !v)} size="sm" />
       </div>
 
@@ -190,7 +190,7 @@ const CsvUpload = () => {
       </button>
 
       {status !== 'idle' && summary && (
-        <div className="rounded-xl border border-blue-100 bg-blue-50 p-3 text-xs text-blue-800 shadow transition-opacity duration-300 opacity-100">
+        <div className="rounded-xl border border-subtle bg-hover p-3 text-xs text-blue-800 shadow transition-opacity duration-300 opacity-100">
           <p className="font-semibold text-sm text-blue-700">Import summary</p>
           <div className="mt-1 flex flex-wrap gap-3 text-xs">
             <span>Valid rows: {summary.rows_valid ?? summary.rows_read ?? 0}</span>
@@ -201,7 +201,7 @@ const CsvUpload = () => {
       )}
 
       {status === 'error' && error && (
-        <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 flex items-center gap-2 animate-pulse">
+        <div className="rounded-xl border border-red-200 bg-loss-bg px-3 py-2 text-xs text-red-700 flex items-center gap-2 animate-pulse">
           <XCircle size={14} />
           {error}
         </div>
