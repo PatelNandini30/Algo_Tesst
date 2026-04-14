@@ -4,6 +4,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine
 } from 'recharts';
 import { Download, X } from 'lucide-react';
+import ExcelJS from 'exceljs';
 
 const EXIT_REASON_COLORS = {
   Expiry: '#6c757d',
@@ -33,6 +34,38 @@ const renderExitReasonBadge = (reason) => {
   );
 };
 
+const formatDateToDdMmYyyy = (value) => {
+  if (!value && value !== 0) return value;
+  const str = String(value).trim();
+  if (!str) return value;
+  if (str.includes('/')) {
+    const [day, month, year] = str.split('/');
+    if (year && month && day && year.length === 4) {
+      return `${day.padStart(2, '0')}-${month.padStart(2, '0')}-${year}`;
+    }
+  }
+  if (str.includes('-')) {
+    const parts = str.split('-');
+    if (parts.length === 3) {
+      const [p0, p1, p2] = parts;
+      if (p0.length === 4) {
+        return `${p2.padStart(2, '0')}-${p1.padStart(2, '0')}-${p0}`;
+      }
+      if (p2.length === 4) {
+        return `${p0.padStart(2, '0')}-${p1.padStart(2, '0')}-${p2}`;
+      }
+    }
+  }
+  const parsed = new Date(str);
+  if (!Number.isNaN(parsed.getTime())) {
+    const d = parsed.getDate().toString().padStart(2, '0');
+    const m = (parsed.getMonth() + 1).toString().padStart(2, '0');
+    const y = parsed.getFullYear();
+    return `${d}-${m}-${y}`;
+  }
+  return value;
+};
+
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
 
@@ -49,6 +82,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const filteredWarnings = warnings.filter(Boolean);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
+  const tradesWithFormattedDates = useMemo(() => trades.map(trade => ({
+    ...trade,
+    'Entry Date': formatDateToDdMmYyyy(trade['Entry Date']),
+    'Exit Date': formatDateToDdMmYyyy(trade['Exit Date']),
+    'Leg Exit Date': formatDateToDdMmYyyy(trade['Leg Exit Date']),
+    'Expiry': formatDateToDdMmYyyy(trade['Expiry']),
+  })), [trades]);
 
   // Two-pass grouping:
   // Pass 1 — find the canonical (first-seen) Entry Date per Trade number.
@@ -58,11 +98,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   //           never merged with the original trade.
   // Within each group, duplicate Leg numbers are deduplicated (last row wins).
   const groupedTrades = useMemo(() => {
-    if (!trades || trades.length === 0) return [];
+    if (!tradesWithFormattedDates || tradesWithFormattedDates.length === 0) return [];
 
     // Pass 1: canonical entry date per Trade number
     const canonicalEntryByTrade = new Map();
-    trades.forEach(trade => {
+    tradesWithFormattedDates.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
       const entryDate = trade['Entry Date'] || '';
       if (!canonicalEntryByTrade.has(tradeNum)) {
@@ -72,7 +112,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Pass 2: build groups (only main trades, skip rolled/continuation trades)
     const groupMap = new Map(); // groupKey → { legs: Map(legNum → row), firstRow, tradeNum }
-    trades.forEach(trade => {
+    tradesWithFormattedDates.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
       const legNum   = String(trade.Leg  || trade.leg  || 1);
       const entryDate = trade['Entry Date'] || '';
@@ -119,6 +159,16 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       const rawDd         = leg1Row['DD'];
       const rawPctDd      = leg1Row['%DD'];
 
+      const sumLegPnl = (leg) => ['CE P&L', 'PE P&L', 'FUT P&L'].reduce((subtotal, key) => {
+        const raw = leg[key];
+        const num = typeof raw === 'number' ? raw : parseFloat(raw);
+        return subtotal + (isNaN(num) ? 0 : num);
+      }, 0);
+
+      const aggregateLegPnl = legsArr.reduce((acc, leg) => acc + sumLegPnl(leg), 0);
+      const leg1NetPnl = parseFloat(leg1Row['Net P&L']);
+      const totalPnl = Number.isFinite(leg1NetPnl) ? leg1NetPnl : aggregateLegPnl;
+
       result.push({
         tradeNumber: parseInt(tradeNum, 10) || 0,
         groupKey,
@@ -127,7 +177,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         exitDate:   leg1Row['Exit Date'],
         entrySpot:  parseFloat(leg1Row['Entry Spot']) || 0,
         exitSpot:   parseFloat(leg1Row['Exit Spot'])  || 0,
-        totalPnl:   parseFloat(leg1Row['Net P&L']) || 0,
+        totalPnl,
         cumulative: (rawCumulative !== '' && rawCumulative != null && !isNaN(parseFloat(rawCumulative)))
           ? parseFloat(rawCumulative)
           : null,   // null so connectNulls can bridge it; equityData fallbacks to 100.0
@@ -151,7 +201,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       return 0;
     });
     return result;
-  }, [trades]);
+  }, [tradesWithFormattedDates]);
 
   // Prepare chart data - USE GROUPED TRADES (one point per trade, not per leg)
   // Use Series B (compound index starting from 100) for equity curve
@@ -289,148 +339,362 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   }, [summary, groupedTrades]);
 
 
-  // Export CSV
-  const exportToCSV = () => {
-    if (!trades || trades.length === 0) return;
+  // Export Excel — Sheet 1: Trades, Sheet 2: Formatted Summary
+  const exportToCSV = async () => {
+    if (!tradesWithFormattedDates || tradesWithFormattedDates.length === 0) return;
+    const sourceTrades = tradesWithFormattedDates;
 
-    const hasCalls = trades.some(t => (t['Type'] || '').toUpperCase() === 'CALL');
-    const hasPuts = trades.some(t => (t['Type'] || '').toUpperCase() === 'PUT');
-    const hasFutures = trades.some(t => (t['Type'] || '').toUpperCase() === 'FUT');
-    const hasStrSegment = showStrSegment && trades.some(t => t['STR Segment'] && t['STR Segment'] !== '');
+    // ─── Palette ────────────────────────────────────────────────────────────
+    const C = {
+      navyBg:    { argb: 'FF1F3864' },
+      navyText:  { argb: 'FFFFFFFF' },
+      sectionBg: { argb: 'FF2C5F8A' },
+      sectionTx: { argb: 'FFFFFFFF' },
+      headerBg:  { argb: 'FF34495E' },
+      headerTx:  { argb: 'FFFFFFFF' },
+      subHdrBg:  { argb: 'FFD6E4F7' },
+      subHdrTx:  { argb: 'FF1F3864' },
+      greenBg:   { argb: 'FFD4EFDF' },
+      greenTx:   { argb: 'FF1E7E34' },
+      redBg:     { argb: 'FFFDE8E8' },
+      redTx:     { argb: 'FFC0392B' },
+      labelBg:   { argb: 'FFF2F6FA' },
+      altRow:    { argb: 'FFF9FBFD' },
+      border:    { argb: 'FFB0C4D8' },
+      white:     { argb: 'FFFFFFFF' },
+      gold:      { argb: 'FFFFF3CD' },
+      goldTx:    { argb: 'FF856404' },
+    };
 
-    const TRADE_LEVEL_COLS = new Set(['Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD']);
+    const thinBorder = (color = C.border) => ({
+      top:    { style: 'thin', color },
+      left:   { style: 'thin', color },
+      bottom: { style: 'thin', color },
+      right:  { style: 'thin', color },
+    });
+    const boldFont  = (sz = 11, color = { argb: 'FF000000' }) => ({ bold: true,  size: sz, color, name: 'Calibri' });
+    const normFont  = (sz = 10, color = { argb: 'FF000000' }) => ({ bold: false, size: sz, color, name: 'Calibri' });
+    const centerAlign = { horizontal: 'center', vertical: 'middle' };
+    const leftAlign   = { horizontal: 'left',   vertical: 'middle' };
+    const rightAlign  = { horizontal: 'right',  vertical: 'middle' };
 
+    // ─── Prepare trade data ──────────────────────────────────────────────────
+    const hasCalls   = sourceTrades.some(t => ['CE','CALL'].includes((t['Type']||'').toUpperCase()));
+    const hasPuts    = sourceTrades.some(t => ['PE','PUT'].includes((t['Type']||'').toUpperCase()));
+    const hasFutures = sourceTrades.some(t => (t['Type']||'').toUpperCase() === 'FUT');
+    const hasStr     = showStrSegment && sourceTrades.some(t => t['STR Segment']);
+
+    const TRADE_COLS = new Set(['Net P&L','% P&L','Cumulative','Peak','DD','%DD']);
     const keyOrder = [
-      'Trade', 'Leg', 'Index',
-      'Entry Date', 'Exit Date',
-      'Entry Spot', 'Exit Spot', 'Spot P&L',
-      'Type', 'Strike', 'B/S', 'Qty',
-      'Entry Price', 'Exit Price',
-      ...(hasCalls ? ['CE P&L'] : []),
-      ...(hasPuts ? ['PE P&L'] : []),
+      'Trade','Leg','Index','Entry Date','Exit Date',
+      'Entry Spot','Exit Spot','Spot P&L',
+      'Type','Strike','B/S','Qty','Entry Price','Exit Price',
+      ...(hasCalls   ? ['CE P&L']  : []),
+      ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
-      'Net P&L', '% P&L',
-      'Cumulative', 'Peak', 'DD', '%DD',
-      'Exit Reason', 'Expiry',
-      ...(hasStrSegment ? ['STR Segment'] : []),
+      'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
+      'Exit Reason','Expiry',
+      ...(hasStr ? ['STR Segment'] : []),
     ];
 
-    const sortedTrades = [...trades].sort((a, b) => {
-      const tA = parseInt(a.Trade || a.trade || 1, 10);
-      const tB = parseInt(b.Trade || b.trade || 1, 10);
+    const sortedTrades = [...sourceTrades].sort((a, b) => {
+      const tA = parseInt(a.Trade||a.trade||1,10), tB = parseInt(b.Trade||b.trade||1,10);
       if (tA !== tB) return tA - tB;
-      const lA = parseInt(a.Leg || a.leg || 1, 10);
-      const lB = parseInt(b.Leg || b.leg || 1, 10);
-      return lA - lB;
+      return parseInt(a.Leg||a.leg||1,10) - parseInt(b.Leg||b.leg||1,10);
     });
 
     const groupedByTrade = {};
-    sortedTrades.forEach(trade => {
-      const key = String(trade.Trade || trade.trade || 1);
-      if (!groupedByTrade[key]) groupedByTrade[key] = [];
-      groupedByTrade[key].push(trade);
+    sortedTrades.forEach(t => {
+      const k = String(t.Trade||t.trade||1);
+      if (!groupedByTrade[k]) groupedByTrade[k] = [];
+      groupedByTrade[k].push(t);
     });
 
-    const tradeMetrics = {};
-    Object.entries(groupedByTrade).forEach(([key, legs]) => {
-      const entrySpot = parseFloat(legs[0]['Entry Spot']) || 0;
-      const net = legs.reduce((sum, leg) => {
-        return sum +
-          (parseFloat(leg['CE P&L']) || 0) +
-          (parseFloat(leg['PE P&L']) || 0) +
-          (parseFloat(leg['FUT P&L']) || 0);
-      }, 0);
-      const pct = entrySpot > 0 ? (net / entrySpot) * 100 : 0;
-      const rawCumulative = legs[0]['Cumulative'];
-      const rawPeak       = legs[0]['Peak'];
-      const rawDd         = legs[0]['DD'];
-      const rawPctDd      = legs[0]['%DD'];
-      tradeMetrics[key] = {
-        net: +net.toFixed(2),
-        pct: +pct.toFixed(2),
-        cumulative: rawCumulative !== '' && rawCumulative != null && !isNaN(parseFloat(rawCumulative))
-          ? parseFloat(rawCumulative)
-          : '',
-        peak: rawPeak !== '' && rawPeak != null && !isNaN(parseFloat(rawPeak))
-          ? parseFloat(rawPeak)
-          : '',
-        dd: rawDd !== '' && rawDd != null && !isNaN(parseFloat(rawDd))
-          ? parseFloat(rawDd)
-          : '',
-        pctDd: rawPctDd !== '' && rawPctDd != null && !isNaN(parseFloat(rawPctDd))
-          ? parseFloat(rawPctDd)
-          : '',
-      };
+    const tm = {};
+    Object.entries(groupedByTrade).forEach(([k, legs]) => {
+      const spot = parseFloat(legs[0]['Entry Spot'])||0;
+      const net  = legs.reduce((s,l) => s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0), 0);
+      const toN  = v => (v!=null&&v!==''&&!isNaN(parseFloat(v))) ? parseFloat(v) : '';
+      const r    = legs[0];
+      tm[k] = { net:+net.toFixed(2), pct:+(spot>0?(net/spot)*100:0).toFixed(2),
+                cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
+                dd:toN(r['DD']), pctDd:toN(r['%DD']) };
     });
 
-    const writtenTrades = new Set();
-
+    const written = new Set();
     const cleanedTrades = sortedTrades.map(trade => {
-      const tradeKey = String(trade.Trade || trade.trade || 1);
-      const isFirstLeg = !writtenTrades.has(tradeKey);
-      if (isFirstLeg) writtenTrades.add(tradeKey);
-
-      const metrics = tradeMetrics[tradeKey] || {};
+      const k = String(trade.Trade||trade.trade||1);
+      const first = !written.has(k); if (first) written.add(k);
+      const m = tm[k]||{};
       const row = {};
-
       for (const key of keyOrder) {
         let val;
-
-        if (TRADE_LEVEL_COLS.has(key)) {
-          if (!isFirstLeg) {
-            val = '';
-          } else {
-            if (key === 'Net P&L') val = metrics.net;
-            else if (key === '% P&L') val = metrics.pct;
-            else if (key === 'Cumulative') val = metrics.cumulative;
-            else if (key === 'Peak') val = metrics.peak;
-            else if (key === 'DD') val = metrics.dd;
-            else if (key === '%DD') val = metrics.pctDd;
-          }
-        } else if (key === 'Index') {
-          val = parseInt(trade.Trade || trade.trade || 1, 10);
-        } else {
-          val = trade[key];
-        }
-
-        if (
-          val === null ||
-          val === undefined ||
-          (typeof val === 'number' && isNaN(val)) ||
-          val === 'NaN'
-        ) {
-          val = '';
-        }
-        if (typeof val === 'number' && !Number.isInteger(val)) {
-          val = Math.round(val * 100) / 100;
-        }
-
-        row[key] = val;
+        if (TRADE_COLS.has(key)) {
+          if (!first) val='';
+          else if (key==='Net P&L') val=m.net;
+          else if (key==='% P&L')  val=m.pct;
+          else if (key==='Cumulative') val=m.cumulative;
+          else if (key==='Peak')  val=m.peak;
+          else if (key==='DD')    val=m.dd;
+          else if (key==='%DD')   val=m.pctDd;
+        } else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
+        else val=trade[key];
+        if (val==null||(typeof val==='number'&&isNaN(val))||val==='NaN') val='';
+        if (typeof val==='number'&&!Number.isInteger(val)) val=Math.round(val*100)/100;
+        row[key]=val;
       }
-
       return row;
     });
 
-    const escape = (value) => {
-      const text = String(value ?? '');
-      if (text.includes(',') || text.includes('"') || text.includes('\n')) {
-        return `"${text.replace(/"/g, '""')}"`;
+    // ─── Build Workbook ──────────────────────────────────────────────────────
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'AlgoTest Backtest';
+    wb.created = new Date();
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SHEET 1 — TRADE SHEET
+    // ════════════════════════════════════════════════════════════════════════
+    const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state:'frozen', ySplit:1 }] });
+
+    // Column widths
+    const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
+      'Entry Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
+      'Exit Reason':14,'Expiry':12,'STR Segment':14 };
+    ws1.columns = keyOrder.map(k => ({ header: k, key: k, width: colWidths[k]||10 }));
+
+    // Header row style
+    ws1.getRow(1).eachCell(cell => {
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    ws1.getRow(1).height = 22;
+
+    // Data rows
+    cleanedTrades.forEach((row, i) => {
+      const r   = ws1.addRow(keyOrder.map(k => row[k]??''));
+      const net = typeof row['Net P&L']==='number' ? row['Net P&L'] : null;
+      const bg  = i%2===0 ? C.white : C.altRow;
+      r.eachCell(cell => {
+        cell.font   = normFont(10);
+        cell.fill   = { type:'pattern', pattern:'solid', fgColor: bg };
+        cell.border = thinBorder();
+        cell.alignment = { vertical:'middle' };
+      });
+      // Color Net P&L and % P&L
+      if (net !== null) {
+        const col1 = keyOrder.indexOf('Net P&L')+1;
+        const col2 = keyOrder.indexOf('% P&L')+1;
+        [col1,col2].filter(c=>c>0).forEach(c => {
+          const cell = r.getCell(c);
+          cell.font = boldFont(10, net>=0 ? C.greenTx : C.redTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: net>=0 ? C.greenBg : C.redBg };
+        });
       }
-      return text;
+    });
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SHEET 2 — SUMMARY
+    // ════════════════════════════════════════════════════════════════════════
+    const ws2 = wb.addWorksheet('Summary');
+    ws2.columns = [
+      { width: 30 },{ width: 20 },{ width: 4 },{ width: 30 },{ width: 20 },
+    ];
+
+    const addTitle = (text, rowNum, cols = 'A:E', bgColor = C.navyBg) => {
+      ws2.mergeCells(`${cols.split(':')[0]}${rowNum}:${cols.split(':')[1]}${rowNum}`);
+      const cell = ws2.getCell(`${cols.split(':')[0]}${rowNum}`);
+      cell.value = text;
+      cell.font  = boldFont(13, C.navyText);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: bgColor };
+      cell.alignment = { horizontal:'center', vertical:'middle' };
+      ws2.getRow(rowNum).height = 26;
     };
 
-    const headers = keyOrder.join(',');
-    const rows = cleanedTrades.map(row => keyOrder.map(key => escape(row[key])).join(','));
-    const csv = [headers, ...rows].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `backtest_${new Date().toISOString().split('T')[0]}.csv`;
+    const addSectionHeader = (text, rowNum) => {
+      ws2.mergeCells(`A${rowNum}:E${rowNum}`);
+      const cell = ws2.getCell(`A${rowNum}`);
+      cell.value = '  ' + text;
+      cell.font  = boldFont(11, C.sectionTx);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.sectionBg };
+      cell.alignment = leftAlign;
+      ws2.getRow(rowNum).height = 20;
+    };
+
+    const addKvRow = (label, value, rowNum, col='A', isAlt=false, valColor=null) => {
+      const lCol = col; const vCol = String.fromCharCode(col.charCodeAt(0)+1);
+      const lCell = ws2.getCell(`${lCol}${rowNum}`);
+      const vCell = ws2.getCell(`${vCol}${rowNum}`);
+      lCell.value = label;
+      vCell.value = value;
+      lCell.font  = boldFont(10, { argb:'FF2C3E50' });
+      lCell.fill  = { type:'pattern', pattern:'solid', fgColor: isAlt ? C.altRow : C.labelBg };
+      lCell.alignment = leftAlign;
+      lCell.border = thinBorder(C.border);
+      const numVal = typeof value === 'number' ? value : parseFloat(String(value||'').replace(/[+%₹,]/g,''));
+      const autoColor = valColor || (isNaN(numVal) ? null : numVal>=0 ? C.greenTx : C.redTx);
+      vCell.font  = boldFont(10, autoColor || { argb:'FF1A1A2E' });
+      vCell.fill  = { type:'pattern', pattern:'solid', fgColor: isAlt ? C.altRow : C.white };
+      vCell.alignment = leftAlign;
+      vCell.border = thinBorder(C.border);
+      ws2.getRow(rowNum).height = 18;
+    };
+
+    // ── Row 1: Report title ─────────────────────────────────────────────────
+    addTitle('  BACKTEST SUMMARY REPORT', 1, 'A:E', C.navyBg);
+
+    // Sub-title: date
+    ws2.mergeCells('A2:E2');
+    const subCell = ws2.getCell('A2');
+    subCell.value = `Generated: ${new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' })}`;
+    subCell.font  = normFont(10, { argb:'FF555555' });
+    subCell.alignment = centerAlign;
+    subCell.fill  = { type:'pattern', pattern:'solid', fgColor: C.subHdrBg };
+    ws2.getRow(2).height = 16;
+
+    let row = 4;
+
+    // ── SECTION 1: Performance Overview ─────────────────────────────────────
+    addSectionHeader('📊  PERFORMANCE OVERVIEW', row++);
+
+    const profitColor = stats.totalPnLPct >= 0 ? C.greenTx : C.redTx;
+    const kv = (l,v,r,col='A',alt=false,vc=null) => addKvRow(l,v,r,col,alt,vc);
+
+    kv('Overall Profit',   `${stats.totalPnLPct>=0?'+':''}${stats.totalPnLPct.toFixed(2)}%`, row, 'A', false, profitColor);
+    kv('No. of Trades',    stats.totalTrades, row++, 'D', false, { argb:'FF1A1A2E' });
+
+    kv('Win %',            `${(+stats.winRate).toFixed(2)}%`,  row, 'A', true, C.greenTx);
+    kv('Loss %',           `${(+stats.lossPct).toFixed(2)}%`,  row++, 'D', true, C.redTx);
+
+    kv('Avg Profit on Winners', `${(+stats.avgWinPct).toFixed(2)}%`,  row, 'A', false, C.greenTx);
+    kv('Avg Loss on Losers',    `${(+stats.avgLossPct).toFixed(2)}%`, row++, 'D', false, C.redTx);
+
+    kv('Avg Profit per Trade', `${stats.avgProfitPerTrade>=0?'+':''}${(+stats.avgProfitPerTrade).toFixed(2)}%`, row, 'A', true,
+       stats.avgProfitPerTrade>=0?C.greenTx:C.redTx);
+    kv('Expectancy Ratio',  `${(+stats.expectancy).toFixed(4)}`, row++, 'D', true,
+       stats.expectancy>=0?C.greenTx:C.redTx);
+
+    kv('Max Profit (Single Trade)', `₹${(+stats.maxWin).toLocaleString('en-IN',{minimumFractionDigits:2})}`, row, 'A', false, C.greenTx);
+    kv('Max Loss (Single Trade)',   `₹${(+stats.maxLoss).toLocaleString('en-IN',{minimumFractionDigits:2})}`, row++, 'D', false, C.redTx);
+
+    row++; // blank
+
+    // ── SECTION 2: Risk Metrics ─────────────────────────────────────────────
+    addSectionHeader('⚠️  RISK METRICS', row++);
+
+    const mddColor = C.redTx;
+    kv('Max Drawdown',     `${(+stats.maxDDPct).toFixed(2)}%`,  row, 'A', false, mddColor);
+    kv('Max DD Days',      stats.mddDuration,                    row++, 'D', false, mddColor);
+
+    // Full-width DD period
+    const ddPeriod = (stats.mddStartDate && stats.mddEndDate) ? `${stats.mddStartDate}  →  ${stats.mddEndDate}` : '—';
+    ws2.mergeCells(`A${row}:E${row}`);
+    const ddCell = ws2.getCell(`A${row}`);
+    ddCell.value = `📅  Drawdown Period:  ${ddPeriod}`;
+    ddCell.font  = boldFont(10, C.redTx);
+    ddCell.fill  = { type:'pattern', pattern:'solid', fgColor: C.redBg };
+    ddCell.alignment = centerAlign;
+    ddCell.border = thinBorder(C.border);
+    ws2.getRow(row).height = 18;
+    row++;
+
+    kv('Return / MaxDD',     `${(+stats.carMdd).toFixed(2)}`,       row, 'A', true);
+    kv('Reward to Risk',     `${(+stats.rewardToRisk).toFixed(2)}`,  row++, 'D', true);
+
+    row++;
+
+    // ── SECTION 3: Consistency ──────────────────────────────────────────────
+    addSectionHeader('🏆  CONSISTENCY & STREAKS', row++);
+
+    kv('Max Win Streak',    `${stats.maxWinStreak} trades`,   row, 'A', false, C.greenTx);
+    kv('Max Losing Streak', `${stats.maxLossStreak} trades`,  row++, 'D', false, C.redTx);
+
+    row++;
+
+    // ── SECTION 4: Monthly Returns ──────────────────────────────────────────
+    addSectionHeader('📅  MONTHLY RETURNS (₹ Net P&L)', row++);
+
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const mthHdr = ['Year',...MONTHS,'Total','Max DD','DD Days','R/MDD'];
+
+    // Set wide columns for monthly table (columns A–R)
+    const mthCols = mthHdr.length;
+    for (let ci = 0; ci < mthCols; ci++) {
+      ws2.getColumn(ci+1).width = ci===0 ? 8 : ci<=12 ? 9 : ci===13 ? 10 : ci===14 ? 18 : 10;
+    }
+
+    // Header row
+    const hdrRow = ws2.getRow(row);
+    mthHdr.forEach((h, ci) => {
+      const cell = hdrRow.getCell(ci+1);
+      cell.value = h;
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    hdrRow.height = 20;
+    row++;
+
+    // Data rows from pivot or fallback
+    let mthData = [];
+    if (pivot && pivot.rows && pivot.rows.length > 0) {
+      mthData = pivot.rows;
+    } else {
+      const byYM = {};
+      Object.values(groupedByTrade).forEach(legs => {
+        const ed  = legs[0]['Entry Date']||'';
+        const net = legs.reduce((s,l)=>s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0),0);
+        const p   = ed.split('/');
+        if (p.length>=3) {
+          const yr = p[2]; const mo = parseInt(p[1],10)-1;
+          if (!byYM[yr]) byYM[yr]=Array(12).fill(0);
+          byYM[yr][mo]=(byYM[yr][mo]||0)+net;
+        }
+      });
+      mthData = Object.entries(byYM).sort().map(([yr,mos]) => {
+        const total=mos.reduce((s,v)=>s+v,0);
+        return [yr,...mos.map(v=>+v.toFixed(2)),+total.toFixed(2),'','',''];
+      });
+    }
+
+    mthData.forEach((dataRow, ri) => {
+      const r2 = ws2.getRow(row);
+      dataRow.forEach((val, ci) => {
+        const cell = r2.getCell(ci+1);
+        cell.value = val;
+        const num  = typeof val==='number' ? val : parseFloat(String(val||'').replace(/[%,]/g,''));
+        const isValCol = ci>=1 && ci<=12; // month columns
+        const isTotalCol = ci===13;
+        if ((isValCol||isTotalCol) && !isNaN(num) && num!==0) {
+          cell.font = boldFont(10, num>=0 ? C.greenTx : C.redTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: num>=0 ? C.greenBg : C.redBg };
+        } else if (ci===0) {
+          cell.font = boldFont(10, C.subHdrTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: C.subHdrBg };
+        } else {
+          cell.font = normFont(10);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: ri%2===0?C.white:C.altRow };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      row++;
+    });
+
+    // ── Download ─────────────────────────────────────────────────────────────
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `backtest_${new Date().toISOString().split('T')[0]}.xlsx`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
+    URL.revokeObjectURL(url);
   };
 
   const CustomTooltip = ({ active, payload }) => {
@@ -523,7 +787,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium text-sm"
               >
                 <Download size={16} />
-                Export CSV
+                Export Excel
               </button>
               {showCloseButton && (
                 <button
@@ -822,21 +1086,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               </div>
             </div>
 
-            <div className="space-y-4">
-              <div className="grid gap-4 lg:grid-cols-2">
-                {/* Equity Curve placeholder - will be added later */}
-                <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
-                  <h3 className="text-base font-bold text-gray-800 mb-4">Equity Curve</h3>
-                  <p className="text-gray-500 text-sm">Chart unavailable</p>
-                </div>
-                {/* Monthly P&L placeholder - will be added later */}
-                <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
-                  <h3 className="text-base font-bold text-gray-800 mb-4">Monthly P&L</h3>
-                  <p className="text-gray-500 text-sm">Chart unavailable</p>
-                </div>
-              </div>
-            </div>
-
             {/* Full Report Table */}
             <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
               <div className="flex justify-between items-center mb-4">
@@ -860,8 +1109,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Roll Cost</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Reason</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Net P&L</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">% P&L</th>
                     </tr>
@@ -882,16 +1129,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
-                            const rollCostRaw = leg['Roll Cost'] ?? leg['RollCost'] ?? leg['roll_cost'] ?? leg.roll_cost;
-                            const rollCostVal = rollCostRaw === null || rollCostRaw === undefined ? null : Number(rollCostRaw);
-                            const rollCostCell = (rollCostVal === null || Number.isNaN(rollCostVal) || rollCostVal === 0)
-                              ? <span className="text-xs text-gray-400">—</span>
-                              : (
-                                <span style={{ color: rollCostVal > 0 ? '#e53e3e' : '#38a169', fontWeight: 600 }}>
-                                  {rollCostVal > 0 ? '+' : ''}{rollCostVal.toFixed(2)}
-                                </span>
-                              );
-                            const exitReason = leg['Exit Reason'] || leg['exit_reason'] || leg.ExitReason || '';
                             // Per-leg P&L: CE P&L for options, FUT P&L for futures.
                             // Net P&L and % P&L columns hold the trade-level total
                             // (stamped on every row) — must NOT be used per leg.
@@ -926,8 +1163,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{qty}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{entryPrice.toFixed(2)}</td>
                                 <td className="px-3 py-2 text-xs text-right text-gray-700">{exitPrice.toFixed(2)}</td>
-                                <td className="px-3 py-2 text-xs text-right text-gray-700">{rollCostCell}</td>
-                                <td className="px-3 py-2 text-xs text-gray-700">{renderExitReasonBadge(exitReason)}</td>
                                 <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                   {legNetPnlPoints >= 0 ? '+' : ''}{legNetPnlPoints.toFixed(2)}
                                 </td>
@@ -951,11 +1186,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const tradePctPnl = group.entrySpot > 1000
                               ? (tradeNetPnlPoints / group.entrySpot) * 100
                               : 0;
-                            // Summary row comes AFTER the rowSpan ends, so ALL 15 columns
-                            // must be filled. Empty span = 15 total - 2 P&L cols = 13.
-                            // (The old value of 7 wrongly subtracted the 4 rowSpanned cols,
-                            // which pushed Net P&L into the B/S column and % P&L into Qty.)
-                            const emptyCellSpan = 13;
+                            // Summary row comes AFTER the rowSpan ends, so ALL 13 columns
+                            // must be filled. Empty span = 13 total - 2 P&L cols = 11.
+                            const emptyCellSpan = 11;
                             return (
                               <tr className="border-b-2 border-gray-300 bg-slate-100">
                                 <td colSpan={emptyCellSpan}></td>

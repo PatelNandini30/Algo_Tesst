@@ -78,10 +78,10 @@ def _format_dates(trades: Any) -> Any:
                 if value is None:
                     continue
                 if hasattr(value, 'strftime'):
-                    trade[key] = value.strftime('%d/%m/%Y')
+                    trade[key] = value.strftime('%d-%m-%Y')
                 elif isinstance(value, str) and 'T' in value:
                     try:
-                        trade[key] = pd.to_datetime(value).strftime('%d/%m/%Y')
+                        trade[key] = pd.to_datetime(value).strftime('%d-%m-%Y')
                     except Exception:
                         pass
         return trades
@@ -290,6 +290,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 all_chunk_trades = []
                 engine_summary = None
                 engine_pivot = None
+                _trade_id_offset = 0  # cumulative offset so Trade IDs never collide across chunks
                 for chunk_from, chunk_to in _date_chunks(effective_from, effective_to, _BULK_LOAD_CHUNK_YEARS):
                     try:
                         bulk_load_options(index, chunk_from, chunk_to)
@@ -303,7 +304,16 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             print(f"[DEBUG] c_df columns: {list(c_df.columns)[:5]}")
                             print(f"[DEBUG] c_df first row: {c_df.iloc[0].to_dict() if len(c_df) > 0 else 'empty'}")
                         if chunk_count > 0:
-                            all_chunk_trades.extend(c_df.to_dict('records'))
+                            chunk_records = c_df.to_dict('records')
+                            # Offset Trade IDs so they never collide with previous chunks
+                            chunk_max_id = 0
+                            for row in chunk_records:
+                                orig = int(str(row.get('Trade', 0) or 0))
+                                row['Trade'] = orig + _trade_id_offset
+                                if orig > chunk_max_id:
+                                    chunk_max_id = orig
+                            _trade_id_offset += chunk_max_id
+                            all_chunk_trades.extend(chunk_records)
                             if c_summary:
                                 engine_summary = c_summary
                             if c_pivot:

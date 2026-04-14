@@ -73,6 +73,23 @@ class ReEntryMode(str, Enum):
     EITHER_MOVE = "Either Move"  # Re-enter on any move
 
 
+class FuturesExitMode(str, Enum):
+    """Futures rollover exit triggers"""
+    ON_EXPIRY = "ON_EXPIRY"
+    N_DAYS_BEFORE_EXPIRY = "N_DAYS_BEFORE_EXPIRY"
+    LAST_WEEK_BEFORE_EXPIRY = "LAST_WEEK_BEFORE_EXPIRY"
+
+
+class FuturesRolloverConfig(BaseModel):
+    """Controls futures exit/roll behavior per leg"""
+    exit_mode: FuturesExitMode = FuturesExitMode.ON_EXPIRY
+    n_days: int = Field(default=5, ge=1, le=15)
+    with_filter: bool = True
+    with_spot_adjustment: bool = True
+    sl_overrides_rollover: bool = True
+    target_overrides_rollover: bool = True
+
+
 class SuperTrendConfig(str, Enum):
     """Super Trend configuration types"""
     NONE = "None"
@@ -122,6 +139,7 @@ class Leg(BaseModel):
     strike_selection: StrikeSelection
     entry_condition: EntryCondition
     exit_condition: ExitCondition
+    futures_rollover: Optional[FuturesRolloverConfig] = None
     
 class StrategyDefinition(BaseModel):
     """Complete strategy definition"""

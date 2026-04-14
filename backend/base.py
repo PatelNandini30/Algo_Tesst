@@ -1196,6 +1196,70 @@ def get_trading_calendar(from_date, to_date, db_path='bhavcopy_data.db'):
     return df
 
 
+def get_futures_exit_date(monthly_expiry, exit_mode, n_days, trading_calendar):
+    """
+    Determine the futures exit date based on the selected exit mode.
+    """
+    if monthly_expiry is None or exit_mode is None or trading_calendar is None:
+        return pd.Timestamp(monthly_expiry)
+
+    try:
+        expiry_ts = pd.Timestamp(monthly_expiry)
+        mode = str(exit_mode).upper()
+    except Exception:
+        return pd.Timestamp(monthly_expiry)
+
+    if mode == "ON_EXPIRY":
+        return expiry_ts
+
+    cal_df = trading_calendar
+    if isinstance(trading_calendar, pd.DataFrame):
+        arr = cal_df['date'].values.astype("datetime64[ns]")
+    else:
+        arr = trading_calendar.values.astype("datetime64[ns]")
+
+    expiry_np = np.datetime64(expiry_ts, "ns")
+    idx = np.searchsorted(arr, expiry_np, side="left")
+    if idx >= len(arr) or arr[idx] != expiry_np:
+        idx = np.searchsorted(arr, expiry_np, side="right") - 1
+        if idx < 0:
+            return expiry_ts
+
+    if mode == "N_DAYS_BEFORE_EXPIRY":
+        days = max(1, min(int(n_days or 5), 15))
+        target_idx = idx - days
+        if target_idx < 0:
+            target_idx = 0
+        return pd.Timestamp(arr[target_idx])
+
+    if mode == "LAST_WEEK_BEFORE_EXPIRY":
+        target_idx = idx - 5
+        if target_idx < 0:
+            target_idx = 0
+        return pd.Timestamp(arr[target_idx])
+
+    return expiry_ts
+
+
+def get_futures_rollover_entry_date(fut_exit_date, trading_calendar):
+    """
+    Return the next trading day immediately after the futures exit date.
+    """
+    if fut_exit_date is None or trading_calendar is None:
+        return None
+
+    if isinstance(trading_calendar, pd.DataFrame):
+        arr = trading_calendar['date'].values.astype("datetime64[ns]")
+    else:
+        arr = trading_calendar.values.astype("datetime64[ns]")
+
+    exit_np = np.datetime64(pd.Timestamp(fut_exit_date), "ns")
+    idx = np.searchsorted(arr, exit_np, side="right")
+    if idx >= len(arr):
+        return None
+    return pd.Timestamp(arr[idx])
+
+
 def calculate_strike_from_selection(spot_price, strike_interval, selection, option_type):
     """
     Calculate strike based on AlgoTest-style selection
@@ -1233,23 +1297,27 @@ def calculate_strike_from_selection(spot_price, strike_interval, selection, opti
     if selection == 'ATM':
         return atm_strike
     
+    # Normalize option_type: accept 'CALL'/'C' as 'CE', 'PUT'/'P' as 'PE'
+    _ot = str(option_type).upper().strip() if option_type else 'CE'
+    is_call = _ot in ('CE', 'CALL', 'C')
+
     # Extract number from selection (ITM1 -> 1, OTM10 -> 10)
     if selection.startswith('ITM'):
         offset_strikes = int(selection.replace('ITM', ''))
         offset_points = offset_strikes * strike_interval
-        
-        if option_type == 'CE':
+
+        if is_call:
             # For CALL: ITM means LOWER strike (below spot)
             return atm_strike - offset_points
         else:  # PE
             # For PUT: ITM means HIGHER strike (above spot)
             return atm_strike + offset_points
-    
+
     elif selection.startswith('OTM'):
         offset_strikes = int(selection.replace('OTM', ''))
         offset_points = offset_strikes * strike_interval
-        
-        if option_type == 'CE':
+
+        if is_call:
             # For CALL: OTM means HIGHER strike (above spot)
             return atm_strike + offset_points
         else:  # PE

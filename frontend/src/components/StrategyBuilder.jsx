@@ -711,7 +711,9 @@ const StrategyBuilder = () => {
       };
 
       if (segmentType === 'options') {
-        leg.option_type = l.option_type.toUpperCase();
+        // Normalize 'call'/'put' UI values to 'CE'/'PE' for the backend
+        const rawOpt = (l.option_type || '').toLowerCase();
+        leg.option_type = rawOpt === 'call' ? 'CE' : rawOpt === 'put' ? 'PE' : l.option_type.toUpperCase();
         leg.expiry = l.expiry.toUpperCase();
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
@@ -1276,9 +1278,6 @@ const StrategyBuilder = () => {
                             className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
                           />
                         </div>
-                        {leg.segment === 'futures' && (
-                          <FuturesRolloverConfig leg={leg} legIndex={idx} onLegChange={handleLegChange} />
-                        )}
                       </div>
                     </div>
                   )}
@@ -1717,6 +1716,10 @@ const StrategyBuilder = () => {
                           </div>
                         </div>
                       </div>
+                      {/* Futures Rollover Config — only for futures legs */}
+                      {leg.segment === 'futures' && (
+                        <FuturesRolloverConfig leg={leg} legIndex={idx} onLegChange={handleLegChange} />
+                      )}
                     </div>
                   ))}
                 </div>

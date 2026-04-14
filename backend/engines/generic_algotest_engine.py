@@ -21,6 +21,25 @@ def _log(*args, **kwargs):
     if DEBUG:
         print(*args, **kwargs)
 
+
+def format_date_dd_mm_yyyy(value):
+    """Normalize dates to DD-MM-YYYY strings."""
+    if value is None:
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return value
+    if hasattr(value, 'strftime'):
+        return value.strftime('%d-%m-%Y')
+    try:
+        parsed = pd.to_datetime(value)
+        if pd.isna(parsed):
+            return value
+        return parsed.strftime('%d-%m-%Y')
+    except Exception:
+        return value
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -105,6 +124,8 @@ from base import (
     _resolve_nearest_future_expiry_after,
     _resolve_futures_expiry_by_preference,
     resolve_futures_pnl_with_rollover,
+    get_futures_exit_date,
+    get_futures_rollover_entry_date,
 )
 
 from services.data_loader import get_loader
@@ -128,6 +149,28 @@ def _next_trading_day_after(trading_calendar_df, target_date):
     if idx >= len(arr):
         return None
     return pd.Timestamp(arr[idx])
+
+
+def _parse_futures_rollover_config(leg_config):
+    exit_mode = str(leg_config.get('fut_exit_mode', 'ON_EXPIRY') or 'ON_EXPIRY').upper()
+    if exit_mode not in ("ON_EXPIRY", "N_DAYS_BEFORE_EXPIRY", "LAST_WEEK_BEFORE_EXPIRY"):
+        exit_mode = "ON_EXPIRY"
+    try:
+        n_days = int(leg_config.get('fut_n_days', 5))
+    except (TypeError, ValueError):
+        n_days = 5
+    if n_days < 1:
+        n_days = 1
+    if n_days > 15:
+        n_days = 15
+    return {
+        "exit_mode": exit_mode,
+        "n_days": n_days,
+        "with_filter": bool(leg_config.get('fut_with_filter', True)),
+        "sl_override": bool(leg_config.get('fut_sl_override', True)),
+        "target_override": bool(leg_config.get('fut_target_override', True)),
+        "with_spot_adj": bool(leg_config.get('fut_with_spot_adj', True)),
+    }
 
 
 def apply_spot_adjustment_exit(
@@ -510,12 +553,15 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
             tleg['pnl'] = ep - new_exit
         
         # Set CE P&L or PE P&L based on option type
-        if tleg.get('option_type') == 'CALL':
+        if tleg.get('option_type') in ('CE', 'CALL', 'C'):
             tleg['ce_pnl'] = tleg['pnl']
             tleg['pe_pnl'] = 0
-        else:  # PUT
+        elif tleg.get('option_type') in ('PE', 'PUT', 'P'):
             tleg['ce_pnl'] = 0
             tleg['pe_pnl'] = tleg['pnl']
+        else:
+            tleg['ce_pnl'] = 0
+            tleg['pe_pnl'] = 0
 
     else:  # FUTURE
         check_expiry = _resolve_nearest_future_expiry(index, leg_exit_date)
@@ -1942,10 +1988,27 @@ def run_algotest_backtest(params):
                             futures_expiry_pref = 'next_monthly'
                         else:
                             futures_expiry_pref = 'monthly'
+                        roll_cfg = _parse_futures_rollover_config(leg_config)
+
+                        fut_exit_trigger = get_futures_exit_date(
+                            expiry_date,
+                            roll_cfg['exit_mode'],
+                            roll_cfg['n_days'],
+                            trading_calendar,
+                        )
+                        if fut_exit_trigger is None:
+                            fut_exit_trigger = exit_date
+                        fut_exit_date = pd.Timestamp(fut_exit_trigger)
+                        if fut_exit_date > exit_date:
+                            fut_exit_date = exit_date
+
+                        exit_reason = 'Expiry'
+                        if roll_cfg['exit_mode'] != 'ON_EXPIRY' and fut_exit_date < exit_date:
+                            exit_reason = f"FUT_ROLL_{roll_cfg['exit_mode']}"
 
                         fut_result = resolve_futures_pnl_with_rollover(
                             entry_date=entry_date,
-                            exit_date=exit_date,
+                            exit_date=fut_exit_date,
                             index=index,
                             position=position,
                             preference=futures_expiry_pref,
@@ -1957,7 +2020,6 @@ def run_algotest_backtest(params):
                         elif fut_result is not None:
                             fut_segments = [fut_result]
 
-                        # Normalize to tuples (entry_price, exit_price, expiry)
                         normalized_segments = [
                             (seg[0], seg[1], seg[2])
                             for seg in fut_segments
@@ -2000,8 +2062,91 @@ def run_algotest_backtest(params):
                             _log(f"      WARNING: No exit futures price - using entry price")
                             exit_price = entry_price
 
+                        roll_cost = 0.0
+                        roll_entry_date = get_futures_rollover_entry_date(fut_exit_date, trading_calendar)
+                        next_expiry_str = None
+
+                        if roll_entry_date:
+                            # ── Feature 2: Respect Filter on Roll ────────────────────────────────
+                            # If with_filter=True and STR filter is enabled, check whether the
+                            # filter has an active segment on the rollover entry date.
+                            # No active segment → don't roll (skip roll_cost, tag exit reason).
+                            roll_blocked_by_filter = False
+                            if roll_cfg['with_filter'] and str_enabled:
+                                roll_str_seg = get_active_str_segment(roll_entry_date, super_trend_config)
+                                if roll_str_seg is None:
+                                    roll_blocked_by_filter = True
+                                    _log(
+                                        f"      ROLL BLOCKED by filter: STR has no active segment on "
+                                        f"{pd.Timestamp(roll_entry_date).strftime('%Y-%m-%d')}"
+                                    )
+
+                            # ── Feature 5: Spot Adj on Roll ──────────────────────────────────────
+                            # If with_spot_adj=True and the global spot-adjustment is enabled,
+                            # fetch the spot price on the rollover entry date and check whether it
+                            # has breached the rise/fall threshold measured from the ORIGINAL entry
+                            # spot of this trade.  A breach means market has moved too far — skip
+                            # rolling into the next contract.
+                            roll_blocked_by_spot = False
+                            if (
+                                not roll_blocked_by_filter
+                                and roll_cfg['with_spot_adj']
+                                and spot_adjustment_enabled
+                                and entry_spot is not None
+                            ):
+                                roll_entry_date_str = pd.Timestamp(roll_entry_date).strftime('%Y-%m-%d')
+                                roll_spot = get_spot_price_from_db(roll_entry_date_str, index)
+                                if roll_spot is not None:
+                                    if spot_adjustment_units == 'points':
+                                        rise_target = entry_spot + spot_adjustment_pct
+                                        fall_target  = entry_spot - spot_adjustment_pct
+                                    else:
+                                        rise_target = entry_spot * (1 + spot_adjustment_pct / 100)
+                                        fall_target  = entry_spot * (1 - spot_adjustment_pct / 100)
+
+                                    watch_rise = spot_adjustment_direction in ('rise', 'both')
+                                    watch_fall = spot_adjustment_direction in ('fall', 'both')
+                                    breached = (
+                                        (watch_rise and roll_spot >= rise_target) or
+                                        (watch_fall and roll_spot <= fall_target)
+                                    )
+                                    if breached:
+                                        roll_blocked_by_spot = True
+                                        _log(
+                                            f"      ROLL BLOCKED by spot adj: spot={roll_spot:.2f} "
+                                            f"vs entry_spot={entry_spot:.2f} "
+                                            f"(rise_tgt={rise_target:.2f}, fall_tgt={fall_target:.2f}) "
+                                            f"on {roll_entry_date_str}"
+                                        )
+
+                            # ── Compute roll cost only when rollover is not blocked ───────────────
+                            if not roll_blocked_by_filter and not roll_blocked_by_spot and _fut_expiry_str:
+                                try:
+                                    curr_expiry_ts = pd.Timestamp(_fut_expiry_str)
+                                except Exception:
+                                    curr_expiry_ts = None
+                                next_expiry_str = _resolve_nearest_future_expiry_after(
+                                    index=index,
+                                    date=fut_exit_date,
+                                    min_expiry_after=curr_expiry_ts,
+                                )
+                                if next_expiry_str:
+                                    roll_entry_price = get_future_price_from_db(
+                                        roll_entry_date, index, expiry=next_expiry_str
+                                    )
+                                    if roll_entry_price is not None:
+                                        roll_cost = round(roll_entry_price - exit_price, 2)
+
+                            # Tag exit reason so the trade sheet reflects why rollover was skipped
+                            if roll_blocked_by_filter:
+                                exit_reason = exit_reason + '+NO_ROLL(FILTER)'
+                            elif roll_blocked_by_spot:
+                                exit_reason = exit_reason + '+NO_ROLL(SPOT_ADJ)'
+
                         _log(f"      Entry Price: {entry_price} (contract expiry: {_fut_expiry_str})")
                         _log(f"      Exit Price: {exit_price}")
+                        if roll_cost:
+                            _log(f"      Roll Cost (@ {roll_entry_date} → {next_expiry_str}): {roll_cost}")
 
                         if position == 'BUY':
                             leg_pnl = exit_price - entry_price
@@ -2022,6 +2167,8 @@ def run_algotest_backtest(params):
                             'ce_pnl': 0,
                             'pe_pnl': 0,
                             'futures_expiry': _fut_expiry_str,
+                            'Roll Cost': roll_cost,
+                            'Exit Reason': exit_reason,
                         })
 
                     else:  # OPTIONS
@@ -2127,23 +2274,18 @@ def run_algotest_backtest(params):
                             leg_pnl = entry_premium - exit_premium
 
                         # Store CE P&L or PE P&L based on option type (in points, no qty)
-                        if option_type == 'CALL':
+                        if option_type in ('CE', 'CALL', 'C'):
                             ce_pnl = leg_pnl
                             pe_pnl = 0
-                        else:  # PUT
+                        elif option_type in ('PE', 'PUT', 'P'):
                             ce_pnl = 0
                             pe_pnl = leg_pnl
+                        else:
+                            ce_pnl = 0
+                            pe_pnl = 0
 
                         # Store lot_size for DataFrame (but don't use in P&L calculation)
                         lot_size = get_lot_size(index, entry_date)
-
-                        # Store CE P&L or PE P&L based on option type (in points, no qty)
-                        if option_type == 'CALL':
-                            ce_pnl = leg_pnl
-                            pe_pnl = 0
-                        else:  # PUT
-                            ce_pnl = 0
-                            pe_pnl = leg_pnl
 
                         _log(f"      Lots: {lots}, CE P&L: {ce_pnl:.2f}, PE P&L: {pe_pnl:.2f}, Net P&L: {leg_pnl:,.2f}")
 
@@ -2219,12 +2361,15 @@ def run_algotest_backtest(params):
                                         tleg['pnl'] = entry_premium - new_exit_premium
                                     
                                     # Set CE P&L or PE P&L
-                                    if tleg.get('option_type') == 'CALL':
+                                    if tleg.get('option_type') in ('CE', 'CALL', 'C'):
                                         tleg['ce_pnl'] = tleg['pnl']
                                         tleg['pe_pnl'] = 0
-                                    else:  # PUT
+                                    elif tleg.get('option_type') in ('PE', 'PUT', 'P'):
                                         tleg['ce_pnl'] = 0
                                         tleg['pe_pnl'] = tleg['pnl']
+                                    else:
+                                        tleg['ce_pnl'] = 0
+                                        tleg['pe_pnl'] = 0
                         
                             elif tleg.get('segment') == 'FUTURE':
                                 early_exit_expiry = _resolve_nearest_future_expiry(
@@ -2809,17 +2954,16 @@ def run_algotest_backtest(params):
                     row_dd         = None
                     row_pct_dd     = None
                 
-                # ── Show/Hide Spot columns based on leg type ──────────────────────
-                # If only futures legs, hide Entry/Exit Spot and Spot P&L
-                show_spot_cols = has_options_leg
+                # Always show Spot columns — useful for futures to track index movement vs entry
+                show_spot_cols = True
                 
                 row = {
                     'Trade':          trade_id,
                     'Leg':            leg_num,
                     'Index':          trade_id,
-                    'Entry Date':     trade['entry_date'],
-                    'Exit Date':      trade['exit_date'],
-                    'Leg Exit Date':  leg_exit_date,
+                    'Entry Date':     format_date_dd_mm_yyyy(trade['entry_date']),
+                    'Exit Date':      format_date_dd_mm_yyyy(trade['exit_date']),
+                    'Leg Exit Date':  format_date_dd_mm_yyyy(leg_exit_date),
                     'Type':           leg_option_type,
                     'Strike':         strike,
                     'B/S':            position,
