@@ -200,8 +200,10 @@ const DateInput = ({ value, onChange, placeholder }) => {
       onKeyDown={handleKeyDown}
       className="h-8 px-3 border rounded text-sm w-36 font-mono transition-colors duration-150"
       style={{
-        borderColor: isFocused ? '#2563eb' : '#d1d5db',
-        backgroundColor: '#ffffff',
+        borderColor: isFocused ? 'var(--border-accent)' : 'var(--border-default)',
+        backgroundColor: 'var(--bg-input)',
+        boxShadow: isFocused ? '0 0 0 3px var(--accent-bg)' : 'none',
+        outline: 'none'
       }}
     />
   );
@@ -233,14 +235,14 @@ const Tooltip = ({ text }) => {
     <span className="relative inline-flex">
       <button
         type="button"
-        className="text-gray-400 hover:text-gray-600 focus:outline-none"
+        className="text-muted hover:text-secondary focus:outline-none"
         onMouseEnter={() => setShow(true)}
         onMouseLeave={() => setShow(false)}
       >
         <Info size={12} />
       </button>
       {show && (
-        <span className="absolute left-5 top-0 z-50 w-56 rounded bg-gray-900 p-2.5 text-xs text-white shadow-xl whitespace-normal leading-relaxed">
+        <span className="absolute left-5 top-0 z-50 w-56 rounded bg-base p-2.5 text-xs text-white shadow-xl whitespace-normal leading-relaxed">
           {text}
         </span>
       )}
@@ -252,7 +254,7 @@ const SegBtn = ({ options, value, onChange, size = 'md' }) => {
   const sizeClasses = size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-3 py-1 text-xs';
   
   return (
-    <div className="inline-flex rounded border border-gray-300 overflow-hidden">
+    <div className="inline-flex rounded-md border border-subtle bg-hover p-0.5 overflow-hidden">
       {options.map((opt, i) => {
         const disabled = Boolean(opt.disabled);
         return (
@@ -263,14 +265,12 @@ const SegBtn = ({ options, value, onChange, size = 'md' }) => {
               if (disabled) return;
               onChange(opt.value);
             }}
-            className={`${sizeClasses} font-medium transition-colors ${
-              i < options.length - 1 ? 'border-r border-gray-300' : ''
-            } ${
+            className={`${sizeClasses} font-medium transition-colors rounded ${
               disabled
-                ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                ? 'text-muted cursor-not-allowed'
                 : value === opt.value
-                  ? 'bg-blue-600 text-white border-blue-600'
-                  : 'bg-white text-gray-700 hover:bg-gray-50'
+                  ? 'bg-surface text-primary shadow-sm ring-1 ring-black/5'
+                  : 'text-secondary hover:bg-hover'
             }`}
           >
             {opt.label}
@@ -926,24 +926,24 @@ const StrategyBuilder = () => {
   }, [legs, loading, expiryBasis, buildPayload, pollJobStatus, stopJobPolling]);
 
   return (
-    <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, sans-serif' }}>
+    <div className="min-h-screen bg-hover" style={{ fontFamily: 'Inter, sans-serif' }}>
       {/* Header */}
-      <div className="bg-white border-b border-gray-200 px-6 py-3">
+      <div className="bg-surface border-b border-default px-6 py-3">
         <div className="max-w-screen-2xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
+              <div className="w-8 h-8 bg-accent text-inverse rounded flex items-center justify-center">
                 <span className="text-white font-bold text-sm">SL</span>
               </div>
-              <span className="font-bold text-lg text-gray-800">StrategyLab</span>
+              <span className="font-bold text-lg text-primary">StrategyLab</span>
             </div>
-            <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">Backtest Builder</span>
+            <span className="text-xs text-muted bg-base px-2 py-1 rounded">Backtest Builder</span>
           </div>
           <div className="flex items-center gap-4 text-sm">
-            <span className="text-gray-600">{instrument}</span>
-            <span className="text-gray-400">•</span>
-            <span className="text-gray-600">{legs.length} Legs Active</span>
-            <button className="flex items-center gap-1.5 px-3 py-1.5 text-blue-600 hover:bg-blue-50 rounded text-sm font-medium transition-colors">
+            <span className="text-secondary">{instrument}</span>
+            <span className="text-muted">•</span>
+            <span className="text-secondary">{legs.length} Legs Active</span>
+            <button className="flex items-center gap-1.5 px-3 py-1.5 text-accent hover:bg-hover rounded text-sm font-medium transition-colors">
               <Save size={14} />
               Save
             </button>
@@ -957,14 +957,14 @@ const StrategyBuilder = () => {
           {/* LEFT COLUMN - Configuration */}
           <div className="col-span-5 space-y-3">
             {/* Configuration Card */}
-            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-                <div className="px-4 py-3 border-b border-gray-100">
-                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide border-l-4 border-blue-600 pl-3">Configuration</h3>
+            <div className="bg-surface rounded-lg border border-default shadow-sm">
+                <div className="px-4 py-3 border-b border-subtle">
+                  <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Configuration</h3>
             </div>
             <div className="p-4 space-y-4">
                 {/* Strategy Type */}
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-2">Strategy</label>
+                  <label className="block text-xs font-medium text-secondary mb-2">Strategy</label>
                   <SegBtn
                     options={[
                       { value: 'intraday', label: 'Intraday' },
@@ -978,11 +978,11 @@ const StrategyBuilder = () => {
 
                 {/* Instrument */}
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-2">Instrument</label>
+                  <label className="block text-xs font-medium text-secondary mb-2">Instrument</label>
                   <select
                     value={instrument}
                     onChange={e => setInstrument(e.target.value)}
-                    className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                    className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
                   >
                     <option>NIFTY</option>
                     <option>BANKNIFTY</option>
@@ -994,7 +994,7 @@ const StrategyBuilder = () => {
 
                 {/* Underlying */}
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-2">Underlying</label>
+                  <label className="block text-xs font-medium text-secondary mb-2">Underlying</label>
                   <SegBtn
                     options={[
                       { value: 'cash', label: 'Cash', disabled: hasFuturesLeg },
@@ -1008,11 +1008,11 @@ const StrategyBuilder = () => {
                 {/* Expiry Basis */}
                 {strategyType === 'positional' && (
                   <div>
-                    <label className="block text-xs font-medium text-gray-600 mb-2">Expires on</label>
+                    <label className="block text-xs font-medium text-secondary mb-2">Expires on</label>
                     <select
                       value={expiryBasis}
                       onChange={e => setExpiryBasis(e.target.value)}
-                      className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                      className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
                     >
                       <option value="weekly">Weekly Expiry</option>
                       <option value="monthly">Monthly Expiry</option>
@@ -1024,21 +1024,21 @@ const StrategyBuilder = () => {
                 {strategyType === 'positional' && (
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-medium text-gray-600 mb-2">Entry (days before expiry)</label>
+                      <label className="block text-xs font-medium text-secondary mb-2">Entry (days before expiry)</label>
                       <select
                         value={entryDaysBefore}
                         onChange={e => setEntryDaysBefore(+e.target.value)}
-                        className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                        className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
                       >
                         {daysOptions.map(d => <option key={d}>{d}</option>)}
                       </select>
                     </div>
                     <div>
-                      <label className="block text-xs font-medium text-gray-600 mb-2">Exit (days before expiry)</label>
+                      <label className="block text-xs font-medium text-secondary mb-2">Exit (days before expiry)</label>
                       <select
                         value={exitDaysBefore}
                         onChange={e => setExitDaysBefore(+e.target.value)}
-                        className="w-full h-9 px-3 border border-gray-300 rounded text-sm bg-white"
+                        className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
                       >
                         {daysOptions.map(d => <option key={d}>{d}</option>)}
                       </select>
@@ -1048,14 +1048,14 @@ const StrategyBuilder = () => {
 
                 {/* Delay Restart */}
                 <div className="flex items-center justify-between py-2">
-                  <span className="text-xs text-gray-600">Delay Restart</span>
+                  <span className="text-xs text-secondary">Delay Restart</span>
                   <Toggle enabled={delayRestart} onToggle={() => setDelayRestart(v => !v)} size="sm" />
                 </div>
 
                 {/* Overall Momentum */}
                 <div className="flex items-center justify-between py-2">
                   <div className="flex items-center gap-1">
-                    <span className="text-xs text-gray-600">Overall Momentum</span>
+                    <span className="text-xs text-secondary">Overall Momentum</span>
                     <Tooltip text="Entry only when market momentum matches the selected direction and threshold." />
                   </div>
                   <Toggle enabled={overallMomentum} onToggle={() => setOverallMomentum(v => !v)} size="sm" />
@@ -1069,7 +1069,7 @@ const StrategyBuilder = () => {
                 />
                 <div className="flex items-center justify-between py-2">
                   <div className="flex items-center gap-1">
-                    <span className="text-xs text-gray-600">Spot Adjustment</span>
+                    <span className="text-xs text-secondary">Spot Adjustment</span>
                     <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Uses the same entry spot as strike selection (previous day close). Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach." />
                   </div>
                   <Toggle
@@ -1093,7 +1093,7 @@ const StrategyBuilder = () => {
                       />
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-xs text-gray-500">Units</span>
+                      <span className="text-xs text-muted">Units</span>
                       <SegBtn
                         options={[
                           { value: 'percent', label: '% Percent' },
@@ -1105,7 +1105,7 @@ const StrategyBuilder = () => {
                       />
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="w-20 text-xs font-medium text-gray-600">Threshold</span>
+                      <span className="w-20 text-xs font-medium text-secondary">Threshold</span>
                       <input
                         type="number"
                         min={0.25}
@@ -1122,14 +1122,14 @@ const StrategyBuilder = () => {
                           setSpotAdjustmentValue(Number.isNaN(numeric) ? '' : numeric);
                         }}
                         onBlur={() => setSpotAdjustmentValue(prev => clampSpotAdjustmentValue(prev))}
-                        className="h-10 flex-1 border border-gray-300 rounded text-sm px-2"
+                        className="h-10 flex-1 border border-strong rounded text-sm px-2"
                       />
-                      <span className="text-xs font-medium text-gray-500">
+                      <span className="text-xs font-medium text-muted">
                         {spotAdjustmentUnits === 'percent' ? '%' : 'pts'}
                       </span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-gray-500">Show target info</span>
+                      <span className="text-xs text-muted">Show target info</span>
                       <Toggle
                         enabled={spotAdjustmentShowInfo}
                         onToggle={() => setSpotAdjustmentShowInfo(v => !v)}
@@ -1137,7 +1137,7 @@ const StrategyBuilder = () => {
                       />
                     </div>
                     {spotAdjustmentShowInfo && (
-                      <p className="text-xs text-gray-500">{spotAdjustmentHelperText}</p>
+                      <p className="text-xs text-muted">{spotAdjustmentHelperText}</p>
                     )}
                   </div>
                 )}
@@ -1147,13 +1147,13 @@ const StrategyBuilder = () => {
             <CsvUpload />
 
             {/* Legwise Controls Card */}
-            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-                <div className="px-4 py-3 border-b border-gray-100">
-                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide border-l-4 border-blue-600 pl-3">Legwise Controls</h3>
+            <div className="bg-surface rounded-lg border border-default shadow-sm">
+                <div className="px-4 py-3 border-b border-subtle">
+                  <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Legwise Controls</h3>
               </div>
               <div className="p-4 space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-600">Square Off Mode</span>
+                  <span className="text-xs text-secondary">Square Off Mode</span>
                   <SegBtn
                     options={[{ value: 'partial', label: 'Partial' }, { value: 'complete', label: 'Complete' }]}
                     value={squareOffMode}
@@ -1168,9 +1168,9 @@ const StrategyBuilder = () => {
                     id="trailSL"
                     checked={trailSLBreakeven}
                     onChange={e => setTrailSLBreakeven(e.target.checked)}
-                    className="h-3.5 w-3.5 rounded border-gray-300 accent-blue-600"
+                    className="h-3.5 w-3.5 rounded border-strong accent-blue-600"
                   />
-                  <label htmlFor="trailSL" className="text-xs text-gray-600 cursor-pointer flex-1">
+                  <label htmlFor="trailSL" className="text-xs text-secondary cursor-pointer flex-1">
                     Trail Stop Loss to Break-even
                   </label>
                   <SegBtn
@@ -1184,15 +1184,15 @@ const StrategyBuilder = () => {
             </div>
 
             {/* Overall Settings Card */}
-            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-                <div className="px-4 py-3 border-b border-gray-100">
-                  <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide border-l-4 border-blue-600 pl-3">Overall Settings</h3>
+            <div className="bg-surface rounded-lg border border-default shadow-sm">
+                <div className="px-4 py-3 border-b border-subtle">
+                  <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Overall Settings</h3>
               </div>
               <div className="p-4 space-y-4">
                 {/* Overall Stop Loss */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-gray-600">Overall Stop Loss</span>
+                    <span className="text-xs font-medium text-secondary">Overall Stop Loss</span>
                     <Toggle enabled={overallSLEnabled} onToggle={() => setOverallSLEnabled(v => !v)} size="sm" />
                   </div>
                   {overallSLEnabled && (
@@ -1200,7 +1200,7 @@ const StrategyBuilder = () => {
                       <select
                         value={overallSLType}
                         onChange={e => setOverallSLType(e.target.value)}
-                        className="flex-1 h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                        className="flex-1 h-8 px-2 border border-strong rounded text-xs bg-surface"
                       >
                         <option value="max_loss">Max Loss </option>
                         <option value="total_premium_pct"> Total Premium %</option>
@@ -1209,7 +1209,7 @@ const StrategyBuilder = () => {
                         type="number"
                         value={overallSLValue}
                         onChange={e => setOverallSLValue(e.target.value === '' ? '' : +e.target.value)}
-                        className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                        className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
                         placeholder={overallSLType === 'max_loss' ? '₹' : '%'}
                       />
                     </div>
@@ -1219,7 +1219,7 @@ const StrategyBuilder = () => {
                 {/* Overall Target */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-gray-600">Overall Target</span>
+                    <span className="text-xs font-medium text-secondary">Overall Target</span>
                     <Toggle enabled={overallTgtEnabled} onToggle={() => setOverallTgtEnabled(v => !v)} size="sm" />
                   </div>
                   {overallTgtEnabled && (
@@ -1227,7 +1227,7 @@ const StrategyBuilder = () => {
                       <select
                         value={overallTgtType}
                         onChange={e => setOverallTgtType(e.target.value)}
-                        className="flex-1 h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                        className="flex-1 h-8 px-2 border border-strong rounded text-xs bg-surface"
                       >
                         <option value="max_profit">Max Profit</option>
                         <option value="total_premium_pct">% of Premium</option>
@@ -1236,7 +1236,7 @@ const StrategyBuilder = () => {
                         type="number"
                         value={overallTgtValue}
                         onChange={e => setOverallTgtValue(e.target.value === '' ? '' : +e.target.value)}
-                        className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                        className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
                         placeholder={overallTgtType === 'max_profit' ? '₹' : '%'}
                       />
                     </div>
@@ -1246,7 +1246,7 @@ const StrategyBuilder = () => {
                 {/* Trailing */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-gray-600">Trailing</span>
+                    <span className="text-xs font-medium text-secondary">Trailing</span>
                     <Toggle enabled={trailingEnabled} onToggle={() => setTrailingEnabled(v => !v)} size="sm" />
                   </div>
                   {trailingEnabled && (
@@ -1254,28 +1254,28 @@ const StrategyBuilder = () => {
                       <select
                         value={trailingType}
                         onChange={e => setTrailingType(e.target.value)}
-                        className="w-full h-8 px-2 border border-gray-300 rounded text-xs bg-white"
+                        className="w-full h-8 px-2 border border-strong rounded text-xs bg-surface"
                       >
                         <option value="lock">Lock</option>
                         <option value="lock_and_trail">Lock & Trail</option>
                       </select>
                       <div className="grid grid-cols-2 gap-2">
                         <div>
-                          <label className="block text-xs text-gray-500 mb-1">If profit reaches</label>
+                          <label className="block text-xs text-muted mb-1">If profit reaches</label>
                           <input
                             type="number"
                             value={trailingIfProfit}
                             onChange={e => setTrailingIfProfit(+e.target.value)}
-                            className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                            className="w-full h-8 px-2 border border-strong rounded text-xs text-center"
                           />
                         </div>
                         <div>
-                          <label className="block text-xs text-gray-500 mb-1">Lock profit at</label>
+                          <label className="block text-xs text-muted mb-1">Lock profit at</label>
                           <input
                             type="number"
                             value={trailingLockProfit}
                             onChange={e => setTrailingLockProfit(+e.target.value)}
-                            className="w-full h-8 px-2 border border-gray-300 rounded text-xs text-center"
+                            className="w-full h-8 px-2 border border-strong rounded text-xs text-center"
                           />
                         </div>
                       </div>
@@ -1290,16 +1290,16 @@ const StrategyBuilder = () => {
           <div className="col-span-7 space-y-3">
 
             {/* ── Top configurator panel ── */}
-            <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-              <div className="px-4 py-2.5 border-b border-gray-100 flex items-center gap-2">
-                <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wide">Leg Builder</h3>
+            <div className="bg-surface rounded-lg border border-default shadow-sm">
+              <div className="px-4 py-2.5 border-b border-subtle flex items-center gap-2">
+                <h3 className="text-xs font-bold text-secondary uppercase tracking-wide">Leg Builder</h3>
                 <Tooltip text="Configure your leg settings then click Add Leg." />
               </div>
               <div className="px-4 py-3 flex flex-wrap items-end gap-3">
 
                 {/* Segment */}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-1">Select segments</label>
+                  <label className="block text-xs text-muted mb-1">Select segments</label>
                   <SegBtn
                     options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }]}
                     value={draftLeg.segment}
@@ -1313,16 +1313,16 @@ const StrategyBuilder = () => {
 
                 {/* Total Lot */}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-1">Total Lot</label>
+                  <label className="block text-xs text-muted mb-1">Total Lot</label>
                   <input type="number" min={1} value={draftLeg.lot}
                     onChange={e => setDraftLeg(prev => ({ ...prev, lot: Math.max(1, parseInt(e.target.value) || 1) }))}
-                    className="w-16 h-8 px-2 border border-gray-300 rounded text-xs text-center bg-white focus:outline-none focus:ring-2 focus:ring-blue-400"
+                    className="w-16 h-8 px-2 border border-strong rounded text-xs text-center bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400"
                   />
                 </div>
 
                 {/* Position */}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-1">Position</label>
+                  <label className="block text-xs text-muted mb-1">Position</label>
                   <SegBtn
                     options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
                     value={draftLeg.position}
@@ -1333,7 +1333,7 @@ const StrategyBuilder = () => {
                 {/* Option Type */}
                 {draftLeg.segment === 'options' && (
                   <div>
-                    <label className="block text-xs text-gray-500 mb-1">Option Type</label>
+                    <label className="block text-xs text-muted mb-1">Option Type</label>
                     <SegBtn
                       options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
                       value={draftLeg.option_type}
@@ -1344,10 +1344,10 @@ const StrategyBuilder = () => {
 
                 {/* Expiry */}
                 <div>
-                  <label className="block text-xs text-gray-500 mb-1">Expiry</label>
+                  <label className="block text-xs text-muted mb-1">Expiry</label>
                   <select value={draftLeg.expiry}
                     onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
-                    className="h-8 px-2 border border-gray-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 w-36">
+                    className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-36">
                     {draftLeg.segment === 'options' ? (
                       <>
                         <option value="weekly">Weekly</option>
@@ -1367,10 +1367,10 @@ const StrategyBuilder = () => {
                 {/* Strike Criteria */}
                 {draftLeg.segment === 'options' && (
                   <div>
-                    <label className="block text-xs text-gray-500 mb-1">Strike Criteria</label>
+                    <label className="block text-xs text-muted mb-1">Strike Criteria</label>
                     <select value={draftLeg.strike_criteria}
                       onChange={e => setDraftLeg(prev => ({ ...prev, strike_criteria: e.target.value }))}
-                      className="h-8 px-2 border border-gray-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 w-44">
+                      className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-44">
                       <option value="strike_type">Strike Type</option>
                       <option value="premium_range">Premium Range</option>
                       <option value="closest_premium">Closest Premium</option>
@@ -1384,17 +1384,17 @@ const StrategyBuilder = () => {
                       <option value="delta_range">Delta Range</option>
                     </select>
                     {draftLeg.strike_criteria === 'straddle_width' && (
-                      <div className="flex items-center gap-1 mt-2 text-xs text-gray-600">
-                        <span className="text-xs text-gray-500 whitespace-nowrap">ATM Strike</span>
+                      <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
+                        <span className="text-xs text-muted whitespace-nowrap">ATM Strike</span>
                         <select
                           value={draftLeg.straddle_direction ?? '+'}
                           onChange={e => setDraftLeg(prev => ({ ...prev, straddle_direction: e.target.value }))}
-                          className="h-6 px-2 border border-gray-300 rounded text-xs bg-white"
+                          className="h-6 px-2 border border-strong rounded text-xs bg-surface"
                         >
                           <option value="+">+</option>
                           <option value="-">-</option>
                         </select>
-                        <span className="text-xs text-gray-500">(</span>
+                        <span className="text-xs text-muted">(</span>
                         <input
                           type="number"
                           value={draftLeg.straddle_multiplier ?? 0.5}
@@ -1402,9 +1402,9 @@ const StrategyBuilder = () => {
                           step="0.1"
                           min="0"
                           max="10"
-                          className="w-16 h-6 px-2 border border-gray-300 rounded text-xs text-center"
+                          className="w-16 h-6 px-2 border border-strong rounded text-xs text-center"
                         />
-                        <span className="text-xs text-gray-500 whitespace-nowrap">× ATM Straddle Price )</span>
+                        <span className="text-xs text-muted whitespace-nowrap">× ATM Straddle Price )</span>
                       </div>
                     )}
                   </div>
@@ -1413,26 +1413,26 @@ const StrategyBuilder = () => {
                 {/* Strike Type / Premium */}
                 {draftLeg.segment === 'options' && (
                   <div>
-                    <label className="block text-xs text-gray-500 mb-1">Strike Type</label>
+                    <label className="block text-xs text-muted mb-1">Strike Type</label>
                     {draftLeg.strike_criteria === 'strike_type' ? (
                       <select value={draftLeg.strike_type}
                         onChange={e => setDraftLeg(prev => ({ ...prev, strike_type: e.target.value }))}
-                        className="h-8 px-2 border border-gray-300 rounded text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 w-28">
+                        className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-28">
                         {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                       </select>
                     ) : draftLeg.strike_criteria === 'premium_range' ? (
                       <div className="flex gap-1">
                         <input type="number" min={0} placeholder="Min" value={draftLeg.premium_min || ''}
                           onChange={e => setDraftLeg(prev => ({ ...prev, premium_min: +e.target.value }))}
-                          className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center" />
+                          className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
                         <input type="number" min={0} placeholder="Max" value={draftLeg.premium_max || ''}
                           onChange={e => setDraftLeg(prev => ({ ...prev, premium_max: +e.target.value }))}
-                          className="w-20 h-8 px-2 border border-gray-300 rounded text-xs text-center" />
+                          className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
                       </div>
                     ) : (
                       <input type="number" min={0} placeholder="Value" value={draftLeg.premium_value || ''}
                         onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: +e.target.value }))}
-                        className="w-24 h-8 px-2 border border-gray-300 rounded text-xs text-center" />
+                        className="w-24 h-8 px-2 border border-strong rounded text-xs text-center" />
                     )}
                   </div>
                 )}
@@ -1449,9 +1449,9 @@ const StrategyBuilder = () => {
 
             {/* ── Added legs list ── */}
             {legs.length > 0 && (
-              <div className="bg-white rounded-lg border border-gray-200 shadow-sm">
-                <div className="px-4 py-2.5 border-b border-gray-100">
-                  <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wide">Legs <span className="font-normal text-gray-400 ml-1">({legs.length}/6)</span></h3>
+              <div className="bg-surface rounded-lg border border-default shadow-sm">
+                <div className="px-4 py-2.5 border-b border-subtle">
+                  <h3 className="text-xs font-bold text-secondary uppercase tracking-wide">Legs <span className="font-normal text-muted ml-1">({legs.length}/6)</span></h3>
                 </div>
                 <div className="p-3 space-y-3">
                   {trailSLWarning && (
@@ -1467,14 +1467,14 @@ const StrategyBuilder = () => {
                     </div>
                   )}
                   {legs.map((leg, idx) => (
-                    <div key={leg.id} className="border border-gray-200 rounded-lg overflow-hidden">
+                    <div key={leg.id} className="border border-default rounded-lg overflow-hidden">
                       <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 py-2 flex items-center justify-between border-b border-blue-200">
                         <span className="text-xs font-bold text-blue-900">
                           Leg {idx + 1} | {leg.segment === 'options' ? `${leg.position.toUpperCase()} ${leg.option_type.toUpperCase()}` : 'FUTURE'} | {leg.expiry}
                         </span>
                         <div className="flex items-center gap-2">
-                          <span className="text-xs text-blue-600 font-medium">{leg.lot * getLotSize(instrument, startDate)} units</span>
-                          <button onClick={() => removeLeg(leg.id)} className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors">
+                          <span className="text-xs text-accent font-medium">{leg.lot * getLotSize(instrument, startDate)} units</span>
+                          <button onClick={() => removeLeg(leg.id)} className="p-1 text-muted hover:text-loss hover:bg-loss-bg rounded transition-colors">
                             <Trash2 size={13} />
                           </button>
                         </div>
@@ -1482,14 +1482,14 @@ const StrategyBuilder = () => {
 
                       <div className="p-3 space-y-3">
                         {leg.strike_criteria === 'straddle_width' && (
-                          <div className="text-xs text-gray-500 px-1">
+                          <div className="text-xs text-muted px-1">
                             Straddle Width: ATM {leg.straddle_direction ?? '+'} ({leg.straddle_multiplier ?? 0.5} × Straddle)
                           </div>
                         )}
                         {/* Basic fields */}
                         <div className="flex flex-wrap items-end gap-3">
                           <div>
-                            <label className="block text-xs text-gray-500 mb-1">Segment</label>
+                            <label className="block text-xs text-muted mb-1">Segment</label>
                             <SegBtn size="sm"
                               options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
                               value={leg.segment}
@@ -1502,19 +1502,19 @@ const StrategyBuilder = () => {
                             />
                           </div>
                           <div>
-                            <label className="block text-xs text-gray-500 mb-1">Lots</label>
+                            <label className="block text-xs text-muted mb-1">Lots</label>
                             <input type="number" min={1} value={leg.lot}
                               onChange={e => updateLeg(leg.id, 'lot', parseInt(e.target.value) || 1)}
-                              className="w-16 h-7 px-2 border border-gray-300 rounded text-xs text-center bg-white" />
+                              className="w-16 h-7 px-2 border border-strong rounded text-xs text-center bg-surface" />
                           </div>
                           <div>
-                            <label className="block text-xs text-gray-500 mb-1">Position</label>
+                            <label className="block text-xs text-muted mb-1">Position</label>
                             <div className="flex items-center gap-2">
                               <SegBtn size="sm"
                                 options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
                                 value={leg.position} onChange={v => updateLeg(leg.id, 'position', v)} />
                               {strFilter.enabled && (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700 border border-blue-200">
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-hover text-blue-700 border border-blue-200">
                                   STR
                                 </span>
                               )}
@@ -1522,16 +1522,16 @@ const StrategyBuilder = () => {
                           </div>
                           {leg.segment === 'options' && (
                             <div>
-                              <label className="block text-xs text-gray-500 mb-1">Option Type</label>
+                              <label className="block text-xs text-muted mb-1">Option Type</label>
                               <SegBtn size="sm"
                                 options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
                                 value={leg.option_type} onChange={v => updateLeg(leg.id, 'option_type', v)} />
                             </div>
                           )}
                           <div>
-                            <label className="block text-xs text-gray-500 mb-1">Expiry</label>
+                            <label className="block text-xs text-muted mb-1">Expiry</label>
                             <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
-                              className="h-7 px-2 border border-gray-300 rounded text-xs bg-white w-28">
+                              className="h-7 px-2 border border-strong rounded text-xs bg-surface w-28">
                               {leg.segment === 'options' ? (
                                 <>
                                   <option value="weekly">Weekly</option>
@@ -1550,9 +1550,9 @@ const StrategyBuilder = () => {
                           {leg.segment === 'options' && (
                             <>
                               <div>
-                                <label className="block text-xs text-gray-500 mb-1">Strike Criteria</label>
+                                <label className="block text-xs text-muted mb-1">Strike Criteria</label>
                                 <select value={leg.strike_criteria} onChange={e => updateLeg(leg.id, 'strike_criteria', e.target.value)}
-                                  className="h-7 px-2 border border-gray-300 rounded text-xs bg-white w-36">
+                                  className="h-7 px-2 border border-strong rounded text-xs bg-surface w-36">
                                   <option value="strike_type">Strike Type</option>
                                   <option value="premium_range">Premium Range</option>
                                   <option value="closest_premium">Closest Premium</option>
@@ -1566,17 +1566,17 @@ const StrategyBuilder = () => {
                                   <option value="delta_range">Delta Range</option>
                                 </select>
                                 {leg.strike_criteria === 'straddle_width' && (
-                                  <div className="flex items-center gap-1 mt-2 text-xs text-gray-600">
-                                    <span className="text-xs text-gray-500 whitespace-nowrap">ATM Strike</span>
+                                  <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
+                                    <span className="text-xs text-muted whitespace-nowrap">ATM Strike</span>
                                     <select
                                       value={leg.straddle_direction ?? '+'}
                                       onChange={e => updateLeg(leg.id, 'straddle_direction', e.target.value)}
-                                      className="h-6 px-2 border border-gray-300 rounded text-xs bg-white"
+                                      className="h-6 px-2 border border-strong rounded text-xs bg-surface"
                                     >
                                       <option value="+">+</option>
                                       <option value="-">-</option>
                                     </select>
-                                    <span className="text-xs text-gray-500">(</span>
+                                    <span className="text-xs text-muted">(</span>
                                     <input
                                       type="number"
                                       value={leg.straddle_multiplier ?? 0.5}
@@ -1584,32 +1584,32 @@ const StrategyBuilder = () => {
                                       step="0.1"
                                       min="0"
                                       max="10"
-                                      className="w-16 h-6 px-2 border border-gray-300 rounded text-xs text-center"
+                                      className="w-16 h-6 px-2 border border-strong rounded text-xs text-center"
                                     />
-                                    <span className="text-xs text-gray-500 whitespace-nowrap">× ATM Straddle Price )</span>
+                                    <span className="text-xs text-muted whitespace-nowrap">× ATM Straddle Price )</span>
                                   </div>
                                 )}
                               </div>
                               <div>
-                                <label className="block text-xs text-gray-500 mb-1">Strike Type</label>
+                                <label className="block text-xs text-muted mb-1">Strike Type</label>
                                 {leg.strike_criteria === 'strike_type' ? (
                                   <select value={leg.strike_type} onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
-                                    className="h-7 px-2 border border-gray-300 rounded text-xs bg-white w-24">
+                                    className="h-7 px-2 border border-strong rounded text-xs bg-surface w-24">
                                     {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                                   </select>
                                 ) : leg.strike_criteria === 'premium_range' ? (
                                   <div className="flex gap-1">
                                     <input type="number" min={0} placeholder="Min" value={leg.premium_min || ''}
                                       onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
-                                      className="w-16 h-7 px-1 border border-gray-300 rounded text-xs text-center" />
+                                      className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
                                     <input type="number" min={0} placeholder="Max" value={leg.premium_max || ''}
                                       onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
-                                      className="w-16 h-7 px-1 border border-gray-300 rounded text-xs text-center" />
+                                      className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
                                   </div>
                                 ) : (
                                   <input type="number" min={0} placeholder="Value" value={leg.premium_value || ''}
                                     onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
-                                    className="w-20 h-7 px-1 border border-gray-300 rounded text-xs text-center" />
+                                    className="w-20 h-7 px-1 border border-strong rounded text-xs text-center" />
                                 )}
                               </div>
                             </>
@@ -1617,54 +1617,54 @@ const StrategyBuilder = () => {
                         </div>
 
                         {/* Advanced controls */}
-                        <div className="pt-2 border-t border-gray-100 space-y-2">
+                        <div className="pt-2 border-t border-subtle space-y-2">
                           <div className="flex flex-wrap gap-x-4 gap-y-2">
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.target_enabled} onToggle={() => updateLeg(leg.id, 'target_enabled', !leg.target_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Target Profit</span>
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                               {leg.target_enabled && (<>
-                                <select value={leg.target_mode} onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.target_mode} onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="UNDERLYING_POINTS">Underlying Pts</option>
                                   <option value="PERCENT">Percent (%)</option>
                                   <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
-                                <input type="number" min={0} value={leg.target_value ?? ''} onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                                <input type="number" min={0} value={leg.target_value ?? ''} onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.stop_loss_enabled} onToggle={() => updateLeg(leg.id, 'stop_loss_enabled', !leg.stop_loss_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Stop Loss</span>
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                               {leg.stop_loss_enabled && (<>
-                                <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="UNDERLYING_POINTS">Underlying Pts</option>
                                   <option value="PERCENT">Percent (%)</option>
                                   <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
-                                <input type="number" min={0} value={leg.stop_loss_value ?? ''} onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                                <input type="number" min={0} value={leg.stop_loss_value ?? ''} onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.trail_sl_enabled} onToggle={() => updateLeg(leg.id, 'trail_sl_enabled', !leg.trail_sl_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Trail SL</span>
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
                               <Tooltip text="For every X profit, trail SL by Y." />
                               {leg.trail_sl_enabled && (<>
-                                <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="POINTS">Points</option>
                                   <option value="PERCENT">Percent</option>
                                 </select>
-                                <input type="number" min={0} placeholder="X" value={leg.trail_sl_trigger ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
-                                <input type="number" min={0} placeholder="Y" value={leg.trail_sl_move ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                                <input type="number" min={0} placeholder="X" value={leg.trail_sl_trigger ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
+                                <input type="number" min={0} placeholder="Y" value={leg.trail_sl_move ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
                               </>)}
                             </div>
                           </div>
                           <div className="flex flex-wrap gap-x-4 gap-y-2">
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.re_entry_target_enabled} onToggle={() => updateLeg(leg.id, 're_entry_target_enabled', !leg.re_entry_target_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Re-entry on Tgt</span>
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
                               {leg.re_entry_target_enabled && (<>
-                                <select value={leg.re_entry_target_mode} onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.re_entry_target_mode} onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
@@ -1673,16 +1673,16 @@ const StrategyBuilder = () => {
                                   <option value="RE_COST_REV">RE COST &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
-                                <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.re_entry_sl_enabled} onToggle={() => updateLeg(leg.id, 're_entry_sl_enabled', !leg.re_entry_sl_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Re-entry on SL</span>
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
                               {leg.re_entry_sl_enabled && (<>
-                                <select value={leg.re_entry_sl_mode} onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.re_entry_sl_mode} onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
@@ -1691,16 +1691,16 @@ const StrategyBuilder = () => {
                                   <option value="RE_COST_REV">RE COST &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
-                                <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.simple_momentum_enabled} onToggle={() => updateLeg(leg.id, 'simple_momentum_enabled', !leg.simple_momentum_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-gray-600 whitespace-nowrap">Simple Momentum</span>
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Simple Momentum</span>
                               {leg.simple_momentum_enabled && (<>
-                                <select value={leg.simple_momentum_mode} onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-gray-300 rounded text-xs bg-white">
+                                <select value={leg.simple_momentum_mode} onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="POINTS_UP">Points (Pts) &#8593;</option>
                                   <option value="POINTS_DOWN">Points (Pts) &#8595;</option>
                                   <option value="PERCENT_UP">Percent (%) &#8593;</option>
@@ -1710,7 +1710,7 @@ const StrategyBuilder = () => {
                                   <option value="UNDERLYING_PERCENT_UP">Underlying % &#8593;</option>
                                   <option value="UNDERLYING_PERCENT_DOWN">Underlying % &#8595;</option>
                                 </select>
-                                <input type="number" min={0} value={leg.simple_momentum_value ?? ''} onChange={e => updateLeg(leg.id, 'simple_momentum_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-gray-300 rounded text-xs text-center" />
+                                <input type="number" min={0} value={leg.simple_momentum_value ?? ''} onChange={e => updateLeg(leg.id, 'simple_momentum_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
                               </>)}
                             </div>
                           </div>
@@ -1729,15 +1729,15 @@ const StrategyBuilder = () => {
         </div>
 
         {/* Date Range Bar */}
-        <div className="mt-4 bg-white rounded-lg border border-gray-200 shadow-sm px-5 py-3">
+        <div className="mt-4 bg-surface rounded-lg border border-default shadow-sm px-5 py-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
-                <label className="text-xs text-gray-600">Start Date</label>
+                <label className="text-xs text-secondary">Start Date</label>
                 <DateInput value={startDate} onChange={handleStartDateChange} />
               </div>
               <div className="flex items-center gap-2">
-                <label className="text-xs text-gray-600">End Date</label>
+                <label className="text-xs text-secondary">End Date</label>
                 <DateInput value={endDate} onChange={handleEndDateChange} />
               </div>
             </div>
@@ -1751,7 +1751,7 @@ const StrategyBuilder = () => {
                 <button
                   type="button"
                   onClick={() => setShowFullRange(true)}
-                  className="px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors"
+                  className="px-3 py-1.5 text-xs font-medium text-blue-700 bg-hover border border-blue-200 rounded-lg hover:bg-hover transition-colors"
                 >
                   Load Full Range ({formatSummaryDateInput(strFilter.summary.range.from)} → {formatSummaryDateInput(strFilter.summary.range.to)})
                 </button>
@@ -1760,14 +1760,14 @@ const StrategyBuilder = () => {
           </div>
         </div>
         {validationError && (
-          <div className="mt-2 text-xs text-red-600">{validationError}</div>
+          <div className="mt-2 text-xs text-loss">{validationError}</div>
         )}
 
         {/* Results */}
         {results && (
           <div className="mt-4">
             {results?.meta?.str_enabled && (
-              <div className="mb-3 text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded px-3 py-2 inline-block">
+              <div className="mb-3 text-xs text-blue-700 bg-hover border border-blue-200 rounded px-3 py-2 inline-block">
                 STR {results?.meta?.str_type}: {results?.meta?.trades_before_str_filter} -&gt; {results?.meta?.trades_after_str_filter}
               </div>
             )}
@@ -1783,8 +1783,8 @@ const StrategyBuilder = () => {
 
         {/* Error Alert - Above Button */}
         {error && (
-          <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 bg-red-50 border border-red-200 rounded-lg shadow-lg">
-            <AlertTriangle size={16} className="text-red-600 flex-shrink-0" />
+          <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 bg-loss-bg border border-red-200 rounded-lg shadow-lg">
+            <AlertTriangle size={16} className="text-loss flex-shrink-0" />
             <span className="text-sm text-red-700">{error}</span>
           </div>
         )}
@@ -1811,7 +1811,7 @@ const StrategyBuilder = () => {
             )}
           </button>
           {jobStatusLabel && (
-            <div className="mt-2 text-xs text-center text-gray-600">{jobStatusLabel}</div>
+            <div className="mt-2 text-xs text-center text-secondary">{jobStatusLabel}</div>
           )}
         </div>
       </div>

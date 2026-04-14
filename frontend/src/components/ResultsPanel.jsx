@@ -7,27 +7,27 @@ import { Download, X } from 'lucide-react';
 import ExcelJS from 'exceljs';
 
 const EXIT_REASON_COLORS = {
-  Expiry: '#6c757d',
-  STOP_LOSS: '#e53e3e',
-  TARGET: '#38a169',
-  TRAIL_SL: '#d69e2e',
-  STR_Exit: '#805ad5',
-  FILTER_END: '#3182ce',
-  FUT_ROLL_ON_EXPIRY: '#0078ff',
-  FUT_ROLL_N_DAYS_BEFORE_EXPIRY: '#0078ff',
-  FUT_ROLL_LAST_WEEK_BEFORE_EXPIRY: '#0078ff',
-  default: '#4a5568',
+  Expiry:                           { bg: '#f1f5f9', text: '#475569', border: '#cbd5e1' },
+  STOP_LOSS:                        { bg: 'var(--loss-bg)', text: 'var(--loss)', border: 'var(--loss-border)' },
+  TARGET:                           { bg: 'var(--profit-bg)', text: 'var(--profit)', border: 'var(--profit-border)' },
+  TRAIL_SL:                         { bg: 'var(--warning-bg)', text: 'var(--warning)', border: 'rgba(245, 158, 11, 0.3)' },
+  STR_Exit:                         { bg: 'rgba(147, 51, 234, 0.1)', text: '#7e22ce', border: 'rgba(147, 51, 234, 0.25)' },
+  FILTER_END:                       { bg: 'var(--accent-bg)', text: 'var(--accent)', border: 'rgba(37, 99, 235, 0.25)' },
+  FUT_ROLL_ON_EXPIRY:               { bg: '#e0f2fe', text: '#0369a1', border: '#bae6fd' },
+  FUT_ROLL_N_DAYS_BEFORE_EXPIRY:    { bg: '#e0f2fe', text: '#0369a1', border: '#bae6fd' },
+  FUT_ROLL_LAST_WEEK_BEFORE_EXPIRY: { bg: '#e0f2fe', text: '#0369a1', border: '#bae6fd' },
+  default:                          { bg: 'var(--bg-hover)', text: 'var(--text-secondary)', border: 'var(--border-strong)' }
 };
 
 const renderExitReasonBadge = (reason) => {
   if (!reason) {
-    return <span className="text-xs text-gray-400">—</span>;
+    return <span className="text-xs text-muted">—</span>;
   }
-  const color = EXIT_REASON_COLORS[reason] || EXIT_REASON_COLORS.default;
+  const colorInfo = EXIT_REASON_COLORS[reason] || EXIT_REASON_COLORS.default;
   return (
     <span
-      className="px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wide"
-      style={{ backgroundColor: color, color: '#fff' }}
+      className="px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase tracking-wide border"
+      style={{ backgroundColor: colorInfo.bg, color: colorInfo.text, borderColor: colorInfo.border }}
     >
       {reason}
     </span>
@@ -700,8 +700,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const CustomTooltip = ({ active, payload }) => {
     if (active && payload && payload.length) {
       return (
-        <div className="bg-gray-900 border border-gray-700 rounded-lg p-3 shadow-xl">
-          <p className="text-xs text-gray-400 mb-1">{payload[0]?.payload?.date}</p>
+        <div className="bg-base border border-strong rounded-lg p-3 shadow-xl">
+          <p className="text-xs text-muted mb-1">{payload[0]?.payload?.date}</p>
           {payload.map((entry, index) => {
             const dataKey = entry.dataKey || '';
             const value = entry.value;
@@ -766,17 +766,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     }>
       <div className="h-full overflow-y-auto">
         <div
-          className={`${showCloseButton ? "max-w-[1400px] mx-auto min-h-screen px-4 py-6" : "w-full mx-auto"} bg-white rounded-xl shadow-2xl`}
+          className={`${showCloseButton ? "max-w-[1400px] mx-auto min-h-screen px-4 py-6" : "w-full mx-auto"} bg-surface rounded-xl shadow-2xl`}
         >
           {/* Header */}
-          <div className="flex justify-between items-center px-6 py-5 border-b border-gray-200">
+          <div className="flex justify-between items-center px-6 py-5 border-b border-default">
           <div>
-            <h2 className="text-2xl font-bold text-gray-900">Backtest Results</h2>
-            <p className="text-sm text-gray-600 mt-1">
+            <h2 className="text-2xl font-bold text-primary">Backtest Results</h2>
+            <p className="text-sm text-secondary mt-1">
               {stats.totalTrades} trades • {results.meta?.date_range || ''}
             </p>
             {filterInfo && (
-              <span className="mt-2 inline-flex items-center rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+              <span className="mt-2 inline-flex items-center rounded-full border border-subtle bg-hover px-3 py-1 text-xs font-semibold text-blue-700">
                 {filterInfo}
               </span>
             )}
@@ -784,7 +784,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             <div className="flex gap-3">
               <button
                 onClick={exportToCSV}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium text-sm"
+                className="flex items-center gap-2 px-4 py-2 bg-accent text-inverse text-white rounded-lg hover:bg-blue-700 transition-colors font-medium text-sm"
               >
                 <Download size={16} />
                 Export Excel
@@ -792,9 +792,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               {showCloseButton && (
                 <button
                   onClick={onClose}
-                  className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+                  className="p-2 hover:bg-base rounded-lg transition-colors"
                 >
-                  <X size={22} className="text-gray-600" />
+                  <X size={22} className="text-secondary" />
                 </button>
               )}
             </div>
@@ -811,69 +811,69 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
           )}
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6 bg-gradient-to-br from-gray-50 to-gray-100">
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Total P&L</p>
-              <p className={`text-2xl font-bold ${stats.totalPnLPct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+            <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
+              <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">Total P&L</p>
+              <p className={`text-2xl font-bold ${stats.totalPnLPct >= 0 ? 'text-profit' : 'text-loss'}`}>
                 {stats.totalPnLPct >= 0 ? '+' : ''}{stats.totalPnLPct.toFixed(2)}%
               </p>
             </div>
             
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Win Rate</p>
-              <p className="text-2xl font-bold text-blue-600">
+            <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
+              <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">Win Rate</p>
+              <p className="text-2xl font-bold text-accent">
                 {stats.winRate.toFixed(1)}%
               </p>
             </div>
 
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">CAGR</p>
-              <p className={`text-2xl font-bold ${stats.cagr >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+            <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
+              <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">CAGR</p>
+              <p className={`text-2xl font-bold ${stats.cagr >= 0 ? 'text-profit' : 'text-loss'}`}>
                 {stats.cagr.toFixed(1)}%
               </p>
             </div>
             
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Max DD</p>
-              <p className="text-2xl font-bold text-red-600">
+            <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
+              <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">Max DD</p>
+              <p className="text-2xl font-bold text-loss">
                 {stats.maxDDPct.toFixed(2)}%
               </p>
             </div>
             
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Trades</p>
-              <p className="text-2xl font-bold text-gray-700">
+            <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
+              <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">Trades</p>
+              <p className="text-2xl font-bold text-secondary">
                 {stats.totalTrades}
               </p>
             </div>
           </div>
 
           {/* Charts */}
-          <div className="p-6 space-y-6 bg-gray-50">
+          <div className="p-6 space-y-6 bg-hover">
             {/* Equity Curve */}
-            <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
-              <h3 className="text-base font-bold text-gray-800 mb-4">Equity Curve (Cumulative P&L)</h3>
+            <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
+              <h3 className="text-base font-bold text-primary mb-4">Equity Curve (Cumulative P&L)</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
               <ResponsiveContainer width="100%" height={300}>
                 <AreaChart data={equityData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
                   <defs>
                     <linearGradient id="colorEquity" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4}/>
-                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0.1}/>
+                      <stop offset="5%" stopColor="var(--chart-equity)" stopOpacity={0.15}/>
+                      <stop offset="95%" stopColor="var(--chart-equity)" stopOpacity={0}/>
                     </linearGradient>
                   </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
                   <XAxis
                     dataKey="date"
-                    stroke="#9ca3af"
-                    tick={{ fontSize: 10, fill: '#6b7280' }}
+                    stroke="var(--border-default)"
+                    tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
                     tickLine={false}
                     tickFormatter={formatDateShort}
                     interval="preserveStartEnd"
                     minTickGap={50}
                   />
                   <YAxis
-                    stroke="#9ca3af"
-                    tick={{ fontSize: 11, fill: '#6b7280' }}
+                    stroke="var(--border-default)"
+                    tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
                     tickLine={false}
                     tickFormatter={(value) => value.toFixed(1)}
                     domain={equityDomain}
@@ -882,13 +882,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   <Area
                     type="monotone"
                     dataKey="cumulative"
-                    stroke="#3b82f6"
+                    stroke="var(--chart-equity)"
                     strokeWidth={2}
                     fill="url(#colorEquity)"
                     name="Cumulative P&L"
                     isAnimationActive={false}
                     connectNulls={true}
                     baseValue={equityDomain[0]}
+                    dot={false}
                   />
                 </AreaChart>
               </ResponsiveContainer>
@@ -896,47 +897,41 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
 
             {/* Drawdown */}
-            <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
-              <h3 className="text-base font-bold text-gray-800 mb-4">Drawdown</h3>
+            <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
+              <h3 className="text-base font-bold text-primary mb-4">Drawdown</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
               <ResponsiveContainer width="100%" height={260}>
                 <AreaChart data={drawdownData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
-                  <defs>
-                    <linearGradient id="colorDrawdown" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#ef4444" stopOpacity={0.4}/>
-                      <stop offset="95%" stopColor="#ef4444" stopOpacity={0.1}/>
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
                   <XAxis
                     dataKey="date"
-                    stroke="#9ca3af"
-                    tick={{ fontSize: 10, fill: '#6b7280' }}
+                    stroke="var(--border-default)"
+                    tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
                     tickLine={false}
                     tickFormatter={formatDateShort}
                     interval="preserveStartEnd"
                     minTickGap={50}
                   />
                   <YAxis
-                    stroke="#9ca3af"
-                    tick={{ fontSize: 11, fill: '#6b7280' }}
+                    stroke="var(--border-default)"
+                    tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
                     tickLine={false}
                     tickFormatter={(value) => `${value.toFixed(1)}%`}
                     domain={drawdownDomain}
                   />
                   <Tooltip content={<CustomTooltip />} />
-                  {/* Zero baseline — visible even during periods of zero drawdown */}
-                  <ReferenceLine y={0} stroke="#9ca3af" strokeWidth={1} />
+                  <ReferenceLine y={0} stroke="var(--border-strong)" strokeWidth={1} />
                   <Area
                     type="monotone"
                     dataKey="drawdown"
-                    stroke="#ef4444"
-                    strokeWidth={2}
-                    fill="url(#colorDrawdown)"
+                    stroke="var(--chart-drawdown)"
+                    strokeWidth={1.5}
+                    fill="var(--loss-bg)"
                     name="Drawdown"
                     isAnimationActive={false}
                     connectNulls={true}
                     baseValue={0}
+                    dot={false}
                   />
                 </AreaChart>
               </ResponsiveContainer>
@@ -945,14 +940,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
             {/* Monthly Returns */}
             {pivot.rows && pivot.rows.length > 0 && (
-              <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
-                <h3 className="text-base font-bold text-gray-800 mb-4">Monthly Returns</h3>
+              <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
+                <h3 className="text-base font-bold text-primary mb-4">Monthly Returns</h3>
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
                     <thead>
-                      <tr className="border-b-2 border-gray-300">
+                      <tr className="border-b-2 border-strong">
                         {pivot.headers?.map((header, idx) => (
-                          <th key={idx} className="px-4 py-3 text-center text-xs font-bold text-gray-700 uppercase tracking-wider">
+                          <th key={idx} className="px-4 py-3 text-center text-xs font-bold text-secondary uppercase tracking-wider">
                             {header}
                           </th>
                         ))}
@@ -960,7 +955,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     </thead>
                     <tbody>
                       {pivot.rows?.map((row, rowIdx) => (
-                        <tr key={rowIdx} className="border-b border-gray-200 hover:bg-gray-50 transition-colors">
+                        <tr key={rowIdx} className="border-b border-default hover:bg-hover transition-colors">
                           {row.map((cell, cellIdx) => {
                             const isNumeric = typeof cell === 'number';
                             const isPositive = isNumeric && cell > 0;
@@ -970,11 +965,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               <td 
                                 key={cellIdx} 
                                 className={`px-4 py-3 text-center ${
-                                  cellIdx === 0 ? 'font-bold text-gray-900' : ''
+                                  cellIdx === 0 ? 'font-bold text-primary' : ''
                                 } ${
-                                  isPositive ? 'text-green-600 font-semibold' : 
-                                  isNegative ? 'text-red-600 font-semibold' : 
-                                  'text-gray-500'
+                                  isPositive ? 'text-profit font-semibold' : 
+                                  isNegative ? 'text-loss font-semibold' : 
+                                  'text-muted'
                                 }`}
                               >
                                 {isNumeric ? cell.toFixed(2) : cell || '-'}
@@ -990,127 +985,127 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             )}
 
             {/* Detailed Statistics Summary */}
-            <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-200">
-              <h3 className="text-sm font-bold text-gray-800 mb-3">Detailed Statistics</h3>
+            <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
+              <h3 className="text-sm font-bold text-primary mb-3">Detailed Statistics</h3>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2 text-xs">
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Overall Profit</p>
-                  <p className="font-normal text-gray-900">
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Overall Profit</p>
+                  <p className="font-normal text-primary">
                     {stats.totalPnLPct >= 0 ? '+' : ''}{stats.totalPnLPct.toFixed(2)}%
                   </p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">No. of Trades</p>
-                  <p className="font-normal text-gray-900">{stats.totalTrades}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">No. of Trades</p>
+                  <p className="font-normal text-primary">{stats.totalTrades}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Average Profit per Trade</p>
-                  <p className="font-normal text-gray-900">
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Average Profit per Trade</p>
+                  <p className="font-normal text-primary">
                     {stats.avgWinPct >= 0 ? '+' : ''}{Math.abs(stats.avgWinPct).toFixed(2)}%
                   </p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Win %</p>
-                  <p className="font-normal text-gray-900">{stats.winRate.toFixed(2)}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Win %</p>
+                  <p className="font-normal text-primary">{stats.winRate.toFixed(2)}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Loss %</p>
-                  <p className="font-normal text-gray-900">{stats.lossPct.toFixed(2)}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Loss %</p>
+                  <p className="font-normal text-primary">{stats.lossPct.toFixed(2)}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Average Profit on Winning Trades</p>
-                  <p className="font-normal text-gray-900">+{Math.abs(stats.avgWinPct).toFixed(2)}%</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Average Profit on Winning Trades</p>
+                  <p className="font-normal text-primary">+{Math.abs(stats.avgWinPct).toFixed(2)}%</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Average Loss on Losing Trades</p>
-                  <p className="font-normal text-gray-900">{stats.avgLossPct.toFixed(2)}%</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Average Loss on Losing Trades</p>
+                  <p className="font-normal text-primary">{stats.avgLossPct.toFixed(2)}%</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max Profit in Single Trade</p>
-                  <p className="font-normal text-gray-900">₹{stats.maxWin.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max Profit in Single Trade</p>
+                  <p className="font-normal text-primary">₹{stats.maxWin.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max Loss in Single Trade</p>
-                  <p className="font-normal text-gray-900">₹{stats.maxLoss.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max Loss in Single Trade</p>
+                  <p className="font-normal text-primary">₹{stats.maxLoss.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max Drawdown</p>
-                  <p className="font-normal text-gray-900">{stats.maxDDPct.toFixed(2)}%</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max Drawdown</p>
+                  <p className="font-normal text-primary">{stats.maxDDPct.toFixed(2)}%</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max DD Days</p>
-                  <p className="font-normal text-gray-900">
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max DD Days</p>
+                  <p className="font-normal text-primary">
                     {stats.mddDuration > 0 ? stats.mddDuration : 'N/A'}
                   </p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Return/MaxDD</p>
-                  <p className="font-normal text-gray-900">{stats.recoveryFactor.toFixed(2)}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Return/MaxDD</p>
+                  <p className="font-normal text-primary">{stats.recoveryFactor.toFixed(2)}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Reward to Risk Ratio</p>
-                  <p className="font-normal text-gray-900">{stats.rewardToRisk.toFixed(2)}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Reward to Risk Ratio</p>
+                  <p className="font-normal text-primary">{stats.rewardToRisk.toFixed(2)}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Expectancy Ratio</p>
-                  <p className="font-normal text-gray-900">{stats.expectancy.toFixed(2)}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Expectancy Ratio</p>
+                  <p className="font-normal text-primary">{stats.expectancy.toFixed(2)}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max Win Streak (trades)</p>
-                  <p className="font-normal text-gray-900">{stats.maxWinStreak}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max Win Streak (trades)</p>
+                  <p className="font-normal text-primary">{stats.maxWinStreak}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max Losing Streak (trades)</p>
-                  <p className="font-normal text-gray-900">{stats.maxLossStreak}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max Losing Streak (trades)</p>
+                  <p className="font-normal text-primary">{stats.maxLossStreak}</p>
                 </div>
                 
-                <div className="border-b border-gray-200 pb-2">
-                  <p className="font-bold text-gray-900 mb-0.5">Max trades in any drawdown</p>
-                  <p className="font-normal text-gray-900">{stats.mddTradeNumber || 'N/A'}</p>
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">Max trades in any drawdown</p>
+                  <p className="font-normal text-primary">{stats.mddTradeNumber || 'N/A'}</p>
                 </div>
               </div>
             </div>
 
             {/* Full Report Table */}
-            <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-200">
+            <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
               <div className="flex justify-between items-center mb-4">
-                <h3 className="text-base font-bold text-gray-800">Full Report</h3>
-                <div className="text-sm text-gray-600">
+                <h3 className="text-base font-bold text-primary">Full Report</h3>
+                <div className="text-sm text-secondary">
                   Showing <span className="font-semibold">{((currentPage - 1) * itemsPerPage) + 1} - {Math.min(currentPage * itemsPerPage, groupedTrades.length)}</span> trades out of <span className="font-semibold">{groupedTrades.length}</span>
                 </div>
               </div>
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">
                   <thead>
-                    <tr className="bg-gray-200 border-b-2 border-gray-400">
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Index</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Entry Date</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Exit Date</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Spot</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Spot</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">Type</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Strike</th>
-                      <th className="px-3 py-3 text-left text-xs font-bold text-gray-800">B/S</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Qty</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Entry Price</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Exit Price</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">Net P&L</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-gray-800">% P&L</th>
+                    <tr className="bg-base border-b-2 border-gray-400">
+                      <th className="px-3 py-3 text-left text-xs font-bold text-primary">Index</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-primary">Entry Date</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-primary">Exit Date</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Entry Spot</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Exit Spot</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-primary">Type</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Strike</th>
+                      <th className="px-3 py-3 text-left text-xs font-bold text-primary">B/S</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Qty</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Entry Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Exit Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Net P&L</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">% P&L</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1142,31 +1137,31 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               : 0;
                             
                             return (
-                              <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-gray-200 ${groupIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50'} hover:bg-gray-100 transition-colors`}>
+                              <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-default ${groupIdx % 2 === 0 ? 'bg-surface' : 'bg-hover'} hover:bg-base transition-colors`}>
                                 {isFirstLeg ? (
                                   <>
-                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.legs[0]['Index'] || group.tradeNumber}</td>
-                                    <td className="px-3 py-2 text-xs text-gray-900" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
+                                    <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.legs[0]['Index'] || group.tradeNumber}</td>
+                                    <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
                                   </>
                                 ) : null}
                                 {/* Show individual exit date for each leg */}
-                                <td className="px-3 py-2 text-xs text-gray-900">{leg['Exit Date'] || group.exitDate || '-'}</td>
+                                <td className="px-3 py-2 text-xs text-primary">{leg['Exit Date'] || group.exitDate || '-'}</td>
                                 {isFirstLeg ? (
                                   <>
-                                    <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
-                                    <td className="px-3 py-2 text-xs text-right text-gray-900" rowSpan={group.legs.length}>{(group.exitSpot || 0).toFixed(2)}</td>
+                                    <td className="px-3 py-2 text-xs text-right text-primary" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
+                                    <td className="px-3 py-2 text-xs text-right text-primary" rowSpan={group.legs.length}>{(group.exitSpot || 0).toFixed(2)}</td>
                                   </>
                                 ) : null}
-                                <td className="px-3 py-2 text-xs text-gray-700">{optionType}</td>
-                                <td className="px-3 py-2 text-xs text-right text-gray-700">{parseFloat(strike).toFixed(0)}</td>
-                                <td className="px-3 py-2 text-xs text-gray-700">{position}</td>
-                                <td className="px-3 py-2 text-xs text-right text-gray-700">{qty}</td>
-                                <td className="px-3 py-2 text-xs text-right text-gray-700">{entryPrice.toFixed(2)}</td>
-                                <td className="px-3 py-2 text-xs text-right text-gray-700">{exitPrice.toFixed(2)}</td>
-                                <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                <td className="px-3 py-2 text-xs text-secondary">{optionType}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{parseFloat(strike).toFixed(0)}</td>
+                                <td className="px-3 py-2 text-xs text-secondary">{position}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{qty}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{entryPrice.toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{exitPrice.toFixed(2)}</td>
+                                <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-profit' : 'text-loss'}`}>
                                   {legNetPnlPoints >= 0 ? '+' : ''}{legNetPnlPoints.toFixed(2)}
                                 </td>
-                                <td className={`px-3 py-2 text-xs text-right ${legPercentPnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                <td className={`px-3 py-2 text-xs text-right ${legPercentPnl >= 0 ? 'text-profit' : 'text-loss'}`}>
                                   {legPercentPnl >= 0 ? '+' : ''}{legPercentPnl.toFixed(2)}%
                                 </td>
                               </tr>
@@ -1190,7 +1185,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             // must be filled. Empty span = 13 total - 2 P&L cols = 11.
                             const emptyCellSpan = 11;
                             return (
-                              <tr className="border-b-2 border-gray-300 bg-slate-100">
+                              <tr className="border-b-2 border-strong bg-slate-100">
                                 <td colSpan={emptyCellSpan}></td>
                                 <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-green-700' : 'text-red-700'}`}>
                                   {tradeNetPnlPoints >= 0 ? '+' : ''}{tradeNetPnlPoints.toFixed(2)}
@@ -1213,14 +1208,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 <button 
                   onClick={() => setCurrentPage(1)} 
                   disabled={currentPage === 1}
-                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                  className="px-2 py-1 text-sm text-secondary hover:text-primary disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   ≪
                 </button>
                 <button 
                   onClick={() => setCurrentPage(p => Math.max(1, p - 1))} 
                   disabled={currentPage === 1}
-                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                  className="px-2 py-1 text-sm text-secondary hover:text-primary disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   ‹
                 </button>
@@ -1238,8 +1233,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       onClick={() => setCurrentPage(pageNum)}
                       className={`px-3 py-1 text-sm rounded ${
                         currentPage === pageNum 
-                          ? 'bg-blue-600 text-white' 
-                          : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-300'
+                          ? 'bg-accent text-inverse text-white' 
+                          : 'bg-surface text-secondary hover:bg-base border border-strong'
                       }`}
                     >
                       {pageNum}
@@ -1249,14 +1244,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 <button 
                   onClick={() => setCurrentPage(p => Math.min(Math.ceil(groupedTrades.length / itemsPerPage), p + 1))} 
                   disabled={currentPage === Math.ceil(groupedTrades.length / itemsPerPage)}
-                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                  className="px-2 py-1 text-sm text-secondary hover:text-primary disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   ›
                 </button>
                 <button 
                   onClick={() => setCurrentPage(Math.ceil(groupedTrades.length / itemsPerPage))} 
                   disabled={currentPage === Math.ceil(groupedTrades.length / itemsPerPage)}
-                  className="px-2 py-1 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-30 disabled:cursor-not-allowed"
+                  className="px-2 py-1 text-sm text-secondary hover:text-primary disabled:opacity-30 disabled:cursor-not-allowed"
                 >
                   ≫
                 </button>
