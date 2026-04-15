@@ -228,6 +228,38 @@ const getLotSize = (index, tradeDate) => {
   return 1;
 };
 
+const STRIKE_INTERVALS = {
+  NIFTY: 50,
+  BANKNIFTY: 100,
+  FINNIFTY: 50,
+  MIDCPNIFTY: 25,
+  SENSEX: 100,
+  BANKEX: 100,
+};
+
+function getBufferPreview(value, unit, applyTo, posAbove, posBelow, indexName = 'NIFTY') {
+  const spot = 25000;
+  const interval = STRIKE_INTERVALS[indexName?.toUpperCase()] ?? 50;
+  const numericValue = Number(value) || 0;
+  const bufPts = unit === 'percent' ? spot * (numericValue / 100) : numericValue;
+  const parts = [];
+
+  if (applyTo === 'call' || applyTo === 'both') {
+    const position = posAbove ? 'above' : 'below';
+    const ref = position === 'above' ? spot + bufPts : spot - bufPts;
+    const strike = Math.round(ref / interval) * interval;
+    parts.push(`CALL -> ${strike.toLocaleString('en-IN')} CE (${position})`);
+  }
+  if (applyTo === 'put' || applyTo === 'both') {
+    const position = posBelow ? 'below' : 'above';
+    const ref = position === 'below' ? spot - bufPts : spot + bufPts;
+    const strike = Math.round(ref / interval) * interval;
+    parts.push(`PUT -> ${strike.toLocaleString('en-IN')} PE (${position})`);
+  }
+
+  return `e.g. spot 25,000: ${parts.join(' | ')}`;
+}
+
 const Tooltip = ({ text }) => {
   const [show, setShow] = useState(false);
   return (
@@ -316,6 +348,12 @@ const StrategyBuilder = () => {
   const [spotAdjustmentValue, setSpotAdjustmentValue] = useState(1.0);
   const [spotAdjustmentUnits, setSpotAdjustmentUnits] = useState('percent');
   const [spotAdjustmentShowInfo, setSpotAdjustmentShowInfo] = useState(true);
+  const [bufferStrikeEnabled, setBufferStrikeEnabled] = useState(false);
+  const [bufferStrikeValue, setBufferStrikeValue] = useState(0.5);
+  const [bufferStrikeUnit, setBufferStrikeUnit] = useState('percent');
+  const [bufferStrikeApplyTo, setBufferStrikeApplyTo] = useState('both');
+  const [bufferPositionAbove, setBufferPositionAbove] = useState(true);
+  const [bufferPositionBelow, setBufferPositionBelow] = useState(true);
   const [slippagePct, setSlippagePct] = useState(0);
   const [chargesEnabled, setChargesEnabled] = useState(false);
 
@@ -685,12 +723,12 @@ const StrategyBuilder = () => {
       const res = await fetch('/api/backtest/recalculate-slippage', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: JSON.stringify(sanitizePayload({
           trades: rawResults.trades,
           slippage_pct: Number(slippagePct) || 0,
           charges_enabled: chargesEnabled,
           initial_capital: 100000,
-        }),
+        })),
       });
 
       if (!res.ok) {
@@ -858,6 +896,12 @@ const StrategyBuilder = () => {
       spot_adjustment_pct: normalizedSpotAdjustmentValue,
       spot_adjustment_units: spotAdjustmentUnits,
       spot_adjustment_use_entry_close: true,
+      buffer_strike_enabled: Boolean(bufferStrikeEnabled),
+      buffer_strike_value: Number(bufferStrikeValue) || 0,
+      buffer_strike_unit: String(bufferStrikeUnit || 'percent'),
+      buffer_strike_apply_to: String(bufferStrikeApplyTo || 'both'),
+      buffer_position_above: Boolean(bufferPositionAbove),
+      buffer_position_below: Boolean(bufferPositionBelow),
       slippage_pct: Math.max(0, Number(slippagePct) || 0),
       charges_enabled: chargesEnabled,
       legs: legsPayload,
@@ -878,6 +922,51 @@ const StrategyBuilder = () => {
         ? { enabled: true, config: strFilter.configId }
         : { enabled: false },
     };
+  };
+
+  // Deep-clone and strip all non-serializable values from a payload object.
+  // Safe against circular refs, DOM nodes, React fibers, functions, and symbols.
+  const sanitizePayload = (obj, _seen = new WeakSet()) => {
+    // Primitives and null pass through directly
+    if (obj === null || obj === undefined) return obj;
+    if (typeof obj === 'boolean') return obj;
+    if (typeof obj === 'number') return Number.isFinite(obj) ? obj : null;
+    if (typeof obj === 'string') return obj;
+    // Skip non-serializable types entirely
+    if (typeof obj === 'function') return undefined;
+    if (typeof obj === 'symbol') return undefined;
+    // Skip DOM nodes and React elements — these cause the circular ref error
+    if (typeof window !== 'undefined') {
+      if (obj instanceof Element) return undefined;
+      if (obj instanceof Node) return undefined;
+      if (obj instanceof Event) return undefined;
+    }
+    // Skip React synthetic events and fiber nodes
+    if (obj && typeof obj === 'object' && obj.$$typeof) return undefined;
+    // Handle Date objects
+    if (obj instanceof Date) return obj.toISOString().split('T')[0];
+    // Guard against circular references
+    if (_seen.has(obj)) return undefined;
+    _seen.add(obj);
+    // Handle arrays
+    if (Array.isArray(obj)) {
+      return obj
+        .map(item => sanitizePayload(item, _seen))
+        .filter(item => item !== undefined);
+    }
+    // Handle plain objects — iterate key by key, never trust whole-object stringify
+    const out = {};
+    for (const key of Object.keys(obj)) {
+      // Skip React internal keys
+      if (key.startsWith('__react') || key.startsWith('_reactFiber') || key === '__reactInternals') {
+        continue;
+      }
+      const sanitized = sanitizePayload(obj[key], _seen);
+      if (sanitized !== undefined) {
+        out[key] = sanitized;
+      }
+    }
+    return out;
   };
 
   const runBacktest = useCallback(async () => {
@@ -938,6 +1027,7 @@ const StrategyBuilder = () => {
       : null;
 
     const payload = buildPayload();
+    const sanitized = sanitizePayload(payload);
     stopJobPolling();
     setLoading(true);
     setError(null);
@@ -948,11 +1038,25 @@ const StrategyBuilder = () => {
       setError(tslMissingSLMessage);
       setTimeout(() => setError(null), 3000);
     }
+    console.log('[runBacktest] payload keys:', Object.keys(sanitized));
+    console.log('[runBacktest] str_filter:', sanitized?.str_filter);
+    console.log('[runBacktest] filter_segments:', sanitized?.filter_segments);
+    console.log('[runBacktest] legs[0] keys:', sanitized?.legs?.[0] ? Object.keys(sanitized.legs[0]) : 'none');
+    try {
+      JSON.stringify(sanitized);
+      console.log('[runBacktest] sanitized payload stringify SUCCESS');
+    } catch (circErr) {
+      console.error('[runBacktest] sanitized payload still has circular ref:', circErr);
+      for (const k of Object.keys(sanitized ?? {})) {
+        try { JSON.stringify(sanitized[k]); }
+        catch { console.error('[runBacktest] circular ref in key:', k); }
+      }
+    }
     try {
       const res = await fetch('/api/algotest/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(sanitized),
       });
 
       if (res.status === 504) {
@@ -1105,7 +1209,7 @@ const StrategyBuilder = () => {
                 {/* Delay Restart */}
                 <div className="flex items-center justify-between py-2">
                   <span className="text-xs text-secondary">Delay Restart</span>
-                  <Toggle enabled={delayRestart} onToggle={() => setDelayRestart(v => !v)} size="sm" />
+                  <Toggle enabled={delayRestart} onToggle={(val) => setDelayRestart(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                 </div>
 
                 {/* Overall Momentum */}
@@ -1114,13 +1218,13 @@ const StrategyBuilder = () => {
                     <span className="text-xs text-secondary">Overall Momentum</span>
                     <Tooltip text="Entry only when market momentum matches the selected direction and threshold." />
                   </div>
-                  <Toggle enabled={overallMomentum} onToggle={() => setOverallMomentum(v => !v)} size="sm" />
+                  <Toggle enabled={overallMomentum} onToggle={(val) => setOverallMomentum(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                 </div>
 
                 {/* SuperTrend Filter */}
                 <SuperTrendFilter
                   enabled={strFilter.enabled}
-                  onToggle={() => setStrFilter(prev => ({ ...prev, enabled: !prev.enabled }))}
+                  onToggle={(val) => setStrFilter(prev => ({ ...prev, enabled: val !== undefined ? Boolean(val) : !prev.enabled }))}
                   onFilterChange={(payload) => setStrFilter(prev => ({ ...prev, ...payload }))}
                 />
                 <div className="flex items-center justify-between py-2">
@@ -1130,7 +1234,7 @@ const StrategyBuilder = () => {
                   </div>
                   <Toggle
                     enabled={spotAdjustmentEnabled}
-                    onToggle={() => setSpotAdjustmentEnabled(v => !v)}
+                    onToggle={(val) => setSpotAdjustmentEnabled(prev => val !== undefined ? Boolean(val) : !prev)}
                     size="sm"
                   />
                 </div>
@@ -1188,7 +1292,7 @@ const StrategyBuilder = () => {
                       <span className="text-xs text-muted">Show target info</span>
                       <Toggle
                         enabled={spotAdjustmentShowInfo}
-                        onToggle={() => setSpotAdjustmentShowInfo(v => !v)}
+                        onToggle={(val) => setSpotAdjustmentShowInfo(prev => val !== undefined ? Boolean(val) : !prev)}
                         size="sm"
                       />
                     </div>
@@ -1197,6 +1301,134 @@ const StrategyBuilder = () => {
                     )}
                   </div>
                 )}
+                <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
+                        Buffer Strike
+                      </span>
+                    </div>
+                    <Toggle enabled={bufferStrikeEnabled} onToggle={() => setBufferStrikeEnabled(prev => !prev)} size="sm" />
+                  </div>
+
+                  {bufferStrikeEnabled && (
+                    <div className="space-y-4 pt-1">
+                      <div className="space-y-1">
+                        <p className="text-xs font-semibold text-muted uppercase tracking-wide">Apply to</p>
+                        <div className="flex gap-2">
+                          {['call', 'put', 'both'].map(opt => (
+                            <button
+                              key={opt}
+                              type="button"
+                              onClick={() => setBufferStrikeApplyTo(opt)}
+                              className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                bufferStrikeApplyTo === opt
+                                  ? 'bg-accent text-white border-accent'
+                                  : 'border-default text-secondary hover:bg-hover'
+                              }`}
+                            >
+                              {opt === 'call' ? 'Call' : opt === 'put' ? 'Put' : 'Both'}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <p className="text-xs font-semibold text-muted uppercase tracking-wide">Buffer</p>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            value={bufferStrikeValue}
+                            onChange={e => setBufferStrikeValue(Math.max(0, parseFloat(e.target.value) || 0))}
+                            step={bufferStrikeUnit === 'percent' ? 0.1 : 50}
+                            min={bufferStrikeUnit === 'percent' ? 0.1 : 25}
+                            max={bufferStrikeUnit === 'percent' ? 20 : 10000}
+                            className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
+                          />
+                          <div className="flex gap-1">
+                            {['percent', 'points'].map(u => (
+                              <button
+                                key={u}
+                                type="button"
+                                onClick={() => {
+                                  setBufferStrikeUnit(u);
+                                  setBufferStrikeValue(u === 'percent' ? 0.5 : 500);
+                                }}
+                                className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                  bufferStrikeUnit === u
+                                    ? 'bg-accent text-white border-accent'
+                                    : 'border-default text-secondary hover:bg-hover'
+                                }`}
+                              >
+                                {u === 'percent' ? '% Pct' : 'Pts'}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <p className="text-xs font-semibold text-muted uppercase tracking-wide">
+                          Buffer position
+                          <span className="ml-1 text-muted font-normal normal-case">
+                            (which side of spot)
+                          </span>
+                        </p>
+                        <div className="flex flex-wrap gap-4">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={bufferPositionAbove}
+                              onChange={e => {
+                                const next = e.target.checked;
+                                if (!next && !bufferPositionBelow) return;
+                                setBufferPositionAbove(next);
+                              }}
+                              className="accent-blue-600"
+                            />
+                            <span className="text-xs font-medium text-orange-700">↑ Above</span>
+                            <span className="text-xs text-muted">
+                              {bufferStrikeUnit === 'percent'
+                                ? `(+${bufferStrikeValue}% -> ${(25000 * (1 + bufferStrikeValue / 100)).toFixed(0)})`
+                                : `(+${bufferStrikeValue} pts -> ${25000 + Number(bufferStrikeValue)})`
+                              }
+                            </span>
+                          </label>
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={bufferPositionBelow}
+                              onChange={e => {
+                                const next = e.target.checked;
+                                if (!next && !bufferPositionAbove) return;
+                                setBufferPositionBelow(next);
+                              }}
+                              className="accent-blue-600"
+                            />
+                            <span className="text-xs font-medium text-blue-700">↓ Below</span>
+                            <span className="text-xs text-muted">
+                              {bufferStrikeUnit === 'percent'
+                                ? `(-${bufferStrikeValue}% -> ${(25000 * (1 - bufferStrikeValue / 100)).toFixed(0)})`
+                                : `(-${bufferStrikeValue} pts -> ${25000 - Number(bufferStrikeValue)})`
+                              }
+                            </span>
+                          </label>
+                        </div>
+                      </div>
+
+                      <p className="text-[11px] text-muted leading-relaxed bg-hover rounded-lg px-3 py-2">
+                        {getBufferPreview(
+                          bufferStrikeValue,
+                          bufferStrikeUnit,
+                          bufferStrikeApplyTo,
+                          bufferPositionAbove,
+                          bufferPositionBelow,
+                          instrument
+                        )}
+                      </p>
+                    </div>
+                  )}
+                </div>
                 <div>
                   <label className="block text-xs font-medium text-secondary mb-2">Slippage %</label>
                   <div className="flex items-center gap-2">
@@ -1221,7 +1453,7 @@ const StrategyBuilder = () => {
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="text-xs font-medium text-secondary">Transaction Charges</label>
-                    <Toggle enabled={chargesEnabled} onToggle={() => setChargesEnabled(v => !v)} size="sm" />
+<Toggle enabled={chargesEnabled} onToggle={(val) => setChargesEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                   </div>
                   {chargesEnabled && (
                     <div className="rounded-md border border-subtle bg-hover p-2.5 space-y-1 text-xs text-muted">
@@ -1288,7 +1520,7 @@ const StrategyBuilder = () => {
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-medium text-secondary">Overall Stop Loss</span>
-                    <Toggle enabled={overallSLEnabled} onToggle={() => setOverallSLEnabled(v => !v)} size="sm" />
+                    <Toggle enabled={overallSLEnabled} onToggle={(val) => setOverallSLEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                   </div>
                   {overallSLEnabled && (
                     <div className="flex gap-2">
@@ -1315,7 +1547,7 @@ const StrategyBuilder = () => {
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-medium text-secondary">Overall Target</span>
-                    <Toggle enabled={overallTgtEnabled} onToggle={() => setOverallTgtEnabled(v => !v)} size="sm" />
+                    <Toggle enabled={overallTgtEnabled} onToggle={(val) => setOverallTgtEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                   </div>
                   {overallTgtEnabled && (
                     <div className="flex gap-2">
@@ -1342,7 +1574,7 @@ const StrategyBuilder = () => {
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-medium text-secondary">Trailing</span>
-                    <Toggle enabled={trailingEnabled} onToggle={() => setTrailingEnabled(v => !v)} size="sm" />
+                    <Toggle enabled={trailingEnabled} onToggle={(val) => setTrailingEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                   </div>
                   {trailingEnabled && (
                     <div className="space-y-2">
@@ -1715,7 +1947,7 @@ const StrategyBuilder = () => {
                         <div className="pt-2 border-t border-subtle space-y-2">
                           <div className="flex flex-wrap gap-x-4 gap-y-2">
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.target_enabled} onToggle={() => updateLeg(leg.id, 'target_enabled', !leg.target_enabled)} size="sm" />
+                              <Toggle enabled={leg.target_enabled} onToggle={(val) => updateLeg(leg.id, 'target_enabled', val !== undefined ? Boolean(val) : !leg.target_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                               {leg.target_enabled && (<>
                                 <select value={leg.target_mode} onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -1728,7 +1960,7 @@ const StrategyBuilder = () => {
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.stop_loss_enabled} onToggle={() => updateLeg(leg.id, 'stop_loss_enabled', !leg.stop_loss_enabled)} size="sm" />
+                              <Toggle enabled={leg.stop_loss_enabled} onToggle={(val) => updateLeg(leg.id, 'stop_loss_enabled', val !== undefined ? Boolean(val) : !leg.stop_loss_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                               {leg.stop_loss_enabled && (<>
                                 <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -1741,7 +1973,7 @@ const StrategyBuilder = () => {
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.trail_sl_enabled} onToggle={() => updateLeg(leg.id, 'trail_sl_enabled', !leg.trail_sl_enabled)} size="sm" />
+                              <Toggle enabled={leg.trail_sl_enabled} onToggle={(val) => updateLeg(leg.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !leg.trail_sl_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
                               <Tooltip text="For every X profit, trail SL by Y." />
                               {leg.trail_sl_enabled && (<>
@@ -1756,7 +1988,7 @@ const StrategyBuilder = () => {
                           </div>
                           <div className="flex flex-wrap gap-x-4 gap-y-2">
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.re_entry_target_enabled} onToggle={() => updateLeg(leg.id, 're_entry_target_enabled', !leg.re_entry_target_enabled)} size="sm" />
+                              <Toggle enabled={leg.re_entry_target_enabled} onToggle={(val) => updateLeg(leg.id, 're_entry_target_enabled', val !== undefined ? Boolean(val) : !leg.re_entry_target_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
                               {leg.re_entry_target_enabled && (<>
                                 <select value={leg.re_entry_target_mode} onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -1774,7 +2006,7 @@ const StrategyBuilder = () => {
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.re_entry_sl_enabled} onToggle={() => updateLeg(leg.id, 're_entry_sl_enabled', !leg.re_entry_sl_enabled)} size="sm" />
+                              <Toggle enabled={leg.re_entry_sl_enabled} onToggle={(val) => updateLeg(leg.id, 're_entry_sl_enabled', val !== undefined ? Boolean(val) : !leg.re_entry_sl_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
                               {leg.re_entry_sl_enabled && (<>
                                 <select value={leg.re_entry_sl_mode} onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -1792,7 +2024,7 @@ const StrategyBuilder = () => {
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.simple_momentum_enabled} onToggle={() => updateLeg(leg.id, 'simple_momentum_enabled', !leg.simple_momentum_enabled)} size="sm" />
+                              <Toggle enabled={leg.simple_momentum_enabled} onToggle={(val) => updateLeg(leg.id, 'simple_momentum_enabled', val !== undefined ? Boolean(val) : !leg.simple_momentum_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Simple Momentum</span>
                               {leg.simple_momentum_enabled && (<>
                                 <select value={leg.simple_momentum_mode} onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -1898,7 +2130,7 @@ const StrategyBuilder = () => {
                 <label className="text-xs font-medium text-secondary whitespace-nowrap">
                   Txn Charges
                 </label>
-                <Toggle enabled={chargesEnabled} onToggle={() => setChargesEnabled(v => !v)} size="sm" />
+                <Toggle enabled={chargesEnabled} onToggle={(val) => setChargesEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
               </div>
               <button
                 onClick={handleRecalculate}

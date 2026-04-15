@@ -80,6 +80,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const { trades = [], summary = {}, pivot = {} } = results;
   const slippagePct = Number(results?.meta?.slippage_pct || 0);
   const chargesEnabled = Boolean(results?.meta?.charges_enabled);
+  const bufferStrikeEnabled = Boolean(
+    results?.meta?.buffer_strike_enabled ||
+    trades.some(trade => trade?.buffer_ref_price != null || Number(trade?.buffer_strike_offset))
+  );
   const warnings = results?.warnings || [];
   const filteredWarnings = warnings.filter(Boolean);
   const [currentPage, setCurrentPage] = useState(1);
@@ -385,12 +389,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const hasPuts    = sourceTrades.some(t => ['PE','PUT'].includes((t['Type']||'').toUpperCase()));
     const hasFutures = sourceTrades.some(t => (t['Type']||'').toUpperCase() === 'FUT');
     const hasStr     = showStrSegment && sourceTrades.some(t => t['STR Segment']);
+    const hasBuffer  = bufferStrikeEnabled;
 
     const TRADE_COLS = new Set(['Net P&L','% P&L','Cumulative','Peak','DD','%DD']);
     const keyOrder = [
       'Trade','Leg','Index','Entry Date','Exit Date',
       'Entry Spot','Exit Spot','Spot P&L',
-      'Type','Strike','B/S','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
+      'Type','Strike',
+      ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
+      'B/S','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
@@ -460,7 +467,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Column widths
     const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
+      'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
     ws1.columns = keyOrder.map(k => ({ header: k, key: k, width: colWidths[k]||10 }));
 
@@ -1104,6 +1111,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Exit Spot</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Type</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Strike</th>
+                      {bufferStrikeEnabled && (
+                        <>
+                          <th className="px-3 py-3 text-right text-xs font-bold text-primary">Buffer Ref</th>
+                          <th className="px-3 py-3 text-right text-xs font-bold text-primary">Strike Offset</th>
+                        </>
+                      )}
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">B/S</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Qty</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Raw Entry</th>
@@ -1129,6 +1142,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             
                             const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
                             const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
+                            const bufferRef = parseFloat(leg.buffer_ref_price);
+                            const bufferOffsetRaw = leg.buffer_strike_offset;
+                            const bufferOffset = Number.isFinite(Number(bufferOffsetRaw)) ? Number(bufferOffsetRaw) : null;
                             const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
                             const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
                             const rawEntryPrice = parseFloat(leg['Raw Entry Price']);
@@ -1165,6 +1181,16 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 ) : null}
                                 <td className="px-3 py-2 text-xs text-secondary">{optionType}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{parseFloat(strike).toFixed(0)}</td>
+                                {bufferStrikeEnabled && (
+                                  <>
+                                    <td className="px-3 py-2 text-xs text-right text-muted">
+                                      {Number.isFinite(bufferRef) ? bufferRef.toFixed(2) : '—'}
+                                    </td>
+                                    <td className="px-3 py-2 text-xs text-right text-muted">
+                                      {bufferOffset == null ? '—' : (bufferOffset > 0 ? `+${bufferOffset}` : `${bufferOffset}`)}
+                                    </td>
+                                  </>
+                                )}
                                 <td className="px-3 py-2 text-xs text-secondary">{position}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{qty}</td>
                                 <td className="px-3 py-2 text-xs text-right text-muted">
@@ -1209,7 +1235,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const totalChargesInr = chargesEnabled
                               ? group.legs.reduce((sum, leg) => sum + (parseFloat(leg['Charges']) || 0), 0)
                               : 0;
-                            const emptyCellSpan = chargesEnabled ? 13 : 13;
+                            const emptyCellSpan = 13 + (bufferStrikeEnabled ? 2 : 0);
                             return (
                               <tr className="border-b-2 border-strong bg-slate-100">
                                 <td colSpan={emptyCellSpan}></td>
