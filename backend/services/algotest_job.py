@@ -513,6 +513,13 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             'trades': _make_json_safe(all_trades),
             'summary': _make_json_safe(result_summary),
             'pivot': _make_json_safe(result_pivot),
+            'meta': _make_json_safe({
+                'slippage_pct': payload.get('slippage_pct', 0),
+                'index': payload.get('index', 'NIFTY'),
+                'from_date': payload.get('from_date'),
+                'to_date': payload.get('to_date'),
+                'date_range': f"{effective_from} to {effective_to}",
+            }),
             'cached': False,
         }
         

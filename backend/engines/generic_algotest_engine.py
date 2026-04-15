@@ -16,6 +16,150 @@ _EARLY_EXIT_REASONS = {
     'OVERALL_TARGET',
 }
 
+
+def _normalize_slippage_pct(value):
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if pct < 0:
+        return 0.0
+    if pct > 100:
+        return 100.0
+    return pct
+
+
+def _apply_slippage(price, position, side, slippage_pct):
+    if price is None:
+        return None
+    try:
+        raw_price = float(price)
+    except (TypeError, ValueError):
+        return price
+
+    pct = _normalize_slippage_pct(slippage_pct)
+    if pct <= 0:
+        return round(raw_price, 2)
+
+    pos = str(position or '').upper().strip()
+    side_key = str(side or '').lower().strip()
+    is_sell = pos == 'SELL'
+
+    if side_key == 'entry':
+        factor = 1 - (pct / 100.0) if is_sell else 1 + (pct / 100.0)
+    else:
+        factor = 1 + (pct / 100.0) if is_sell else 1 - (pct / 100.0)
+
+    return round(max(raw_price * factor, 0.0), 2)
+
+def _calculate_fo_charges(entry_price, exit_price, qty, position, segment='OPTION'):
+    """
+    Calculate Zerodha F&O transaction charges for one leg (entry + exit orders combined).
+
+    Based on Zerodha's published charge schedule:
+    - Options: ₹20 flat brokerage, 0.15% STT on sell-side premium, 0.03553% NSE txn,
+               ₹10/crore SEBI, 0.003% stamp on buy-side, 18% GST on brokerage+txn+SEBI
+    - Futures: ₹20 or 0.03% brokerage (lower), 0.05% STT on sell-side, 0.00183% NSE txn,
+               ₹10/crore SEBI, 0.002% stamp on buy-side, 18% GST on brokerage+txn+SEBI
+
+    Args:
+        entry_price:  Per-unit entry price (after slippage, if any)
+        exit_price:   Per-unit exit price (after slippage, if any)
+        qty:          Total quantity (lots × lot_size)
+        position:     'SELL' or 'BUY'
+        segment:      'OPTION' (default) or 'FUTURE'
+
+    Returns:
+        dict:
+            total_charges_inr      - Total charges in ₹
+            entry_charge_per_unit  - Entry-side charges ÷ qty  (deduct from/add to entry price)
+            exit_charge_per_unit   - Exit-side charges ÷ qty   (add to/deduct from exit price)
+            breakdown              - Itemised ₹ amounts
+    """
+    _zero = {'total_charges_inr': 0.0, 'entry_charge_per_unit': 0.0,
+             'exit_charge_per_unit': 0.0, 'breakdown': {}}
+
+    if entry_price is None or exit_price is None:
+        return _zero
+    try:
+        ep = float(entry_price)
+        xp = float(exit_price)
+        q  = float(qty)
+    except (TypeError, ValueError):
+        return _zero
+    if q <= 0:
+        return _zero
+
+    is_sell    = str(position or '').upper().strip() == 'SELL'
+    is_options = str(segment  or 'OPTION').upper().strip() != 'FUTURE'
+
+    to_entry = ep * q   # turnover at entry
+    to_exit  = xp * q   # turnover at exit
+
+    if is_options:
+        # ── OPTIONS ─────────────────────────────────────────────────────────
+        brk_e = 20.0
+        brk_x = 20.0
+
+        # STT: 0.15% on sell-side premium only
+        stt_e  = 0.0015 * to_entry if is_sell else 0.0
+        stt_x  = 0.0    if is_sell else 0.0015 * to_exit   # exit is BUY side when is_sell
+
+        # Stamp: 0.003% on buy-side only
+        stmp_e = 0.0          if is_sell else 0.00003 * to_entry
+        stmp_x = 0.00003 * to_exit if is_sell else 0.0
+
+        # Exchange txn: NSE 0.03553% on premium
+        txn_e = 0.0003553 * to_entry
+        txn_x = 0.0003553 * to_exit
+
+        # SEBI: ₹10 per crore = 0.000001 × turnover
+        sebi_e = 1e-6 * to_entry
+        sebi_x = 1e-6 * to_exit
+
+        # GST 18% on (brokerage + txn + SEBI)  – not on STT / stamp
+        gst_e = 0.18 * (brk_e + txn_e + sebi_e)
+        gst_x = 0.18 * (brk_x + txn_x + sebi_x)
+
+    else:
+        # ── FUTURES ─────────────────────────────────────────────────────────
+        brk_e = min(20.0, 0.0003 * to_entry)
+        brk_x = min(20.0, 0.0003 * to_exit)
+
+        stt_e  = 0.0005 * to_entry if is_sell else 0.0
+        stt_x  = 0.0    if is_sell else 0.0005 * to_exit
+
+        stmp_e = 0.0           if is_sell else 0.00002 * to_entry
+        stmp_x = 0.00002 * to_exit if is_sell else 0.0
+
+        txn_e = 0.0000183 * to_entry
+        txn_x = 0.0000183 * to_exit
+
+        sebi_e = 1e-6 * to_entry
+        sebi_x = 1e-6 * to_exit
+
+        gst_e = 0.18 * (brk_e + txn_e + sebi_e)
+        gst_x = 0.18 * (brk_x + txn_x + sebi_x)
+
+    total_entry = stt_e + brk_e + txn_e + sebi_e + stmp_e + gst_e
+    total_exit  = stt_x + brk_x + txn_x + sebi_x + stmp_x + gst_x
+    total_charges_inr = round(total_entry + total_exit, 4)
+
+    return {
+        'total_charges_inr':     total_charges_inr,
+        'entry_charge_per_unit': round(total_entry / q, 6),
+        'exit_charge_per_unit':  round(total_exit  / q, 6),
+        'breakdown': {
+            'stt':        round(stt_e  + stt_x,  2),
+            'brokerage':  round(brk_e  + brk_x,  2),
+            'txn':        round(txn_e  + txn_x,  2),
+            'sebi':       round(sebi_e + sebi_x, 4),
+            'stamp':      round(stmp_e + stmp_x, 4),
+            'gst':        round(gst_e  + gst_x,  2),
+        },
+    }
+
+
 def _log(*args, **kwargs):
     """Helper to print only when DEBUG is True"""
     if DEBUG:
@@ -520,7 +664,7 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
     return strike
 
 
-def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_spot):
+def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_spot, slippage_pct=0.0):
     """
     Re-fetch market exit price/premium at leg_exit_date and rewrite pnl in-place.
     Works for both OPTION and FUTURE segment legs.
@@ -543,14 +687,17 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
             new_exit = calculate_intrinsic_value(spot=spot, strike=tleg['strike'],
                                                   option_type=tleg['option_type'])
         ep = tleg['entry_premium']
-        tleg['exit_premium']    = new_exit
+        adjusted_exit = _apply_slippage(new_exit, position, 'exit', slippage_pct)
+        tleg['market_exit_premium'] = new_exit
+        tleg['raw_exit_premium'] = new_exit
+        tleg['exit_premium']    = adjusted_exit
         tleg['early_exit_date'] = leg_exit_date
         
         # P&L in POINTS (no quantity multiplication)
         if position == 'BUY':
-            tleg['pnl'] = new_exit - ep
+            tleg['pnl'] = adjusted_exit - ep
         else:  # SELL
-            tleg['pnl'] = ep - new_exit
+            tleg['pnl'] = ep - adjusted_exit
         
         # Set CE P&L or PE P&L based on option type
         if tleg.get('option_type') in ('CE', 'CALL', 'C'):
@@ -573,15 +720,18 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
             expiry=check_expiry,
         ) or tleg['entry_price']
         ep = tleg['entry_price']
-        tleg['exit_price']      = new_exit
+        adjusted_exit = _apply_slippage(new_exit, position, 'exit', slippage_pct)
+        tleg['market_exit_price'] = new_exit
+        tleg['raw_exit_price'] = new_exit
+        tleg['exit_price']      = adjusted_exit
         tleg['futures_expiry']  = check_expiry
         tleg['early_exit_date'] = leg_exit_date
         
         # P&L in POINTS (no quantity multiplication)
         if position == 'BUY':
-            tleg['pnl'] = new_exit - ep
+            tleg['pnl'] = adjusted_exit - ep
         else:  # SELL
-            tleg['pnl'] = ep - new_exit
+            tleg['pnl'] = ep - adjusted_exit
         
         # No CE/PE for futures
         tleg['ce_pnl'] = 0
@@ -682,7 +832,8 @@ def _apply_overall_sl_to_per_leg(per_leg_results, overall_date, overall_reason, 
 
 
 def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_config,
-                               index, trading_calendar, square_off_mode='partial'):
+                               index, trading_calendar, square_off_mode='partial',
+                               slippage_pct=0.0):
     """
     Check per-leg stop loss / target during the holding period.
 
@@ -826,18 +977,19 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                 check_expiry = _resolve_nearest_future_expiry(index, check_date)
                 if check_expiry is None:
                     check_expiry = leg.get('futures_expiry')
-                current_price = get_future_price_from_db(
+                current_price_raw = get_future_price_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
                     expiry=check_expiry
                 )
-                if current_price is None:
+                if current_price_raw is None:
                     continue
 
                 entry_price = leg.get('entry_price')
                 if entry_price is None:
                     continue
 
+                current_price = _apply_slippage(current_price_raw, position, 'exit', slippage_pct)
                 cp = current_price
                 # For FUTURES: premium_move = current - entry (positive = rose)
                 premium_move = current_price - entry_price
@@ -855,16 +1007,17 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                 if not option_type or not strike:
                     continue
 
-                current_premium = get_option_premium_from_db(
+                current_premium_raw = get_option_premium_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
                     strike=strike,
                     option_type=option_type,
                     expiry=expiry_date.strftime('%Y-%m-%d')
                 )
-                if current_premium is None:
+                if current_premium_raw is None:
                     continue
 
+                current_premium = _apply_slippage(current_premium_raw, position, 'exit', slippage_pct)
                 cp = current_premium
                 entry_premium = leg.get('entry_premium')
                 if entry_premium is None:
@@ -1184,6 +1337,7 @@ def check_overall_stop_loss_target(
     per_leg_results=None,
     overall_sl_type=None,
     overall_target_type=None,
+    slippage_pct=0.0,
 ):
     """
     Overall SL / Target checker.
@@ -1268,7 +1422,7 @@ def check_overall_stop_loss_target(
                 if strike is None or entry_premium is None:
                     continue
 
-                current_premium = get_option_premium_from_db(
+                current_premium_raw = get_option_premium_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
                     strike=strike,
@@ -1276,9 +1430,10 @@ def check_overall_stop_loss_target(
                     expiry=expiry_date.strftime('%Y-%m-%d')
                 )
 
-                if current_premium is None:
+                if current_premium_raw is None:
                     continue
 
+                current_premium = _apply_slippage(current_premium_raw, position, 'exit', slippage_pct)
                 has_data = True
 
                 if position == 'BUY':
@@ -1294,15 +1449,16 @@ def check_overall_stop_loss_target(
                 check_expiry = _resolve_nearest_future_expiry(index, check_date)
                 if check_expiry is None:
                     check_expiry = leg.get('futures_expiry')
-                current_price = get_future_price_from_db(
+                current_price_raw = get_future_price_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
                     expiry=check_expiry
                 )
 
-                if current_price is None:
+                if current_price_raw is None:
                     continue
 
+                current_price = _apply_slippage(current_price_raw, position, 'exit', slippage_pct)
                 has_data = True
 
                 if position == 'BUY':
@@ -1584,6 +1740,9 @@ def run_algotest_backtest(params):
     spot_adjustment_units = str(params.get('spot_adjustment_units', 'percent') or 'percent').lower().strip()
     if spot_adjustment_units not in ('percent', 'points'):
         spot_adjustment_units = 'percent'
+    slippage_pct = _normalize_slippage_pct(
+        params.get('slippage_pct', params.get('slippage_percent', params.get('slippage', 0.0)))
+    )
 
     # Re-entry settings (for both Weekly and Monthly strategies)
     re_entry_enabled = params.get('re_entry_enabled', False)
@@ -2148,6 +2307,13 @@ def run_algotest_backtest(params):
                         if roll_cost:
                             _log(f"      Roll Cost (@ {roll_entry_date} → {next_expiry_str}): {roll_cost}")
 
+                        market_entry_price = entry_price
+                        market_exit_price = exit_price
+                        raw_entry_price = market_entry_price
+                        raw_exit_price = market_exit_price
+                        entry_price = _apply_slippage(raw_entry_price, position, 'entry', slippage_pct)
+                        exit_price = _apply_slippage(raw_exit_price, position, 'exit', slippage_pct)
+
                         if position == 'BUY':
                             leg_pnl = exit_price - entry_price
                         else:  # SELL
@@ -2163,6 +2329,10 @@ def run_algotest_backtest(params):
                             'lot_size': lot_size,
                             'entry_price': entry_price,
                             'exit_price': exit_price,
+                            'raw_entry_price': raw_entry_price,
+                            'raw_exit_price': raw_exit_price,
+                            'market_entry_price': market_entry_price,
+                            'market_exit_price': market_exit_price,
                             'pnl': leg_pnl,
                             'ce_pnl': 0,
                             'pe_pnl': 0,
@@ -2216,6 +2386,9 @@ def run_algotest_backtest(params):
                             _log(f"      WARNING: No entry premium - skipping leg")
                             continue
 
+                        market_entry_premium = entry_premium
+                        raw_entry_premium = market_entry_premium
+                        entry_premium = _apply_slippage(raw_entry_premium, position, 'entry', slippage_pct)
                         _log(f"      Entry Premium: {entry_premium}")
 
                         # ========== GET EXIT PREMIUM ==========
@@ -2265,6 +2438,10 @@ def run_algotest_backtest(params):
                             if exit_premium == 0:
                                 _log(f"      INFO: Option expired WORTHLESS (OTM)")
 
+                        market_exit_premium = exit_premium
+                        raw_exit_premium = market_exit_premium
+                        exit_premium = _apply_slippage(raw_exit_premium, position, 'exit', slippage_pct)
+
                         # Calculate P&L in POINTS (no quantity multiplication)
                         # CE P&L = Entry - Exit for CALL SELL, Exit - Entry for CALL BUY
                         # PE P&L = Entry - Exit for PUT SELL, Exit - Entry for PUT BUY
@@ -2299,6 +2476,10 @@ def run_algotest_backtest(params):
                             'lot_size': lot_size,
                             'entry_premium': entry_premium,
                             'exit_premium': exit_premium,
+                            'raw_entry_premium': raw_entry_premium,
+                            'raw_exit_premium': raw_exit_premium,
+                            'market_entry_premium': market_entry_premium,
+                            'market_exit_premium': market_exit_premium,
                             'pnl': leg_pnl,
                             'ce_pnl': ce_pnl,
                             'pe_pnl': pe_pnl
@@ -2327,6 +2508,7 @@ def run_algotest_backtest(params):
                     index=index,
                     trading_calendar=trading_calendar,
                     square_off_mode=square_off_mode,
+                    slippage_pct=slippage_pct,
                 )
             
                 # ========== STEP 8C-2: UPDATE EXIT PREMIUMS BASED ON PER-LEG EXIT DATES ==========
@@ -2348,17 +2530,18 @@ def run_algotest_backtest(params):
                                 )
                             
                                 if new_exit_premium is not None:
-                                    old_exit_premium = tleg['exit_premium']
-                                    tleg['exit_premium'] = new_exit_premium
+                                    tleg['market_exit_premium'] = new_exit_premium
+                                    tleg['raw_exit_premium'] = new_exit_premium
+                                    tleg['exit_premium'] = _apply_slippage(new_exit_premium, tleg['position'], 'exit', slippage_pct)
                                 
                                     # Recalculate P&L in POINTS (no quantity multiplication)
                                     position = tleg['position']
                                     entry_premium = tleg['entry_premium']
                                 
                                     if position == 'BUY':
-                                        tleg['pnl'] = new_exit_premium - entry_premium
+                                        tleg['pnl'] = tleg['exit_premium'] - entry_premium
                                     else:  # SELL
-                                        tleg['pnl'] = entry_premium - new_exit_premium
+                                        tleg['pnl'] = entry_premium - tleg['exit_premium']
                                     
                                     # Set CE P&L or PE P&L
                                     if tleg.get('option_type') in ('CE', 'CALL', 'C'):
@@ -2383,17 +2566,18 @@ def run_algotest_backtest(params):
                                 )
                             
                                 if new_exit_price is not None:
-                                    old_exit_price = tleg['exit_price']
-                                    tleg['exit_price'] = new_exit_price
+                                    tleg['market_exit_price'] = new_exit_price
+                                    tleg['raw_exit_price'] = new_exit_price
+                                    tleg['exit_price'] = _apply_slippage(new_exit_price, tleg['position'], 'exit', slippage_pct)
                                     tleg['futures_expiry'] = early_exit_expiry
                                 
                                     position = tleg['position']
                                     entry_price = tleg['entry_price']
                                 
                                     if position == 'BUY':
-                                        tleg['pnl'] = new_exit_price - entry_price
+                                        tleg['pnl'] = tleg['exit_price'] - entry_price
                                     else:  # SELL
-                                        tleg['pnl'] = entry_price - new_exit_price
+                                        tleg['pnl'] = entry_price - tleg['exit_price']
                                     
                                     tleg['ce_pnl'] = 0
                                     tleg['pe_pnl'] = 0
@@ -2424,6 +2608,7 @@ def run_algotest_backtest(params):
                             per_leg_results=per_leg_results,
                             overall_sl_type=overall_sl_type,
                             overall_target_type=overall_target_type,
+                            slippage_pct=slippage_pct,
                         )
                     )
 
@@ -2463,6 +2648,7 @@ def run_algotest_backtest(params):
                                 expiry_date=expiry_date,
                                 lot_size=lot_size_for_pnl,
                                 fallback_spot=entry_spot,
+                                slippage_pct=slippage_pct,
                             )
                             tleg['exit_reason'] = res['exit_reason']
 
@@ -2633,12 +2819,22 @@ def run_algotest_backtest(params):
                                         re_ok = False; break
                                     if rxp is None:
                                         rxp = rep
+                                    market_rep = rep
+                                    market_rxp = rxp
+                                    raw_rep = market_rep
+                                    raw_rxp = market_rxp
+                                    rep = _apply_slippage(raw_rep, rpos, 'entry', slippage_pct)
+                                    rxp = _apply_slippage(raw_rxp, rpos, 'exit', slippage_pct)
                                     rpnl = (rxp - rep) if rpos == 'BUY' else (rep - rxp)
                                     re_leg = {
                                         'leg_number': rli + 1, 'segment': 'FUTURE',
                                         'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
                                         'entry_price': rep, 'exit_price': rxp, 'pnl': rpnl,
                                         'futures_expiry': re_fut_expiry,
+                                        'raw_entry_price': raw_rep,
+                                        'raw_exit_price': raw_rxp,
+                                        'market_entry_price': market_rep,
+                                        'market_exit_price': market_rxp,
                                     }
                                 else:  # OPTIONS — same strike criteria as initial entry
                                     ropt = rlc.get('option_type', 'CE')
@@ -2659,6 +2855,9 @@ def run_algotest_backtest(params):
                                     )
                                     if rep2 is None:
                                         re_ok = False; break
+                                    market_rep2 = rep2
+                                    raw_rep2 = market_rep2
+                                    rep2 = _apply_slippage(raw_rep2, rpos, 'entry', slippage_pct)
                                     rxp2 = get_option_premium_from_db(
                                         date=exit_date.strftime('%Y-%m-%d'),
                                         index=index, strike=rstk, option_type=ropt,
@@ -2667,12 +2866,19 @@ def run_algotest_backtest(params):
                                     if rxp2 is None:
                                         s2   = get_spot_price_from_db(exit_date, index) or re_entry_spot
                                         rxp2 = calculate_intrinsic_value(spot=s2, strike=rstk, option_type=ropt)
+                                    market_rxp2 = rxp2
+                                    raw_rxp2 = market_rxp2
+                                    rxp2 = _apply_slippage(raw_rxp2, rpos, 'exit', slippage_pct)
                                     rpnl2 = (rxp2 - rep2) if rpos == 'BUY' else (rep2 - rxp2)
                                     re_leg = {
                                         'leg_number': rli + 1, 'segment': 'OPTION',
                                         'option_type': ropt, 'strike': rstk,
                                         'position': rpos, 'lots': rlts, 'lot_size': re_lot_size,
                                         'entry_premium': rep2, 'exit_premium': rxp2, 'pnl': rpnl2,
+                                        'raw_entry_premium': raw_rep2,
+                                        'raw_exit_premium': raw_rxp2,
+                                        'market_entry_premium': market_rep2,
+                                        'market_exit_premium': market_rxp2,
                                     }
 
                                 _copy_sl_tgt_to_leg(re_leg, rlc)
@@ -2692,6 +2898,7 @@ def run_algotest_backtest(params):
                                 index=index,
                                 trading_calendar=trading_calendar,
                                 square_off_mode=square_off_mode,
+                                slippage_pct=slippage_pct,
                             )
 
                             # Overall SL/TGT for this re-entry
@@ -2711,6 +2918,7 @@ def run_algotest_backtest(params):
                                 per_leg_results=re_per_leg,
                                 overall_sl_type=overall_sl_type,
                                 overall_target_type=overall_target_type,
+                                slippage_pct=slippage_pct,
                             )
 
                             if re_ovr_date is not None:
@@ -2735,6 +2943,7 @@ def run_algotest_backtest(params):
                                             expiry_date=expiry_date,
                                             lot_size=re_lot_sz_pnl,
                                             fallback_spot=re_entry_spot,
+                                            slippage_pct=slippage_pct,
                                         )
                                         rtleg['exit_reason'] = rres['exit_reason']
                                         # Only per-leg SL/TGT triggers chaining (not OVERALL)
@@ -2889,6 +3098,8 @@ def run_algotest_backtest(params):
                     strike      = ''
                     entry_price = leg.get('entry_price', 0)
                     exit_price  = leg.get('exit_price', 0)
+                    raw_entry_price = leg.get('raw_entry_price', leg.get('market_entry_price', entry_price))
+                    raw_exit_price = leg.get('raw_exit_price', leg.get('market_exit_price', exit_price))
                     fut_entry_price = entry_price
                     fut_exit_price = exit_price
                     leg_pnl     = leg.get('pnl')
@@ -2904,6 +3115,8 @@ def run_algotest_backtest(params):
                     strike      = leg['strike']
                     entry_price = leg['entry_premium']
                     exit_price  = leg.get('exit_premium', 0)
+                    raw_entry_price = leg.get('raw_entry_premium', leg.get('market_entry_premium', entry_price))
+                    raw_exit_price = leg.get('raw_exit_premium', leg.get('market_exit_premium', exit_price))
                     fut_entry_price = np.nan
                     fut_exit_price = np.nan
                     leg_pnl     = leg['pnl']
@@ -2970,6 +3183,8 @@ def run_algotest_backtest(params):
                     'Qty':            qty,
                     'Entry Price':    entry_price,
                     'Exit Price':     exit_price,
+                    'Raw Entry Price': raw_entry_price,
+                    'Raw Exit Price': raw_exit_price,
                     'Entry Spot':     entry_spot_val if entry_spot_val is not None else np.nan,
                     'Exit Spot':      leg_exit_spot if leg_exit_spot is not None else np.nan,
                     'Spot P&L':       (round(leg_exit_spot - entry_spot_val, 2)

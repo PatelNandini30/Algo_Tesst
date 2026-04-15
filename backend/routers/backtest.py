@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
 from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
 # NOTE: keep FastAPI imports at top for readability
-from engines.generic_algotest_engine import run_algotest_backtest
+from engines.generic_algotest_engine import run_algotest_backtest, _apply_slippage, _calculate_fo_charges
 from services.algotest_job import execute_algotest_job
 from services.backtest_cache import get_backtest_cache as _get_result_cache
 from worker.tasks import run_algotest_job
@@ -93,6 +93,133 @@ except ImportError as e:
                 return value
 
 router = APIRouter()
+
+
+def _normalize_recalc_numeric(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value == '':
+            return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(numeric):
+        return None
+    return numeric
+
+
+def _recalculate_trade_prices(
+    trades: List[Dict[str, Any]],
+    slippage_pct: float,
+    charges_enabled: bool = False,
+):
+    """
+    Re-price every leg row using raw prices.
+
+    1. Applies slippage to raw entry/exit prices (existing behaviour).
+    2. Optionally applies Zerodha F&O transaction charges as price adjustments:
+       - SELL leg: effective_entry = entry - entry_charge_per_unit
+                   effective_exit  = exit  + exit_charge_per_unit
+       - BUY  leg: effective_entry = entry + entry_charge_per_unit
+                   effective_exit  = exit  - exit_charge_per_unit
+       Charges per unit = total_charges_₹ / qty.  This keeps Net P&L in
+       the same "per-unit points" unit that the rest of the system uses,
+       while correctly deducting the rupee cost of every brokerage component.
+    """
+    updated_rows: List[Dict[str, Any]] = []
+    trade_totals:  Dict[Any, float] = {}
+    trade_charges: Dict[Any, float] = {}   # total ₹ charges per trade_id
+
+    for raw_row in trades:
+        row = dict(raw_row)
+        position  = str(row.get('B/S',  '') or '').upper().strip()
+        raw_entry = _normalize_recalc_numeric(row.get('Raw Entry Price'))
+        raw_exit  = _normalize_recalc_numeric(row.get('Raw Exit Price'))
+        trade_id  = row.get('Trade')
+        leg_type  = str(row.get('Type', '') or '').upper().strip()
+        is_leg_row = (
+            bool(position)
+            and leg_type in {'CE', 'PE', 'FUT', 'CALL', 'PUT', 'C', 'P'}
+        )
+
+        if is_leg_row and raw_entry is not None and raw_exit is not None:
+            # ── Step 1: apply slippage ────────────────────────────────────
+            new_entry = _apply_slippage(raw_entry, position, 'entry', slippage_pct)
+            new_exit  = _apply_slippage(raw_exit,  position, 'exit',  slippage_pct)
+
+            # ── Step 2: apply transaction charges ────────────────────────
+            charges_inr = 0.0
+            if charges_enabled:
+                qty_raw = _normalize_recalc_numeric(row.get('Qty'))
+                qty     = float(qty_raw) if qty_raw and qty_raw > 0 else 1.0
+                segment = 'FUTURE' if leg_type == 'FUT' else 'OPTION'
+                ch = _calculate_fo_charges(new_entry, new_exit, qty, position, segment)
+
+                epu = ch['entry_charge_per_unit']   # ₹ / qty
+                xpu = ch['exit_charge_per_unit']    # ₹ / qty
+                charges_inr = ch['total_charges_inr']
+
+                # Adjust effective prices so P&L = (eff_entry - eff_exit) for SELL
+                if position == 'SELL':
+                    new_entry = round(new_entry - epu, 2)   # sell gets less
+                    new_exit  = round(new_exit  + xpu, 2)   # buy-back costs more
+                else:
+                    new_entry = round(new_entry + epu, 2)   # buy costs more
+                    new_exit  = round(new_exit  - xpu, 2)   # sell-to-close gets less
+
+            # ── Step 3: P&L (per-unit points) ────────────────────────────
+            if position == 'BUY':
+                leg_pnl = new_exit - new_entry
+            else:
+                leg_pnl = new_entry - new_exit
+
+            row['Entry Price'] = new_entry
+            row['Exit Price']  = new_exit
+            if charges_enabled:
+                row['Charges'] = round(charges_inr, 2)
+
+            if leg_type == 'FUT':
+                row['FUT Entry Price'] = new_entry
+                row['FUT Exit Price']  = new_exit
+                row['FUT P&L'] = leg_pnl
+                row['CE P&L']  = 0
+                row['PE P&L']  = 0
+            elif leg_type in {'CE', 'CALL', 'C'}:
+                row['CE P&L']  = leg_pnl
+                row['PE P&L']  = 0
+                row['FUT P&L'] = row.get('FUT P&L', 0) or 0
+            else:
+                row['PE P&L']  = leg_pnl
+                row['CE P&L']  = 0
+                row['FUT P&L'] = row.get('FUT P&L', 0) or 0
+
+            trade_totals[trade_id]  = trade_totals.get(trade_id, 0.0)  + float(leg_pnl)
+            trade_charges[trade_id] = trade_charges.get(trade_id, 0.0) + charges_inr
+        else:
+            numeric_net = _normalize_recalc_numeric(row.get('Net P&L'))
+            if trade_id is not None and numeric_net is not None:
+                trade_totals.setdefault(trade_id, float(numeric_net))
+
+        updated_rows.append(row)
+
+    for row in updated_rows:
+        trade_id = row.get('Trade')
+        net_pnl  = trade_totals.get(trade_id)
+        if net_pnl is None:
+            continue
+        row['Net P&L'] = round(float(net_pnl), 2)
+        if charges_enabled:
+            row['Total Charges'] = round(trade_charges.get(trade_id, 0.0), 2)
+        entry_spot = _normalize_recalc_numeric(row.get('Entry Spot'))
+        if entry_spot and entry_spot > 1000:
+            row['% P&L'] = round((float(net_pnl) / entry_spot) * 100, 4)
+        else:
+            row['% P&L'] = 0.0
+
+    return updated_rows
 
 
 @router.post("/clear-cache")
@@ -376,6 +503,68 @@ async def queue_algotest_job(request: dict):
     payload = dict(request or {})
     task = run_algotest_job.apply_async(args=[payload])
     return {"status": "queued", "job_id": task.id}
+
+
+@router.post("/backtest/recalculate-slippage")
+async def recalculate_slippage(request: dict):
+    trades = request.get('trades') or []
+    if not isinstance(trades, list) or not trades:
+        raise HTTPException(status_code=400, detail="No trades provided")
+
+    try:
+        slippage_pct = float(request.get('slippage_pct', 0) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid slippage_pct")
+
+    charges_enabled = bool(request.get('charges_enabled', False))
+
+    recalculated_rows = _recalculate_trade_prices(
+        trades, slippage_pct, charges_enabled=charges_enabled
+    )
+    trades_df = pd.DataFrame(recalculated_rows)
+
+    if trades_df.empty:
+        return {
+            'trades': [],
+            'summary': {},
+            'pivot': {"headers": [], "rows": []},
+            'meta': {'slippage_pct': slippage_pct, 'charges_enabled': charges_enabled},
+        }
+
+    for col in ['Entry Date', 'Exit Date', 'Leg Exit Date', 'Expiry']:
+        if col in trades_df.columns:
+            trades_df[col] = pd.to_datetime(trades_df[col], dayfirst=True, errors='coerce')
+
+    from base import compute_analytics, build_pivot
+
+    trades_df, result_summary = compute_analytics(trades_df)
+    result_pivot = build_pivot(trades_df, 'Exit Date')
+
+    for col in ['Entry Date', 'Exit Date', 'Leg Exit Date', 'Expiry']:
+        if col in trades_df.columns:
+            trades_df[col] = trades_df[col].apply(
+                lambda v: v.strftime('%d-%m-%Y') if hasattr(v, 'strftime') and not pd.isna(v) else None
+            )
+
+    result_trades = []
+    for row in trades_df.to_dict('records'):
+        for key in ('Cumulative', 'Peak', 'DD', '%DD'):
+            value = row.get(key)
+            if value is not None:
+                try:
+                    numeric = float(value)
+                    if np.isnan(numeric):
+                        row[key] = None
+                except (TypeError, ValueError):
+                    row[key] = None
+        result_trades.append(row)
+
+    return {
+        'trades': result_trades,
+        'summary': result_summary,
+        'pivot': result_pivot,
+        'meta': {'slippage_pct': slippage_pct, 'charges_enabled': charges_enabled},
+    }
 
 
 @router.get("/algotest/jobs/{job_id}")

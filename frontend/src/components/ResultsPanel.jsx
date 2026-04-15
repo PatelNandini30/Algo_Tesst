@@ -78,6 +78,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   
   console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
   const { trades = [], summary = {}, pivot = {} } = results;
+  const slippagePct = Number(results?.meta?.slippage_pct || 0);
+  const chargesEnabled = Boolean(results?.meta?.charges_enabled);
   const warnings = results?.warnings || [];
   const filteredWarnings = warnings.filter(Boolean);
   const [currentPage, setCurrentPage] = useState(1);
@@ -388,7 +390,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const keyOrder = [
       'Trade','Leg','Index','Entry Date','Exit Date',
       'Entry Spot','Exit Spot','Spot P&L',
-      'Type','Strike','B/S','Qty','Entry Price','Exit Price',
+      'Type','Strike','B/S','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
@@ -458,7 +460,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Column widths
     const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'Entry Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
+      'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
     ws1.columns = keyOrder.map(k => ({ header: k, key: k, width: colWidths[k]||10 }));
 
@@ -774,6 +776,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             <h2 className="text-2xl font-bold text-primary">Backtest Results</h2>
             <p className="text-sm text-secondary mt-1">
               {stats.totalTrades} trades • {results.meta?.date_range || ''}
+              {slippagePct > 0 ? ` • ${slippagePct}% slippage` : ''}
+              {chargesEnabled ? ' • Zerodha txn charges applied' : ''}
             </p>
             {filterInfo && (
               <span className="mt-2 inline-flex items-center rounded-full border border-subtle bg-hover px-3 py-1 text-xs font-semibold text-blue-700">
@@ -1102,8 +1106,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Strike</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">B/S</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Qty</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Raw Entry</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Entry Price</th>
+                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Raw Exit</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Exit Price</th>
+                      {chargesEnabled && (
+                        <th className="px-3 py-3 text-right text-xs font-bold text-primary">Charges ₹</th>
+                      )}
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Net P&L</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">% P&L</th>
                     </tr>
@@ -1122,7 +1131,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
                             const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
                             const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
+                            const rawEntryPrice = parseFloat(leg['Raw Entry Price']);
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
+                            const rawExitPrice = parseFloat(leg['Raw Exit Price']);
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
                             // Per-leg P&L: CE P&L for options, FUT P&L for futures.
                             // Net P&L and % P&L columns hold the trade-level total
@@ -1156,8 +1167,22 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{parseFloat(strike).toFixed(0)}</td>
                                 <td className="px-3 py-2 text-xs text-secondary">{position}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{qty}</td>
+                                <td className="px-3 py-2 text-xs text-right text-muted">
+                                  {Number.isFinite(rawEntryPrice) ? rawEntryPrice.toFixed(2) : '—'}
+                                </td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{entryPrice.toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-right text-muted">
+                                  {Number.isFinite(rawExitPrice) ? rawExitPrice.toFixed(2) : '—'}
+                                </td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{exitPrice.toFixed(2)}</td>
+                                {chargesEnabled && (
+                                  <td className="px-3 py-2 text-xs text-right text-orange-600">
+                                    {(() => {
+                                      const c = parseFloat(leg['Charges']);
+                                      return Number.isFinite(c) ? `₹${c.toFixed(2)}` : '—';
+                                    })()}
+                                  </td>
+                                )}
                                 <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-profit' : 'text-loss'}`}>
                                   {legNetPnlPoints >= 0 ? '+' : ''}{legNetPnlPoints.toFixed(2)}
                                 </td>
@@ -1181,12 +1206,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const tradePctPnl = group.entrySpot > 1000
                               ? (tradeNetPnlPoints / group.entrySpot) * 100
                               : 0;
-                            // Summary row comes AFTER the rowSpan ends, so ALL 13 columns
-                            // must be filled. Empty span = 13 total - 2 P&L cols = 11.
-                            const emptyCellSpan = 11;
+                            const totalChargesInr = chargesEnabled
+                              ? group.legs.reduce((sum, leg) => sum + (parseFloat(leg['Charges']) || 0), 0)
+                              : 0;
+                            const emptyCellSpan = chargesEnabled ? 13 : 13;
                             return (
                               <tr className="border-b-2 border-strong bg-slate-100">
                                 <td colSpan={emptyCellSpan}></td>
+                                {chargesEnabled && (
+                                  <td className="px-3 py-2 text-right text-xs font-bold text-orange-600">
+                                    ₹{totalChargesInr.toFixed(2)}
+                                  </td>
+                                )}
                                 <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-green-700' : 'text-red-700'}`}>
                                   {tradeNetPnlPoints >= 0 ? '+' : ''}{tradeNetPnlPoints.toFixed(2)}
                                 </td>

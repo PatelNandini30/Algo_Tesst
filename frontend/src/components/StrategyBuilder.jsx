@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2 } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
-import CsvUpload from './CsvUpload';
 import SuperTrendFilter from './SuperTrendFilter';
 import Toggle from './ui/Toggle';
 
@@ -317,6 +316,8 @@ const StrategyBuilder = () => {
   const [spotAdjustmentValue, setSpotAdjustmentValue] = useState(1.0);
   const [spotAdjustmentUnits, setSpotAdjustmentUnits] = useState('percent');
   const [spotAdjustmentShowInfo, setSpotAdjustmentShowInfo] = useState(true);
+  const [slippagePct, setSlippagePct] = useState(0);
+  const [chargesEnabled, setChargesEnabled] = useState(false);
 
   const clampSpotAdjustmentValue = useCallback((value) => {
     const numeric = Number(value);
@@ -376,6 +377,9 @@ const StrategyBuilder = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
+  const [rawResults, setRawResults] = useState(null);
+  const [displayResults, setDisplayResults] = useState(null);
+  const [isRecalculating, setIsRecalculating] = useState(false);
   const [validationError, setValidationError] = useState(null);
   const [trailSLWarning, setTrailSLWarning] = useState(null);
   const jobPollRef = useRef(null);
@@ -384,12 +388,12 @@ const StrategyBuilder = () => {
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
 
   const latestEntrySpot = useMemo(() => {
-    const firstTrade = results?.trades?.[0];
+    const firstTrade = displayResults?.trades?.[0];
     if (!firstTrade) return null;
     const value = firstTrade.entry_spot ?? firstTrade.entrySpot ?? firstTrade['Entry Spot'];
     const parsed = value != null ? Number(value) : null;
     return Number.isFinite(parsed) ? parsed : null;
-  }, [results]);
+  }, [displayResults]);
 
   const spotAdjustmentHelperText = useMemo(() => {
     const entrySpot = latestEntrySpot ?? 10791;
@@ -487,6 +491,10 @@ const StrategyBuilder = () => {
             setError('Backtest completed without a result payload.');
             return;
           }
+          setRawResults(payload);
+          setDisplayResults(payload);
+          setSlippagePct(payload?.meta?.slippage_pct ?? 0);
+          setChargesEnabled(payload?.meta?.charges_enabled ?? false);
           setResults(payload);
           if (strFilter.enabled && Array.isArray(payload?.trades) && payload.trades.length === 0) {
             setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
@@ -668,6 +676,50 @@ const StrategyBuilder = () => {
 
   const canRunBacktest = legs.length > 0 && !loading;
 
+  const handleRecalculate = useCallback(async () => {
+    if (!rawResults?.trades?.length) return;
+
+    setIsRecalculating(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/backtest/recalculate-slippage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          trades: rawResults.trades,
+          slippage_pct: Number(slippagePct) || 0,
+          charges_enabled: chargesEnabled,
+          initial_capital: 100000,
+        }),
+      });
+
+      if (!res.ok) {
+        const payload = await res.json().catch(() => null);
+        throw new Error(payload?.detail || payload?.error || `Recalculate failed (${res.status})`);
+      }
+
+      const data = await res.json();
+      const nextResults = {
+        ...rawResults,
+        trades: data.trades || [],
+        summary: data.summary || {},
+        pivot: data.pivot || { headers: [], rows: [] },
+        meta: {
+          ...(rawResults.meta || {}),
+          ...(data.meta || {}),
+          slippage_pct: Number(slippagePct) || 0,
+          charges_enabled: chargesEnabled,
+        },
+      };
+      setDisplayResults(nextResults);
+      setResults(nextResults);
+    } catch (err) {
+      setError(err.message || 'Recalculate failed');
+    } finally {
+      setIsRecalculating(false);
+    }
+  }, [rawResults, slippagePct, chargesEnabled]);
+
   const addLegFromDraft = () => {
     if (legs.length >= 6) return;
     setLegs(prev => [...prev, {
@@ -806,6 +858,8 @@ const StrategyBuilder = () => {
       spot_adjustment_pct: normalizedSpotAdjustmentValue,
       spot_adjustment_units: spotAdjustmentUnits,
       spot_adjustment_use_entry_close: true,
+      slippage_pct: Math.max(0, Number(slippagePct) || 0),
+      charges_enabled: chargesEnabled,
       legs: legsPayload,
       // Overall SL/TGT - send flat structure with correct field names expected by backend
       overall_sl_type: overallSLEnabled ? overallSLType : null,
@@ -887,6 +941,8 @@ const StrategyBuilder = () => {
     stopJobPolling();
     setLoading(true);
     setError(null);
+    setRawResults(null);
+    setDisplayResults(null);
     setResults(null);
     if (tslMissingSLMessage) {
       setError(tslMissingSLMessage);
@@ -1141,10 +1197,49 @@ const StrategyBuilder = () => {
                     )}
                   </div>
                 )}
+                <div>
+                  <label className="block text-xs font-medium text-secondary mb-2">Slippage %</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={slippagePct}
+                      onChange={e => setSlippagePct(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+                      onBlur={() => setSlippagePct(prev => {
+                        const numeric = Number(prev);
+                        return Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
+                      })}
+                      className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
+                    />
+                    <span className="text-xs text-muted">%</span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted">
+                    Applied on both entry and exit. Sell gets worse by lower entry and higher exit. Buy gets worse by higher entry and lower exit.
+                  </p>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-medium text-secondary">Transaction Charges</label>
+                    <Toggle enabled={chargesEnabled} onToggle={() => setChargesEnabled(v => !v)} size="sm" />
+                  </div>
+                  {chargesEnabled && (
+                    <div className="rounded-md border border-subtle bg-hover p-2.5 space-y-1 text-xs text-muted">
+                      <p className="font-medium text-secondary">Zerodha F&amp;O Options</p>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
+                        <span>Brokerage</span><span className="text-right">₹20 / order</span>
+                        <span>STT</span><span className="text-right">0.15% sell-side</span>
+                        <span>Txn (NSE)</span><span className="text-right">0.03553%</span>
+                        <span>SEBI</span><span className="text-right">₹10 / crore</span>
+                        <span>Stamp</span><span className="text-right">0.003% buy-side</span>
+                        <span>GST</span><span className="text-right">18% on brk+txn+SEBI</span>
+                      </div>
+                      <p className="text-muted pt-1">Charges are reflected as effective price adjustments. Click Re-calculate to apply.</p>
+                    </div>
+                  )}
+                </div>
             </div>
           </div>
-
-            <CsvUpload />
 
             {/* Legwise Controls Card */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
@@ -1764,20 +1859,74 @@ const StrategyBuilder = () => {
         )}
 
         {/* Results */}
-        {results && (
+        {displayResults && (
           <div className="mt-4">
-            {results?.meta?.str_enabled && (
+            {displayResults?.meta?.str_enabled && (
               <div className="mb-3 text-xs text-blue-700 bg-hover border border-blue-200 rounded px-3 py-2 inline-block">
-                STR {results?.meta?.str_type}: {results?.meta?.trades_before_str_filter} -&gt; {results?.meta?.trades_after_str_filter}
+                STR {displayResults?.meta?.str_type}: {displayResults?.meta?.trades_before_str_filter} -&gt; {displayResults?.meta?.trades_after_str_filter}
               </div>
             )}
             <ResultsPanel
-              results={results}
-              onClose={() => setResults(null)}
+              results={displayResults}
+              onClose={() => {
+                setResults(null);
+                setRawResults(null);
+                setDisplayResults(null);
+              }}
               showCloseButton={false}
               filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
               showStrSegment={strFilter.enabled}
             />
+            <div className="flex flex-wrap items-center gap-4 px-4 py-3 bg-surface border border-default border-t-0 rounded-b-xl">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-medium text-secondary whitespace-nowrap">
+                  Slippage (%)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="10"
+                  step="0.1"
+                  value={slippagePct}
+                  onChange={e => setSlippagePct(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+                  onBlur={() => setSlippagePct(prev => Number(prev) || 0)}
+                  className="w-20 px-2 py-1.5 text-sm border border-default rounded bg-surface text-primary text-center"
+                  placeholder="0"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-medium text-secondary whitespace-nowrap">
+                  Txn Charges
+                </label>
+                <Toggle enabled={chargesEnabled} onToggle={() => setChargesEnabled(v => !v)} size="sm" />
+              </div>
+              <button
+                onClick={handleRecalculate}
+                disabled={isRecalculating || !rawResults}
+                className="flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded bg-accent text-white hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isRecalculating ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Recalculating...
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Re-calculate
+                  </>
+                )}
+              </button>
+              {(displayResults?.meta?.slippage_pct > 0 || displayResults?.meta?.charges_enabled) && (
+                <span className="text-xs text-secondary">
+                  {displayResults.meta.slippage_pct > 0 && (
+                    <>Applied: <strong>{displayResults.meta.slippage_pct}%</strong> slippage</>
+                  )}
+                  {displayResults.meta.slippage_pct > 0 && displayResults.meta.charges_enabled && ' + '}
+                  {displayResults.meta.charges_enabled && <strong>Txn charges</strong>}
+                </span>
+              )}
+            </div>
           </div>
         )}
 
