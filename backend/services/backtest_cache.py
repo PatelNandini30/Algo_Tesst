@@ -46,6 +46,26 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _compute_engine_version() -> str:
+    """
+    Auto-generate cache version from engine file hash.
+    Any code change to the engine automatically invalidates all cached results
+    on the next Docker build — no manual version bumping needed.
+    """
+    engine_path = os.path.join(os.path.dirname(__file__), '..', 'engines', 'generic_algotest_engine.py')
+    try:
+        with open(engine_path, 'rb') as f:
+            digest = hashlib.md5(f.read()).hexdigest()[:8]
+        logger.info(f"[REDIS] Cache version (engine hash): {digest}")
+        return digest
+    except Exception as e:
+        logger.warning(f"[REDIS] Could not hash engine file, using fallback version: {e}")
+        return "fallback"
+
+
+# Auto-computed from engine file hash — changes whenever engine code changes.
+CACHE_VERSION = _compute_engine_version()
+
 # Configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -182,7 +202,7 @@ class BacktestCache:
         key_str = json.dumps(key_payload, sort_keys=True, default=str)
         full_hash = hashlib.sha256(key_str.encode()).hexdigest()
 
-        return f"backtest:{symbol.upper() if symbol else ''}:{from_date_norm}:{to_date_norm}:{full_hash}"
+        return f"backtest:{CACHE_VERSION}:{symbol.upper() if symbol else ''}:{from_date_norm}:{to_date_norm}:{full_hash}"
     
     def get(self, key: str) -> Optional[Dict[str, Any]]:
         """

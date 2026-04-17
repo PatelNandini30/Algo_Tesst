@@ -1112,16 +1112,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Type</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Strike</th>
                       {bufferStrikeEnabled && (
-                        <>
-                          <th className="px-3 py-3 text-right text-xs font-bold text-primary">Buffer Ref</th>
-                          <th className="px-3 py-3 text-right text-xs font-bold text-primary">Strike Offset</th>
-                        </>
+                        <th className="px-3 py-3 text-right text-xs font-bold text-primary">Buffer Ref</th>
                       )}
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">B/S</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Qty</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Raw Entry</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Entry Price</th>
-                      <th className="px-3 py-3 text-right text-xs font-bold text-primary">Raw Exit</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Exit Price</th>
                       {chargesEnabled && (
                         <th className="px-3 py-3 text-right text-xs font-bold text-primary">Charges ₹</th>
@@ -1182,24 +1177,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-secondary">{optionType}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{parseFloat(strike).toFixed(0)}</td>
                                 {bufferStrikeEnabled && (
-                                  <>
-                                    <td className="px-3 py-2 text-xs text-right text-muted">
-                                      {Number.isFinite(bufferRef) ? bufferRef.toFixed(2) : '—'}
-                                    </td>
-                                    <td className="px-3 py-2 text-xs text-right text-muted">
-                                      {bufferOffset == null ? '—' : (bufferOffset > 0 ? `+${bufferOffset}` : `${bufferOffset}`)}
-                                    </td>
-                                  </>
+                                  <td className="px-3 py-2 text-xs text-right text-muted">
+                                    {Number.isFinite(bufferRef) ? bufferRef.toFixed(2) : '—'}
+                                  </td>
                                 )}
                                 <td className="px-3 py-2 text-xs text-secondary">{position}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{qty}</td>
-                                <td className="px-3 py-2 text-xs text-right text-muted">
-                                  {Number.isFinite(rawEntryPrice) ? rawEntryPrice.toFixed(2) : '—'}
-                                </td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{entryPrice.toFixed(2)}</td>
-                                <td className="px-3 py-2 text-xs text-right text-muted">
-                                  {Number.isFinite(rawExitPrice) ? rawExitPrice.toFixed(2) : '—'}
-                                </td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{exitPrice.toFixed(2)}</td>
                                 {chargesEnabled && (
                                   <td className="px-3 py-2 text-xs text-right text-orange-600">

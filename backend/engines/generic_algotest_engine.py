@@ -525,45 +525,97 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
     _buf_below = bool(leg_config.get('_buffer_position_below', True))
 
     option_type_for_buf = str(leg_config.get('option_type', option_type) or '').upper().strip()
+    _is_ce = option_type_for_buf in ('CE', 'CALL', 'C')
+    _is_pe = option_type_for_buf in ('PE', 'PUT', 'P')
+
+    # "Above" checkbox gates CE buffering; "Below" checkbox gates PE buffering.
+    # A leg whose checkbox is NOT checked gets no buffer — it stays at ATM.
+    # CE is always buffered ABOVE (more OTM); PE is always buffered BELOW (more OTM).
+    _checkbox_allows = (_is_ce and _buf_above) or (_is_pe and _buf_below)
+
     _apply_buffer_to_this_leg = (
-        _buf_enabled and _buf_value > 0 and option_type_for_buf in ('CE', 'PE', 'CALL', 'PUT', 'C', 'P') and
+        _buf_enabled and _buf_value > 0 and (_is_ce or _is_pe) and
+        _checkbox_allows and
         (
             _buf_apply_to == 'both' or
-            (_buf_apply_to == 'call' and option_type_for_buf in ('CE', 'CALL', 'C')) or
-            (_buf_apply_to == 'put' and option_type_for_buf in ('PE', 'PUT', 'P'))
+            (_buf_apply_to == 'call' and _is_ce) or
+            (_buf_apply_to == 'put' and _is_pe)
         )
     )
 
-    buffered_ref = None
-    buffered_spot_for_atm = None
+    # IMPORTANT: Strike buffer must be applied AFTER the base strike is resolved.
+    # Direction is fixed by leg type: CE always goes above spot (more OTM),
+    # PE always goes below spot (more OTM). The checkboxes gate whether
+    # buffering applies at all, not which direction.
+    base_atm = spot_atm_strike
     buffer_position = None
     if _apply_buffer_to_this_leg:
-        if option_type_for_buf in ('CE', 'CALL', 'C'):
-            buffer_position = 'above' if _buf_above else 'below'
-        else:
-            buffer_position = 'below' if _buf_below else 'above'
+        buffer_position = 'above' if _is_ce else 'below'
 
-        buffered_ref = compute_buffer_reference_price(
-            spot_price=entry_spot,
-            buffer_value=_buf_value,
-            buffer_unit=_buf_unit,
-            buffer_position=buffer_position,
-        )
-        buffered_spot_for_atm = snap_to_strike_interval(buffered_ref, strike_interval)
-        atm_strike = buffered_spot_for_atm
+    atm_strike = spot_atm_strike
+
+    def _apply_strike_buffer_after_selection(base_strike):
+        if base_strike is None:
+            return None, 0, None
+
+        if not _apply_buffer_to_this_leg or not buffer_position:
+            return float(base_strike), 0, float(base_strike)
+
+        try:
+            base = float(base_strike)
+        except:
+            return base_strike, 0, None
+
+        if base <= 0:
+            return base_strike, 0, None
+
+        if _buf_unit == 'points':
+            pct = (float(_buf_value) / base) * 100.0
+        else:
+            pct = float(_buf_value)
+
+        if pct <= 0:
+            return float(base), 0, float(base)
+
+        buffer_value = base * (pct / 100.0)
+
+        if option_type_for_buf in ('CE', 'CALL', 'C'):
+            if buffer_position == 'above':
+                shifted = base + buffer_value
+            else:
+                shifted = base - buffer_value
+        else:
+            if buffer_position == 'below':
+                shifted = base - buffer_value
+            else:
+                shifted = base + buffer_value
+
+        if option_type_for_buf in ('CE', 'CALL', 'C'):
+            snapped = _math.ceil(shifted / strike_interval) * strike_interval
+        else:
+            snapped = _math.floor(shifted / strike_interval) * strike_interval
+
+        offset = snapped - base
+
+        # buffer_ref_price = ATM base ± buffer_value (the raw shifted price before snapping)
+        # e.g. ATM=22800, 0.5% → 22800 + 114 = 22914, then snapped to 22950
+        # ref_price shows exactly where the buffer lands before interval rounding
+        ref_price = shifted
+
         _log(
-            f"      [BUFFER] {option_type_for_buf} leg: spot={entry_spot:.0f}, "
-            f"buffer={_buf_value}{_buf_unit} {buffer_position}, "
-            f"ref={buffered_ref:.0f}, atm_override={atm_strike:.0f}"
+            f"      [BUFFER] {option_type_for_buf} leg: base_strike={base:.0f}, "
+            f"pct={pct:.2f}%, buffer_value={buffer_value:.2f}, shifted={shifted:.2f}, "
+            f"final_strike={snapped:.0f}, offset={offset:.0f}, ref_price={ref_price:.2f}"
         )
-    else:
-        atm_strike = spot_atm_strike
+        return snapped, offset, ref_price
 
     leg_config['_buffer_runtime'] = {
         'enabled': _buf_enabled,
         'applied': _apply_buffer_to_this_leg,
         'position': buffer_position,
-        'reference_price': buffered_ref,
+        # Kept for logging/traceability; buffer is NOT used to modify ATM/reference for selection.
+        'reference_price': None,
+        'base_atm': base_atm,
         'spot_atm_strike': spot_atm_strike,
         'atm_strike': atm_strike,
     }
@@ -574,7 +626,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         max_prem = leg_config.get('max_premium') or leg_config.get('upper')
         if min_prem is None or max_prem is None:
             _log(f"      WARNING: PREMIUM_RANGE missing lower/upper — falling back to ATM")
-            return atm_strike
+            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
+            return final_strike, offset, ref_price
         _log(f"      PREMIUM_RANGE: Searching for strikes with premium between {min_prem} and {max_prem}")
         strike = calculate_strike_from_premium_range(
             date=date_str, index=index, expiry=expiry_date,
@@ -583,7 +636,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             min_premium=float(min_prem), max_premium=float(max_prem),
         )
         _log(f"      PREMIUM_RANGE [{min_prem}, {max_prem}] → strike={strike}")
-        return strike  # None if no qualifying strike
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(strike)
+        return final_strike, offset, ref_price
 
     # ── CLOSEST PREMIUM: nearest to target value ───────────────────────────────
     if strike_sel_type == 'CLOSEST_PREMIUM':
@@ -596,14 +650,16 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             target = strike_sel.get('value')
         if target is None:
             _log(f"      WARNING: CLOSEST_PREMIUM missing target — falling back to ATM")
-            return atm_strike
+            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
+            return final_strike, offset, ref_price
         strike = calculate_strike_from_closest_premium(
             date=date_str, index=index, expiry=expiry_date,
             option_type=option_type, spot_price=entry_spot,
             strike_interval=strike_interval, target_premium=float(target),
         )
         _log(f"      CLOSEST_PREMIUM target={target} → strike={strike}")
-        return strike
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(strike)
+        return final_strike, offset, ref_price
 
     # ── PREMIUM >= : all strikes with premium >= value, pick ATM-closest ───────
     if strike_sel_type == 'PREMIUM_GTE':
@@ -616,7 +672,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             min_prem = strike_sel.get('value')
         if min_prem is None:
             _log(f"      WARNING: PREMIUM_GTE missing value — falling back to ATM")
-            return atm_strike
+            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
+            return final_strike, offset, ref_price
         _log(f"      PREMIUM_GTE: Searching for strikes with premium >= {min_prem}")
         all_strikes = get_all_strikes_with_premiums(
             date_str, index, expiry_date, option_type, entry_spot, strike_interval
@@ -625,7 +682,7 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         qualifying = [s for s in all_strikes if s['premium'] >= float(min_prem)]
         if not qualifying:
             _log(f"      WARNING: No strike with premium >= {min_prem}")
-            return None
+            return None, 0, None
         _log(f"      Found {len(qualifying)} qualifying strikes, showing first 5: {[(s['strike'], s['premium']) for s in qualifying[:5]]}")
         # Pick strike with premium closest to the target value (min_prem)
         # Deterministic tie-breaking: prefer higher strike for CE, lower for PE
@@ -635,7 +692,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         else:
             best = min(qualifying, key=lambda x: (abs(x['premium'] - float(min_prem)), abs(x['strike'] - atm_strike), x['strike']))
         _log(f"      PREMIUM_GTE >= {min_prem} → strike={best['strike']} (premium={best['premium']:.2f}, closest to target, ATM={atm_strike})")
-        return best['strike']
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(best['strike'])
+        return final_strike, offset, ref_price
 
     # ── PREMIUM <= : all strikes with premium <= value, pick ATM-closest ───────
     if strike_sel_type == 'PREMIUM_LTE':
@@ -648,7 +706,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             max_prem = strike_sel.get('value')
         if max_prem is None:
             _log(f"      WARNING: PREMIUM_LTE missing value — falling back to ATM")
-            return atm_strike
+            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
+            return final_strike, offset, ref_price
         _log(f"      PREMIUM_LTE: Searching for strikes with premium <= {max_prem}")
         all_strikes = get_all_strikes_with_premiums(
             date_str, index, expiry_date, option_type, entry_spot, strike_interval
@@ -657,7 +716,7 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         qualifying = [s for s in all_strikes if s['premium'] <= float(max_prem)]
         if not qualifying:
             _log(f"      WARNING: No strike with premium <= {max_prem}")
-            return None
+            return None, 0, None
         _log(f"      Found {len(qualifying)} qualifying strikes, showing first 5: {[(s['strike'], s['premium']) for s in qualifying[:5]]}")
         # Pick strike with premium closest to the target value (max_prem)
         # Deterministic tie-breaking: prefer higher strike for CE, lower for PE
@@ -667,7 +726,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         else:
             best = min(qualifying, key=lambda x: (abs(x['premium'] - float(max_prem)), abs(x['strike'] - atm_strike), x['strike']))
         _log(f"      PREMIUM_LTE <= {max_prem} → strike={best['strike']} (premium={best['premium']:.2f}, closest to target, ATM={atm_strike})")
-        return best['strike']
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(best['strike'])
+        return final_strike, offset, ref_price
 
     # ── STRADDLE WIDTH: ATM ± (multiplier × (ATM CE + ATM PE)) ────────────────
     if strike_sel_type == 'STRADDLE_WIDTH':
@@ -702,10 +762,12 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
                 f"multiplier={multiplier}, direction={direction}, "
                 f"shift={shift:.2f} → {final_strike}"
             )
-            return final_strike
+            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(final_strike)
+            return final_strike, offset, ref_price
 
         _log(f"      STRADDLE_WIDTH: Missing CE/PE data, fallback to ATM={atm_strike}")
-        return atm_strike
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
+        return final_strike, offset, ref_price
 
     # ── SYNTHETIC FUTURE: Find strike where |CE - PE| is minimum ────────────────
     if strike_sel_type == 'SYNTHETIC_FUTURE':
@@ -713,7 +775,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             date_str, index, expiry_date, 'CE', entry_spot, strike_interval
         )
         if not all_strikes:
-            return atm_strike
+            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
+            return final_strike, offset, ref_price
         
         min_diff = float('inf')
         best_strike = atm_strike
@@ -728,7 +791,8 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
                     best_strike = s['strike']
         
         _log(f"      SYNTHETIC_FUTURE: best_strike={best_strike}, min_diff={min_diff:.2f}")
-        return best_strike
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(best_strike)
+        return final_strike, offset, ref_price
 
     # ── ATM / ITM / OTM string ─────────────────────────────────────────────────
     sel_str = strike_sel
@@ -736,11 +800,13 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         sel_str = sel_str.get('strike_type') or sel_str.get('type') or 'ATM'
     sel_str = str(sel_str)
     strike = calculate_strike_from_selection(
-        spot_price=buffered_spot_for_atm if buffered_spot_for_atm is not None else entry_spot, strike_interval=strike_interval,
+        spot_price=entry_spot,
+        strike_interval=strike_interval,
         selection=sel_str, option_type=option_type,
     )
     _log(f"      STRIKE_TYPE '{sel_str}' → strike={strike}")
-    return strike
+    final_strike, offset, ref_price = _apply_strike_buffer_after_selection(strike)
+    return final_strike, offset, ref_price
 
 
 def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_spot, slippage_pct=0.0):
@@ -1851,6 +1917,7 @@ def run_algotest_backtest(params):
         f"apply_to={buffer_strike_apply_to}, "
         f"above={buffer_position_above}, below={buffer_position_below}"
     )
+
     slippage_pct = _normalize_slippage_pct(
         params.get('slippage_pct', params.get('slippage_percent', params.get('slippage', 0.0)))
     )
@@ -2478,7 +2545,7 @@ def run_algotest_backtest(params):
                             '_buffer_position_above': buffer_position_above,
                             '_buffer_position_below': buffer_position_below,
                         }
-                        strike = _resolve_strike(
+                        strike, buffer_offset, buffer_ref_price = _resolve_strike(
                             leg_config=leg_config_with_buffer,
                             entry_date=entry_date,
                             entry_spot=entry_spot,
@@ -2492,7 +2559,7 @@ def run_algotest_backtest(params):
                             continue
 
                         buffer_runtime = leg_config_with_buffer.get('_buffer_runtime', {})
-                        _log(f"      Calculated Strike: {strike}")
+                        _log(f"      Calculated Strike: {strike}, buffer_offset={buffer_offset}, buffer_ref_price={buffer_ref_price}")
 
                         # Get entry premium
                         entry_premium = get_option_premium_from_db(
@@ -2603,10 +2670,11 @@ def run_algotest_backtest(params):
                             'market_exit_premium': market_exit_premium,
                             'buffer_strike_enabled': buffer_strike_enabled,
                             'buffer_position': buffer_runtime.get('position'),
-                            'buffer_ref_price': buffer_runtime.get('reference_price'),
+                            'buffer_ref_price': buffer_ref_price,
                             'buffer_spot_atm': buffer_runtime.get('spot_atm_strike'),
                             'buffer_atm_strike': buffer_runtime.get('atm_strike'),
-                            'buffer_applied': buffer_runtime.get('applied', False),
+                            'buffer_applied': buffer_offset != 0,
+                            'buffer_strike_offset': buffer_offset,
                             'pnl': leg_pnl,
                             'ce_pnl': ce_pnl,
                             'pe_pnl': pe_pnl
@@ -2972,7 +3040,7 @@ def run_algotest_backtest(params):
                                         '_buffer_strike_unit': buffer_strike_unit,
                                         '_buffer_strike_apply_to': buffer_strike_apply_to,
                                         '_buffer_position_above': buffer_position_above,
-                                        '_buffer_position_below': buffer_position_below,
+                            '_buffer_position_below': buffer_position_below,
                                     }
                                     rstk = _resolve_strike(
                                         leg_config=rlc_with_buffer,
@@ -3272,14 +3340,8 @@ def run_algotest_backtest(params):
                 buffer_atm_strike = leg.get('buffer_atm_strike')
                 buffer_spot_atm = leg.get('buffer_spot_atm')
                 buffer_applied = bool(leg.get('buffer_applied', False))
+                buffer_strike_offset = leg.get('buffer_strike_offset', 0)
                 buffer_position_value = leg.get('buffer_position')
-                if buffer_applied and buffer_atm_strike is not None and buffer_spot_atm is not None and strike_interval:
-                    try:
-                        buffer_strike_offset = int((float(buffer_atm_strike) - float(buffer_spot_atm)) / float(strike_interval))
-                    except (TypeError, ValueError, ZeroDivisionError):
-                        buffer_strike_offset = 0
-                else:
-                    buffer_strike_offset = 0
 
                 lots          = leg.get('lots', 1)
                 lot_size      = leg.get('lot_size', 65)
@@ -3334,7 +3396,7 @@ def run_algotest_backtest(params):
                     'Exit Date':      format_date_dd_mm_yyyy(trade['exit_date']),
                     'Leg Exit Date':  format_date_dd_mm_yyyy(leg_exit_date),
                     'Type':           leg_option_type,
-                    'Strike':         strike,
+                    'Strike':         buffer_spot_atm if buffer_applied and buffer_spot_atm else strike,
                     'B/S':            position,
                     'Qty':            qty,
                     'Entry Price':    entry_price,

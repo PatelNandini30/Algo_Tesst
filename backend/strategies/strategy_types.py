@@ -38,7 +38,6 @@ class StrikeSelectionType(str, Enum):
     PREMIUM_LTE = "PREMIUM_LTE"  # Premium <= value
     STRADDLE_WIDTH = "Straddle Width"
     PERCENT_OF_ATM = "% of ATM"
-    DELTA = "Delta"
     STRIKE_TYPE = "Strike Type"  # Specific strike value
     OTM_PERCENT = "OTM %"  # Out of the money by percentage
     ITM_PERCENT = "ITM %"  # In the money by percentage
@@ -107,7 +106,6 @@ class StrikeSelection(BaseModel):
     premium_max: Optional[float] = None  # For premium range
     lower: Optional[float] = None  # Alternative name for premium_min (frontend compatibility)
     upper: Optional[float] = None  # Alternative name for premium_max (frontend compatibility)
-    delta_value: Optional[float] = None  # For delta-based selection
     strike_type: Optional[StrikeType] = None  # ATM/ITM/OTM
     otm_strikes: Optional[int] = None  # Number of strikes OTM
     itm_strikes: Optional[int] = None  # Number of strikes ITM

@@ -244,19 +244,24 @@ function getBufferPreview(value, unit, applyTo, posAbove, posBelow, indexName = 
   const bufPts = unit === 'percent' ? spot * (numericValue / 100) : numericValue;
   const parts = [];
 
-  if (applyTo === 'call' || applyTo === 'both') {
-    const position = posAbove ? 'above' : 'below';
-    const ref = position === 'above' ? spot + bufPts : spot - bufPts;
-    const strike = Math.round(ref / interval) * interval;
-    parts.push(`CALL -> ${strike.toLocaleString('en-IN')} CE (${position})`);
+  // CE: Above checkbox gates it, always moves UP (more OTM, away from spot)
+  if ((applyTo === 'call' || applyTo === 'both') && posAbove) {
+    const ref = spot + bufPts;
+    const strike = Math.ceil(ref / interval) * interval;
+    const bufOnStrike = unit === 'percent' ? strike * (numericValue / 100) : numericValue;
+    const refPrice = (strike + bufOnStrike).toFixed(2);
+    parts.push(`CALL → ${strike.toLocaleString('en-IN')} CE (ref ${refPrice})`);
   }
-  if (applyTo === 'put' || applyTo === 'both') {
-    const position = posBelow ? 'below' : 'above';
-    const ref = position === 'below' ? spot - bufPts : spot + bufPts;
-    const strike = Math.round(ref / interval) * interval;
-    parts.push(`PUT -> ${strike.toLocaleString('en-IN')} PE (${position})`);
+  // PE: Below checkbox gates it, always moves DOWN (more OTM, away from spot)
+  if ((applyTo === 'put' || applyTo === 'both') && posBelow) {
+    const ref = spot - bufPts;
+    const strike = Math.floor(ref / interval) * interval;
+    const bufOnStrike = unit === 'percent' ? strike * (numericValue / 100) : numericValue;
+    const refPrice = (strike - bufOnStrike).toFixed(2);
+    parts.push(`PUT → ${strike.toLocaleString('en-IN')} PE (ref ${refPrice})`);
   }
 
+  if (parts.length === 0) return 'No buffer applied (enable Above for CE, Below for PE)';
   return `e.g. spot 25,000: ${parts.join(' | ')}`;
 }
 
@@ -273,7 +278,7 @@ const Tooltip = ({ text }) => {
         <Info size={12} />
       </button>
       {show && (
-        <span className="absolute left-5 top-0 z-50 w-56 rounded bg-base p-2.5 text-xs text-white shadow-xl whitespace-normal leading-relaxed">
+        <span className="absolute left-5 top-0 z-50 w-56 rounded bg-base p-2.5 text-xs text-secondary shadow-xl whitespace-normal leading-relaxed border border-subtle">
           {text}
         </span>
       )}
@@ -354,7 +359,7 @@ const StrategyBuilder = () => {
   const [bufferStrikeApplyTo, setBufferStrikeApplyTo] = useState('both');
   const [bufferPositionAbove, setBufferPositionAbove] = useState(true);
   const [bufferPositionBelow, setBufferPositionBelow] = useState(true);
-  const [slippagePct, setSlippagePct] = useState(0);
+const [slippagePct, setSlippagePct] = useState(0);
   const [chargesEnabled, setChargesEnabled] = useState(false);
 
   const clampSpotAdjustmentValue = useCallback((value) => {
@@ -1370,48 +1375,27 @@ const StrategyBuilder = () => {
                       <div className="space-y-1">
                         <p className="text-xs font-semibold text-muted uppercase tracking-wide">
                           Buffer position
-                          <span className="ml-1 text-muted font-normal normal-case">
-                            (which side of spot)
-                          </span>
                         </p>
                         <div className="flex flex-wrap gap-4">
                           <label className="flex items-center gap-2 cursor-pointer">
                             <input
                               type="checkbox"
                               checked={bufferPositionAbove}
-                              onChange={e => {
-                                const next = e.target.checked;
-                                if (!next && !bufferPositionBelow) return;
-                                setBufferPositionAbove(next);
-                              }}
+                              onChange={e => setBufferPositionAbove(e.target.checked)}
                               className="accent-blue-600"
                             />
                             <span className="text-xs font-medium text-orange-700">↑ Above</span>
-                            <span className="text-xs text-muted">
-                              {bufferStrikeUnit === 'percent'
-                                ? `(+${bufferStrikeValue}% -> ${(25000 * (1 + bufferStrikeValue / 100)).toFixed(0)})`
-                                : `(+${bufferStrikeValue} pts -> ${25000 + Number(bufferStrikeValue)})`
-                              }
-                            </span>
+                            <span className="text-xs text-muted">CE moves up (more OTM)</span>
                           </label>
                           <label className="flex items-center gap-2 cursor-pointer">
                             <input
                               type="checkbox"
                               checked={bufferPositionBelow}
-                              onChange={e => {
-                                const next = e.target.checked;
-                                if (!next && !bufferPositionAbove) return;
-                                setBufferPositionBelow(next);
-                              }}
+                              onChange={e => setBufferPositionBelow(e.target.checked)}
                               className="accent-blue-600"
                             />
                             <span className="text-xs font-medium text-blue-700">↓ Below</span>
-                            <span className="text-xs text-muted">
-                              {bufferStrikeUnit === 'percent'
-                                ? `(-${bufferStrikeValue}% -> ${(25000 * (1 - bufferStrikeValue / 100)).toFixed(0)})`
-                                : `(-${bufferStrikeValue} pts -> ${25000 - Number(bufferStrikeValue)})`
-                              }
-                            </span>
+                            <span className="text-xs text-muted">PE moves down (more OTM)</span>
                           </label>
                         </div>
                       </div>
@@ -1697,7 +1681,7 @@ const StrategyBuilder = () => {
                     <label className="block text-xs text-muted mb-1">Strike Criteria</label>
                     <select value={draftLeg.strike_criteria}
                       onChange={e => setDraftLeg(prev => ({ ...prev, strike_criteria: e.target.value }))}
-                      className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-44">
+                      className="h-8 px-2 border border-strong rounded text-xs bg-surface text-secondary focus:outline-none focus:ring-2 focus:ring-blue-400 w-44">
                       <option value="strike_type">Strike Type</option>
                       <option value="premium_range">Premium Range</option>
                       <option value="closest_premium">Closest Premium</option>
@@ -1707,8 +1691,6 @@ const StrategyBuilder = () => {
                       <option value="pct_of_atm">% of ATM</option>
                       <option value="synthetic_future">Synthetic Future</option>
                       <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
-                      <option value="closest_delta">Closest Delta</option>
-                      <option value="delta_range">Delta Range</option>
                     </select>
                     {draftLeg.strike_criteria === 'straddle_width' && (
                       <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
@@ -1879,7 +1861,7 @@ const StrategyBuilder = () => {
                               <div>
                                 <label className="block text-xs text-muted mb-1">Strike Criteria</label>
                                 <select value={leg.strike_criteria} onChange={e => updateLeg(leg.id, 'strike_criteria', e.target.value)}
-                                  className="h-7 px-2 border border-strong rounded text-xs bg-surface w-36">
+                                  className="h-7 px-2 border border-strong rounded text-xs bg-surface text-secondary w-36">
                                   <option value="strike_type">Strike Type</option>
                                   <option value="premium_range">Premium Range</option>
                                   <option value="closest_premium">Closest Premium</option>
@@ -1889,8 +1871,6 @@ const StrategyBuilder = () => {
                                   <option value="pct_of_atm">% of ATM</option>
                                   <option value="synthetic_future">Synthetic Future</option>
                                   <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
-                                  <option value="closest_delta">Closest Delta</option>
-                                  <option value="delta_range">Delta Range</option>
                                 </select>
                                 {leg.strike_criteria === 'straddle_width' && (
                                   <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
