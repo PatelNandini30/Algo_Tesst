@@ -2679,20 +2679,33 @@ def get_all_strikes_with_premiums(date, index, expiry, option_type, spot_price, 
     """
     date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
     expiry_str = expiry.strftime('%Y-%m-%d') if hasattr(expiry, 'strftime') else str(expiry)
-    
-    # Load bhavcopy data
-    bhav_df = load_bhavcopy(date_str)
-    
-    if bhav_df is None or bhav_df.empty:
-        return []
-    
-    # Normalize option type
+
+    # Normalize option type once (used by both paths)
     opt_type = option_type.upper()
     if opt_type in ['CALL', 'C']:
         opt_type = 'CE'
     elif opt_type in ['PUT', 'P']:
         opt_type = 'PE'
-    
+
+    # ── Fast path: use pre-loaded bulk Polars DataFrame ───────────────────────
+    if is_bulk_data_loaded():
+        try:
+            bulk_df = fast_get_strikes_for_date(date_str, expiry_str, opt_type)
+            if bulk_df is not None and not bulk_df.is_empty():
+                sorted_df = bulk_df.select(['StrikePrice', 'Close']).sort('StrikePrice')
+                return [
+                    {'strike': float(r[0]), 'premium': float(r[1])}
+                    for r in sorted_df.iter_rows()
+                ]
+        except Exception:
+            pass  # fall through to bhavcopy
+
+    # ── Slow path: load individual day bhavcopy (CSV or Postgres) ─────────────
+    bhav_df = load_bhavcopy(date_str)
+
+    if bhav_df is None or bhav_df.empty:
+        return []
+
     # Filter for the specific index, expiry, and option type
     expiry_ts = pd.to_datetime(expiry_str)
     mask = (
@@ -2700,14 +2713,13 @@ def get_all_strikes_with_premiums(date, index, expiry, option_type, spot_price, 
         (bhav_df['OptionType'] == opt_type) &
         (bhav_df['ExpiryDate'] == expiry_ts)
     )
-    
+
     filtered_df = bhav_df[mask].copy()
-    
+
     if filtered_df.empty:
         return []
-    
-    # Extract strikes and premiums
-    # Vectorised — replaces iterrows() loop
+
+    # Extract strikes and premiums — vectorised
     strikes_with_premiums = (
         filtered_df[['StrikePrice', 'Close']]
         .rename(columns={'StrikePrice': 'strike', 'Close': 'premium'})
@@ -2718,7 +2730,7 @@ def get_all_strikes_with_premiums(date, index, expiry, option_type, spot_price, 
         .sort_values('strike')
         .to_dict('records')
     )
-    
+
     return strikes_with_premiums
 
 
@@ -2743,15 +2755,18 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
         
     Trading Logic:
         1. Get all available strikes with premiums
-        2. Filter strikes where premium is between min and max
-        3. Select the strike with premium closest to max_premium (highest in range)
-        4. This ensures we get the maximum premium within the specified range
-        
+        2. Filter strikes where premium is between min and max (inclusive)
+        3. Among qualifying strikes, pick the one closest to the RANGE MAX
+           (i.e., prefer the highest premium within the range, like selecting from 200→150)
+        4. Tie-breaks (deterministic):
+           - closer to ATM
+           - for CE: prefer higher strike, for PE: prefer lower strike
+
     Example:
-        Spot = 24,350, Min = 150, Max = 200
-        Available: 24300 (₹250), 24350 (₹156), 24400 (₹198), 24450 (₹80)
-        In Range: 24350 (₹156), 24400 (₹198)
-        Selected: 24400 (₹198 - closest to max ₹200) ✅
+        Spot = 23,800, ATM = 23800, Min = 50, Max = 200
+        Available: 23800 (₹347), 23850 (₹290), 23900 (₹195.70), 23950 (₹120)
+        In Range: 23900 (₹195.70), 23950 (₹120)
+        Selected: 23900 (₹195.70 — closest to Max=200 within range) ✅
     """
     # Get all strikes with premiums
     strikes_data = get_all_strikes_with_premiums(
@@ -2761,7 +2776,6 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
     if not strikes_data:
         return None
     
-    # Print ALL strikes with premiums for debugging
     # Filter by premium range
     in_range = [s for s in strikes_data if min_premium <= s['premium'] <= max_premium]
     
@@ -2771,8 +2785,27 @@ def calculate_strike_from_premium_range(date, index, expiry, option_type, spot_p
     # Calculate ATM strike for distance comparison
     atm_strike = round(spot_price / strike_interval) * strike_interval
     
-    # Select strike closest to ATM from valid strikes in range
-    best = min(in_range, key=lambda x: abs(x['strike'] - atm_strike))
+    # Pick strike with premium closest to the range maximum (effectively: highest premium in-range).
+    # Then prefer closer-to-ATM, and apply deterministic strike-direction tie-break.
+    option_type_upper = option_type.upper() if option_type else 'CE'
+    if option_type_upper in ['CE', 'CALL', 'C']:
+        best = min(
+            in_range,
+            key=lambda x: (
+                abs(float(max_premium) - float(x['premium'])),
+                abs(float(x['strike']) - float(atm_strike)),
+                -float(x['strike']),
+            ),
+        )
+    else:
+        best = min(
+            in_range,
+            key=lambda x: (
+                abs(float(max_premium) - float(x['premium'])),
+                abs(float(x['strike']) - float(atm_strike)),
+                float(x['strike']),
+            ),
+        )
     return best['strike']
 
 

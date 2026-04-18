@@ -324,14 +324,8 @@ const StrategyBuilder = () => {
   const [expiryBasis, setExpiryBasis] = useState('weekly');
   const [entryDaysBefore, setEntryDaysBefore] = useState(0);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
-  const [delayRestart, setDelayRestart] = useState(false);
   const [delayTime, setDelayTime] = useState('09:15');
-  const [overallMomentum, setOverallMomentum] = useState(false);
-  const [momentumType, setMomentumType] = useState('points_up');
-  const [momentumValue, setMomentumValue] = useState(0);
   const [squareOffMode, setSquareOffMode] = useState('partial');
-  const [trailSLBreakeven, setTrailSLBreakeven] = useState(false);
-  const [trailSLTarget, setTrailSLTarget] = useState('all_legs');
   const [legs, setLegs] = useState([]);
 
   const hasFuturesLeg = useMemo(
@@ -386,6 +380,9 @@ const [slippagePct, setSlippagePct] = useState(0);
     premium_value: 0,
     premium_min: 0,
     premium_max: 0,
+    pct_direction: '-',
+    pct_value: 0,
+    atm_straddle_prem_pct: 0,
     straddle_multiplier: 0.5,
     straddle_direction: '+',
   });
@@ -703,19 +700,37 @@ const [slippagePct, setSlippagePct] = useState(0);
 
   // Upload management removed - handled by CsvUpload component
 
+  const validationErrorTimerRef = useRef(null);
+  const showValidationError = (msg) => {
+    if (validationErrorTimerRef.current) clearTimeout(validationErrorTimerRef.current);
+    setValidationError(msg);
+    validationErrorTimerRef.current = setTimeout(() => setValidationError(null), 10000);
+  };
+
   // Validate expiry mismatch
   const validateExpiry = () => {
-  if (expiryBasis === 'monthly') {
-    const weeklyLegs = legs.filter(l => l.segment !== 'futures' && l.expiry === 'weekly');
-    if (weeklyLegs.length > 0) {
-      const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
-      setValidationError(`Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`);
-      return false;
+    if (expiryBasis === 'monthly') {
+      const weeklyLegs = legs.filter(l => l.segment !== 'futures' && ['weekly', 'next_weekly'].includes(l.expiry));
+      if (weeklyLegs.length > 0) {
+        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
+        showValidationError(`Monthly expiry basis selected — Leg(s) ${legNumbers} have weekly expiry. Change leg expiry to Monthly or Next Monthly.`);
+        return false;
+      }
     }
+    if (expiryBasis === 'weekly') {
+      const monthlyLegs = legs.filter(l => l.segment !== 'futures' && ['monthly', 'next_monthly'].includes(l.expiry));
+      if (monthlyLegs.length > 0) {
+        const legNumbers = monthlyLegs.map((_, i) => i + 1).join(', ');
+        showValidationError(`Weekly expiry basis selected — Leg(s) ${legNumbers} have monthly expiry. Change leg expiry to Weekly or Next Weekly.`);
+        return false;
+      }
     }
     setValidationError(null);
     return true;
   };
+
+  // Clear expiry warning when user changes legs or basis so it doesn't persist after fix
+  useEffect(() => { setValidationError(null); }, [legs, expiryBasis]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const canRunBacktest = legs.length > 0 && !loading;
 
@@ -786,6 +801,9 @@ const [slippagePct, setSlippagePct] = useState(0);
       premium_value: 0,
       premium_min: 0,
       premium_max: 0,
+      pct_direction: '-',
+      pct_value: 0,
+      atm_straddle_prem_pct: 0,
       straddle_multiplier: 0.5,
       straddle_direction: '+',
     }));
@@ -817,6 +835,13 @@ const [slippagePct, setSlippagePct] = useState(0);
           lower: l.premium_min,
           upper: l.premium_max,
         };
+        if (l.strike_criteria === 'pct_of_atm') {
+          leg.strike_selection.value = Number(l.pct_value) || 0;
+          leg.strike_selection.direction = String(l.pct_direction || '-');
+        }
+        if (l.strike_criteria === 'atm_straddle_prem_pct') {
+          leg.strike_selection.value = Number(l.atm_straddle_prem_pct) || 0;
+        }
         if (l.strike_criteria === 'straddle_width') {
           leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
           leg.straddle_direction = l.straddle_direction ?? '+';
@@ -894,8 +919,6 @@ const [slippagePct, setSlippagePct] = useState(0);
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
       square_off_mode: squareOffMode,
-      trail_sl_breakeven: trailSLBreakeven,
-      trail_sl_target: trailSLTarget,
       spot_adjustment_enabled: spotAdjustmentEnabled,
       spot_adjustment_direction: spotAdjustmentDirection,
       spot_adjustment_pct: normalizedSpotAdjustmentValue,
@@ -986,20 +1009,11 @@ const [slippagePct, setSlippagePct] = useState(0);
     setValidationError(null);
     
     if (entryDaysBefore === 0 && exitDaysBefore === 0) {
-      setError('Expiry day entry requires same-day spot data for accurate ATM/spot strike selection; results may differ when using previous close data.');
-      setTimeout(() => setError(null), 1000);
-      return;
+      setError('Entry & exit on expiry day — trade will use next expiry contract and exit on next expiry.');
+      setTimeout(() => setError(null), 5000);
     }
-    
-    if (expiryBasis === 'monthly') {
-      const weeklyLegs = legs.filter(l => l.segment !== 'futures' && l.expiry === 'weekly');
-      if (weeklyLegs.length > 0) {
-        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
-        const msg = `Cannot enter on monthly expiry basis - Leg(s) ${legNumbers} have weekly expiry selected`;
-        setError(msg);
-        return;
-      }
-    }
+
+    if (!validateExpiry()) return;
 
     const trailSLWarnings = legs.reduce((acc, leg, idx) => {
       if (!leg.trail_sl_enabled) return acc;
@@ -1211,101 +1225,101 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
-                {/* Delay Restart */}
-                <div className="flex items-center justify-between py-2">
-                  <span className="text-xs text-secondary">Delay Restart</span>
-                  <Toggle enabled={delayRestart} onToggle={(val) => setDelayRestart(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
-                </div>
-
-                {/* Overall Momentum */}
-                <div className="flex items-center justify-between py-2">
-                  <div className="flex items-center gap-1">
-                    <span className="text-xs text-secondary">Overall Momentum</span>
-                    <Tooltip text="Entry only when market momentum matches the selected direction and threshold." />
-                  </div>
-                  <Toggle enabled={overallMomentum} onToggle={(val) => setOverallMomentum(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
-                </div>
-
                 {/* SuperTrend Filter */}
                 <SuperTrendFilter
                   enabled={strFilter.enabled}
                   onToggle={(val) => setStrFilter(prev => ({ ...prev, enabled: val !== undefined ? Boolean(val) : !prev.enabled }))}
                   onFilterChange={(payload) => setStrFilter(prev => ({ ...prev, ...payload }))}
                 />
-                <div className="flex items-center justify-between py-2">
-                  <div className="flex items-center gap-1">
-                    <span className="text-xs text-secondary">Spot Adjustment</span>
-                    <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Uses the same entry spot as strike selection (previous day close). Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach." />
-                  </div>
-                  <Toggle
-                    enabled={spotAdjustmentEnabled}
-                    onToggle={(val) => setSpotAdjustmentEnabled(prev => val !== undefined ? Boolean(val) : !prev)}
-                    size="sm"
-                  />
-                </div>
-                {spotAdjustmentEnabled && (
-                  <div className="space-y-2 pl-2">
+                <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
+                  <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <SegBtn
-                        options={[
-                          { value: 'rise', label: '↑ Rise' },
-                          { value: 'fall', label: '↓ Fall' },
-                          { value: 'both', label: '↕ Both' },
-                        ]}
-                        value={spotAdjustmentDirection}
-                        onChange={setSpotAdjustmentDirection}
-                        size="sm"
-                      />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted">Units</span>
-                      <SegBtn
-                        options={[
-                          { value: 'percent', label: '% Percent' },
-                          { value: 'points', label: 'Pts' },
-                        ]}
-                        value={spotAdjustmentUnits}
-                        onChange={setSpotAdjustmentUnits}
-                        size="sm"
-                      />
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="w-20 text-xs font-medium text-secondary">Threshold</span>
-                      <input
-                        type="number"
-                        min={0.25}
-                        max={5}
-                        step={0.25}
-                        value={spotAdjustmentValue}
-                        onChange={e => {
-                          const nextValue = e.target.value;
-                          if (nextValue === '') {
-                            setSpotAdjustmentValue('');
-                            return;
-                          }
-                          const numeric = Number(nextValue);
-                          setSpotAdjustmentValue(Number.isNaN(numeric) ? '' : numeric);
-                        }}
-                        onBlur={() => setSpotAdjustmentValue(prev => clampSpotAdjustmentValue(prev))}
-                        className="h-10 flex-1 border border-strong rounded text-sm px-2"
-                      />
-                      <span className="text-xs font-medium text-muted">
-                        {spotAdjustmentUnits === 'percent' ? '%' : 'pts'}
+                      <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
+                        Spot Adjustment
                       </span>
+                      <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach." />
                     </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-muted">Show target info</span>
-                      <Toggle
-                        enabled={spotAdjustmentShowInfo}
-                        onToggle={(val) => setSpotAdjustmentShowInfo(prev => val !== undefined ? Boolean(val) : !prev)}
-                        size="sm"
-                      />
-                    </div>
-                    {spotAdjustmentShowInfo && (
-                      <p className="text-xs text-muted">{spotAdjustmentHelperText}</p>
-                    )}
+                    <Toggle
+                      enabled={spotAdjustmentEnabled}
+                      onToggle={(val) => setSpotAdjustmentEnabled(prev => val !== undefined ? Boolean(val) : !prev)}
+                      size="sm"
+                    />
                   </div>
-                )}
+
+                  {spotAdjustmentEnabled && (
+                    <div className="space-y-4 pt-1">
+                      <div className="space-y-1">
+                        <p className="text-xs font-semibold text-muted uppercase tracking-wide">Direction</p>
+                        <div className="flex gap-2">
+                          {[
+                            { value: 'rise', label: '↑ Rise' },
+                            { value: 'fall', label: '↓ Fall' },
+                            { value: 'both', label: '↕ Both' },
+                          ].map(opt => (
+                            <button
+                              key={opt.value}
+                              type="button"
+                              onClick={() => setSpotAdjustmentDirection(opt.value)}
+                              className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                spotAdjustmentDirection === opt.value
+                                  ? 'bg-accent text-white border-accent'
+                                  : 'border-default text-secondary hover:bg-hover'
+                              }`}
+                            >
+                              {opt.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <p className="text-xs font-semibold text-muted uppercase tracking-wide">Threshold</p>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            min={0.25}
+                            max={spotAdjustmentUnits === 'percent' ? 20 : 10000}
+                            step={spotAdjustmentUnits === 'percent' ? 0.25 : 50}
+                            value={spotAdjustmentValue}
+                            onChange={e => {
+                              const nextValue = e.target.value;
+                              if (nextValue === '') { setSpotAdjustmentValue(''); return; }
+                              const numeric = Number(nextValue);
+                              setSpotAdjustmentValue(Number.isNaN(numeric) ? '' : numeric);
+                            }}
+                            onBlur={() => setSpotAdjustmentValue(prev => clampSpotAdjustmentValue(prev))}
+                            className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
+                          />
+                          <div className="flex gap-1">
+                            {['percent', 'points'].map(u => (
+                              <button
+                                key={u}
+                                type="button"
+                                onClick={() => {
+                                  setSpotAdjustmentUnits(u);
+                                  setSpotAdjustmentValue(u === 'percent' ? 1.0 : 200);
+                                }}
+                                className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                  spotAdjustmentUnits === u
+                                    ? 'bg-accent text-white border-accent'
+                                    : 'border-default text-secondary hover:bg-hover'
+                                }`}
+                              >
+                                {u === 'percent' ? '% Pct' : 'Pts'}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      {spotAdjustmentHelperText && (
+                        <p className="text-[11px] text-muted leading-relaxed bg-hover rounded-lg px-3 py-2">
+                          {spotAdjustmentHelperText}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
                 <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
@@ -1473,24 +1487,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                   />
                 </div>
 
-                <div className="flex items-center gap-2 py-2">
-                  <input
-                    type="checkbox"
-                    id="trailSL"
-                    checked={trailSLBreakeven}
-                    onChange={e => setTrailSLBreakeven(e.target.checked)}
-                    className="h-3.5 w-3.5 rounded border-strong accent-blue-600"
-                  />
-                  <label htmlFor="trailSL" className="text-xs text-secondary cursor-pointer flex-1">
-                    Trail Stop Loss to Break-even
-                  </label>
-                  <SegBtn
-                    options={[{ value: 'all_legs', label: 'All Legs' }, { value: 'sl_legs', label: 'SL Legs' }]}
-                    value={trailSLTarget}
-                    onChange={setTrailSLTarget}
-                    size="sm"
-                  />
-                </div>
               </div>
             </div>
 
@@ -1720,28 +1716,89 @@ const [slippagePct, setSlippagePct] = useState(0);
                 )}
 
                 {/* Strike Type / Premium */}
-                {draftLeg.segment === 'options' && (
+                {draftLeg.segment === 'options' && draftLeg.strike_criteria !== 'straddle_width' && (
                   <div>
-                    <label className="block text-xs text-muted mb-1">Strike Type</label>
-                    {draftLeg.strike_criteria === 'strike_type' ? (
-                      <select value={draftLeg.strike_type}
-                        onChange={e => setDraftLeg(prev => ({ ...prev, strike_type: e.target.value }))}
-                        className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-28">
-                        {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                      </select>
-                    ) : draftLeg.strike_criteria === 'premium_range' ? (
-                      <div className="flex gap-1">
-                        <input type="number" min={0} placeholder="Min" value={draftLeg.premium_min || ''}
-                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_min: +e.target.value }))}
-                          className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
-                        <input type="number" min={0} placeholder="Max" value={draftLeg.premium_max || ''}
-                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_max: +e.target.value }))}
-                          className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
-                      </div>
-                    ) : (
-                      <input type="number" min={0} placeholder="Value" value={draftLeg.premium_value || ''}
-                        onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: +e.target.value }))}
-                        className="w-24 h-8 px-2 border border-strong rounded text-xs text-center" />
+                    {(draftLeg.strike_criteria === 'strike_type' || draftLeg.strike_criteria === 'synthetic_future') && (
+                      <>
+                        <label className="block text-xs text-muted mb-1">Strike Type</label>
+                        <select value={draftLeg.strike_type}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, strike_type: e.target.value }))}
+                          className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-28">
+                          {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </>
+                    )}
+
+                    {draftLeg.strike_criteria === 'premium_range' && (
+                      <>
+                        <div className="flex gap-2">
+                          <div>
+                            <label className="block text-xs text-muted mb-1">Lower Range</label>
+                            <input type="number" min={0} placeholder="Lower" value={draftLeg.premium_min || ''}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, premium_min: +e.target.value }))}
+                              className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
+                          </div>
+                          <div>
+                            <label className="block text-xs text-muted mb-1">Upper Range</label>
+                            <input type="number" min={0} placeholder="Upper" value={draftLeg.premium_max || ''}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, premium_max: +e.target.value }))}
+                              className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
+                          </div>
+                        </div>
+                      </>
+                    )}
+
+                    {(draftLeg.strike_criteria === 'closest_premium' || draftLeg.strike_criteria === 'premium_gte' || draftLeg.strike_criteria === 'premium_lte') && (
+                      <>
+                        <label className="block text-xs text-muted mb-1">Premium</label>
+                        <input type="number" min={0} placeholder="Premium" value={draftLeg.premium_value || ''}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: +e.target.value }))}
+                          className="w-24 h-8 px-2 border border-strong rounded text-xs text-center" />
+                      </>
+                    )}
+
+                    {draftLeg.strike_criteria === 'pct_of_atm' && (
+                      <>
+                        <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                        <div className="flex items-center gap-1 h-8">
+                          <span className="text-xs text-muted whitespace-nowrap">ATM</span>
+                          <select
+                            value={draftLeg.pct_direction ?? '-'}
+                            onChange={e => setDraftLeg(prev => ({ ...prev, pct_direction: e.target.value }))}
+                            className="h-8 px-2 border border-strong rounded text-xs bg-surface"
+                          >
+                            <option value="-">-</option>
+                            <option value="+">+</option>
+                          </select>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.1"
+                            value={draftLeg.pct_value ?? 0}
+                            onChange={e => setDraftLeg(prev => ({ ...prev, pct_value: parseFloat(e.target.value) || 0 }))}
+                            className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
+                          />
+                          <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
+                        </div>
+                      </>
+                    )}
+
+                    {draftLeg.strike_criteria === 'atm_straddle_prem_pct' && (
+                      <>
+                        <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                        <div className="flex items-center gap-1 h-8">
+                          <span className="text-xs text-muted whitespace-nowrap">ATM Straddle Premium %</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.1"
+                            value={draftLeg.atm_straddle_prem_pct ?? 0}
+                            onChange={e => setDraftLeg(prev => ({ ...prev, atm_straddle_prem_pct: parseFloat(e.target.value) || 0 }))}
+                            className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
+                          />
+                          <span className="text-xs text-muted whitespace-nowrap">%</span>
+                        </div>
+                      </>
                     )}
                   </div>
                 )}
@@ -1897,28 +1954,89 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   </div>
                                 )}
                               </div>
-                              <div>
-                                <label className="block text-xs text-muted mb-1">Strike Type</label>
-                                {leg.strike_criteria === 'strike_type' ? (
-                                  <select value={leg.strike_type} onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
-                                    className="h-7 px-2 border border-strong rounded text-xs bg-surface w-24">
-                                    {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-                                  </select>
-                                ) : leg.strike_criteria === 'premium_range' ? (
-                                  <div className="flex gap-1">
-                                    <input type="number" min={0} placeholder="Min" value={leg.premium_min || ''}
-                                      onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
-                                      className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
-                                    <input type="number" min={0} placeholder="Max" value={leg.premium_max || ''}
-                                      onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
-                                      className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
-                                  </div>
-                                ) : (
-                                  <input type="number" min={0} placeholder="Value" value={leg.premium_value || ''}
-                                    onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
-                                    className="w-20 h-7 px-1 border border-strong rounded text-xs text-center" />
-                                )}
-                              </div>
+                              {leg.strike_criteria !== 'straddle_width' && (
+                                <div>
+                                  {(leg.strike_criteria === 'strike_type' || leg.strike_criteria === 'synthetic_future') && (
+                                    <>
+                                      <label className="block text-xs text-muted mb-1">Strike Type</label>
+                                      <select value={leg.strike_type} onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
+                                        className="h-7 px-2 border border-strong rounded text-xs bg-surface w-24">
+                                        {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                      </select>
+                                    </>
+                                  )}
+
+                                  {leg.strike_criteria === 'premium_range' && (
+                                    <div className="flex gap-2">
+                                      <div>
+                                        <label className="block text-xs text-muted mb-1">Lower Range</label>
+                                        <input type="number" min={0} placeholder="Lower" value={leg.premium_min || ''}
+                                          onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
+                                          className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
+                                      </div>
+                                      <div>
+                                        <label className="block text-xs text-muted mb-1">Upper Range</label>
+                                        <input type="number" min={0} placeholder="Upper" value={leg.premium_max || ''}
+                                          onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
+                                          className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {(leg.strike_criteria === 'closest_premium' || leg.strike_criteria === 'premium_gte' || leg.strike_criteria === 'premium_lte') && (
+                                    <>
+                                      <label className="block text-xs text-muted mb-1">Premium</label>
+                                      <input type="number" min={0} placeholder="Premium" value={leg.premium_value || ''}
+                                        onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
+                                        className="w-20 h-7 px-1 border border-strong rounded text-xs text-center" />
+                                    </>
+                                  )}
+
+                                  {leg.strike_criteria === 'pct_of_atm' && (
+                                    <>
+                                      <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                                      <div className="flex items-center gap-1">
+                                        <span className="text-xs text-muted whitespace-nowrap">ATM</span>
+                                        <select
+                                          value={leg.pct_direction ?? '-'}
+                                          onChange={e => updateLeg(leg.id, 'pct_direction', e.target.value)}
+                                          className="h-7 px-2 border border-strong rounded text-xs bg-surface"
+                                        >
+                                          <option value="-">-</option>
+                                          <option value="+">+</option>
+                                        </select>
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          step="0.1"
+                                          value={leg.pct_value ?? 0}
+                                          onChange={e => updateLeg(leg.id, 'pct_value', parseFloat(e.target.value) || 0)}
+                                          className="w-14 h-7 px-1 border border-strong rounded text-xs text-center"
+                                        />
+                                        <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
+                                      </div>
+                                    </>
+                                  )}
+
+                                  {leg.strike_criteria === 'atm_straddle_prem_pct' && (
+                                    <>
+                                      <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                                      <div className="flex items-center gap-1">
+                                        <span className="text-xs text-muted whitespace-nowrap">ATM Straddle Premium %</span>
+                                        <input
+                                          type="number"
+                                          min="0"
+                                          step="0.1"
+                                          value={leg.atm_straddle_prem_pct ?? 0}
+                                          onChange={e => updateLeg(leg.id, 'atm_straddle_prem_pct', parseFloat(e.target.value) || 0)}
+                                          className="w-14 h-7 px-1 border border-strong rounded text-xs text-center"
+                                        />
+                                        <span className="text-xs text-muted whitespace-nowrap">%</span>
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                              )}
                             </>
                           )}
                         </div>
@@ -2151,7 +2269,12 @@ const [slippagePct, setSlippagePct] = useState(0);
         )}
 
         {/* Run Backtest Button - Bottom */}
-        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50">
+        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50 flex flex-col items-center gap-2">
+          {validationError && (
+            <div className="flex items-start gap-2 bg-red-50 border border-red-300 text-red-700 text-xs rounded-xl px-4 py-2.5 shadow-lg max-w-sm text-center">
+              <span>⚠️ {validationError}</span>
+            </div>
+          )}
           <button
             onClick={runBacktest}
             disabled={!canRunBacktest}

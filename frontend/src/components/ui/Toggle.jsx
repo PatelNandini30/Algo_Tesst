@@ -15,7 +15,7 @@ const Toggle = ({ enabled, onToggle, size = 'md' }) => {
   return (
     <button
       type="button"
-      onClick={onToggle}
+      onClick={() => onToggle(!enabled)}
       className={`relative inline-flex ${sizeClasses} flex-shrink-0 items-center rounded-full transition-colors duration-200 focus:outline-none ${
         enabled ? 'bg-accent text-inverse' : 'bg-gray-300'
       }`}

@@ -502,6 +502,15 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         'SYNTHETIC_FUTURE': 'SYNTHETIC_FUTURE',
         'SYNTHETIC':      'SYNTHETIC_FUTURE',
         'SYNTHETIC_LONG': 'SYNTHETIC_FUTURE',
+        'PCT_OF_ATM':     'PCT_OF_ATM',
+        'PCTOFATM':       'PCT_OF_ATM',
+        '%OFATM':         'PCT_OF_ATM',
+        'PERCENTOFATM':   'PCT_OF_ATM',
+        'PERCENT_OF_ATM': 'PCT_OF_ATM',
+        'ATM_STRADDLE_PREM_PCT': 'ATM_STRADDLE_PREM_PCT',
+        'ATM_STRADDLE_PREMIUM_PCT': 'ATM_STRADDLE_PREM_PCT',
+        'ATMSTRADDLEPREMIUMPCT': 'ATM_STRADDLE_PREM_PCT',
+        'ATMSTRADDLEPREMPCT': 'ATM_STRADDLE_PREM_PCT',
     }
     strike_sel_type = _type_aliases.get(strike_sel_type, strike_sel_type)
     
@@ -620,14 +629,18 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         'atm_strike': atm_strike,
     }
 
+    # Helper: extract value from strike_selection dict (frontend stores params inside it)
+    _ss = strike_sel if isinstance(strike_sel, dict) else {}
+
     # ── PREMIUM RANGE: lower <= premium <= upper ───────────────────────────────
     if strike_sel_type == 'PREMIUM_RANGE':
-        min_prem = leg_config.get('min_premium') or leg_config.get('lower')
-        max_prem = leg_config.get('max_premium') or leg_config.get('upper')
+        min_prem = (leg_config.get('min_premium') or leg_config.get('lower')
+                    or _ss.get('lower') or _ss.get('min_premium'))
+        max_prem = (leg_config.get('max_premium') or leg_config.get('upper')
+                    or _ss.get('upper') or _ss.get('max_premium'))
         if min_prem is None or max_prem is None:
-            _log(f"      WARNING: PREMIUM_RANGE missing lower/upper — falling back to ATM")
-            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
-            return final_strike, offset, ref_price
+            _log(f"      WARNING: PREMIUM_RANGE missing lower/upper — skipping trade")
+            return None, 0, None
         _log(f"      PREMIUM_RANGE: Searching for strikes with premium between {min_prem} and {max_prem}")
         strike = calculate_strike_from_premium_range(
             date=date_str, index=index, expiry=expiry_date,
@@ -636,6 +649,9 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             min_premium=float(min_prem), max_premium=float(max_prem),
         )
         _log(f"      PREMIUM_RANGE [{min_prem}, {max_prem}] → strike={strike}")
+        if strike is None:
+            _log(f"      WARNING: No strike found in premium range [{min_prem}, {max_prem}] — skipping trade")
+            return None, 0, None
         final_strike, offset, ref_price = _apply_strike_buffer_after_selection(strike)
         return final_strike, offset, ref_price
 
@@ -645,19 +661,20 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             leg_config.get('premium')
             or leg_config.get('strike_selection_value')
             or (strike_sel if isinstance(strike_sel, (int, float)) else None)
+            or _ss.get('premium') or _ss.get('value')
         )
-        if target is None and isinstance(strike_sel, dict):
-            target = strike_sel.get('value')
         if target is None:
-            _log(f"      WARNING: CLOSEST_PREMIUM missing target — falling back to ATM")
-            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
-            return final_strike, offset, ref_price
+            _log(f"      WARNING: CLOSEST_PREMIUM missing target — skipping trade")
+            return None, 0, None
         strike = calculate_strike_from_closest_premium(
             date=date_str, index=index, expiry=expiry_date,
             option_type=option_type, spot_price=entry_spot,
             strike_interval=strike_interval, target_premium=float(target),
         )
         _log(f"      CLOSEST_PREMIUM target={target} → strike={strike}")
+        if strike is None:
+            _log(f"      WARNING: CLOSEST_PREMIUM found no strike — skipping trade")
+            return None, 0, None
         final_strike, offset, ref_price = _apply_strike_buffer_after_selection(strike)
         return final_strike, offset, ref_price
 
@@ -667,13 +684,13 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             leg_config.get('premium')
             or leg_config.get('strike_selection_value')
             or (strike_sel if isinstance(strike_sel, (int, float)) else None)
+            or _ss.get('premium') or _ss.get('value')
         )
-        if min_prem is None and isinstance(strike_sel, dict):
-            min_prem = strike_sel.get('value')
         if min_prem is None:
-            _log(f"      WARNING: PREMIUM_GTE missing value — falling back to ATM")
-            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
-            return final_strike, offset, ref_price
+            min_prem = _ss.get('lower')
+        if min_prem is None:
+            _log(f"      WARNING: PREMIUM_GTE missing value — skipping trade")
+            return None, 0, None
         _log(f"      PREMIUM_GTE: Searching for strikes with premium >= {min_prem}")
         all_strikes = get_all_strikes_with_premiums(
             date_str, index, expiry_date, option_type, entry_spot, strike_interval
@@ -701,13 +718,11 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             leg_config.get('premium')
             or leg_config.get('strike_selection_value')
             or (strike_sel if isinstance(strike_sel, (int, float)) else None)
+            or _ss.get('premium') or _ss.get('value') or _ss.get('upper')
         )
-        if max_prem is None and isinstance(strike_sel, dict):
-            max_prem = strike_sel.get('value')
         if max_prem is None:
-            _log(f"      WARNING: PREMIUM_LTE missing value — falling back to ATM")
-            final_strike, offset, ref_price = _apply_strike_buffer_after_selection(atm_strike)
-            return final_strike, offset, ref_price
+            _log(f"      WARNING: PREMIUM_LTE missing value — skipping trade")
+            return None, 0, None
         _log(f"      PREMIUM_LTE: Searching for strikes with premium <= {max_prem}")
         all_strikes = get_all_strikes_with_premiums(
             date_str, index, expiry_date, option_type, entry_spot, strike_interval
@@ -794,6 +809,64 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         final_strike, offset, ref_price = _apply_strike_buffer_after_selection(best_strike)
         return final_strike, offset, ref_price
 
+    # ── % OF ATM: ATM ± (pct% of ATM strike) ──────────────────────────────────
+    if strike_sel_type == 'PCT_OF_ATM':
+        pct = (
+            leg_config.get('pct_value')
+            or (strike_sel.get('value') if isinstance(strike_sel, dict) else None)
+            or (strike_sel.get('pct') if isinstance(strike_sel, dict) else None)
+            or 0
+        )
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            pct = 0.0
+        direction = (
+            leg_config.get('pct_direction')
+            or (strike_sel.get('direction') if isinstance(strike_sel, dict) else None)
+            or '-'
+        )
+        direction = str(direction).strip()
+        shift = (atm_strike * pct) / 100.0
+        raw_strike = atm_strike - shift if direction == '-' else atm_strike + shift
+        final = round(raw_strike / strike_interval) * strike_interval
+        _log(f"      PCT_OF_ATM: ATM={atm_strike}, pct={pct}, direction={direction} → {final}")
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(final)
+        return final_strike, offset, ref_price
+
+    # ── ATM STRADDLE PREMIUM %: target = pct% × (ATM CE+PE), then closest-premium ──
+    if strike_sel_type == 'ATM_STRADDLE_PREM_PCT':
+        pct = (
+            leg_config.get('atm_straddle_prem_pct')
+            or (strike_sel.get('value') if isinstance(strike_sel, dict) else None)
+            or 0
+        )
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            pct = 0.0
+
+        ce_price = get_option_premium_from_db(entry_date, index, atm_strike, 'CE', expiry_date)
+        pe_price = get_option_premium_from_db(entry_date, index, atm_strike, 'PE', expiry_date)
+        if ce_price is None or pe_price is None:
+            _log("      ATM_STRADDLE_PREM_PCT: Missing ATM CE/PE premium — skipping trade")
+            return None, 0, None
+
+        straddle_price = float(ce_price) + float(pe_price)
+        target_premium = (pct / 100.0) * straddle_price
+        _log(f"      ATM_STRADDLE_PREM_PCT: ATM={atm_strike}, straddle={straddle_price:.2f}, pct={pct} → target={target_premium:.2f}")
+
+        strike = calculate_strike_from_closest_premium(
+            date=date_str, index=index, expiry=expiry_date,
+            option_type=option_type, spot_price=entry_spot,
+            strike_interval=strike_interval, target_premium=target_premium,
+        )
+        if strike is None:
+            _log("      ATM_STRADDLE_PREM_PCT: No strike found for target premium — skipping trade")
+            return None, 0, None
+        final_strike, offset, ref_price = _apply_strike_buffer_after_selection(strike)
+        return final_strike, offset, ref_price
+
     # ── ATM / ITM / OTM string ─────────────────────────────────────────────────
     sel_str = strike_sel
     if isinstance(sel_str, dict):
@@ -820,12 +893,13 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
     lots     = tleg.get('lots', 1)
 
     if seg in ('OPTION',):
+        _leg_expiry_for_lookup = tleg.get('_resolved_expiry') or expiry_date
         new_exit = get_option_premium_from_db(
             date=leg_exit_date.strftime('%Y-%m-%d'),
             index=index,
             strike=tleg['strike'],
             option_type=tleg['option_type'],
-            expiry=expiry_date.strftime('%Y-%m-%d'),
+            expiry=pd.Timestamp(_leg_expiry_for_lookup).strftime('%Y-%m-%d'),
         )
         if new_exit is None:
             spot = get_spot_price_from_db(leg_exit_date, index) or fallback_spot
@@ -1152,12 +1226,15 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                 if not option_type or not strike:
                     continue
 
+                # Use per-leg resolved expiry if available (set during main trade processing)
+                _sl_expiry = leg.get('_resolved_expiry') or expiry_date
+
                 current_premium_raw = get_option_premium_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
                     strike=strike,
                     option_type=option_type,
-                    expiry=expiry_date.strftime('%Y-%m-%d')
+                    expiry=pd.Timestamp(_sl_expiry).strftime('%Y-%m-%d')
                 )
                 if current_premium_raw is None:
                     continue
@@ -1567,12 +1644,14 @@ def check_overall_stop_loss_target(
                 if strike is None or entry_premium is None:
                     continue
 
+                _trail_expiry = leg.get('_resolved_expiry') or expiry_date
+
                 current_premium_raw = get_option_premium_from_db(
                     date=check_date.strftime('%Y-%m-%d'),
                     index=index,
                     strike=strike,
                     option_type=option_type,
-                    expiry=expiry_date.strftime('%Y-%m-%d')
+                    expiry=pd.Timestamp(_trail_expiry).strftime('%Y-%m-%d')
                 )
 
                 if current_premium_raw is None:
@@ -1936,15 +2015,18 @@ def run_algotest_backtest(params):
     # Pre-build sorted numpy array for O(log n) searchsorted lookups
     trading_calendar_arr = trading_calendar['date'].values.astype('datetime64[ns]')
     
+    _etype = expiry_type.upper()
+    _is_next = _etype in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+
     if expiry_day_of_week is not None:
         expiry_dates = get_custom_expiry_dates(index, expiry_day_of_week, from_date, to_date)
         expiry_df = pd.DataFrame({'Current Expiry': expiry_dates})
     else:
-        if expiry_type.upper() == 'WEEKLY':
+        if _etype in ('WEEKLY', 'NEXT_WEEKLY', 'WEEKLY_T1'):
             expiry_df = get_expiry_dates(index, 'weekly', from_date, to_date)
-        else:  # MONTHLY
+        else:  # MONTHLY, NEXT_MONTHLY, MONTHLY_T1
             expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
-    
+
     # ========== STEP 4: INITIALIZE RESULTS ==========
     all_trades = []
     trade_id_counter = 0
@@ -1952,20 +2034,40 @@ def run_algotest_backtest(params):
     n_expiries = len(expiry_df)
     schedule = []
     for expiry_idx, expiry_row in expiry_df.iterrows():
-        expiry_date = expiry_row['Current Expiry']
+        current_exp = pd.Timestamp(expiry_row['Current Expiry'])
+        next_exp = pd.Timestamp(expiry_row['Next Expiry']) if 'Next Expiry' in expiry_row and pd.notna(expiry_row['Next Expiry']) else None
+
+        # Determine DTE anchor: if ALL option legs trade a next-series contract
+        # (NEXT_WEEKLY / NEXT_MONTHLY), anchor entry/exit DTE to the NEXT expiry
+        # so that "3 days before expiry" means 3 days before the contract you hold.
+        # For mixed strategies (calendar spreads) keep current_exp as anchor so
+        # all legs enter on the same date.
+        # EXCEPTION: DTE=0/0 keeps current_exp anchor — the existing _force_next_expiry
+        # logic already handles that case (enters on current_exp day, trades next contract,
+        # exits on next_exp). Shifting anchor breaks it by making entry land on next_exp.
+        schedule_anchor = current_exp
+        _opt_legs = [l for l in legs_config if str(l.get('segment', 'OPTION')).upper() not in ('FUTURES', 'FUTURE')]
+        _next_types = ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+        _all_legs_next = bool(_opt_legs) and all(
+            str(l.get('expiry', 'WEEKLY') or 'WEEKLY').upper() in _next_types
+            for l in _opt_legs
+        )
+        _is_zero_dte = (entry_dte == 0 and exit_dte == 0)
+        dte_anchor = (next_exp if (_all_legs_next and next_exp is not None and not _is_zero_dte) else current_exp)
+
         entry_date = calculate_trading_days_before_expiry(
-            expiry_date=expiry_date,
+            expiry_date=dte_anchor,
             days_before=entry_dte,
             trading_calendar_df=trading_calendar
         )
         exit_date = calculate_trading_days_before_expiry(
-            expiry_date=expiry_date,
+            expiry_date=dte_anchor,
             days_before=exit_dte,
             trading_calendar_df=trading_calendar
         )
 
         if entry_date is None or exit_date is None:
-            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} (dte_anchor={dte_anchor.date()}) ---")
             _log("  WARNING: Missing entry or exit date; skipping expiry")
             continue
 
@@ -1977,26 +2079,44 @@ def run_algotest_backtest(params):
             continue
 
         if entry_date > exit_date:
-            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} (dte_anchor={dte_anchor.date()}) ---")
             _log(f"  WARNING: Entry ({entry_date}) after exit ({exit_date}) - skipping")
             continue
 
+        # Expiry-to-next-expiry mode: when both entry and exit land on the same
+        # expiry day (entry_dte=0, exit_dte=0), same-day options are worthless.
+        # Shift exit to next_exp and force all legs to use the next-expiry contract.
+        # For NEXT_WEEKLY this still works: dte_anchor=current_exp (DTE=0/0 exception
+        # above), so entry lands on current_exp, exit shifts to next_exp, and the
+        # _is_leg_next flag makes legs trade the next_exp contract as intended.
+        _force_next_expiry = False
         if entry_date == exit_date:
-            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {expiry_date} ---")
-            _log(f"  INFO: Entry == Exit ({entry_date}) — zero-holding trade skipped")
-            continue
+            if next_exp is not None:
+                exit_date = next_exp
+                _force_next_expiry = True
+                _log(f"  INFO: Entry == Exit on expiry day → exit shifted to next expiry {next_exp.date()}, forcing next-expiry contract")
+            else:
+                _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
+                _log(f"  INFO: Entry == Exit ({entry_date}) and no next expiry — skipping")
+                continue
 
         schedule.append({
-            'expiry_idx': expiry_idx,
-            'expiry_date': expiry_date,
-            'entry_date': entry_date,
-            'exit_date': exit_date,
+            'expiry_idx':        expiry_idx,
+            'expiry_date':       schedule_anchor,
+            'current_expiry':    current_exp,
+            'next_expiry':       next_exp,
+            'entry_date':        entry_date,
+            'exit_date':         exit_date,
+            '_force_next_expiry': _force_next_expiry,
         })
 
     if not schedule:
         return pd.DataFrame(), {}, {}
 
     _log(f"Schedule entries constructed: {len(schedule)}")
+    if schedule:
+        s0 = schedule[0]
+        _log(f"[SCHED DEBUG] First schedule record: expiry_date={s0['expiry_date']} | current_expiry={s0['current_expiry']} | next_expiry={s0['next_expiry']} | entry={s0['entry_date']} | exit={s0['exit_date']}")
 
     segments = []
     if str_enabled:
@@ -2114,11 +2234,14 @@ def run_algotest_backtest(params):
                     continue
 
                 seg_entries.append({
-                    'segment':      segment,
-                    'entry_date':   current_entry_ts,
-                    'exit_date':    exit_ts,
-                    'expiry_date':  rec['expiry_date'],
-                    'clamped_exit': clamped_exit,
+                    'segment':             segment,
+                    'entry_date':          current_entry_ts,
+                    'exit_date':           exit_ts,
+                    'expiry_date':         rec['expiry_date'],
+                    'current_expiry':      rec.get('current_expiry', rec['expiry_date']),
+                    'next_expiry':         rec.get('next_expiry',    rec['expiry_date']),
+                    '_force_next_expiry':  rec.get('_force_next_expiry', False),
+                    'clamped_exit':        clamped_exit,
                 })
 
                 prev_exit_ts = exit_ts
@@ -2173,11 +2296,14 @@ def run_algotest_backtest(params):
                         continue
                     exit_ts = pd.Timestamp(last_day)
                 seg_entries.append({
-                    'segment':      segment,
-                    'entry_date':   rec['entry_date'],
-                    'exit_date':    exit_ts,
-                    'expiry_date':  rec['expiry_date'],
-                    'clamped_exit': clamped_exit,
+                    'segment':             segment,
+                    'entry_date':          rec['entry_date'],
+                    'exit_date':           exit_ts,
+                    'expiry_date':         rec['expiry_date'],
+                    'current_expiry':      rec.get('current_expiry', rec['expiry_date']),
+                    'next_expiry':         rec.get('next_expiry',    rec['expiry_date']),
+                    '_force_next_expiry':  rec.get('_force_next_expiry', False),
+                    'clamped_exit':        clamped_exit,
                 })
 
         segment_records.append({
@@ -2213,9 +2339,15 @@ def run_algotest_backtest(params):
             entry_date = trade_entry['entry_date']
             exit_date = trade_entry['exit_date']
             expiry_date = trade_entry['expiry_date']
+            _sched_current_exp   = trade_entry.get('current_expiry') or expiry_date
+            _sched_next_exp      = trade_entry.get('next_expiry')    or expiry_date
+            _force_next_expiry   = trade_entry.get('_force_next_expiry', False)
             clamped_exit = trade_entry['clamped_exit']
             trade_id += 1
             _log(f"--- Segment {segment['label']} | Trade {trade_id}/{total_entries} ---")
+            _log(f"  [EXPIRY DEBUG] expiry_type={expiry_type} | trade_entry keys={list(trade_entry.keys())}")
+            _log(f"  [EXPIRY DEBUG] expiry_date={expiry_date} | current_expiry_raw={trade_entry.get('current_expiry')} | next_expiry_raw={trade_entry.get('next_expiry')}")
+            _log(f"  [EXPIRY DEBUG] _sched_current_exp={_sched_current_exp} | _sched_next_exp={_sched_next_exp}")
             _log(f"  Segment window: {segment['start'].strftime('%Y-%m-%d')} -> {segment['end'].strftime('%Y-%m-%d')}")
             _log(f"  Entry Date: {entry_date} | Exit Date: {exit_date}")
             _log(f"[TRADE] id={trade_id} | segment={segment['label']} | "
@@ -2532,6 +2664,25 @@ def run_algotest_backtest(params):
                         _log(f"      DEBUG: leg_config['strike_selection'] = {leg_config.get('strike_selection')}")
                         _log(f"      DEBUG: leg_config['strike_selection_type'] = {leg_config.get('strike_selection_type')}")
 
+                        # ── Resolve per-leg options expiry ─────────────────────────────────
+                        # Each leg can independently trade a different expiry series
+                        # (e.g., Leg 1 = WEEKLY, Leg 2 = NEXT_WEEKLY for calendar spreads).
+                        # We use the schedule's stored current/next expiry directly to avoid
+                        # mismatches from looking up by entry_date (which may be past current expiry
+                        # when the global basis is NEXT_WEEKLY/NEXT_MONTHLY).
+                        _leg_expiry_raw = str(leg_config.get('expiry', 'WEEKLY') or 'WEEKLY').upper()
+                        _is_leg_next = _leg_expiry_raw in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+                        if _force_next_expiry or _is_leg_next:
+                            leg_options_expiry = pd.Timestamp(_sched_next_exp)
+                        else:
+                            leg_options_expiry = pd.Timestamp(_sched_current_exp)
+                        _log(f"      [LEG EXPIRY DEBUG] leg.expiry={_leg_expiry_raw} | _is_leg_next={_is_leg_next}")
+                        _log(f"      [LEG EXPIRY DEBUG] _sched_current_exp={_sched_current_exp} | _sched_next_exp={_sched_next_exp}")
+                        _log(f"      [LEG EXPIRY DEBUG] → resolved leg_options_expiry={leg_options_expiry.strftime('%Y-%m-%d')}")
+
+                        # Store resolved expiry in leg_config so SL checker can use it
+                        leg_config = {**leg_config, '_resolved_expiry': leg_options_expiry}
+
                         # ========== CALCULATE STRIKE ==========
                         # Routes through _resolve_strike which handles ALL criteria:
                         # ATM/ITM/OTM, Premium Range, Closest Premium, Premium >=, Premium <=
@@ -2549,7 +2700,7 @@ def run_algotest_backtest(params):
                             leg_config=leg_config_with_buffer,
                             entry_date=entry_date,
                             entry_spot=entry_spot,
-                            expiry_date=expiry_date,
+                            expiry_date=leg_options_expiry,
                             strike_interval=strike_interval,
                             index=index,
                         )
@@ -2567,7 +2718,7 @@ def run_algotest_backtest(params):
                             index=index,
                             strike=strike,
                             option_type=option_type,
-                            expiry=expiry_date.strftime('%Y-%m-%d')
+                            expiry=leg_options_expiry.strftime('%Y-%m-%d')
                         )
 
                         if entry_premium is None:
@@ -2590,7 +2741,7 @@ def run_algotest_backtest(params):
                             index=index,
                             strike=strike,
                             option_type=option_type,
-                            expiry=expiry_date.strftime('%Y-%m-%d')
+                            expiry=leg_options_expiry.strftime('%Y-%m-%d')
                         )
 
                         if exit_premium is not None:
@@ -2677,7 +2828,8 @@ def run_algotest_backtest(params):
                             'buffer_strike_offset': buffer_offset,
                             'pnl': leg_pnl,
                             'ce_pnl': ce_pnl,
-                            'pe_pnl': pe_pnl
+                            'pe_pnl': pe_pnl,
+                            '_resolved_expiry': leg_options_expiry,
                         })
             
                 # Guard: if all legs were skipped (no data), don't record this trade
@@ -2715,13 +2867,14 @@ def run_algotest_backtest(params):
                     
                         if actual_leg_exit_date != exit_date:
                             if tleg.get('segment') == 'OPTION':
-                                # Recalculate option exit premium
+                                # Recalculate option exit premium using leg's resolved expiry
+                                _leg_expiry_8c = tleg.get('_resolved_expiry') or expiry_date
                                 new_exit_premium = get_option_premium_from_db(
                                     date=actual_leg_exit_date.strftime('%Y-%m-%d'),
                                     index=index,
                                     strike=tleg['strike'],
                                     option_type=tleg['option_type'],
-                                    expiry=expiry_date.strftime('%Y-%m-%d')
+                                    expiry=pd.Timestamp(_leg_expiry_8c).strftime('%Y-%m-%d')
                                 )
                             
                                 if new_exit_premium is not None:
@@ -3413,12 +3566,16 @@ def run_algotest_backtest(params):
                                       if show_spot_cols and leg_exit_spot is not None and entry_spot_val is not None
                                       else np.nan),
                     'Expiry':         (
-                        leg.get('futures_expiry') 
-                        if leg.get('segment') == 'FUTURE' 
+                        leg.get('futures_expiry')
+                        if leg.get('segment') == 'FUTURE'
                         else (
-                            trade['expiry_date'].strftime('%Y-%m-%d') 
-                            if hasattr(trade['expiry_date'], 'strftime') 
-                            else str(trade['expiry_date'])[:10]
+                            leg['_resolved_expiry'].strftime('%Y-%m-%d')
+                            if leg.get('_resolved_expiry') is not None and hasattr(leg['_resolved_expiry'], 'strftime')
+                            else (
+                                trade['expiry_date'].strftime('%Y-%m-%d')
+                                if hasattr(trade['expiry_date'], 'strftime')
+                                else str(trade['expiry_date'])[:10]
+                            )
                         )
                     ),
                     'CE P&L':         ce_pnl_val,

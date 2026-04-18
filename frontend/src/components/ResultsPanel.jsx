@@ -393,16 +393,16 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     const TRADE_COLS = new Set(['Net P&L','% P&L','Cumulative','Peak','DD','%DD']);
     const keyOrder = [
-      'Trade','Leg','Index','Entry Date','Exit Date',
+      'Trade','Leg','Index','Entry Date','Exit Date','Expiry',
       'Entry Spot','Exit Spot','Spot P&L',
       'Type','Strike',
       ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
-      'B/S','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
+      'B/S','Qty','Raw Entry Price','Entry Price','Entry Turnover','Raw Exit Price','Exit Price','Exit Turnover',
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
       'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
-      'Exit Reason','Expiry',
+      'Exit Reason',
       ...(hasStr ? ['STR Segment'] : []),
     ];
 
@@ -447,6 +447,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='DD')    val=m.dd;
           else if (key==='%DD')   val=m.pctDd;
         } else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
+        else if (key==='Exit Date') val=trade['Leg Exit Date']||trade['Exit Date'];
+        else if (key==='Entry Turnover') val=Math.round((parseFloat(trade['Entry Price'])||0)*(parseInt(trade['Qty'])||0)*100)/100;
+        else if (key==='Exit Turnover')  val=Math.round((parseFloat(trade['Exit Price'])||0)*(parseInt(trade['Qty'])||0)*100)/100;
         else val=trade[key];
         if (val==null||(typeof val==='number'&&isNaN(val))||val==='NaN') val='';
         if (typeof val==='number'&&!Number.isInteger(val)) val=Math.round(val*100)/100;
@@ -459,6 +462,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const wb = new ExcelJS.Workbook();
     wb.creator = 'AlgoTest Backtest';
     wb.created = new Date();
+    wb.calcProperties = { fullCalcOnLoad: true };
 
     // ════════════════════════════════════════════════════════════════════════
     // SHEET 1 — TRADE SHEET
@@ -467,7 +471,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Column widths
     const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
+      'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Entry Turnover':14,'Raw Exit Price':12,'Exit Price':12,'Exit Turnover':14,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
     ws1.columns = keyOrder.map(k => ({ header: k, key: k, width: colWidths[k]||10 }));
 
@@ -485,11 +489,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       const r   = ws1.addRow(keyOrder.map(k => row[k]??''));
       const net = typeof row['Net P&L']==='number' ? row['Net P&L'] : null;
       const bg  = i%2===0 ? C.white : C.altRow;
-      r.eachCell(cell => {
+      r.eachCell((cell, colNum) => {
         cell.font   = normFont(10);
         cell.fill   = { type:'pattern', pattern:'solid', fgColor: bg };
         cell.border = thinBorder();
         cell.alignment = { vertical:'middle' };
+        // Ensure numeric cells are not formatted as text so Excel formulas work
+        if (typeof cell.value === 'number') {
+          cell.numFmt = '#,##0.##';
+        }
       });
       // Color Net P&L and % P&L
       if (net !== null) {
