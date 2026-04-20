@@ -1547,6 +1547,22 @@ def compute_overall_target_threshold(trade_legs, overall_target_type, overall_ta
 
     return float(overall_target_value)
 
+
+def _resolve_leg_exit(per_leg_results, trade_exit_date, trade_exit_reason, leg_idx):
+    """
+    Resolve per-leg exit date & reason for output rows.
+
+    per_leg_results is aligned to the in-memory trade['legs'] list order (0..n-1),
+    not to leg_number (which can be non-contiguous if some configured legs were
+    skipped due to missing data).
+    """
+    if per_leg_results is not None and 0 <= leg_idx < len(per_leg_results):
+        r = per_leg_results[leg_idx] or {}
+        return (r.get('exit_date') or trade_exit_date,
+                r.get('exit_reason', 'EXPIRY'))
+    return (trade_exit_date, trade_exit_reason or 'EXPIRY')
+
+
 def check_overall_stop_loss_target(
     entry_date,
     exit_date,
@@ -3448,17 +3464,21 @@ def run_algotest_backtest(params):
         for leg_idx, leg in enumerate(trade['legs']):
             try:
                 leg_num = leg['leg_number']
-                li      = leg_num - 1  # 0-based index
+                # per_leg_results is aligned to trade['legs'] order (the list passed to
+                # check_leg_stop_loss_target), NOT necessarily leg_number.
+                # If any configured leg was skipped earlier due to missing data,
+                # leg_number can be non-contiguous (e.g., first leg missing → only
+                # leg_number=2 exists), so indexing per_leg_results via leg_number
+                # misattributes the exit_date/reason (partial square-off mode).
+                li = leg_idx  # 0-based index into per_leg_results
 
                 # ── Resolve per-leg exit date & reason ────────────────────────────
-                # In partial mode different legs can exit on different dates.
-                # In complete / overall-SL mode all legs share the same date.
-                if per_leg_res is not None and li < len(per_leg_res):
-                    leg_exit_date   = per_leg_res[li].get('exit_date') or trade['exit_date']
-                    leg_exit_reason = per_leg_res[li].get('exit_reason', 'EXPIRY')
-                else:
-                    leg_exit_date   = trade['exit_date']
-                    leg_exit_reason = trade.get('exit_reason', 'EXPIRY')
+                leg_exit_date, leg_exit_reason = _resolve_leg_exit(
+                    per_leg_results=per_leg_res,
+                    trade_exit_date=trade['exit_date'],
+                    trade_exit_reason=trade.get('exit_reason', 'EXPIRY'),
+                    leg_idx=li,
+                )
 
                 # ── Exit spot price taken from the leg's own exit date ─────────────
                 # Each leg may exit on a different day (partial mode), so we fetch

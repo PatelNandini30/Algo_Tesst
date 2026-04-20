@@ -397,7 +397,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Entry Spot','Exit Spot','Spot P&L',
       'Type','Strike',
       ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
-      'B/S','Qty','Raw Entry Price','Entry Price','Entry Turnover','Raw Exit Price','Exit Price','Exit Turnover',
+      'B/S','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
@@ -448,8 +448,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='%DD')   val=m.pctDd;
         } else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
         else if (key==='Exit Date') val=trade['Leg Exit Date']||trade['Exit Date'];
-        else if (key==='Entry Turnover') val=Math.round((parseFloat(trade['Entry Price'])||0)*(parseInt(trade['Qty'])||0)*100)/100;
-        else if (key==='Exit Turnover')  val=Math.round((parseFloat(trade['Exit Price'])||0)*(parseInt(trade['Qty'])||0)*100)/100;
         else val=trade[key];
         if (val==null||(typeof val==='number'&&isNaN(val))||val==='NaN') val='';
         if (typeof val==='number'&&!Number.isInteger(val)) val=Math.round(val*100)/100;
@@ -471,7 +469,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Column widths
     const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Entry Turnover':14,'Raw Exit Price':12,'Exit Price':12,'Exit Turnover':14,'Net P&L':10,'% P&L':8,'Cumulative':11,
+      'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
     ws1.columns = keyOrder.map(k => ({ header: k, key: k, width: colWidths[k]||10 }));
 
