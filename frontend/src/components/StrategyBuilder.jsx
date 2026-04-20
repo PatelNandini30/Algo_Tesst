@@ -1254,7 +1254,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                 )}
 
                 {/* DTE validation warning for weekly/monthly legs */}
-                {(entryDaysBefore === exitDaysBefore || entryDaysBefore < exitDaysBefore) && (() => {
+                {(() => {
                   const hasCurrentLegs = legs
                     .filter(l => l.segment !== 'futures')
                     .some(l => l.expiry === 'weekly' || l.expiry === 'monthly');
@@ -1604,45 +1604,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                   )}
                 </div>
 
-                {/* Trailing */}
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-secondary">Trailing</span>
-                    <Toggle enabled={trailingEnabled} onToggle={(val) => setTrailingEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
-                  </div>
-                  {trailingEnabled && (
-                    <div className="space-y-2">
-                      <select
-                        value={trailingType}
-                        onChange={e => setTrailingType(e.target.value)}
-                        className="w-full h-8 px-2 border border-strong rounded text-xs bg-surface"
-                      >
-                        <option value="lock">Lock</option>
-                        <option value="lock_and_trail">Lock & Trail</option>
-                      </select>
-                      <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <label className="block text-xs text-muted mb-1">If profit reaches</label>
-                          <input
-                            type="number"
-                            value={trailingIfProfit}
-                            onChange={e => setTrailingIfProfit(+e.target.value)}
-                            className="w-full h-8 px-2 border border-strong rounded text-xs text-center"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-xs text-muted mb-1">Lock profit at</label>
-                          <input
-                            type="number"
-                            value={trailingLockProfit}
-                            onChange={e => setTrailingLockProfit(+e.target.value)}
-                            className="w-full h-8 px-2 border border-strong rounded text-xs text-center"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
+
               </div>
             </div>
           </div>
