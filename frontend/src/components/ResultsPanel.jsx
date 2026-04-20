@@ -1174,8 +1174,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                     <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
                                   </>
                                 ) : null}
-                                {/* Show individual exit date for each leg */}
-                                <td className="px-3 py-2 text-xs text-primary">{leg['Exit Date'] || group.exitDate || '-'}</td>
+                                {/* Show per-leg exit date; triggered legs (SL/Target/Trail) have their own early exit date */}
+                                <td className="px-3 py-2 text-xs text-primary">{leg['Leg Exit Date'] || leg['Exit Date'] || group.exitDate || '-'}</td>
                                 {isFirstLeg ? (
                                   <>
                                     <td className="px-3 py-2 text-xs text-right text-primary" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>

@@ -2037,14 +2037,22 @@ def run_algotest_backtest(params):
         current_exp = pd.Timestamp(expiry_row['Current Expiry'])
         next_exp = pd.Timestamp(expiry_row['Next Expiry']) if 'Next Expiry' in expiry_row and pd.notna(expiry_row['Next Expiry']) else None
 
-        # Determine DTE anchor: if ALL option legs trade a next-series contract
-        # (NEXT_WEEKLY / NEXT_MONTHLY), anchor entry/exit DTE to the NEXT expiry
-        # so that "3 days before expiry" means 3 days before the contract you hold.
-        # For mixed strategies (calendar spreads) keep current_exp as anchor so
-        # all legs enter on the same date.
-        # EXCEPTION: DTE=0/0 keeps current_exp anchor — the existing _force_next_expiry
-        # logic already handles that case (enters on current_exp day, trades next contract,
-        # exits on next_exp). Shifting anchor breaks it by making entry land on next_exp.
+        # Determine DTE anchors for entry and exit dates.
+        #
+        # For NEXT_WEEKLY / NEXT_MONTHLY strategies ALL option legs trade the next
+        # series contract. The correct market interpretation is:
+        #   - Entry is relative to the CURRENT expiry (you roll into the next contract
+        #     on/before the current expiry day — "0 entry DTE" = enter on roll day).
+        #   - Exit  is relative to the NEXT expiry (you hold until N days before the
+        #     contract you're trading actually expires).
+        #
+        # This handles all DTE combinations correctly:
+        #   (0,0): entry=current_exp, exit=next_exp  [roll day → next expiry]
+        #   (0,2): entry=current_exp, exit=next_exp-2d [roll day → 2 days before next]
+        #   (2,0): entry=current_exp-2d, exit=next_exp [2 before roll → next expiry]
+        #   (2,2): entry=current_exp-2d, exit=next_exp-2d
+        #
+        # For mixed / non-next strategies both dates use the same anchor (current_exp).
         schedule_anchor = current_exp
         _opt_legs = [l for l in legs_config if str(l.get('segment', 'OPTION')).upper() not in ('FUTURES', 'FUTURE')]
         _next_types = ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
@@ -2052,22 +2060,32 @@ def run_algotest_backtest(params):
             str(l.get('expiry', 'WEEKLY') or 'WEEKLY').upper() in _next_types
             for l in _opt_legs
         )
-        _is_zero_dte = (entry_dte == 0 and exit_dte == 0)
-        dte_anchor = (next_exp if (_all_legs_next and next_exp is not None and not _is_zero_dte) else current_exp)
 
-        entry_date = calculate_trading_days_before_expiry(
-            expiry_date=dte_anchor,
-            days_before=entry_dte,
-            trading_calendar_df=trading_calendar
-        )
-        exit_date = calculate_trading_days_before_expiry(
-            expiry_date=dte_anchor,
-            days_before=exit_dte,
-            trading_calendar_df=trading_calendar
-        )
+        if _all_legs_next and next_exp is not None:
+            entry_date = calculate_trading_days_before_expiry(
+                expiry_date=current_exp,
+                days_before=entry_dte,
+                trading_calendar_df=trading_calendar
+            )
+            exit_date = calculate_trading_days_before_expiry(
+                expiry_date=next_exp,
+                days_before=exit_dte,
+                trading_calendar_df=trading_calendar
+            )
+        else:
+            entry_date = calculate_trading_days_before_expiry(
+                expiry_date=current_exp,
+                days_before=entry_dte,
+                trading_calendar_df=trading_calendar
+            )
+            exit_date = calculate_trading_days_before_expiry(
+                expiry_date=current_exp,
+                days_before=exit_dte,
+                trading_calendar_df=trading_calendar
+            )
 
         if entry_date is None or exit_date is None:
-            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} (dte_anchor={dte_anchor.date()}) ---")
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
             _log("  WARNING: Missing entry or exit date; skipping expiry")
             continue
 
@@ -2079,16 +2097,15 @@ def run_algotest_backtest(params):
             continue
 
         if entry_date > exit_date:
-            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} (dte_anchor={dte_anchor.date()}) ---")
+            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
             _log(f"  WARNING: Entry ({entry_date}) after exit ({exit_date}) - skipping")
             continue
 
         # Expiry-to-next-expiry mode: when both entry and exit land on the same
-        # expiry day (entry_dte=0, exit_dte=0), same-day options are worthless.
-        # Shift exit to next_exp and force all legs to use the next-expiry contract.
-        # For NEXT_WEEKLY this still works: dte_anchor=current_exp (DTE=0/0 exception
-        # above), so entry lands on current_exp, exit shifts to next_exp, and the
-        # _is_leg_next flag makes legs trade the next_exp contract as intended.
+        # expiry day (entry_dte=0, exit_dte=0 for standard WEEKLY/MONTHLY), same-day
+        # options are worthless. Shift exit to next_exp and force next-expiry contract.
+        # For NEXT_WEEKLY/NEXT_MONTHLY the split-anchor logic above already produces
+        # entry=current_exp and exit=next_exp, so entry != exit and this block won't fire.
         _force_next_expiry = False
         if entry_date == exit_date:
             if next_exp is not None:
