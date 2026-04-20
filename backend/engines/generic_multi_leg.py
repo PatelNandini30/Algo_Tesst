@@ -417,6 +417,15 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     from_date = params.get("from_date", "2020-01-01")
     to_date = params.get("to_date", "2025-12-31")
 
+    # Entry/Exit DTE settings
+    entry_dte = int(params.get('entry_dte', 0))
+    exit_dte = int(params.get('exit_dte', 0))
+    expiry_type = str(params.get('expiry_type', 'WEEKLY')).upper()
+    is_next_expiry = expiry_type in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+    
+    if entry_dte > 0 or exit_dte > 0:
+        print(f"[DTE] entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={expiry_type}, is_next={is_next_expiry}")
+
     # STR initialization
     super_trend_config = getattr(strategy_def, "super_trend_config", SuperTrendConfig.NONE)
     str_enabled = bool(super_trend_config and super_trend_config != SuperTrendConfig.NONE)
@@ -514,6 +523,43 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
             continue
 
         interval_df = pd.DataFrame(intervals, columns=["From", "To"])
+
+        # Apply entry_dte/exit_dte adjustments
+        if (entry_dte > 0 or exit_dte > 0) and not is_next_expiry:
+            # For WEEKLY/MONTHLY (not NEXT_*), offset dates from current expiry
+            all_dates = sorted(filtered_data["Date"].unique())
+            date_arr = np.array(all_dates, dtype='datetime64[ns]')
+            
+            # Calculate adjusted From and To based on DTE
+            adjusted_intervals = []
+            for _, row in interval_df.iterrows():
+                entry_date = pd.Timestamp(row["From"])
+                # Find position of curr_expiry in the date array
+                curr_idx = np.searchsorted(date_arr, np.datetime64(curr_expiry, 'ns'), side='left')
+                
+                # For exit: exit_dte days before curr_expiry
+                if exit_dte > 0 and curr_idx > exit_dte:
+                    new_exit_idx = curr_idx - exit_dte
+                    exit_date = pd.Timestamp(date_arr[new_exit_idx])
+                else:
+                    exit_date = pd.Timestamp(row["To"])
+                
+                # For entry: entry_dte days before curr_expiry (same anchor for non-next)
+                if entry_dte > 0 and curr_idx > entry_dte:
+                    new_entry_idx = curr_idx - entry_dte
+                    entry_date = pd.Timestamp(date_arr[new_entry_idx])
+                else:
+                    entry_date = pd.Timestamp(row["From"])
+                
+                # Skip if entry >= exit (same or crossed)
+                if entry_date >= exit_date:
+                    continue
+                    
+                adjusted_intervals.append({"From": entry_date, "To": exit_date})
+            
+            interval_df = pd.DataFrame(adjusted_intervals, columns=["From", "To"])
+            if interval_df.empty:
+                continue
 
         for i in range(len(interval_df)):
             base_trade_number = i + 1

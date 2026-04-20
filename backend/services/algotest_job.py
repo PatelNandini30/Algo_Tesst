@@ -154,6 +154,7 @@ def _run_backtest_chunk(args: tuple) -> list:
 
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_request(request)
+    print(f"[SERVICE] entry_dte in payload = {payload.get('entry_dte')}, exit_dte = {payload.get('exit_dte')}")
     index = payload['index']
     from_date = payload.get('from_date')
     to_date = payload.get('to_date')

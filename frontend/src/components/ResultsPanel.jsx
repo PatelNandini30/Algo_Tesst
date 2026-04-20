@@ -471,16 +471,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
       'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
-    ws1.columns = keyOrder.map(k => ({ header: k, key: k, width: colWidths[k]||10 }));
+    ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 
     // Header row style
-    ws1.getRow(1).eachCell(cell => {
+    // Add header row explicitly (no auto-header from column definition)
+    const headerDataRow = ws1.addRow(keyOrder);
+    headerDataRow.eachCell(cell => {
       cell.font  = boldFont(10, C.navyText);
       cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
       cell.alignment = centerAlign;
       cell.border = thinBorder();
     });
-    ws1.getRow(1).height = 22;
+    headerDataRow.height = 22;
 
     // Data rows
     cleanedTrades.forEach((row, i) => {
@@ -494,7 +496,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         cell.alignment = { vertical:'middle' };
         // Ensure numeric cells are not formatted as text so Excel formulas work
         if (typeof cell.value === 'number') {
-          cell.numFmt = '#,##0.##';
+          cell.numFmt = Number.isInteger(cell.value) ? '0' : '#,##0.00';
         }
       });
       // Color Net P&L and % P&L
@@ -652,27 +654,56 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     hdrRow.height = 20;
     row++;
 
-    // Data rows from pivot or fallback
-    let mthData = [];
+    // Data rows: compute monthly Net P&L from trade-level totals grouped by Exit Date month.
+    // If backend pivot rows exist, preserve the last 3 columns (Max DD / DD Days / R/MDD) per year.
+    const pivotExtrasByYear = {};
     if (pivot && pivot.rows && pivot.rows.length > 0) {
-      mthData = pivot.rows;
-    } else {
-      const byYM = {};
-      Object.values(groupedByTrade).forEach(legs => {
-        const ed  = legs[0]['Entry Date']||'';
-        const net = legs.reduce((s,l)=>s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0),0);
-        const p   = ed.split('/');
-        if (p.length>=3) {
-          const yr = p[2]; const mo = parseInt(p[1],10)-1;
-          if (!byYM[yr]) byYM[yr]=Array(12).fill(0);
-          byYM[yr][mo]=(byYM[yr][mo]||0)+net;
-        }
-      });
-      mthData = Object.entries(byYM).sort().map(([yr,mos]) => {
-        const total=mos.reduce((s,v)=>s+v,0);
-        return [yr,...mos.map(v=>+v.toFixed(2)),+total.toFixed(2),'','',''];
+      pivot.rows.forEach(r => {
+        const yr = String(r?.[0] ?? '');
+        if (!yr) return;
+        pivotExtrasByYear[yr] = [r?.[14] ?? '', r?.[15] ?? '', r?.[16] ?? ''];
       });
     }
+
+    const parseToYearMonth = (d) => {
+      if (!d && d !== 0) return null;
+      const s = String(d).trim();
+      if (!s) return null;
+      // supports DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD
+      const parts = s.includes('/') ? s.split('/') : s.split('-');
+      if (parts.length !== 3) return null;
+      let dd, mm, yy;
+      if (parts[0].length === 4) { // YYYY-MM-DD
+        yy = parts[0]; mm = parts[1]; dd = parts[2];
+      } else { // DD-MM-YYYY or DD/MM/YYYY
+        dd = parts[0]; mm = parts[1]; yy = parts[2];
+      }
+      const year = String(yy);
+      const monthIdx = parseInt(mm, 10) - 1;
+      if (!year || !Number.isFinite(monthIdx) || monthIdx < 0 || monthIdx > 11) return null;
+      return { year, monthIdx };
+    };
+
+    const byYM = {};
+    Object.entries(groupedByTrade).forEach(([tradeId, legs]) => {
+      const exitDate = legs?.[0]?.['Exit Date'] || '';
+      const ym = parseToYearMonth(exitDate);
+      if (!ym) return;
+      const net = legs.reduce((s, l) => (
+        s +
+        (parseFloat(l['CE P&L']) || 0) +
+        (parseFloat(l['PE P&L']) || 0) +
+        (parseFloat(l['FUT P&L']) || 0)
+      ), 0);
+      if (!byYM[ym.year]) byYM[ym.year] = Array(12).fill(0);
+      byYM[ym.year][ym.monthIdx] = (byYM[ym.year][ym.monthIdx] || 0) + net;
+    });
+
+    const mthData = Object.entries(byYM).sort().map(([yr, mos]) => {
+      const total = mos.reduce((s, v) => s + v, 0);
+      const extras = pivotExtrasByYear[yr] || ['', '', ''];
+      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), ...extras];
+    });
 
     mthData.forEach((dataRow, ri) => {
       const r2 = ws2.getRow(row);
@@ -956,14 +987,65 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
 
             {/* Monthly Returns */}
-            {pivot.rows && pivot.rows.length > 0 && (
+            {(() => {
+              const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+              const headers = pivot.headers && pivot.headers.length > 0
+                ? pivot.headers
+                : ['Year', ...MONTHS, 'Total', 'Max DD', 'DD Days', 'R/MDD'];
+
+              const extrasByYear = {};
+              (pivot.rows || []).forEach(r => {
+                const yr = String(r?.[0] ?? '');
+                if (!yr) return;
+                extrasByYear[yr] = [r?.[14] ?? '', r?.[15] ?? '', r?.[16] ?? ''];
+              });
+
+              const parseToYearMonth = (d) => {
+                if (!d && d !== 0) return null;
+                const s = String(d).trim();
+                if (!s) return null;
+                const parts = s.includes('/') ? s.split('/') : s.split('-');
+                if (parts.length !== 3) return null;
+                let dd, mm, yy;
+                if (parts[0].length === 4) { yy = parts[0]; mm = parts[1]; dd = parts[2]; }
+                else { dd = parts[0]; mm = parts[1]; yy = parts[2]; }
+                const year = String(yy);
+                const monthIdx = parseInt(mm, 10) - 1;
+                if (!year || !Number.isFinite(monthIdx) || monthIdx < 0 || monthIdx > 11) return null;
+                return { year, monthIdx };
+              };
+
+              const byYM = {};
+              groupedTrades.forEach(group => {
+                const exitDate = group.exitDate || '';
+                const ym = parseToYearMonth(exitDate);
+                if (!ym) return;
+                const net = (group.legs || []).reduce((sum, leg) => (
+                  sum +
+                  (parseFloat(leg['CE P&L'])  || 0) +
+                  (parseFloat(leg['PE P&L'])  || 0) +
+                  (parseFloat(leg['FUT P&L']) || 0)
+                ), 0);
+                if (!byYM[ym.year]) byYM[ym.year] = Array(12).fill(0);
+                byYM[ym.year][ym.monthIdx] = (byYM[ym.year][ym.monthIdx] || 0) + net;
+              });
+
+              const rows = Object.entries(byYM).sort().map(([yr, mos]) => {
+                const total = mos.reduce((s, v) => s + v, 0);
+                const extras = extrasByYear[yr] || ['', '', ''];
+                return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), ...extras];
+              });
+
+              if (!rows || rows.length === 0) return null;
+
+              return (
               <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
                 <h3 className="text-base font-bold text-primary mb-4">Monthly Returns</h3>
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
                     <thead>
                       <tr className="border-b-2 border-strong">
-                        {pivot.headers?.map((header, idx) => (
+                        {headers.map((header, idx) => (
                           <th key={idx} className="px-4 py-3 text-center text-xs font-bold text-secondary uppercase tracking-wider">
                             {header}
                           </th>
@@ -971,7 +1053,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       </tr>
                     </thead>
                     <tbody>
-                      {pivot.rows?.map((row, rowIdx) => (
+                      {rows.map((row, rowIdx) => (
                         <tr key={rowIdx} className="border-b border-default hover:bg-hover transition-colors">
                           {row.map((cell, cellIdx) => {
                             const isNumeric = typeof cell === 'number';
@@ -999,7 +1081,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   </table>
                 </div>
               </div>
-            )}
+              );
+            })()}
 
             {/* Detailed Statistics Summary */}
             <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
@@ -1172,8 +1255,21 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                     <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
                                   </>
                                 ) : null}
-                                {/* Show per-leg exit date; triggered legs (SL/Target/Trail) have their own early exit date */}
-                                <td className="px-3 py-2 text-xs text-primary">{leg['Leg Exit Date'] || leg['Exit Date'] || group.exitDate || '-'}</td>
+                                {/* Per-leg exit date.
+                                    Priority: Leg Exit Date (set by backend on early/partial exits)
+                                              → this leg's own Exit Date
+                                              → group.exitDate ONLY for the primary leg (legIdx === 0)
+                                    Non-primary legs must NEVER fall back to group.exitDate — it is the
+                                    trade-level date from Leg 1 and is wrong for any other leg. */}
+                                <td className="px-3 py-2 text-xs text-primary">
+                                  {(() => {
+                                    const legExit = leg['Leg Exit Date'];
+                                    if (legExit && String(legExit).trim() !== '') return legExit;
+                                    const ownExit = leg['Exit Date'];
+                                    if (ownExit && String(ownExit).trim() !== '') return ownExit;
+                                    return legIdx === 0 ? (group.exitDate || '-') : '-';
+                                  })()}
+                                </td>
                                 {isFirstLeg ? (
                                   <>
                                     <td className="px-3 py-2 text-xs text-right text-primary" rowSpan={group.legs.length}>{(group.entrySpot || 0).toFixed(2)}</td>
@@ -1225,7 +1321,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const totalChargesInr = chargesEnabled
                               ? group.legs.reduce((sum, leg) => sum + (parseFloat(leg['Charges']) || 0), 0)
                               : 0;
-                            const emptyCellSpan = 13 + (bufferStrikeEnabled ? 2 : 0);
+                            // 11 always-present columns before Net P&L and % P&L:
+                            // Index, Entry Date, Exit Date, Entry Spot, Exit Spot, Type, Strike, B/S, Qty, Entry Price, Exit Price
+                            // + 1 if bufferStrikeEnabled (Buffer Ref column)
+                            // Charges column is handled as its own <td> below, so excluded here.
+                            const emptyCellSpan = 11 + (bufferStrikeEnabled ? 1 : 0);
                             return (
                               <tr className="border-b-2 border-strong bg-slate-100">
                                 <td colSpan={emptyCellSpan}></td>

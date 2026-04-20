@@ -701,10 +701,10 @@ const [slippagePct, setSlippagePct] = useState(0);
   // Upload management removed - handled by CsvUpload component
 
   const validationErrorTimerRef = useRef(null);
-  const showValidationError = (msg) => {
+  const showValidationError = (msg, durationMs = 10000) => {
     if (validationErrorTimerRef.current) clearTimeout(validationErrorTimerRef.current);
     setValidationError(msg);
-    validationErrorTimerRef.current = setTimeout(() => setValidationError(null), 10000);
+    validationErrorTimerRef.current = setTimeout(() => setValidationError(null), durationMs);
   };
 
   // Validate expiry mismatch
@@ -1008,9 +1008,37 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
     setValidationError(null);
     
-    if (entryDaysBefore === 0 && exitDaysBefore === 0) {
-      setError('Entry & exit on expiry day — trade will use next expiry contract and exit on next expiry.');
-      setTimeout(() => setError(null), 5000);
+    // Validate entry/exit DTE for weekly/monthly legs.
+    // For weekly/monthly: entry_dte must be strictly > exit_dte.
+    //   - entry_dte == exit_dte → same calendar date → zero holding period → backend skips all trades
+    //   - entry_dte < exit_dte  → entry would be AFTER exit in calendar → backend skips all trades
+    // For next_weekly/next_monthly: entry uses current expiry anchor, exit uses next expiry anchor
+    //   → they are always different dates regardless of DTE values → all combinations valid.
+    const hasCurrentExpiryLegs = legs
+      .filter(l => l.segment !== 'futures')
+      .some(l => l.expiry === 'weekly' || l.expiry === 'monthly');
+
+    if (hasCurrentExpiryLegs) {
+      if (entryDaysBefore === exitDaysBefore) {
+        const basisLabel = expiryBasis === 'weekly' ? 'Weekly' : 'Monthly';
+        setError(
+          `⚠️ Invalid: Entry Days (${entryDaysBefore}) and Exit Days (${exitDaysBefore}) are equal for ${basisLabel} leg(s). ` +
+          `Entry and exit would fall on the same date — no holding period. ` +
+          `Set Entry Days greater than Exit Days (e.g., Entry=2, Exit=0).`
+        );
+        setLoading(false);
+        return;
+      }
+      if (entryDaysBefore < exitDaysBefore) {
+        const basisLabel = expiryBasis === 'weekly' ? 'Weekly' : 'Monthly';
+        setError(
+          `⚠️ Invalid: Entry Days (${entryDaysBefore}) is less than Exit Days (${exitDaysBefore}) for ${basisLabel} leg(s). ` +
+          `A smaller entry DTE means entering AFTER the exit date. ` +
+          `Set Entry Days greater than Exit Days (e.g., Entry=2, Exit=0).`
+        );
+        setLoading(false);
+        return;
+      }
     }
 
     if (!validateExpiry()) return;
@@ -1036,14 +1064,18 @@ const [slippagePct, setSlippagePct] = useState(0);
     const tslWithoutSLLegs = legs.reduce((acc, leg, idx) => {
       if (!leg.trail_sl_enabled) return acc;
       const hasStopLoss = leg.stop_loss_enabled && Number(leg.stop_loss_value) > 0;
-      if (!hasStopLoss) {
-        acc.push(`Leg-${idx + 1}`);
-      }
+      if (!hasStopLoss) acc.push(`Leg ${idx + 1}`);
       return acc;
     }, []);
-    const tslMissingSLMessage = tslWithoutSLLegs.length > 0
-      ? `Fix ${tslWithoutSLLegs.join(', ')}: Leg Stop Loss value should be set for Leg Trail SL`
-      : null;
+
+    if (tslWithoutSLLegs.length > 0) {
+      setError(null);
+      showValidationError(
+        `Trail SL needs Stop Loss. Turn on Stop Loss and set a value on ${tslWithoutSLLegs.join(', ')} to run backtest.`,
+        5000
+      );
+      return; // Hard block — do not proceed to buildPayload() or API call
+    }
 
     const payload = buildPayload();
     const sanitized = sanitizePayload(payload);
@@ -1053,10 +1085,6 @@ const [slippagePct, setSlippagePct] = useState(0);
     setRawResults(null);
     setDisplayResults(null);
     setResults(null);
-    if (tslMissingSLMessage) {
-      setError(tslMissingSLMessage);
-      setTimeout(() => setError(null), 3000);
-    }
     console.log('[runBacktest] payload keys:', Object.keys(sanitized));
     console.log('[runBacktest] str_filter:', sanitized?.str_filter);
     console.log('[runBacktest] filter_segments:', sanitized?.filter_segments);
@@ -1102,7 +1130,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       setJobStatusLabel('');
       setError(err.message || 'Backtest queue failed');
     }
-  }, [legs, loading, expiryBasis, buildPayload, pollJobStatus, stopJobPolling]);
+  }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
 
   return (
     <div className="min-h-screen bg-hover" style={{ fontFamily: 'Inter, sans-serif' }}>
@@ -1224,6 +1252,32 @@ const [slippagePct, setSlippagePct] = useState(0);
                     </div>
                   </div>
                 )}
+
+                {/* DTE validation warning for weekly/monthly legs */}
+                {(entryDaysBefore === exitDaysBefore || entryDaysBefore < exitDaysBefore) && (() => {
+                  const hasCurrentLegs = legs
+                    .filter(l => l.segment !== 'futures')
+                    .some(l => l.expiry === 'weekly' || l.expiry === 'monthly');
+                  if (!hasCurrentLegs) return null;
+
+                  const isEqual = entryDaysBefore === exitDaysBefore;
+                  const isInverted = entryDaysBefore < exitDaysBefore;
+                  if (!isEqual && !isInverted) return null;
+
+                  const basisLabel = expiryBasis === 'weekly' ? 'Weekly' : 'Monthly';
+                  const message = isEqual
+                    ? `Entry (${entryDaysBefore}) = Exit (${exitDaysBefore}): same date, no holding period — backtest will be blocked.`
+                    : `Entry (${entryDaysBefore}) < Exit (${exitDaysBefore}): entry falls after exit — backtest will be blocked.`;
+
+                  return (
+                    <div className="flex items-center gap-1.5 mt-1 px-2 py-1.5 rounded bg-amber-50 border border-amber-200 text-amber-700 text-xs">
+                      <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+                      <span>
+                        {basisLabel} leg detected — {message} Set Entry Days &gt; Exit Days (e.g., Entry=2, Exit=0).
+                      </span>
+                    </div>
+                  );
+                })()}
 
                 {/* SuperTrend Filter */}
                 <SuperTrendFilter
@@ -2071,9 +2125,28 @@ const [slippagePct, setSlippagePct] = useState(0);
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.trail_sl_enabled} onToggle={(val) => updateLeg(leg.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !leg.trail_sl_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
-                              <Tooltip text="For every X profit, trail SL by Y." />
+                              {(() => {
+                                const slReady = leg.stop_loss_enabled && Number(leg.stop_loss_value) > 0;
+                                return (
+                                  <>
+                                    <div
+                                      style={!slReady ? { opacity: 0.45, pointerEvents: 'none', cursor: 'not-allowed' } : {}}
+                                      title={!slReady ? 'Enable Leg Stop Loss first' : ''}
+                                    >
+                                      <Toggle
+                                        enabled={leg.trail_sl_enabled}
+                                        onToggle={(val) => {
+                                          if (!slReady) return;
+                                          updateLeg(leg.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !leg.trail_sl_enabled);
+                                        }}
+                                        size="sm"
+                                      />
+                                    </div>
+                                    <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
+                                    <Tooltip text={slReady ? 'For every X profit, trail SL by Y.' : 'Enable Leg Stop Loss with a value > 0 to use Trail SL.'} />
+                                  </>
+                                );
+                              })()}
                               {leg.trail_sl_enabled && (<>
                                 <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="POINTS">Points</option>

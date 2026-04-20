@@ -1852,6 +1852,7 @@ def run_algotest_backtest(params):
 
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
     exit_dte = _coerce_int(params.get('exit_dte', 0), 0, 'Exit')
+    print(f"[DEBUG] Received entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={params.get('expiry_type', 'WEEKLY')}, keys={list(params.keys())}")
     legs_config = params.get('legs', [])
     # Read super_trend_config ONLY from its dedicated key.
     # Never fall back to filter_config — they are separate concepts.
@@ -2100,6 +2101,8 @@ def run_algotest_backtest(params):
                 trading_calendar_df=trading_calendar
             )
 
+        _log(f"[SCHED] Expiry={schedule_anchor.date()}, entry_dte={entry_dte}, exit_dte={exit_dte} → entry={entry_date}, exit={exit_date}")
+
         if entry_date is None or exit_date is None:
             _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
             _log("  WARNING: Missing entry or exit date; skipping expiry")
@@ -2117,20 +2120,21 @@ def run_algotest_backtest(params):
             _log(f"  WARNING: Entry ({entry_date}) after exit ({exit_date}) - skipping")
             continue
 
-        # Expiry-to-next-expiry mode: when both entry and exit land on the same
-        # expiry day (entry_dte=0, exit_dte=0 for standard WEEKLY/MONTHLY), same-day
-        # options are worthless. Shift exit to next_exp and force next-expiry contract.
-        # For NEXT_WEEKLY/NEXT_MONTHLY the split-anchor logic above already produces
-        # entry=current_exp and exit=next_exp, so entry != exit and this block won't fire.
+        # For WEEKLY/MONTHLY: when entry_dte == exit_dte (> 0), entry and exit are on the same
+        # or adjacent days. Since we use previous-day close data, this results in near-zero P&L.
+        # Skip these trades entirely. For NEXT_WEEKLY/NEXT_MONTHLY, continue with normal logic
+        # (entry on current expiry, exit on next expiry).
         _force_next_expiry = False
+        _is_next_expiry_type = expiry_type.upper() in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+        
         if entry_date == exit_date:
-            if next_exp is not None:
+            if _is_next_expiry_type and next_exp is not None:
                 exit_date = next_exp
                 _force_next_expiry = True
-                _log(f"  INFO: Entry == Exit on expiry day → exit shifted to next expiry {next_exp.date()}, forcing next-expiry contract")
+                _log(f"  INFO: Entry == Exit on expiry day (NEXT expiry type) → exit shifted to next expiry {next_exp.date()}, forcing next-expiry contract")
             else:
                 _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
-                _log(f"  INFO: Entry == Exit ({entry_date}) and no next expiry — skipping")
+                _log(f"  INFO: Entry == Exit ({entry_date.date()}) for {expiry_type} → skipping (entry_dte == exit_dte results in ~0 P&L with previous-day close data)")
                 continue
 
         schedule.append({
