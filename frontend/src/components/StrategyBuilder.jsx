@@ -2087,28 +2087,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              {(() => {
-                                const slReady = leg.stop_loss_enabled && Number(leg.stop_loss_value) > 0;
-                                return (
-                                  <>
-                                    <div
-                                      style={!slReady ? { opacity: 0.45, pointerEvents: 'none', cursor: 'not-allowed' } : {}}
-                                      title={!slReady ? 'Enable Leg Stop Loss first' : ''}
-                                    >
-                                      <Toggle
-                                        enabled={leg.trail_sl_enabled}
-                                        onToggle={(val) => {
-                                          if (!slReady) return;
-                                          updateLeg(leg.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !leg.trail_sl_enabled);
-                                        }}
-                                        size="sm"
-                                      />
-                                    </div>
-                                    <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
-                                    <Tooltip text={slReady ? 'For every X profit, trail SL by Y.' : 'Enable Leg Stop Loss with a value > 0 to use Trail SL.'} />
-                                  </>
-                                );
-                              })()}
+                              <Toggle enabled={leg.trail_sl_enabled} onToggle={(val) => updateLeg(leg.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !leg.trail_sl_enabled)} size="sm" />
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
+                              <Tooltip text="For every X profit, trail SL by Y." />
                               {leg.trail_sl_enabled && (<>
                                 <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="POINTS">Points</option>
