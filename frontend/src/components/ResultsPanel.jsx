@@ -111,36 +111,65 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     tradesWithFormattedDates.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
       const entryDate = trade['Entry Date'] || '';
-      if (!canonicalEntryByTrade.has(tradeNum)) {
+      const isReEntryRow = Boolean(trade['ReEntryIndex'] || trade['ReEntryTrigger'] || trade['ReEntryMode']);
+      if (!isReEntryRow && !canonicalEntryByTrade.has(tradeNum)) {
         canonicalEntryByTrade.set(tradeNum, entryDate);
       }
     });
 
-    // Pass 2: build groups (only main trades, skip rolled/continuation trades)
-    const groupMap = new Map(); // groupKey → { legs: Map(legNum → row), firstRow, tradeNum }
+    const parseRowNetPnl = (row) => {
+      const rawNet = row?.['Net P&L'];
+      const net = typeof rawNet === 'number' ? rawNet : parseFloat(rawNet);
+      if (Number.isFinite(net)) return net;
+      return ['CE P&L', 'PE P&L', 'FUT P&L'].reduce((subtotal, key) => {
+        const raw = row?.[key];
+        const num = typeof raw === 'number' ? raw : parseFloat(raw);
+        return subtotal + (Number.isFinite(num) ? num : 0);
+      }, 0);
+    };
+
+    // Pass 2: build groups; keep main legs and re-entry sub-rows separately.
+    const groupMap = new Map(); // groupKey → { mainLegs: Map, reEntryRows: Map, firstRow, tradeNum }
     tradesWithFormattedDates.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
       const legNum   = String(trade.Leg  || trade.leg  || 1);
       const entryDate = trade['Entry Date'] || '';
       const canonical = canonicalEntryByTrade.get(tradeNum) || entryDate;
+      const isReEntryRow = Boolean(
+        trade['ReEntryIndex'] ||
+        trade['ReEntryTrigger'] ||
+        trade['ReEntryMode'] ||
+        String(trade['Index'] || '').includes('.')
+      );
+
+      const groupKey = tradeNum;
+
+      if (!groupMap.has(groupKey)) {
+        groupMap.set(groupKey, { mainLegs: new Map(), reEntryRows: new Map(), firstRow: trade, tradeNum });
+      }
+      const group = groupMap.get(groupKey);
+
+      if (isReEntryRow) {
+        const baseLegNum = String(parseInt(String(legNum).split('.')[0], 10) || legNum || 1);
+        if (!group.reEntryRows.has(baseLegNum)) {
+          group.reEntryRows.set(baseLegNum, []);
+        }
+        group.reEntryRows.get(baseLegNum).push(trade);
+        return;
+      }
 
       // Skip rolled/continuation trades - only include main trades with canonical entry date
       if (entryDate !== canonical) {
         return;
       }
 
-      const groupKey = tradeNum;
-
-      if (!groupMap.has(groupKey)) {
-        groupMap.set(groupKey, { legs: new Map(), firstRow: trade, tradeNum });
-      }
       // Last row for a given Leg number wins (deduplication)
-      groupMap.get(groupKey).legs.set(legNum, trade);
+      group.mainLegs.set(legNum, trade);
     });
 
     const result = [];
-    for (const [groupKey, { legs, firstRow, tradeNum }] of groupMap.entries()) {
-      const legsArr = Array.from(legs.values());
+    for (const [groupKey, { mainLegs, reEntryRows, firstRow, tradeNum }] of groupMap.entries()) {
+      const legsArr = Array.from(mainLegs.values());
 
       // Leg 1 is the only row the backend populates Cumulative/Peak/DD/%DD on.
       // firstRow is the first-encountered row which may be Leg 2+ if the trades
@@ -155,32 +184,49 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         sortedLegsAsc.find(r =>
           r['Cumulative'] !== '' && r['Cumulative'] != null && !isNaN(parseFloat(r['Cumulative']))
         ) ||
-        legs.get('1') ||
-        legs.get(1) ||
+        mainLegs.get('1') ||
+        mainLegs.get(1) ||
         sortedLegsAsc[0] ||
         firstRow;
+
+      const displayRows = [];
+      sortedLegsAsc.forEach(mainLeg => {
+        const mainLegNum = String(mainLeg.Leg || mainLeg.leg || 1);
+        displayRows.push(mainLeg);
+        const reRows = (reEntryRows.get(mainLegNum) || []).slice().sort((a, b) => {
+          const aIdx = parseInt(String(a.ReEntryIndex || a['ReEntryIndex'] || a.Index || 0).split('.').pop(), 10) || 0;
+          const bIdx = parseInt(String(b.ReEntryIndex || b['ReEntryIndex'] || b.Index || 0).split('.').pop(), 10) || 0;
+          return aIdx - bIdx;
+        });
+        reRows.forEach(r => displayRows.push(r));
+      });
+
+      // Include any orphan re-entry rows that do not match an existing main leg.
+      Array.from(reEntryRows.entries())
+        .filter(([legNum]) => !sortedLegsAsc.some(mainLeg => String(mainLeg.Leg || mainLeg.leg || 1) === legNum))
+        .forEach(([, rows]) => {
+          rows.slice().sort((a, b) => {
+            const aIdx = parseInt(String(a.ReEntryIndex || a['ReEntryIndex'] || a.Index || 0).split('.').pop(), 10) || 0;
+            const bIdx = parseInt(String(b.ReEntryIndex || b['ReEntryIndex'] || b.Index || 0).split('.').pop(), 10) || 0;
+            return aIdx - bIdx;
+          }).forEach(r => displayRows.push(r));
+        });
+
+      const totalPnl = displayRows.reduce((sum, row) => sum + parseRowNetPnl(row), 0);
 
       const rawCumulative = leg1Row['Cumulative'];
       const rawPeak       = leg1Row['Peak'];
       const rawDd         = leg1Row['DD'];
       const rawPctDd      = leg1Row['%DD'];
 
-      const sumLegPnl = (leg) => ['CE P&L', 'PE P&L', 'FUT P&L'].reduce((subtotal, key) => {
-        const raw = leg[key];
-        const num = typeof raw === 'number' ? raw : parseFloat(raw);
-        return subtotal + (isNaN(num) ? 0 : num);
-      }, 0);
-
-      const aggregateLegPnl = legsArr.reduce((acc, leg) => acc + sumLegPnl(leg), 0);
-      const leg1NetPnl = parseFloat(leg1Row['Net P&L']);
-      const totalPnl = Number.isFinite(leg1NetPnl) ? leg1NetPnl : aggregateLegPnl;
-
       result.push({
         tradeNumber: parseInt(tradeNum, 10) || 0,
         groupKey,
         legs: legsArr,
+        displayRows,
+        hasReEntries: displayRows.some(row => Boolean(row['ReEntryIndex'] || row['ReEntryTrigger'] || row['ReEntryMode'])),
         entryDate:  leg1Row['Entry Date'],
-        exitDate:   leg1Row['Exit Date'],
+        exitDate:    leg1Row['Exit Date'],
         entrySpot:  parseFloat(leg1Row['Entry Spot']) || 0,
         exitSpot:   parseFloat(leg1Row['Exit Spot'])  || 0,
         totalPnl,
@@ -1216,12 +1262,83 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   </thead>
                   <tbody>
                     {groupedTrades.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage).map((group, groupIdx) => {
-                      
-                      // Calculate totals for summary row
+                      const rowsToRender = group.displayRows || group.legs;
+                      const hasReEntries = Boolean(group.hasReEntries);
+
                       return (
                         <React.Fragment key={group.groupKey}>
-                          {/* Leg rows */}
-                          {group.legs.map((leg, legIdx) => {
+                          {hasReEntries ? rowsToRender.map((leg, rowIdx) => {
+                            const isReEntryRow = Boolean(leg['ReEntryIndex'] || leg['ReEntryTrigger'] || leg['ReEntryMode']);
+                            const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
+                            const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
+                            const bufferRef = parseFloat(leg.buffer_ref_price);
+                            const position = leg['B/S'] || leg['Leg_1_Position'] || 'Sell';
+                            const qty = parseInt(leg['Qty']) || parseInt(leg.qty) || parseInt(leg.quantity) || 65;
+                            const rawEntryPrice = parseFloat(leg['Raw Entry Price']);
+                            const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
+                            const rawExitPrice = parseFloat(leg['Raw Exit Price']);
+                            const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
+                            const isFutLeg = (leg['Type'] || '').toUpperCase() === 'FUT';
+                            const legNetPnlPoints = isFutLeg
+                              ? (parseFloat(leg['FUT P&L']) || 0)
+                              : (parseFloat(leg['CE P&L']) || parseFloat(leg['PE P&L']) || 0);
+                            const entrySpotForPct = parseFloat(leg['Entry Spot']) || 0;
+                            const legPercentPnl = entrySpotForPct > 1000
+                              ? (legNetPnlPoints / entrySpotForPct) * 100
+                              : 0;
+                            const rowBg = isReEntryRow
+                              ? 'bg-blue-50/40 dark:bg-blue-950/20'
+                              : (rowIdx % 2 === 0 ? 'bg-white dark:bg-gray-900' : 'bg-gray-50 dark:bg-gray-800/50');
+                            const exitDateValue = (() => {
+                              const legExit = leg['Leg Exit Date'];
+                              if (legExit && String(legExit).trim() !== '') return legExit;
+                              const ownExit = leg['Exit Date'];
+                              if (ownExit && String(ownExit).trim() !== '') return ownExit;
+                              return group.exitDate || '-';
+                            })();
+
+                            return (
+                              <tr key={`${group.tradeNumber}-${rowIdx}`} className={`border-b border-default ${rowBg} hover:bg-base transition-colors`}>
+                                <td className="px-3 py-2 text-xs text-primary">{leg['Index'] || group.tradeNumber}</td>
+                                <td className="px-3 py-2 text-xs text-primary">{leg['Entry Date'] || group.entryDate || '-'}</td>
+                                <td className="px-3 py-2 text-xs text-primary">{exitDateValue}</td>
+                                <td className="px-3 py-2 text-xs text-right text-primary">{Number.isFinite(parseFloat(leg['Entry Spot'])) ? parseFloat(leg['Entry Spot']).toFixed(2) : (group.entrySpot || 0).toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-right text-primary">{Number.isFinite(parseFloat(leg['Exit Spot'])) ? parseFloat(leg['Exit Spot']).toFixed(2) : (group.exitSpot || 0).toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-secondary">{optionType}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{parseFloat(strike).toFixed(0)}</td>
+                                {bufferStrikeEnabled && (
+                                  <td className="px-3 py-2 text-xs text-right text-muted">
+                                    {Number.isFinite(bufferRef) ? bufferRef.toFixed(2) : '—'}
+                                  </td>
+                                )}
+                                <td className="px-3 py-2 text-xs text-secondary">
+                                  {position}
+                                  {isReEntryRow && (
+                                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">
+                                      RE-{leg['ReEntryTrigger']}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{qty}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{entryPrice.toFixed(2)}</td>
+                                <td className="px-3 py-2 text-xs text-right text-secondary">{exitPrice.toFixed(2)}</td>
+                                {chargesEnabled && (
+                                  <td className="px-3 py-2 text-xs text-right text-orange-600">
+                                    {(() => {
+                                      const c = parseFloat(leg['Charges']);
+                                      return Number.isFinite(c) ? `₹${c.toFixed(2)}` : '—';
+                                    })()}
+                                  </td>
+                                )}
+                                <td className={`px-3 py-2 text-xs text-right ${legNetPnlPoints >= 0 ? 'text-profit' : 'text-loss'}`}>
+                                  {legNetPnlPoints >= 0 ? '+' : ''}{legNetPnlPoints.toFixed(2)}
+                                </td>
+                                <td className={`px-3 py-2 text-xs text-right ${legPercentPnl >= 0 ? 'text-profit' : 'text-loss'}`}>
+                                  {legPercentPnl >= 0 ? '+' : ''}{legPercentPnl.toFixed(2)}%
+                                </td>
+                              </tr>
+                            );
+                          }) : group.legs.map((leg, legIdx) => {
                             const isFirstLeg = legIdx === 0;
                             
                             const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
@@ -1235,9 +1352,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const entryPrice = parseFloat(leg['Entry Price']) || parseFloat(leg['Leg_1_EntryPrice']) || parseFloat(leg['Leg 1 Entry']) || 0;
                             const rawExitPrice = parseFloat(leg['Raw Exit Price']);
                             const exitPrice = parseFloat(leg['Exit Price']) || parseFloat(leg['Leg_1_ExitPrice']) || parseFloat(leg['Leg 1 Exit']) || 0;
-                            // Per-leg P&L: CE P&L for options, FUT P&L for futures.
-                            // Net P&L and % P&L columns hold the trade-level total
-                            // (stamped on every row) — must NOT be used per leg.
                             const isFutLeg = (leg['Type'] || '').toUpperCase() === 'FUT';
                             const legNetPnlPoints = isFutLeg
                               ? (parseFloat(leg['FUT P&L']) || 0)
@@ -1255,12 +1369,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                     <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
                                   </>
                                 ) : null}
-                                {/* Per-leg exit date.
-                                    Priority: Leg Exit Date (set by backend on early/partial exits)
-                                              → this leg's own Exit Date
-                                              → group.exitDate ONLY for the primary leg (legIdx === 0)
-                                    Non-primary legs must NEVER fall back to group.exitDate — it is the
-                                    trade-level date from Leg 1 and is wrong for any other leg. */}
                                 <td className="px-3 py-2 text-xs text-primary">
                                   {(() => {
                                     const legExit = leg['Leg Exit Date'];
@@ -1306,20 +1414,16 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                           })}
                           
                           {/* Summary Row - Only show for multi-leg trades */}
-                          {group.legs.length > 1 && (() => {
-                            // Sum per-leg individual P&L columns.
-                            // DO NOT sum Net P&L — it is the trade total repeated on every row.
-                            const tradeNetPnlPoints = group.legs.reduce((sum, leg) => {
-                              return sum +
-                                (parseFloat(leg['CE P&L'])  || 0) +
-                                (parseFloat(leg['PE P&L'])  || 0) +
-                                (parseFloat(leg['FUT P&L']) || 0);
+                          {rowsToRender.length > 1 && (() => {
+                            const tradeNetPnlPoints = rowsToRender.reduce((sum, leg) => {
+                              const raw = parseFloat(leg['Net P&L']);
+                              return sum + (Number.isFinite(raw) ? raw : 0);
                             }, 0);
                             const tradePctPnl = group.entrySpot > 1000
                               ? (tradeNetPnlPoints / group.entrySpot) * 100
                               : 0;
                             const totalChargesInr = chargesEnabled
-                              ? group.legs.reduce((sum, leg) => sum + (parseFloat(leg['Charges']) || 0), 0)
+                              ? rowsToRender.reduce((sum, leg) => sum + (parseFloat(leg['Charges']) || 0), 0)
                               : 0;
                             // 11 always-present columns before Net P&L and % P&L:
                             // Index, Entry Date, Exit Date, Entry Spot, Exit Spot, Type, Strike, B/S, Qty, Entry Price, Exit Price

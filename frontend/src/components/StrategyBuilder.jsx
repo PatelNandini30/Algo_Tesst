@@ -17,6 +17,8 @@ const toApiDate = (displayStr) => {
   }
 };
 
+const BUILDER_STORAGE_KEY = 'algotest.strategyBuilder.v1';
+
 const getApiStartDate = (startDate) => toApiDate(startDate);
 const getApiEndDate = (endDate) => toApiDate(endDate);
 
@@ -426,6 +428,159 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [jobId, setJobId] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
+  const hasHydratedBuilderStateRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(BUILDER_STORAGE_KEY);
+      if (!raw) {
+        hasHydratedBuilderStateRef.current = true;
+        return;
+      }
+
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.instrument) setInstrument(parsed.instrument);
+        if (parsed.underlying) setUnderlying(parsed.underlying);
+        if (parsed.strategyType) setStrategyType(parsed.strategyType);
+        if (parsed.expiryBasis) setExpiryBasis(parsed.expiryBasis);
+        if (parsed.entryDaysBefore != null) setEntryDaysBefore(parsed.entryDaysBefore);
+        if (parsed.exitDaysBefore != null) setExitDaysBefore(parsed.exitDaysBefore);
+        if (parsed.delayTime) setDelayTime(parsed.delayTime);
+        if (parsed.squareOffMode) setSquareOffMode(parsed.squareOffMode);
+        if (Array.isArray(parsed.legs)) setLegs(parsed.legs);
+        if (parsed.spotAdjustmentEnabled != null) setSpotAdjustmentEnabled(parsed.spotAdjustmentEnabled);
+        if (parsed.spotAdjustmentDirection) setSpotAdjustmentDirection(parsed.spotAdjustmentDirection);
+        if (parsed.spotAdjustmentValue != null) setSpotAdjustmentValue(parsed.spotAdjustmentValue);
+        if (parsed.spotAdjustmentUnits) setSpotAdjustmentUnits(parsed.spotAdjustmentUnits);
+        if (parsed.spotAdjustmentShowInfo != null) setSpotAdjustmentShowInfo(parsed.spotAdjustmentShowInfo);
+        if (parsed.bufferStrikeEnabled != null) setBufferStrikeEnabled(parsed.bufferStrikeEnabled);
+        if (parsed.bufferStrikeValue != null) setBufferStrikeValue(parsed.bufferStrikeValue);
+        if (parsed.bufferStrikeUnit) setBufferStrikeUnit(parsed.bufferStrikeUnit);
+        if (parsed.bufferStrikeApplyTo) setBufferStrikeApplyTo(parsed.bufferStrikeApplyTo);
+        if (parsed.bufferPositionAbove != null) setBufferPositionAbove(parsed.bufferPositionAbove);
+        if (parsed.bufferPositionBelow != null) setBufferPositionBelow(parsed.bufferPositionBelow);
+        if (parsed.slippagePct != null) setSlippagePct(parsed.slippagePct);
+        if (parsed.chargesEnabled != null) setChargesEnabled(parsed.chargesEnabled);
+        if (parsed.overallSLEnabled != null) setOverallSLEnabled(parsed.overallSLEnabled);
+        if (parsed.overallSLType) setOverallSLType(parsed.overallSLType);
+        if (parsed.overallSLValue != null) setOverallSLValue(parsed.overallSLValue);
+        if (parsed.overallTgtEnabled != null) setOverallTgtEnabled(parsed.overallTgtEnabled);
+        if (parsed.overallTgtType) setOverallTgtType(parsed.overallTgtType);
+        if (parsed.overallTgtValue != null) setOverallTgtValue(parsed.overallTgtValue);
+        if (parsed.trailingEnabled != null) setTrailingEnabled(parsed.trailingEnabled);
+        if (parsed.trailingType) setTrailingType(parsed.trailingType);
+        if (parsed.trailingIfProfit != null) setTrailingIfProfit(parsed.trailingIfProfit);
+        if (parsed.trailingLockProfit != null) setTrailingLockProfit(parsed.trailingLockProfit);
+        if (parsed.reentryOnSL != null) setReentryOnSL(parsed.reentryOnSL);
+        if (parsed.reentryOnSLMode) setReentryOnSLMode(parsed.reentryOnSLMode);
+        if (parsed.reentryOnSLCount != null) setReentryOnSLCount(parsed.reentryOnSLCount);
+        if (parsed.reentryOnTgt != null) setReentryOnTgt(parsed.reentryOnTgt);
+        if (parsed.reentryOnTgtMode) setReentryOnTgtMode(parsed.reentryOnTgtMode);
+        if (parsed.reentryOnTgtCount != null) setReentryOnTgtCount(parsed.reentryOnTgtCount);
+        if (parsed.strFilter) setStrFilter(parsed.strFilter);
+        if (parsed.startDate) setStartDate(parsed.startDate);
+        if (parsed.endDate) setEndDate(parsed.endDate);
+      }
+    } catch (err) {
+      console.warn('[StrategyBuilder] failed to restore state', err);
+    } finally {
+      hasHydratedBuilderStateRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasHydratedBuilderStateRef.current) return;
+    try {
+      localStorage.setItem(BUILDER_STORAGE_KEY, JSON.stringify({
+        instrument,
+        underlying,
+        strategyType,
+        expiryBasis,
+        entryDaysBefore,
+        exitDaysBefore,
+        delayTime,
+        squareOffMode,
+        legs,
+        spotAdjustmentEnabled,
+        spotAdjustmentDirection,
+        spotAdjustmentValue,
+        spotAdjustmentUnits,
+        spotAdjustmentShowInfo,
+        bufferStrikeEnabled,
+        bufferStrikeValue,
+        bufferStrikeUnit,
+        bufferStrikeApplyTo,
+        bufferPositionAbove,
+        bufferPositionBelow,
+        slippagePct,
+        chargesEnabled,
+        overallSLEnabled,
+        overallSLType,
+        overallSLValue,
+        overallTgtEnabled,
+        overallTgtType,
+        overallTgtValue,
+        trailingEnabled,
+        trailingType,
+        trailingIfProfit,
+        trailingLockProfit,
+        reentryOnSL,
+        reentryOnSLMode,
+        reentryOnSLCount,
+        reentryOnTgt,
+        reentryOnTgtMode,
+        reentryOnTgtCount,
+        strFilter,
+        startDate,
+        endDate,
+      }));
+    } catch (err) {
+      console.warn('[StrategyBuilder] failed to persist state', err);
+    }
+  }, [
+    instrument,
+    underlying,
+    strategyType,
+    expiryBasis,
+    entryDaysBefore,
+    exitDaysBefore,
+    delayTime,
+    squareOffMode,
+    legs,
+    spotAdjustmentEnabled,
+    spotAdjustmentDirection,
+    spotAdjustmentValue,
+    spotAdjustmentUnits,
+    spotAdjustmentShowInfo,
+    bufferStrikeEnabled,
+    bufferStrikeValue,
+    bufferStrikeUnit,
+    bufferStrikeApplyTo,
+    bufferPositionAbove,
+    bufferPositionBelow,
+    slippagePct,
+    chargesEnabled,
+    overallSLEnabled,
+    overallSLType,
+    overallSLValue,
+    overallTgtEnabled,
+    overallTgtType,
+    overallTgtValue,
+    trailingEnabled,
+    trailingType,
+    trailingIfProfit,
+    trailingLockProfit,
+    reentryOnSL,
+    reentryOnSLMode,
+    reentryOnSLCount,
+    reentryOnTgt,
+    reentryOnTgtMode,
+    reentryOnTgtCount,
+    strFilter,
+    startDate,
+    endDate,
+  ]);
 
   const latestEntrySpot = useMemo(() => {
     const firstTrade = displayResults?.trades?.[0];
@@ -1380,6 +1535,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
                         Buffer Strike
                       </span>
+                      <Tooltip text="Shift the selected option strike away from ATM by a fixed percentage or points for call, put, or both sides. Use this when you want entries slightly away from the exact ATM strike." />
                     </div>
                     <Toggle enabled={bufferStrikeEnabled} onToggle={() => setBufferStrikeEnabled(prev => !prev)} size="sm" />
                   </div>
@@ -2115,7 +2271,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
                                 <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
-                                  {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
+                                  {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
                             </div>
@@ -2133,25 +2289,8 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
                                 <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
-                                  {[1,2,3,4,5].map(n => <option key={n} value={n}>{n}</option>)}
+                                  {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
-                              </>)}
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.simple_momentum_enabled} onToggle={(val) => updateLeg(leg.id, 'simple_momentum_enabled', val !== undefined ? Boolean(val) : !leg.simple_momentum_enabled)} size="sm" />
-                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Simple Momentum</span>
-                              {leg.simple_momentum_enabled && (<>
-                                <select value={leg.simple_momentum_mode} onChange={e => updateLeg(leg.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
-                                  <option value="POINTS_UP">Points (Pts) &#8593;</option>
-                                  <option value="POINTS_DOWN">Points (Pts) &#8595;</option>
-                                  <option value="PERCENT_UP">Percent (%) &#8593;</option>
-                                  <option value="PERCENT_DOWN">Percent (%) &#8595;</option>
-                                  <option value="UNDERLYING_POINTS_UP">Underlying Pts &#8593;</option>
-                                  <option value="UNDERLYING_POINTS_DOWN">Underlying Pts &#8595;</option>
-                                  <option value="UNDERLYING_PERCENT_UP">Underlying % &#8593;</option>
-                                  <option value="UNDERLYING_PERCENT_DOWN">Underlying % &#8595;</option>
-                                </select>
-                                <input type="number" min={0} value={leg.simple_momentum_value ?? ''} onChange={e => updateLeg(leg.id, 'simple_momentum_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
                               </>)}
                             </div>
                           </div>
