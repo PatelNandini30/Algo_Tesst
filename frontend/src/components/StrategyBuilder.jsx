@@ -17,8 +17,6 @@ const toApiDate = (displayStr) => {
   }
 };
 
-const BUILDER_STORAGE_KEY = 'algotest.strategyBuilder.v1';
-
 const getApiStartDate = (startDate) => toApiDate(startDate);
 const getApiEndDate = (endDate) => toApiDate(endDate);
 
@@ -425,162 +423,10 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [validationError, setValidationError] = useState(null);
   const [trailSLWarning, setTrailSLWarning] = useState(null);
   const jobPollRef = useRef(null);
+  const errorTimerRef = useRef(null);
   const [jobId, setJobId] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
-  const hasHydratedBuilderStateRef = useRef(false);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(BUILDER_STORAGE_KEY);
-      if (!raw) {
-        hasHydratedBuilderStateRef.current = true;
-        return;
-      }
-
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        if (parsed.instrument) setInstrument(parsed.instrument);
-        if (parsed.underlying) setUnderlying(parsed.underlying);
-        if (parsed.strategyType) setStrategyType(parsed.strategyType);
-        if (parsed.expiryBasis) setExpiryBasis(parsed.expiryBasis);
-        if (parsed.entryDaysBefore != null) setEntryDaysBefore(parsed.entryDaysBefore);
-        if (parsed.exitDaysBefore != null) setExitDaysBefore(parsed.exitDaysBefore);
-        if (parsed.delayTime) setDelayTime(parsed.delayTime);
-        if (parsed.squareOffMode) setSquareOffMode(parsed.squareOffMode);
-        if (Array.isArray(parsed.legs)) setLegs(parsed.legs);
-        if (parsed.spotAdjustmentEnabled != null) setSpotAdjustmentEnabled(parsed.spotAdjustmentEnabled);
-        if (parsed.spotAdjustmentDirection) setSpotAdjustmentDirection(parsed.spotAdjustmentDirection);
-        if (parsed.spotAdjustmentValue != null) setSpotAdjustmentValue(parsed.spotAdjustmentValue);
-        if (parsed.spotAdjustmentUnits) setSpotAdjustmentUnits(parsed.spotAdjustmentUnits);
-        if (parsed.spotAdjustmentShowInfo != null) setSpotAdjustmentShowInfo(parsed.spotAdjustmentShowInfo);
-        if (parsed.bufferStrikeEnabled != null) setBufferStrikeEnabled(parsed.bufferStrikeEnabled);
-        if (parsed.bufferStrikeValue != null) setBufferStrikeValue(parsed.bufferStrikeValue);
-        if (parsed.bufferStrikeUnit) setBufferStrikeUnit(parsed.bufferStrikeUnit);
-        if (parsed.bufferStrikeApplyTo) setBufferStrikeApplyTo(parsed.bufferStrikeApplyTo);
-        if (parsed.bufferPositionAbove != null) setBufferPositionAbove(parsed.bufferPositionAbove);
-        if (parsed.bufferPositionBelow != null) setBufferPositionBelow(parsed.bufferPositionBelow);
-        if (parsed.slippagePct != null) setSlippagePct(parsed.slippagePct);
-        if (parsed.chargesEnabled != null) setChargesEnabled(parsed.chargesEnabled);
-        if (parsed.overallSLEnabled != null) setOverallSLEnabled(parsed.overallSLEnabled);
-        if (parsed.overallSLType) setOverallSLType(parsed.overallSLType);
-        if (parsed.overallSLValue != null) setOverallSLValue(parsed.overallSLValue);
-        if (parsed.overallTgtEnabled != null) setOverallTgtEnabled(parsed.overallTgtEnabled);
-        if (parsed.overallTgtType) setOverallTgtType(parsed.overallTgtType);
-        if (parsed.overallTgtValue != null) setOverallTgtValue(parsed.overallTgtValue);
-        if (parsed.trailingEnabled != null) setTrailingEnabled(parsed.trailingEnabled);
-        if (parsed.trailingType) setTrailingType(parsed.trailingType);
-        if (parsed.trailingIfProfit != null) setTrailingIfProfit(parsed.trailingIfProfit);
-        if (parsed.trailingLockProfit != null) setTrailingLockProfit(parsed.trailingLockProfit);
-        if (parsed.reentryOnSL != null) setReentryOnSL(parsed.reentryOnSL);
-        if (parsed.reentryOnSLMode) setReentryOnSLMode(parsed.reentryOnSLMode);
-        if (parsed.reentryOnSLCount != null) setReentryOnSLCount(parsed.reentryOnSLCount);
-        if (parsed.reentryOnTgt != null) setReentryOnTgt(parsed.reentryOnTgt);
-        if (parsed.reentryOnTgtMode) setReentryOnTgtMode(parsed.reentryOnTgtMode);
-        if (parsed.reentryOnTgtCount != null) setReentryOnTgtCount(parsed.reentryOnTgtCount);
-        if (parsed.strFilter) setStrFilter(parsed.strFilter);
-        if (parsed.startDate) setStartDate(parsed.startDate);
-        if (parsed.endDate) setEndDate(parsed.endDate);
-      }
-    } catch (err) {
-      console.warn('[StrategyBuilder] failed to restore state', err);
-    } finally {
-      hasHydratedBuilderStateRef.current = true;
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!hasHydratedBuilderStateRef.current) return;
-    try {
-      localStorage.setItem(BUILDER_STORAGE_KEY, JSON.stringify({
-        instrument,
-        underlying,
-        strategyType,
-        expiryBasis,
-        entryDaysBefore,
-        exitDaysBefore,
-        delayTime,
-        squareOffMode,
-        legs,
-        spotAdjustmentEnabled,
-        spotAdjustmentDirection,
-        spotAdjustmentValue,
-        spotAdjustmentUnits,
-        spotAdjustmentShowInfo,
-        bufferStrikeEnabled,
-        bufferStrikeValue,
-        bufferStrikeUnit,
-        bufferStrikeApplyTo,
-        bufferPositionAbove,
-        bufferPositionBelow,
-        slippagePct,
-        chargesEnabled,
-        overallSLEnabled,
-        overallSLType,
-        overallSLValue,
-        overallTgtEnabled,
-        overallTgtType,
-        overallTgtValue,
-        trailingEnabled,
-        trailingType,
-        trailingIfProfit,
-        trailingLockProfit,
-        reentryOnSL,
-        reentryOnSLMode,
-        reentryOnSLCount,
-        reentryOnTgt,
-        reentryOnTgtMode,
-        reentryOnTgtCount,
-        strFilter,
-        startDate,
-        endDate,
-      }));
-    } catch (err) {
-      console.warn('[StrategyBuilder] failed to persist state', err);
-    }
-  }, [
-    instrument,
-    underlying,
-    strategyType,
-    expiryBasis,
-    entryDaysBefore,
-    exitDaysBefore,
-    delayTime,
-    squareOffMode,
-    legs,
-    spotAdjustmentEnabled,
-    spotAdjustmentDirection,
-    spotAdjustmentValue,
-    spotAdjustmentUnits,
-    spotAdjustmentShowInfo,
-    bufferStrikeEnabled,
-    bufferStrikeValue,
-    bufferStrikeUnit,
-    bufferStrikeApplyTo,
-    bufferPositionAbove,
-    bufferPositionBelow,
-    slippagePct,
-    chargesEnabled,
-    overallSLEnabled,
-    overallSLType,
-    overallSLValue,
-    overallTgtEnabled,
-    overallTgtType,
-    overallTgtValue,
-    trailingEnabled,
-    trailingType,
-    trailingIfProfit,
-    trailingLockProfit,
-    reentryOnSL,
-    reentryOnSLMode,
-    reentryOnSLCount,
-    reentryOnTgt,
-    reentryOnTgtMode,
-    reentryOnTgtCount,
-    strFilter,
-    startDate,
-    endDate,
-  ]);
 
   const latestEntrySpot = useMemo(() => {
     const firstTrade = displayResults?.trades?.[0];
@@ -856,11 +702,24 @@ const [slippagePct, setSlippagePct] = useState(0);
   // Upload management removed - handled by CsvUpload component
 
   const validationErrorTimerRef = useRef(null);
-  const showValidationError = (msg, durationMs = 10000) => {
+  const showValidationError = (msg, durationMs = 5000) => {
     if (validationErrorTimerRef.current) clearTimeout(validationErrorTimerRef.current);
     setValidationError(msg);
     validationErrorTimerRef.current = setTimeout(() => setValidationError(null), durationMs);
   };
+
+  const showTimedError = (msg, durationMs = 5000) => {
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    setError(msg);
+    errorTimerRef.current = setTimeout(() => setError(null), durationMs);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (validationErrorTimerRef.current) clearTimeout(validationErrorTimerRef.current);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    };
+  }, []);
 
   // Validate expiry mismatch
   const validateExpiry = () => {
@@ -1066,6 +925,13 @@ const [slippagePct, setSlippagePct] = useState(0);
       return leg;
     });
 
+    const allFuturesNextMonthly = (
+      legsPayload.length > 0 &&
+      legsPayload.every(l => String(l.segment || '').toUpperCase() === 'FUTURES') &&
+      legsPayload.some(l => String(l.expiry || '').toLowerCase() === 'next_monthly')
+    );
+    const effectiveExpiryType = allFuturesNextMonthly ? 'NEXT_MONTHLY' : expiryBasis.toUpperCase();
+
     return {
       index: instrument,
       underlying,
@@ -1095,7 +961,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       overall_target_value: overallTgtEnabled ? (overallTgtValue === '' ? 0 : overallTgtValue) : null,
       date_from: getApiStartDate(startDate),
       date_to: getApiEndDate(endDate),
-      expiry_type: expiryBasis.toUpperCase(),
+      expiry_type: effectiveExpiryType,
       filter: strFilter.enabled ? strFilter.configId : null,
       filter_config: strFilter.enabled ? strFilter.configId : null,
       filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
@@ -1163,33 +1029,37 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
     setValidationError(null);
     
-    // Validate entry/exit DTE for weekly/monthly legs.
-    // For weekly/monthly: entry_dte must be strictly > exit_dte.
-    //   - entry_dte == exit_dte → same calendar date → zero holding period → backend skips all trades
-    //   - entry_dte < exit_dte  → entry would be AFTER exit in calendar → backend skips all trades
-    // For next_weekly/next_monthly: entry uses current expiry anchor, exit uses next expiry anchor
-    //   → they are always different dates regardless of DTE values → all combinations valid.
-    const hasCurrentExpiryLegs = legs
+    // DTE validation: current weekly/monthly legs anchor entry and exit to the
+    // same expiry, so equal or inverted DTE values produce no valid hold.
+    const hasCurrentExpiryOptionLegs = legs
       .filter(l => l.segment !== 'futures')
       .some(l => l.expiry === 'weekly' || l.expiry === 'monthly');
+    const hasCurrentExpiryFuturesLegs = legs
+      .filter(l => l.segment === 'futures')
+      .some(l => l.expiry === 'monthly');
+    const hasCurrentExpiryLegs = hasCurrentExpiryOptionLegs || hasCurrentExpiryFuturesLegs;
 
     if (hasCurrentExpiryLegs) {
+      const basisLabel = hasCurrentExpiryOptionLegs
+        ? (expiryBasis === 'weekly' ? 'Weekly' : 'Monthly')
+        : 'Monthly Futures';
+
       if (entryDaysBefore === exitDaysBefore) {
-        const basisLabel = expiryBasis === 'weekly' ? 'Weekly' : 'Monthly';
-        setError(
-          `⚠️ Invalid: Entry Days (${entryDaysBefore}) and Exit Days (${exitDaysBefore}) are equal for ${basisLabel} leg(s). ` +
-          `Entry and exit would fall on the same date — no holding period. ` +
-          `Set Entry Days greater than Exit Days (e.g., Entry=2, Exit=0).`
+        setValidationError(null);
+        showTimedError(
+          `Invalid DTE: Entry Days (${entryDaysBefore}) equals Exit Days (${exitDaysBefore}) ` +
+          `for ${basisLabel} leg(s). Both dates resolve to the same day, so no trades will execute. ` +
+          `Set Entry Days > Exit Days (e.g., Entry=2, Exit=0).`
         );
         setLoading(false);
         return;
       }
       if (entryDaysBefore < exitDaysBefore) {
-        const basisLabel = expiryBasis === 'weekly' ? 'Weekly' : 'Monthly';
-        setError(
-          `⚠️ Invalid: Entry Days (${entryDaysBefore}) is less than Exit Days (${exitDaysBefore}) for ${basisLabel} leg(s). ` +
-          `A smaller entry DTE means entering AFTER the exit date. ` +
-          `Set Entry Days greater than Exit Days (e.g., Entry=2, Exit=0).`
+        setValidationError(null);
+        showTimedError(
+          `Invalid DTE: Entry Days (${entryDaysBefore}) is less than Exit Days (${exitDaysBefore}) ` +
+          `for ${basisLabel} leg(s). Lower DTE means a later calendar date, so entry would fall after exit. ` +
+          `Set Entry Days > Exit Days (e.g., Entry=2, Exit=0).`
         );
         setLoading(false);
         return;
@@ -1408,31 +1278,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
-                {/* DTE validation warning for weekly/monthly legs */}
-                {(() => {
-                  const hasCurrentLegs = legs
-                    .filter(l => l.segment !== 'futures')
-                    .some(l => l.expiry === 'weekly' || l.expiry === 'monthly');
-                  if (!hasCurrentLegs) return null;
-
-                  const isEqual = entryDaysBefore === exitDaysBefore;
-                  const isInverted = entryDaysBefore < exitDaysBefore;
-                  if (!isEqual && !isInverted) return null;
-
-                  const basisLabel = expiryBasis === 'weekly' ? 'Weekly' : 'Monthly';
-                  const message = isEqual
-                    ? `Entry (${entryDaysBefore}) = Exit (${exitDaysBefore}): same date, no holding period — backtest will be blocked.`
-                    : `Entry (${entryDaysBefore}) < Exit (${exitDaysBefore}): entry falls after exit — backtest will be blocked.`;
-
-                  return (
-                    <div className="flex items-center gap-1.5 mt-1 px-2 py-1.5 rounded bg-amber-50 border border-amber-200 text-amber-700 text-xs">
-                      <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-                      <span>
-                        {basisLabel} leg detected — {message} Set Entry Days &gt; Exit Days (e.g., Entry=2, Exit=0).
-                      </span>
-                    </div>
-                  );
-                })()}
+                {strategyType === 'positional' && legs.length > 0 && legs.every(l => l.segment === 'futures') && legs.some(l => l.expiry === 'next_monthly') && (
+                  <div className="text-[11px] text-muted mt-1">
+                    Futures Next Monthly: entry anchored to <strong>current</strong> monthly expiry, exit anchored to <strong>next</strong> monthly expiry. All Entry/Exit DTE combinations are valid.
+                  </div>
+                )}
 
                 {/* SuperTrend Filter */}
                 <SuperTrendFilter
@@ -2296,10 +2146,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                           </div>
                         </div>
                       </div>
-                      {/* Futures Rollover Config — only for futures legs */}
-                      {leg.segment === 'futures' && (
-                        <FuturesRolloverConfig leg={leg} legIndex={idx} onLegChange={handleLegChange} />
-                      )}
                     </div>
                   ))}
                 </div>
@@ -2425,11 +2271,6 @@ const [slippagePct, setSlippagePct] = useState(0);
 
         {/* Run Backtest Button - Bottom */}
         <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50 flex flex-col items-center gap-2">
-          {validationError && (
-            <div className="flex items-start gap-2 bg-red-50 border border-red-300 text-red-700 text-xs rounded-xl px-4 py-2.5 shadow-lg max-w-sm text-center">
-              <span>⚠️ {validationError}</span>
-            </div>
-          )}
           <button
             onClick={runBacktest}
             disabled={!canRunBacktest}
@@ -2453,103 +2294,6 @@ const [slippagePct, setSlippagePct] = useState(0);
             <div className="mt-2 text-xs text-center text-secondary">{jobStatusLabel}</div>
           )}
         </div>
-      </div>
-    </div>
-  );
-};
-
-const FuturesRolloverConfig = ({ leg, legIndex, onLegChange }) => {
-  const exitMode = leg.fut_exit_mode || 'ON_EXPIRY';
-
-  const handleChange = (field, value) => {
-    onLegChange(legIndex, { ...leg, [field]: value });
-  };
-
-  return (
-    <div className="futures-rollover-config" style={{
-      marginTop: 12,
-      padding: "10px 14px",
-      background: "rgba(0, 120, 255, 0.06)",
-      border: "1px solid rgba(0, 120, 255, 0.20)",
-      borderRadius: 8,
-    }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: "#0078ff", marginBottom: 10, letterSpacing: 1 }}>
-        ⚙ FUTURES EXIT & ROLLOVER
-      </div>
-
-      <div className="config-row" style={{ marginBottom: 10 }}>
-        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>
-          Exit Trigger
-        </label>
-        <select
-          value={exitMode}
-          onChange={(e) => handleChange("fut_exit_mode", e.target.value)}
-          style={{ width: "100%", padding: "5px 8px", borderRadius: 6, fontSize: 12 }}
-        >
-          <option value="ON_EXPIRY">On Monthly Expiry Day</option>
-          <option value="N_DAYS_BEFORE_EXPIRY">N Days Before Expiry</option>
-          <option value="LAST_WEEK_BEFORE_EXPIRY">Last 5 Trading Days Before Expiry (Expiry Week)</option>
-        </select>
-      </div>
-
-      {exitMode === "N_DAYS_BEFORE_EXPIRY" && (
-        <div className="config-row" style={{ marginBottom: 10 }}>
-          <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 4 }}>
-            Days Before Expiry (1–15)
-          </label>
-          <input
-            type="number"
-            min={1}
-            max={15}
-            value={leg.fut_n_days ?? 5}
-            onChange={(e) => handleChange("fut_n_days", parseInt(e.target.value, 10) || 5)}
-            style={{ width: 80, padding: "5px 8px", borderRadius: 6, fontSize: 12 }}
-          />
-          <span style={{ fontSize: 11, color: "#aaa", marginLeft: 8 }}>
-            e.g. 5 → exit 5 calendar days before last Thursday
-          </span>
-        </div>
-      )}
-
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 6 }}>
-        <ToggleOption
-          label="Respect Filter on Roll"
-          tooltip="If ON: futures rollover respects the active STR/date filter — don't roll into a new month if filter is inactive. If OFF: always roll regardless of filter."
-          checked={leg.fut_with_filter !== false}
-          onChange={(v) => handleChange("fut_with_filter", v)}
-        />
-        <ToggleOption
-          label="SL Cancels Rollover"
-          tooltip="If SL is hit during the futures hold period, close everything and skip rollover into next month."
-          checked={leg.fut_sl_override !== false}
-          onChange={(v) => handleChange("fut_sl_override", v)}
-        />
-        <ToggleOption
-          label="Target Cancels Rollover"
-          tooltip="If Target is hit, close everything and skip rollover."
-          checked={leg.fut_target_override !== false}
-          onChange={(v) => handleChange("fut_target_override", v)}
-        />
-        <ToggleOption
-          label="Spot Adj on Roll"
-          tooltip="Apply spot adjustment at the rollover entry date."
-          checked={leg.fut_with_spot_adj !== false}
-          onChange={(v) => handleChange("fut_with_spot_adj", v)}
-        />
-      </div>
-
-      <div style={{
-        marginTop: 10,
-        padding: "6px 10px",
-        background: "rgba(255, 180, 0, 0.07)",
-        borderRadius: 6,
-        fontSize: 11,
-        color: "#b8860b",
-        lineHeight: 1.6,
-      }}>
-        ℹ Roll Cost = Next-month entry price − Current-month exit price.<br />
-        In contango (normal): positive roll cost (debit for longs, credit for shorts).<br />
-        Shown separately in the trade sheet under "Roll Cost" column.
       </div>
     </div>
   );

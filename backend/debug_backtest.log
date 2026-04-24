@@ -1,0 +1,18 @@
+
+============================================================
+DEBUG: About to execute strategy
+DEBUG: Strategy executed, df shape: (112, 23)
+DEBUG: df columns: ['Trade', 'Leg', 'Index', 'Entry Date', 'Exit Date', 'Type', 'Strike', 'B/S', 'Qty', 'Entry Price', 'Exit Price', 'Entry Spot', 'Exit Spot', 'Spot P&L', 'Future Expiry', 'Net P&L', '% P&L', 'Exit Reason', 'STR Segment', 'Cumulative', 'Peak', 'DD', '%DD']
+
+============================================================
+DEBUG: About to execute strategy
+DEBUG: Strategy executed, df shape: (112, 23)
+DEBUG: df columns: ['Trade', 'Leg', 'Index', 'Entry Date', 'Exit Date', 'Type', 'Strike', 'B/S', 'Qty', 'Entry Price', 'Exit Price', 'Entry Spot', 'Exit Spot', 'Spot P&L', 'Future Expiry', 'Net P&L', '% P&L', 'Exit Reason', 'STR Segment', 'Cumulative', 'Peak', 'DD', '%DD']
+
+============================================================
+DEBUG: About to execute strategy
+
+============================================================
+DEBUG: About to execute strategy
+DEBUG: Strategy executed, df shape: empty
+DEBUG: df columns: N/A

@@ -194,6 +194,33 @@ import time
 import traceback
 
 
+def _futures_only_next_monthly_schedule(legs_config):
+    """
+    Futures-only strategies that contain a next-month futures leg must anchor
+    their schedule like a next-expiry strategy: entry against the current
+    expiry, exit against the next expiry.
+    """
+    opt_legs = [
+        leg for leg in legs_config
+        if str(leg.get('segment', 'OPTION')).upper() not in ('FUTURES', 'FUTURE')
+    ]
+    fut_legs = [
+        leg for leg in legs_config
+        if str(leg.get('segment', 'OPTION')).upper() in ('FUTURES', 'FUTURE')
+    ]
+    if opt_legs or not fut_legs:
+        return False
+
+    return any(
+        str(leg.get('expiry', 'monthly') or 'monthly').lower() in (
+            'next_monthly',
+            'next_month',
+            'monthly_t1',
+        )
+        for leg in fut_legs
+    )
+
+
 def get_lot_size(index, entry_date):
     """
     Returns correct lot size based on index and trade date.
@@ -882,6 +909,33 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
     return final_strike, offset, ref_price
 
 
+def _get_future_price_for_held_contract(date, index, leg):
+    """Prefer the futures contract already stored on the leg, then fall back."""
+    date_ts = pd.Timestamp(date)
+    stored_expiry = leg.get('futures_expiry')
+
+    if stored_expiry:
+        price = get_future_price_from_db(
+            date=date_ts.strftime('%Y-%m-%d'),
+            index=index,
+            expiry=stored_expiry,
+        )
+        if price is not None:
+            return price, stored_expiry
+
+    fallback_expiry = _resolve_nearest_future_expiry(index, date_ts)
+    if fallback_expiry and fallback_expiry != stored_expiry:
+        price = get_future_price_from_db(
+            date=date_ts.strftime('%Y-%m-%d'),
+            index=index,
+            expiry=fallback_expiry,
+        )
+        if price is not None:
+            return price, fallback_expiry
+
+    return None, stored_expiry or fallback_expiry
+
+
 def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_spot, slippage_pct=0.0):
     """
     Re-fetch market exit price/premium at leg_exit_date and rewrite pnl in-place.
@@ -930,14 +984,9 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
             tleg['pe_pnl'] = 0
 
     else:  # FUTURE
-        check_expiry = _resolve_nearest_future_expiry(index, leg_exit_date)
-        if check_expiry is None:
-            check_expiry = tleg.get('futures_expiry')
-        new_exit = get_future_price_from_db(
-            date=leg_exit_date.strftime('%Y-%m-%d'),
-            index=index,
-            expiry=check_expiry,
-        ) or tleg['entry_price']
+        new_exit, check_expiry = _get_future_price_for_held_contract(leg_exit_date, index, tleg)
+        if new_exit is None:
+            new_exit = tleg['entry_price']
         ep = tleg['entry_price']
         adjusted_exit = _apply_slippage(new_exit, position, 'exit', slippage_pct)
         tleg['market_exit_price'] = new_exit
@@ -1114,11 +1163,12 @@ def _execute_per_leg_reentry(
     """
     segment = str(leg_config.get('segment', '') or '').upper()
     if segment in ('FUTURE', 'FUTURES'):
-        _log("[REENTRY] Futures legs are not supported for per-leg re-entry")
+        _log(f"[REENTRY] Skip: futures legs are not supported (leg={leg_config.get('leg_number', '?')})")
         return []
 
     reentry_cfg = leg_config.get('_reentry') or {}
     if not reentry_cfg:
+        _log(f"[REENTRY] Skip: no re-entry config present (leg={leg_config.get('leg_number', '?')})")
         return []
 
     def _base_reason(reason_str):
@@ -1129,6 +1179,10 @@ def _execute_per_leg_reentry(
 
     first_reason = _base_reason(original_exit_reason)
     if first_reason not in sl_reasons | tgt_reasons:
+        _log(
+            f"[REENTRY] Skip: trigger reason '{first_reason}' is not SL/Target "
+            f"(leg={leg_config.get('leg_number', '?')}, exit_date={pd.Timestamp(original_exit_date).strftime('%Y-%m-%d')})"
+        )
         return []
 
     re_on_sl = bool(reentry_cfg.get('re_entry_on_sl', False))
@@ -1148,8 +1202,16 @@ def _execute_per_leg_reentry(
         )
 
     if first_reason in sl_reasons and not re_on_sl:
+        _log(
+            f"[REENTRY] Skip: SL re-entry disabled for leg={leg_config.get('leg_number', '?')} "
+            f"(reason={first_reason})"
+        )
         return []
     if first_reason in tgt_reasons and not re_on_tgt:
+        _log(
+            f"[REENTRY] Skip: Target re-entry disabled for leg={leg_config.get('leg_number', '?')} "
+            f"(reason={first_reason})"
+        )
         return []
 
     current_trigger_date = pd.Timestamp(original_exit_date)
@@ -1169,19 +1231,28 @@ def _execute_per_leg_reentry(
 
         if is_sl:
             if not re_on_sl or sl_used >= max_sl:
+                _log(
+                    f"[REENTRY] Stop: SL budget exhausted or disabled "
+                    f"(leg={leg_config.get('leg_number', '?')}, used={sl_used}, max={max_sl})"
+                )
                 break
             mode = str(reentry_cfg.get('re_entry_on_sl_mode', 'RE_ASAP') or 'RE_ASAP').upper().strip()
             if _reentry_mode_base(mode) != 'RE_ASAP':
-                _log(f"[REENTRY] Unsupported SL re-entry mode '{mode}' - skipping")
+                _log(f"[REENTRY] Skip: unsupported SL re-entry mode '{mode}' (leg={leg_config.get('leg_number', '?')})")
                 break
         elif is_tgt:
             if not re_on_tgt or tgt_used >= max_tgt:
+                _log(
+                    f"[REENTRY] Stop: Target budget exhausted or disabled "
+                    f"(leg={leg_config.get('leg_number', '?')}, used={tgt_used}, max={max_tgt})"
+                )
                 break
             mode = str(reentry_cfg.get('re_entry_on_target_mode', 'RE_ASAP') or 'RE_ASAP').upper().strip()
             if _reentry_mode_base(mode) != 'RE_ASAP':
-                _log(f"[REENTRY] Unsupported Target re-entry mode '{mode}' - skipping")
+                _log(f"[REENTRY] Skip: unsupported Target re-entry mode '{mode}' (leg={leg_config.get('leg_number', '?')})")
                 break
         else:
+            _log(f"[REENTRY] Stop: current trigger reason no longer SL/Target (reason={current_reason})")
             break
 
         reentry_mode = mode
@@ -1189,11 +1260,15 @@ def _execute_per_leg_reentry(
 
         re_entry_date = pd.Timestamp(current_trigger_date)
         if re_entry_date >= pd.Timestamp(cycle_exit_date):
+            _log(
+                f"[REENTRY] Stop: re-entry date {re_entry_date.strftime('%Y-%m-%d')} "
+                f"is at/after cycle exit {pd.Timestamp(cycle_exit_date).strftime('%Y-%m-%d')}"
+            )
             break
 
         re_spot = get_spot_price_from_db(re_entry_date, index)
         if re_spot is None:
-            _log(f"[REENTRY] Missing spot data for {re_entry_date.strftime('%Y-%m-%d')}")
+            _log(f"[REENTRY] Stop: missing spot data for {re_entry_date.strftime('%Y-%m-%d')}")
             break
 
         re_leg_config = {
@@ -1215,32 +1290,50 @@ def _execute_per_leg_reentry(
             index=index,
         )
         if re_strike is None:
-            _log(f"[REENTRY] Strike resolution failed for {re_entry_date.strftime('%Y-%m-%d')}")
+            _log(f"[REENTRY] Stop: strike resolution failed for {re_entry_date.strftime('%Y-%m-%d')}")
+            break
+        re_buffer_offset = 0
+        re_buffer_ref_price = None
+        if isinstance(re_strike, (tuple, list)):
+            re_strike_value = re_strike[0] if len(re_strike) > 0 else None
+            re_buffer_offset = re_strike[1] if len(re_strike) > 1 else 0
+            re_buffer_ref_price = re_strike[2] if len(re_strike) > 2 else None
+        else:
+            re_strike_value = re_strike
+        if re_strike_value is None:
+            _log(f"[REENTRY] Stop: normalized strike is missing for {re_entry_date.strftime('%Y-%m-%d')}")
             break
         buffer_runtime = re_leg_config.get('_buffer_runtime', {})
 
         raw_entry = get_option_premium_from_db(
             date=re_entry_date.strftime('%Y-%m-%d'),
             index=index,
-            strike=re_strike,
+            strike=re_strike_value,
             option_type=option_type,
             expiry=pd.Timestamp(expiry_date).strftime('%Y-%m-%d'),
         )
         if raw_entry is None:
-            _log(f"[REENTRY] Missing entry premium for strike {re_strike} on {re_entry_date.strftime('%Y-%m-%d')}")
+            _log(
+                f"[REENTRY] Stop: missing entry premium for strike {re_strike_value} "
+                f"on {re_entry_date.strftime('%Y-%m-%d')} (expiry={pd.Timestamp(expiry_date).strftime('%Y-%m-%d')})"
+            )
             break
         entry_premium = _apply_slippage(raw_entry, position, 'entry', slippage_pct)
 
         raw_exit = get_option_premium_from_db(
             date=pd.Timestamp(cycle_exit_date).strftime('%Y-%m-%d'),
             index=index,
-            strike=re_strike,
+            strike=re_strike_value,
             option_type=option_type,
             expiry=pd.Timestamp(expiry_date).strftime('%Y-%m-%d'),
         )
         if raw_exit is None:
             fallback_spot = get_spot_price_from_db(cycle_exit_date, index) or re_spot
-            raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=re_strike, option_type=option_type)
+            raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=re_strike_value, option_type=option_type)
+            _log(
+                f"[REENTRY] Fallback exit premium used for strike {re_strike_value} "
+                f"on {pd.Timestamp(cycle_exit_date).strftime('%Y-%m-%d')} (spot={fallback_spot})"
+            )
         exit_premium = _apply_slippage(raw_exit, position, 'exit', slippage_pct)
         leg_pnl = (exit_premium - entry_premium) if position == 'BUY' else (entry_premium - exit_premium)
 
@@ -1248,7 +1341,7 @@ def _execute_per_leg_reentry(
             'leg_number': leg_config.get('leg_number', 1),
             'segment': 'OPTION',
             'option_type': option_type,
-            'strike': re_strike,
+            'strike': re_strike_value,
             'position': position,
             'lots': leg_config.get('lots', 1),
             'lot_size': lot_size,
@@ -1268,7 +1361,8 @@ def _execute_per_leg_reentry(
             'buffer_spot_atm': buffer_runtime.get('spot_atm_strike'),
             'buffer_atm_strike': buffer_runtime.get('atm_strike'),
             'buffer_applied': bool(buffer_runtime.get('applied', False)),
-            'buffer_strike_offset': buffer_runtime.get('offset', 0),
+            'buffer_strike_offset': re_buffer_offset if re_buffer_offset is not None else buffer_runtime.get('offset', 0),
+            'buffer_ref_price_raw': re_buffer_ref_price,
             'pnl': leg_pnl,
             'ce_pnl': leg_pnl if option_type in ('CE', 'CALL', 'C') else 0,
             'pe_pnl': leg_pnl if option_type in ('PE', 'PUT', 'P') else 0,
@@ -1317,6 +1411,11 @@ def _execute_per_leg_reentry(
             elif trig_base in tgt_reasons and re_on_tgt and tgt_used < max_tgt:
                 next_trigger_date = trig_date
                 next_trigger_reason = trig_reason
+            else:
+                _log(
+                    f"[REENTRY] Stop: chained trigger '{trig_base}' did not qualify "
+                    f"for further re-entry (leg={leg_config.get('leg_number', '?')})"
+                )
 
         reentry_results.append(re_leg)
         if is_sl:
@@ -1507,14 +1606,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             cp = None
 
             if segment in ('FUTURES', 'FUTURE'):
-                check_expiry = _resolve_nearest_future_expiry(index, check_date)
-                if check_expiry is None:
-                    check_expiry = leg.get('futures_expiry')
-                current_price_raw = get_future_price_from_db(
-                    date=check_date.strftime('%Y-%m-%d'),
-                    index=index,
-                    expiry=check_expiry
-                )
+                current_price_raw, _ = _get_future_price_for_held_contract(check_date, index, leg)
                 if current_price_raw is None:
                     continue
 
@@ -2000,14 +2092,7 @@ def check_overall_stop_loss_target(
                 if entry_price is None:
                     continue
 
-                check_expiry = _resolve_nearest_future_expiry(index, check_date)
-                if check_expiry is None:
-                    check_expiry = leg.get('futures_expiry')
-                current_price_raw = get_future_price_from_db(
-                    date=check_date.strftime('%Y-%m-%d'),
-                    index=index,
-                    expiry=check_expiry
-                )
+                current_price_raw, _ = _get_future_price_for_held_contract(check_date, index, leg)
 
                 if current_price_raw is None:
                     continue
@@ -2359,6 +2444,23 @@ def run_algotest_backtest(params):
     trade_id_counter = 0
     strike_interval = get_strike_interval(index)
     n_expiries = len(expiry_df)
+
+    if 'Next Expiry' not in expiry_df.columns:
+        expiry_df = expiry_df.copy().reset_index(drop=True)
+        expiry_df['Next Expiry'] = expiry_df['Current Expiry'].shift(-1)
+
+    opt_legs = [
+        l for l in legs_config
+        if str(l.get('segment', 'OPTION')).upper() not in ('FUTURES', 'FUTURE')
+    ]
+    _next_types = ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+    _all_opt_legs_next = bool(opt_legs) and all(
+        str(l.get('expiry', 'WEEKLY') or 'WEEKLY').upper() in _next_types
+        for l in opt_legs
+    )
+    _all_fut_legs_next_monthly = _futures_only_next_monthly_schedule(legs_config)
+    _all_legs_next = _all_opt_legs_next or _all_fut_legs_next_monthly
+
     schedule = []
     for expiry_idx, expiry_row in expiry_df.iterrows():
         current_exp = pd.Timestamp(expiry_row['Current Expiry'])
@@ -2381,13 +2483,6 @@ def run_algotest_backtest(params):
         #
         # For mixed / non-next strategies both dates use the same anchor (current_exp).
         schedule_anchor = current_exp
-        _opt_legs = [l for l in legs_config if str(l.get('segment', 'OPTION')).upper() not in ('FUTURES', 'FUTURE')]
-        _next_types = ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
-        _all_legs_next = bool(_opt_legs) and all(
-            str(l.get('expiry', 'WEEKLY') or 'WEEKLY').upper() in _next_types
-            for l in _opt_legs
-        )
-
         if _all_legs_next and next_exp is not None:
             entry_date = calculate_trading_days_before_expiry(
                 expiry_date=current_exp,
@@ -2435,8 +2530,8 @@ def run_algotest_backtest(params):
         # Skip these trades entirely. For NEXT_WEEKLY/NEXT_MONTHLY, continue with normal logic
         # (entry on current expiry, exit on next expiry).
         _force_next_expiry = False
-        _is_next_expiry_type = expiry_type.upper() in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
-        
+        _is_next_expiry_type = expiry_type.upper() in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1') or _all_legs_next
+
         if entry_date == exit_date:
             if _is_next_expiry_type and next_exp is not None:
                 exit_date = next_exp
@@ -2456,6 +2551,18 @@ def run_algotest_backtest(params):
             'exit_date':         exit_date,
             '_force_next_expiry': _force_next_expiry,
         })
+
+    if schedule:
+        seen_date_pairs = set()
+        deduplicated_schedule = []
+        for rec in schedule:
+            key = (pd.Timestamp(rec['entry_date']), pd.Timestamp(rec['exit_date']))
+            if key in seen_date_pairs:
+                _log(f"[SCHED] Dedup: skipping duplicate entry/exit pair {key}")
+                continue
+            seen_date_pairs.add(key)
+            deduplicated_schedule.append(rec)
+        schedule = deduplicated_schedule
 
     if not schedule:
         return pd.DataFrame(), {}, {}
@@ -2805,22 +2912,35 @@ def run_algotest_backtest(params):
                         else:
                             futures_expiry_pref = 'monthly'
                         roll_cfg = _parse_futures_rollover_config(leg_config)
-
-                        fut_exit_trigger = get_futures_exit_date(
-                            expiry_date,
-                            roll_cfg['exit_mode'],
-                            roll_cfg['n_days'],
-                            trading_calendar,
-                        )
-                        if fut_exit_trigger is None:
-                            fut_exit_trigger = exit_date
-                        fut_exit_date = pd.Timestamp(fut_exit_trigger)
-                        if fut_exit_date > exit_date:
+                        if futures_expiry_pref == 'next_monthly':
                             fut_exit_date = exit_date
+                            exit_reason = 'Expiry'
+                            _log(
+                                f"      [FUT NEXT_MONTHLY] exit_anchor=next_exp ({_sched_next_exp}) | "
+                                f"exit_date={exit_date} (DTE-computed, exit_dte={exit_dte}) | no rollover"
+                            )
+                        else:
+                            futures_exit_anchor = _sched_current_exp
+                            _log(
+                                f"      [FUT EXPIRY DEBUG] pref={futures_expiry_pref} | "
+                                f"exit_anchor={pd.Timestamp(futures_exit_anchor).strftime('%Y-%m-%d') if futures_exit_anchor is not None else 'None'}"
+                            )
 
-                        exit_reason = 'Expiry'
-                        if roll_cfg['exit_mode'] != 'ON_EXPIRY' and fut_exit_date < exit_date:
-                            exit_reason = f"FUT_ROLL_{roll_cfg['exit_mode']}"
+                            fut_exit_trigger = get_futures_exit_date(
+                                futures_exit_anchor,
+                                roll_cfg['exit_mode'],
+                                roll_cfg['n_days'],
+                                trading_calendar,
+                            )
+                            if fut_exit_trigger is None:
+                                fut_exit_trigger = exit_date
+                            fut_exit_date = pd.Timestamp(fut_exit_trigger)
+                            if fut_exit_date > exit_date:
+                                fut_exit_date = exit_date
+
+                            exit_reason = 'Expiry'
+                            if roll_cfg['exit_mode'] != 'ON_EXPIRY' and fut_exit_date < exit_date:
+                                exit_reason = f"FUT_ROLL_{roll_cfg['exit_mode']}"
 
                         fut_result = resolve_futures_pnl_with_rollover(
                             entry_date=entry_date,
@@ -2879,8 +2999,10 @@ def run_algotest_backtest(params):
                             exit_price = entry_price
 
                         roll_cost = 0.0
-                        roll_entry_date = get_futures_rollover_entry_date(fut_exit_date, trading_calendar)
+                        roll_entry_date = None
                         next_expiry_str = None
+                        if futures_expiry_pref != 'next_monthly':
+                            roll_entry_date = get_futures_rollover_entry_date(fut_exit_date, trading_calendar)
 
                         if roll_entry_date:
                             # ── Feature 2: Respect Filter on Roll ────────────────────────────────
@@ -3251,14 +3373,10 @@ def run_algotest_backtest(params):
                                         tleg['pe_pnl'] = 0
                         
                             elif tleg.get('segment') == 'FUTURE':
-                                early_exit_expiry = _resolve_nearest_future_expiry(
-                                    index=index,
-                                    date=actual_leg_exit_date,
-                                ) or tleg.get('futures_expiry')
-                                new_exit_price = get_future_price_from_db(
-                                    date=actual_leg_exit_date.strftime('%Y-%m-%d'),
-                                    index=index,
-                                    expiry=early_exit_expiry
+                                new_exit_price, early_exit_expiry = _get_future_price_for_held_contract(
+                                    actual_leg_exit_date,
+                                    index,
+                                    tleg,
                                 )
                             
                                 if new_exit_price is not None:

@@ -88,10 +88,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const filteredWarnings = warnings.filter(Boolean);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 25;
+  const getVisibleExitDate = (trade) => {
+    return formatDateToDdMmYyyy(trade?.['Exit Date']);
+  };
   const tradesWithFormattedDates = useMemo(() => trades.map(trade => ({
     ...trade,
     'Entry Date': formatDateToDdMmYyyy(trade['Entry Date']),
-    'Exit Date': formatDateToDdMmYyyy(trade['Exit Date']),
+    'Exit Date': getVisibleExitDate(trade),
     'Leg Exit Date': formatDateToDdMmYyyy(trade['Leg Exit Date']),
     'Expiry': formatDateToDdMmYyyy(trade['Expiry']),
   })), [trades]);
@@ -493,7 +496,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='DD')    val=m.dd;
           else if (key==='%DD')   val=m.pctDd;
         } else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
-        else if (key==='Exit Date') val=trade['Leg Exit Date']||trade['Exit Date'];
+        else if (key==='Exit Date') val=getVisibleExitDate(trade);
+        else if (key==='Expiry') val=formatDateToDdMmYyyy(
+          trade['Future Expiry'] || trade['futures_expiry'] || trade['Expiry']
+        );
         else val=trade[key];
         if (val==null||(typeof val==='number'&&isNaN(val))||val==='NaN') val='';
         if (typeof val==='number'&&!Number.isInteger(val)) val=Math.round(val*100)/100;
@@ -1290,9 +1296,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               ? 'bg-blue-50/40 dark:bg-blue-950/20'
                               : (rowIdx % 2 === 0 ? 'bg-white dark:bg-gray-900' : 'bg-gray-50 dark:bg-gray-800/50');
                             const exitDateValue = (() => {
-                              const legExit = leg['Leg Exit Date'];
-                              if (legExit && String(legExit).trim() !== '') return legExit;
-                              const ownExit = leg['Exit Date'];
+                              const ownExit = getVisibleExitDate(leg);
                               if (ownExit && String(ownExit).trim() !== '') return ownExit;
                               return group.exitDate || '-';
                             })();
@@ -1371,9 +1375,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 ) : null}
                                 <td className="px-3 py-2 text-xs text-primary">
                                   {(() => {
-                                    const legExit = leg['Leg Exit Date'];
-                                    if (legExit && String(legExit).trim() !== '') return legExit;
-                                    const ownExit = leg['Exit Date'];
+                                    const ownExit = getVisibleExitDate(leg);
                                     if (ownExit && String(ownExit).trim() !== '') return ownExit;
                                     return legIdx === 0 ? (group.exitDate || '-') : '-';
                                   })()}

@@ -36,6 +36,7 @@ try:
         get_nearest_strike,
         get_otm_strike,
         get_strike_data,
+        get_expiry_for_selection,
         get_super_trend_segments,
         load_bhavcopy,
         load_expiry,
@@ -101,6 +102,20 @@ def _same_segment(seg_a: Dict[str, Any], seg_b: Dict[str, Any]) -> bool:
         pd.Timestamp(seg_a["start"]) == pd.Timestamp(seg_b["start"])
         and pd.Timestamp(seg_a["end"]) == pd.Timestamp(seg_b["end"])
     )
+
+
+def _strategy_uses_futures_only_next_monthly(strategy_def: StrategyDefinition) -> bool:
+    fut_legs = [
+        leg for leg in getattr(strategy_def, "legs", [])
+        if leg.instrument == InstrumentType.FUTURE
+    ]
+    opt_legs = [
+        leg for leg in getattr(strategy_def, "legs", [])
+        if leg.instrument == InstrumentType.OPTION
+    ]
+    if opt_legs or not fut_legs:
+        return False
+    return any(leg.expiry_type == ExpiryType.MONTHLY_T1 for leg in fut_legs)
 
 
 def _format_trade_index(base_index: int, roll_count: int):
@@ -267,6 +282,9 @@ def _process_trade_legs(
     entry_spot: float,
 ):
     global _debug_fut_log_count
+    strategy_future_only = bool(strategy_def.legs) and all(
+        leg.instrument == InstrumentType.FUTURE for leg in strategy_def.legs
+    )
     # Use optimized data loading - cached, no repeated Polars->Pandas conversion
     bhav_entry = _get_bhav_data(from_date)
     bhav_exit  = _get_bhav_data(to_date)
@@ -344,7 +362,14 @@ def _process_trade_legs(
             )
 
         elif leg.instrument == InstrumentType.FUTURE:
-            fut_expiry_for_leg = fut_expiry if leg.expiry_type == ExpiryType.MONTHLY else curr_expiry
+            if leg.expiry_type == ExpiryType.MONTHLY_T1:
+                fut_expiry_for_leg = pd.Timestamp(
+                    get_expiry_for_selection(from_date, index_name, "NEXT_MONTHLY")
+                )
+            elif leg.expiry_type == ExpiryType.MONTHLY:
+                fut_expiry_for_leg = fut_expiry
+            else:
+                fut_expiry_for_leg = curr_expiry
 
             fut_entry_mask = bhav_entry[
                 (bhav_entry["Instrument"] == "FUTIDX")
@@ -421,7 +446,10 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
     entry_dte = int(params.get('entry_dte', 0))
     exit_dte = int(params.get('exit_dte', 0))
     expiry_type = str(params.get('expiry_type', 'WEEKLY')).upper()
-    is_next_expiry = expiry_type in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+    is_next_expiry = (
+        expiry_type in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+        or _strategy_uses_futures_only_next_monthly(strategy_def)
+    )
     
     if entry_dte > 0 or exit_dte > 0:
         print(f"[DTE] entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={expiry_type}, is_next={is_next_expiry}")
@@ -598,46 +626,60 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 if trade_curr_expiry is None:
                     break
 
-                # Find the monthly futures contract for this trade's FUT leg.
-                midx = np.searchsorted(monthly_exp_arr, np.datetime64(trade_curr_expiry, "ns"), side="left")
-                if midx >= len(monthly_exp_arr):
-                    break
-                trade_fut_expiry = pd.Timestamp(monthly_exp_arr[midx])
+                if strategy_future_only:
+                    future_leg_types = [
+                        leg.expiry_type
+                        for leg in strategy_def.legs
+                        if leg.instrument == InstrumentType.FUTURE
+                    ]
+                    future_leg_expiry = future_leg_types[0] if future_leg_types else ExpiryType.MONTHLY
+                    future_expiry_sel = "NEXT_MONTHLY" if future_leg_expiry == ExpiryType.MONTHLY_T1 else "MONTHLY"
+                    trade_fut_expiry = pd.Timestamp(
+                        get_expiry_for_selection(current_entry, index_name, future_expiry_sel)
+                    )
+                else:
+                    # Find the monthly futures contract for this trade's FUT leg.
+                    midx = np.searchsorted(monthly_exp_arr, np.datetime64(trade_curr_expiry, "ns"), side="left")
+                    if midx >= len(monthly_exp_arr):
+                        break
+                    trade_fut_expiry = pd.Timestamp(monthly_exp_arr[midx])
 
-                # ── FUTURES ROLL LOGIC ───────────────────────────────────────────
-                # Market reality: when weekly_expiry == monthly_expiry (last week
-                # of the month), the current month futures contract expires the
-                # same day as the options. On that day the contract is illiquid,
-                # bid-ask spreads blow out, and the hedge breaks down.
-                #
-                # Professional practice: always trade the NEXT month's futures
-                # contract during expiry week.
-                #
-                # Entry  → open next-month FUT on trade entry date
-                # Exit   → close next-month FUT on the same weekly expiry date
-                #           (we do NOT hold to the FUT's own expiry; we simply
-                #            read next-month contract price on the options exit day)
-                #
-                # Example — Trade 4 (entry 27-Jan-2025, expiry 30-Jan-2025):
-                #   OLD: Jan FUT  (illiquid on its own expiry day)
-                #   NEW: Feb FUT  (liquid; read Feb contract price on 30-Jan close)
-                if trade_curr_expiry == trade_fut_expiry:
-                    next_midx = midx + 1
-                    if next_midx < len(monthly_exp_arr):
-                        trade_fut_expiry = pd.Timestamp(monthly_exp_arr[next_midx])
-                        logger.debug(
-                            "FUT roll: weekly==monthly (%s) -> using next month FUT expiry %s",
-                            trade_curr_expiry.strftime("%Y-%m-%d"),
-                            trade_fut_expiry.strftime("%Y-%m-%d"),
-                        )
-                    # else: last data point — keep current month, better than skipping
+                    # ── FUTURES ROLL LOGIC ───────────────────────────────────────────
+                    # Market reality: when weekly_expiry == monthly_expiry (last week
+                    # of the month), the current month futures contract expires the
+                    # same day as the options. On that day the contract is illiquid,
+                    # bid-ask spreads blow out, and the hedge breaks down.
+                    #
+                    # Professional practice: always trade the NEXT month's futures
+                    # contract during expiry week.
+                    #
+                    # Entry  → open next-month FUT on trade entry date
+                    # Exit   → close next-month FUT on the same weekly expiry date
+                    #           (we do NOT hold to the FUT's own expiry; we simply
+                    #            read next-month contract price on the options exit day)
+                    #
+                    # Example — Trade 4 (entry 27-Jan-2025, expiry 30-Jan-2025):
+                    #   OLD: Jan FUT  (illiquid on its own expiry day)
+                    #   NEW: Feb FUT  (liquid; read Feb contract price on 30-Jan close)
+                    if trade_curr_expiry == trade_fut_expiry:
+                        next_midx = midx + 1
+                        if next_midx < len(monthly_exp_arr):
+                            trade_fut_expiry = pd.Timestamp(monthly_exp_arr[next_midx])
+                            logger.debug(
+                                "FUT roll: weekly==monthly (%s) -> using next month FUT expiry %s",
+                                trade_curr_expiry.strftime("%Y-%m-%d"),
+                                trade_fut_expiry.strftime("%Y-%m-%d"),
+                            )
+                        # else: last data point — keep current month, better than skipping
 
                 # Calendar exit competition: Expiry vs STR segment end
-                effective_to_date = trade_curr_expiry
+                # Futures-only strategies should close on the futures contract expiry
+                # they are priced against, not the current weekly expiry.
+                effective_to_date = trade_fut_expiry if strategy_future_only else trade_curr_expiry
                 exit_reason = "Expiry"
                 if str_enabled and active_segment is not None:
                     seg_end = pd.Timestamp(active_segment["end"])
-                    if seg_end < pd.Timestamp(trade_curr_expiry):
+                    if seg_end < pd.Timestamp(effective_to_date):
                         # FIX #3A: use pre-extracted array
                         last_trade_day = _get_last_trading_day_on_or_before(spot_dates_arr, seg_end)
                         if last_trade_day is None:
@@ -681,13 +723,16 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 spot_pnl = round(exit_spot_price - entry_spot_price, 2)
                 for leg_index, leg_row in enumerate(leg_rows):
                     is_future_leg = leg_row["Type"] == "FUT"
+                    leg_exit_date = effective_to_date
+                    if is_future_leg and exit_reason == "Expiry":
+                        leg_exit_date = trade_fut_expiry
                     trades.append(
                         {
                             "Trade": current_trade_num,
                             "Leg": leg_index + 1,
                             "Index": trade_index_label,
                             "Entry Date": current_entry,
-                            "Exit Date": effective_to_date,
+                            "Exit Date": leg_exit_date,
                             "Type": leg_row["Type"],
                             "Strike": leg_row["Strike"],
                             "B/S": leg_row["B/S"],

@@ -32,3 +32,12 @@ Recent history mixes free-form messages with Conventional Commit prefixes. Prefe
 
 ## Graphify Workflow
 If `graphify-out/GRAPH_REPORT.md` exists, read it before answering architecture questions. Prefer `graphify-out/wiki/index.md` over raw graph files when available. After changing code files, run `graphify update .` to refresh the repository graph.
+
+## graphify
+
+This project has a graphify knowledge graph at graphify-out/.
+
+Rules:
+- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
