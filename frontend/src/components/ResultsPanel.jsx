@@ -1106,7 +1106,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     </thead>
                     <tbody>
                       {rows.map((row, rowIdx) => (
-                        <tr key={rowIdx} className="border-b border-default hover:bg-hover transition-colors">
+                        <tr key={rowIdx} className="border-b border-default">
                           {row.map((cell, cellIdx) => {
                             const isNumeric = typeof cell === 'number';
                             const isPositive = isNumeric && cell > 0;
@@ -1292,9 +1292,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const legPercentPnl = entrySpotForPct > 1000
                               ? (legNetPnlPoints / entrySpotForPct) * 100
                               : 0;
-                            const rowBg = isReEntryRow
-                              ? 'bg-blue-50/40 dark:bg-blue-950/20'
-                              : (rowIdx % 2 === 0 ? 'bg-white dark:bg-gray-900' : 'bg-gray-50 dark:bg-gray-800/50');
+                            const rowBg = rowIdx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
                             const exitDateValue = (() => {
                               const ownExit = getVisibleExitDate(leg);
                               if (ownExit && String(ownExit).trim() !== '') return ownExit;
@@ -1302,7 +1300,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             })();
 
                             return (
-                              <tr key={`${group.tradeNumber}-${rowIdx}`} className={`border-b border-default ${rowBg} hover:bg-base transition-colors`}>
+                              <tr key={`${group.tradeNumber}-${rowIdx}`} className={`border-b border-default ${rowBg}`}>
                                 <td className="px-3 py-2 text-xs text-primary">{leg['Index'] || group.tradeNumber}</td>
                                 <td className="px-3 py-2 text-xs text-primary">{leg['Entry Date'] || group.entryDate || '-'}</td>
                                 <td className="px-3 py-2 text-xs text-primary">{exitDateValue}</td>
@@ -1318,7 +1316,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-secondary">
                                   {position}
                                   {isReEntryRow && (
-                                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300">
+                                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-700">
                                       RE-{leg['ReEntryTrigger']}
                                     </span>
                                   )}
@@ -1366,7 +1364,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               : 0;
                             
                             return (
-                              <tr key={`${group.tradeNumber}-${legIdx}`} className={`border-b border-default ${groupIdx % 2 === 0 ? 'bg-surface' : 'bg-hover'} hover:bg-base transition-colors`}>
+                              <tr key={`${group.tradeNumber}-${legIdx}`} className={legIdx % 2 === 0 ? 'border-b border-default bg-white' : 'border-b border-default bg-slate-50'}>
                                 {isFirstLeg ? (
                                   <>
                                     <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.legs[0]['Index'] || group.tradeNumber}</td>
@@ -1433,7 +1431,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             // Charges column is handled as its own <td> below, so excluded here.
                             const emptyCellSpan = 11 + (bufferStrikeEnabled ? 1 : 0);
                             return (
-                              <tr className="border-b-2 border-strong bg-slate-100">
+                              <tr className={groupIdx % 2 === 0 ? 'border-b-2 border-strong bg-white' : 'border-b-2 border-strong bg-slate-50'}>
                                 <td colSpan={emptyCellSpan}></td>
                                 {chargesEnabled && (
                                   <td className="px-3 py-2 text-right text-xs font-bold text-orange-600">
