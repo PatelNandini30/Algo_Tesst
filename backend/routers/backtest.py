@@ -39,6 +39,28 @@ _backtest_process_executor = ProcessPoolExecutor(max_workers=_BACKTEST_PROCESS_W
 # Add the parent directory to the path to import engines
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
+def _validate_lazy_leg_no_cycles(leg_config: dict, depth: int = 0) -> None:
+    """Guard lazy-leg chaining depth before dispatching a backtest."""
+    if depth > 3:
+        raise ValueError("Lazy leg chaining depth exceeds maximum of 3.")
+    for reentry_key in ('reEntryOnSL', 'reEntryOnTarget'):
+        reentry = leg_config.get(reentry_key) or {}
+        if not isinstance(reentry, dict):
+            continue
+        if str(reentry.get('mode', '') or '').upper().replace(' ', '_') != 'LAZY_LEG':
+            continue
+        child = reentry.get('lazyLegConfig')
+        if child:
+            _validate_lazy_leg_no_cycles(child, depth + 1)
+
+
+def _validate_lazy_legs_payload(payload: dict) -> None:
+    """Validate all lazy-leg configs in a submitted AlgoTest payload."""
+    for leg in payload.get('legs', []) or []:
+        if isinstance(leg, dict):
+            _validate_lazy_leg_no_cycles(leg)
+
 # Import strategy functions dynamically to avoid circular imports
 import importlib
 
@@ -486,6 +508,10 @@ async def run_algotest_backtest_endpoint(request: dict):
     """
     Legacy synchronous endpoint kept for backwards compatibility.
     """
+    try:
+        _validate_lazy_legs_payload(request or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         _backtest_process_executor,
@@ -501,6 +527,10 @@ async def queue_algotest_job(request: dict):
     Enqueue an AlgoTest backtest to run asynchronously via Celery.
     """
     payload = dict(request or {})
+    try:
+        _validate_lazy_legs_payload(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     task = run_algotest_job.apply_async(args=[payload])
     return {"status": "queued", "job_id": task.id}
 

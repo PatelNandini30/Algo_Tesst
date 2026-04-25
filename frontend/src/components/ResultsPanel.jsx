@@ -99,6 +99,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     'Expiry': formatDateToDdMmYyyy(trade['Expiry']),
   })), [trades]);
 
+  const isLazyLegRow = (row) => (
+    row?.['Is Lazy Leg'] === true ||
+    String(row?.['Is Lazy Leg'] || '').toLowerCase() === 'true' ||
+    Boolean(row?.['Lazy Leg Name'])
+  );
+
   // Two-pass grouping:
   // Pass 1 — find the canonical (first-seen) Entry Date per Trade number.
   // Pass 2 — rows whose Entry Date matches the canonical go into the main
@@ -114,7 +120,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     tradesWithFormattedDates.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
       const entryDate = trade['Entry Date'] || '';
-      const isReEntryRow = Boolean(trade['ReEntryIndex'] || trade['ReEntryTrigger'] || trade['ReEntryMode']);
+      const isReEntryRow = Boolean(trade['ReEntryIndex'] || trade['ReEntryTrigger'] || trade['ReEntryMode'] || isLazyLegRow(trade));
       if (!isReEntryRow && !canonicalEntryByTrade.has(tradeNum)) {
         canonicalEntryByTrade.set(tradeNum, entryDate);
       }
@@ -142,6 +148,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         trade['ReEntryIndex'] ||
         trade['ReEntryTrigger'] ||
         trade['ReEntryMode'] ||
+        isLazyLegRow(trade) ||
         String(trade['Index'] || '').includes('.')
       );
 
@@ -227,7 +234,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         groupKey,
         legs: legsArr,
         displayRows,
-        hasReEntries: displayRows.some(row => Boolean(row['ReEntryIndex'] || row['ReEntryTrigger'] || row['ReEntryMode'])),
+        hasReEntries: displayRows.some(row => Boolean(row['ReEntryIndex'] || row['ReEntryTrigger'] || row['ReEntryMode'] || isLazyLegRow(row))),
         entryDate:  leg1Row['Entry Date'],
         exitDate:    leg1Row['Exit Date'],
         entrySpot:  parseFloat(leg1Row['Entry Spot']) || 0,
@@ -446,7 +453,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Entry Spot','Exit Spot','Spot P&L',
       'Type','Strike',
       ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
-      'B/S','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
+      'B/S','Re-Entry','Mode','Lazy Leg','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
@@ -495,7 +502,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='Peak')  val=m.peak;
           else if (key==='DD')    val=m.dd;
           else if (key==='%DD')   val=m.pctDd;
-        } else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
+        } else if (key==='Leg' && isLazyLegRow(trade)) val=trade['Lazy Leg Name'] || trade[key];
+        else if (key==='Re-Entry') val=isLazyLegRow(trade) ? 'Lazy Leg' : (trade['ReEntryTrigger'] || '');
+        else if (key==='Mode') val=isLazyLegRow(trade) ? 'Lazy Leg' : (trade['ReEntryMode'] || '');
+        else if (key==='Lazy Leg') val=isLazyLegRow(trade) ? (trade['Lazy Leg Name'] || 'Lazy Leg') : '';
+        else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
         else if (key==='Exit Date') val=getVisibleExitDate(trade);
         else if (key==='Expiry') val=formatDateToDdMmYyyy(
           trade['Future Expiry'] || trade['futures_expiry'] || trade['Expiry']
@@ -520,8 +531,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state:'frozen', ySplit:1 }] });
 
     // Column widths
-    const colWidths = { 'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'buffer_ref_price':12,'buffer_strike_offset':10,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
+    const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
+      'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry':14,'Mode':12,'Lazy Leg':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
     ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 
@@ -1274,7 +1285,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                       return (
                         <React.Fragment key={group.groupKey}>
                           {hasReEntries ? rowsToRender.map((leg, rowIdx) => {
-                            const isReEntryRow = Boolean(leg['ReEntryIndex'] || leg['ReEntryTrigger'] || leg['ReEntryMode']);
+                            const isLazy = isLazyLegRow(leg);
+                            const isReEntryRow = Boolean(leg['ReEntryIndex'] || leg['ReEntryTrigger'] || leg['ReEntryMode'] || isLazy);
                             const optionType = leg['Type'] || leg['Leg_1_Type'] || 'CE';
                             const strike = leg['Strike'] || leg['Leg_1_Strike'] || leg['Leg 1 Strike'] || 0;
                             const bufferRef = parseFloat(leg.buffer_ref_price);
@@ -1316,8 +1328,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-secondary">
                                   {position}
                                   {isReEntryRow && (
-                                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-100 text-blue-700">
-                                      RE-{leg['ReEntryTrigger']}
+                                    <span className={`ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${isLazy ? 'bg-violet-100 text-violet-700' : 'bg-blue-100 text-blue-700'}`}>
+                                      {isLazy ? `LAZY-${leg['Lazy Leg Name'] || 'LEG'}` : `RE-${leg['ReEntryTrigger']}`}
                                     </span>
                                   )}
                                 </td>

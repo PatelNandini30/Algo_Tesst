@@ -1074,6 +1074,7 @@ def _parse_leg_reentry_config(leg_src: dict) -> dict:
 
     Supports the frontend camelCase payload and the older snake_case fallback.
     Re-entry counts are capped at 20 and clamped to a minimum of 1.
+    Lazy-leg configs are preserved for the dedicated lazy-leg execution path.
     """
     def _normalize_count(value):
         try:
@@ -1089,32 +1090,292 @@ def _parse_leg_reentry_config(leg_src: dict) -> dict:
         're_entry_on_target': False,
         're_entry_on_target_count': 1,
         're_entry_on_target_mode': 'RE_ASAP',
+        're_entry_on_target_lazy_leg_config': None,
         're_entry_on_sl': False,
         're_entry_on_sl_count': 1,
         're_entry_on_sl_mode': 'RE_ASAP',
+        're_entry_on_sl_lazy_leg_config': None,
+        'on_target': None,
+        'on_sl': None,
     }
 
     ret = leg_src.get('reEntryOnTarget') or leg_src.get('re_entry_on_target') or {}
     if isinstance(ret, dict) and ret:
+        mode = _normalize_mode(ret.get('mode', 'RE_ASAP'))
+        count = _normalize_count(ret.get('count', 1))
+        lazy_cfg = ret.get('lazyLegConfig') or ret.get('lazy_leg_config')
         cfg['re_entry_on_target'] = True
-        cfg['re_entry_on_target_count'] = _normalize_count(ret.get('count', 1))
-        cfg['re_entry_on_target_mode'] = _normalize_mode(ret.get('mode', 'RE_ASAP'))
+        cfg['re_entry_on_target_count'] = count
+        cfg['re_entry_on_target_mode'] = mode
+        cfg['re_entry_on_target_lazy_leg_config'] = lazy_cfg
+        cfg['on_target'] = {'mode': mode, 'count': count, 'lazy_leg_config': lazy_cfg}
     elif bool(leg_src.get('re_entry_target_enabled', False)):
+        mode = _normalize_mode(leg_src.get('re_entry_target_mode', 'RE_ASAP'))
+        count = _normalize_count(leg_src.get('re_entry_target_count', 1))
+        lazy_cfg = leg_src.get('re_entry_target_lazy_leg_config')
         cfg['re_entry_on_target'] = True
-        cfg['re_entry_on_target_count'] = _normalize_count(leg_src.get('re_entry_target_count', 1))
-        cfg['re_entry_on_target_mode'] = _normalize_mode(leg_src.get('re_entry_target_mode', 'RE_ASAP'))
+        cfg['re_entry_on_target_count'] = count
+        cfg['re_entry_on_target_mode'] = mode
+        cfg['re_entry_on_target_lazy_leg_config'] = lazy_cfg
+        cfg['on_target'] = {'mode': mode, 'count': count, 'lazy_leg_config': lazy_cfg}
 
     resl = leg_src.get('reEntryOnSL') or leg_src.get('re_entry_on_sl') or {}
     if isinstance(resl, dict) and resl:
+        mode = _normalize_mode(resl.get('mode', 'RE_ASAP'))
+        count = _normalize_count(resl.get('count', 1))
+        lazy_cfg = resl.get('lazyLegConfig') or resl.get('lazy_leg_config')
         cfg['re_entry_on_sl'] = True
-        cfg['re_entry_on_sl_count'] = _normalize_count(resl.get('count', 1))
-        cfg['re_entry_on_sl_mode'] = _normalize_mode(resl.get('mode', 'RE_ASAP'))
+        cfg['re_entry_on_sl_count'] = count
+        cfg['re_entry_on_sl_mode'] = mode
+        cfg['re_entry_on_sl_lazy_leg_config'] = lazy_cfg
+        cfg['on_sl'] = {'mode': mode, 'count': count, 'lazy_leg_config': lazy_cfg}
     elif bool(leg_src.get('re_entry_sl_enabled', False)):
+        mode = _normalize_mode(leg_src.get('re_entry_sl_mode', 'RE_ASAP'))
+        count = _normalize_count(leg_src.get('re_entry_sl_count', 1))
+        lazy_cfg = leg_src.get('re_entry_sl_lazy_leg_config')
         cfg['re_entry_on_sl'] = True
-        cfg['re_entry_on_sl_count'] = _normalize_count(leg_src.get('re_entry_sl_count', 1))
-        cfg['re_entry_on_sl_mode'] = _normalize_mode(leg_src.get('re_entry_sl_mode', 'RE_ASAP'))
+        cfg['re_entry_on_sl_count'] = count
+        cfg['re_entry_on_sl_mode'] = mode
+        cfg['re_entry_on_sl_lazy_leg_config'] = lazy_cfg
+        cfg['on_sl'] = {'mode': mode, 'count': count, 'lazy_leg_config': lazy_cfg}
 
     return cfg
+
+
+def _resolve_lazy_leg_expiry(lazy_leg_config: dict, entry_date, index: str, fallback_expiry) -> pd.Timestamp:
+    """Resolve the option expiry for a lazy leg from its own expiry selection."""
+    expiry_raw = str(lazy_leg_config.get('expiry', 'WEEKLY') or 'WEEKLY').upper().strip()
+    if expiry_raw in ('WEEKLY_T1', 'NEXT_WEEK', 'NEXTWEEKLY'):
+        expiry_raw = 'NEXT_WEEKLY'
+    elif expiry_raw in ('MONTHLY_T1', 'NEXT_MONTH', 'NEXTMONTHLY'):
+        expiry_raw = 'NEXT_MONTHLY'
+    elif expiry_raw not in ('WEEKLY', 'NEXT_WEEKLY', 'MONTHLY', 'NEXT_MONTHLY'):
+        expiry_raw = 'WEEKLY'
+
+    try:
+        return pd.Timestamp(get_expiry_for_selection(entry_date, index, expiry_raw))
+    except Exception as exc:
+        _log(f"      [LAZY LEG] Expiry resolve failed for {expiry_raw}: {exc}; using {fallback_expiry}")
+        return pd.Timestamp(fallback_expiry)
+
+
+def _lazy_base_reason(reason_str: str) -> str:
+    """Normalize an exit reason to its base lazy-leg trigger category."""
+    base = str(reason_str or '').split('[')[0].strip().upper()
+    if base.startswith('COMPLETE_'):
+        base = base.replace('COMPLETE_', '', 1)
+    return base
+
+
+def _execute_lazy_leg(
+    lazy_leg_config: dict,
+    entry_date,
+    exit_date,
+    expiry_date,
+    entry_spot: float,
+    index: str,
+    trading_calendar,
+    square_off_mode: str,
+    slippage_pct: float,
+    strike_interval: int,
+    depth: int = 0,
+) -> list:
+    """
+    Enter a separately configured lazy leg on the parent trigger date, monitor its
+    own risk rules, and return trade-leg dicts compatible with normal legs.
+    """
+    max_chain_depth = 3
+    if not isinstance(lazy_leg_config, dict) or not lazy_leg_config:
+        _log("      [LAZY LEG] Missing lazyLegConfig - skipping")
+        return []
+    if depth > max_chain_depth:
+        _log(f"      [LAZY LEG] Chain depth {depth} exceeded - stopping recursion")
+        return []
+
+    entry_ts = pd.Timestamp(entry_date)
+    exit_ts = pd.Timestamp(exit_date)
+    if entry_ts >= exit_ts:
+        _log(f"      [LAZY LEG] Entry {entry_ts.date()} >= exit {exit_ts.date()} - skipping")
+        return []
+
+    reentry_cutoff = str(lazy_leg_config.get('no_reentry_after') or '').strip()
+    if reentry_cutoff and entry_ts >= exit_ts:
+        _log(f"      [LAZY LEG] No Re-Entry After gate blocked entry on {entry_ts.date()}")
+        return []
+
+    option_type = str(lazy_leg_config.get('option_type', 'CE') or 'CE').upper().strip()
+    if option_type in ('CALL', 'C'):
+        option_type = 'CE'
+    elif option_type in ('PUT', 'P'):
+        option_type = 'PE'
+    position = str(lazy_leg_config.get('position', 'SELL') or 'SELL').upper().strip()
+    lots = int(lazy_leg_config.get('lots', lazy_leg_config.get('lot', 1)) or 1)
+    lot_size = get_lot_size(index, entry_ts)
+    ll_expiry = _resolve_lazy_leg_expiry(lazy_leg_config, entry_ts, index, expiry_date)
+
+    ll_strike_config = {
+        **lazy_leg_config,
+        'option_type': option_type,
+        'strike_selection': lazy_leg_config.get('strike_selection', {}),
+        'strike_selection_type': (
+            lazy_leg_config.get('strike_selection_type')
+            or (lazy_leg_config.get('strike_selection') or {}).get('type', 'STRIKE_TYPE')
+        ),
+    }
+    strike, _, _ = _resolve_strike(
+        leg_config=ll_strike_config,
+        entry_date=entry_ts,
+        entry_spot=entry_spot,
+        expiry_date=ll_expiry,
+        strike_interval=strike_interval,
+        index=index,
+    )
+    if strike is None:
+        _log("      [LAZY LEG] Strike resolution failed - skipping")
+        return []
+
+    raw_entry = get_option_premium_from_db(
+        date=entry_ts.strftime('%Y-%m-%d'),
+        index=index,
+        strike=strike,
+        option_type=option_type,
+        expiry=ll_expiry.strftime('%Y-%m-%d'),
+    )
+    if raw_entry is None:
+        _log(f"      [LAZY LEG] Missing entry premium for {option_type} {strike} on {entry_ts.date()}")
+        return []
+    entry_premium = _apply_slippage(raw_entry, position, 'entry', slippage_pct)
+
+    raw_exit = get_option_premium_from_db(
+        date=exit_ts.strftime('%Y-%m-%d'),
+        index=index,
+        strike=strike,
+        option_type=option_type,
+        expiry=ll_expiry.strftime('%Y-%m-%d'),
+    )
+    if raw_exit is None:
+        fallback_spot = get_spot_price_from_db(exit_ts, index) or entry_spot
+        raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=strike, option_type=option_type)
+    exit_premium = _apply_slippage(raw_exit, position, 'exit', slippage_pct)
+    pnl = (exit_premium - entry_premium) if position == 'BUY' else (entry_premium - exit_premium)
+
+    lazy_leg = {
+        'leg_number': 9000 + depth,
+        'segment': 'OPTION',
+        'option_type': option_type,
+        'strike': strike,
+        'position': position,
+        'lots': lots,
+        'lot_size': lot_size,
+        'entry_date': entry_ts,
+        'exit_date': exit_ts,
+        'entry_spot': entry_spot,
+        'exit_spot': get_spot_price_from_db(exit_ts, index) or entry_spot,
+        'entry_premium': entry_premium,
+        'exit_premium': exit_premium,
+        'raw_entry_premium': raw_entry,
+        'raw_exit_premium': raw_exit,
+        'market_entry_premium': raw_entry,
+        'market_exit_premium': raw_exit,
+        'pnl': pnl,
+        'ce_pnl': pnl if option_type in ('CE', 'CALL', 'C') else 0,
+        'pe_pnl': pnl if option_type in ('PE', 'PUT', 'P') else 0,
+        '_resolved_expiry': ll_expiry,
+        '_is_lazy_leg': True,
+        '_lazy_leg_name': lazy_leg_config.get('lazy_leg_name') or lazy_leg_config.get('name') or f'lazy{depth + 1}',
+        '_lazy_entry_date': entry_ts,
+        '_lazy_exit_date': exit_ts,
+        '_lazy_depth': depth,
+    }
+    _copy_sl_tgt_to_leg(lazy_leg, lazy_leg_config)
+    _copy_trail_sl_to_leg(lazy_leg, lazy_leg_config)
+    lazy_leg['_reentry'] = _parse_leg_reentry_config(lazy_leg_config)
+
+    lazy_check = check_leg_stop_loss_target(
+        entry_date=entry_ts,
+        exit_date=exit_ts,
+        expiry_date=ll_expiry,
+        entry_spot=entry_spot,
+        legs_config=[lazy_leg],
+        index=index,
+        trading_calendar=trading_calendar,
+        square_off_mode='partial',
+        slippage_pct=slippage_pct,
+    )
+
+    actual_exit_date = exit_ts
+    exit_reason = 'EXPIRY'
+    if lazy_check and lazy_check[0].get('triggered'):
+        actual_exit_date = pd.Timestamp(lazy_check[0].get('exit_date') or exit_ts)
+        exit_reason = lazy_check[0].get('exit_reason', 'EXPIRY')
+        new_raw_exit = get_option_premium_from_db(
+            date=actual_exit_date.strftime('%Y-%m-%d'),
+            index=index,
+            strike=strike,
+            option_type=option_type,
+            expiry=ll_expiry.strftime('%Y-%m-%d'),
+        )
+        if new_raw_exit is None:
+            fallback_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
+            new_raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=strike, option_type=option_type)
+        new_exit = _apply_slippage(new_raw_exit, position, 'exit', slippage_pct)
+        lazy_leg['exit_date'] = actual_exit_date
+        lazy_leg['_lazy_exit_date'] = actual_exit_date
+        lazy_leg['exit_spot'] = get_spot_price_from_db(actual_exit_date, index) or entry_spot
+        lazy_leg['exit_premium'] = new_exit
+        lazy_leg['raw_exit_premium'] = new_raw_exit
+        lazy_leg['market_exit_premium'] = new_raw_exit
+        lazy_leg['pnl'] = (new_exit - entry_premium) if position == 'BUY' else (entry_premium - new_exit)
+        lazy_leg['ce_pnl'] = lazy_leg['pnl'] if option_type in ('CE', 'CALL', 'C') else 0
+        lazy_leg['pe_pnl'] = lazy_leg['pnl'] if option_type in ('PE', 'PUT', 'P') else 0
+
+    lazy_leg['exit_reason'] = exit_reason
+    result_legs = [lazy_leg]
+
+    if lazy_check and lazy_check[0].get('triggered') and actual_exit_date < exit_ts:
+        trigger_base = _lazy_base_reason(exit_reason)
+        reentry_cfg = None
+        if trigger_base in {'STOP_LOSS', 'TRAIL_SL'}:
+            reentry_cfg = (lazy_leg.get('_reentry') or {}).get('on_sl')
+        elif trigger_base == 'TARGET':
+            reentry_cfg = (lazy_leg.get('_reentry') or {}).get('on_target')
+
+        if reentry_cfg:
+            mode = str(reentry_cfg.get('mode', '') or '').upper().strip()
+            child_cfg = reentry_cfg.get('lazy_leg_config')
+            if mode == 'LAZY_LEG' and child_cfg:
+                result_legs.extend(_execute_lazy_leg(
+                    lazy_leg_config=child_cfg,
+                    entry_date=actual_exit_date,
+                    exit_date=exit_ts,
+                    expiry_date=expiry_date,
+                    entry_spot=get_spot_price_from_db(actual_exit_date, index) or entry_spot,
+                    index=index,
+                    trading_calendar=trading_calendar,
+                    square_off_mode=square_off_mode,
+                    slippage_pct=slippage_pct,
+                    strike_interval=strike_interval,
+                    depth=depth + 1,
+                ))
+            elif mode in ('RE_ASAP', 'RE_ASAP_REV', 'RE_MOMENTUM', 'RE_MOMENTUM_REV', 'RE_COST', 'RE_COST_REV'):
+                repeat_cfg = dict(lazy_leg_config)
+                if _is_reentry_mode_reverse(mode):
+                    repeat_cfg['position'] = 'BUY' if position == 'SELL' else 'SELL'
+                result_legs.extend(_execute_lazy_leg(
+                    lazy_leg_config=repeat_cfg,
+                    entry_date=actual_exit_date,
+                    exit_date=exit_ts,
+                    expiry_date=expiry_date,
+                    entry_spot=get_spot_price_from_db(actual_exit_date, index) or entry_spot,
+                    index=index,
+                    trading_calendar=trading_calendar,
+                    square_off_mode=square_off_mode,
+                    slippage_pct=slippage_pct,
+                    strike_interval=strike_interval,
+                    depth=depth + 1,
+                ))
+
+    return result_legs
 
 
 def _reentry_mode_base(mode_str: str) -> str:
@@ -3599,6 +3860,66 @@ def run_algotest_backtest(params):
                         )
                         sl_reason = first_t['exit_reason'] if first_t else None
 
+                # ========== STEP 8G: FIRE LAZY LEGS ==========
+                # Lazy legs are separately configured legs that start on the parent
+                # leg's SL/Target trigger date and contribute to the same trade P&L.
+                lazy_result_legs = []
+                if per_leg_results is not None:
+                    for li, tleg in enumerate(trade_legs):
+                        if li >= len(per_leg_results):
+                            continue
+                        res = per_leg_results[li]
+                        if not res.get('triggered'):
+                            continue
+
+                        trigger_base = _lazy_base_reason(res.get('exit_reason', ''))
+                        reentry_cfg = tleg.get('_reentry') or {}
+                        candidate_cfg = None
+                        if trigger_base in {'STOP_LOSS', 'TRAIL_SL'}:
+                            sl_cfg = reentry_cfg.get('on_sl') or {}
+                            if sl_cfg.get('mode') == 'LAZY_LEG':
+                                candidate_cfg = sl_cfg.get('lazy_leg_config')
+                        elif trigger_base == 'TARGET':
+                            tgt_cfg = reentry_cfg.get('on_target') or {}
+                            if tgt_cfg.get('mode') == 'LAZY_LEG':
+                                candidate_cfg = tgt_cfg.get('lazy_leg_config')
+
+                        if not candidate_cfg:
+                            if (
+                                (trigger_base in {'STOP_LOSS', 'TRAIL_SL'} and reentry_cfg.get('re_entry_on_sl_mode') == 'LAZY_LEG') or
+                                (trigger_base == 'TARGET' and reentry_cfg.get('re_entry_on_target_mode') == 'LAZY_LEG')
+                            ):
+                                _log(f"  [LAZY LEG] Leg {li + 1}: LAZY_LEG mode has no lazyLegConfig - skipping")
+                            continue
+
+                        lazy_entry_date = pd.Timestamp(res.get('exit_date') or exit_date)
+                        if lazy_entry_date >= pd.Timestamp(exit_date):
+                            _log(f"  [LAZY LEG] Trigger date {lazy_entry_date.date()} >= exit_date {pd.Timestamp(exit_date).date()} - no room")
+                            continue
+
+                        lazy_spot = get_spot_price_from_db(lazy_entry_date, index) or entry_spot
+                        new_lazy_legs = _execute_lazy_leg(
+                            lazy_leg_config=candidate_cfg,
+                            entry_date=lazy_entry_date,
+                            exit_date=exit_date,
+                            expiry_date=expiry_date,
+                            entry_spot=lazy_spot,
+                            index=index,
+                            trading_calendar=trading_calendar,
+                            square_off_mode=square_off_mode,
+                            slippage_pct=slippage_pct,
+                            strike_interval=strike_interval,
+                            depth=0,
+                        )
+                        for lazy_leg in new_lazy_legs:
+                            lazy_leg['_lazy_parent_leg_number'] = tleg.get('leg_number', li + 1)
+                            lazy_leg['_lazy_trigger'] = trigger_base
+                        lazy_result_legs.extend(new_lazy_legs)
+                        _log(f"  [LAZY LEG] Leg {li + 1} trigger={res.get('exit_reason')}: fired {len(new_lazy_legs)} lazy leg(s)")
+
+                if lazy_result_legs:
+                    trade_legs.extend(lazy_result_legs)
+
                 # ========== STEP 9: TOTAL P&L ==========
                 total_pnl = sum(leg['pnl'] for leg in trade_legs)
                 
@@ -3635,6 +3956,11 @@ def run_algotest_backtest(params):
                 # last leg closes. Use max() over all valid per-leg exit dates.
                 if per_leg_results is not None:
                     valid_dates = [r['exit_date'] for r in per_leg_results if r.get('exit_date') is not None]
+                    valid_dates.extend(
+                        leg.get('_lazy_exit_date')
+                        for leg in trade_legs
+                        if leg.get('_is_lazy_leg') and leg.get('_lazy_exit_date') is not None
+                    )
                     actual_exit_date = max(valid_dates) if valid_dates else exit_date
                 else:
                     actual_exit_date = exit_date
@@ -3692,6 +4018,11 @@ def run_algotest_backtest(params):
 
                         reentry_cfg = tleg.get('_reentry') or {}
                         if not reentry_cfg.get('re_entry_on_sl') and not reentry_cfg.get('re_entry_on_target'):
+                            continue
+                        if (
+                            (leg_exit_base in ('STOP_LOSS', 'TRAIL_SL') and reentry_cfg.get('re_entry_on_sl_mode') == 'LAZY_LEG') or
+                            (leg_exit_base == 'TARGET' and reentry_cfg.get('re_entry_on_target_mode') == 'LAZY_LEG')
+                        ):
                             continue
 
                         re_legs = _execute_per_leg_reentry(
@@ -3780,6 +4111,9 @@ def run_algotest_backtest(params):
         for plr in per_leg:
             _all_exit_dates.add(str(plr.get('exit_date', '')))
         for _leg in t.get('legs', []):
+            _leg_exit = _leg.get('_lazy_exit_date') or _leg.get('exit_date')
+            if _leg_exit is not None:
+                _all_exit_dates.add(str(_leg_exit))
             for _re in (_leg.get('re_entries') or []):
                 _re_exit = _re.get('exit_date')
                 if _re_exit is not None:
@@ -3804,7 +4138,13 @@ def run_algotest_backtest(params):
         # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
         for leg_idx, leg in enumerate(trade['legs']):
             try:
-                leg_num = leg['leg_number']
+                leg_num = leg.get('_lazy_parent_leg_number') if leg.get('_is_lazy_leg', False) else leg['leg_number']
+                if leg_num is None:
+                    leg_num = leg.get('leg_number', 1)
+                is_lazy_leg = bool(leg.get('_is_lazy_leg', False))
+                lazy_leg_name = leg.get('_lazy_leg_name', '')
+                lazy_entry_date_val = leg.get('_lazy_entry_date')
+                lazy_exit_date_val = leg.get('_lazy_exit_date')
                 # per_leg_results is aligned to trade['legs'] order (the list passed to
                 # check_leg_stop_loss_target), NOT necessarily leg_number.
                 # If any configured leg was skipped earlier due to missing data,
@@ -3814,19 +4154,23 @@ def run_algotest_backtest(params):
                 li = leg_idx  # 0-based index into per_leg_results
 
                 # ── Resolve per-leg exit date & reason ────────────────────────────
-                leg_exit_date, leg_exit_reason = _resolve_leg_exit(
-                    per_leg_results=per_leg_res,
-                    trade_exit_date=trade['exit_date'],
-                    trade_exit_reason=trade.get('exit_reason', 'EXPIRY'),
-                    leg_idx=li,
-                )
+                if is_lazy_leg:
+                    leg_exit_date = lazy_exit_date_val or leg.get('exit_date') or trade['exit_date']
+                    leg_exit_reason = leg.get('exit_reason', 'EXPIRY')
+                else:
+                    leg_exit_date, leg_exit_reason = _resolve_leg_exit(
+                        per_leg_results=per_leg_res,
+                        trade_exit_date=trade['exit_date'],
+                        trade_exit_reason=trade.get('exit_reason', 'EXPIRY'),
+                        leg_idx=li,
+                    )
 
                 # ── Exit spot price taken from the leg's own exit date ─────────────
                 # Each leg may exit on a different day (partial mode), so we fetch
                 # the spot price for that specific exit date.
                 leg_exit_spot = _exit_spot_cache.get(str(leg_exit_date))
                 if leg_exit_spot is None:
-                    leg_exit_spot = trade.get('exit_spot', entry_spot_val)
+                    leg_exit_spot = leg.get('exit_spot', trade.get('exit_spot', entry_spot_val))
 
                 # ── Check if trade has any options legs (for Spot columns visibility) ─
                 has_options_leg = any(l.get('segment') != 'FUTURE' for l in trade['legs'])
@@ -3921,9 +4265,13 @@ def run_algotest_backtest(params):
                 
                 row = {
                     'Trade':          trade_id,
-                    'Leg':            leg_num,
-                    'Index':          trade_id,
-                    'Entry Date':     format_date_dd_mm_yyyy(trade['entry_date']),
+                    'Leg':            lazy_leg_name if is_lazy_leg and lazy_leg_name else leg_num,
+                    'Index':          (
+                        f"{trade_id}.{leg.get('_lazy_depth', 0) + 1}"
+                        if is_lazy_leg
+                        else trade_id
+                    ),
+                    'Entry Date':     format_date_dd_mm_yyyy(lazy_entry_date_val if is_lazy_leg and lazy_entry_date_val is not None else trade['entry_date']),
                     'Exit Date':      format_date_dd_mm_yyyy(leg_exit_date),
                     'Leg Exit Date':  format_date_dd_mm_yyyy(leg_exit_date),
                     'Type':           leg_option_type,
@@ -3968,6 +4316,13 @@ def run_algotest_backtest(params):
                     'DD':             row_dd,
                     '%DD':            row_pct_dd,
                     'Exit Reason':    leg_exit_reason,
+                    'ReEntryIndex':   leg.get('_lazy_depth', 0) + 1 if is_lazy_leg else '',
+                    'ReEntryTrigger': f"LAZY-{str(leg.get('_lazy_trigger') or leg_exit_reason or '').replace('COMPLETE_', '')}" if is_lazy_leg else '',
+                    'ReEntryMode':    'LAZY_LEG' if is_lazy_leg else '',
+                    'Is Lazy Leg':    is_lazy_leg,
+                    'Lazy Leg Name':  lazy_leg_name if is_lazy_leg else '',
+                    'Lazy Entry Date': format_date_dd_mm_yyyy(lazy_entry_date_val) if is_lazy_leg and lazy_entry_date_val is not None else '',
+                    'Lazy Exit Date': format_date_dd_mm_yyyy(lazy_exit_date_val) if is_lazy_leg and lazy_exit_date_val is not None else '',
                 }
                 row[segment_column_name] = trade.get('str_segment', '')
                 if leg.get('segment') == 'FUTURE':

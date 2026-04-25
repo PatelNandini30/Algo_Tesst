@@ -317,6 +317,259 @@ const SegBtn = ({ options, value, onChange, size = 'md' }) => {
   );
 };
 
+const createDefaultLazyLeg = (index = 1) => ({
+  id: null,
+  name: `lazy${index}`,
+  segment: 'options',
+  position: 'sell',
+  lot: 1,
+  option_type: 'call',
+  expiry: 'weekly',
+  strike_criteria: 'strike_type',
+  strike_type: 'atm',
+  premium_value: 0,
+  premium_min: 0,
+  premium_max: 0,
+  target_enabled: false,
+  target_mode: 'POINTS',
+  target_value: 0,
+  stop_loss_enabled: false,
+  stop_loss_mode: 'POINTS',
+  stop_loss_value: 0,
+  trail_sl_enabled: false,
+  trail_sl_mode: 'POINTS',
+  trail_sl_trigger: 0,
+  trail_sl_move: 0,
+  re_entry_target_enabled: false,
+  re_entry_target_mode: 'RE_ASAP',
+  re_entry_target_count: 1,
+  re_entry_sl_enabled: false,
+  re_entry_sl_mode: 'RE_ASAP',
+  re_entry_sl_count: 1,
+  simple_momentum_enabled: false,
+  simple_momentum_mode: 'POINTS_UP',
+  simple_momentum_value: 0,
+  no_reentry_after: '',
+  child_lazy_leg_sl_id: null,
+  child_lazy_leg_target_id: null,
+});
+
+const LazyLegModal = ({
+  isOpen,
+  onClose,
+  onSave,
+  onConfigureChild,
+  editingConfig,
+  strikeTypeOpts,
+  totalLazyLegCount,
+}) => {
+  const [form, setForm] = useState(() => editingConfig || createDefaultLazyLeg(totalLazyLegCount + 1));
+  const set = (key, value) => setForm(prev => ({ ...prev, [key]: value }));
+
+  useEffect(() => {
+    setForm(editingConfig || createDefaultLazyLeg(totalLazyLegCount + 1));
+  }, [isOpen, editingConfig, totalLazyLegCount]);
+
+  if (!isOpen) return null;
+
+  const numberValue = (value) => value ?? '';
+  const riskModeOptions = (
+    <>
+      <option value="POINTS">Points</option>
+      <option value="PERCENT">Percent</option>
+    </>
+  );
+  const reEntryModeOptions = (
+    <>
+      <option value="RE_ASAP">RE ASAP</option>
+      <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+      <option value="RE_MOMENTUM">RE MOMENTUM</option>
+      <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+      <option value="RE_COST">RE COST</option>
+      <option value="RE_COST_REV">RE COST &#8629;</option>
+      <option value="LAZY_LEG">Lazy Leg</option>
+    </>
+  );
+  const inputClass = 'h-8 px-2 border border-strong rounded text-xs bg-surface';
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[100] flex items-center justify-center p-4">
+      <div className="bg-surface rounded-xl shadow-2xl border border-default w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+        <div className="sticky top-0 bg-surface border-b border-subtle px-5 py-4 flex items-center justify-between">
+          <h3 className="text-base font-semibold text-primary">Create New Lazy Leg</h3>
+          <button type="button" onClick={onClose} className="text-xl leading-none text-muted hover:text-primary">×</button>
+        </div>
+
+        <div className="p-5 space-y-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="text-xs text-secondary">
+              Name
+              <input value={form.name || ''} onChange={e => set('name', e.target.value)} className={`${inputClass} mt-1 w-full`} />
+            </label>
+            <label className="text-xs text-secondary">
+              Lots
+              <input type="number" min={1} value={numberValue(form.lot)} onChange={e => set('lot', parseInt(e.target.value, 10) || 1)} className={`${inputClass} mt-1 w-full`} />
+            </label>
+            <div>
+              <div className="text-xs text-secondary mb-1">Position</div>
+              <SegBtn size="sm" value={form.position} onChange={v => set('position', v)} options={[{ label: 'Buy', value: 'buy' }, { label: 'Sell', value: 'sell' }]} />
+            </div>
+            <div>
+              <div className="text-xs text-secondary mb-1">Option Type</div>
+              <SegBtn size="sm" value={form.option_type} onChange={v => set('option_type', v)} options={[{ label: 'Call', value: 'call' }, { label: 'Put', value: 'put' }]} />
+            </div>
+            <label className="text-xs text-secondary">
+              Expiry
+              <select value={form.expiry} onChange={e => set('expiry', e.target.value)} className={`${inputClass} mt-1 w-full`}>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+                <option value="next_weekly">Next Weekly</option>
+                <option value="next_monthly">Next Monthly</option>
+              </select>
+            </label>
+            <label className="text-xs text-secondary">
+              Strike Criteria
+              <select value={form.strike_criteria} onChange={e => set('strike_criteria', e.target.value)} className={`${inputClass} mt-1 w-full`}>
+                <option value="strike_type">Strike Type</option>
+                <option value="closest_premium">Closest Premium</option>
+                <option value="premium_range">Premium Range</option>
+              </select>
+            </label>
+            {form.strike_criteria === 'strike_type' && (
+              <label className="text-xs text-secondary">
+                Strike Type
+                <select value={form.strike_type} onChange={e => set('strike_type', e.target.value)} className={`${inputClass} mt-1 w-full`}>
+                  {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </label>
+            )}
+            {form.strike_criteria === 'closest_premium' && (
+              <label className="text-xs text-secondary">
+                Premium Value
+                <input type="number" min={0} value={numberValue(form.premium_value)} onChange={e => set('premium_value', +e.target.value)} className={`${inputClass} mt-1 w-full`} />
+              </label>
+            )}
+            {form.strike_criteria === 'premium_range' && (
+              <>
+                <label className="text-xs text-secondary">
+                  Premium Min
+                  <input type="number" min={0} value={numberValue(form.premium_min)} onChange={e => set('premium_min', +e.target.value)} className={`${inputClass} mt-1 w-full`} />
+                </label>
+                <label className="text-xs text-secondary">
+                  Premium Max
+                  <input type="number" min={0} value={numberValue(form.premium_max)} onChange={e => set('premium_max', +e.target.value)} className={`${inputClass} mt-1 w-full`} />
+                </label>
+              </>
+            )}
+          </div>
+
+          <div className="border-t border-subtle pt-4 space-y-3">
+            <h4 className="text-xs font-semibold text-secondary uppercase tracking-wide">Risk Controls</h4>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="flex items-center gap-2">
+                <Toggle enabled={form.target_enabled} onToggle={v => set('target_enabled', v !== undefined ? Boolean(v) : !form.target_enabled)} size="sm" />
+                <span className="text-xs text-secondary">Target Profit</span>
+              </div>
+              {form.target_enabled && (
+                <>
+                  <select value={form.target_mode} onChange={e => set('target_mode', e.target.value)} className={inputClass}>{riskModeOptions}</select>
+                  <input type="number" min={0} value={numberValue(form.target_value)} onChange={e => set('target_value', +e.target.value)} className={inputClass} />
+                </>
+              )}
+              <div className="flex items-center gap-2">
+                <Toggle enabled={form.stop_loss_enabled} onToggle={v => set('stop_loss_enabled', v !== undefined ? Boolean(v) : !form.stop_loss_enabled)} size="sm" />
+                <span className="text-xs text-secondary">Stop Loss</span>
+              </div>
+              {form.stop_loss_enabled && (
+                <>
+                  <select value={form.stop_loss_mode} onChange={e => set('stop_loss_mode', e.target.value)} className={inputClass}>{riskModeOptions}</select>
+                  <input type="number" min={0} value={numberValue(form.stop_loss_value)} onChange={e => set('stop_loss_value', +e.target.value)} className={inputClass} />
+                </>
+              )}
+              <div className="flex items-center gap-2">
+                <Toggle enabled={form.trail_sl_enabled} onToggle={v => set('trail_sl_enabled', v !== undefined ? Boolean(v) : !form.trail_sl_enabled)} size="sm" />
+                <span className="text-xs text-secondary">Trail SL</span>
+              </div>
+              {form.trail_sl_enabled && (
+                <>
+                  <select value={form.trail_sl_mode} onChange={e => set('trail_sl_mode', e.target.value)} className={inputClass}>{riskModeOptions}</select>
+                  <div className="flex gap-2">
+                    <input type="number" min={0} placeholder="X" value={numberValue(form.trail_sl_trigger)} onChange={e => set('trail_sl_trigger', +e.target.value)} className={`${inputClass} w-full`} />
+                    <input type="number" min={0} placeholder="Y" value={numberValue(form.trail_sl_move)} onChange={e => set('trail_sl_move', +e.target.value)} className={`${inputClass} w-full`} />
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="border-t border-subtle pt-4 space-y-3">
+            <h4 className="text-xs font-semibold text-secondary uppercase tracking-wide">Re-Entry</h4>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Toggle enabled={form.re_entry_target_enabled} onToggle={v => set('re_entry_target_enabled', v !== undefined ? Boolean(v) : !form.re_entry_target_enabled)} size="sm" />
+                  <span className="text-xs text-secondary">Re-entry on Target</span>
+                </div>
+                {form.re_entry_target_enabled && (
+                  <div className="flex gap-2">
+                    <select value={form.re_entry_target_mode} onChange={e => set('re_entry_target_mode', e.target.value)} className={`${inputClass} flex-1`}>{reEntryModeOptions}</select>
+                    <input type="number" min={1} max={20} value={form.re_entry_target_count} onChange={e => set('re_entry_target_count', +e.target.value || 1)} className={`${inputClass} w-16`} />
+                  </div>
+                )}
+                {form.re_entry_target_enabled && form.re_entry_target_mode === 'LAZY_LEG' && (
+                  <button type="button" disabled={!form.id} onClick={() => onConfigureChild(form.id, 'target')} className="text-xs px-2 py-1 rounded border border-accent text-accent disabled:opacity-50">
+                    {form.child_lazy_leg_target_id ? 'Edit Child Lazy Leg' : 'Configure Child Lazy Leg'}
+                  </button>
+                )}
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <Toggle enabled={form.re_entry_sl_enabled} onToggle={v => set('re_entry_sl_enabled', v !== undefined ? Boolean(v) : !form.re_entry_sl_enabled)} size="sm" />
+                  <span className="text-xs text-secondary">Re-entry on SL</span>
+                </div>
+                {form.re_entry_sl_enabled && (
+                  <div className="flex gap-2">
+                    <select value={form.re_entry_sl_mode} onChange={e => set('re_entry_sl_mode', e.target.value)} className={`${inputClass} flex-1`}>{reEntryModeOptions}</select>
+                    <input type="number" min={1} max={20} value={form.re_entry_sl_count} onChange={e => set('re_entry_sl_count', +e.target.value || 1)} className={`${inputClass} w-16`} />
+                  </div>
+                )}
+                {form.re_entry_sl_enabled && form.re_entry_sl_mode === 'LAZY_LEG' && (
+                  <button type="button" disabled={!form.id} onClick={() => onConfigureChild(form.id, 'sl')} className="text-xs px-2 py-1 rounded border border-accent text-accent disabled:opacity-50">
+                    {form.child_lazy_leg_sl_id ? 'Edit Child Lazy Leg' : 'Configure Child Lazy Leg'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-subtle pt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="flex items-center gap-2">
+              <Toggle enabled={form.simple_momentum_enabled} onToggle={v => set('simple_momentum_enabled', v !== undefined ? Boolean(v) : !form.simple_momentum_enabled)} size="sm" />
+              <span className="text-xs text-secondary">Simple Momentum</span>
+            </div>
+            {form.simple_momentum_enabled && (
+              <>
+                <select value={form.simple_momentum_mode} onChange={e => set('simple_momentum_mode', e.target.value)} className={inputClass}>
+                  <option value="POINTS_UP">Points Up</option>
+                  <option value="POINTS_DOWN">Points Down</option>
+                  <option value="PERCENT_UP">Percent Up</option>
+                  <option value="PERCENT_DOWN">Percent Down</option>
+                </select>
+                <input type="number" min={0} value={numberValue(form.simple_momentum_value)} onChange={e => set('simple_momentum_value', +e.target.value)} className={inputClass} />
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="sticky bottom-0 bg-surface border-t border-subtle px-5 py-4 flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="px-4 py-2 rounded border border-default text-sm text-secondary hover:bg-hover">Cancel</button>
+          <button type="button" onClick={() => onSave(form)} className="px-4 py-2 rounded bg-accent text-white text-sm font-semibold hover:bg-accent-hover">Create and Select</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const StrategyBuilder = () => {
   const [instrument, setInstrument] = useState('NIFTY');
   const [underlying, setUnderlying] = useState('cash');
@@ -327,6 +580,15 @@ const StrategyBuilder = () => {
   const [delayTime, setDelayTime] = useState('09:15');
   const [squareOffMode, setSquareOffMode] = useState('partial');
   const [legs, setLegs] = useState([]);
+  const [lazyLegs, setLazyLegs] = useState({});
+  const [lazyLegModal, setLazyLegModal] = useState({
+    open: false,
+    parentLegId: null,
+    trigger: null,
+    editingLazyLegId: null,
+    parentLazyLegId: null,
+    childTrigger: null,
+  });
 
   const hasFuturesLeg = useMemo(
     () => legs.some(l => l.segment === 'futures'),
@@ -802,6 +1064,8 @@ const [slippagePct, setSlippagePct] = useState(0);
       trail_sl_enabled: false, trail_sl_mode: 'POINTS', trail_sl_trigger: 0, trail_sl_move: 0,
       re_entry_target_enabled: false, re_entry_target_mode: 'RE_ASAP', re_entry_target_count: 1,
       re_entry_sl_enabled: false, re_entry_sl_mode: 'RE_ASAP', re_entry_sl_count: 1,
+      lazy_leg_sl_id: null,
+      lazy_leg_target_id: null,
       simple_momentum_enabled: false, simple_momentum_mode: 'POINTS_UP', simple_momentum_value: 0,
       straddle_multiplier: draftLeg.straddle_multiplier ?? 0.5,
       straddle_direction: draftLeg.straddle_direction ?? '+',
@@ -824,9 +1088,230 @@ const [slippagePct, setSlippagePct] = useState(0);
   };
   const addLeg = addLegFromDraft;
 
-  const removeLeg = (id) => setLegs(prev => prev.filter(l => l.id !== id));
+  const removeLeg = (id) => {
+    const leg = legs.find(l => l.id === id);
+    const lazyIds = [leg?.lazy_leg_sl_id, leg?.lazy_leg_target_id].filter(Boolean);
+    setLegs(prev => prev.filter(l => l.id !== id));
+    if (lazyIds.length) {
+      setLazyLegs(prev => {
+        const next = { ...prev };
+        lazyIds.forEach(lazyId => delete next[lazyId]);
+        return next;
+      });
+    }
+  };
   const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => l.id === id ? { ...l, [field]: value } : l));
   const handleLegChange = (legIndex, nextLeg) => setLegs(prev => prev.map((leg, idx) => idx === legIndex ? { ...leg, ...nextLeg } : leg));
+  const totalLazyLegCount = Object.keys(lazyLegs).length;
+  const lazyLegList = Object.values(lazyLegs);
+
+  const updateLazyLeg = (id, field, value) => {
+    setLazyLegs(prev => prev[id] ? ({ ...prev, [id]: { ...prev[id], [field]: value } }) : prev);
+  };
+
+  const createLazyLegConfig = (overrides = {}) => {
+    const id = `lazy_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    return {
+      ...createDefaultLazyLeg(totalLazyLegCount + 1),
+      id,
+      name: `lazy${totalLazyLegCount + 1}`,
+      ...overrides,
+    };
+  };
+
+  const attachLazyLegToParent = (parentLegId, trigger, lazyId) => {
+    updateLeg(parentLegId, trigger === 'sl' ? 'lazy_leg_sl_id' : 'lazy_leg_target_id', lazyId);
+  };
+
+  const attachLazyLegToLazyParent = (parentLazyLegId, trigger, lazyId) => {
+    setLazyLegs(prev => prev[parentLazyLegId] ? ({
+      ...prev,
+      [parentLazyLegId]: {
+        ...prev[parentLazyLegId],
+        [trigger === 'sl' ? 'child_lazy_leg_sl_id' : 'child_lazy_leg_target_id']: lazyId,
+      },
+    }) : prev);
+  };
+
+  const ensureLazyLegForParent = (parentLegId, trigger) => {
+    const parentLeg = legs.find(l => l.id === parentLegId);
+    const existingId = trigger === 'sl' ? parentLeg?.lazy_leg_sl_id : parentLeg?.lazy_leg_target_id;
+    if (existingId && lazyLegs[existingId]) return existingId;
+    if (totalLazyLegCount >= 10) {
+      alert('Maximum 10 lazy legs allowed per strategy.');
+      return null;
+    }
+    const lazyLeg = createLazyLegConfig();
+    setLazyLegs(prev => ({ ...prev, [lazyLeg.id]: lazyLeg }));
+    attachLazyLegToParent(parentLegId, trigger, lazyLeg.id);
+    return lazyLeg.id;
+  };
+
+  const ensureChildLazyLeg = (parentLazyLegId, trigger) => {
+    const parentLazyLeg = lazyLegs[parentLazyLegId];
+    const existingId = trigger === 'sl' ? parentLazyLeg?.child_lazy_leg_sl_id : parentLazyLeg?.child_lazy_leg_target_id;
+    if (existingId && lazyLegs[existingId]) return existingId;
+    if (totalLazyLegCount >= 10) {
+      alert('Maximum 10 lazy legs allowed per strategy.');
+      return null;
+    }
+    const lazyLeg = createLazyLegConfig();
+    setLazyLegs(prev => ({
+      ...prev,
+      [lazyLeg.id]: lazyLeg,
+      [parentLazyLegId]: {
+        ...prev[parentLazyLegId],
+        [trigger === 'sl' ? 'child_lazy_leg_sl_id' : 'child_lazy_leg_target_id']: lazyLeg.id,
+      },
+    }));
+    return lazyLeg.id;
+  };
+
+  const openLazyLegModal = (parentLegId, trigger) => {
+    const parentLeg = legs.find(l => l.id === parentLegId);
+    const existingId = trigger === 'sl' ? parentLeg?.lazy_leg_sl_id : parentLeg?.lazy_leg_target_id;
+    setLazyLegModal({ open: true, parentLegId, trigger, editingLazyLegId: existingId || null, parentLazyLegId: null, childTrigger: null });
+  };
+
+  // Open the lazy-leg popup when Lazy Leg is selected; saved lazy legs render as full rows below.
+  const handleReEntryModeSelect = (legId, trigger, value) => {
+    updateLeg(legId, trigger === 'sl' ? 're_entry_sl_mode' : 're_entry_target_mode', value);
+    if (value === 'LAZY_LEG') {
+      openLazyLegModal(legId, trigger);
+    }
+  };
+
+  const handleLazyReEntryModeSelect = (lazyId, trigger, value) => {
+    updateLazyLeg(lazyId, trigger === 'sl' ? 're_entry_sl_mode' : 're_entry_target_mode', value);
+    if (value === 'LAZY_LEG') {
+      openChildLazyLegModal(lazyId, trigger);
+    }
+  };
+
+  const openLazyLegById = (lazyLegId) => {
+    setLazyLegModal({ open: true, parentLegId: null, trigger: null, editingLazyLegId: lazyLegId, parentLazyLegId: null, childTrigger: null });
+  };
+
+  const openChildLazyLegModal = (parentLazyLegId, trigger) => {
+    if (!parentLazyLegId) return;
+    const parentLazyLeg = lazyLegs[parentLazyLegId];
+    const existingId = trigger === 'sl' ? parentLazyLeg?.child_lazy_leg_sl_id : parentLazyLeg?.child_lazy_leg_target_id;
+    setLazyLegModal({ open: true, parentLegId: null, trigger: null, editingLazyLegId: existingId || null, parentLazyLegId, childTrigger: trigger });
+  };
+
+  const closeLazyLegModal = () => {
+    setLazyLegModal({ open: false, parentLegId: null, trigger: null, editingLazyLegId: null, parentLazyLegId: null, childTrigger: null });
+  };
+
+  const saveLazyLeg = (lazyLegConfig) => {
+    const { parentLegId, trigger, editingLazyLegId, parentLazyLegId, childTrigger } = lazyLegModal;
+    if (totalLazyLegCount >= 10 && !editingLazyLegId) {
+      alert('Maximum 10 lazy legs allowed per strategy.');
+      return;
+    }
+    const id = editingLazyLegId || `lazy_${Date.now()}`;
+    const finalConfig = { ...lazyLegConfig, id };
+
+    setLazyLegs(prev => {
+      const next = { ...prev, [id]: finalConfig };
+      if (parentLazyLegId && next[parentLazyLegId]) {
+        next[parentLazyLegId] = {
+          ...next[parentLazyLegId],
+          [childTrigger === 'sl' ? 'child_lazy_leg_sl_id' : 'child_lazy_leg_target_id']: id,
+        };
+      }
+      return next;
+    });
+
+    if (parentLegId && trigger) {
+      updateLeg(parentLegId, trigger === 'sl' ? 'lazy_leg_sl_id' : 'lazy_leg_target_id', id);
+    }
+
+    closeLazyLegModal();
+  };
+
+  const removeLazyLeg = (lazyLegId) => {
+    setLazyLegs(prev => {
+      const next = { ...prev };
+      delete next[lazyLegId];
+      Object.keys(next).forEach(id => {
+        next[id] = {
+          ...next[id],
+          child_lazy_leg_sl_id: next[id].child_lazy_leg_sl_id === lazyLegId ? null : next[id].child_lazy_leg_sl_id,
+          child_lazy_leg_target_id: next[id].child_lazy_leg_target_id === lazyLegId ? null : next[id].child_lazy_leg_target_id,
+        };
+      });
+      return next;
+    });
+    setLegs(prev => prev.map(leg => ({
+      ...leg,
+      lazy_leg_sl_id: leg.lazy_leg_sl_id === lazyLegId ? null : leg.lazy_leg_sl_id,
+      lazy_leg_target_id: leg.lazy_leg_target_id === lazyLegId ? null : leg.lazy_leg_target_id,
+    })));
+  };
+
+  const serializeLazyLeg = (ll, registry, seen = new Set()) => {
+    if (!ll || seen.has(ll.id)) return null;
+    const nextSeen = new Set(seen);
+    if (ll.id) nextSeen.add(ll.id);
+    const optType = (ll.option_type || 'call').toLowerCase();
+    const criteria = ll.strike_criteria || 'strike_type';
+    const strikeType = criteria === 'closest_premium'
+      ? 'CLOSEST_PREMIUM'
+      : criteria === 'premium_range'
+        ? 'PREMIUM_RANGE'
+        : 'STRIKE_TYPE';
+    const serialized = {
+      segment: 'OPTIONS',
+      position: (ll.position || 'sell').toUpperCase(),
+      lots: ll.lot || 1,
+      option_type: optType === 'call' ? 'CE' : 'PE',
+      expiry: (ll.expiry || 'weekly').toUpperCase(),
+      strike_selection: {
+        type: strikeType,
+        strike_type: (ll.strike_type || 'atm').toUpperCase(),
+        premium: ll.premium_value || 0,
+        lower: ll.premium_min || 0,
+        upper: ll.premium_max || 0,
+      },
+      lazy_leg_name: ll.name,
+      no_reentry_after: ll.no_reentry_after || null,
+    };
+
+    if (ll.target_enabled && ll.target_value > 0) {
+      serialized.targetProfit = { mode: ll.target_mode, value: ll.target_value };
+    }
+    if (ll.stop_loss_enabled && ll.stop_loss_value > 0) {
+      serialized.stopLoss = { mode: ll.stop_loss_mode, value: ll.stop_loss_value };
+    }
+    if (ll.trail_sl_enabled) {
+      serialized.trailSL = { mode: ll.trail_sl_mode, trigger: ll.trail_sl_trigger, move: ll.trail_sl_move };
+    }
+    if (ll.re_entry_sl_enabled) {
+      const childConfig = ll.re_entry_sl_mode === 'LAZY_LEG' && ll.child_lazy_leg_sl_id
+        ? serializeLazyLeg(registry[ll.child_lazy_leg_sl_id], registry, nextSeen)
+        : null;
+      serialized.reEntryOnSL = {
+        mode: ll.re_entry_sl_mode,
+        count: ll.re_entry_sl_count,
+        ...(childConfig ? { lazyLegConfig: childConfig } : {}),
+      };
+    }
+    if (ll.re_entry_target_enabled) {
+      const childConfig = ll.re_entry_target_mode === 'LAZY_LEG' && ll.child_lazy_leg_target_id
+        ? serializeLazyLeg(registry[ll.child_lazy_leg_target_id], registry, nextSeen)
+        : null;
+      serialized.reEntryOnTarget = {
+        mode: ll.re_entry_target_mode,
+        count: ll.re_entry_target_count,
+        ...(childConfig ? { lazyLegConfig: childConfig } : {}),
+      };
+    }
+    if (ll.simple_momentum_enabled) {
+      serialized.simpleMomentum = { mode: ll.simple_momentum_mode, value: ll.simple_momentum_value };
+    }
+    return serialized;
+  };
 
   const buildPayload = () => {
     const legsPayload = legs.map(l => {
@@ -904,6 +1389,12 @@ const [slippagePct, setSlippagePct] = useState(0);
           mode: l.re_entry_target_mode,
           count: l.re_entry_target_count,
         };
+        if (l.re_entry_target_mode === 'LAZY_LEG' && l.lazy_leg_target_id) {
+          const lazyConfig = serializeLazyLeg(lazyLegs[l.lazy_leg_target_id], lazyLegs);
+          if (lazyConfig) {
+            leg.reEntryOnTarget.lazyLegConfig = lazyConfig;
+          }
+        }
       }
 
       // Re-entry on SL - only send if enabled
@@ -912,6 +1403,12 @@ const [slippagePct, setSlippagePct] = useState(0);
           mode: l.re_entry_sl_mode,
           count: l.re_entry_sl_count,
         };
+        if (l.re_entry_sl_mode === 'LAZY_LEG' && l.lazy_leg_sl_id) {
+          const lazyConfig = serializeLazyLeg(lazyLegs[l.lazy_leg_sl_id], lazyLegs);
+          if (lazyConfig) {
+            leg.reEntryOnSL.lazyLegConfig = lazyConfig;
+          }
+        }
       }
 
       // Simple Momentum - only send if enabled
@@ -2111,7 +2608,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <Toggle enabled={leg.re_entry_target_enabled} onToggle={(val) => updateLeg(leg.id, 're_entry_target_enabled', val !== undefined ? Boolean(val) : !leg.re_entry_target_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
                               {leg.re_entry_target_enabled && (<>
-                                <select value={leg.re_entry_target_mode} onChange={e => updateLeg(leg.id, 're_entry_target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.re_entry_target_mode} onChange={e => handleReEntryModeSelect(leg.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
@@ -2124,12 +2621,30 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
+                              {leg.re_entry_target_enabled && leg.re_entry_target_mode === 'LAZY_LEG' && (
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => openLazyLegModal(leg.id, 'target')}
+                                    className="text-xs px-2 py-0.5 rounded border border-accent text-accent hover:bg-accent hover:text-white transition-colors"
+                                  >
+                                    {leg.lazy_leg_target_id
+                                      ? `Edit: ${lazyLegs[leg.lazy_leg_target_id]?.name || 'lazy leg'}`
+                                      : '+ Configure Lazy Leg'}
+                                  </button>
+                                  {leg.lazy_leg_target_id && (
+                                    <span className="text-xs text-secondary">
+                                      ({lazyLegs[leg.lazy_leg_target_id]?.option_type?.toUpperCase()} {lazyLegs[leg.lazy_leg_target_id]?.strike_type?.toUpperCase()})
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.re_entry_sl_enabled} onToggle={(val) => updateLeg(leg.id, 're_entry_sl_enabled', val !== undefined ? Boolean(val) : !leg.re_entry_sl_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
                               {leg.re_entry_sl_enabled && (<>
-                                <select value={leg.re_entry_sl_mode} onChange={e => updateLeg(leg.id, 're_entry_sl_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.re_entry_sl_mode} onChange={e => handleReEntryModeSelect(leg.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
@@ -2142,7 +2657,195 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
+                              {leg.re_entry_sl_enabled && leg.re_entry_sl_mode === 'LAZY_LEG' && (
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => openLazyLegModal(leg.id, 'sl')}
+                                    className="text-xs px-2 py-0.5 rounded border border-accent text-accent hover:bg-accent hover:text-white transition-colors"
+                                  >
+                                    {leg.lazy_leg_sl_id
+                                      ? `Edit: ${lazyLegs[leg.lazy_leg_sl_id]?.name || 'lazy leg'}`
+                                      : '+ Configure Lazy Leg'}
+                                  </button>
+                                  {leg.lazy_leg_sl_id && (
+                                    <span className="text-xs text-secondary">
+                                      ({lazyLegs[leg.lazy_leg_sl_id]?.option_type?.toUpperCase()} {lazyLegs[leg.lazy_leg_sl_id]?.strike_type?.toUpperCase()})
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {Object.keys(lazyLegs).length > 0 && (
+              <div className="bg-surface rounded-lg border border-default shadow-sm overflow-hidden">
+                <div className="px-4 py-2.5 border-b border-subtle">
+                  <h3 className="text-xs font-bold text-secondary uppercase tracking-wide">
+                    Lazy Legs <span className="text-muted font-medium normal-case">({lazyLegList.length}/10)</span>
+                  </h3>
+                </div>
+                <div className="divide-y divide-subtle">
+                  {lazyLegList.map(ll => (
+                    <div key={ll.id} className="px-4 py-3">
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-accent">{ll.name}</span>
+                          <span className="text-xs font-semibold text-primary">
+                            {ll.position?.toUpperCase()} {ll.option_type?.toUpperCase()} | {ll.expiry}
+                          </span>
+                        </div>
+                        <button type="button" onClick={() => removeLazyLeg(ll.id)} className="w-5 h-5 rounded-full bg-loss text-white text-xs leading-none">
+                          ×
+                        </button>
+                      </div>
+
+                      <div className="flex flex-wrap items-end gap-3">
+                        <label className="text-xs text-muted">
+                          Lots
+                          <input type="number" min={1} value={ll.lot || 1} onChange={e => updateLazyLeg(ll.id, 'lot', parseInt(e.target.value, 10) || 1)} className="block mt-1 w-14 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                        </label>
+                        <label className="text-xs text-muted">
+                          Position
+                          <select value={ll.position || 'sell'} onChange={e => updateLazyLeg(ll.id, 'position', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                            <option value="buy">Buy</option>
+                            <option value="sell">Sell</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-muted">
+                          Option Type
+                          <select value={ll.option_type || 'call'} onChange={e => updateLazyLeg(ll.id, 'option_type', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                            <option value="call">Call</option>
+                            <option value="put">Put</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-muted">
+                          Expiry
+                          <select value={ll.expiry || 'weekly'} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                            <option value="weekly">Weekly</option>
+                            <option value="monthly">Monthly</option>
+                            <option value="next_weekly">Next Weekly</option>
+                            <option value="next_monthly">Next Monthly</option>
+                          </select>
+                        </label>
+                        <label className="text-xs text-muted">
+                          Strike Criteria
+                          <select value={ll.strike_criteria || 'strike_type'} onChange={e => updateLazyLeg(ll.id, 'strike_criteria', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                            <option value="strike_type">Strike Type</option>
+                            <option value="closest_premium">Closest Premium</option>
+                            <option value="premium_range">Premium Range</option>
+                          </select>
+                        </label>
+                        {ll.strike_criteria === 'closest_premium' ? (
+                          <label className="text-xs text-muted">
+                            Premium
+                            <input type="number" min={0} value={ll.premium_value || 0} onChange={e => updateLazyLeg(ll.id, 'premium_value', +e.target.value)} className="block mt-1 w-20 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                          </label>
+                        ) : ll.strike_criteria === 'premium_range' ? (
+                          <div className="flex gap-2">
+                            <label className="text-xs text-muted">
+                              Min
+                              <input type="number" min={0} value={ll.premium_min || 0} onChange={e => updateLazyLeg(ll.id, 'premium_min', +e.target.value)} className="block mt-1 w-16 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                            </label>
+                            <label className="text-xs text-muted">
+                              Max
+                              <input type="number" min={0} value={ll.premium_max || 0} onChange={e => updateLazyLeg(ll.id, 'premium_max', +e.target.value)} className="block mt-1 w-16 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                            </label>
+                          </div>
+                        ) : (
+                          <label className="text-xs text-muted">
+                            Strike Type
+                            <select value={ll.strike_type || 'atm'} onChange={e => updateLazyLeg(ll.id, 'strike_type', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface w-24">
+                              {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                            </select>
+                          </label>
+                        )}
+                      </div>
+
+                      <div className="pt-2 mt-3 border-t border-subtle space-y-2">
+                        <div className="flex flex-wrap gap-x-4 gap-y-2">
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.target_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'target_enabled', val !== undefined ? Boolean(val) : !ll.target_enabled)} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
+                            {ll.target_enabled && (
+                              <>
+                                <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                </select>
+                                <input type="number" min={0} value={ll.target_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'target_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                              </>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.stop_loss_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'stop_loss_enabled', val !== undefined ? Boolean(val) : !ll.stop_loss_enabled)} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
+                            {ll.stop_loss_enabled && (
+                              <>
+                                <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                </select>
+                                <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                              </>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.trail_sl_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !ll.trail_sl_enabled)} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
+                          </div>
+                        </div>
+                        <div className="flex flex-wrap gap-x-4 gap-y-2">
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.re_entry_target_enabled} onToggle={(val) => updateLazyLeg(ll.id, 're_entry_target_enabled', val !== undefined ? Boolean(val) : !ll.re_entry_target_enabled)} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
+                            {ll.re_entry_target_enabled && (
+                              <>
+                                <select value={ll.re_entry_target_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                  <option value="RE_ASAP">RE ASAP</option>
+                                  <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+                                  <option value="RE_MOMENTUM">RE MOMENTUM</option>
+                                  <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+                                  <option value="RE_COST">RE COST</option>
+                                  <option value="RE_COST_REV">RE COST &#8629;</option>
+                                  <option value="LAZY_LEG">Lazy Leg</option>
+                                </select>
+                                <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                  {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
+                                </select>
+                              </>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.re_entry_sl_enabled} onToggle={(val) => updateLazyLeg(ll.id, 're_entry_sl_enabled', val !== undefined ? Boolean(val) : !ll.re_entry_sl_enabled)} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
+                            {ll.re_entry_sl_enabled && (
+                              <>
+                                <select value={ll.re_entry_sl_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                  <option value="RE_ASAP">RE ASAP</option>
+                                  <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+                                  <option value="RE_MOMENTUM">RE MOMENTUM</option>
+                                  <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+                                  <option value="RE_COST">RE COST</option>
+                                  <option value="RE_COST_REV">RE COST &#8629;</option>
+                                  <option value="LAZY_LEG">Lazy Leg</option>
+                                </select>
+                                <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                  {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
+                                </select>
+                              </>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.simple_momentum_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'simple_momentum_enabled', val !== undefined ? Boolean(val) : !ll.simple_momentum_enabled)} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Simple Momentum</span>
                           </div>
                         </div>
                       </div>
@@ -2153,6 +2856,215 @@ const [slippagePct, setSlippagePct] = useState(0);
             )}
           </div>
         </div>
+
+        {false && Object.keys(lazyLegs).length > 0 && (
+          <div className="mt-4 bg-surface rounded-lg border border-default shadow-sm overflow-hidden">
+            <div className="px-4 py-3 border-b border-subtle">
+              <h3 className="text-sm font-semibold text-primary">Lazy Legs</h3>
+            </div>
+            <div className="divide-y divide-subtle">
+              {lazyLegList.map(ll => (
+                <div key={ll.id} className="relative px-4 py-4 bg-surface">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className="px-2 py-0.5 rounded bg-hover border border-subtle text-xs font-semibold text-primary">
+                        {ll.name}
+                      </span>
+                      <span className="text-xs text-secondary">
+                        {ll.position?.toUpperCase()} {ll.option_type?.toUpperCase()} {ll.expiry}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button type="button" onClick={() => openLazyLegById(ll.id)} className="text-xs text-accent hover:text-accent-hover">
+                        Edit popup
+                      </button>
+                      <button type="button" onClick={() => removeLazyLeg(ll.id)} className="w-5 h-5 rounded-full bg-loss text-white text-xs leading-none">
+                        ×
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+                    <label className="text-xs text-secondary">
+                      Lots
+                      <input type="number" min={1} value={ll.lot || 1} onChange={e => updateLazyLeg(ll.id, 'lot', parseInt(e.target.value, 10) || 1)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface" />
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Position
+                      <select value={ll.position || 'sell'} onChange={e => updateLazyLeg(ll.id, 'position', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
+                        <option value="buy">Buy</option>
+                        <option value="sell">Sell</option>
+                      </select>
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Option Type
+                      <select value={ll.option_type || 'call'} onChange={e => updateLazyLeg(ll.id, 'option_type', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
+                        <option value="call">Call</option>
+                        <option value="put">Put</option>
+                      </select>
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Expiry
+                      <select value={ll.expiry || 'weekly'} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                        <option value="next_weekly">Next Weekly</option>
+                        <option value="next_monthly">Next Monthly</option>
+                      </select>
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Strike Criteria
+                      <select value={ll.strike_criteria || 'strike_type'} onChange={e => updateLazyLeg(ll.id, 'strike_criteria', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
+                        <option value="strike_type">Strike Type</option>
+                        <option value="closest_premium">Closest Premium</option>
+                        <option value="premium_range">Premium Range</option>
+                      </select>
+                    </label>
+                    {ll.strike_criteria === 'closest_premium' ? (
+                      <label className="text-xs text-secondary">
+                        Premium
+                        <input type="number" min={0} value={ll.premium_value || 0} onChange={e => updateLazyLeg(ll.id, 'premium_value', +e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface" />
+                      </label>
+                    ) : ll.strike_criteria === 'premium_range' ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="text-xs text-secondary">
+                          Min
+                          <input type="number" min={0} value={ll.premium_min || 0} onChange={e => updateLazyLeg(ll.id, 'premium_min', +e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface" />
+                        </label>
+                        <label className="text-xs text-secondary">
+                          Max
+                          <input type="number" min={0} value={ll.premium_max || 0} onChange={e => updateLazyLeg(ll.id, 'premium_max', +e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface" />
+                        </label>
+                      </div>
+                    ) : (
+                      <label className="text-xs text-secondary">
+                        Strike Type
+                        <select value={ll.strike_type || 'atm'} onChange={e => updateLazyLeg(ll.id, 'strike_type', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
+                          {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </label>
+                    )}
+                  </div>
+
+                  <div className="mt-3 pt-3 border-t border-subtle space-y-2">
+                    <div className="flex flex-wrap gap-x-4 gap-y-2">
+                      <div className="flex items-center gap-2">
+                        <Toggle enabled={ll.target_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'target_enabled', val !== undefined ? Boolean(val) : !ll.target_enabled)} size="sm" />
+                        <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
+                        {ll.target_enabled && (
+                          <>
+                            <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <option value="POINTS">Points (Pts)</option>
+                              <option value="PERCENT">Percent (%)</option>
+                            </select>
+                            <input type="number" min={0} value={ll.target_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'target_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                          </>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Toggle enabled={ll.stop_loss_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'stop_loss_enabled', val !== undefined ? Boolean(val) : !ll.stop_loss_enabled)} size="sm" />
+                        <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
+                        {ll.stop_loss_enabled && (
+                          <>
+                            <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <option value="POINTS">Points (Pts)</option>
+                              <option value="PERCENT">Percent (%)</option>
+                            </select>
+                            <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                          </>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Toggle enabled={ll.trail_sl_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'trail_sl_enabled', val !== undefined ? Boolean(val) : !ll.trail_sl_enabled)} size="sm" />
+                        <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
+                        {ll.trail_sl_enabled && (
+                          <>
+                            <select value={ll.trail_sl_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <option value="POINTS">Points</option>
+                              <option value="PERCENT">Percent</option>
+                            </select>
+                            <input type="number" min={0} placeholder="X" value={ll.trail_sl_trigger ?? 0} onChange={e => updateLazyLeg(ll.id, 'trail_sl_trigger', +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
+                            <input type="number" min={0} placeholder="Y" value={ll.trail_sl_move ?? 0} onChange={e => updateLazyLeg(ll.id, 'trail_sl_move', +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-x-4 gap-y-2">
+                      <div className="flex items-center gap-2">
+                        <Toggle enabled={ll.re_entry_target_enabled} onToggle={(val) => updateLazyLeg(ll.id, 're_entry_target_enabled', val !== undefined ? Boolean(val) : !ll.re_entry_target_enabled)} size="sm" />
+                        <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
+                        {ll.re_entry_target_enabled && (
+                          <>
+                            <select value={ll.re_entry_target_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <option value="RE_ASAP">RE ASAP</option>
+                              <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+                              <option value="RE_MOMENTUM">RE MOMENTUM</option>
+                              <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+                              <option value="RE_COST">RE COST</option>
+                              <option value="RE_COST_REV">RE COST &#8629;</option>
+                              <option value="LAZY_LEG">Lazy Leg</option>
+                            </select>
+                            <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
+                            </select>
+                            {ll.re_entry_target_mode === 'LAZY_LEG' && (
+                              <select value={ll.child_lazy_leg_target_id || ''} onChange={e => attachLazyLegToLazyParent(ll.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <option value="">Select</option>
+                                {lazyLegList.filter(opt => opt.id !== ll.id).map(opt => <option key={opt.id} value={opt.id}>{opt.name}</option>)}
+                              </select>
+                            )}
+                          </>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Toggle enabled={ll.re_entry_sl_enabled} onToggle={(val) => updateLazyLeg(ll.id, 're_entry_sl_enabled', val !== undefined ? Boolean(val) : !ll.re_entry_sl_enabled)} size="sm" />
+                        <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
+                        {ll.re_entry_sl_enabled && (
+                          <>
+                            <select value={ll.re_entry_sl_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <option value="RE_ASAP">RE ASAP</option>
+                              <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
+                              <option value="RE_MOMENTUM">RE MOMENTUM</option>
+                              <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
+                              <option value="RE_COST">RE COST</option>
+                              <option value="RE_COST_REV">RE COST &#8629;</option>
+                              <option value="LAZY_LEG">Lazy Leg</option>
+                            </select>
+                            <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
+                            </select>
+                            {ll.re_entry_sl_mode === 'LAZY_LEG' && (
+                              <select value={ll.child_lazy_leg_sl_id || ''} onChange={e => attachLazyLegToLazyParent(ll.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <option value="">Select</option>
+                                {lazyLegList.filter(opt => opt.id !== ll.id).map(opt => <option key={opt.id} value={opt.id}>{opt.name}</option>)}
+                              </select>
+                            )}
+                          </>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Toggle enabled={ll.simple_momentum_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'simple_momentum_enabled', val !== undefined ? Boolean(val) : !ll.simple_momentum_enabled)} size="sm" />
+                        <span className="text-xs font-medium text-secondary whitespace-nowrap">Simple Momentum</span>
+                        {ll.simple_momentum_enabled && (
+                          <>
+                            <select value={ll.simple_momentum_mode || 'POINTS_UP'} onChange={e => updateLazyLeg(ll.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <option value="POINTS_UP">Points Up</option>
+                              <option value="POINTS_DOWN">Points Down</option>
+                              <option value="PERCENT_UP">Percent Up</option>
+                              <option value="PERCENT_DOWN">Percent Down</option>
+                            </select>
+                            <input type="number" min={0} value={ll.simple_momentum_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'simple_momentum_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Date Range Bar */}
         <div className="mt-4 bg-surface rounded-lg border border-default shadow-sm px-5 py-3">
@@ -2294,6 +3206,17 @@ const [slippagePct, setSlippagePct] = useState(0);
             <div className="mt-2 text-xs text-center text-secondary">{jobStatusLabel}</div>
           )}
         </div>
+        {lazyLegModal.open && (
+          <LazyLegModal
+            isOpen={lazyLegModal.open}
+            onClose={closeLazyLegModal}
+            onSave={saveLazyLeg}
+            onConfigureChild={openChildLazyLegModal}
+            editingConfig={lazyLegModal.editingLazyLegId ? lazyLegs[lazyLegModal.editingLazyLegId] : null}
+            strikeTypeOpts={strikeTypeOpts}
+            totalLazyLegCount={totalLazyLegCount}
+          />
+        )}
       </div>
     </div>
   );
