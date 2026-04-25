@@ -2,3 +2,7 @@
 .graphify_python
 graphify-out/
 .codex/
+cleaned_csvs/
+__pycache__/
+*.pyc
+.venv/
