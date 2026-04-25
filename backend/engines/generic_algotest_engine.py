@@ -1219,7 +1219,7 @@ def _execute_per_leg_reentry(
     reentry_results = []
     lot_size = get_lot_size(index, current_trigger_date)
     option_type = str(leg_config.get('option_type', 'CE') or 'CE').upper()
-    position = str(leg_config.get('position', 'SELL') or 'SELL').upper()
+    current_position = str(leg_config.get('position', 'SELL') or 'SELL').upper()
     reentry_mode = 'RE_ASAP'
 
     while True:
@@ -1254,7 +1254,9 @@ def _execute_per_leg_reentry(
             break
 
         reentry_mode = mode
-        position = _resolve_reentry_position(leg_config.get('position', 'SELL'), reentry_mode)
+        if _is_reentry_mode_reverse(reentry_mode):
+            current_position = 'BUY' if current_position == 'SELL' else 'SELL'
+        position = current_position
 
         re_entry_date = pd.Timestamp(current_trigger_date)
         if re_entry_date >= pd.Timestamp(cycle_exit_date):
@@ -1315,8 +1317,59 @@ def _execute_per_leg_reentry(
                 break
             entry_price_fut = _apply_slippage(raw_entry_fut, position, 'entry', slippage_pct)
 
+            re_leg_stub = {
+                **leg_config,
+                'segment': 'FUTURE',
+                'option_type': 'FUT',
+                'strike': '',
+                'position': position,
+                'lots': leg_config.get('lots', 1),
+                'lot_size': lot_size,
+                'entry_date': re_entry_date,
+                'exit_date': pd.Timestamp(cycle_exit_date),
+                'entry_spot': re_spot,
+                'entry_price': entry_price_fut,
+                'exit_price': entry_price_fut,
+                'futures_expiry': re_futures_expiry,
+            }
+            _copy_sl_tgt_to_leg(re_leg_stub, leg_config)
+            _copy_trail_sl_to_leg(re_leg_stub, leg_config)
+
+            re_check = check_leg_stop_loss_target(
+                entry_date=re_entry_date,
+                exit_date=cycle_exit_date,
+                expiry_date=expiry_date,
+                entry_spot=re_spot,
+                legs_config=[re_leg_stub],
+                index=index,
+                trading_calendar=trading_calendar,
+                square_off_mode=square_off_mode,
+                slippage_pct=slippage_pct,
+            )
+
+            actual_exit_date = pd.Timestamp(cycle_exit_date)
+            actual_exit_reason = 'EXPIRY'
+            next_trigger_date = None
+            next_trigger_reason = None
+            if re_check and re_check[0].get('triggered'):
+                triggered = re_check[0]
+                actual_exit_date = pd.Timestamp(triggered.get('exit_date') or cycle_exit_date)
+                actual_exit_reason = triggered.get('exit_reason', 'EXPIRY')
+                trig_base = _base_reason(actual_exit_reason)
+                if trig_base in sl_reasons and re_on_sl and sl_used < max_sl:
+                    next_trigger_date = actual_exit_date
+                    next_trigger_reason = actual_exit_reason
+                elif trig_base in tgt_reasons and re_on_tgt and tgt_used < max_tgt:
+                    next_trigger_date = actual_exit_date
+                    next_trigger_reason = actual_exit_reason
+                else:
+                    _log(
+                        f"[REENTRY] Stop: chained trigger '{trig_base}' did not qualify "
+                        f"for further re-entry (leg={leg_config.get('leg_number', '?')})"
+                    )
+
             raw_exit_fut, _ = _get_future_price_for_held_contract(
-                pd.Timestamp(cycle_exit_date),
+                actual_exit_date,
                 index,
                 {**leg_config, 'futures_expiry': re_futures_expiry},
             )
@@ -1334,9 +1387,10 @@ def _execute_per_leg_reentry(
                 'lots': leg_config.get('lots', 1),
                 'lot_size': lot_size,
                 'entry_date': re_entry_date,
-                'exit_date': pd.Timestamp(cycle_exit_date),
+                'exit_date': actual_exit_date,
+                'exit_reason': actual_exit_reason,
                 'entry_spot': re_spot,
-                'exit_spot': get_spot_price_from_db(cycle_exit_date, index) or re_spot,
+                'exit_spot': get_spot_price_from_db(actual_exit_date, index) or re_spot,
                 'entry_price': entry_price_fut,
                 'exit_price': exit_price_fut,
                 'raw_entry_price': raw_entry_fut,
@@ -1362,18 +1416,6 @@ def _execute_per_leg_reentry(
             _copy_sl_tgt_to_leg(re_leg, leg_config)
             _copy_trail_sl_to_leg(re_leg, leg_config)
             re_leg['_reentry'] = reentry_cfg
-
-            re_check = check_leg_stop_loss_target(
-                entry_date=re_entry_date,
-                exit_date=cycle_exit_date,
-                expiry_date=expiry_date,
-                entry_spot=re_spot,
-                legs_config=[re_leg],
-                index=index,
-                trading_calendar=trading_calendar,
-                square_off_mode=square_off_mode,
-                slippage_pct=slippage_pct,
-            )
         else:
             raw_entry = get_option_premium_from_db(
                 date=re_entry_date.strftime('%Y-%m-%d'),
@@ -1390,19 +1432,71 @@ def _execute_per_leg_reentry(
                 break
             entry_premium = _apply_slippage(raw_entry, position, 'entry', slippage_pct)
 
+            re_leg_stub = {
+                **leg_config,
+                'segment': 'OPTION',
+                'option_type': option_type,
+                'strike': re_strike_value,
+                'position': position,
+                'lots': leg_config.get('lots', 1),
+                'lot_size': lot_size,
+                'entry_date': re_entry_date,
+                'entry_spot': re_spot,
+                'exit_date': pd.Timestamp(cycle_exit_date),
+                'entry_premium': entry_premium,
+                'exit_premium': entry_premium,
+                'pnl': 0.0,
+                '_resolved_expiry': leg_config.get('_resolved_expiry') or expiry_date,
+            }
+            _copy_sl_tgt_to_leg(re_leg_stub, leg_config)
+            _copy_trail_sl_to_leg(re_leg_stub, leg_config)
+
+            re_check = check_leg_stop_loss_target(
+                entry_date=re_entry_date,
+                exit_date=cycle_exit_date,
+                expiry_date=expiry_date,
+                entry_spot=re_spot,
+                legs_config=[re_leg_stub],
+                index=index,
+                trading_calendar=trading_calendar,
+                square_off_mode=square_off_mode,
+                slippage_pct=slippage_pct,
+            )
+
+            actual_exit_date = pd.Timestamp(cycle_exit_date)
+            actual_exit_reason = 'EXPIRY'
+            next_trigger_date = None
+            next_trigger_reason = None
+            if re_check and re_check[0].get('triggered'):
+                triggered = re_check[0]
+                actual_exit_date = pd.Timestamp(triggered.get('exit_date') or cycle_exit_date)
+                actual_exit_reason = triggered.get('exit_reason', 'EXPIRY')
+                trig_base = _base_reason(actual_exit_reason)
+                if trig_base in sl_reasons and re_on_sl and sl_used < max_sl:
+                    next_trigger_date = actual_exit_date
+                    next_trigger_reason = actual_exit_reason
+                elif trig_base in tgt_reasons and re_on_tgt and tgt_used < max_tgt:
+                    next_trigger_date = actual_exit_date
+                    next_trigger_reason = actual_exit_reason
+                else:
+                    _log(
+                        f"[REENTRY] Stop: chained trigger '{trig_base}' did not qualify "
+                        f"for further re-entry (leg={leg_config.get('leg_number', '?')})"
+                    )
+
             raw_exit = get_option_premium_from_db(
-                date=pd.Timestamp(cycle_exit_date).strftime('%Y-%m-%d'),
+                date=actual_exit_date.strftime('%Y-%m-%d'),
                 index=index,
                 strike=re_strike_value,
                 option_type=option_type,
                 expiry=pd.Timestamp(expiry_date).strftime('%Y-%m-%d'),
             )
             if raw_exit is None:
-                fallback_spot = get_spot_price_from_db(cycle_exit_date, index) or re_spot
+                fallback_spot = get_spot_price_from_db(actual_exit_date, index) or re_spot
                 raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=re_strike_value, option_type=option_type)
                 _log(
                     f"[REENTRY] Fallback exit premium used for strike {re_strike_value} "
-                    f"on {pd.Timestamp(cycle_exit_date).strftime('%Y-%m-%d')} (spot={fallback_spot})"
+                    f"on {actual_exit_date.strftime('%Y-%m-%d')} (spot={fallback_spot})"
                 )
             exit_premium = _apply_slippage(raw_exit, position, 'exit', slippage_pct)
             leg_pnl = (exit_premium - entry_premium) if position == 'BUY' else (entry_premium - exit_premium)
@@ -1416,9 +1510,10 @@ def _execute_per_leg_reentry(
                 'lots': leg_config.get('lots', 1),
                 'lot_size': lot_size,
                 'entry_date': re_entry_date,
-                'exit_date': pd.Timestamp(cycle_exit_date),
+                'exit_date': actual_exit_date,
+                'exit_reason': actual_exit_reason,
                 'entry_spot': re_spot,
-                'exit_spot': get_spot_price_from_db(cycle_exit_date, index) or re_spot,
+                'exit_spot': get_spot_price_from_db(actual_exit_date, index) or re_spot,
                 'entry_premium': entry_premium,
                 'exit_premium': exit_premium,
                 'raw_entry_premium': raw_entry,
@@ -1444,52 +1539,6 @@ def _execute_per_leg_reentry(
             _copy_sl_tgt_to_leg(re_leg, leg_config)
             _copy_trail_sl_to_leg(re_leg, leg_config)
             re_leg['_reentry'] = reentry_cfg
-
-            re_check = check_leg_stop_loss_target(
-                entry_date=re_entry_date,
-                exit_date=cycle_exit_date,
-                expiry_date=expiry_date,
-                entry_spot=re_spot,
-                legs_config=[re_leg],
-                index=index,
-                trading_calendar=trading_calendar,
-                square_off_mode=square_off_mode,
-                slippage_pct=slippage_pct,
-            )
-
-        next_trigger_date = None
-        next_trigger_reason = None
-        if re_check and re_check[0].get('triggered'):
-            triggered = re_check[0]
-            trig_date = pd.Timestamp(triggered.get('exit_date') or cycle_exit_date)
-            trig_reason = triggered.get('exit_reason', 'EXPIRY')
-            _recalc_leg_pnl(
-                tleg=re_leg,
-                leg_exit_date=trig_date,
-                index=index,
-                expiry_date=expiry_date,
-                lot_size=lot_size,
-                fallback_spot=re_spot,
-                slippage_pct=slippage_pct,
-            )
-            re_leg['exit_date'] = trig_date
-            re_leg['exit_reason'] = trig_reason
-            sl_exit_spot = get_spot_price_from_db(trig_date, index)
-            if sl_exit_spot is not None:
-                re_leg['exit_spot'] = sl_exit_spot
-
-            trig_base = _base_reason(trig_reason)
-            if trig_base in sl_reasons and re_on_sl and sl_used < max_sl:
-                next_trigger_date = trig_date
-                next_trigger_reason = trig_reason
-            elif trig_base in tgt_reasons and re_on_tgt and tgt_used < max_tgt:
-                next_trigger_date = trig_date
-                next_trigger_reason = trig_reason
-            else:
-                _log(
-                    f"[REENTRY] Stop: chained trigger '{trig_base}' did not qualify "
-                    f"for further re-entry (leg={leg_config.get('leg_number', '?')})"
-                )
 
         reentry_results.append(re_leg)
         if is_sl:
@@ -3875,7 +3924,7 @@ def run_algotest_backtest(params):
                     'Leg':            leg_num,
                     'Index':          trade_id,
                     'Entry Date':     format_date_dd_mm_yyyy(trade['entry_date']),
-                    'Exit Date':      format_date_dd_mm_yyyy(trade['exit_date']),
+                    'Exit Date':      format_date_dd_mm_yyyy(leg_exit_date),
                     'Leg Exit Date':  format_date_dd_mm_yyyy(leg_exit_date),
                     'Type':           leg_option_type,
                     'Strike':         buffer_spot_atm if buffer_applied and buffer_spot_atm else strike,
@@ -3956,14 +4005,15 @@ def run_algotest_backtest(params):
                     )
                     re_pct_pnl = round((re_pnl_points / float(entry_spot_val)) * 100, 2) if entry_spot_val and float(entry_spot_val) > 1000 else 0.0
                     re_index = f"{trade_id}.{leg_num + re_idx + 1}"
+                    re_exit_date = re_leg.get('exit_date') or trade.get('exit_date')
 
                     re_row = {
                         'Trade':          trade_id,
                         'Leg':            leg_num,
                         'Index':          re_index,
                         'Entry Date':     format_date_dd_mm_yyyy(re_leg['entry_date']),
-                        'Exit Date':      format_date_dd_mm_yyyy(re_leg.get('exit_date') or trade['exit_date']),
-                        'Leg Exit Date':  format_date_dd_mm_yyyy(re_leg['exit_date']),
+                        'Exit Date':      format_date_dd_mm_yyyy(re_exit_date),
+                        'Leg Exit Date':  format_date_dd_mm_yyyy(re_exit_date),
                         'Type':           'FUT' if re_is_futures else re_leg.get('option_type', leg_option_type),
                         'Strike':         re_leg.get('buffer_spot_atm') if re_leg.get('buffer_applied') and re_leg.get('buffer_spot_atm') else re_leg.get('strike', ''),
                         'B/S':            re_position,
