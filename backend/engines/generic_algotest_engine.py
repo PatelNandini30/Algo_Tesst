@@ -4177,6 +4177,14 @@ def run_algotest_backtest(params):
                 has_fut_leg = any(l.get('segment') == 'FUTURE' for l in trade['legs'])
                 _log(f"[DEBUG] Trade {trade_idx}: has_fut_leg={has_fut_leg}, leg segment={leg.get('segment')}")
 
+                row_entry_spot = entry_spot_val
+                if is_lazy_leg:
+                    row_entry_spot = (
+                        leg.get('entry_spot')
+                        or get_spot_price_from_db(lazy_entry_date_val, index)
+                        or entry_spot_val
+                    )
+
                 # ── Entry / Exit price (premium for options, price for futures) ────
                 if leg['segment'] == 'FUTURE':
                     leg_option_type = 'FUT'
@@ -4235,11 +4243,11 @@ def run_algotest_backtest(params):
                 else:
                     net_pnl_points = leg_pnl if leg_pnl is not None else 0
 
-                if pd.notna(entry_spot_val) and float(entry_spot_val) > 1000:
-                    pct_pnl = round((net_pnl_points / float(entry_spot_val)) * 100, 2)
+                if pd.notna(row_entry_spot) and float(row_entry_spot) > 1000:
+                    pct_pnl = round((net_pnl_points / float(row_entry_spot)) * 100, 2)
                 else:
                     pct_pnl = 0.0
-                    _log(f"  WARNING: Invalid entry_spot_val={entry_spot_val} for Trade {trade_idx} — %P&L set to 0")
+                    _log(f"  WARNING: Invalid row_entry_spot={row_entry_spot} for Trade {trade_idx} — %P&L set to 0")
 
                 segment_meta = trade.get('segment') or {}
                 segment_type = segment_meta.get('type')
@@ -4286,10 +4294,10 @@ def run_algotest_backtest(params):
                     'buffer_position': buffer_position_value if buffer_applied else None,
                     'buffer_ref_price': round(float(buffer_ref_price), 2) if buffer_applied and buffer_ref_price is not None else None,
                     'buffer_strike_offset': buffer_strike_offset,
-                    'Entry Spot':     entry_spot_val if entry_spot_val is not None else np.nan,
+                    'Entry Spot':     row_entry_spot if row_entry_spot is not None else np.nan,
                     'Exit Spot':      leg_exit_spot if leg_exit_spot is not None else np.nan,
-                    'Spot P&L':       (round(leg_exit_spot - entry_spot_val, 2)
-                                      if show_spot_cols and leg_exit_spot is not None and entry_spot_val is not None
+                    'Spot P&L':       (round(leg_exit_spot - row_entry_spot, 2)
+                                      if show_spot_cols and leg_exit_spot is not None and row_entry_spot is not None
                                       else np.nan),
                     'Expiry':         (
                         leg.get('futures_expiry')

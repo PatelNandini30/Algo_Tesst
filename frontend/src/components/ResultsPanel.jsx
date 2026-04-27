@@ -222,7 +222,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           }).forEach(r => displayRows.push(r));
         });
 
-      const totalPnl = displayRows.reduce((sum, row) => sum + parseRowNetPnl(row), 0);
+      const totalPnl = parseRowNetPnl(leg1Row);
 
       const rawCumulative = leg1Row['Cumulative'];
       const rawPeak       = leg1Row['Peak'];
@@ -477,10 +477,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     const tm = {};
     Object.entries(groupedByTrade).forEach(([k, legs]) => {
-      const spot = parseFloat(legs[0]['Entry Spot'])||0;
-      const net  = legs.reduce((s,l) => s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0), 0);
+      const mainRow = legs.find(l => !l['ReEntryIndex'] && !l['ReEntryTrigger'] && !l['ReEntryMode'] && !isLazyLegRow(l)) || legs[0];
+      const spot = parseFloat(mainRow?.['Entry Spot']) || 0;
+      const rawNet = mainRow?.['Net P&L'];
+      const net = Number.isFinite(typeof rawNet === 'number' ? rawNet : parseFloat(rawNet))
+        ? (typeof rawNet === 'number' ? rawNet : parseFloat(rawNet))
+        : legs.reduce((s,l) => s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0), 0);
       const toN  = v => (v!=null&&v!==''&&!isNaN(parseFloat(v))) ? parseFloat(v) : '';
-      const r    = legs[0];
+      const r    = mainRow || legs[0];
       tm[k] = { net:+net.toFixed(2), pct:+(spot>0?(net/spot)*100:0).toFixed(2),
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
                 dd:toN(r['DD']), pctDd:toN(r['%DD']) };
@@ -748,16 +752,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     };
 
     const byYM = {};
-    Object.entries(groupedByTrade).forEach(([tradeId, legs]) => {
-      const exitDate = legs?.[0]?.['Exit Date'] || '';
+    groupedTrades.forEach(group => {
+      const exitDate = group?.exitDate || '';
       const ym = parseToYearMonth(exitDate);
       if (!ym) return;
-      const net = legs.reduce((s, l) => (
-        s +
-        (parseFloat(l['CE P&L']) || 0) +
-        (parseFloat(l['PE P&L']) || 0) +
-        (parseFloat(l['FUT P&L']) || 0)
-      ), 0);
+      const net = Number(group?.totalPnl ?? 0) || 0;
       if (!byYM[ym.year]) byYM[ym.year] = Array(12).fill(0);
       byYM[ym.year][ym.monthIdx] = (byYM[ym.year][ym.monthIdx] || 0) + net;
     });
@@ -1083,12 +1082,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 const exitDate = group.exitDate || '';
                 const ym = parseToYearMonth(exitDate);
                 if (!ym) return;
-                const net = (group.legs || []).reduce((sum, leg) => (
-                  sum +
-                  (parseFloat(leg['CE P&L'])  || 0) +
-                  (parseFloat(leg['PE P&L'])  || 0) +
-                  (parseFloat(leg['FUT P&L']) || 0)
-                ), 0);
+                const net = Number(group.totalPnl ?? 0) || 0;
                 if (!byYM[ym.year]) byYM[ym.year] = Array(12).fill(0);
                 byYM[ym.year][ym.monthIdx] = (byYM[ym.year][ym.monthIdx] || 0) + net;
               });
@@ -1427,10 +1421,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                           
                           {/* Summary Row - Only show for multi-leg trades */}
                           {rowsToRender.length > 1 && (() => {
-                            const tradeNetPnlPoints = rowsToRender.reduce((sum, leg) => {
-                              const raw = parseFloat(leg['Net P&L']);
-                              return sum + (Number.isFinite(raw) ? raw : 0);
-                            }, 0);
+                            const tradeNetPnlPoints = Number.isFinite(Number(group.totalPnl))
+                              ? Number(group.totalPnl)
+                              : rowsToRender.reduce((sum, leg) => {
+                                  const raw = parseFloat(leg['Net P&L']);
+                                  return sum + (Number.isFinite(raw) ? raw : 0);
+                                }, 0);
                             const tradePctPnl = group.entrySpot > 1000
                               ? (tradeNetPnlPoints / group.entrySpot) * 100
                               : 0;
