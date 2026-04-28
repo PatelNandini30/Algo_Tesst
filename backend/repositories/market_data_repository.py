@@ -399,6 +399,11 @@ class MarketDataRepository:
         Bulk load ALL option data for a symbol across date range.
         Returns DataFrame with only required columns for fast in-memory lookups.
 
+        Keep this select list intentionally narrow.  The live production index
+        idx_option_core_query covers these columns and `close`, so PostgreSQL can
+        serve the bulk load as an index-only scan.  Adding OHLC/instrument here
+        forces heap reads plus a sort on large date ranges.
+
         FIX #2: Removed 60-day chunking loop.
         Original code fired 40+ sequential DB round-trips for a 7-year range
         (~43 chunks × ~150ms overhead = 6+ seconds in connection overhead alone).
@@ -414,9 +419,6 @@ class MarketDataRepository:
             return pd.DataFrame()
         date_col  = self._pick(cols, "trade_date", "date")
         close_col = self._pick(cols, "close_price", "close")
-        open_col = self._pick_any(cols, ["open_price", "open"], close_col)
-        high_col = self._pick_any(cols, ["high_price", "high"], close_col)
-        low_col = self._pick_any(cols, ["low_price", "low"], close_col)
 
         from_date = from_date or "1900-01-01"
         to_date   = to_date   or "2099-12-31"
@@ -429,9 +431,6 @@ class MarketDataRepository:
                 expiry_date     AS "ExpiryDate",
                 option_type     AS "OptionType",
                 strike_price    AS "StrikePrice",
-                {open_col}      AS "Open",
-                {high_col}      AS "High",
-                {low_col}       AS "Low",
                 {close_col}     AS "Close"
             FROM option_data
             WHERE symbol      = :symbol
@@ -465,7 +464,6 @@ class MarketDataRepository:
             return pd.DataFrame()
 
         df = pd.concat(dfs, ignore_index=True)
-        df.drop_duplicates(inplace=True)
         if df.empty:
             return df
         df["Date"]       = pd.to_datetime(df["Date"])

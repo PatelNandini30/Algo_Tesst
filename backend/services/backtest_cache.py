@@ -200,6 +200,9 @@ class BacktestCache:
             config_copy = dict(key_payload['config'])
             for field in ['no_cache', 'request_id', 'timestamp', 'user_id']:
                 config_copy.pop(field, None)
+            for field in list(config_copy.keys()):
+                if str(field).startswith('_'):
+                    config_copy.pop(field, None)
             key_payload['config'] = config_copy
 
         key_str = json.dumps(key_payload, sort_keys=True, default=str)

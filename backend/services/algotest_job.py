@@ -6,7 +6,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict
 
 import numpy as np
-import orjson
 import pandas as pd
 from sqlalchemy.exc import OperationalError
 
@@ -21,6 +20,17 @@ logger = logging.getLogger(__name__)
 # Maximum years to load at once before chunking a single-threaded run.
 # Keep this bounded so long backtests do not accumulate a huge working set.
 _BULK_LOAD_CHUNK_YEARS = int(os.environ.get("BULK_LOAD_CHUNK_YEARS", "3"))
+
+
+def _get_backtest_worker_count() -> int:
+    """
+    Return the number of process workers for one backtest.
+
+    Process-level parallelism duplicates the option/spot working set in each
+    child process.  That can make long backtests slower on typical desktops and
+    can starve the UI, so keep it opt-in.
+    """
+    return max(1, int(os.environ.get("BACKTEST_WORKERS", "1")))
 
 
 def _date_chunks(from_date: str, to_date: str, chunk_years: int):
@@ -45,6 +55,48 @@ def _normalize_request(request: Dict[str, Any]) -> Dict[str, Any]:
     payload['from_date'] = payload.get('date_from') or payload.get('from_date')
     payload['to_date'] = payload.get('date_to') or payload.get('to_date')
     return payload
+
+
+def _resolve_effective_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolve the effective date window for a request without changing trade logic.
+    STR filters can narrow the range; this helper centralizes that so cache keys
+    and queued jobs use the same request shape.
+    """
+    resolved = dict(payload or {})
+    from_date = resolved.get('from_date')
+    to_date = resolved.get('to_date')
+
+    effective_from = from_date
+    effective_to = to_date
+    super_trend_config = str(resolved.get('super_trend_config', 'None'))
+    if super_trend_config in ('5x1', '5x2'):
+        try:
+            from base import load_super_trend_dates, get_super_trend_segments
+            load_super_trend_dates()
+            segments = get_super_trend_segments(super_trend_config)
+            if segments:
+                user_from = pd.to_datetime(from_date)
+                user_to = pd.to_datetime(to_date)
+                seg_dates = []
+                for seg in segments:
+                    seg_start = pd.to_datetime(seg.get('start') or seg.get('Start'))
+                    seg_end = pd.to_datetime(seg.get('end') or seg.get('End'))
+                    if seg_end >= user_from and seg_start <= user_to:
+                        seg_dates.append(seg_start)
+                        seg_dates.append(seg_end)
+                if seg_dates:
+                    effective_from = max(min(seg_dates), user_from).strftime('%Y-%m-%d')
+                    effective_to = min(max(seg_dates), user_to).strftime('%Y-%m-%d')
+                logger.info("[STR FILTER] Segments=%s Effective range=%s -> %s", len(segments), effective_from, effective_to)
+        except Exception as exc:
+            logger.warning("[STR FILTER] Error: %s", exc)
+
+    resolved['from_date'] = effective_from
+    resolved['to_date'] = effective_to
+    resolved['_effective_from'] = effective_from
+    resolved['_effective_to'] = effective_to
+    return resolved
 
 
 def _convert_numpy(obj: Any) -> Any:
@@ -169,6 +221,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_request(request)
     validate_index_payload(payload)
     logger.debug("[SERVICE] entry_dte=%s exit_dte=%s", payload.get('entry_dte'), payload.get('exit_dte'))
+    payload = _resolve_effective_request(payload)
     index = payload['index']
     from_date = payload.get('from_date')
     to_date = payload.get('to_date')
@@ -193,44 +246,12 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         use_cache = False
 
     try:
-        # If STR filter is enabled, shrink the load range to only the dates covered
-        # by active segments — avoids loading the full 18-year history when only
-        # a portion is needed.
-        effective_from = from_date
-        effective_to = to_date
-        super_trend_config = str(payload.get('super_trend_config', 'None'))
-        if super_trend_config in ('5x1', '5x2'):
-            try:
-                from base import load_super_trend_dates, get_super_trend_segments
-                load_super_trend_dates()
-                segments = get_super_trend_segments(super_trend_config)
-                if segments:
-                    user_from = pd.to_datetime(from_date)
-                    user_to = pd.to_datetime(to_date)
-                    seg_dates = []
-                    for seg in segments:
-                        seg_start = pd.to_datetime(seg.get('start') or seg.get('Start'))
-                        seg_end = pd.to_datetime(seg.get('end') or seg.get('End'))
-                        if seg_end >= user_from and seg_start <= user_to:
-                            seg_dates.append(seg_start)
-                            seg_dates.append(seg_end)
-                    if seg_dates:
-                        effective_from = max(min(seg_dates), user_from).strftime('%Y-%m-%d')
-                        effective_to = min(max(seg_dates), user_to).strftime('%Y-%m-%d')
-                    logger.info("[STR FILTER] Segments=%s Effective range=%s -> %s", len(segments), effective_from, effective_to)
-            except Exception as e:
-                logger.warning("[STR FILTER] Error: %s", e)
-                pass  # fall back to full range on any error
-        
-        # Update payload with effective date range for the engine
-        payload['from_date'] = effective_from
-        payload['to_date'] = effective_to
-
-        default_workers = min(4, max(2, (os.cpu_count() or 2) // 3))
-        n_workers = max(1, int(os.environ.get("BACKTEST_WORKERS", str(default_workers))))
+        effective_from = payload.get('_effective_from', from_date)
+        effective_to = payload.get('_effective_to', to_date)
+        n_workers = _get_backtest_worker_count()
         expiry_type = payload.get('expiry_type', 'WEEKLY')
 
-        logger.debug("[DATE RANGE] User=%s -> %s Effective=%s -> %s", from_date, to_date, effective_from, effective_to)
+        logger.debug("[DATE RANGE] User=%s -> %s Effective=%s -> %s", request.get('from_date') or request.get('date_from'), request.get('to_date') or request.get('date_to'), effective_from, effective_to)
         expiry_df = get_expiry_dates(index, expiry_type.lower(), effective_from, effective_to)
         
         logger.debug("[DEBUG] expiry_df type=%s len=%s", type(expiry_df), len(expiry_df) if expiry_df is not None else 'None')
@@ -511,6 +532,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 import pandas as _pd
                 import numpy as np
+                import orjson
 
                 if isinstance(obj, _pd.DataFrame):
                     obj = obj.to_dict('records')

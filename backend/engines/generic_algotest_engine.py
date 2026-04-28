@@ -507,6 +507,9 @@ def _calculate_mae_mfe_from_extremes(entry_price, position, entry_spot, max_high
 
 
 def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, position, entry_spot, trading_calendar_df, trade=None):
+    if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return None, None
+
     if trading_calendar_df is None or trading_calendar_df.empty:
         return None, None
 

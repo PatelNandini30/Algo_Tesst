@@ -3054,14 +3054,14 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     requested_from = pd.to_datetime(from_date)
     requested_to   = pd.to_datetime(to_date)
 
-    # Fast early return: partitioned data already covers this symbol/range and
-    # lookup cache is populated — skip the expensive DB + partition step entirely.
+    # Fast early return: partitioned data already covers this symbol/range.
+    # Per-date option lookup dicts are built lazily by _build_option_lookup(),
+    # so do not require _option_lookup_cache to be pre-populated here.
     if (_bulk_bhav_by_date
             and _bhav_by_date_symbol == sym_upper
             and _bhav_by_date_from is not None
             and pd.to_datetime(_bhav_by_date_from) <= requested_from
-            and pd.to_datetime(_bhav_by_date_to) >= requested_to
-            and len(_option_lookup_cache) > 0):
+            and pd.to_datetime(_bhav_by_date_to) >= requested_to):
         _bulk_loaded = True
         _bulk_date_range = (from_date, to_date)
         return {
@@ -3076,31 +3076,11 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     _bump_lookup_cache_epoch()
     clear_lookup_caches()
 
-    def _partition_and_prebuild(options_df, sym_upper):
-        """Partition by date and pre-build the full option lookup cache for this symbol."""
+    def _partition_bulk_options(options_df):
+        """Partition by date; per-date lookup dicts are built lazily on demand."""
         _bulk_bhav_df_ref = options_df
         for date_val, sub_df in options_df.partition_by("Date", as_dict=True).items():
             _bulk_bhav_by_date[str(date_val)[:10]] = sub_df
-
-        # Pre-build lookup cache for ALL dates × this symbol — eliminates per-call filter cost
-        for date_str, date_df in _bulk_bhav_by_date.items():
-            cache_key = (date_str, sym_upper)
-            if cache_key in _option_lookup_cache:
-                continue
-            opt_df = date_df.filter(
-                (pl.col("Symbol") == sym_upper) &
-                (pl.col("OptionType").is_in(["CE", "PE"]))
-            )
-            if opt_df.is_empty():
-                _option_lookup_cache[cache_key] = {}
-                continue
-            strikes  = opt_df["StrikePrice"].cast(pl.Int64).to_list()
-            types    = opt_df["OptionType"].to_list()
-            expiries = opt_df["ExpiryDate"].cast(pl.Date).cast(pl.Utf8).to_list()
-            closes   = opt_df["Close"].to_list()
-            _option_lookup_cache[cache_key] = {
-                (s, t, e): c for s, t, e, c in zip(strikes, types, expiries, closes)
-            }
 
     # Check Redis / in-memory Polars DF covers the full requested range
     lookup_loaded_from_redis = False
@@ -3109,7 +3089,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         min_date = str(options_df["Date"].min())
         max_date = str(options_df["Date"].max())
         if min_date <= from_date and max_date >= to_date:
-            _partition_and_prebuild(options_df, sym_upper)
+            _partition_bulk_options(options_df)
             _bulk_bhav_df = options_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
@@ -3121,7 +3101,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     if not lookup_loaded_from_redis:
         options_df = get_bulk_options_df()
         if options_df is not None and not options_df.is_empty():
-            _partition_and_prebuild(options_df, sym_upper)
+            _partition_bulk_options(options_df)
             _bulk_bhav_df = options_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)

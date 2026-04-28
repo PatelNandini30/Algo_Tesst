@@ -3,7 +3,7 @@ from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
 # NOTE: keep FastAPI imports at top for readability
 from engines.generic_algotest_engine import run_algotest_backtest, _apply_slippage, _calculate_fo_charges
-from services.algotest_job import execute_algotest_job
+from services.algotest_job import execute_algotest_job, _normalize_request, _resolve_effective_request
 from services.backtest_cache import get_backtest_cache as _get_result_cache
 from services.index_metadata import validate_index_payload
 from worker.tasks import run_algotest_job
@@ -529,7 +529,7 @@ async def queue_algotest_job(request: dict):
     """
     Enqueue an AlgoTest backtest to run asynchronously via Celery.
     """
-    payload = dict(request or {})
+    payload = _resolve_effective_request(_normalize_request(request))
     try:
         _validate_lazy_legs_payload(payload)
         validate_index_payload(payload)
@@ -541,8 +541,8 @@ async def queue_algotest_job(request: dict):
         try:
             cache_key = cache.generate_key(
                 symbol=payload.get("index") or payload.get("symbol") or "NIFTY",
-                from_date=payload.get("from_date") or payload.get("date_from"),
-                to_date=payload.get("to_date") or payload.get("date_to"),
+                from_date=payload.get("from_date"),
+                to_date=payload.get("to_date"),
                 strategy_config=payload,
             )
             cached = cache.get(cache_key)

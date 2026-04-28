@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _WARM_YEARS = int(os.environ.get("PREBUILD_WARM_YEARS", "2"))
 _WARM_SYMBOL = os.environ.get("PREBUILD_SYMBOL", "NIFTY")
+_WARM_BULK_OPTIONS = os.environ.get("PREBUILD_BULK_OPTIONS", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _do_warmup():
@@ -67,25 +68,27 @@ def _do_warmup():
         except Exception as e:
             logger.warning(f"[WARMUP] STR segment warmup failed: {e}")
 
-        # Step 3: Warm bulk option data for recent N years
-        # This is the expensive step — runs in background so it
-        # does NOT block the first user request.
-        try:
-            from base import bulk_load_options
-            to_date = datetime.now().strftime("%Y-%m-%d")
-            from_date = (datetime.now() - timedelta(days=_WARM_YEARS * 365)).strftime("%Y-%m-%d")
-            logger.info(
-                f"[WARMUP] Bulk loading {_WARM_SYMBOL} options "
-                f"{from_date} → {to_date} ({_WARM_YEARS} years)..."
-            )
-            result = bulk_load_options(_WARM_SYMBOL, from_date, to_date)
-            logger.info(
-                f"[WARMUP] Bulk load complete: "
-                f"{result.get('options_rows', '?')} option rows, "
-                f"{result.get('spot_rows', '?')} spot rows."
-            )
-        except Exception as e:
-            logger.warning(f"[WARMUP] Bulk option warmup failed: {e}")
+        # Step 3: Optional bulk option warmup. Disabled by default because it can
+        # monopolize HDD I/O for minutes and compete with real backtests.
+        if _WARM_BULK_OPTIONS:
+            try:
+                from base import bulk_load_options
+                to_date = datetime.now().strftime("%Y-%m-%d")
+                from_date = (datetime.now() - timedelta(days=_WARM_YEARS * 365)).strftime("%Y-%m-%d")
+                logger.info(
+                    f"[WARMUP] Bulk loading {_WARM_SYMBOL} options "
+                    f"{from_date} → {to_date} ({_WARM_YEARS} years)..."
+                )
+                result = bulk_load_options(_WARM_SYMBOL, from_date, to_date)
+                logger.info(
+                    f"[WARMUP] Bulk load complete: "
+                    f"{result.get('options_rows', '?')} option rows, "
+                    f"{result.get('spot_rows', '?')} spot rows."
+                )
+            except Exception as e:
+                logger.warning(f"[WARMUP] Bulk option warmup failed: {e}")
+        else:
+            logger.info("[WARMUP] Bulk option warmup skipped (PREBUILD_BULK_OPTIONS=0).")
 
         logger.info("[WARMUP] Background warmup complete.")
 

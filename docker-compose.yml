@@ -41,6 +41,13 @@ x-backend-env: &backend-env
   DB_POOL_RECYCLE: "3600"
   # Cap in-process bulk_load so backend+worker never OOM on 16GB HDD server
   BULK_LOAD_MAX_MEMORY_MB: "1500"
+  # NIFTY bulk loads are narrow (date/expiry/type/strike/close), so avoid
+  # splitting normal 6-7 year backtests into repeated DB+engine passes.
+  BULK_LOAD_CHUNK_YEARS: "10"
+  # Keep startup responsive on HDD. Real backtest requests load their own range.
+  PREBUILD_BULK_OPTIONS: "0"
+  # MAE/MFE scans are expensive on multi-year runs; enable only when needed.
+  BACKTEST_INCLUDE_MAE_MFE: "0"
 
 x-backend-volumes: &backend-volumes
   - ./cleaned_csvs:/data/cleaned_csvs:ro
