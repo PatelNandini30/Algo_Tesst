@@ -73,12 +73,21 @@ class MarketDataRepository:
     def _pick(self, cols: set, preferred: str, fallback: str):
         return preferred if preferred in cols else fallback
 
+    def _pick_any(self, cols: set, names: list[str], fallback: str):
+        for name in names:
+            if name in cols:
+                return name
+        return fallback
+
     def get_bhavcopy_by_date(self, date_str: str) -> pd.DataFrame:
         cols = self._table_columns("option_data")
         if not cols:
             return pd.DataFrame()
         date_col = self._pick(cols, "trade_date", "date")
         close_col = self._pick(cols, "close_price", "close")
+        open_col = self._pick_any(cols, ["open_price", "open"], close_col)
+        high_col = self._pick_any(cols, ["high_price", "high"], close_col)
+        low_col = self._pick_any(cols, ["low_price", "low"], close_col)
         q = text(
             f"""
             SELECT
@@ -87,6 +96,9 @@ class MarketDataRepository:
                 expiry_date AS "ExpiryDate",
                 option_type AS "OptionType",
                 strike_price AS "StrikePrice",
+                {open_col} AS "Open",
+                {high_col} AS "High",
+                {low_col} AS "Low",
                 {close_col} AS "Close",
                 {date_col} AS "Date"
             FROM option_data
@@ -315,6 +327,9 @@ class MarketDataRepository:
             return pd.DataFrame()
         date_col = self._pick(cols, "trade_date", "date")
         close_col = self._pick(cols, "close_price", "close")
+        open_col = self._pick_any(cols, ["open_price", "open"], close_col)
+        high_col = self._pick_any(cols, ["high_price", "high"], close_col)
+        low_col = self._pick_any(cols, ["low_price", "low"], close_col)
         
         symbol_filter = ""
         if symbols:
@@ -329,6 +344,9 @@ class MarketDataRepository:
                 expiry_date AS "ExpiryDate",
                 option_type AS "OptionType",
                 strike_price AS "StrikePrice",
+                {open_col} AS "Open",
+                {high_col} AS "High",
+                {low_col} AS "Low",
                 {close_col} AS "Close",
                 {date_col} AS "Date"
             FROM option_data
@@ -396,6 +414,9 @@ class MarketDataRepository:
             return pd.DataFrame()
         date_col  = self._pick(cols, "trade_date", "date")
         close_col = self._pick(cols, "close_price", "close")
+        open_col = self._pick_any(cols, ["open_price", "open"], close_col)
+        high_col = self._pick_any(cols, ["high_price", "high"], close_col)
+        low_col = self._pick_any(cols, ["low_price", "low"], close_col)
 
         from_date = from_date or "1900-01-01"
         to_date   = to_date   or "2099-12-31"
@@ -408,6 +429,9 @@ class MarketDataRepository:
                 expiry_date     AS "ExpiryDate",
                 option_type     AS "OptionType",
                 strike_price    AS "StrikePrice",
+                {open_col}      AS "Open",
+                {high_col}      AS "High",
+                {low_col}       AS "Low",
                 {close_col}     AS "Close"
             FROM option_data
             WHERE symbol      = :symbol

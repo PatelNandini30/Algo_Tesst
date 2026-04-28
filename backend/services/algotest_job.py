@@ -13,6 +13,7 @@ from engines.generic_algotest_engine import run_algotest_backtest, get_expiry_da
 from base import bulk_load_options
 from database import reset_engine
 from services.backtest_cache import get_backtest_cache
+from services.index_metadata import normalize_index, validate_index_payload
 
 
 # Maximum years to load at once; keeps chunked bulk loads under ~1.2GB.
@@ -37,7 +38,7 @@ def _date_chunks(from_date: str, to_date: str, chunk_years: int):
 
 def _normalize_request(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(request or {})
-    payload['index'] = payload.get('index', 'NIFTY')
+    payload['index'] = normalize_index(payload.get('index', 'NIFTY'))
     payload['from_date'] = payload.get('date_from') or payload.get('from_date')
     payload['to_date'] = payload.get('date_to') or payload.get('to_date')
     return payload
@@ -154,6 +155,7 @@ def _run_backtest_chunk(args: tuple) -> list:
 
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_request(request)
+    validate_index_payload(payload)
     print(f"[SERVICE] entry_dte in payload = {payload.get('entry_dte')}, exit_dte = {payload.get('exit_dte')}")
     index = payload['index']
     from_date = payload.get('from_date')

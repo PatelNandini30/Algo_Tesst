@@ -2,9 +2,14 @@
 Generic AlgoTest-Style Engine
 Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
+import os
+import sys
 
 # Set DEBUG = True to enable verbose logging for debugging
 DEBUG = True
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from services.index_metadata import get_lot_size_for_index
 
 _EARLY_EXIT_REASONS = {
     'STOP_LOSS',
@@ -192,6 +197,10 @@ import sys
 import os
 import time
 import traceback
+try:
+    import polars as pl
+except Exception:
+    pl = None
 
 
 def _futures_only_next_monthly_schedule(legs_config):
@@ -223,45 +232,17 @@ def _futures_only_next_monthly_schedule(legs_config):
 
 def get_lot_size(index, entry_date):
     """
-    Returns correct lot size based on index and trade date.
-    NSE official lot size history:
-    
-    NIFTY:
-      Jun 2000 – Sep 2010 : 200
-      Oct 2010 – Oct 2015 : 50
-      Oct 2015 – Oct 2019 : 75
-      Nov 2019 – present  : 65  # Updated to match AlgoTest
-    
-    BANKNIFTY:
-      Jun 2000 – Sep 2010 : 50
-      Oct 2010 – Oct 2015 : 25
-      Oct 2015 – Oct 2019 : 20
-      Nov 2019 – present  : 15
+    Returns index-specific lot size based on trade date.
+
+    Kept as the engine-facing wrapper so existing P&L code paths remain
+    unchanged while metadata stays centralized.
     """
-    d = pd.Timestamp(entry_date)
-    if index.upper() == 'NIFTY':
-        if d < pd.Timestamp("2010-10-01"):
-            return 200
-        elif d < pd.Timestamp("2015-10-29"):
-            return 50
-        elif d < pd.Timestamp("2019-11-01"):
-            return 75
-        else:
-            return 65  # Changed from 50 to 65 to match AlgoTest
-    elif index.upper() == 'BANKNIFTY':
-        if d < pd.Timestamp("2010-10-01"):
-            return 50
-        elif d < pd.Timestamp("2015-10-29"):
-            return 25
-        elif d < pd.Timestamp("2019-11-01"):
-            return 20
-        else:
-            return 15
-    return 1  # fallback for other indexes
+    return get_lot_size_for_index(index, entry_date)
 
 
 # Import from base.py
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import base as base_market_data
 from base import (
     calculate_trading_days_before_expiry,
     get_trading_calendar,
@@ -321,6 +302,253 @@ def _next_trading_day_after(trading_calendar_df, target_date):
     if idx >= len(arr):
         return None
     return pd.Timestamp(arr[idx])
+
+
+def _date_key(value):
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return None
+        return ts.strftime('%Y-%m-%d')
+    except Exception:
+        return str(value)[:10] if str(value) else None
+
+
+def _safe_float(value):
+    try:
+        if value is None or value == '':
+            return None
+        val = float(value)
+        if _math.isnan(val):
+            return None
+        return val
+    except Exception:
+        return None
+
+
+def _expiry_candidates(expiry):
+    try:
+        expiry_ts = pd.Timestamp(expiry)
+        if pd.isna(expiry_ts):
+            return []
+        return [
+            expiry_ts.strftime('%Y-%m-%d'),
+            (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d'),
+            (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d'),
+        ]
+    except Exception:
+        return []
+
+
+def _is_future_leg(leg):
+    return str(leg.get('segment', '') or '').upper() in ('FUTURE', 'FUTURES') or str(leg.get('option_type', '') or '').upper() == 'FUT'
+
+
+def _get_leg_expiry(leg, trade=None):
+    if _is_future_leg(leg):
+        return leg.get('futures_expiry') or leg.get('expiry_date') or leg.get('expiry')
+    expiry = leg.get('_resolved_expiry') or leg.get('expiry_date') or leg.get('expiry')
+    if expiry is None and trade is not None:
+        expiry = trade.get('expiry_date')
+    return expiry
+
+
+def _ohlc_from_polars(date_df, index, leg, expiry):
+    if pl is None or date_df is None or not hasattr(date_df, 'filter') or date_df.is_empty():
+        return None
+
+    cols = set(date_df.columns)
+    high_col = 'High' if 'High' in cols else 'Close'
+    low_col = 'Low' if 'Low' in cols else 'Close'
+    if high_col not in cols or low_col not in cols or 'Symbol' not in cols:
+        return None
+
+    filtered = date_df.filter(pl.col('Symbol') == str(index).upper())
+    if filtered.is_empty():
+        return None
+
+    if _is_future_leg(leg):
+        if 'Instrument' not in cols:
+            return None
+        filtered = filtered.filter(pl.col('Instrument').cast(pl.Utf8).str.to_uppercase().str.contains('FUT'))
+    else:
+        if not {'OptionType', 'StrikePrice'}.issubset(cols):
+            return None
+        opt = str(leg.get('option_type', '') or '').upper()
+        if opt in ('CALL', 'C'):
+            opt = 'CE'
+        elif opt in ('PUT', 'P'):
+            opt = 'PE'
+        strike = _safe_float(leg.get('strike'))
+        if strike is None:
+            return None
+        filtered = filtered.filter(
+            (pl.col('OptionType').cast(pl.Utf8).str.to_uppercase() == opt) &
+            ((pl.col('StrikePrice').cast(pl.Float64) - float(strike)).abs() <= 0.5)
+        )
+
+    if filtered.is_empty():
+        return None
+
+    expiry_values = _expiry_candidates(expiry)
+    if expiry_values and 'ExpiryDate' in cols:
+        expiry_expr = pl.col('ExpiryDate').cast(pl.Date).cast(pl.Utf8)
+        exact = None
+        for expiry_str in expiry_values:
+            exact = filtered.filter(expiry_expr == expiry_str)
+            if not exact.is_empty():
+                filtered = exact
+                break
+        else:
+            return None
+
+    try:
+        agg = filtered.select([
+            pl.col(high_col).cast(pl.Float64).max().alias('High'),
+            pl.col(low_col).cast(pl.Float64).min().alias('Low'),
+        ])
+        if agg.is_empty():
+            return None
+        high = _safe_float(agg['High'][0])
+        low = _safe_float(agg['Low'][0])
+        if high is None or low is None:
+            return None
+        return high, low
+    except Exception:
+        return None
+
+
+def _ohlc_from_pandas(date_df, index, leg, expiry):
+    if date_df is None or date_df.empty or 'Symbol' not in date_df.columns:
+        return None
+
+    high_col = 'High' if 'High' in date_df.columns else 'Close'
+    low_col = 'Low' if 'Low' in date_df.columns else 'Close'
+    if high_col not in date_df.columns or low_col not in date_df.columns:
+        return None
+
+    filtered = date_df[date_df['Symbol'].astype(str).str.upper() == str(index).upper()].copy()
+    if filtered.empty:
+        return None
+
+    if _is_future_leg(leg):
+        if 'Instrument' not in filtered.columns:
+            return None
+        filtered = filtered[filtered['Instrument'].astype(str).str.upper().str.contains('FUT', na=False)]
+    else:
+        opt = str(leg.get('option_type', '') or '').upper()
+        if opt in ('CALL', 'C'):
+            opt = 'CE'
+        elif opt in ('PUT', 'P'):
+            opt = 'PE'
+        strike = _safe_float(leg.get('strike'))
+        if strike is None or 'OptionType' not in filtered.columns or 'StrikePrice' not in filtered.columns:
+            return None
+        filtered = filtered[
+            (filtered['OptionType'].astype(str).str.upper() == opt) &
+            ((pd.to_numeric(filtered['StrikePrice'], errors='coerce') - float(strike)).abs() <= 0.5)
+        ]
+
+    if filtered.empty:
+        return None
+
+    expiry_values = _expiry_candidates(expiry)
+    if expiry_values and 'ExpiryDate' in filtered.columns:
+        exp_series = pd.to_datetime(filtered['ExpiryDate'], errors='coerce').dt.strftime('%Y-%m-%d')
+        matched = filtered[exp_series.isin(expiry_values)]
+        if matched.empty:
+            return None
+        filtered = matched
+
+    highs = pd.to_numeric(filtered[high_col], errors='coerce')
+    lows = pd.to_numeric(filtered[low_col], errors='coerce')
+    if highs.dropna().empty or lows.dropna().empty:
+        return None
+    return float(highs.max()), float(lows.min())
+
+
+def _get_ohlc_for_leg_on_date(index, date_str, leg, expiry):
+    bulk_by_date = getattr(base_market_data, '_bulk_bhav_by_date', {}) or {}
+    date_df = bulk_by_date.get(date_str)
+    if date_df is not None:
+        result = _ohlc_from_polars(date_df, index, leg, expiry)
+        if result is not None:
+            return result
+
+    try:
+        bhav_df = load_bhavcopy(date_str)
+    except Exception:
+        return None
+    return _ohlc_from_pandas(bhav_df, index, leg, expiry)
+
+
+def _calculate_mae_mfe_from_extremes(entry_price, position, entry_spot, max_high, min_low):
+    entry = _safe_float(entry_price)
+    spot = _safe_float(entry_spot)
+    high = _safe_float(max_high)
+    low = _safe_float(min_low)
+    if entry is None or spot is None or spot == 0 or high is None or low is None:
+        return None, None
+
+    pos = str(position or '').upper().strip()
+    if pos == 'SELL':
+        mae = (entry - high) / spot
+        mfe = (entry - low) / spot
+    else:
+        mae = (low - entry) / spot
+        mfe = (high - entry) / spot
+
+    # Store percent-points, matching the existing % P&L style in the trade sheet.
+    return round(mae * 100, 4), round(mfe * 100, 4)
+
+
+def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, position, entry_spot, trading_calendar_df, trade=None):
+    if trading_calendar_df is None or trading_calendar_df.empty:
+        return None, None
+
+    start = _next_trading_day_after(trading_calendar_df, entry_date)
+    if start is None:
+        return None, None
+
+    try:
+        end = pd.Timestamp(exit_date)
+        if pd.isna(end) or start > end:
+            return None, None
+    except Exception:
+        return None, None
+
+    cal = trading_calendar_df.copy()
+    cal['date'] = pd.to_datetime(cal['date'])
+    window = cal[(cal['date'] >= start) & (cal['date'] <= end)]
+    if window.empty:
+        return None, None
+
+    expiry = _get_leg_expiry(leg, trade)
+    highs = []
+    lows = []
+    for date_value in window['date']:
+        date_str = _date_key(date_value)
+        if not date_str:
+            continue
+        ohlc = _get_ohlc_for_leg_on_date(index, date_str, leg, expiry)
+        if ohlc is None:
+            continue
+        high, low = ohlc
+        highs.append(high)
+        lows.append(low)
+
+    if not highs or not lows:
+        return None, None
+
+    return _calculate_mae_mfe_from_extremes(
+        entry_price=entry_price,
+        position=position,
+        entry_spot=entry_spot,
+        max_high=max(highs),
+        min_low=min(lows),
+    )
 
 
 def _parse_futures_rollover_config(leg_config):
@@ -1084,6 +1312,10 @@ def _parse_leg_reentry_config(leg_src: dict) -> dict:
 
     def _normalize_mode(value):
         mode = str(value or 'RE_ASAP').upper().strip()
+        if mode == 'RE_COST':
+            return 'RE_ASAP'
+        if mode == 'RE_COST_REV':
+            return 'RE_ASAP_REV'
         return mode or 'RE_ASAP'
 
     cfg = {
@@ -1357,7 +1589,7 @@ def _execute_lazy_leg(
                     strike_interval=strike_interval,
                     depth=depth + 1,
                 ))
-            elif mode in ('RE_ASAP', 'RE_ASAP_REV', 'RE_MOMENTUM', 'RE_MOMENTUM_REV', 'RE_COST', 'RE_COST_REV'):
+            elif mode in ('RE_ASAP', 'RE_ASAP_REV', 'RE_MOMENTUM', 'RE_MOMENTUM_REV'):
                 repeat_cfg = dict(lazy_leg_config)
                 if _is_reentry_mode_reverse(mode):
                     repeat_cfg['position'] = 'BUY' if position == 'SELL' else 'SELL'
@@ -4249,6 +4481,18 @@ def run_algotest_backtest(params):
                     pct_pnl = 0.0
                     _log(f"  WARNING: Invalid row_entry_spot={row_entry_spot} for Trade {trade_idx} — %P&L set to 0")
 
+                mae_val, mfe_val = _calculate_leg_mae_mfe(
+                    index=index,
+                    entry_date=lazy_entry_date_val if is_lazy_leg and lazy_entry_date_val is not None else trade['entry_date'],
+                    exit_date=leg_exit_date,
+                    leg=leg,
+                    entry_price=entry_price,
+                    position=position,
+                    entry_spot=row_entry_spot,
+                    trading_calendar_df=trading_calendar,
+                    trade=trade,
+                )
+
                 segment_meta = trade.get('segment') or {}
                 segment_type = segment_meta.get('type')
                 segment_column_name = 'Filter Segment' if segment_type == 'FILTER' else 'STR Segment'
@@ -4290,6 +4534,8 @@ def run_algotest_backtest(params):
                     'Exit Price':     exit_price,
                     'Raw Entry Price': raw_entry_price,
                     'Raw Exit Price': raw_exit_price,
+                    'MAE':            mae_val if mae_val is not None else np.nan,
+                    'MFE':            mfe_val if mfe_val is not None else np.nan,
                     'buffer_strike_enabled': bool(buffer_strike_enabled),
                     'buffer_position': buffer_position_value if buffer_applied else None,
                     'buffer_ref_price': round(float(buffer_ref_price), 2) if buffer_applied and buffer_ref_price is not None else None,
@@ -4369,6 +4615,17 @@ def run_algotest_backtest(params):
                     re_pct_pnl = round((re_pnl_points / float(entry_spot_val)) * 100, 2) if entry_spot_val and float(entry_spot_val) > 1000 else 0.0
                     re_index = f"{trade_id}.{leg_num + re_idx + 1}"
                     re_exit_date = re_leg.get('exit_date') or trade.get('exit_date')
+                    re_mae_val, re_mfe_val = _calculate_leg_mae_mfe(
+                        index=index,
+                        entry_date=re_leg['entry_date'],
+                        exit_date=re_exit_date,
+                        leg=re_leg,
+                        entry_price=re_entry_price,
+                        position=re_position,
+                        entry_spot=re_entry_spot,
+                        trading_calendar_df=trading_calendar,
+                        trade=trade,
+                    )
 
                     re_row = {
                         'Trade':          trade_id,
@@ -4385,6 +4642,8 @@ def run_algotest_backtest(params):
                         'Exit Price':     re_exit_price,
                         'Raw Entry Price': re_raw_entry,
                         'Raw Exit Price': re_raw_exit,
+                        'MAE':            re_mae_val if re_mae_val is not None else np.nan,
+                        'MFE':            re_mfe_val if re_mfe_val is not None else np.nan,
                         'buffer_strike_enabled': bool(re_leg.get('buffer_strike_enabled', False)),
                         'buffer_position': re_leg.get('buffer_position'),
                         'buffer_ref_price': round(float(re_leg.get('buffer_ref_price')), 2) if re_leg.get('buffer_ref_price') is not None else None,

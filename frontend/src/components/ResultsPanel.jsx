@@ -446,21 +446,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const hasFutures = sourceTrades.some(t => (t['Type']||'').toUpperCase() === 'FUT');
     const hasStr     = showStrSegment && sourceTrades.some(t => t['STR Segment']);
     const hasBuffer  = bufferStrikeEnabled;
+    const hasReEntry = sourceTrades.some(t => (
+      Boolean(t['ReEntryIndex'] || t['ReEntryTrigger'] || t['ReEntryMode']) || isLazyLegRow(t)
+    ));
 
-    const TRADE_COLS = new Set(['Net P&L','% P&L','Cumulative','Peak','DD','%DD']);
-    const keyOrder = [
-      'Trade','Leg','Index','Entry Date','Exit Date','Expiry',
-      'Entry Spot','Exit Spot','Spot P&L',
-      'Type','Strike',
-      ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
-      'B/S','Re-Entry','Mode','Lazy Leg','Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price',
-      ...(hasCalls   ? ['CE P&L']  : []),
-      ...(hasPuts    ? ['PE P&L']  : []),
-      ...(hasFutures ? ['FUT P&L'] : []),
-      'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
-      'Exit Reason',
-      ...(hasStr ? ['STR Segment'] : []),
-    ];
+    const getReEntryType = (trade) => {
+      if (isLazyLegRow(trade)) return 'Lazy';
+      const mode = String(trade?.['ReEntryMode'] || '').trim();
+      if (mode) return mode;
+      const trigger = String(trade?.['ReEntryTrigger'] || '').trim();
+      if (trigger) return trigger;
+      return trade?.['ReEntryIndex'] ? 'Re-Entry' : '';
+    };
 
     const sortedTrades = [...sourceTrades].sort((a, b) => {
       const tA = parseInt(a.Trade||a.trade||1,10), tB = parseInt(b.Trade||b.trade||1,10);
@@ -475,6 +472,82 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       groupedByTrade[k].push(t);
     });
 
+    const toNumber = (value) => {
+      if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+      if (value == null || value === '') return null;
+      const parsed = parseFloat(String(value).replace(/[,%₹\s]/g, ''));
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const isFutureRow = (row) => String(row?.['Type'] || '').toUpperCase() === 'FUT';
+    const isOptionRow = (row) => ['CE','CALL','PE','PUT'].includes(String(row?.['Type'] || '').toUpperCase());
+    const sumRequired = (rows, key) => {
+      let total = 0;
+      for (const row of rows) {
+        const value = toNumber(row?.[key]);
+        if (value == null) return null;
+        total += value;
+      }
+      return total;
+    };
+
+    const roundMae = (value) => Math.round(value * 10000) / 10000;
+
+    const calcTradeMae = (legs) => {
+      const futureLegs = legs.filter(isFutureRow);
+      const optionLegs = legs.filter(isOptionRow);
+      if (optionLegs.length === 0) return null;
+
+      const optionMae = sumRequired(optionLegs, 'MAE');
+      const optionMfe = sumRequired(optionLegs, 'MFE');
+      if ([optionMae, optionMfe].some(v => v == null)) return null;
+
+      if (futureLegs.length > 0) {
+        const futureMfe = sumRequired(futureLegs, 'MFE');
+        const futureMae = sumRequired(futureLegs, 'MAE');
+        if ([futureMfe, futureMae].some(v => v == null)) return null;
+
+        const netMae1 = futureMfe + optionMae;
+        const netMae2 = optionMfe + futureMae;
+        return {
+          netMae1: roundMae(netMae1),
+          netMae2: roundMae(netMae2),
+          finalMae: roundMae(Math.min(netMae1, netMae2)),
+        };
+      }
+
+      const netMae1 = optionMae;
+      const netMae2 = optionMfe;
+      return {
+        netMae1: roundMae(netMae1),
+        netMae2: roundMae(netMae2),
+        finalMae: roundMae(Math.min(netMae1, netMae2)),
+      };
+    };
+
+    const hasTradeMae = Object.values(groupedByTrade).some(legs => calcTradeMae(legs));
+
+    const TRADE_COLS = new Set([
+      'Net MAE 1','Net MAE 2','Final MAE',
+      'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
+    ]);
+    const keyOrder = [
+      'Trade','Leg','Index','Entry Date','Exit Date','Expiry',
+      'Entry Spot','Exit Spot','Spot P&L',
+      'Type','Strike',
+      ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
+      'B/S',
+      ...(hasReEntry ? ['Re-Entry Type'] : []),
+      'Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price','MAE','MFE',
+      ...(hasTradeMae ? ['Net MAE 1','Net MAE 2','Final MAE'] : []),
+      ...(hasCalls   ? ['CE P&L']  : []),
+      ...(hasPuts    ? ['PE P&L']  : []),
+      ...(hasFutures ? ['FUT P&L'] : []),
+      'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
+      'Exit Reason',
+      ...(hasStr ? ['STR Segment'] : []),
+    ];
+
     const tm = {};
     Object.entries(groupedByTrade).forEach(([k, legs]) => {
       const mainRow = legs.find(l => !l['ReEntryIndex'] && !l['ReEntryTrigger'] && !l['ReEntryMode'] && !isLazyLegRow(l)) || legs[0];
@@ -485,7 +558,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         : legs.reduce((s,l) => s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0), 0);
       const toN  = v => (v!=null&&v!==''&&!isNaN(parseFloat(v))) ? parseFloat(v) : '';
       const r    = mainRow || legs[0];
+      const tradeMae = calcTradeMae(legs);
       tm[k] = { net:+net.toFixed(2), pct:+(spot>0?(net/spot)*100:0).toFixed(2),
+                netMae1:tradeMae?.netMae1 ?? '', netMae2:tradeMae?.netMae2 ?? '', finalMae:tradeMae?.finalMae ?? '',
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
                 dd:toN(r['DD']), pctDd:toN(r['%DD']) };
     });
@@ -500,6 +575,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         let val;
         if (TRADE_COLS.has(key)) {
           if (!first) val='';
+          else if (key==='Net MAE 1') val=m.netMae1;
+          else if (key==='Net MAE 2') val=m.netMae2;
+          else if (key==='Final MAE') val=m.finalMae;
           else if (key==='Net P&L') val=m.net;
           else if (key==='% P&L')  val=m.pct;
           else if (key==='Cumulative') val=m.cumulative;
@@ -507,9 +585,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='DD')    val=m.dd;
           else if (key==='%DD')   val=m.pctDd;
         } else if (key==='Leg' && isLazyLegRow(trade)) val=trade['Lazy Leg Name'] || trade[key];
-        else if (key==='Re-Entry') val=isLazyLegRow(trade) ? 'Lazy Leg' : (trade['ReEntryTrigger'] || '');
-        else if (key==='Mode') val=isLazyLegRow(trade) ? 'Lazy Leg' : (trade['ReEntryMode'] || '');
-        else if (key==='Lazy Leg') val=isLazyLegRow(trade) ? (trade['Lazy Leg Name'] || 'Lazy Leg') : '';
+        else if (key==='Re-Entry Type') val=getReEntryType(trade);
         else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
         else if (key==='Exit Date') val=getVisibleExitDate(trade);
         else if (key==='Expiry') val=formatDateToDdMmYyyy(
@@ -517,7 +593,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         );
         else val=trade[key];
         if (val==null||(typeof val==='number'&&isNaN(val))||val==='NaN') val='';
-        if (typeof val==='number'&&!Number.isInteger(val)) val=Math.round(val*100)/100;
+        if (typeof val==='number'&&!Number.isInteger(val)) {
+          val = ['MAE','MFE','Net MAE 1','Net MAE 2','Final MAE'].includes(key)
+            ? Math.round(val * 10000) / 10000
+            : Math.round(val*100)/100;
+        }
         row[key]=val;
       }
       return row;
@@ -536,7 +616,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Column widths
     const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry':14,'Mode':12,'Lazy Leg':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'Net P&L':10,'% P&L':8,'Cumulative':11,
+      'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry Type':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'MAE':9,'MFE':9,'Net MAE 1':10,'Net MAE 2':10,'Final MAE':10,'Net P&L':10,'% P&L':8,'Cumulative':11,
       'Exit Reason':14,'Expiry':12,'STR Segment':14 };
     ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 

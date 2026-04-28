@@ -31,6 +31,97 @@ const isValidDisplayDate = (dateStr) => {
   }
 };
 
+const INDEX_CONFIG = {
+  NIFTY: {
+    label: 'NIFTY',
+    subtitle: 'Weekly & monthly expiries',
+    group: 'weekly_monthly',
+    backtestEnabled: true,
+    expiryBases: ['weekly', 'monthly'],
+    defaultExpiryBasis: 'weekly',
+    defaultOptionExpiry: 'weekly',
+    strikeInterval: 50,
+  },
+  SENSEX: {
+    label: 'SENSEX',
+    subtitle: 'Data not available',
+    group: 'weekly_monthly',
+    backtestEnabled: false,
+    expiryBases: ['weekly', 'monthly'],
+    defaultExpiryBasis: 'weekly',
+    defaultOptionExpiry: 'weekly',
+    strikeInterval: 100,
+  },
+  MIDCPNIFTY: {
+    label: 'MIDCPNIFTY',
+    subtitle: 'Monthly expiry only',
+    group: 'monthly_only',
+    backtestEnabled: true,
+    expiryBases: ['monthly'],
+    defaultExpiryBasis: 'monthly',
+    defaultOptionExpiry: 'monthly',
+    strikeInterval: 25,
+  },
+  BANKNIFTY: {
+    label: 'BANKNIFTY',
+    subtitle: 'Monthly expiry only',
+    group: 'monthly_only',
+    backtestEnabled: true,
+    expiryBases: ['monthly'],
+    defaultExpiryBasis: 'monthly',
+    defaultOptionExpiry: 'monthly',
+    strikeInterval: 100,
+  },
+};
+
+const INDEX_GROUPS = [
+  {
+    key: 'weekly_monthly',
+    title: 'Weekly & Monthly Expiries',
+    symbols: ['NIFTY', 'SENSEX'],
+  },
+  {
+    key: 'monthly_only',
+    title: 'Monthly Only Expiry',
+    symbols: ['MIDCPNIFTY', 'BANKNIFTY'],
+  },
+];
+
+const WEEKLY_OPTION_EXPIRIES = [
+  { value: 'weekly', label: 'Weekly' },
+  { value: 'next_weekly', label: 'Next Weekly' },
+  { value: 'monthly', label: 'Monthly' },
+  { value: 'next_monthly', label: 'Next Monthly' },
+];
+
+const MONTHLY_OPTION_EXPIRIES = [
+  { value: 'monthly', label: 'Monthly' },
+  { value: 'next_monthly', label: 'Next Monthly' },
+];
+
+const FUTURES_EXPIRIES = MONTHLY_OPTION_EXPIRIES;
+
+const getIndexConfig = (symbol) => INDEX_CONFIG[String(symbol || 'NIFTY').toUpperCase()] || INDEX_CONFIG.NIFTY;
+
+const getOptionExpiryOptions = (symbol) => {
+  const config = getIndexConfig(symbol);
+  return config.expiryBases.includes('weekly') ? WEEKLY_OPTION_EXPIRIES : MONTHLY_OPTION_EXPIRIES;
+};
+
+const normalizeReEntryMode = (mode) => {
+  const value = String(mode || 'RE_ASAP').toUpperCase().trim();
+  if (value === 'RE_COST') return 'RE_ASAP';
+  if (value === 'RE_COST_REV') return 'RE_ASAP_REV';
+  return value || 'RE_ASAP';
+};
+
+const normalizeExpiryForIndex = (expiry, symbol, segment = 'options') => {
+  const options = segment === 'futures' ? FUTURES_EXPIRIES : getOptionExpiryOptions(symbol);
+  const current = String(expiry || '').toLowerCase();
+  if (options.some(opt => opt.value === current)) return current;
+  return segment === 'futures' ? 'monthly' : getIndexConfig(symbol).defaultOptionExpiry;
+};
+
 const DATE_YEAR_MIN = 1900;
 const DATE_YEAR_MAX = 2100;
 const DIGIT_LIMIT = 8;
@@ -208,8 +299,18 @@ const DateInput = ({ value, onChange, placeholder }) => {
   );
 };
 
+const parseDisplayDateForLot = (tradeDate) => {
+  if (!tradeDate) return new Date();
+  if (typeof tradeDate === 'string' && tradeDate.includes('/')) {
+    const parsed = parse(tradeDate, 'dd/MM/yyyy', new Date());
+    return isValid(parsed) ? parsed : new Date();
+  }
+  const parsed = new Date(tradeDate);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+};
+
 const getLotSize = (index, tradeDate) => {
-  const d = new Date(tradeDate);
+  const d = parseDisplayDateForLot(tradeDate);
   if (index === 'NIFTY') {
     if (d < new Date('2010-10-01')) return 200;
     if (d < new Date('2015-10-29')) return 50;
@@ -220,22 +321,27 @@ const getLotSize = (index, tradeDate) => {
     if (d < new Date('2010-10-01')) return 50;
     if (d < new Date('2015-10-29')) return 25;
     if (d < new Date('2019-11-01')) return 20;
-    return 15;
+    if (d < new Date('2023-07-01')) return 25;
+    if (d < new Date('2024-11-20')) return 15;
+    if (d < new Date('2025-07-01')) return 30;
+    if (d < new Date('2026-01-01')) return 35;
+    return 30;
   }
-  if (index === 'FINNIFTY')   return 40;
-  if (index === 'MIDCPNIFTY') return 75;
-  if (index === 'SENSEX')     return 10;
+  if (index === 'FINNIFTY')   return d < new Date('2026-01-01') ? 65 : 60;
+  if (index === 'MIDCPNIFTY') {
+    if (d < new Date('2024-11-20')) return 75;
+    if (d < new Date('2025-07-01')) return 120;
+    if (d < new Date('2026-01-01')) return 140;
+    return 120;
+  }
+  if (index === 'SENSEX')     return 20;
+  if (index === 'BANKEX')     return 30;
   return 1;
 };
 
-const STRIKE_INTERVALS = {
-  NIFTY: 50,
-  BANKNIFTY: 100,
-  FINNIFTY: 50,
-  MIDCPNIFTY: 25,
-  SENSEX: 100,
-  BANKEX: 100,
-};
+const STRIKE_INTERVALS = Object.fromEntries(
+  Object.entries(INDEX_CONFIG).map(([symbol, config]) => [symbol, config.strikeInterval])
+);
 
 function getBufferPreview(value, unit, applyTo, posAbove, posBelow, indexName = 'NIFTY') {
   const spot = 25000;
@@ -361,14 +467,24 @@ const LazyLegModal = ({
   onConfigureChild,
   editingConfig,
   strikeTypeOpts,
+  expiryOptions,
+  defaultExpiry,
   totalLazyLegCount,
 }) => {
-  const [form, setForm] = useState(() => editingConfig || createDefaultLazyLeg(totalLazyLegCount + 1));
+  const [form, setForm] = useState(() => ({
+    ...(editingConfig || createDefaultLazyLeg(totalLazyLegCount + 1)),
+    expiry: (editingConfig || {}).expiry || defaultExpiry,
+  }));
   const set = (key, value) => setForm(prev => ({ ...prev, [key]: value }));
 
   useEffect(() => {
-    setForm(editingConfig || createDefaultLazyLeg(totalLazyLegCount + 1));
-  }, [isOpen, editingConfig, totalLazyLegCount]);
+    const next = editingConfig || createDefaultLazyLeg(totalLazyLegCount + 1);
+    const allowed = expiryOptions?.some(opt => opt.value === next.expiry);
+    setForm({
+      ...next,
+      expiry: allowed ? next.expiry : defaultExpiry,
+    });
+  }, [isOpen, editingConfig, expiryOptions, defaultExpiry, totalLazyLegCount]);
 
   if (!isOpen) return null;
 
@@ -385,8 +501,6 @@ const LazyLegModal = ({
       <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
       <option value="RE_MOMENTUM">RE MOMENTUM</option>
       <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-      <option value="RE_COST">RE COST</option>
-      <option value="RE_COST_REV">RE COST &#8629;</option>
       <option value="LAZY_LEG">Lazy Leg</option>
     </>
   );
@@ -421,10 +535,9 @@ const LazyLegModal = ({
             <label className="text-xs text-secondary">
               Expiry
               <select value={form.expiry} onChange={e => set('expiry', e.target.value)} className={`${inputClass} mt-1 w-full`}>
-                <option value="weekly">Weekly</option>
-                <option value="monthly">Monthly</option>
-                <option value="next_weekly">Next Weekly</option>
-                <option value="next_monthly">Next Monthly</option>
+                {expiryOptions.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
               </select>
             </label>
             <label className="text-xs text-secondary">
@@ -594,6 +707,31 @@ const StrategyBuilder = () => {
     () => legs.some(l => l.segment === 'futures'),
     [legs]
   );
+  const indexConfig = useMemo(() => getIndexConfig(instrument), [instrument]);
+  const expiryBasisOptions = useMemo(
+    () => indexConfig.expiryBases.map(value => ({
+      value,
+      label: value === 'weekly' ? 'Weekly Expiry' : 'Monthly Expiry',
+    })),
+    [indexConfig]
+  );
+  const optionExpiryOptions = useMemo(() => getOptionExpiryOptions(instrument), [instrument]);
+  const defaultOptionExpiry = indexConfig.defaultOptionExpiry;
+  const unsupportedIndexMessage = `${instrument} backtest data is not available. Import option quotes and expiry calendar before running this index.`;
+
+  const normalizeLegForSelectedIndex = useCallback((leg) => ({
+    ...leg,
+    expiry: normalizeExpiryForIndex(leg.expiry, instrument, leg.segment),
+    re_entry_target_mode: normalizeReEntryMode(leg.re_entry_target_mode),
+    re_entry_sl_mode: normalizeReEntryMode(leg.re_entry_sl_mode),
+  }), [instrument]);
+
+  const selectInstrument = useCallback((symbol) => {
+    const nextConfig = getIndexConfig(symbol);
+    setInstrument(symbol);
+    setExpiryBasis(prev => nextConfig.expiryBases.includes(prev) ? prev : nextConfig.defaultExpiryBasis);
+  }, []);
+
   const handleUnderlyingChange = useCallback(
     (value) => {
       if (value === 'cash' && hasFuturesLeg) {
@@ -648,6 +786,15 @@ const [slippagePct, setSlippagePct] = useState(0);
     straddle_multiplier: 0.5,
     straddle_direction: '+',
   });
+
+  useEffect(() => {
+    setExpiryBasis(prev => indexConfig.expiryBases.includes(prev) ? prev : indexConfig.defaultExpiryBasis);
+    setDraftLeg(prev => normalizeLegForSelectedIndex(prev));
+    setLegs(prev => prev.map(normalizeLegForSelectedIndex));
+    setLazyLegs(prev => Object.fromEntries(
+      Object.entries(prev).map(([id, leg]) => [id, normalizeLegForSelectedIndex(leg)])
+    ));
+  }, [indexConfig, normalizeLegForSelectedIndex]);
 
   const [overallSLEnabled, setOverallSLEnabled] = useState(false);
   const [overallSLType, setOverallSLType] = useState('max_loss');
@@ -985,6 +1132,22 @@ const [slippagePct, setSlippagePct] = useState(0);
 
   // Validate expiry mismatch
   const validateExpiry = () => {
+    if (!indexConfig.backtestEnabled) {
+      showValidationError(unsupportedIndexMessage);
+      return false;
+    }
+    if (!indexConfig.expiryBases.includes(expiryBasis)) {
+      showValidationError(`${instrument} supports ${indexConfig.defaultExpiryBasis} expiry only.`);
+      return false;
+    }
+    if (!indexConfig.expiryBases.includes('weekly')) {
+      const weeklyLegs = legs.filter(l => ['weekly', 'next_weekly'].includes(String(l.expiry || '').toLowerCase()));
+      if (weeklyLegs.length > 0) {
+        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
+        showValidationError(`${instrument} is monthly-only. Leg(s) ${legNumbers} cannot use weekly expiry.`);
+        return false;
+      }
+    }
     if (expiryBasis === 'monthly') {
       const weeklyLegs = legs.filter(l => l.segment !== 'futures' && ['weekly', 'next_weekly'].includes(l.expiry));
       if (weeklyLegs.length > 0) {
@@ -1008,7 +1171,7 @@ const [slippagePct, setSlippagePct] = useState(0);
   // Clear expiry warning when user changes legs or basis so it doesn't persist after fix
   useEffect(() => { setValidationError(null); }, [legs, expiryBasis]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const canRunBacktest = legs.length > 0 && !loading;
+  const canRunBacktest = legs.length > 0 && !loading && indexConfig.backtestEnabled;
 
   const handleRecalculate = useCallback(async () => {
     if (!rawResults?.trades?.length) return;
@@ -1056,9 +1219,10 @@ const [slippagePct, setSlippagePct] = useState(0);
 
   const addLegFromDraft = () => {
     if (legs.length >= 6) return;
+    const normalizedDraft = normalizeLegForSelectedIndex(draftLeg);
     setLegs(prev => [...prev, {
       id: Date.now(),
-      ...draftLeg,
+      ...normalizedDraft,
       target_enabled: false, target_mode: 'POINTS', target_value: 0,
       stop_loss_enabled: false, stop_loss_mode: 'POINTS', stop_loss_value: 0,
       trail_sl_enabled: false, trail_sl_mode: 'POINTS', trail_sl_trigger: 0, trail_sl_move: 0,
@@ -1067,8 +1231,8 @@ const [slippagePct, setSlippagePct] = useState(0);
       lazy_leg_sl_id: null,
       lazy_leg_target_id: null,
       simple_momentum_enabled: false, simple_momentum_mode: 'POINTS_UP', simple_momentum_value: 0,
-      straddle_multiplier: draftLeg.straddle_multiplier ?? 0.5,
-      straddle_direction: draftLeg.straddle_direction ?? '+',
+      straddle_multiplier: normalizedDraft.straddle_multiplier ?? 0.5,
+      straddle_direction: normalizedDraft.straddle_direction ?? '+',
     }]);
     if (draftLeg.segment === 'futures') {
       setUnderlying('futures');
@@ -1081,6 +1245,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       premium_max: 0,
       pct_direction: '-',
       pct_value: 0,
+      expiry: normalizeExpiryForIndex(prev.expiry, instrument, prev.segment),
       atm_straddle_prem_pct: 0,
       straddle_multiplier: 0.5,
       straddle_direction: '+',
@@ -1100,23 +1265,37 @@ const [slippagePct, setSlippagePct] = useState(0);
       });
     }
   };
-  const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => l.id === id ? { ...l, [field]: value } : l));
+  const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => {
+    if (l.id !== id) return l;
+    const next = { ...l, [field]: value };
+    if (field === 'segment' || field === 'expiry') {
+      next.expiry = normalizeExpiryForIndex(next.expiry, instrument, next.segment);
+    }
+    return next;
+  }));
   const handleLegChange = (legIndex, nextLeg) => setLegs(prev => prev.map((leg, idx) => idx === legIndex ? { ...leg, ...nextLeg } : leg));
   const totalLazyLegCount = Object.keys(lazyLegs).length;
   const lazyLegList = Object.values(lazyLegs);
 
   const updateLazyLeg = (id, field, value) => {
-    setLazyLegs(prev => prev[id] ? ({ ...prev, [id]: { ...prev[id], [field]: value } }) : prev);
+    setLazyLegs(prev => {
+      if (!prev[id]) return prev;
+      const nextLeg = { ...prev[id], [field]: value };
+      if (field === 'expiry' || field === 'segment') {
+        nextLeg.expiry = normalizeExpiryForIndex(nextLeg.expiry, instrument, nextLeg.segment);
+      }
+      return { ...prev, [id]: nextLeg };
+    });
   };
 
   const createLazyLegConfig = (overrides = {}) => {
     const id = `lazy_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    return {
+    return normalizeLegForSelectedIndex({
       ...createDefaultLazyLeg(totalLazyLegCount + 1),
       id,
       name: `lazy${totalLazyLegCount + 1}`,
       ...overrides,
-    };
+    });
   };
 
   const attachLazyLegToParent = (parentLegId, trigger, lazyId) => {
@@ -1175,14 +1354,14 @@ const [slippagePct, setSlippagePct] = useState(0);
 
   // Open the lazy-leg popup when Lazy Leg is selected; saved lazy legs render as full rows below.
   const handleReEntryModeSelect = (legId, trigger, value) => {
-    updateLeg(legId, trigger === 'sl' ? 're_entry_sl_mode' : 're_entry_target_mode', value);
+    updateLeg(legId, trigger === 'sl' ? 're_entry_sl_mode' : 're_entry_target_mode', normalizeReEntryMode(value));
     if (value === 'LAZY_LEG') {
       openLazyLegModal(legId, trigger);
     }
   };
 
   const handleLazyReEntryModeSelect = (lazyId, trigger, value) => {
-    updateLazyLeg(lazyId, trigger === 'sl' ? 're_entry_sl_mode' : 're_entry_target_mode', value);
+    updateLazyLeg(lazyId, trigger === 'sl' ? 're_entry_sl_mode' : 're_entry_target_mode', normalizeReEntryMode(value));
     if (value === 'LAZY_LEG') {
       openChildLazyLegModal(lazyId, trigger);
     }
@@ -1210,7 +1389,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       return;
     }
     const id = editingLazyLegId || `lazy_${Date.now()}`;
-    const finalConfig = { ...lazyLegConfig, id };
+    const finalConfig = normalizeLegForSelectedIndex({ ...lazyLegConfig, id });
 
     setLazyLegs(prev => {
       const next = { ...prev, [id]: finalConfig };
@@ -1266,7 +1445,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       position: (ll.position || 'sell').toUpperCase(),
       lots: ll.lot || 1,
       option_type: optType === 'call' ? 'CE' : 'PE',
-      expiry: (ll.expiry || 'weekly').toUpperCase(),
+      expiry: normalizeExpiryForIndex(ll.expiry || defaultOptionExpiry, instrument, 'options').toUpperCase(),
       strike_selection: {
         type: strikeType,
         strike_type: (ll.strike_type || 'atm').toUpperCase(),
@@ -1326,7 +1505,7 @@ const [slippagePct, setSlippagePct] = useState(0);
         // Normalize 'call'/'put' UI values to 'CE'/'PE' for the backend
         const rawOpt = (l.option_type || '').toLowerCase();
         leg.option_type = rawOpt === 'call' ? 'CE' : rawOpt === 'put' ? 'PE' : l.option_type.toUpperCase();
-        leg.expiry = l.expiry.toUpperCase();
+        leg.expiry = normalizeExpiryForIndex(l.expiry, instrument, 'options').toUpperCase();
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
           strike_type: l.strike_type.toUpperCase(),
@@ -1637,7 +1816,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
       if (!res.ok) {
         const errorPayload = await res.json().catch(() => null);
-        throw new Error(errorPayload?.message || `Server error (${res.status})`);
+        throw new Error(errorPayload?.message || errorPayload?.detail || `Server error (${res.status})`);
       }
 
       const data = await res.json();
@@ -1681,6 +1860,35 @@ const [slippagePct, setSlippagePct] = useState(0);
       </div>
 
       <div className="max-w-screen-2xl mx-auto px-6 py-4">
+        <div className="mb-4 bg-surface border border-default shadow-sm">
+          <div className="grid grid-cols-1 md:grid-cols-2">
+            {INDEX_GROUPS.map(group => (
+              <div key={group.key} className="px-4 py-3 border-b md:border-b-0 md:border-r last:border-r-0 border-subtle">
+                <div className="text-sm font-semibold text-primary">{group.title}</div>
+                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1">
+                  {group.symbols.map(symbol => {
+                    const cfg = getIndexConfig(symbol);
+                    const active = instrument === symbol;
+                    return (
+                      <button
+                        key={symbol}
+                        type="button"
+                        onClick={() => selectInstrument(symbol)}
+                        className={`text-xs font-semibold transition-colors ${
+                          active ? 'text-accent' : 'text-secondary hover:text-primary'
+                        }`}
+                        title={cfg.subtitle}
+                      >
+                        {symbol}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
         <div className="grid grid-cols-12 gap-4">
 
           {/* LEFT COLUMN - Configuration */}
@@ -1707,18 +1915,11 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                 {/* Instrument */}
                 <div>
-                  <label className="block text-xs font-medium text-secondary mb-2">Instrument</label>
-                  <select
-                    value={instrument}
-                    onChange={e => setInstrument(e.target.value)}
-                    className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
-                  >
-                    <option>NIFTY</option>
-                    <option>BANKNIFTY</option>
-                    <option>FINNIFTY</option>
-                    <option>MIDCPNIFTY</option>
-                    <option>SENSEX</option>
-                  </select>
+                  <label className="block text-xs font-medium text-secondary mb-2">Index</label>
+                  <div className="h-9 px-3 border border-strong rounded text-sm bg-base flex items-center justify-between">
+                    <span className="font-semibold text-primary">{instrument}</span>
+                    <span className="text-xs text-muted">{indexConfig.subtitle}</span>
+                  </div>
                 </div>
 
                 {/* Underlying */}
@@ -1743,8 +1944,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                       onChange={e => setExpiryBasis(e.target.value)}
                       className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
                     >
-                      <option value="weekly">Weekly Expiry</option>
-                      <option value="monthly">Monthly Expiry</option>
+                      {expiryBasisOptions.map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
                     </select>
                   </div>
                 )}
@@ -2132,7 +2334,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                     onChange={v => setDraftLeg(prev => ({
                       ...prev,
                       segment: v,
-                      expiry: v === 'futures' ? 'monthly' : prev.expiry,
+                      expiry: normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, instrument, v),
                     }))}
                   />
                 </div>
@@ -2174,19 +2376,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                   <select value={draftLeg.expiry}
                     onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
                     className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-36">
-                    {draftLeg.segment === 'options' ? (
-                      <>
-                        <option value="weekly">Weekly</option>
-                        <option value="next_weekly">Next Weekly</option>
-                        <option value="monthly">Monthly</option>
-                        <option value="next_monthly">Next Monthly</option>
-                      </>
-                    ) : (
-                      <>
-                        <option value="monthly">Monthly</option>
-                        <option value="next_monthly">Next Monthly</option>
-                      </>
-                    )}
+                    {(draftLeg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
                   </select>
                 </div>
 
@@ -2417,19 +2609,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <label className="block text-xs text-muted mb-1">Expiry</label>
                             <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
                               className="h-7 px-2 border border-strong rounded text-xs bg-surface w-28">
-                              {leg.segment === 'options' ? (
-                                <>
-                                  <option value="weekly">Weekly</option>
-                                  <option value="next_weekly">Next Weekly</option>
-                                  <option value="monthly">Monthly</option>
-                                  <option value="next_monthly">Next Monthly</option>
-                                </>
-                              ) : (
-                                <>
-                                  <option value="monthly">Monthly</option>
-                                  <option value="next_monthly">Next Monthly</option>
-                                </>
-                              )}
+                              {(leg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
                             </select>
                           </div>
                           {leg.segment === 'options' && (
@@ -2613,8 +2795,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-                                  <option value="RE_COST">RE COST</option>
-                                  <option value="RE_COST_REV">RE COST &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
                                 <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -2649,8 +2829,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-                                  <option value="RE_COST">RE COST</option>
-                                  <option value="RE_COST_REV">RE COST &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
                                 <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -2728,11 +2906,10 @@ const [slippagePct, setSlippagePct] = useState(0);
                         </label>
                         <label className="text-xs text-muted">
                           Expiry
-                          <select value={ll.expiry || 'weekly'} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
-                            <option value="weekly">Weekly</option>
-                            <option value="monthly">Monthly</option>
-                            <option value="next_weekly">Next Weekly</option>
-                            <option value="next_monthly">Next Monthly</option>
+                          <select value={ll.expiry || defaultOptionExpiry} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                            {optionExpiryOptions.map(opt => (
+                              <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
                           </select>
                         </label>
                         <label className="text-xs text-muted">
@@ -2813,8 +2990,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-                                  <option value="RE_COST">RE COST</option>
-                                  <option value="RE_COST_REV">RE COST &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
                                 <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -2833,8 +3008,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-                                  <option value="RE_COST">RE COST</option>
-                                  <option value="RE_COST_REV">RE COST &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
                                 <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -2905,11 +3078,10 @@ const [slippagePct, setSlippagePct] = useState(0);
                     </label>
                     <label className="text-xs text-secondary">
                       Expiry
-                      <select value={ll.expiry || 'weekly'} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
-                        <option value="weekly">Weekly</option>
-                        <option value="monthly">Monthly</option>
-                        <option value="next_weekly">Next Weekly</option>
-                        <option value="next_monthly">Next Monthly</option>
+                      <select value={ll.expiry || defaultOptionExpiry} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface">
+                        {optionExpiryOptions.map(opt => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
                       </select>
                     </label>
                     <label className="text-xs text-secondary">
@@ -3001,8 +3173,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                               <option value="RE_MOMENTUM">RE MOMENTUM</option>
                               <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-                              <option value="RE_COST">RE COST</option>
-                              <option value="RE_COST_REV">RE COST &#8629;</option>
                               <option value="LAZY_LEG">Lazy Leg</option>
                             </select>
                             <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -3027,8 +3197,6 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                               <option value="RE_MOMENTUM">RE MOMENTUM</option>
                               <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
-                              <option value="RE_COST">RE COST</option>
-                              <option value="RE_COST_REV">RE COST &#8629;</option>
                               <option value="LAZY_LEG">Lazy Leg</option>
                             </select>
                             <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
@@ -3180,6 +3348,12 @@ const [slippagePct, setSlippagePct] = useState(0);
             <span className="text-sm text-red-700">{error}</span>
           </div>
         )}
+        {!indexConfig.backtestEnabled && (
+          <div className="fixed bottom-24 left-1/2 transform -translate-x-1/2 z-40 flex items-center gap-2 px-4 py-2 bg-loss-bg border border-red-200 rounded-lg shadow-lg">
+            <AlertTriangle size={16} className="text-loss flex-shrink-0" />
+            <span className="text-sm text-red-700">{unsupportedIndexMessage}</span>
+          </div>
+        )}
 
         {/* Run Backtest Button - Bottom */}
         <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50 flex flex-col items-center gap-2">
@@ -3214,6 +3388,8 @@ const [slippagePct, setSlippagePct] = useState(0);
             onConfigureChild={openChildLazyLegModal}
             editingConfig={lazyLegModal.editingLazyLegId ? lazyLegs[lazyLegModal.editingLazyLegId] : null}
             strikeTypeOpts={strikeTypeOpts}
+            expiryOptions={optionExpiryOptions}
+            defaultExpiry={defaultOptionExpiry}
             totalLazyLegCount={totalLazyLegCount}
           />
         )}

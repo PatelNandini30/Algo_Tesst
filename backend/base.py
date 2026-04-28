@@ -447,7 +447,7 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     if _use_postgres():
         try:
             df = _repo.get_bhavcopy_by_date(date_str=date_str)
-            required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Close', 'Date']
+            required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Open', 'High', 'Low', 'Close', 'Date']
             available_cols = [col for col in required_cols if col in df.columns]
             return df[available_cols].copy()
         except Exception as exc:
@@ -467,7 +467,7 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     df['ExpiryDate'] = pd.to_datetime(df['ExpiryDate'])
     
     # Return only the required columns
-    required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Close', 'Date']
+    required_cols = ['Instrument', 'Symbol', 'ExpiryDate', 'OptionType', 'StrikePrice', 'Open', 'High', 'Low', 'Close', 'Date']
     available_cols = [col for col in required_cols if col in df.columns]
     
     result = df[available_cols].copy()

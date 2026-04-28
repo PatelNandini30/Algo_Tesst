@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from engines.generic_algotest_engine import run_algotest_backtest, _apply_slippage, _calculate_fo_charges
 from services.algotest_job import execute_algotest_job
 from services.backtest_cache import get_backtest_cache as _get_result_cache
+from services.index_metadata import validate_index_payload
 from worker.tasks import run_algotest_job
 from worker.celery import celery_app
 import sys
@@ -510,6 +511,7 @@ async def run_algotest_backtest_endpoint(request: dict):
     """
     try:
         _validate_lazy_legs_payload(request or {})
+        validate_index_payload(request or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     loop = asyncio.get_running_loop()
@@ -529,6 +531,7 @@ async def queue_algotest_job(request: dict):
     payload = dict(request or {})
     try:
         _validate_lazy_legs_payload(payload)
+        validate_index_payload(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     task = run_algotest_job.apply_async(args=[payload])
