@@ -2,11 +2,13 @@
 Generic AlgoTest-Style Engine
 Matches AlgoTest behavior exactly with DTE-based entry/exit
 """
+import logging
 import os
 import sys
 
 # Set DEBUG = True to enable verbose logging for debugging
-DEBUG = True
+DEBUG = False
+logger = logging.getLogger(__name__)
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from services.index_metadata import get_lot_size_for_index
@@ -2867,7 +2869,7 @@ def run_algotest_backtest(params):
 
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
     exit_dte = _coerce_int(params.get('exit_dte', 0), 0, 'Exit')
-    print(f"[DEBUG] Received entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={params.get('expiry_type', 'WEEKLY')}, keys={list(params.keys())}")
+    _log(f"[DEBUG] Received entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={params.get('expiry_type', 'WEEKLY')}, keys={list(params.keys())}")
     legs_config = params.get('legs', [])
     # Read super_trend_config ONLY from its dedicated key.
     # Never fall back to filter_config — they are separate concepts.
@@ -2881,10 +2883,10 @@ def run_algotest_backtest(params):
     if str_enabled:
         load_super_trend_dates()
         str_segments = get_super_trend_segments(super_trend_config)
-        print(f"[STR DEBUG] super_trend_config={super_trend_config}, str_enabled={str_enabled}, segments={len(str_segments)}")
+        _log(f"[STR DEBUG] super_trend_config={super_trend_config}, str_enabled={str_enabled}, segments={len(str_segments)}")
         _log(f"STR Filter ON: {super_trend_config}, segments={len(str_segments)}")
     else:
-        print(f"[STR DEBUG] super_trend_config={super_trend_config}, str_enabled={str_enabled} - FILTER OFF")
+        _log(f"[STR DEBUG] super_trend_config={super_trend_config}, str_enabled={str_enabled} - FILTER OFF")
         _log("STR Filter OFF")
     
     # ── NEW: Date Range Filter ──────────────────────────────────────────────────────
@@ -2907,7 +2909,7 @@ def run_algotest_backtest(params):
         filter_enabled = _fc in ('custom', 'base2') and (
             _fc != 'custom' or len(filter_segments_custom) > 0
         )
-        print(f"[FILTER DEBUG] filter_config={filter_config}, _fc={_fc}, filter_enabled={filter_enabled}, custom_segments_count={len(filter_segments_custom)}")
+        _log(f"[FILTER DEBUG] filter_config={filter_config}, _fc={_fc}, filter_enabled={filter_enabled}, custom_segments_count={len(filter_segments_custom)}")
         _block_b_config = filter_config if filter_enabled else None
 
     filter_segments = []
@@ -2944,9 +2946,9 @@ def run_algotest_backtest(params):
     ).lower().strip()
     fixed_entry_mode = (filter_entry_mode == 'fixed') and (str_enabled or filter_enabled)
     if filter_entry_mode == 'fixed' and not fixed_entry_mode:
-        print("[WARN] filter_entry_mode='fixed' requested but no active filter/STR — falling back to DTE mode. "
-              f"(str_enabled={str_enabled}, filter_enabled={filter_enabled}, "
-              f"filter_config={filter_config})")
+        _log("[WARN] filter_entry_mode='fixed' requested but no active filter/STR — falling back to DTE mode. "
+             f"(str_enabled={str_enabled}, filter_enabled={filter_enabled}, "
+             f"filter_config={filter_config})")
     
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -2988,10 +2990,10 @@ def run_algotest_backtest(params):
     except (TypeError, ValueError):
         spot_adjustment_pct = 1.0
     if spot_adjustment_pct < 0.25:
-        print(f"[WARN] spot_adjustment_pct too low ({spot_adjustment_pct}) - clamping to 0.25")
+        _log(f"[WARN] spot_adjustment_pct too low ({spot_adjustment_pct}) - clamping to 0.25")
         spot_adjustment_pct = 0.25
     elif spot_adjustment_pct > 5.0:
-        print(f"[WARN] spot_adjustment_pct too high ({spot_adjustment_pct}) - clamping to 5.0")
+        _log(f"[WARN] spot_adjustment_pct too high ({spot_adjustment_pct}) - clamping to 5.0")
         spot_adjustment_pct = 5.0
     spot_adjustment_units = str(params.get('spot_adjustment_units', 'percent') or 'percent').lower().strip()
     if spot_adjustment_units not in ('percent', 'points'):
@@ -4315,13 +4317,13 @@ def run_algotest_backtest(params):
                     trade_record['net_pnl_pct'] = round((trade_record['net_pnl'] / entry_spot) * 100, 2) / 100.0 if entry_spot != 0 else 0.0
 
             except Exception as e:
-                print(f"  ERROR: {str(e)}")
+                _log(f"  ERROR: {str(e)}")
                 traceback.print_exc()
                 continue
     
-    print(f"[DEBUG] After main loop: all_trades has {len(all_trades)} items")
+    _log(f"[DEBUG] After main loop: all_trades has {len(all_trades)} items")
     if all_trades:
-        print(f"[DEBUG] Sample trade: entry_date={all_trades[0].get('entry_date')}, legs={len(all_trades[0].get('legs', []))}")
+        _log(f"[DEBUG] Sample trade: entry_date={all_trades[0].get('entry_date')}, legs={len(all_trades[0].get('legs', []))}")
     
     # ========== STEP 11: CONVERT TO DATAFRAME ==========
     # Filter out trades with no legs (skipped due to missing option data)
@@ -4366,6 +4368,11 @@ def run_algotest_backtest(params):
         trade_id = trade.get('trade_id', trade_idx)
         entry_spot_val = trade['entry_spot']
         per_leg_res    = trade.get('per_leg_results')  # None if no SL/Target configured
+        trade_entry_date = trade['entry_date']
+        trade_exit_date = trade['exit_date']
+        trade_exit_reason = trade.get('exit_reason', 'EXPIRY')
+        has_options_leg = any(l.get('segment') != 'FUTURE' for l in trade['legs'])
+        has_fut_leg = any(l.get('segment') == 'FUTURE' for l in trade['legs'])
 
         # Create SEPARATE row for EACH leg (like AlgoTest CSV format)
         for leg_idx, leg in enumerate(trade['legs']):
@@ -4392,8 +4399,8 @@ def run_algotest_backtest(params):
                 else:
                     leg_exit_date, leg_exit_reason = _resolve_leg_exit(
                         per_leg_results=per_leg_res,
-                        trade_exit_date=trade['exit_date'],
-                        trade_exit_reason=trade.get('exit_reason', 'EXPIRY'),
+                        trade_exit_date=trade_exit_date,
+                        trade_exit_reason=trade_exit_reason,
                         leg_idx=li,
                     )
 
@@ -4404,9 +4411,6 @@ def run_algotest_backtest(params):
                 if leg_exit_spot is None:
                     leg_exit_spot = leg.get('exit_spot', trade.get('exit_spot', entry_spot_val))
 
-                # ── Check if trade has any options legs (for Spot columns visibility) ─
-                has_options_leg = any(l.get('segment') != 'FUTURE' for l in trade['legs'])
-                has_fut_leg = any(l.get('segment') == 'FUTURE' for l in trade['legs'])
                 _log(f"[DEBUG] Trade {trade_idx}: has_fut_leg={has_fut_leg}, leg segment={leg.get('segment')}")
 
                 row_entry_spot = entry_spot_val
@@ -4483,7 +4487,7 @@ def run_algotest_backtest(params):
 
                 mae_val, mfe_val = _calculate_leg_mae_mfe(
                     index=index,
-                    entry_date=lazy_entry_date_val if is_lazy_leg and lazy_entry_date_val is not None else trade['entry_date'],
+                    entry_date=lazy_entry_date_val if is_lazy_leg and lazy_entry_date_val is not None else trade_entry_date,
                     exit_date=leg_exit_date,
                     leg=leg,
                     entry_price=entry_price,
@@ -4686,18 +4690,18 @@ def run_algotest_backtest(params):
                     trades_flat.append(re_row)
             except Exception as e:
                 flatten_errors.append(f"Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
-                print(f"[DEBUG] ERROR in flatten: Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
+                _log(f"[DEBUG] ERROR in flatten: Trade {trade_idx}, Leg {leg_idx}: {str(e)}")
                 continue
 
     t_loop_elapsed = time.perf_counter() - t_loop
     t_agg = time.perf_counter()
     
-    print(f"[DEBUG] flatten: {len(all_trades)} trades, {len(trades_flat)} rows, errors: {flatten_errors}")
+    _log(f"[DEBUG] flatten: {len(all_trades)} trades, {len(trades_flat)} rows, errors: {flatten_errors}")
     if not trades_flat:
-        print(f"[DEBUG] trades_flat is empty! all_trades had {len(all_trades)} items")
+        _log(f"[DEBUG] trades_flat is empty! all_trades had {len(all_trades)} items")
 
     trades_df = pd.DataFrame(trades_flat)
-    print(f"[DEBUG] trades_df created: {len(trades_df)} rows, cols: {list(trades_df.columns)[:10]}")
+    _log(f"[DEBUG] trades_df created: {len(trades_df)} rows, cols: {list(trades_df.columns)[:10]}")
     
     # ========== AGGREGATE LEGS INTO TRADES FOR ANALYTICS ==========
     if trades_df.empty:
@@ -4772,12 +4776,18 @@ def run_algotest_backtest(params):
             n_exp = len(expiry_df)
         except:
             n_exp = 'N/A'
-        print(f"[PERF] {index} {from_date}→{to_date} | "
-              f"data_load={t_loop - t_spot:.2f}s | "
-              f"loop({n_exp} exps)={t_agg - t_loop:.2f}s | "
-              f"agg+analytics={t_agg_actual:.2f}s | "
-              f"pivot={t_pivot_actual:.2f}s | "
-              f"TOTAL={t_total:.2f}s")
+        logger.info(
+            "[PERF] %s %s->%s | data_load=%.2fs | loop(%s exps)=%.2fs | agg+analytics=%.2fs | pivot=%.2fs | TOTAL=%.2fs",
+            index,
+            from_date,
+            to_date,
+            t_loop - t_spot,
+            n_exp,
+            t_agg - t_loop,
+            t_agg_actual,
+            t_pivot_actual,
+            t_total,
+        )
     
     return trades_df, summary, pivot
 

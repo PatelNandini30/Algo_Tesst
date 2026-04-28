@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import asyncio
 import logging
 from datetime import datetime
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +535,26 @@ async def queue_algotest_job(request: dict):
         validate_index_payload(payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    cache = _get_result_cache()
+    if cache.is_available() and not payload.get("no_cache"):
+        try:
+            cache_key = cache.generate_key(
+                symbol=payload.get("index") or payload.get("symbol") or "NIFTY",
+                from_date=payload.get("from_date") or payload.get("date_from"),
+                to_date=payload.get("to_date") or payload.get("date_to"),
+                strategy_config=payload,
+            )
+            cached = cache.get(cache_key)
+            if cached:
+                job_id = str(uuid4())
+                cached_result = {k: v for k, v in cached.items() if k != "trades_df"}
+                cached_result = {**cached_result, "status": "success", "cached": True}
+                celery_app.backend.store_result(job_id, cached_result, state="SUCCESS")
+                return {"status": "completed", "job_id": job_id, "cached": True}
+        except Exception as exc:
+            logger.warning("Cache short-circuit failed, falling back to queue: %s", exc)
+
     task = run_algotest_job.apply_async(args=[payload])
     return {"status": "queued", "job_id": task.id}
 

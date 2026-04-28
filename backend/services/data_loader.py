@@ -37,6 +37,7 @@ import hashlib
 import os
 import time
 import logging
+import tempfile
 import pandas as pd
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -56,12 +57,30 @@ from database import get_engine
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PARQUET_CACHE_DIR = Path(os.getenv("PARQUET_CACHE_DIR", "/tmp/parquet_cache"))
-PARQUET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    PARQUET_CACHE_DIR.chmod(0o777)
-except Exception:
-    pass
+def _resolve_parquet_cache_dir() -> Path:
+    candidates = []
+    env_dir = os.getenv("PARQUET_CACHE_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.append(Path("/tmp/algotest_parquet_cache"))
+    candidates.append(Path(tempfile.gettempdir()) / "algotest_parquet_cache")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            test_file = candidate / ".write_test"
+            test_file.write_text("ok")
+            test_file.unlink(missing_ok=True)
+            return candidate
+        except Exception:
+            continue
+
+    fallback = Path(tempfile.gettempdir()) / f"algotest_parquet_cache_{os.getpid()}"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+PARQUET_CACHE_DIR = _resolve_parquet_cache_dir()
 
 _LOOKUP_CACHE_TTL = int(os.getenv("LOOKUP_CACHE_TTL", "86400"))
 _LOOKUP_KEY_PREFIX = "bulk"
@@ -183,6 +202,16 @@ def _store_full_range_in_redis(symbol: str, df: pl.DataFrame) -> None:
     if client is None or df is None or df.is_empty():
         return
 
+    # Large full-range payloads are expensive to serialize and can exceed Redis maxmemory.
+    # Keep Redis for smaller reusable snapshots and rely on Parquet for the heavy cache.
+    if df.height > int(os.getenv("REDIS_FULL_RANGE_MAX_ROWS", "200000")):
+        logger.info(
+            "[REDIS] Skipping full range cache for %s (%s rows exceeds threshold)",
+            symbol.upper(),
+            df.height,
+        )
+        return
+
     try:
         df = df.with_columns([
             pl.col("Date").dt.strftime("%Y-%m-%d"),
@@ -210,6 +239,17 @@ def _serialize_cache_value(value: Any) -> Any:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return value
+
+
+def _as_date_value(value: Any) -> Optional[date]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
 
 
 def _is_full_range_loaded(symbol: str) -> bool:
@@ -256,6 +296,7 @@ _shared_premium_cache = LRUCache(max_size=5000)
 _shared_trading_days_cache = LRUCache(max_size=100)
 _shared_expiry_cache = LRUCache(max_size=200)
 _shared_spot_cache = LRUCache(max_size=2000)
+_shared_bulk_strikes_cache = LRUCache(max_size=2000)
 
 
 class PerformanceTimer:
@@ -301,6 +342,7 @@ class HighPerformanceLoader:
         self._trading_days_cache = _shared_trading_days_cache
         self._expiry_cache = _shared_expiry_cache
         self._spot_cache = _shared_spot_cache
+        self._bulk_strikes_cache = _shared_bulk_strikes_cache
         
         logger.info(f"[INIT] HighPerformanceLoader initialized with Polars + Caching")
     
@@ -574,7 +616,10 @@ class HighPerformanceLoader:
             # Split by date and cache each
             if not df.is_empty():
                 for date in uncached_dates:
-                    date_df = df.filter(pl.col("date") == date)
+                    date_value = _as_date_value(date)
+                    if date_value is None:
+                        continue
+                    date_df = df.filter(pl.col("date").cast(pl.Date) == date_value)
                     cache_key = ("date_options", symbol.upper(), date)
                     self._date_cache.put(cache_key, date_df)
                 result_dfs.append(df)
@@ -1201,6 +1246,7 @@ def bulk_clear():
     _bulk_loaded_key = None
     _full_range_loaded = False
     _full_range_symbol = None
+    _shared_bulk_strikes_cache.clear()
     
     logger.info("[BULK] Cleared bulk data from memory")
 
@@ -1224,11 +1270,15 @@ def get_bulk_option_price(
         return None
     
     try:
+        date_value = _as_date_value(date)
+        expiry_value = _as_date_value(expiry_date)
+        if date_value is None or expiry_value is None:
+            return None
         result = _bulk_options_df.filter(
-            (pl.col("Date") == date) &
+            (pl.col("Date").cast(pl.Date) == date_value) &
             (pl.col("StrikePrice") == strike_price) &
             (pl.col("OptionType") == option_type.upper()) &
-            (pl.col("ExpiryDate") == expiry_date)
+            (pl.col("ExpiryDate").cast(pl.Date) == expiry_value)
         )
         
         if result.is_empty():
@@ -1248,7 +1298,10 @@ def get_bulk_spot_price(date: str) -> Optional[float]:
         return None
     
     try:
-        result = _bulk_spot_df.filter(pl.col("Date") == date)
+        date_value = _as_date_value(date)
+        if date_value is None:
+            return None
+        result = _bulk_spot_df.filter(pl.col("Date").cast(pl.Date) == date_value)
         
         if result.is_empty():
             return None
@@ -1272,14 +1325,26 @@ def get_bulk_strikes_for_date(
         return pl.DataFrame()
     
     try:
-        result = _bulk_options_df.filter(
-            (pl.col("Date") == date) &
-            (pl.col("ExpiryDate") == expiry_date)
+        date_value = _as_date_value(date)
+        expiry_value = _as_date_value(expiry_date)
+        if date_value is None:
+            return pl.DataFrame()
+        cache_key = (
+            date_value.isoformat(),
+            expiry_value.isoformat() if expiry_value is not None else "",
+            option_type.upper() if option_type else "",
         )
+        cached = _shared_bulk_strikes_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result = _bulk_options_df.filter(pl.col("Date").cast(pl.Date) == date_value)
+        if expiry_value is not None:
+            result = result.filter(pl.col("ExpiryDate").cast(pl.Date) == expiry_value)
         
         if option_type:
             result = result.filter(pl.col("OptionType") == option_type.upper())
         
+        _shared_bulk_strikes_cache.put(cache_key, result)
         return result
     except Exception as e:
         logger.warning(f"[BULK] Strikes lookup failed: {e}")
@@ -1299,9 +1364,13 @@ def get_bulk_expiry_dates(
     result = _bulk_expiry_df
     
     if from_date:
-        result = result.filter(pl.col("Current Expiry") >= from_date)
+        from_value = _as_date_value(from_date)
+        if from_value is not None:
+            result = result.filter(pl.col("Current Expiry").cast(pl.Date) >= from_value)
     if to_date:
-        result = result.filter(pl.col("Current Expiry") <= to_date)
+        to_value = _as_date_value(to_date)
+        if to_value is not None:
+            result = result.filter(pl.col("Current Expiry").cast(pl.Date) <= to_value)
     
     return result
 

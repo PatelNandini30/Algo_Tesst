@@ -37,6 +37,7 @@ import os
 import json
 import hashlib
 import logging
+import zlib
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
@@ -135,12 +136,14 @@ class BacktestCache:
         if "pivot" in result:
             serialized["pivot"] = result["pivot"]
 
-        return json.dumps(serialized, default=str)
+        payload = json.dumps(serialized, default=str).encode("utf-8")
+        compressed = zlib.compress(payload, level=6)
+        return compressed.decode("latin1")
     
     def _deserialize_result(self, data: str) -> Optional[Dict[str, Any]]:
         """Deserialize backtest result from JSON."""
         try:
-            parsed = json.loads(data)
+            parsed = json.loads(zlib.decompress(data.encode("latin1")).decode("utf-8"))
             result = {}
             
             if "trades" in parsed:

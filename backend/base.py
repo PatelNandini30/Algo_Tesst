@@ -1373,6 +1373,10 @@ _future_lookup_cache: Dict[tuple, dict] = {}
 # key: (date_str, index) → float
 _spot_lookup_cache: Dict[tuple, Optional[float]] = {}
 
+# Cache epoch used to invalidate function-level memoization whenever a new
+# bulk-loaded market window is activated.
+_lookup_cache_epoch = 0
+
 # Bulk preloaded DataFrames (when using PostgreSQL bulk mode)
 _bulk_bhav_df: pd.DataFrame = None
 _bulk_spot_df: pd.DataFrame = None
@@ -1391,6 +1395,235 @@ _bhav_by_date_from: str = None
 _bhav_by_date_to: str = None
 # O(1) guard — replaces the O(n) key scan in _load_date_data_on_demand
 _loaded_on_demand_dates: set = set()
+
+
+def _bump_lookup_cache_epoch():
+    """
+    Advance the cache epoch so memoized lookup helpers stop reusing stale
+    results after the loaded market window changes.
+    """
+    global _lookup_cache_epoch
+    _lookup_cache_epoch += 1
+
+
+def _normalize_lookup_date(value) -> str:
+    if hasattr(value, 'strftime'):
+        return value.strftime('%Y-%m-%d')
+    return str(value)[:10]
+
+
+def _normalize_option_type(value) -> str:
+    if hasattr(value, 'value'):
+        opt_type_upper = str(value.value).upper()
+    elif hasattr(value, 'upper'):
+        opt_type_upper = value.upper()
+    else:
+        opt_type_upper = str(value).upper()
+
+    if opt_type_upper in ['CE', 'CALL', 'C']:
+        return 'CE'
+    if opt_type_upper in ['PE', 'PUT', 'P']:
+        return 'PE'
+    return opt_type_upper
+
+
+@lru_cache(maxsize=200000)
+def _cached_spot_lookup(epoch: int, date_str: str, index_upper: str, db_path: str):
+    cache_key = (date_str, index_upper)
+
+    cached = _spot_lookup_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if _bulk_loaded and _spot_lookup_table:
+        val = _spot_lookup_table.get((date_str, index_upper))
+        if val is not None:
+            _spot_lookup_cache[cache_key] = val
+            return val
+        return None
+
+    try:
+        if _bulk_loaded and _bulk_spot_df is not None and not _bulk_spot_df.empty:
+            date_ts = pd.Timestamp(date_str)
+            if 'Symbol' in _bulk_spot_df.columns:
+                spot_df = _bulk_spot_df[_bulk_spot_df['Symbol'] == index_upper]
+            else:
+                spot_df = _bulk_spot_df
+        else:
+            spot_df = get_strike_data(index_upper, date_str, date_str)
+
+        if spot_df is not None and not spot_df.empty:
+            date_ts = pd.to_datetime(date_str)
+            exact = spot_df[spot_df['Date'] == date_ts]
+            if not exact.empty:
+                val = float(exact.iloc[0]['Close'])
+                _spot_lookup_cache[cache_key] = val
+                return val
+            prior = spot_df[spot_df['Date'] <= date_ts]
+            if not prior.empty:
+                val = float(prior.iloc[-1]['Close'])
+                _spot_lookup_cache[cache_key] = val
+                return val
+    except Exception:
+        pass
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        query = """SELECT close FROM bhavcopy WHERE date = ? AND symbol = ? AND strike IS NULL AND option_type IS NULL LIMIT 1"""
+        cursor.execute(query, (date_str, index_upper))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            val = float(result[0])
+            _spot_lookup_cache[cache_key] = val
+            return val
+    except Exception:
+        pass
+
+    return None
+
+
+@lru_cache(maxsize=200000)
+def _cached_future_lookup(epoch: int, date_str: str, index_upper: str, expiry_str: str):
+    if _bulk_loaded and _future_lookup_table:
+        result = _future_lookup_table.get((date_str, index_upper, expiry_str))
+        if result is not None:
+            return result
+        result = _future_lookup_table.get((date_str, index_upper, (pd.Timestamp(expiry_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+        if result is not None:
+            return result
+        result = _future_lookup_table.get((date_str, index_upper, (pd.Timestamp(expiry_str) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+        if result is not None:
+            return result
+        if _bulk_date_range and _bulk_date_range[0] <= date_str <= _bulk_date_range[1]:
+            _load_date_data_on_demand(date_str, index_upper)
+            result = _future_lookup_table.get((date_str, index_upper, expiry_str))
+            if result is not None:
+                return result
+        return None
+
+    _build_future_lookup(date_str, index_upper)
+    lookup = _future_lookup_cache.get((date_str, index_upper), {})
+    result = lookup.get(expiry_str)
+    if result is not None:
+        return result
+    result = lookup.get((pd.Timestamp(expiry_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
+    if result is not None:
+        return result
+    result = lookup.get((pd.Timestamp(expiry_str) - pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
+    if result is not None:
+        return result
+
+    loader = get_loader()
+    futures_df = loader.get_all_futures_for_date(symbol=index_upper, date=date_str)
+    if futures_df is not None and not futures_df.is_empty():
+        date_ts = pd.Timestamp(date_str)
+        filtered = futures_df.filter(pl.col("expiry_date") >= date_ts)
+        target_df = filtered if not filtered.is_empty() else futures_df
+        if not target_df.is_empty():
+            for row in target_df.iter_rows():
+                exp = row[0]
+                exp_str = exp.strftime('%Y-%m-%d') if hasattr(exp, 'strftime') else str(exp)[:10]
+                if exp_str == expiry_str or (pd.Timestamp(exp_str) - pd.Timestamp(expiry_str)).days in (-1, 0, 1):
+                    return float(row[1])
+
+    return None
+
+
+@lru_cache(maxsize=200000)
+def _cached_option_lookup(epoch: int, date_str: str, index_upper: str, strike_key: int, opt_match: str, expiry_str: str):
+    _build_option_lookup(date_str, index_upper)
+    lookup = _option_lookup_cache.get((date_str, index_upper), {})
+    result = lookup.get((strike_key, opt_match, expiry_str))
+    if result is not None:
+        return result
+    result = lookup.get((strike_key, opt_match, (pd.Timestamp(expiry_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+    if result is not None:
+        return result
+    result = lookup.get((strike_key, opt_match, (pd.Timestamp(expiry_str) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+    if result is not None:
+        return result
+    return None
+
+
+@lru_cache(maxsize=100000)
+def _cached_nearest_future_expiry(epoch: int, index_upper: str, date_str: str) -> Optional[str]:
+    loader = get_loader()
+    futures_df = loader.get_all_futures_for_date(symbol=index_upper, date=date_str)
+    if futures_df is None or futures_df.is_empty():
+        return None
+    date_ts = pd.Timestamp(date_str)
+    filtered = futures_df.filter(pl.col("expiry_date") >= pl.lit(date_ts))
+    target_df = filtered if not filtered.is_empty() else futures_df
+    if target_df.is_empty():
+        return None
+    expiry_raw = target_df["expiry_date"][0]
+    expiry_ts = pd.Timestamp(expiry_raw)
+    return expiry_ts.strftime('%Y-%m-%d')
+
+
+@lru_cache(maxsize=100000)
+def _cached_nearest_future_expiry_after(epoch: int, index_upper: str, date_str: str, min_expiry_str: str) -> Optional[str]:
+    loader = get_loader()
+    futures_df = loader.get_all_futures_for_date(symbol=index_upper, date=date_str)
+    if futures_df is None or futures_df.is_empty():
+        return None
+    min_expiry_ts = pd.Timestamp(min_expiry_str)
+    filtered = futures_df.filter(pl.col("expiry_date") > pl.lit(min_expiry_ts))
+    if filtered.is_empty():
+        return None
+    expiry_raw = filtered["expiry_date"][0]
+    expiry_ts = pd.Timestamp(expiry_raw)
+    return expiry_ts.strftime('%Y-%m-%d')
+
+
+@lru_cache(maxsize=100000)
+def _cached_futures_expiry_by_preference(epoch: int, index_upper: str, date_str: str, preference: str) -> Optional[str]:
+    loader = get_loader()
+    futures_df = loader.get_all_futures_for_date(symbol=index_upper, date=date_str)
+    if futures_df is None or futures_df.is_empty():
+        return None
+    date_ts = pd.Timestamp(date_str)
+    filtered = futures_df.filter(pl.col("expiry_date") >= pl.lit(date_ts))
+    if filtered.is_empty():
+        filtered = futures_df
+    if filtered.is_empty():
+        return None
+    if preference == 'next_monthly' and len(filtered) >= 2:
+        expiry_raw = filtered["expiry_date"][1]
+    else:
+        expiry_raw = filtered["expiry_date"][0]
+    expiry_ts = pd.Timestamp(expiry_raw)
+    return expiry_ts.strftime('%Y-%m-%d')
+
+
+def clear_lookup_memoization():
+    """Clear memoized lookup helpers without touching the current data tables."""
+    _cached_spot_lookup.cache_clear()
+    _cached_future_lookup.cache_clear()
+    _cached_option_lookup.cache_clear()
+    _cached_nearest_future_expiry.cache_clear()
+    _cached_nearest_future_expiry_after.cache_clear()
+    _cached_futures_expiry_by_preference.cache_clear()
+
+
+def clear_lookup_caches(clear_partitions: bool = True):
+    """Clear memoized helpers and lookup dicts.
+
+    When `clear_partitions` is False, preserve the expensive per-date partition
+    cache so the next backtest for the same symbol/range can reuse it.
+    """
+    clear_lookup_memoization()
+    _option_lookup_cache.clear()
+    _future_lookup_cache.clear()
+    _spot_lookup_cache.clear()
+    _option_lookup_table.clear()
+    _future_lookup_table.clear()
+    _spot_lookup_table.clear()
+    if clear_partitions:
+        _bulk_bhav_by_date.clear()
+        _loaded_on_demand_dates.clear()
 
 
 def _load_bhavcopy_range_csv(from_date: str, to_date: str, symbols: list) -> pd.DataFrame:
@@ -2003,9 +2236,9 @@ def parse_filter_csv(csv_content: str) -> list:
         valid_mask = start_series.notna() & end_series.notna()
         
         # Log raw values for debugging
-        print(f"[CSV PARSE DEBUG] start_col={start_col}, end_col={end_col}")
-        print(f"[CSV PARSE DEBUG] raw starts: {df[start_col].tolist()[:5]}")
-        print(f"[CSV PARSE DEBUG] raw ends: {df[end_col].tolist()[:5]}")
+        logger.debug("[CSV PARSE DEBUG] start_col=%s end_col=%s", start_col, end_col)
+        logger.debug("[CSV PARSE DEBUG] raw starts=%s", df[start_col].tolist()[:5])
+        logger.debug("[CSV PARSE DEBUG] raw ends=%s", df[end_col].tolist()[:5])
         
         start_dates = start_series[valid_mask].dt.date.tolist()
         end_dates = end_series[valid_mask].dt.date.tolist()
@@ -2059,59 +2292,12 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
     Loads data for each date once, then caches forever.
     """
     try:
-        date_str  = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+        date_str = _normalize_lookup_date(date)
         expiry_ts = pd.Timestamp(expiry)
         expiry_str = expiry_ts.strftime('%Y-%m-%d')
-
-        if hasattr(option_type, 'value'):
-            opt_type_upper = str(option_type.value).upper()
-        elif hasattr(option_type, 'upper'):
-            opt_type_upper = option_type.upper()
-        else:
-            opt_type_upper = str(option_type).upper()
-
-        if opt_type_upper in ['CE', 'CALL', 'C']:
-            opt_match = 'CE'
-        elif opt_type_upper in ['PE', 'PUT', 'P']:
-            opt_match = 'PE'
-        else:
-            opt_match = opt_type_upper
-
+        opt_match = _normalize_option_type(option_type)
         strike_key = int(round(float(strike)))
-
-        # Use lazy per-date cache instead of a 7M-entry dict
-        if _bulk_loaded:
-            # Use per-date cache — built lazily from Polars DataFrame
-            # Uses ~50MB instead of 5GB for the full history
-            _build_option_lookup(date_str, index)
-            lookup = _option_lookup_cache.get((date_str, index), {})
-            result = lookup.get((strike_key, opt_match, expiry_str))
-            if result is not None:
-                return result
-            result = lookup.get((strike_key, opt_match,
-                (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-            if result is not None:
-                return result
-            result = lookup.get((strike_key, opt_match,
-                (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-            if result is not None:
-                return result
-            return None
-
-        # Fallback: use lookup cache
-        _build_option_lookup(date_str, index)
-        lookup = _option_lookup_cache.get((date_str, index), {})
-        result = lookup.get((strike_key, opt_match, expiry_str))
-        if result is not None:
-            return result
-        result = lookup.get((strike_key, opt_match, (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-        if result is not None:
-            return result
-        result = lookup.get((strike_key, opt_match, (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-        if result is not None:
-            return result
-        return None
-
+        return _cached_option_lookup(_lookup_cache_epoch, date_str, str(index).upper(), strike_key, opt_match, expiry_str)
     except Exception:
         return None
 
@@ -2165,69 +2351,36 @@ def _load_date_data_on_demand(date_str: str, index: str):
 
 def _resolve_nearest_future_expiry(index: str, date) -> Optional[str]:
     try:
-        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
-        loader = get_loader()
-        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
-        if futures_df is None or futures_df.is_empty():
-            return None
-        date_ts = pd.Timestamp(date_str)
-        filtered = futures_df.filter(
-            pl.col("expiry_date") >= pl.lit(date_ts)
-        )
-        target_df = filtered if not filtered.is_empty() else futures_df
-        if target_df.is_empty():
-            return None
-        expiry_raw = target_df["expiry_date"][0]
-        expiry_ts = pd.Timestamp(expiry_raw)
-        return expiry_ts.strftime('%Y-%m-%d')
+        date_str = _normalize_lookup_date(date)
+        return _cached_nearest_future_expiry(_lookup_cache_epoch, str(index).upper(), date_str)
     except Exception:
         return None
 
 
 def _resolve_nearest_future_expiry_after(index: str, date, min_expiry_after) -> Optional[str]:
     try:
-        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
-        min_expiry_ts = pd.Timestamp(min_expiry_after)
-        loader = get_loader()
-        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
-        if futures_df is None or futures_df.is_empty():
-            return None
-        filtered = futures_df.filter(
-            pl.col("expiry_date") > pl.lit(min_expiry_ts)
+        date_str = _normalize_lookup_date(date)
+        min_expiry_str = _normalize_lookup_date(min_expiry_after)
+        return _cached_nearest_future_expiry_after(
+            _lookup_cache_epoch,
+            str(index).upper(),
+            date_str,
+            min_expiry_str,
         )
-        if filtered.is_empty():
-            return None
-        expiry_raw = filtered["expiry_date"][0]
-        expiry_ts = pd.Timestamp(expiry_raw)
-        return expiry_ts.strftime('%Y-%m-%d')
     except Exception:
         return None
 
 
 def _resolve_futures_expiry_by_preference(index: str, date, preference='monthly') -> Optional[str]:
     try:
-        date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
-        loader = get_loader()
-        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
-        if futures_df is None or futures_df.is_empty():
-            return None
-
-        date_ts = pd.Timestamp(date_str)
-        filtered = futures_df.filter(
-            pl.col("expiry_date") >= pl.lit(date_ts)
+        date_str = _normalize_lookup_date(date)
+        pref = str(preference or 'monthly').lower().strip()
+        return _cached_futures_expiry_by_preference(
+            _lookup_cache_epoch,
+            str(index).upper(),
+            date_str,
+            pref,
         )
-        if filtered.is_empty():
-            filtered = futures_df
-        if filtered.is_empty():
-            return None
-
-        if preference == 'next_monthly' and len(filtered) >= 2:
-            expiry_raw = filtered["expiry_date"][1]
-        else:
-            expiry_raw = filtered["expiry_date"][0]
-
-        expiry_ts = pd.Timestamp(expiry_raw)
-        return expiry_ts.strftime('%Y-%m-%d')
     except Exception:
         return None
 
@@ -2311,62 +2464,15 @@ def get_future_price_from_db(date, index, expiry=None, db_path='bhavcopy_data.db
     HIGH-PERFORMANCE: O(1) lookup with on-demand loading.
     """
     try:
-        date_str   = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)[:10]
+        date_str = _normalize_lookup_date(date)
+        index_upper = str(index).upper()
         if expiry is None:
-            expiry = _resolve_nearest_future_expiry(index, date_str)
+            expiry = _resolve_nearest_future_expiry(index_upper, date_str)
             if expiry is None:
                 return None
         expiry_ts  = pd.Timestamp(expiry)
         expiry_str = expiry_ts.strftime('%Y-%m-%d')
-
-        # HIGH-PERFORMANCE: Use instant lookup table
-        if _bulk_loaded and _future_lookup_table:
-            result = _future_lookup_table.get((date_str, index, expiry_str))
-            if result is not None:
-                return result
-            result = _future_lookup_table.get((date_str, index, (expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-            if result is not None:
-                return result
-            result = _future_lookup_table.get((date_str, index, (expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
-            if result is not None:
-                return result
-            # Try loading on-demand
-            if _bulk_date_range and _bulk_date_range[0] <= date_str <= _bulk_date_range[1]:
-                _load_date_data_on_demand(date_str, index)
-                result = _future_lookup_table.get((date_str, index, expiry_str))
-                if result is not None:
-                    return result
-            return None
-
-        # Fallback: old method
-        _build_future_lookup(date_str, index)
-        lookup = _future_lookup_cache.get((date_str, index), {})
-        result = lookup.get(expiry_str)
-        if result is not None:
-            return result
-        result = lookup.get((expiry_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
-        if result is not None:
-            return result
-        result = lookup.get((expiry_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
-        if result is not None:
-            return result
-
-        # Final fallback: use data_loader directly (handles Redis cache, on-demand DB queries)
-        loader = get_loader()
-        futures_df = loader.get_all_futures_for_date(symbol=index, date=date_str)
-        if futures_df is not None and not futures_df.is_empty():
-            date_ts = pd.Timestamp(date_str)
-            filtered = futures_df.filter(pl.col("expiry_date") >= date_ts)
-            target_df = filtered if not filtered.is_empty() else futures_df
-            if not target_df.is_empty():
-                for row in target_df.iter_rows():
-                    exp = row[0]  # expiry_date is first column
-                    exp_str = exp.strftime('%Y-%m-%d') if hasattr(exp, 'strftime') else str(exp)[:10]
-                    if exp_str == expiry_str or (pd.Timestamp(exp_str) - expiry_ts).days in (-1, 0, 1):
-                        return float(row[1])  # close is second column
-
-        return None
-
+        return _cached_future_lookup(_lookup_cache_epoch, date_str, index_upper, expiry_str)
     except Exception as e:
         return None
 
@@ -2522,74 +2628,9 @@ def get_spot_price_from_db(date, index, db_path='bhavcopy_data.db'):
     """
     HIGH-PERFORMANCE: O(1) lookup using pre-built instant lookup table.
     """
-    # Bug fix 1: strip time component from string dates ("2025-01-06 00:00:00" → "2025-01-06")
-    if hasattr(date, 'strftime'):
-        date_str = date.strftime('%Y-%m-%d')
-    else:
-        date_str = str(date)[:10]  # take only the date part
-
-    # Bug fix 2: normalise symbol casing for consistent lookup keys
+    date_str = _normalize_lookup_date(date)
     index_upper = str(index).upper()
-    cache_key = (date_str, index_upper)
-
-    # Check old cache first — but skip cached None so a post-bulk_load call can succeed
-    cached = _spot_lookup_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    # HIGH-PERFORMANCE: Use instant lookup table
-    if _bulk_loaded and _spot_lookup_table:
-        val = _spot_lookup_table.get((date_str, index_upper))
-        if val is not None:
-            _spot_lookup_cache[cache_key] = val
-            return val
-        return None
-
-    # Fallback to old method
-    try:
-        if _bulk_loaded and _bulk_spot_df is not None and not _bulk_spot_df.empty:
-            date_ts = pd.Timestamp(date_str)
-            # Spot data may or may not have Symbol column - handle both
-            if 'Symbol' in _bulk_spot_df.columns:
-                spot_df = _bulk_spot_df[_bulk_spot_df['Symbol'] == index]
-            else:
-                # No Symbol column - use all rows
-                spot_df = _bulk_spot_df
-        else:
-            spot_df = get_strike_data(index, date_str, date_str)
-
-        if spot_df is not None and not spot_df.empty:
-            date_ts = pd.to_datetime(date_str)
-            exact = spot_df[spot_df['Date'] == date_ts]
-            if not exact.empty:
-                val = float(exact.iloc[0]['Close'])
-                _spot_lookup_cache[cache_key] = val
-                return val
-            prior = spot_df[spot_df['Date'] <= date_ts]
-            if not prior.empty:
-                val = float(prior.iloc[-1]['Close'])
-                _spot_lookup_cache[cache_key] = val
-                return val
-
-    except Exception:
-        pass
-
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        query = """SELECT close FROM bhavcopy WHERE date = ? AND symbol = ? AND strike IS NULL AND option_type IS NULL LIMIT 1"""
-        cursor.execute(query, (date_str, index))
-        result = cursor.fetchone()
-        conn.close()
-        if result:
-            val = float(result[0])
-            _spot_lookup_cache[cache_key] = val
-            return val
-    except Exception:
-        pass
-
-    # Do NOT cache None — a subsequent call after bulk_load should be able to succeed
-    return None
+    return _cached_spot_lookup(_lookup_cache_epoch, date_str, index_upper, db_path)
 
 
 # ============================================================================
@@ -3032,14 +3073,12 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         }
 
     result = dl_bulk_load(symbol, from_date, to_date)
+    _bump_lookup_cache_epoch()
+    clear_lookup_caches()
 
     def _partition_and_prebuild(options_df, sym_upper):
         """Partition by date and pre-build the full option lookup cache for this symbol."""
-        _option_lookup_table.clear()
-        _future_lookup_table.clear()
-        _option_lookup_cache.clear()
         _bulk_bhav_df_ref = options_df
-        _bulk_bhav_by_date.clear()
         for date_val, sub_df in options_df.partition_by("Date", as_dict=True).items():
             _bulk_bhav_by_date[str(date_val)[:10]] = sub_df
 
@@ -3092,7 +3131,6 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
 
     spot_df = get_bulk_spot_df()
     if spot_df is not None and not spot_df.is_empty():
-        _spot_lookup_table.clear()
         s_dates   = _series_to_iso_date_list(spot_df["Date"])
         s_closes  = spot_df["Close"].to_list()
         _spot_lookup_table = {(d, symbol.upper()): c for d, c in zip(s_dates, s_closes)}
@@ -3114,10 +3152,6 @@ def bulk_clear_options():
     _bulk_spot_df = None
     _bulk_loaded = False
     _bulk_date_range = None
-    _option_lookup_table.clear()
-    _future_lookup_table.clear()
-    _spot_lookup_table.clear()
-    _loaded_on_demand_dates.clear()
     # _bulk_bhav_by_date and _option_lookup_cache intentionally kept —
     # next backtest for the same symbol hits the fast early return in bulk_load_options()
     # NOTE: data_loader Polars cache intentionally kept alive for re-use
@@ -3137,15 +3171,10 @@ def bulk_force_clear():
     _bulk_spot_df = None
     _bulk_loaded = False
     _bulk_date_range = None
-    _option_lookup_table.clear()
-    _bulk_bhav_by_date.clear()
-    _option_lookup_cache.clear()
-    _future_lookup_table.clear()
-    _spot_lookup_table.clear()
+    clear_lookup_caches()
     _bhav_by_date_symbol = None
     _bhav_by_date_from   = None
     _bhav_by_date_to     = None
-    _loaded_on_demand_dates.clear()
 
 
 def fast_get_option_premium(

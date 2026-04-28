@@ -1,4 +1,5 @@
 """Shared helper for running AlgoTest backtests with caching/logging."""
+import logging
 import traceback
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -10,13 +11,15 @@ import pandas as pd
 from sqlalchemy.exc import OperationalError
 
 from engines.generic_algotest_engine import run_algotest_backtest, get_expiry_dates
-from base import bulk_load_options
+from base import bulk_load_options, bulk_force_clear
 from database import reset_engine
 from services.backtest_cache import get_backtest_cache
 from services.index_metadata import normalize_index, validate_index_payload
 
+logger = logging.getLogger(__name__)
 
-# Maximum years to load at once; keeps chunked bulk loads under ~1.2GB.
+# Maximum years to load at once before chunking a single-threaded run.
+# Keep this bounded so long backtests do not accumulate a huge working set.
 _BULK_LOAD_CHUNK_YEARS = int(os.environ.get("BULK_LOAD_CHUNK_YEARS", "3"))
 
 
@@ -136,39 +139,50 @@ def _reindex_trades(trades: list):
 def _run_backtest_chunk(args: tuple) -> list:
     """Run backtest for a subset of expiry dates. Must be top-level for pickling."""
     params, chunk_dates = args
-    from base import bulk_load_options
+    from base import bulk_load_options, bulk_force_clear
     from engines.generic_algotest_engine import run_algotest_backtest
     
     index = params.get('index', 'NIFTY')
     from_date = params.get('from_date')
     to_date = params.get('to_date')
+    chunk_from = min(chunk_dates) if chunk_dates else from_date
+    chunk_to = max(chunk_dates) if chunk_dates else to_date
     
     try:
-        bulk_load_options(index, from_date, to_date)
+        bulk_load_options(index, chunk_from, chunk_to)
         chunk_params = dict(params)
+        chunk_params['from_date'] = chunk_from
+        chunk_params['to_date'] = chunk_to
         chunk_params['_expiry_chunk'] = chunk_dates
         df, _, _ = run_algotest_backtest(chunk_params)
         return df.to_dict('records') if df is not None and not df.empty else []
     except Exception:
         return []
+    finally:
+        try:
+            bulk_force_clear()
+        except Exception:
+            pass
 
 
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_request(request)
     validate_index_payload(payload)
-    print(f"[SERVICE] entry_dte in payload = {payload.get('entry_dte')}, exit_dte = {payload.get('exit_dte')}")
+    logger.debug("[SERVICE] entry_dte=%s exit_dte=%s", payload.get('entry_dte'), payload.get('exit_dte'))
     index = payload['index']
     from_date = payload.get('from_date')
     to_date = payload.get('to_date')
 
     redis_cache = None
-    use_cache = False  # DEBUG: Disabled cache to trace issues
+    use_cache = os.environ.get("BACKTEST_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
     cache_key = None
 
     try:
+        # Drop any stale bulk state left behind by a previous task in the same worker.
+        bulk_force_clear()
+
         redis_cache = get_backtest_cache()
-        # Cache disabled for debugging
-        if False and redis_cache.is_available():
+        if use_cache and redis_cache.is_available():
             use_cache = True
             cache_key = redis_cache.generate_key(symbol=index, from_date=from_date, to_date=to_date, strategy_config=payload)
             cached = redis_cache.get(cache_key)
@@ -203,30 +217,30 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     if seg_dates:
                         effective_from = max(min(seg_dates), user_from).strftime('%Y-%m-%d')
                         effective_to = min(max(seg_dates), user_to).strftime('%Y-%m-%d')
-                    print(f"[STR FILTER] Segments: {len(segments)}, Effective range: {effective_from} → {effective_to}")
+                    logger.info("[STR FILTER] Segments=%s Effective range=%s -> %s", len(segments), effective_from, effective_to)
             except Exception as e:
-                print(f"[STR FILTER] Error: {e}")
+                logger.warning("[STR FILTER] Error: %s", e)
                 pass  # fall back to full range on any error
         
         # Update payload with effective date range for the engine
         payload['from_date'] = effective_from
         payload['to_date'] = effective_to
 
-        n_workers = int(os.environ.get("BACKTEST_WORKERS", "1"))
+        default_workers = min(4, max(2, (os.cpu_count() or 2) // 3))
+        n_workers = max(1, int(os.environ.get("BACKTEST_WORKERS", str(default_workers))))
         expiry_type = payload.get('expiry_type', 'WEEKLY')
 
-        print(f"[DATE RANGE] User: {from_date} → {to_date}, Effective: {effective_from} → {effective_to}")
+        logger.debug("[DATE RANGE] User=%s -> %s Effective=%s -> %s", from_date, to_date, effective_from, effective_to)
         expiry_df = get_expiry_dates(index, expiry_type.lower(), effective_from, effective_to)
         
-        print(f"[DEBUG] expiry_df: {type(expiry_df)}, len={len(expiry_df) if expiry_df is not None else 'None'}")
+        logger.debug("[DEBUG] expiry_df type=%s len=%s", type(expiry_df), len(expiry_df) if expiry_df is not None else 'None')
         if expiry_df is not None and not expiry_df.empty:
-            print(f"[DEBUG] First expiry: {expiry_df.iloc[0]['Current Expiry']}")
-            print(f"[DEBUG] Last expiry: {expiry_df.iloc[-1]['Current Expiry']}")
+            logger.debug("[DEBUG] First expiry=%s", expiry_df.iloc[0]['Current Expiry'])
+            logger.debug("[DEBUG] Last expiry=%s", expiry_df.iloc[-1]['Current Expiry'])
 
         all_trades = []
 
         if n_workers > 1 and expiry_df is not None and not expiry_df.empty and len(expiry_df) >= n_workers * 2:
-            bulk_load_options(index, effective_from, effective_to)
             expiry_dates = expiry_df['Current Expiry'].dt.strftime('%Y-%m-%d').tolist()
             chunk_size = max(1, len(expiry_dates) // n_workers)
 
@@ -241,6 +255,10 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 for chunk_trades in results:
                     if chunk_trades:
                         all_trades.extend(chunk_trades)
+            try:
+                bulk_force_clear()
+            except Exception:
+                pass
             engine_summary = None
             engine_pivot = None
             if engine_summary is None:
@@ -253,12 +271,12 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             span_years = (to_dt - from_dt).days / 365.25
             if span_years <= _BULK_LOAD_CHUNK_YEARS:
                 bulk_load_options(index, effective_from, effective_to)
-                print(f"[DEBUG] Calling run_algotest_backtest with from={effective_from}, to={effective_to}")
+                logger.debug("[DEBUG] Calling run_algotest_backtest from=%s to=%s", effective_from, effective_to)
                 trades_df, engine_summary, engine_pivot = run_algotest_backtest(payload)
-                print(f"[DEBUG] Backtest returned: type={type(trades_df)}, len={len(trades_df) if trades_df is not None else 'None'}, empty={trades_df.empty if trades_df is not None else 'N/A'}")
+                logger.debug("[DEBUG] Backtest returned type=%s len=%s empty=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None', trades_df.empty if trades_df is not None else 'N/A')
                 all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
-                print(f"[DEBUG] Single chunk: trades_df={type(trades_df)}, len={len(trades_df) if trades_df is not None else 'None'}")
-                print(f"[DEBUG] all_trades from single chunk: {len(all_trades)}")
+                logger.debug("[DEBUG] Single chunk trades_df=%s len=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None')
+                logger.debug("[DEBUG] all_trades from single chunk=%s", len(all_trades))
                 if engine_summary is None:
                     engine_summary = {}
                 if engine_pivot is None:
@@ -285,10 +303,14 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             trades_agg[col] = saved
 
                         all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
+                        try:
+                            bulk_force_clear()
+                        except Exception:
+                            pass
                         engine_summary = result_summary
                         engine_pivot = result_pivot
                     except Exception as e:
-                        print(f"[WARN] compute_analytics for single chunk failed: {e}")
+                        logger.warning("[WARN] compute_analytics for single chunk failed: %s", e)
             else:
                 all_chunk_trades = []
                 engine_summary = None
@@ -302,10 +324,10 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         chunk_payload['to_date'] = chunk_to
                         c_df, c_summary, c_pivot = run_algotest_backtest(chunk_payload)
                         chunk_count = len(c_df) if c_df is not None and not c_df.empty else 0
-                        print(f"[DEBUG] chunk {chunk_from}→{chunk_to}: c_df type={type(c_df)}, count={chunk_count}")
+                        logger.debug("[DEBUG] chunk %s -> %s c_df type=%s count=%s", chunk_from, chunk_to, type(c_df), chunk_count)
                         if c_df is not None and not c_df.empty:
-                            print(f"[DEBUG] c_df columns: {list(c_df.columns)[:5]}")
-                            print(f"[DEBUG] c_df first row: {c_df.iloc[0].to_dict() if len(c_df) > 0 else 'empty'}")
+                            logger.debug("[DEBUG] c_df columns=%s", list(c_df.columns)[:5])
+                            logger.debug("[DEBUG] c_df first row=%s", c_df.iloc[0].to_dict() if len(c_df) > 0 else 'empty')
                         if chunk_count > 0:
                             chunk_records = c_df.to_dict('records')
                             # Offset Trade IDs so they never collide with previous chunks
@@ -322,13 +344,18 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             if c_pivot:
                                 engine_pivot = c_pivot
                         expiry_type_used = chunk_payload.get('expiry_type', 'WEEKLY')
-                        print(f"[CHUNK] {chunk_from} → {chunk_to}: {chunk_count} trades (expiry_type={expiry_type_used})")
+                        logger.info("[CHUNK] %s -> %s: %s trades (expiry_type=%s)", chunk_from, chunk_to, chunk_count, expiry_type_used)
                     except Exception as chunk_err:
-                        print(f"[CHUNK ERROR] {chunk_from} → {chunk_to}: {chunk_err}")
+                        logger.error("[CHUNK ERROR] %s -> %s: %s", chunk_from, chunk_to, chunk_err)
                         traceback.print_exc()
                         continue
+                    finally:
+                        try:
+                            bulk_force_clear()
+                        except Exception:
+                            pass
                 all_trades = all_chunk_trades
-                print(f"[DEBUG] Total all_chunk_trades collected: {len(all_chunk_trades)}")
+                logger.debug("[DEBUG] Total all_chunk_trades collected=%s", len(all_chunk_trades))
                 if not all_trades:
                     engine_summary = None
                     engine_pivot = None
@@ -361,15 +388,14 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 trades_aggregated = trades_df
 
                 if 'Net P&L' in trades_aggregated.columns:
-                    print(f"[DEBUG] Net P&L sample: "
-                          f"{trades_aggregated['Net P&L'].head().tolist()}")
+                    logger.debug("[DEBUG] Net P&L sample=%s", trades_aggregated['Net P&L'].head().tolist())
 
                 # Preserve engine-computed cumulative before compute_analytics drops and rewrites them
                 _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
                 _saved_final = {col: trades_aggregated[col].copy() for col in _cum_cols if col in trades_aggregated.columns}
 
                 trades_aggregated, result_summary = compute_analytics(trades_aggregated)
-                print(f"[DEBUG] Result summary: {result_summary}")
+                logger.debug("[DEBUG] Result summary=%s", result_summary)
                 result_pivot = build_pivot(trades_aggregated, "Exit Date")
 
                 # Restore correct additive-from-100 series (compute_analytics overwrites these)
@@ -382,7 +408,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
             except Exception as e:
-                print(f"[ERROR] compute_analytics failed: {e}")
+                logger.error("[ERROR] compute_analytics failed: %s", e)
                 traceback.print_exc()
                 result_summary = {}
                 try:
@@ -458,9 +484,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             'spot_change': 0,
                             'profit_factor': round(wins.sum() / abs(losses.sum()), 2) if losses.sum() != 0 else 0,
                         }
-                        print(f"[DEBUG] Fallback summary: {result_summary}")
+                        logger.debug("[DEBUG] Fallback summary=%s", result_summary)
                 except Exception as fallback_error:
-                    print(f"[ERROR] Fallback summary failed: {fallback_error}")
+                    logger.error("[ERROR] Fallback summary failed: %s", fallback_error)
         else:
             all_trades = _convert_numpy(_format_dates(all_trades))
 
@@ -508,8 +534,8 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 # Fallback: convert to string representation
                 return str(obj)
 
-        print(f"[DEBUG] Before JSON safe: result_summary={result_summary}")
-        print(f"[DEBUG] result_summary types: {[(k, type(v)) for k, v in result_summary.items()]}")
+        logger.debug("[DEBUG] Before JSON safe result_summary=%s", result_summary)
+        logger.debug("[DEBUG] result_summary types=%s", [(k, type(v)) for k, v in result_summary.items()])
         
         result_payload = {
             'status': 'success',
@@ -532,27 +558,33 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             'cached': False,
         }
         
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.warning(f"[SUMMARY_DEBUG] result_summary has {len(result_summary)} keys: {list(result_summary.keys())}")
-        logger.warning(f"[SUMMARY_DEBUG] total_pnl value: {result_summary.get('total_pnl')}")
-        logger.warning(f"[SUMMARY_DEBUG] cagr_options value: {result_summary.get('cagr_options')}")
-        
-        print(f"[DEBUG] After JSON safe: payload.summary={result_payload.get('summary')}")
+        logger.debug("[DEBUG] After JSON safe payload.summary=%s", result_payload.get('summary'))
 
         if use_cache and redis_cache and cache_key:
             redis_cache.set(cache_key, result_payload)
 
+        try:
+            bulk_force_clear()
+        except Exception:
+            pass
         return result_payload
     except OperationalError:
         traceback.print_exc()
         reset_engine()
+        try:
+            bulk_force_clear()
+        except Exception:
+            pass
         return {
             'status': 'error',
             'message': 'PostgreSQL connection dropped while running the backtest.'
         }
     except Exception as err:
         traceback.print_exc()
+        try:
+            bulk_force_clear()
+        except Exception:
+            pass
         return {
             'status': 'error',
             'message': str(err)
