@@ -275,13 +275,71 @@ def run_intraday_backtest(spec, date_from, date_to, symbol):
 
 ### 5.2 Rust kernels (extend `backend/native/`)
 
-New native functions:
-- `intraday_open_dataset(symbol_dir: str) -> DatasetHandle` — opens all snapshot mmaps under the symbol directory; returns an opaque handle.
-- `intraday_resolve_atm(handle, date, minute) -> (strike_x100, spot_x100)` — direct array indexing into the snapshot.
-- `intraday_leg_curve(handle, date, expiry_idx, strike_x100, opt_type, t_start, t_end) -> Arrow Float64Array` — returns a contiguous slice of close prices.
-- `intraday_first_hit(curve: &[i32], threshold: i32, direction: i8) -> i32` — SIMD-friendly first-crossing scan; returns minute index or -1.
+The Rust extension is **opportunistic**, not mandatory. Every kernel has a Polars-vectorized fallback in `services/rust_fast_path.py`. Rust is used where data shows Polars hits a wall — which on profiling is one specific case: **stateful path-dependent exit logic** (trailing SL, breakeven moves, re-entry).
 
-Existing `services/rust_fast_path.py` infrastructure is reused for loading the extension and providing a Python wrapper. EOD path is **not** affected — the new functions are additive.
+**Must-have kernels (phase 3):**
+
+```rust
+// Mmap setup — shared once per worker process, not per request
+fn intraday_open_dataset(symbol_dir: &str) -> DatasetHandle;
+
+// O(1) array indexing into the day's snapshot
+fn intraday_resolve_atm(h: &DatasetHandle, date: i32, minute: u16) -> (i32, i32);
+
+// Returns a contiguous slice of a leg's full-day close curve (zero-copy where possible)
+fn intraday_leg_curve(h: &DatasetHandle, date: i32, expiry_idx: i16, strike: i32,
+                      opt_type: i8, t0: u16, t1: u16) -> Float64Array;
+
+// Stateless first-cross scan; SIMD-friendly; covers fixed SL/target exits
+fn intraday_first_hit(curve: &[i32], threshold: i32, direction: i8) -> i32;
+```
+
+**Must-have kernel (phase 6 — added during stateful exit support):**
+
+```rust
+// Full leg lifecycle in ONE Rust call. Handles trailing SL, breakeven moves,
+// target priority, square-off, and computes MAE/MFE inline.
+// Eliminates the per-minute Python<->Rust boundary cost for stateful exits.
+fn intraday_leg_lifecycle(h: &DatasetHandle, date: i32,
+                          leg: LegSpec, exits: ExitSpec) -> LegResult;
+//   Returns: entry_min, entry_px, exit_min, exit_px, exit_reason, mae, mfe
+```
+
+**Nice-to-have kernel (phase 7+ — only if profiling shows need):**
+
+```rust
+// Whole-day strategy run in Rust. Adds 5-10x headroom for adversarial workloads.
+// Defer until perf regression test fails the budget.
+fn intraday_run_day(h: &DatasetHandle, date: i32, spec: &StrategySpec) -> DayResult;
+```
+
+**Compilation flags** (mandatory — leave 30–50% perf on the table without them):
+
+```toml
+# backend/native/.cargo/config.toml
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3", "-C", "lto=fat"]
+```
+
+`target-cpu=native` lets LLVM use AVX2 instructions on the i5-10500.
+
+Existing `services/rust_fast_path.py` infrastructure is reused for loading the extension and providing Python wrappers. **EOD path is not affected** — all new functions are additive; existing native exports are unchanged.
+
+### 5.2.1 What stays in Python (and why)
+
+| Concern | Implementation | Reason |
+|---|---|---|
+| API routing, validation | FastAPI + pydantic | Glue, not hot path; Python overhead ~50 ms total |
+| Strategy spec parsing | Python | One-time per request |
+| Entry signal resolution | Polars vectorized | 30–80 ms even for signal-based; well within budget |
+| Per-minute P&L curve math | Polars vectorized | SIMD via Arrow; faster than naive NumPy or Rust |
+| Stateless exit logic (fixed SL/target/time) | Polars `arg_max` | One expression per leg; <80 ms for 1000 legs |
+| MAE/MFE for stateless exits | Polars rolling min/max | Vectorized, fast |
+| **Stateful exit logic (trailing SL, breakeven)** | **Rust `intraday_leg_lifecycle`** | Path-dependent state machine; Polars `.apply()` is Python-speed |
+| Tradesheet aggregation | Polars groupby | Right tool |
+| Arrow IPC serialization | pyarrow (C++ underneath) | Already optimal |
+
+The senior-engineering principle: **rewrite when data demands it, not preemptively.** Profile in phase 7 with the perf-regression test; if any step exceeds its budget, push that step into Rust. The list above is what we expect to be needed; we'll know for sure after phase 4.
 
 ### 5.3 Strategy spec (intraday)
 
@@ -539,7 +597,7 @@ Each phase is a runnable, mergeable slice. **Order matters** — later phases de
 | 3 | Rust kernels (`open_dataset`, `resolve_atm`, `leg_curve`, `first_hit`) + golden tests | `test_intraday_native_golden.py` green |
 | 4 | Engine for fixed-time short-straddle end-to-end | `POST /api/intraday/backtest` returns valid tradesheet for 1 month NIFTY in p50 < 400 ms |
 | 5 | Frontend mode toggle + intraday strategy form fields + slow-path warning | User can run a 1-month intraday straddle through the UI |
-| 6 | Multi-leg, per-leg SL/target/trailing, square-off time | 4-leg iron condor 1 month NIFTY in p50 < 600 ms |
+| 6 | Multi-leg + per-leg SL/target/trailing + square-off time. **Adds Rust `intraday_leg_lifecycle` for stateful exits.** | 4-leg iron condor 1 month NIFTY in p50 < 600 ms; trailing-SL strategy benchmarked against Polars-only fallback |
 | 7 | Backfill all of 2024 NIFTY + nightly vmtouch warmup | 1-year backtest at p95 < 1100 ms with warm cache |
 | 8 | Add BANKNIFTY, FINNIFTY, SENSEX (data + ingest only) | Same engine works on all four symbols |
 | 9 | Backfill 2023 (clean format) | 2 years live for all four symbols |
@@ -608,9 +666,57 @@ DuckDB is retained as the **slow-path** (Layer 2) query engine when the chain fa
 
 If usage grows to 200+ users or multi-machine, ClickHouse becomes the right migration target — and Parquet is the natural source data format for that migration (ClickHouse ingests Parquet natively). The architecture is forward-compatible.
 
-## Appendix C: Why not move the backend off Python
+## Appendix C: Backend language strategy
 
-The hot path is already not Python — it's vectorized Polars + a Rust extension via `backend/native/`. A full backend rewrite to Go/Rust would gain milliseconds at orchestration time and cost months of work plus team context loss. Senior-engineering judgment: **extend the existing Rust extension where the data tells you to, don't rewrite for taste.**
+### Why we are NOT rewriting the backend
+
+The hot path is already not Python — it's vectorized Polars (which is Rust under the hood, with SIMD and Arrow column layout) plus a Rust extension via `backend/native/`. Where time actually goes in a 1-year backtest:
+
+| Layer | Language | Time budget |
+|---|---|---|
+| FastAPI routing, validation, gzip | Python | ~50 ms |
+| Polars-vectorized engine logic | Python → Rust (Polars) | ~150–300 ms |
+| Rust kernels for hot loops | Rust | ~50–150 ms |
+| Arrow IPC serialization | Python → C++ (pyarrow) | ~5–15 ms |
+| **Total typical** | mixed | **~250–500 ms** |
+
+Rewriting the FastAPI/Celery layer in Go saves ~30–50 ms on a 500 ms request. Cost: 2–3 months of engineering, loss of FastAPI's automatic OpenAPI generation (the frontend depends on it), and replacing Celery's mature task ecosystem. **Wrong trade.**
+
+### Where we DO use Rust (and what we don't)
+
+**Use Rust for:**
+- Memory-mapping snapshot files (`intraday_open_dataset`)
+- O(1) array indexing into snapshots (`intraday_resolve_atm`)
+- Zero-copy slice extraction (`intraday_leg_curve`)
+- Stateless first-cross scans (`intraday_first_hit`)
+- **Stateful exit logic — trailing SL, breakeven moves, re-entry** (`intraday_leg_lifecycle`) ← the one place Polars hits a wall
+
+**Do NOT use Rust for:**
+- Anything Polars already vectorizes (you'd be reimplementing Polars)
+- API routing, validation, serialization (Python overhead is negligible there)
+- Strategy spec parsing (one-time per request)
+- Tradesheet aggregation (Polars groupby is the right tool)
+
+### What we considered and rejected
+
+| Alternative | Verdict |
+|---|---|
+| Full Go/Rust backend rewrite | Saves ~50 ms; costs 3 months; loses ecosystem; rejected |
+| Replace Polars with raw NumPy | Polars is faster than NumPy on this workload (Arrow + parallelism); rejected |
+| Replace Polars with hand-written Rust DataFrames | Reimplements Polars; rejected |
+| Cython / Numba | ~10% gain over Polars; adds build dependency; existing Rust extension is cleaner; rejected |
+| Move Celery to NATS / RabbitMQ | Queue is not the bottleneck; rejected |
+| Replace FastAPI with starlette / aiohttp / actix | <10 ms gain; loses tooling; rejected |
+
+### When to revisit
+
+If profiling in phase 7 (1-year backtest perf-regression test) shows any of these, push more into Rust:
+
+- Polars `apply()` callbacks dominating profile → that operation moves to Rust
+- Python<->Rust FFI overhead per minute > 10% of request → batch into `intraday_run_day`
+- More than 30% of total time in Python orchestration → consider compiled glue (Cython for the hot dispatch only, not whole rewrite)
+
+**Senior-engineering principle:** rewrite when data demands it, not preemptively. Most teams that "rewrite to Go/Rust for performance" find afterward that 80% of their gain came from one specific hot loop they could have ported in a week.
 
 ## Appendix D: When to revisit this design
 
