@@ -174,7 +174,7 @@ Create `backend/services/intraday_paths.py`:
 """Pure path arithmetic for intraday storage. No I/O."""
 from datetime import date
 
-SUPPORTED_SYMBOLS = frozenset({"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"})
+SUPPORTED_SYMBOLS = frozenset({"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"})
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -254,7 +254,7 @@ CREATE TABLE IF NOT EXISTS intraday_imports (
     expiry_count SMALLINT NOT NULL,
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT intraday_imports_symbol_check
-      CHECK (symbol IN ('NIFTY','BANKNIFTY','FINNIFTY','SENSEX')),
+      CHECK (symbol IN ('NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY')),
     UNIQUE (symbol, trading_date)
 );
 
@@ -340,7 +340,7 @@ Date,Time,Symbol,ExpiryDate,StrikePrice,OptionType,Open,High,Low,Close,Volume,OI
 |-------------|---------|--------------|--------------------------------|
 | Date        | date    | YYYY-MM-DD   | trade date                     |
 | Time        | time    | HH:MM        | 24h, IST, 09:15..15:30         |
-| Symbol      | string  |              | NIFTY/BANKNIFTY/FINNIFTY/SENSEX|
+| Symbol      | string  |              | NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY|
 | ExpiryDate  | date    | YYYY-MM-DD   |                                |
 | StrikePrice | decimal | %.2f         | strike in INR                  |
 | OptionType  | string  | CE \| PE     |                                |
@@ -849,10 +849,10 @@ from backend.services.intraday_ingest.base import IntradayValidationError
 
 PK_COLUMNS = ("ts_min", "expiry_date", "strike_x100", "opt_type")
 STRIKE_STEP_X100 = {
-    "NIFTY": 5000,      # 50 INR
-    "BANKNIFTY": 10000, # 100 INR
-    "FINNIFTY": 5000,   # 50 INR
-    "SENSEX": 10000,    # 100 INR
+    "NIFTY": 5000,       # 50 INR
+    "BANKNIFTY": 10000,  # 100 INR
+    "FINNIFTY": 5000,    # 50 INR
+    "MIDCPNIFTY": 2500,  # 25 INR
 }
 
 
@@ -2439,7 +2439,7 @@ from backend.services.intraday_snapshot.builder import build_day_snapshot
 from backend.services.intraday_paths import _normalize_symbol  # type: ignore
 
 # Strike steps in x100 units
-_STEP_X100 = {"NIFTY": 5000, "BANKNIFTY": 10000, "FINNIFTY": 5000, "SENSEX": 10000}
+_STEP_X100 = {"NIFTY": 5000, "BANKNIFTY": 10000, "FINNIFTY": 5000, "MIDCPNIFTY": 2500}
 
 
 def _sha256_file(path: str) -> str:

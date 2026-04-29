@@ -5,7 +5,7 @@
 **Status:** Draft for review
 **Target hardware:** Existing box (HP 280 Pro G6, i5-10500 6C/12T, 16 GB DDR4-3200, 1 TB Toshiba HDD, Linux)
 **Target users:** Up to 50 in-house, single-machine deployment
-**Symbols in scope:** NIFTY, BANKNIFTY, FINNIFTY, SENSEX (index options only)
+**Symbols in scope:** NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY (index options only)
 **Bar resolution:** 1 minute OHLCV
 **Date range (eventual):** 2017-01-01 to current (2026)
 **Date range (phase 1):** 2024 NIFTY only
@@ -69,7 +69,7 @@ If hardware is later upgraded (SSD + 32 GB RAM), cold-path latencies drop to 200
 │   └── ...                  (same shape)
 ├── FINNIFTY/
 │   └── ...
-├── SENSEX/
+├── MIDCPNIFTY/
 │   └── ...
 └── _manifest/
     └── intraday_imports.parquet
@@ -215,7 +215,7 @@ Handlers in `backend/services/intraday_ingest/`:
    - No nulls in primary key columns (`ts_min`, `expiry_idx`, `strike_x100`, `opt_type`).
    - Monotonic `ts_min` per `(expiry_idx, opt_type, strike_x100)`.
    - Expiry dates in the future (relative to trading_date) and within 90 days.
-   - Strikes are multiples of the symbol's strike step (50 for NIFTY, 100 for BANKNIFTY/SENSEX).
+   - Strikes are multiples of the symbol's strike step (50 for NIFTY/FINNIFTY, 25 for MIDCPNIFTY, 100 for BANKNIFTY).
    - `high >= max(open, close) >= min(open, close) >= low`.
    - Reject the whole file on any violation (no partial loads).
 4. **Sort** by `(expiry_idx, opt_type, strike_x100, ts_min)`.
@@ -346,7 +346,7 @@ The senior-engineering principle: **rewrite when data demands it, not preemptive
 Extends the existing leg DSL in `backend/strategies/strategy_types.py` with intraday fields. New file: `backend/strategies/intraday_strategy.py`.
 
 Required fields:
-- `symbol`: one of `NIFTY | BANKNIFTY | FINNIFTY | SENSEX`
+- `symbol`: one of `NIFTY | BANKNIFTY | FINNIFTY | MIDCPNIFTY`
 - `entry_time`: `HH:MM` (IST), e.g. `"09:20"`
 - `legs[]`:
   - `type`: `CE | PE`
@@ -665,7 +665,7 @@ Each phase is a runnable, mergeable slice. **Order matters** — later phases de
 | 5 | Frontend mode toggle + intraday strategy form fields + slow-path warning | User can run a 1-month intraday straddle through the UI |
 | 6 | Multi-leg + per-leg SL/target/trailing + square-off time. **Adds Rust `intraday_leg_lifecycle` for stateful exits.** | 4-leg iron condor 1 month NIFTY in p50 < 600 ms; trailing-SL strategy benchmarked against Polars-only fallback |
 | 7 | Backfill all of 2024 NIFTY + nightly vmtouch warmup | 1-year backtest at p95 < 1100 ms with warm cache |
-| 8 | Add BANKNIFTY, FINNIFTY, SENSEX (data + ingest only) | Same engine works on all four symbols |
+| 8 | Add BANKNIFTY, FINNIFTY, MIDCPNIFTY (data + ingest only) | Same engine works on all four symbols |
 | 9 | Backfill 2023 (clean format) | 2 years live for all four symbols |
 | 10 | 2017–2022 dirty-data cleaning + backfill (tracked separately) | 9 years live |
 
@@ -702,7 +702,7 @@ These are intentionally **not** answered in this design — the implementation p
 
 ## 14. Acceptance criteria for "design done"
 
-- [ ] All four symbols (NIFTY, BANKNIFTY, FINNIFTY, SENSEX) ingestible end-to-end.
+- [ ] All four symbols (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY) ingestible end-to-end.
 - [ ] 1-year NIFTY backtest p95 < 1100 ms on warm cache, single-user.
 - [ ] 50 concurrent diverse-strategy requests do not OOM, do not regress EOD path latency.
 - [ ] Existing EOD tests pass unchanged.
