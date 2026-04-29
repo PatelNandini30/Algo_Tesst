@@ -366,9 +366,75 @@ Required fields:
 
 ### 5.4 Tradesheet output
 
-Returned as Arrow IPC bytes. Frontend deserializes via Arrow JS. Same schema as EOD tradesheet plus an `entry_minute` and `exit_minute` column.
+Returned as **Arrow IPC bytes** (not JSON). Frontend deserializes via the `apache-arrow` JS package. Same schema as EOD tradesheet plus `entry_minute` and `exit_minute` columns.
+
+```python
+from fastapi import Response
+
+@router.post("/intraday/backtest")
+async def run_intraday_backtest(req: IntradayBacktestRequest):
+    arrow_bytes = await execute_intraday(req)   # returns bytes
+    return Response(
+        content=arrow_bytes,
+        media_type="application/vnd.apache.arrow.stream",
+    )
+```
+
+For a 1-year, 4-leg backtest with ~1000 trade rows, Arrow IPC is **5–10× faster** to serialize than `JSONResponse` and ~3× smaller on the wire (gzip helps both, but Arrow's columnar layout compresses better).
 
 MAE/MFE (already supported by the EOD path via `BACKTEST_INCLUDE_MAE_MFE`) is computed from the per-minute high/low arrays — exact, not approximated.
+
+### 5.5 API server stack (locked)
+
+The intraday endpoint runs on **FastAPI + granian + ORJSONResponse + Arrow IPC**. This is the chosen stack after evaluating Litestar, Hono/Bun, Go (Fiber), Rust (Axum), and an nginx-direct-read cache-hit path.
+
+**Components:**
+
+| Component | Choice | Why |
+|---|---|---|
+| Web framework | **FastAPI** (existing) | Pydantic v2 (Rust core), OpenAPI auto-gen, mature ecosystem, Celery integration |
+| ASGI server | **granian** (replaces uvicorn) | Rust-implemented; ~2× faster than uvicorn at no code cost |
+| Default JSON response | **ORJSONResponse** | 3–5× faster JSON than stdlib; one-line change |
+| Tradesheet response | **Arrow IPC bytes** | Bypasses JSON entirely for the largest payload |
+
+**Migration steps (phase 4 sub-tasks):**
+
+1. Add `granian` and `orjson` to `backend/requirements.txt`.
+2. Update `docker-compose.yml` backend command from uvicorn to granian:
+   ```yaml
+   command:
+     - granian
+     - --interface
+     - asgi
+     - --host
+     - 0.0.0.0
+     - --port
+     - "8000"
+     - --workers
+     - "1"
+     - --loop
+     - uvloop
+     - main:app
+   ```
+   (Note: granian supports uvloop natively. The healthcheck stays unchanged.)
+3. Update `backend/main.py`:
+   ```python
+   from fastapi.responses import ORJSONResponse
+   app = FastAPI(
+       title="AlgoTest Clone API",
+       version="1.0.0",
+       lifespan=lifespan,
+       default_response_class=ORJSONResponse,
+   )
+   ```
+4. Update `backend/Dockerfile` if it pre-installs uvicorn explicitly — replace with granian, keep uvloop (granian uses it).
+5. Update `backend/start_backend.py` (local-dev entrypoint) to invoke granian instead of uvicorn.
+6. Update the `__main__` block at the bottom of `backend/main.py` similarly.
+7. Frontend: add `apache-arrow` to `frontend/package.json` and a tradesheet decoder in `frontend/src/components/`.
+
+**Why this is forward-compatible:** granian is a drop-in replacement; the FastAPI app object is unchanged. If we ever migrate to Litestar (option 3 in the evaluation), the ORJSONResponse and Arrow IPC patterns carry over unchanged. We're not painting into a corner.
+
+**EOD path note:** the granian + ORJSONResponse changes apply to the **whole backend** (both EOD and intraday), since they're server-level. EOD response shapes and behavior are unchanged — only the serialization is faster. EOD tradesheet endpoints can adopt Arrow IPC later as an opportunistic optimization, but it's **out of scope** for this spec.
 
 ---
 
@@ -595,7 +661,7 @@ Each phase is a runnable, mergeable slice. **Order matters** — later phases de
 | 1 | Parquet writer + ingest one month of NIFTY 2024 | One file at `/data/intraday/NIFTY/options/year=2024/month=03/options.parquet` validated, manifest row inserted |
 | 2 | DaySnapshot builder + golden test | 22 snapshot files for March 2024; `test_intraday_snapshot_golden.py` green |
 | 3 | Rust kernels (`open_dataset`, `resolve_atm`, `leg_curve`, `first_hit`) + golden tests | `test_intraday_native_golden.py` green |
-| 4 | Engine for fixed-time short-straddle end-to-end | `POST /api/intraday/backtest` returns valid tradesheet for 1 month NIFTY in p50 < 400 ms |
+| 4 | Engine for fixed-time short-straddle end-to-end. **Includes API stack swap: uvicorn→granian, ORJSONResponse default, Arrow IPC tradesheet response.** See §5.5 sub-tasks. | `POST /api/intraday/backtest` returns valid Arrow-IPC tradesheet for 1 month NIFTY in p50 < 400 ms; `granian` confirmed running via `/health`; existing EOD endpoints regression-tested green |
 | 5 | Frontend mode toggle + intraday strategy form fields + slow-path warning | User can run a 1-month intraday straddle through the UI |
 | 6 | Multi-leg + per-leg SL/target/trailing + square-off time. **Adds Rust `intraday_leg_lifecycle` for stateful exits.** | 4-leg iron condor 1 month NIFTY in p50 < 600 ms; trailing-SL strategy benchmarked against Polars-only fallback |
 | 7 | Backfill all of 2024 NIFTY + nightly vmtouch warmup | 1-year backtest at p95 < 1100 ms with warm cache |
@@ -706,7 +772,19 @@ Rewriting the FastAPI/Celery layer in Go saves ~30–50 ms on a 500 ms request. 
 | Replace Polars with hand-written Rust DataFrames | Reimplements Polars; rejected |
 | Cython / Numba | ~10% gain over Polars; adds build dependency; existing Rust extension is cleaner; rejected |
 | Move Celery to NATS / RabbitMQ | Queue is not the bottleneck; rejected |
-| Replace FastAPI with starlette / aiohttp / actix | <10 ms gain; loses tooling; rejected |
+| **Replace FastAPI with Litestar** | Saves ~2 ms per request; ~1–2 days migration touching every router/model; not justified at 50 users. Forward-compatible if needed later. |
+| **Replace FastAPI with Hono/Fiber/Axum sidecar** | Saves ~3–5 ms; introduces second language, dual deploy, Celery integration friction; rejected |
+| **nginx + Redis direct-read for cache hits** | Sub-millisecond cache-hit path but only for hits; complex Lua/njs config; ops surface explodes; rejected |
+
+### What we ARE adopting at the API layer (locked — see §5.5)
+
+| Change | Gain | Cost |
+|---|---|---|
+| uvicorn → **granian** | ~10–20 ms per request | docker-compose.yml + Dockerfile + requirements.txt edits |
+| `default_response_class=`**`ORJSONResponse`** | ~5 ms per JSON response | one line in `main.py` |
+| Tradesheet response as **Arrow IPC** bytes | 5–10× faster on large tradesheets | new endpoint shape + frontend `apache-arrow` decoder |
+
+These three together shave ~30–40 ms off every intraday request, with no language change and no framework rewrite.
 
 ### When to revisit
 
