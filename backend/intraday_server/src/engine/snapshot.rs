@@ -23,12 +23,20 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
+        // SAFETY: file is opened read-only; snapshot files are write-once historical records.
+        // SIGBUS on disk I/O error is an accepted risk and will terminate the process.
         let mmap = unsafe { Mmap::map(&file)? };
         if mmap.len() < HEADER_SIZE {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file too small"));
         }
         if &mmap[0..4] != b"ITDS" {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad magic"));
+        }
+        if mmap[4] != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported format version: {}", mmap[4]),
+            ));
         }
         let symbol = std::str::from_utf8(&mmap[5..21])
             .unwrap_or("")
@@ -37,6 +45,13 @@ impl Snapshot {
         let date_days = i32::from_le_bytes(mmap[21..25].try_into().unwrap());
         let expiry_count = mmap[25] as usize;
         let minute_count = u16::from_le_bytes(mmap[26..28].try_into().unwrap()) as usize;
+        let min_len = HEADER_SIZE + SPOT_SIZE + expiry_count * EXPIRY_SIZE;
+        if mmap.len() < min_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file too small: {} < {}", mmap.len(), min_len),
+            ));
+        }
         Ok(Snapshot { mmap, expiry_count, date_days, symbol, minute_count })
     }
 
@@ -45,34 +60,45 @@ impl Snapshot {
     }
 
     pub fn spot_open_x100(&self, m: usize) -> i32 {
+        debug_assert!(m < MINUTES);
         let off = HEADER_SIZE + m * SPOT_ENTRY;
         i32::from_le_bytes(self.mmap[off..off+4].try_into().unwrap())
     }
     pub fn spot_high_x100(&self, m: usize) -> i32 {
+        debug_assert!(m < MINUTES);
         let off = HEADER_SIZE + m * SPOT_ENTRY + 4;
         i32::from_le_bytes(self.mmap[off..off+4].try_into().unwrap())
     }
     pub fn spot_low_x100(&self, m: usize) -> i32 {
+        debug_assert!(m < MINUTES);
         let off = HEADER_SIZE + m * SPOT_ENTRY + 8;
         i32::from_le_bytes(self.mmap[off..off+4].try_into().unwrap())
     }
     pub fn spot_close_x100(&self, m: usize) -> i32 {
+        debug_assert!(m < MINUTES);
         let off = HEADER_SIZE + m * SPOT_ENTRY + 12;
         i32::from_le_bytes(self.mmap[off..off+4].try_into().unwrap())
     }
 
     pub fn expiry_idx(&self, e: usize) -> i16 {
+        debug_assert!(e < self.expiry_count);
         let off = self.expiry_base(e);
         i16::from_le_bytes(self.mmap[off..off+2].try_into().unwrap())
     }
 
     pub fn atm_x100(&self, e: usize, m: usize) -> i32 {
+        debug_assert!(e < self.expiry_count);
         let off = self.expiry_base(e) + 2 + m * 4;
         i32::from_le_bytes(self.mmap[off..off+4].try_into().unwrap())
     }
 
     /// field: 0=close 1=high 2=low 3=volume
     pub fn chain_val(&self, e: usize, s: usize, t: usize, field: usize, m: usize) -> i32 {
+        debug_assert!(e < self.expiry_count);
+        debug_assert!(s < CHAIN_STRIKES);
+        debug_assert!(t < CHAIN_TYPES);
+        debug_assert!(field < CHAIN_FIELDS);
+        debug_assert!(m < MINUTES);
         let chain_off = self.expiry_base(e) + 2 + MINUTES * 4;
         let idx = s * CHAIN_TYPES * CHAIN_FIELDS * MINUTES
             + t * CHAIN_FIELDS * MINUTES
@@ -91,7 +117,6 @@ impl Snapshot {
 #[cfg(test)]
 pub mod test_helpers {
     use super::*;
-    use std::io::Write;
 
     /// Build a minimal valid DaySnapshot in memory for testing.
     pub fn synthetic_snapshot(
