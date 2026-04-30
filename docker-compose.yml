@@ -13,8 +13,9 @@
 #   worker-backtests : 3500M
 #   worker-uploads   :  500M
 #   frontend         :  200M
+#   intraday-api     :  512M
 #   ─────────────────────────────
-#   Total hard limit : 10,900M
+#   Total hard limit : 11,412M
 #   OS + kernel      : ~1,500M
 #   Headroom/cache   : ~3,600M  ← HDD needs large OS page cache
 #   ─────────────────────────────
@@ -299,10 +300,42 @@ services:
     networks:
       - algotest-network
 
+  intraday-api:
+    build:
+      context: ./backend/intraday_server
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      INTRADAY_DATA_DIR: /data/intraday
+      REDIS_URL: redis://redis:6379/0
+      RUST_LOG: info
+    volumes:
+      - algo_cache:/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    container_name: algotest-intraday-api
+    networks:
+      - algotest-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/api/intraday/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "4.0"
+        reservations:
+          memory: 128M
+
 volumes:
   pgdata:
   redis_data:
   parquet_cache:
+  algo_cache:
 
 networks:
   algotest-network:
