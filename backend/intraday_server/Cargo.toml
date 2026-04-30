@@ -25,6 +25,7 @@ memmap2 = "0.9"
 blake2 = "0.10"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
+# tower 0.4 for test oneshot; axum 0.7 pulls tower 0.5 as runtime dep — both coexist
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
