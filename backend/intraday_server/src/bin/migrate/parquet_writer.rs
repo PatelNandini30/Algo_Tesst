@@ -15,7 +15,12 @@ fn epoch() -> NaiveDate {
 }
 
 fn to_days(d: NaiveDate) -> i32 {
-    (d - epoch()).num_days() as i32
+    let days = (d - epoch()).num_days();
+    debug_assert!(
+        days >= 0 && days <= i64::from(i32::MAX),
+        "date {d} is out of Date32 range (days={days})"
+    );
+    days as i32
 }
 
 fn writer_props() -> anyhow::Result<WriterProperties> {
@@ -28,7 +33,7 @@ fn writer_props() -> anyhow::Result<WriterProperties> {
 
 /// Write one trading day's real (non-padded) option bars to a Parquet file.
 /// `rows` must already be sorted by (expiry_date, strike_x100, opt_type, ts_min).
-/// Writes atomically: path.tmp → fsync → rename.
+/// Writes atomically: .tmp → rename (no fsync; idempotent via manifest on re-run).
 pub fn write_options_parquet(
     path: &Path,
     symbol: &str,
