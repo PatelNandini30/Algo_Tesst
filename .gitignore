@@ -6,3 +6,4 @@ cleaned_csvs/
 __pycache__/
 *.pyc
 .venv/
+.worktrees/
