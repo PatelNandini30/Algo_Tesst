@@ -43,6 +43,7 @@ pub fn compute_atm(
     spot_by_min: &[i32; MINUTES],
     strike_step: i32,
 ) -> (i32, [i32; MINUTES]) {
+    debug_assert!(strike_step > 0, "strike_step must be positive");
     let step_x100 = strike_step * 100;
     let round_to_step = |px: i32| -> i32 {
         if px <= 0 { return 0; }
@@ -84,14 +85,15 @@ pub fn build(
     let mut spot_low   = [0i32; MINUTES];
     for b in spot_bars {
         let m = (b.ts_min - SESSION_START_MIN) as usize;
-        if m < MINUTES {
-            spot_close[m] = b.close_x100;
-            spot_open[m]  = b.open_x100;
-            spot_high[m]  = b.high_x100;
-            spot_low[m]   = b.low_x100;
-        }
+        if m >= MINUTES { continue; }
+        spot_close[m] = b.close_x100;
+        spot_open[m]  = b.open_x100;
+        spot_high[m]  = b.high_x100;
+        spot_low[m]   = b.low_x100;
     }
     // Forward-fill
+    // Minutes before the first real bar are back-filled from the first bar's value
+    // so the reader never sees a zero-price leading gap.
     let mut last_close = spot_close.iter().copied().find(|&v| v > 0).unwrap_or(0);
     let mut last_open  = spot_open.iter().copied().find(|&v| v > 0).unwrap_or(0);
     let mut last_high  = spot_high.iter().copied().find(|&v| v > 0).unwrap_or(0);
@@ -171,11 +173,11 @@ pub fn build(
 
             for t in 0..CHAIN_TYPES {
                 let opt_type = t as u8;
+                let idx_base = (s_offset as usize) * CHAIN_TYPES * CHAIN_FIELDS * MINUTES
+                    + t * CHAIN_FIELDS * MINUTES;
                 let mut last_close = 0i32;
                 for m in 0..MINUTES {
                     let key: Key = (expiry_date, strike_x100, opt_type, m);
-                    let idx_base = (s_offset as usize) * CHAIN_TYPES * CHAIN_FIELDS * MINUTES
-                        + t * CHAIN_FIELDS * MINUTES;
                     if let Some(&(close, high, low, vol)) = lookup.get(&key) {
                         last_close = close;
                         chain[idx_base + 0 * MINUTES + m] = close;
@@ -296,5 +298,54 @@ mod tests {
         assert_eq!(active.len(), 4);
         assert!(active[0] > date);
         for w in active.windows(2) { assert!(w[0] < w[1]); }
+    }
+
+    #[test]
+    fn test_pre_market_bars_ignored() {
+        let date = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
+        let expiry = NaiveDate::from_ymd_opt(2025, 1, 9).unwrap();
+        let atm_x100 = 2_400_000i32;
+
+        // Pre-market spot bar (ts_min=540 < SESSION_START_MIN=555) — must be ignored
+        let pre_market_spot = SpotBar {
+            trade_date: date, ts_min: 540,
+            open_x100: atm_x100, high_x100: atm_x100,
+            low_x100: atm_x100, close_x100: atm_x100,
+        };
+        let in_session_spot = SpotBar {
+            trade_date: date, ts_min: SESSION_START_MIN,
+            open_x100: atm_x100, high_x100: atm_x100 + 100,
+            low_x100: atm_x100 - 100, close_x100: atm_x100,
+        };
+
+        // Pre-market option bar (ts_min=540) — must be ignored
+        let pre_market_row = BarRow {
+            trade_date: date, ts_min: 540,
+            expiry_date: expiry, strike_x100: atm_x100,
+            opt_type: false,
+            open_x100: 99999, high_x100: 99999,
+            low_x100: 99999, close_x100: 99999,
+            volume: 99999, oi: 99999,
+        };
+
+        let spot = vec![pre_market_spot, in_session_spot];
+        let rows = vec![pre_market_row];
+        let active = vec![(expiry, 0i16)];
+        let bytes = build("NIFTY", date, &spot, &rows, &active, 50);
+
+        // Snapshot must be valid size
+        assert_eq!(bytes.len(), HEADER_SIZE + SPOT_SIZE + EXPIRY_SIZE);
+
+        // Spot at minute 0 should reflect the in-session bar, not the pre-market one
+        let off = HEADER_SIZE; // minute 0
+        let open_val = i32::from_le_bytes(bytes[off..off+4].try_into().unwrap());
+        assert_eq!(open_val, atm_x100, "pre-market spot bar must not overwrite minute 0");
+
+        // Chain at ATM, CE, close, minute 0 must be 0 (no real in-session CE bar was given)
+        let chain_base = HEADER_SIZE + SPOT_SIZE + 2 + MINUTES * 4;
+        let idx = 5 * CHAIN_TYPES * CHAIN_FIELDS * MINUTES + 0;
+        let off = chain_base + idx * 4;
+        let chain_val = i32::from_le_bytes(bytes[off..off+4].try_into().unwrap());
+        assert_eq!(chain_val, 0, "pre-market option bar must not appear in chain");
     }
 }
