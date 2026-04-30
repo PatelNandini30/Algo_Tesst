@@ -110,8 +110,6 @@ const getOptionExpiryOptions = (symbol) => {
 
 const normalizeReEntryMode = (mode) => {
   const value = String(mode || 'RE_ASAP').toUpperCase().trim();
-  if (value === 'RE_COST') return 'RE_ASAP';
-  if (value === 'RE_COST_REV') return 'RE_ASAP_REV';
   return value || 'RE_ASAP';
 };
 
@@ -831,11 +829,14 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [validationError, setValidationError] = useState(null);
   const [trailSLWarning, setTrailSLWarning] = useState(null);
+  const warmCacheTimerRef = useRef(null);
   const jobPollRef = useRef(null);
   const errorTimerRef = useRef(null);
   const [jobId, setJobId] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
+  const [cacheWarmReady, setCacheWarmReady] = useState(false);
+  const [cacheWarmLabel, setCacheWarmLabel] = useState('');
 
   const latestEntrySpot = useMemo(() => {
     const firstTrade = displayResults?.trades?.[0];
@@ -881,9 +882,9 @@ const [slippagePct, setSlippagePct] = useState(0);
   }, [latestEntrySpot, normalizedSpotAdjustmentValue, spotAdjustmentDirection, spotAdjustmentUnits]);
 
   // Validate date is in DD/MM/YYYY format
-  const isValidDate = (dateStr) => {
+  const isValidDate = useCallback((dateStr) => {
     return isValidDisplayDate(dateStr);
-  };
+  }, []);
 
   const evaluateDateValidation = useCallback((nextStart, nextEnd) => {
     const shouldValidateStart = !!nextStart?.trim();
@@ -921,7 +922,7 @@ const [slippagePct, setSlippagePct] = useState(0);
   const pollJobStatus = useCallback((jobId) => {
     stopJobPolling();
     setJobState('queued');
-    const intervalMs = 1500;
+    const startedAt = Date.now();
 
     const fetchStatus = async () => {
       try {
@@ -969,9 +970,16 @@ const [slippagePct, setSlippagePct] = useState(0);
           setJobStatusLabel(data.meta?.status || 'Running backtest…');
         } else {
           setJobState('queued');
-          setJobStatusLabel('Queued…');
+          const depth = Number(data.queue_depth);
+          setJobStatusLabel(Number.isFinite(depth) && depth > 0 ? `Queued (${depth} ahead)…` : 'Queued…');
         }
 
+        const elapsedMs = Date.now() - startedAt;
+        const intervalMs = elapsedMs < 5000
+          ? 250
+          : elapsedMs < 30000
+            ? 1000
+            : 2000;
         jobPollRef.current = setTimeout(fetchStatus, intervalMs);
       } catch (err) {
         setJobState('idle');
@@ -1108,6 +1116,59 @@ const [slippagePct, setSlippagePct] = useState(0);
     };
   }, []);
 
+  useEffect(() => {
+    if (warmCacheTimerRef.current) {
+      clearTimeout(warmCacheTimerRef.current);
+      warmCacheTimerRef.current = null;
+    }
+    if (!indexConfig.backtestEnabled || !isValidDate(startDate) || !isValidDate(endDate)) {
+      setCacheWarmReady(true);
+      setCacheWarmLabel('');
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    setCacheWarmReady(false);
+    setCacheWarmLabel('Preparing worker data cache...');
+    warmCacheTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/backtest/warm-cache', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            index: instrument,
+            from_date: getApiStartDate(startDate),
+            to_date: getApiEndDate(endDate),
+          }),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error('Cache warm failed');
+        const data = await res.json();
+        if (controller.signal.aborted) return;
+        if (data.status === 'ready') {
+          const elapsed = Number(data.elapsed_seconds);
+          setCacheWarmLabel(Number.isFinite(elapsed) ? `Worker cache ready (${elapsed.toFixed(1)}s)` : 'Worker cache ready');
+        } else if (data.status === 'warming') {
+          setCacheWarmLabel('Worker cache warming in queue...');
+        } else {
+          setCacheWarmLabel('');
+        }
+      } catch (_) {
+        if (!controller.signal.aborted) setCacheWarmLabel('');
+      } finally {
+        if (!controller.signal.aborted) setCacheWarmReady(true);
+      }
+    }, 700);
+
+    return () => {
+      controller.abort();
+      if (warmCacheTimerRef.current) {
+        clearTimeout(warmCacheTimerRef.current);
+        warmCacheTimerRef.current = null;
+      }
+    };
+  }, [instrument, startDate, endDate, indexConfig.backtestEnabled, isValidDate]);
+
   // Upload management removed - handled by CsvUpload component
 
   const validationErrorTimerRef = useRef(null);
@@ -1125,6 +1186,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
   useEffect(() => {
     return () => {
+      if (warmCacheTimerRef.current) clearTimeout(warmCacheTimerRef.current);
       if (validationErrorTimerRef.current) clearTimeout(validationErrorTimerRef.current);
       if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
     };
@@ -1824,7 +1886,8 @@ const [slippagePct, setSlippagePct] = useState(0);
         throw new Error('No job ID returned. Please try again.');
       }
       setJobId(data.job_id);
-      setJobStatusLabel('Queued…');
+      const queueDepth = Number(data.queue_depth);
+      setJobStatusLabel(Number.isFinite(queueDepth) && queueDepth > 0 ? `Queued (${queueDepth} ahead)…` : 'Queued…');
       pollJobStatus(data.job_id);
     } catch (err) {
       setLoading(false);
@@ -3378,6 +3441,9 @@ const [slippagePct, setSlippagePct] = useState(0);
           </button>
           {jobStatusLabel && (
             <div className="mt-2 text-xs text-center text-secondary">{jobStatusLabel}</div>
+          )}
+          {cacheWarmLabel && (
+            <div className="mt-1 text-xs text-center text-secondary">{cacheWarmLabel}</div>
           )}
         </div>
         {lazyLegModal.open && (

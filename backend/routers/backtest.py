@@ -6,7 +6,7 @@ from engines.generic_algotest_engine import run_algotest_backtest, _apply_slippa
 from services.algotest_job import execute_algotest_job, _normalize_request, _resolve_effective_request
 from services.backtest_cache import get_backtest_cache as _get_result_cache
 from services.index_metadata import validate_index_payload
-from worker.tasks import run_algotest_job
+from worker.tasks import run_algotest_job, warm_backtest_cache_task
 from worker.celery import celery_app
 import sys
 import os
@@ -32,6 +32,19 @@ def _normalize_date(value: Any) -> str:
         except ValueError:
             continue
     return value
+
+
+def _normalize_payload_dates(payload: dict) -> dict:
+    normalized = dict(payload or {})
+    from_date = _normalize_date(normalized.get("date_from") or normalized.get("from_date"))
+    to_date = _normalize_date(normalized.get("date_to") or normalized.get("to_date"))
+    if from_date:
+        normalized["from_date"] = from_date
+        normalized["date_from"] = from_date
+    if to_date:
+        normalized["to_date"] = to_date
+        normalized["date_to"] = to_date
+    return normalized
 
 # Thread pool for async tasks (I/O/cache warming) and process pool for CPU-heavy backtests
 _backtest_executor = ThreadPoolExecutor(max_workers=3)
@@ -117,6 +130,39 @@ except ImportError as e:
                 return value
 
 router = APIRouter()
+
+
+def _backtest_queue_depth() -> int:
+    try:
+        import redis
+        client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        return int(client.llen("backtests") or 0)
+    except Exception:
+        return 0
+
+
+def _queue_depth(queue_name: str) -> int:
+    try:
+        import redis
+        client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        return int(client.llen(queue_name) or 0)
+    except Exception:
+        return 0
+
+
+def _date_span_days(from_date: Any, to_date: Any) -> int:
+    try:
+        start = pd.to_datetime(_normalize_date(from_date))
+        end = pd.to_datetime(_normalize_date(to_date))
+        return max(0, int((end - start).days))
+    except Exception:
+        return 999999
+
+
+def _backtest_queue_for_payload(payload: dict) -> str:
+    max_fast_days = int(os.environ.get("BACKTEST_FAST_QUEUE_MAX_DAYS", "550"))
+    span_days = _date_span_days(payload.get("from_date"), payload.get("to_date"))
+    return "backtests_fast" if span_days <= max_fast_days else "backtests"
 
 
 def _normalize_recalc_numeric(value: Any) -> Optional[float]:
@@ -257,28 +303,49 @@ async def clear_cache():
 @router.post("/warm-cache")
 async def warm_cache(request: dict):
     """
-    Pre-load bulk data in background - makes actual backtest run faster.
-    Returns immediately while data loads in background thread.
+    Pre-load bulk data in the Celery backtest worker before the next run.
+
+    The worker is the process that executes backtests, so warming only the
+    FastAPI process gives a false readiness signal.
     """
-    from base import bulk_load_options
-    
+    request = _normalize_payload_dates(request)
     symbol = request.get('index', request.get('symbol', 'NIFTY'))
     from_date = request.get('from_date', request.get('date_from'))
     to_date = request.get('to_date', request.get('date_to'))
     
     if not from_date or not to_date:
         return {"status": "error", "message": "Missing from_date or to_date"}
-    
-    def _load():
-        try:
-            bulk_load_options(symbol, from_date, to_date)
-            return {"status": "warmed"}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
 
-    _backtest_executor.submit(_load)
-    
-    return {"status": "warming", "message": f"Pre-loading {symbol} {from_date} to {to_date}"}
+    warm_timeout = float(os.environ.get("WARM_CACHE_WAIT_SECONDS", "90"))
+    warm_payload = {"index": symbol, "from_date": from_date, "to_date": to_date}
+    queue_name = _backtest_queue_for_payload(warm_payload)
+    task = warm_backtest_cache_task.apply_async(
+        args=[warm_payload],
+        queue=queue_name,
+    )
+
+    try:
+        result = await asyncio.to_thread(task.get, timeout=warm_timeout, propagate=False)
+    except Exception as exc:
+        logger.warning("Worker cache warm did not finish within %.1fs: %s", warm_timeout, exc)
+        return {
+            "status": "warming",
+            "job_id": task.id,
+            "queue": queue_name,
+            "queue_depth": _queue_depth(queue_name),
+            "message": f"Worker cache warm queued for {symbol} {from_date} to {to_date}",
+        }
+
+    if isinstance(result, dict) and result.get("status") == "ready":
+        return {"status": "ready", "job_id": task.id, "queue": queue_name, **result}
+    if isinstance(result, dict):
+        return {"status": result.get("status", "error"), "job_id": task.id, "queue": queue_name, **result}
+    return {"status": "error", "job_id": task.id, "queue": queue_name, "message": str(result)}
+
+
+@router.post("/backtest/warm-cache")
+async def warm_cache_legacy(request: dict):
+    return await warm_cache(request)
 
 
 @router.post("/upload-filter-csv")
@@ -529,7 +596,7 @@ async def queue_algotest_job(request: dict):
     """
     Enqueue an AlgoTest backtest to run asynchronously via Celery.
     """
-    payload = _resolve_effective_request(_normalize_request(request))
+    payload = _resolve_effective_request(_normalize_request(_normalize_payload_dates(request)))
     try:
         _validate_lazy_legs_payload(payload)
         validate_index_payload(payload)
@@ -555,8 +622,10 @@ async def queue_algotest_job(request: dict):
         except Exception as exc:
             logger.warning("Cache short-circuit failed, falling back to queue: %s", exc)
 
-    task = run_algotest_job.apply_async(args=[payload])
-    return {"status": "queued", "job_id": task.id}
+    queue_name = _backtest_queue_for_payload(payload)
+    queue_depth = _queue_depth(queue_name)
+    task = run_algotest_job.apply_async(args=[payload], queue=queue_name)
+    return {"status": "queued", "job_id": task.id, "queue": queue_name, "queue_depth": queue_depth}
 
 
 @router.post("/backtest/recalculate-slippage")
@@ -636,7 +705,10 @@ async def get_algotest_job_status(job_id: str):
         state = "FAILURE"
         info = {"error": "Task metadata corrupted"}
     if state == "PENDING":
-        return {"status": "queued"}
+        return {
+            "status": "queued",
+            "queue_depth": _queue_depth("backtests") + _queue_depth("backtests_fast"),
+        }
     if state in {"STARTED", "PROCESSING", "RETRY"}:
         return {"status": "running", "meta": info or {"status": "Running..."}} 
     if state == "SUCCESS":

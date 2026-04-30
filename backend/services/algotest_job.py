@@ -2,6 +2,7 @@
 import logging
 import traceback
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict
 
@@ -10,16 +11,22 @@ import pandas as pd
 from sqlalchemy.exc import OperationalError
 
 from engines.generic_algotest_engine import run_algotest_backtest, get_expiry_dates
-from base import bulk_load_options, bulk_force_clear
+from base import bulk_load_options, bulk_clear_options
 from database import reset_engine
 from services.backtest_cache import get_backtest_cache
 from services.index_metadata import normalize_index, validate_index_payload
+# ── FAST_LOOKUP imports ──────────────────────────────────────────────────────
+from services.fast_lookup import build_fast_lookup, clear_fast_lookup
+from services.data_loader import get_bulk_options_df, get_bulk_spot_df
+# ────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
 
 # Maximum years to load at once before chunking a single-threaded run.
 # Keep this bounded so long backtests do not accumulate a huge working set.
 _BULK_LOAD_CHUNK_YEARS = int(os.environ.get("BULK_LOAD_CHUNK_YEARS", "3"))
+_FAST_LOOKUP_MIN_YEARS = float(os.environ.get("FAST_LOOKUP_MIN_YEARS", "2.0"))
+_FAST_LOOKUP_MODE = os.environ.get("FAST_LOOKUP_MODE", "auto").strip().lower()
 
 
 def _get_backtest_worker_count() -> int:
@@ -52,8 +59,10 @@ def _date_chunks(from_date: str, to_date: str, chunk_years: int):
 def _normalize_request(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(request or {})
     payload['index'] = normalize_index(payload.get('index', 'NIFTY'))
-    payload['from_date'] = payload.get('date_from') or payload.get('from_date')
-    payload['to_date'] = payload.get('date_to') or payload.get('to_date')
+    payload['from_date'] = _normalize_cache_date(payload.get('date_from') or payload.get('from_date'))
+    payload['to_date'] = _normalize_cache_date(payload.get('date_to') or payload.get('to_date'))
+    payload['date_from'] = payload['from_date']
+    payload['date_to'] = payload['to_date']
     return payload
 
 
@@ -188,10 +197,97 @@ def _reindex_trades(trades: list):
     return trades
 
 
+def _normalize_cache_date(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return pd.to_datetime(text, format=fmt).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    try:
+        return pd.to_datetime(text, dayfirst=True).strftime("%Y-%m-%d")
+    except Exception:
+        return text
+
+
+def _filter_df_date_range(df, from_date: str, to_date: str):
+    if df is None or df.is_empty() or not from_date or not to_date:
+        return df
+    try:
+        from services.data_loader import pl
+        from_value = pd.to_datetime(from_date, dayfirst=True).date()
+        to_value = pd.to_datetime(to_date, dayfirst=True).date()
+        if "Date" not in df.columns:
+            return df
+        return df.filter(
+            (pl.col("Date").cast(pl.Date) >= from_value) &
+            (pl.col("Date").cast(pl.Date) <= to_value)
+        )
+    except Exception as exc:
+        logger.warning("[FAST_LOOKUP] Date-range filter skipped: %s", exc)
+        return df
+
+
+def _strategy_needs_native_scan(payload: Dict[str, Any]) -> bool:
+    if payload.get("spot_adjustment_enabled"):
+        return True
+    if payload.get("overall_sl_value") is not None or payload.get("overall_target_value") is not None:
+        return True
+    for leg in payload.get("legs", []) or []:
+        if not isinstance(leg, dict):
+            continue
+        for key in ("targetProfit", "stopLoss", "trailSL", "reEntryOnSL", "reEntryOnTarget", "simpleMomentum"):
+            if leg.get(key):
+                return True
+    return False
+
+
+def _should_build_fast_lookup(payload: Dict[str, Any], from_date: str, to_date: str) -> bool:
+    if _FAST_LOOKUP_MODE in ("0", "off", "false", "no"):
+        return False
+    if _FAST_LOOKUP_MODE in ("1", "on", "true", "yes", "always"):
+        return True
+    if _strategy_needs_native_scan(payload):
+        return True
+    try:
+        span_years = (pd.to_datetime(to_date) - pd.to_datetime(from_date)).days / 365.25
+        return span_years >= _FAST_LOOKUP_MIN_YEARS
+    except Exception:
+        return False
+
+
+def _build_fast_lookup_from_bulk(index: str = None, from_date: str = None, to_date: str = None) -> None:
+    """Build the O(1) lookup dict from whatever is in the bulk DFs right now."""
+    try:
+        options_df = get_bulk_options_df()
+        spot_df = get_bulk_spot_df()
+        cache_key = None
+        if index and from_date and to_date and os.environ.get("FAST_LOOKUP_RANGE_FILTER", "0").strip().lower() in ("1", "true", "yes", "on"):
+            normalized_from = _normalize_cache_date(from_date)
+            normalized_to = _normalize_cache_date(to_date)
+            options_df = _filter_df_date_range(options_df, normalized_from, normalized_to)
+            spot_df = _filter_df_date_range(spot_df, normalized_from, normalized_to)
+            cache_key = f"bulk:{str(index).upper()}:{normalized_from}:{normalized_to}"
+        build_fast_lookup(options_df, spot_df, cache_key_override=cache_key)
+        from base_fast_patch import apply_fast_lookup_patches
+        apply_fast_lookup_patches()
+    except Exception as exc:
+        logger.warning("[FAST_LOOKUP] Build failed (non-fatal): %s", exc)
+
+
+def _safe_clear_fast_lookup() -> None:
+    try:
+        clear_fast_lookup(clear_native=False)
+    except Exception:
+        pass
+
+
 def _run_backtest_chunk(args: tuple) -> list:
     """Run backtest for a subset of expiry dates. Must be top-level for pickling."""
     params, chunk_dates = args
-    from base import bulk_load_options, bulk_force_clear
+    from base import bulk_load_options, bulk_clear_options
     from engines.generic_algotest_engine import run_algotest_backtest
     
     index = params.get('index', 'NIFTY')
@@ -202,6 +298,8 @@ def _run_backtest_chunk(args: tuple) -> list:
     
     try:
         bulk_load_options(index, chunk_from, chunk_to)
+        if _should_build_fast_lookup(params, chunk_from, chunk_to):
+            _build_fast_lookup_from_bulk(index, chunk_from, chunk_to)
         chunk_params = dict(params)
         chunk_params['from_date'] = chunk_from
         chunk_params['to_date'] = chunk_to
@@ -212,12 +310,17 @@ def _run_backtest_chunk(args: tuple) -> list:
         return []
     finally:
         try:
-            bulk_force_clear()
+            _safe_clear_fast_lookup()
+        except Exception:
+            pass
+        try:
+            bulk_clear_options()
         except Exception:
             pass
 
 
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
+    job_t0 = time.perf_counter()
     payload = _normalize_request(request)
     validate_index_payload(payload)
     logger.debug("[SERVICE] entry_dte=%s exit_dte=%s", payload.get('entry_dte'), payload.get('exit_dte'))
@@ -227,12 +330,16 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     to_date = payload.get('to_date')
 
     redis_cache = None
-    use_cache = os.environ.get("BACKTEST_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+    use_cache = (
+        os.environ.get("BACKTEST_CACHE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+        and not payload.get("no_cache")
+    )
     cache_key = None
 
     try:
         # Drop any stale bulk state left behind by a previous task in the same worker.
-        bulk_force_clear()
+        _safe_clear_fast_lookup()
+        bulk_clear_options()
 
         redis_cache = get_backtest_cache()
         if use_cache and redis_cache.is_available():
@@ -277,7 +384,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     if chunk_trades:
                         all_trades.extend(chunk_trades)
             try:
-                bulk_force_clear()
+                bulk_clear_options()
             except Exception:
                 pass
             engine_summary = None
@@ -291,11 +398,21 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             to_dt = pd.to_datetime(effective_to)
             span_years = (to_dt - from_dt).days / 365.25
             if span_years <= _BULK_LOAD_CHUNK_YEARS:
+                stage_t = time.perf_counter()
                 bulk_load_options(index, effective_from, effective_to)
+                logger.info("[JOB_PERF] bulk_load_options %.2fs", time.perf_counter() - stage_t)
+                if _should_build_fast_lookup(payload, effective_from, effective_to):
+                    stage_t = time.perf_counter()
+                    _build_fast_lookup_from_bulk(index, effective_from, effective_to)
+                    logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)
                 logger.debug("[DEBUG] Calling run_algotest_backtest from=%s to=%s", effective_from, effective_to)
+                stage_t = time.perf_counter()
                 trades_df, engine_summary, engine_pivot = run_algotest_backtest(payload)
+                logger.info("[JOB_PERF] run_algotest_backtest %.2fs", time.perf_counter() - stage_t)
                 logger.debug("[DEBUG] Backtest returned type=%s len=%s empty=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None', trades_df.empty if trades_df is not None else 'N/A')
+                stage_t = time.perf_counter()
                 all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
+                logger.info("[JOB_PERF] trades_df_to_records %.2fs rows=%s", time.perf_counter() - stage_t, len(all_trades))
                 logger.debug("[DEBUG] Single chunk trades_df=%s len=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None')
                 logger.debug("[DEBUG] all_trades from single chunk=%s", len(all_trades))
                 if engine_summary is None:
@@ -306,6 +423,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 # Compute analytics for single chunk to add Cumulative/Peak/DD/%DD
                 if all_trades and len(all_trades) > 0:
                     try:
+                        stage_t = time.perf_counter()
                         from base import compute_analytics, build_pivot
                         trades_agg = pd.DataFrame(all_trades)
                         for col in ['Entry Date', 'Exit Date']:
@@ -325,11 +443,12 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
 
                         all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
                         try:
-                            bulk_force_clear()
+                            bulk_clear_options()
                         except Exception:
                             pass
                         engine_summary = result_summary
                         engine_pivot = result_pivot
+                        logger.info("[JOB_PERF] first analytics %.2fs", time.perf_counter() - stage_t)
                     except Exception as e:
                         logger.warning("[WARN] compute_analytics for single chunk failed: %s", e)
             else:
@@ -343,6 +462,8 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         chunk_payload = dict(payload)
                         chunk_payload['from_date'] = chunk_from
                         chunk_payload['to_date'] = chunk_to
+                        if _should_build_fast_lookup(chunk_payload, chunk_from, chunk_to):
+                            _build_fast_lookup_from_bulk(index, chunk_from, chunk_to)
                         c_df, c_summary, c_pivot = run_algotest_backtest(chunk_payload)
                         chunk_count = len(c_df) if c_df is not None and not c_df.empty else 0
                         logger.debug("[DEBUG] chunk %s -> %s c_df type=%s count=%s", chunk_from, chunk_to, type(c_df), chunk_count)
@@ -372,7 +493,11 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         continue
                     finally:
                         try:
-                            bulk_force_clear()
+                            _safe_clear_fast_lookup()
+                        except Exception:
+                            pass
+                        try:
+                            bulk_clear_options()
                         except Exception:
                             pass
                 all_trades = all_chunk_trades
@@ -383,7 +508,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
 
         # Reindex trades so multi-chunk runs produce unique trade numbers
         if all_trades:
+            stage_t = time.perf_counter()
             _reindex_trades(all_trades)
+            logger.info("[JOB_PERF] reindex %.2fs", time.perf_counter() - stage_t)
 
         # Re-compute summary and pivot from the collected trades
         # so the frontend receives full analytics, not just raw trades.
@@ -394,6 +521,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         # (engine_summary only reflects the last chunk's trades)
         if all_trades and len(all_trades) > 0:
             try:
+                stage_t = time.perf_counter()
                 from base import compute_analytics, build_pivot
                 trades_df = pd.DataFrame(all_trades)
 
@@ -427,6 +555,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 all_trades = _convert_numpy(
                     _format_dates(trades_aggregated.to_dict('records'))
                 )
+                logger.info("[JOB_PERF] final analytics %.2fs", time.perf_counter() - stage_t)
 
             except Exception as e:
                 logger.error("[ERROR] compute_analytics failed: %s", e)
@@ -559,6 +688,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         logger.debug("[DEBUG] Before JSON safe result_summary=%s", result_summary)
         logger.debug("[DEBUG] result_summary types=%s", [(k, type(v)) for k, v in result_summary.items()])
         
+        stage_t = time.perf_counter()
         result_payload = {
             'status': 'success',
             'trades': _make_json_safe(all_trades),
@@ -579,22 +709,34 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             }),
             'cached': False,
         }
+        logger.info("[JOB_PERF] json_safe_payload %.2fs", time.perf_counter() - stage_t)
         
         logger.debug("[DEBUG] After JSON safe payload.summary=%s", result_payload.get('summary'))
 
         if use_cache and redis_cache and cache_key:
+            stage_t = time.perf_counter()
             redis_cache.set(cache_key, result_payload)
+            logger.info("[JOB_PERF] redis_set %.2fs", time.perf_counter() - stage_t)
 
         try:
-            bulk_force_clear()
+            _safe_clear_fast_lookup()
         except Exception:
             pass
+        try:
+            bulk_clear_options()
+        except Exception:
+            pass
+        logger.info("[JOB_PERF] total %.2fs", time.perf_counter() - job_t0)
         return result_payload
     except OperationalError:
         traceback.print_exc()
         reset_engine()
         try:
-            bulk_force_clear()
+            _safe_clear_fast_lookup()
+        except Exception:
+            pass
+        try:
+            bulk_clear_options()
         except Exception:
             pass
         return {
@@ -604,7 +746,11 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as err:
         traceback.print_exc()
         try:
-            bulk_force_clear()
+            _safe_clear_fast_lookup()
+        except Exception:
+            pass
+        try:
+            bulk_clear_options()
         except Exception:
             pass
         return {

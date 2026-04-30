@@ -49,18 +49,30 @@ logger = logging.getLogger(__name__)
 
 def _compute_engine_version() -> str:
     """
-    Auto-generate cache version from engine file hash.
-    Any code change to the engine automatically invalidates all cached results
-    on the next Docker build — no manual version bumping needed.
+    Auto-generate cache version from calculation-path file hashes.
+    Any code change to the engine or fast lookup wrappers automatically
+    invalidates cached results on the next Docker build.
     """
-    engine_path = os.path.join(os.path.dirname(__file__), '..', 'engines', 'generic_algotest_engine.py')
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    hash_paths = [
+        os.path.join(root, 'engines', 'generic_algotest_engine.py'),
+        os.path.join(root, 'base_fast_patch.py'),
+        os.path.join(root, 'services', 'rust_fast_path.py'),
+        os.path.join(root, 'services', 'fast_lookup.py'),
+    ]
     try:
-        with open(engine_path, 'rb') as f:
-            digest = hashlib.md5(f.read()).hexdigest()[:8]
-        logger.info(f"[REDIS] Cache version (engine hash): {digest}")
+        hasher = hashlib.md5()
+        for path in hash_paths:
+            if not os.path.exists(path):
+                continue
+            hasher.update(os.path.relpath(path, root).encode("utf-8"))
+            with open(path, 'rb') as f:
+                hasher.update(f.read())
+        digest = hasher.hexdigest()[:8]
+        logger.info(f"[REDIS] Cache version (calculation hash): {digest}")
         return digest
     except Exception as e:
-        logger.warning(f"[REDIS] Could not hash engine file, using fallback version: {e}")
+        logger.warning(f"[REDIS] Could not hash calculation files, using fallback version: {e}")
         return "fallback"
 
 

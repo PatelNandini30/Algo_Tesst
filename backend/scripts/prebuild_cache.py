@@ -73,6 +73,8 @@ def _do_warmup():
         if _WARM_BULK_OPTIONS:
             try:
                 from base import bulk_load_options
+                from services.fast_lookup import build_fast_lookup
+                from services.data_loader import get_bulk_options_df, get_bulk_spot_df
                 to_date = datetime.now().strftime("%Y-%m-%d")
                 from_date = (datetime.now() - timedelta(days=_WARM_YEARS * 365)).strftime("%Y-%m-%d")
                 logger.info(
@@ -85,6 +87,11 @@ def _do_warmup():
                     f"{result.get('options_rows', '?')} option rows, "
                     f"{result.get('spot_rows', '?')} spot rows."
                 )
+                try:
+                    build_fast_lookup(get_bulk_options_df(), get_bulk_spot_df())
+                    logger.info("[WARMUP] Native fast cache warmed.")
+                except Exception as native_exc:
+                    logger.warning(f"[WARMUP] Native fast cache warmup failed: {native_exc}")
             except Exception as e:
                 logger.warning(f"[WARMUP] Bulk option warmup failed: {e}")
         else:

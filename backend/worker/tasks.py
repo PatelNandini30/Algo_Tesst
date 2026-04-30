@@ -65,6 +65,50 @@ def run_algotest_job(self, params: dict):
         })
 
 
+@celery_app.task(bind=True)
+def warm_backtest_cache_task(self, params: dict):
+    """Warm bulk and native lookup caches inside the backtest worker process."""
+    try:
+        import time
+
+        t0 = time.perf_counter()
+        index = (params or {}).get('index') or (params or {}).get('symbol') or 'NIFTY'
+        from_date = (params or {}).get('from_date') or (params or {}).get('date_from')
+        to_date = (params or {}).get('to_date') or (params or {}).get('date_to')
+        if not from_date or not to_date:
+            return {'status': 'skipped', 'message': 'Missing from_date or to_date'}
+
+        from base import bulk_load_options
+        from services.algotest_job import (
+            _build_fast_lookup_from_bulk,
+            _normalize_cache_date,
+            _should_build_fast_lookup,
+        )
+
+        from_date = _normalize_cache_date(from_date)
+        to_date = _normalize_cache_date(to_date)
+
+        self.update_state(state='PROCESSING', meta={'status': 'Warming worker data cache'})
+        stats = bulk_load_options(index, from_date, to_date)
+        fast_lookup_built = False
+        if _should_build_fast_lookup(params or {}, from_date, to_date):
+            self.update_state(state='PROCESSING', meta={'status': 'Warming worker lookup cache'})
+            _build_fast_lookup_from_bulk(index, from_date, to_date)
+            fast_lookup_built = True
+        return {
+            'status': 'ready',
+            'message': f'Worker cache warmed for {index} {from_date} to {to_date}',
+            'elapsed_seconds': round(time.perf_counter() - t0, 3),
+            'fast_lookup_built': fast_lookup_built,
+            'stats': stats,
+        }
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e),
+        }
+
+
 def _sanitize_result(value):
     """Convert Celery result to JSON-safe structure."""
     import pandas as pd

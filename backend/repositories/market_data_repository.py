@@ -36,6 +36,23 @@ def _generate_date_chunks(from_date: str, to_date: str, days: int = 120):
         current = chunk_end + timedelta(days=1)
 
 
+def _normalize_sql_date(value: str, fallback: str) -> str:
+    """Normalize UI/API date strings before they reach PostgreSQL date params."""
+    if not value:
+        return fallback
+    value = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    try:
+        return pd.to_datetime(value, dayfirst=True).strftime("%Y-%m-%d")
+    except Exception:
+        logger.warning("Could not normalize date %r; using fallback %s", value, fallback)
+        return fallback
+
+
 
 class MarketDataRepository:
     """
@@ -132,8 +149,8 @@ class MarketDataRepository:
             """
         )
 
-        from_date = from_date or "1900-01-01"
-        to_date = to_date or "2099-12-31"
+        from_date = _normalize_sql_date(from_date, "1900-01-01")
+        to_date = _normalize_sql_date(to_date, "2099-12-31")
 
         try:
             # Spot data is ~250 rows/year — single query is always faster
@@ -420,8 +437,8 @@ class MarketDataRepository:
         date_col  = self._pick(cols, "trade_date", "date")
         close_col = self._pick(cols, "close_price", "close")
 
-        from_date = from_date or "1900-01-01"
-        to_date   = to_date   or "2099-12-31"
+        from_date = _normalize_sql_date(from_date, "1900-01-01")
+        to_date = _normalize_sql_date(to_date, "2099-12-31")
 
         q = text(
             f"""

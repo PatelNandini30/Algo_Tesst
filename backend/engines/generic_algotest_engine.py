@@ -507,7 +507,7 @@ def _calculate_mae_mfe_from_extremes(entry_price, position, entry_spot, max_high
 
 
 def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, position, entry_spot, trading_calendar_df, trade=None):
-    if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "0").strip().lower() not in ("1", "true", "yes", "on"):
+    if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() in ("0", "false", "no", "off"):
         return None, None
 
     if trading_calendar_df is None or trading_calendar_df.empty:
@@ -1317,10 +1317,6 @@ def _parse_leg_reentry_config(leg_src: dict) -> dict:
 
     def _normalize_mode(value):
         mode = str(value or 'RE_ASAP').upper().strip()
-        if mode == 'RE_COST':
-            return 'RE_ASAP'
-        if mode == 'RE_COST_REV':
-            return 'RE_ASAP_REV'
         return mode or 'RE_ASAP'
 
     cfg = {
@@ -1633,6 +1629,106 @@ def _resolve_reentry_position(position: str, mode_str: str) -> str:
     return 'BUY' if pos == 'SELL' else 'SELL'
 
 
+def _reentry_scan_dates(trigger_date, cycle_exit_date, trading_calendar):
+    """Trading dates after the trigger date and before/equal the cycle exit date."""
+    try:
+        cal = pd.to_datetime(trading_calendar['date'], errors='coerce').dropna()
+        trigger_ts = pd.Timestamp(trigger_date)
+        exit_ts = pd.Timestamp(cycle_exit_date)
+        return [pd.Timestamp(d) for d in cal[(cal > trigger_ts) & (cal <= exit_ts)].tolist()]
+    except Exception:
+        return []
+
+
+def _reentry_mode_trigger_date(
+    mode: str,
+    trigger_date,
+    trigger_reason: str,
+    leg_config: dict,
+    cycle_exit_date,
+    index: str,
+    trading_calendar,
+    is_futures: bool,
+):
+    """
+    Resolve when a re-entry mode should enter using EOD data.
+
+    RE_ASAP enters on the trigger date. RE_MOMENTUM scans later
+    closes because the engine has no intraday ticks for "crossed after exit".
+    """
+    mode_base = _reentry_mode_base(mode)
+    trigger_ts = pd.Timestamp(trigger_date)
+    if mode_base == 'RE_ASAP':
+        return trigger_ts
+
+    if mode_base != 'RE_MOMENTUM':
+        _log(f"[REENTRY] Unsupported re-entry mode '{mode}'")
+        return None
+
+    position = str(leg_config.get('position', 'SELL') or 'SELL').upper()
+    reason_base = str(trigger_reason or '').split('[')[0].strip().upper()
+    is_sl = reason_base in {'STOP_LOSS', 'TRAIL_SL', 'COMPLETE_STOP_LOSS'}
+    is_tgt = reason_base in {'TARGET', 'COMPLETE_TARGET'}
+    if not is_sl and not is_tgt:
+        return None
+
+    if is_futures:
+        entry_price = leg_config.get('entry_price')
+        trigger_price = leg_config.get('exit_price')
+    else:
+        entry_price = leg_config.get('entry_premium')
+        trigger_price = leg_config.get('exit_premium')
+
+    try:
+        entry_price = float(entry_price)
+        trigger_price = float(trigger_price)
+    except (TypeError, ValueError):
+        _log(f"[REENTRY] {mode_base}: missing entry/trigger price; skipping")
+        return None
+
+    def _current_price(check_date):
+        if is_futures:
+            price, _ = _get_future_price_for_held_contract(check_date, index, leg_config)
+            return price
+        expiry = leg_config.get('_resolved_expiry')
+        if expiry is None:
+            return None
+        return get_option_premium_from_db(
+            date=pd.Timestamp(check_date).strftime('%Y-%m-%d'),
+            index=index,
+            strike=leg_config.get('strike'),
+            option_type=leg_config.get('option_type'),
+            expiry=pd.Timestamp(expiry).strftime('%Y-%m-%d'),
+        )
+
+    def _hit_momentum(price):
+        # Momentum waits for the exited instrument to continue beyond trigger price.
+        if is_sl:
+            return price >= trigger_price if position == 'SELL' else price <= trigger_price
+        return price <= trigger_price if position == 'SELL' else price >= trigger_price
+
+    for check_date in _reentry_scan_dates(trigger_ts, cycle_exit_date, trading_calendar):
+        price = _current_price(check_date)
+        if price is None:
+            continue
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            continue
+        if _hit_momentum(price):
+            _log(
+                f"[REENTRY] {mode_base}: signal on {check_date.strftime('%Y-%m-%d')} "
+                f"price={price:.2f} entry={entry_price:.2f} trigger={trigger_price:.2f}"
+            )
+            return check_date
+
+    _log(
+        f"[REENTRY] {mode_base}: no signal after {trigger_ts.strftime('%Y-%m-%d')} "
+        f"before {pd.Timestamp(cycle_exit_date).strftime('%Y-%m-%d')}"
+    )
+    return None
+
+
 def _execute_per_leg_reentry(
     leg_config: dict,
     original_exit_date,
@@ -1654,10 +1750,8 @@ def _execute_per_leg_reentry(
     """
     Execute per-leg re-entry for a single option or futures leg after SL/Target fires.
 
-    Only RE_ASAP / RE_ASAP_REV are supported here because the engine uses one EOD
-    observation per date. That means re-entry occurs on the same calendar date as
-    the trigger using that date's closing price, and subsequent trigger checks
-    start from the next trading day.
+    RE_ASAP enters on the trigger date. RE_MOMENTUM uses EOD scan
+    signals after the trigger date because this engine has no intraday ticks.
     """
     segment = str(leg_config.get('segment', '') or '').upper()
     is_futures = segment in ('FUTURE', 'FUTURES')
@@ -1733,7 +1827,7 @@ def _execute_per_leg_reentry(
                 )
                 break
             mode = str(reentry_cfg.get('re_entry_on_sl_mode', 'RE_ASAP') or 'RE_ASAP').upper().strip()
-            if _reentry_mode_base(mode) != 'RE_ASAP':
+            if _reentry_mode_base(mode) not in ('RE_ASAP', 'RE_MOMENTUM'):
                 _log(f"[REENTRY] Skip: unsupported SL re-entry mode '{mode}' (leg={leg_config.get('leg_number', '?')})")
                 break
         elif is_tgt:
@@ -1744,7 +1838,7 @@ def _execute_per_leg_reentry(
                 )
                 break
             mode = str(reentry_cfg.get('re_entry_on_target_mode', 'RE_ASAP') or 'RE_ASAP').upper().strip()
-            if _reentry_mode_base(mode) != 'RE_ASAP':
+            if _reentry_mode_base(mode) not in ('RE_ASAP', 'RE_MOMENTUM'):
                 _log(f"[REENTRY] Skip: unsupported Target re-entry mode '{mode}' (leg={leg_config.get('leg_number', '?')})")
                 break
         else:
@@ -1756,7 +1850,19 @@ def _execute_per_leg_reentry(
             current_position = 'BUY' if current_position == 'SELL' else 'SELL'
         position = current_position
 
-        re_entry_date = pd.Timestamp(current_trigger_date)
+        re_entry_date = _reentry_mode_trigger_date(
+            mode=reentry_mode,
+            trigger_date=current_trigger_date,
+            trigger_reason=current_reason,
+            leg_config=leg_config,
+            cycle_exit_date=cycle_exit_date,
+            index=index,
+            trading_calendar=trading_calendar,
+            is_futures=is_futures,
+        )
+        if re_entry_date is None:
+            break
+        re_entry_date = pd.Timestamp(re_entry_date)
         if re_entry_date >= pd.Timestamp(cycle_exit_date):
             _log(
                 f"[REENTRY] Stop: re-entry date {re_entry_date.strftime('%Y-%m-%d')} "

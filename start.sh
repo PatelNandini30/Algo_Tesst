@@ -32,7 +32,7 @@ cd "$(dirname "$0")"
 echo ""
 echo "[0/5] Checking existing containers..."
 ALL_HEALTHY=true
-for container in backend frontend postgres redis worker-backtests worker-uploads; do
+for container in backend frontend postgres redis worker-backtests worker-backtests-fast worker-uploads; do
     status=$(docker compose ps -q $container 2>/dev/null)
     if [ ! -z "$status" ]; then
         health=$(docker inspect --format='{{.State.Health.Status}}' $container 2>/dev/null)
@@ -123,6 +123,7 @@ echo ""
 LOG_SERVICES=(
   backend
   worker-backtests
+  worker-backtests-fast
   worker-uploads
   frontend
   postgres

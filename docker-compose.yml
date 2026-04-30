@@ -47,15 +47,28 @@ x-backend-env: &backend-env
   BULK_LOAD_CHUNK_YEARS: "10"
   # Keep startup responsive on HDD. Real backtest requests load their own range.
   PREBUILD_BULK_OPTIONS: "0"
-  # MAE/MFE scans are expensive on multi-year runs; enable only when needed.
-  BACKTEST_INCLUDE_MAE_MFE: "0"
+  # Warm enough history to cover the long 2019+ runs used by the team.
+  PREBUILD_WARM_YEARS: "8"
+  # Tradesheet includes MAE/MFE by default; set to 0 only for bulk performance tests.
+  BACKTEST_INCLUDE_MAE_MFE: "1"
+  # Persist hot caches across container recreates.
+  PARQUET_CACHE_DIR: /data/cache/parquet
+  ALGO_RUST_CACHE_DIR: /data/cache/arrow
+  # Avoid expensive native-cache setup for short expiry-only runs.
+  FAST_LOOKUP_MODE: auto
+  FAST_LOOKUP_MIN_YEARS: "2.0"
+  FAST_LOOKUP_RANGE_FILTER: "0"
+  # Route small ranges to a separate worker so they do not wait behind a long run.
+  BACKTEST_FAST_QUEUE_MAX_DAYS: "550"
+  # API warm-cache waits for the Celery worker cache, not only backend memory.
+  WARM_CACHE_WAIT_SECONDS: "90"
 
 x-backend-volumes: &backend-volumes
   - ./cleaned_csvs:/data/cleaned_csvs:ro
   - ./expiryData:/data/expiryData:ro
   - ./strikeData:/data/strikeData:ro
   - ./Filter:/data/Filter:ro
-  - parquet_cache:/tmp/parquet_cache
+  - algo_cache:/data/cache
 
 services:
   postgres:
@@ -172,6 +185,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-algotest}
       POSTGRES_USER: ${POSTGRES_USER:-algotest}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
+    user: "0:0"
     volumes: *backend-volumes
     depends_on:
       postgres:
@@ -204,8 +218,8 @@ services:
       celery -A worker.celery worker
       --queues=backtests
       --concurrency=1
-      -l warning
-      --max-memory-per-child=300000
+      -l info
+      --max-memory-per-child=2800000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -213,6 +227,7 @@ services:
       <<: *backend-env
       BACKTEST_WORKERS: "1"
       BULK_LOAD_MAX_MEMORY_MB: "1500"
+    user: "0:0"
     volumes: *backend-volumes
     depends_on:
       postgres:
@@ -232,6 +247,48 @@ services:
           cpus: "4.0"
         reservations:
           memory: 512M
+    networks:
+      - algotest-network
+
+  worker-backtests-fast:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: algotest-worker-backtests-fast
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery worker
+      --queues=backtests_fast
+      --concurrency=1
+      -l info
+      --max-memory-per-child=1800000
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+    environment:
+      <<: *backend-env
+      BACKTEST_WORKERS: "1"
+      BULK_LOAD_MAX_MEMORY_MB: "900"
+    user: "0:0"
+    volumes: *backend-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A worker.celery inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2200M
+          cpus: "2.0"
+        reservations:
+          memory: 256M
     networks:
       - algotest-network
 

@@ -112,6 +112,7 @@ async def health_stats():
                 "used_memory_mb": round(info.get("used_memory", 0) / 1e6, 1),
                 "max_memory_mb": round(info.get("maxmemory", 0) / 1e6, 1),
                 "backtest_queue_depth": client.llen("backtests"),
+                "backtest_fast_queue_depth": client.llen("backtests_fast"),
                 "upload_queue_depth": client.llen("uploads"),
             }
         except Exception as exc:

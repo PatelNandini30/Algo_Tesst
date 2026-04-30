@@ -6,6 +6,7 @@ import sqlite3
 import calendar
 import asyncio
 import bisect
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, date
 from functools import lru_cache
@@ -32,6 +33,15 @@ from services.data_loader import (
     get_bulk_expiry_dates,
     is_bulk_loaded,
 )
+
+# ── Speed patch: O(1) dict lookup intercept (no calculation logic changes) ──
+try:
+    from base_fast_patch import apply_fast_lookup_patches
+    apply_fast_lookup_patches()
+except Exception as _patch_exc:
+    import logging as _log
+    _log.getLogger(__name__).warning("[FAST_PATCH] non-fatal: %s", _patch_exc)
+# ────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
 
@@ -3052,7 +3062,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
 
     sym_upper = symbol.upper()
     requested_from = pd.to_datetime(from_date)
-    requested_to   = pd.to_datetime(to_date)
+    requested_to = pd.to_datetime(to_date)
 
     # Fast early return: partitioned data already covers this symbol/range.
     # Per-date option lookup dicts are built lazily by _build_option_lookup(),
@@ -3076,11 +3086,35 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     _bump_lookup_cache_epoch()
     clear_lookup_caches()
 
+    def _slice_bulk_options(options_df):
+        """Keep the hot in-memory partition no wider than this backtest range."""
+        if options_df is None or options_df.is_empty():
+            return options_df
+        try:
+            from_value = requested_from.date()
+            to_value = requested_to.date()
+            return options_df.filter(
+                (pl.col("Date").cast(pl.Date) >= from_value) &
+                (pl.col("Date").cast(pl.Date) <= to_value)
+            )
+        except Exception as exc:
+            logger.warning("[BULK] Range slice failed; partitioning full cache: %s", exc)
+            return options_df
+
     def _partition_bulk_options(options_df):
         """Partition by date; per-date lookup dicts are built lazily on demand."""
-        _bulk_bhav_df_ref = options_df
+        if options_df is None or options_df.is_empty():
+            return options_df
+        t0 = time.perf_counter()
         for date_val, sub_df in options_df.partition_by("Date", as_dict=True).items():
             _bulk_bhav_by_date[str(date_val)[:10]] = sub_df
+        logger.info(
+            "[BULK] Partitioned %s option rows across %s dates in %.2fs",
+            options_df.height,
+            len(_bulk_bhav_by_date),
+            time.perf_counter() - t0,
+        )
+        return options_df
 
     # Check Redis / in-memory Polars DF covers the full requested range
     lookup_loaded_from_redis = False
@@ -3089,8 +3123,8 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         min_date = str(options_df["Date"].min())
         max_date = str(options_df["Date"].max())
         if min_date <= from_date and max_date >= to_date:
-            _partition_bulk_options(options_df)
-            _bulk_bhav_df = options_df
+            hot_df = _partition_bulk_options(_slice_bulk_options(options_df))
+            _bulk_bhav_df = hot_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
             _bhav_by_date_symbol = sym_upper
@@ -3101,8 +3135,8 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     if not lookup_loaded_from_redis:
         options_df = get_bulk_options_df()
         if options_df is not None and not options_df.is_empty():
-            _partition_bulk_options(options_df)
-            _bulk_bhav_df = options_df
+            hot_df = _partition_bulk_options(_slice_bulk_options(options_df))
+            _bulk_bhav_df = hot_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
             _bhav_by_date_symbol = sym_upper

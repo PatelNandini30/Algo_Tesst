@@ -29,13 +29,15 @@ celery_app.conf.update(
     task_soft_time_limit=1500,  # 25 minutes soft limit
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=200,   # recycle workers less frequently now that memory is bounded
-    worker_max_memory_per_child=400000,  # restart if worker exceeds 400MB RSS
+    worker_max_memory_per_child=2800000,  # keep native cache resident; CLI uses same value
     broker_connection_retry_on_startup=True,
     broker_connection_retry=True,
     broker_connection_max_retries=3,
     task_routes={
         'worker.tasks.run_backtest_task': {'queue': 'backtests'},
         'worker.tasks.run_algotest_job': {'queue': 'backtests'},
+        'worker.tasks.warm_backtest_cache_task': {'queue': 'backtests'},
+        # Fast queue is selected explicitly by routers/backtest.py for short ranges.
         'worker.tasks.load_data_task': {'queue': 'uploads'},
         'worker.tasks.migrate_csv_task': {'queue': 'uploads'},
     },
