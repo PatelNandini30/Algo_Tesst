@@ -193,6 +193,7 @@ fn main() -> anyhow::Result<()> {
                 || r.low_x100 > r.open_x100 || r.low_x100 > r.close_x100
                 || r.high_x100 < r.low_x100
                 || r.open_x100 < 0 || r.close_x100 < 0
+                || r.low_x100 < 0 || r.high_x100 < 0
             {
                 stats_failed.push((trade_date, format!(
                     "OHLCV invariant: O={} H={} L={} C={}",
