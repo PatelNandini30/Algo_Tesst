@@ -60,9 +60,7 @@ fn run_day(
     let mut records = Vec::new();
     for leg in &spec.legs {
         let expiry_mode = match leg.expiry.as_str() {
-            // TODO: NEXT_MONTHLY should select the following month's contract;
-            // currently mapped to Monthly (last expiry of current month) as a placeholder.
-            "MONTHLY" | "NEXT_MONTHLY" => ExpiryMode::Monthly,
+            "MONTHLY" => ExpiryMode::Monthly,
             _ => ExpiryMode::Weekly,
         };
         let expiry_idx = match pick_expiry_idx(trade_date, expiry_mode, expiry_map) {
@@ -138,6 +136,12 @@ pub fn run_backtest(spec: &StrategySpec, data_dir: &Path) -> Result<Vec<TradeRec
     let snaps_dir = symbol_dir.join("snapshots");
     let expiry_map = load_expiry_map(&symbol_dir)
         .map_err(crate::error::AppError::Io)?;
+
+    for leg in &spec.legs {
+        if leg.expiry == "NEXT_MONTHLY" {
+            return Err(crate::error::AppError::BadRequest("NEXT_MONTHLY expiry mode is not yet supported".into()));
+        }
+    }
 
     let date_from = NaiveDate::parse_from_str(&spec.date_from, "%Y-%m-%d")
         .map_err(|e| crate::error::AppError::BadRequest(e.to_string()))?;

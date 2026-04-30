@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::header,
+    http::{header, StatusCode},
     response::Response,
     Json,
 };
@@ -114,7 +114,9 @@ pub async fn submit(
         }
     });
 
-    let mut builder = Response::builder().header(header::CONTENT_TYPE, "application/json");
+    let mut builder = Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(header::CONTENT_TYPE, "application/json");
     if slow { builder = builder.header("X-Slow-Path", "true"); }
     Ok(builder.body(Body::from(serde_json::json!({"job_id": job_id, "status": "queued"}).to_string())).unwrap())
 }
