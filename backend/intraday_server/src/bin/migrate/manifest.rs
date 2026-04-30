@@ -42,7 +42,7 @@ impl Manifest {
         let date_str = date.format("%Y-%m-%d").to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| anyhow::anyhow!("system clock before epoch: {e}"))?
             .as_secs() as i64;
         self.conn.execute(
             "INSERT OR REPLACE INTO imports (symbol, trade_date, sha256, row_count, ingested_at)
