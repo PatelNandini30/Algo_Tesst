@@ -9,12 +9,20 @@ fn idx_to_time(idx: usize) -> String {
     format!("{:02}:{:02}", abs / 60, abs % 60)
 }
 
-pub fn time_to_idx(hhmm: &str) -> usize {
-    let parts: Vec<u32> = hhmm.splitn(2, ':')
-        .map(|s| s.parse().unwrap_or(0))
-        .collect();
-    let abs_min = parts[0] * 60 + *parts.get(1).unwrap_or(&0);
-    (abs_min.saturating_sub(SESSION_START)) as usize
+pub fn time_to_idx(hhmm: &str) -> Result<usize, AppError> {
+    let (h_str, m_str) = hhmm.split_once(':')
+        .ok_or_else(|| AppError::BadRequest(format!("invalid time format: {hhmm}")))?;
+    let h: u32 = h_str.parse()
+        .map_err(|_| AppError::BadRequest(format!("invalid time format: {hhmm}")))?;
+    let m: u32 = m_str.parse()
+        .map_err(|_| AppError::BadRequest(format!("invalid time format: {hhmm}")))?;
+    let abs_min = h * 60 + m;
+    if abs_min < SESSION_START || abs_min >= SESSION_START + MINUTES as u32 {
+        return Err(AppError::BadRequest(format!(
+            "time {hhmm} is outside trading session 09:15–15:29"
+        )));
+    }
+    Ok((abs_min - SESSION_START) as usize)
 }
 
 pub fn strike_step(symbol: &str) -> i32 {
@@ -26,6 +34,7 @@ pub fn strike_step(symbol: &str) -> i32 {
 }
 
 /// Extract full spot OHLCV for all minutes of the day.
+/// `volume` is always 0: the DaySnapshot format stores no spot volume.
 pub fn spot_series(snap: &Snapshot) -> Vec<OhlcvBar> {
     (0..snap.minute_count)
         .map(|m| OhlcvBar {
@@ -51,8 +60,17 @@ pub fn ohlcv_series(
         .ok_or_else(|| AppError::NotFound(format!("expiry_idx {expiry_idx} not in snapshot")))?;
 
     let step = strike_step(&snap.symbol);
+    // Anchor is based on ATM at minute 0: chain layout is fixed at session open
     let anchor = snap.atm_x100(e, 0) - 5 * step;
-    let s_raw = (strike_x100 - anchor) / step;
+    let diff = strike_x100 - anchor;
+    if diff % step != 0 {
+        return Err(AppError::BadRequest(format!(
+            "strike {} is not on the {} step grid",
+            strike_x100 as f64 / 100.0,
+            step as f64 / 100.0,
+        )));
+    }
+    let s_raw = diff / step;
     if s_raw < 0 || s_raw >= 11 {
         return Err(AppError::BadRequest(format!(
             "strike {} is outside ATM±5 chain range for this day",
@@ -62,6 +80,8 @@ pub fn ohlcv_series(
     let s = s_raw as usize;
     let t = opt_type.chain_idx();
 
+    // DaySnapshot stores close/high/low/volume only for options — no per-minute open.
+    // OhlcvBar.open is aliased to close (field 0 = last price of that minute).
     let bars = (0..snap.minute_count)
         .map(|m| OhlcvBar {
             minute: idx_to_time(m),
@@ -168,8 +188,8 @@ mod tests {
 
     #[test]
     fn test_time_to_idx() {
-        assert_eq!(time_to_idx("09:15"), 0);
-        assert_eq!(time_to_idx("09:20"), 5);
-        assert_eq!(time_to_idx("15:29"), 374);
+        assert_eq!(time_to_idx("09:15").unwrap(), 0);
+        assert_eq!(time_to_idx("09:20").unwrap(), 5);
+        assert_eq!(time_to_idx("15:29").unwrap(), 374);
     }
 }
