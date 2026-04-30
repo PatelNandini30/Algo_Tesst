@@ -82,6 +82,7 @@ pub async fn submit(
             Ok(records) => {
                 match trades_to_ipc(&records) {
                     Ok(bytes) => {
+                        job_store::release_inflight(&mut redis2, &cache_key).await;
                         set_bytes_ex(&mut redis2, &job_store::result_key(&cache_key), &bytes, RESULT_TTL).await;
                         job_store::set_job(&mut redis2, &job_id2, &JobState {
                             status: JobStatus::Done,
@@ -91,6 +92,7 @@ pub async fn submit(
                         }).await;
                     }
                     Err(e) => {
+                        job_store::release_inflight(&mut redis2, &cache_key).await;
                         job_store::set_job(&mut redis2, &job_id2, &JobState {
                             status: JobStatus::Failed,
                             cache_key,
@@ -101,6 +103,7 @@ pub async fn submit(
                 }
             }
             Err(e) => {
+                job_store::release_inflight(&mut redis2, &cache_key).await;
                 job_store::set_job(&mut redis2, &job_id2, &JobState {
                     status: JobStatus::Failed,
                     cache_key,

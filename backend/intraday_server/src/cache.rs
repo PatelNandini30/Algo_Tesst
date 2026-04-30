@@ -33,3 +33,7 @@ pub async fn ping(conn: &mut RedisConn) -> bool {
     let result: redis::RedisResult<String> = redis::cmd("PING").query_async(conn).await;
     result.map(|s| s == "PONG").unwrap_or(false)
 }
+
+pub async fn del(conn: &mut RedisConn, key: &str) {
+    let _: redis::RedisResult<()> = conn.del(key).await;
+}

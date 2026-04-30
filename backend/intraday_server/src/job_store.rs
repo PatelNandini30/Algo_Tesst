@@ -1,8 +1,7 @@
-use crate::cache::{get_bytes, get_str, set_bytes_ex, set_str_ex, setnx_ex, RedisConn};
+use crate::cache::{get_bytes, get_str, set_str_ex, setnx_ex, RedisConn};
 use serde::{Deserialize, Serialize};
 
 const JOB_TTL: u64 = 3600;       // 1 hour
-const RESULT_TTL: u64 = 604800;  // 7 days
 const INFLIGHT_TTL: u64 = 120;   // 2 minutes
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -27,8 +26,8 @@ pub async fn get_result(conn: &mut RedisConn, cache_key: &str) -> Option<Vec<u8>
     get_bytes(conn, &result_key(cache_key)).await
 }
 
-pub async fn store_result(conn: &mut RedisConn, cache_key: &str, bytes: &[u8]) {
-    set_bytes_ex(conn, &result_key(cache_key), bytes, RESULT_TTL).await;
+pub async fn release_inflight(conn: &mut RedisConn, cache_key: &str) {
+    crate::cache::del(conn, &inflight_key(cache_key)).await;
 }
 
 pub async fn get_job(conn: &mut RedisConn, job_id: &str) -> Option<JobState> {
