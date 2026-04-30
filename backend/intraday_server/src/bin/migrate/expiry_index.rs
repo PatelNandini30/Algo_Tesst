@@ -42,6 +42,9 @@ impl ExpiryIndex {
 
             for (idx, date) in pairs {
                 // Indices must be contiguous starting at 0
+                if idx < 0 {
+                    return Err(anyhow::anyhow!("negative index key in expiries.json: {idx}"));
+                }
                 if idx as usize != ordered.len() {
                     return Err(anyhow::anyhow!(
                         "expiries.json has non-contiguous index {idx} (expected {})",
@@ -66,6 +69,10 @@ impl ExpiryIndex {
         if let Some(&idx) = self.by_date.get(&date) {
             return idx;
         }
+        debug_assert!(
+            self.ordered.len() < i16::MAX as usize,
+            "ExpiryIndex overflow: {} expiries exceeds i16::MAX", self.ordered.len()
+        );
         let idx = self.ordered.len() as i16;
         self.ordered.push(date);
         self.by_date.insert(date, idx);
