@@ -78,6 +78,8 @@ fn main() -> anyhow::Result<()> {
         .filter(|p| p.extension().map(|e| e == "csv").unwrap_or(false))
         .filter(|p| {
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Keep yy >= target: a contract expiring next year can contain bars
+            // from the current year (e.g. Dec expiry settles in Jan).
             match csv_reader::filename_expiry_year_2digit(name) {
                 Some(yy) => yy >= target_yy,
                 None     => false,
@@ -171,6 +173,7 @@ fn main() -> anyhow::Result<()> {
     let mut total_bytes = 0u64;
 
     // Slice all_rows by date (sorted by trade_date)
+    let empty_spot: Vec<SpotBar> = vec![];
     let mut row_start = 0usize;
     for &trade_date in &unique_dates {
         pb2.inc(1);
@@ -208,7 +211,6 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Build snapshot first (needed for consistent sha)
-        let empty_spot: Vec<SpotBar> = vec![];
         let day_spot = spot_by_date.get(&trade_date).unwrap_or(&empty_spot);
         let all_day_expiries: Vec<NaiveDate> = {
             let mut v: Vec<NaiveDate> = date_rows.iter().map(|r| r.expiry_date).collect();
@@ -263,7 +265,9 @@ fn main() -> anyhow::Result<()> {
         total_bytes += snap_bytes.len() as u64;
 
         // Update manifest
-        let _ = db.upsert(&args.symbol, trade_date, &sha, date_rows.len() as i32);
+        if let Err(e) = db.upsert(&args.symbol, trade_date, &sha, date_rows.len() as i32) {
+            eprintln!("WARN: manifest upsert failed for {trade_date}: {e}");
+        }
 
         stats_ok += 1;
         total_rows_written += date_rows.len();
