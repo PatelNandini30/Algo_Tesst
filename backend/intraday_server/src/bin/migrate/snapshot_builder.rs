@@ -31,6 +31,7 @@ pub fn pick_active_expiries(
         .copied()
         .collect();
     after.sort();
+    after.dedup();   // guard against duplicate expiries from caller
     after.truncate(4);
     after
 }
