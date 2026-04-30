@@ -7,7 +7,7 @@ use std::path::Path;
 
 const SESSION_START: u32 = 9 * 60 + 15;
 
-fn idx_to_time(idx: usize) -> String {
+pub(crate) fn idx_to_time(idx: usize) -> String {
     let abs = SESSION_START + idx as u32;
     format!("{:02}:{:02}", abs / 60, abs % 60)
 }
@@ -227,7 +227,10 @@ pub fn multi_day_series(
             }
         }
 
-        current = current.succ_opt().unwrap_or(current);
+        current = match current.succ_opt() {
+            Some(d) => d,
+            None => break,
+        };
     }
 
     Ok(result)

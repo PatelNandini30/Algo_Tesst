@@ -1,16 +1,9 @@
-use crate::engine::data_queries::{load_expiry_map, pick_expiry_idx, strike_step, time_to_idx};
+use crate::engine::data_queries::{idx_to_time, load_expiry_map, pick_expiry_idx, strike_step, time_to_idx};
 use crate::engine::snapshot::Snapshot;
 use crate::engine::types::{ExpiryMode, LegSpec, StrategySpec, TradeRecord};
 use chrono::NaiveDate;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-
-const SESSION_START: u32 = 9 * 60 + 15;
-
-fn idx_to_time(idx: usize) -> String {
-    let abs = SESSION_START + idx as u32;
-    format!("{:02}:{:02}", abs / 60, abs % 60)
-}
+use std::path::Path;
 
 fn compute_thresholds(leg: &LegSpec, entry_x100: i32) -> (Option<i32>, Option<i32>) {
     let sl = leg.sl.as_ref().map(|c| {
@@ -67,6 +60,8 @@ fn run_day(
     let mut records = Vec::new();
     for leg in &spec.legs {
         let expiry_mode = match leg.expiry.as_str() {
+            // TODO: NEXT_MONTHLY should select the following month's contract;
+            // currently mapped to Monthly (last expiry of current month) as a placeholder.
             "MONTHLY" | "NEXT_MONTHLY" => ExpiryMode::Monthly,
             _ => ExpiryMode::Weekly,
         };
@@ -162,7 +157,10 @@ pub fn run_backtest(spec: &StrategySpec, data_dir: &Path) -> Result<Vec<TradeRec
                 Err(e) => tracing::warn!("skip {date_str}: {e}"),
             }
         }
-        current = current.succ_opt().unwrap_or(current);
+        current = match current.succ_opt() {
+            Some(d) => d,
+            None => break,
+        };
     }
     Ok(all_records)
 }
