@@ -150,13 +150,12 @@ pub struct BacktestRequest {
 }
 
 impl BacktestRequest {
-    pub fn canonical_key(&self) -> String {
-        let payload = serde_json::to_string(self).unwrap_or_default();
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        payload.hash(&mut h);
-        format!("{:016x}", h.finish())
+    pub fn canonical_key(&self) -> Result<String, serde_json::Error> {
+        use blake2::{digest::consts::U8, Blake2b, Digest};
+        let payload = serde_json::to_string(self)?;
+        let hash = Blake2b::<U8>::digest(payload.as_bytes());
+        let bytes: [u8; 8] = hash.into();
+        Ok(format!("{:016x}", u64::from_le_bytes(bytes)))
     }
 
     pub fn requires_slow_path(&self) -> bool {

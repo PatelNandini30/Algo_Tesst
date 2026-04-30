@@ -18,6 +18,7 @@ arrow-ipc = "52"
 arrow-schema = "52"
 arrow-buffer = "52"
 memmap2 = "0.9"
+blake2 = "0.10"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 redis = { version = "0.26", features = ["tokio-comp"] }
 # tower 0.4 for test oneshot; axum 0.7 pulls tower 0.5 as runtime dep — both coexist
