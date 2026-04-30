@@ -1,6 +1,8 @@
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
 
+mod error;
+
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({"service": "intraday", "status": "ok"}))
 }
