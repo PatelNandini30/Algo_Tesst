@@ -3,7 +3,9 @@
 graphify-out/
 .codex/
 cleaned_csvs/
-__pycache__/
-*.pyc
+**/__pycache__/
+**/*.pyc
 .venv/
 .worktrees/
+.~lock.*
+*.docx~
