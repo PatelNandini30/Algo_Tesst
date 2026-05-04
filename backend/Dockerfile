@@ -39,6 +39,8 @@ RUN pip install --no-cache-dir \
         /wheels/native/*.whl \
         -r requirements.txt
 
+RUN apt-get update -qq && apt-get install -y --no-install-recommends vmtouch && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 RUN mkdir -p /data/cleaned_csvs /data/expiryData /data/strikeData /data/Filter
 

@@ -12,10 +12,11 @@
 #   backend          : 2500M
 #   worker-backtests : 3500M
 #   worker-uploads   :  500M
+#   cron-warmup      :   50M
 #   frontend         :  200M
 #   intraday-api     :  512M
 #   ─────────────────────────────
-#   Total hard limit : 11,412M
+#   Total hard limit : 11,462M
 #   OS + kernel      : ~1,500M
 #   Headroom/cache   : ~3,600M  ← HDD needs large OS page cache
 #   ─────────────────────────────
@@ -304,8 +305,16 @@ services:
       --without-gossip
       --without-mingle
       --without-heartbeat
-    environment: *backend-env
-    volumes: *backend-volumes
+    environment:
+      <<: *backend-env
+      INTRADAY_DATA_DIR: /data/intraday
+    volumes:
+      - ./cleaned_csvs:/data/cleaned_csvs:ro
+      - ./expiryData:/data/expiryData:ro
+      - ./strikeData:/data/strikeData:ro
+      - ./Filter:/data/Filter:ro
+      - algo_cache:/data/cache
+      - algo_cache:/data/intraday
     depends_on:
       postgres:
         condition: service_healthy
@@ -317,6 +326,10 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    labels:
+      ofelia.enabled: "true"
+      ofelia.job-exec.vmtouch-warmup.schedule: "0 30 0 * * *"
+      ofelia.job-exec.vmtouch-warmup.command: "/app/scripts/vmtouch_warmup.sh"
     deploy:
       resources:
         limits:
@@ -324,6 +337,22 @@ services:
           cpus: "0.5"
         reservations:
           memory: 128M
+    networks:
+      - algotest-network
+
+  cron-warmup:
+    image: mcuadros/ofelia:latest
+    restart: unless-stopped
+    command: daemon --docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - worker-uploads
+    deploy:
+      resources:
+        limits:
+          memory: 50M
+          cpus: "0.1"
     networks:
       - algotest-network
 
