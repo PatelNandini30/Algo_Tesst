@@ -1,16 +1,25 @@
+# syntax=docker/dockerfile:1.6
 # ── Build stage ────────────────────────────────────────────────────────────
-FROM rust:1.78-slim AS builder
+FROM rust:1.95-slim AS builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock .
 # Pre-cache dependencies
-RUN mkdir -p src && echo "fn main(){}" > src/main.rs && cargo build --release --locked && rm -f src/main.rs
+RUN --mount=type=secret,id=ca_bundle,required=true \
+    mkdir -p src/bin/migrate && \
+    echo "fn main(){}" > src/main.rs && \
+    echo "fn main(){}" > src/bin/migrate/main.rs && \
+    SSL_CERT_FILE=/run/secrets/ca_bundle \
+    CARGO_HTTP_CAINFO=/run/secrets/ca_bundle \
+    cargo build --release --locked && rm -rf src
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN --mount=type=secret,id=ca_bundle,required=true \
+    touch src/main.rs && \
+    SSL_CERT_FILE=/run/secrets/ca_bundle \
+    CARGO_HTTP_CAINFO=/run/secrets/ca_bundle \
+    cargo build --release
 
 # ── Runtime stage ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl3 ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/intraday_server /usr/local/bin/
 EXPOSE 8001
 ENV RUST_LOG=info

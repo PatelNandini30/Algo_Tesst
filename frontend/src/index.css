@@ -1,65 +1,630 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
+/* ════════════════════════════════════════════════════════════════════
+   APEX — Professional Quantitative Finance Design System
+   Clean, institutional-grade UI for options strategy backtesting.
+   Light-first. Precise. Built for professionals.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ─── Light Mode (default) ───────────────────────────────────────────────── */
 :root {
-  /* Backgrounds */
-  --bg-base: #f4f6f8;          /* App background (light gray) */
-  --bg-surface: #ffffff;       /* Cards, panels */
-  --bg-elevated: #ffffff;      /* Modals, dropdowns */
-  --bg-hover: #f0f2f5;         /* Row hover */
-  --bg-active: #e6f0fa;        /* Selected/active */
-  --bg-input: #ffffff;         /* Input fields */
+  /* ── Backgrounds ─────────────────────────────────── */
+  --bg-base:     #f4f7fb;
+  --bg-surface:  #ffffff;
+  --bg-elevated: #edf2f9;
+  --bg-hover:    #e5edf8;
+  --bg-active:   #dae5f5;
+  --bg-input:    #ffffff;
 
-  /* Borders */
-  --border-subtle: #eaecf0;    /* Barely visible dividers */
-  --border-default: #d0d5dd;   /* Standard borders */
-  --border-strong: #98a2b3;    /* Emphasized borders */
-  --border-accent: #3d6bff;    /* Focus rings, active */
+  /* ── Borders ─────────────────────────────────────── */
+  --border-subtle:  #ecf2fa;
+  --border-default: #d4dff0;
+  --border-strong:  #a3b8d4;
+  --border-accent:  #2563eb;
 
-  /* Text */
-  --text-primary: #101828;     /* Main content (near black) */
-  --text-secondary: #475467;   /* Labels, sublabels */
-  --text-muted: #98a2b3;       /* Placeholders, disabled */
-  --text-inverse: #ffffff;     /* Text on dark backgrounds (buttons) */
+  /* ── Text ────────────────────────────────────────── */
+  --text-primary:   #0d1929;
+  --text-secondary: #3d5a80;
+  --text-muted:     #8099b8;
+  --text-inverse:   #ffffff;
 
-  /* Semantic - Financial (adjusted for light mode) */
-  --profit: #059669;           /* Emerald green */
-  --profit-dim: #10b981;       /* Hover state */
-  --profit-bg: rgba(5, 150, 105, 0.08);
-  --profit-border: rgba(5, 150, 105, 0.25);
-  
-  --loss: #dc2626;             /* Vivid red */
-  --loss-dim: #ef4444;
-  --loss-bg: rgba(220, 38, 38, 0.08);
-  --loss-border: rgba(220, 38, 38, 0.25);
-  
-  --warning: #d97706;          /* Amber */
-  --warning-bg: rgba(245, 158, 11, 0.12);
+  /* ── Financial Semantic ──────────────────────────── */
+  --profit:        #059669;
+  --profit-dim:    #047857;
+  --profit-bg:     rgba(5, 150, 105, 0.07);
+  --profit-border: rgba(5, 150, 105, 0.2);
 
-  /* Accent / Brand */
-  --accent: #2563eb;           /* Electric blue */
-  --accent-dim: #3b82f6;
-  --accent-bg: rgba(37, 99, 235, 0.08);
-  --accent-glow: rgba(37, 99, 235, 0.3);
+  --loss:          #e11d48;
+  --loss-dim:      #be123c;
+  --loss-bg:       rgba(225, 29, 72, 0.07);
+  --loss-border:   rgba(225, 29, 72, 0.2);
 
-  /* Chart colors */
-  --chart-equity: #2563eb;     /* Equity curve line */
-  --chart-drawdown: #dc2626;   /* Drawdown fill */
-  --chart-grid: #eaecf0;       /* Chart gridlines */
-  --chart-pnl-bar-pos: #10b981;
-  --chart-pnl-bar-neg: #ef4444;
+  --warning:       #d97706;
+  --warning-bg:    rgba(217, 119, 6, 0.08);
+
+  /* ── Accent — Royal Blue ─────────────────────────── */
+  --accent:       #2563eb;
+  --accent-dim:   #1d4ed8;
+  --accent-bg:    rgba(37, 99, 235, 0.07);
+  --accent-glow:  rgba(37, 99, 235, 0.16);
+  --accent-hover: #3b82f6;
+
+  /* ── Charts ──────────────────────────────────────── */
+  --chart-equity:      #2563eb;
+  --chart-drawdown:    #e11d48;
+  --chart-grid:        #edf2f9;
+  --chart-pnl-bar-pos: #059669;
+  --chart-pnl-bar-neg: #e11d48;
 }
+
+/* ─── Dark Mode ──────────────────────────────────────────────────────────── */
+body.dark-mode {
+  --bg-base:     #080f1e;
+  --bg-surface:  #0d1728;
+  --bg-elevated: #132035;
+  --bg-hover:    #1a2c44;
+  --bg-active:   #213650;
+  --bg-input:    #060c18;
+
+  --border-subtle:  #132035;
+  --border-default: #1a2c44;
+  --border-strong:  #283f60;
+  --border-accent:  #3b82f6;
+
+  --text-primary:   #d8e5f5;
+  --text-secondary: #5a7faa;
+  --text-muted:     #283f60;
+  --text-inverse:   #080f1e;
+
+  --profit:        #10b981;
+  --profit-dim:    #059669;
+  --profit-bg:     rgba(16, 185, 129, 0.08);
+  --profit-border: rgba(16, 185, 129, 0.22);
+
+  --loss:          #f43f5e;
+  --loss-dim:      #e11d48;
+  --loss-bg:       rgba(244, 63, 94, 0.08);
+  --loss-border:   rgba(244, 63, 94, 0.22);
+
+  --warning:       #f59e0b;
+  --warning-bg:    rgba(245, 158, 11, 0.09);
+
+  --accent:       #3b82f6;
+  --accent-dim:   #2563eb;
+  --accent-bg:    rgba(59, 130, 246, 0.1);
+  --accent-glow:  rgba(59, 130, 246, 0.22);
+  --accent-hover: #60a5fa;
+
+  --chart-equity:      #3b82f6;
+  --chart-drawdown:    #f43f5e;
+  --chart-grid:        #132035;
+  --chart-pnl-bar-pos: #10b981;
+  --chart-pnl-bar-neg: #f43f5e;
+}
+
+/* ─── Base Reset & Typography ─────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
 
 body {
   background-color: var(--bg-base);
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: 'Outfit', system-ui, sans-serif;
   color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  line-height: 1.55;
+  letter-spacing: -0.008em;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Light: clean ambient mesh — not a pattern, just depth */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 90% 60% at 15% -5%, rgba(37, 99, 235, 0.04) 0%, transparent 55%),
+    radial-gradient(ellipse 70% 50% at 85% 105%, rgba(5, 150, 105, 0.025) 0%, transparent 55%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+body.dark-mode::before {
+  background:
+    radial-gradient(ellipse 80% 50% at 15% -5%, rgba(59, 130, 246, 0.05) 0%, transparent 55%),
+    radial-gradient(ellipse 60% 45% at 85% 105%, rgba(16, 185, 129, 0.03) 0%, transparent 55%);
 }
 
 #root {
   min-height: 100vh;
-  background-color: var(--bg-base);
+  background: transparent;
+  position: relative;
+  z-index: 1;
 }
+
+/* ─── Scrollbar ──────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* ─── Text Selection ─────────────────────────────────────────────────────── */
+::selection { background: rgba(37, 99, 235, 0.14); color: var(--text-primary); }
+body.dark-mode ::selection { background: rgba(59, 130, 246, 0.22); }
+
+/* ─── Form Elements ──────────────────────────────────────────────────────── */
+input, select, textarea {
+  background-color: var(--bg-input) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-default) !important;
+  font-family: 'Outfit', sans-serif !important;
+  font-size: 0.8rem !important;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-glow) !important;
+}
+
+/* ─── Custom Select ───────────────────────────────────────────────────────── */
+select {
+  -webkit-appearance: none !important;
+  -moz-appearance: none !important;
+  appearance: none !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='%235a7faa' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 8px center !important;
+  padding-right: 26px !important;
+  border-radius: 7px !important;
+  cursor: pointer !important;
+}
+
+select option {
+  background-color: var(--bg-elevated) !important;
+  color: var(--text-primary) !important;
+  font-family: 'Outfit', sans-serif;
+  padding: 6px 10px;
+}
+
+input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.4);
+  opacity: 0.5; cursor: pointer;
+}
+body.dark-mode input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.65);
+  opacity: 0.45;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+/* ─── Labels ─────────────────────────────────────────────────────────────── */
+.field-label, label.field-label {
+  display: block;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  margin-bottom: 5px;
+}
+
+/* ─── Section Headings ───────────────────────────────────────────────────── */
+.section-heading {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  border-left: 2.5px solid var(--accent);
+  padding-left: 8px;
+}
+
+/* ─── Application Header ─────────────────────────────────────────────────── */
+.app-header {
+  background: rgba(255, 255, 255, 0.88);
+  border-bottom: 1px solid var(--border-default);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-shadow: 0 1px 8px rgba(0, 0, 0, 0.06);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+body.dark-mode .app-header {
+  background: rgba(8, 15, 30, 0.9);
+  border-bottom-color: var(--border-default);
+  box-shadow: 0 1px 12px rgba(0, 0, 0, 0.45);
+}
+
+.logo-mark {
+  width: 30px; height: 30px;
+  background: linear-gradient(135deg, #1d4ed8 0%, #3b82f6 100%);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 10px rgba(37, 99, 235, 0.28);
+  flex-shrink: 0;
+  transition: box-shadow 0.2s ease;
+}
+
+body.dark-mode .logo-mark {
+  box-shadow: 0 2px 14px rgba(59, 130, 246, 0.35);
+}
+
+.logo-mark span {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.58rem; font-weight: 600;
+  color: #ffffff; letter-spacing: -0.02em;
+}
+
+.app-name {
+  font-family: 'Outfit', sans-serif;
+  font-size: 1rem; font-weight: 800;
+  color: var(--text-primary); letter-spacing: -0.03em;
+}
+
+.app-tagline {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.6rem; font-weight: 400;
+  color: var(--text-muted); letter-spacing: 0.03em;
+}
+
+/* ─── Instrument Selector ────────────────────────────────────────────────── */
+.instrument-btn {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.78rem; font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--text-secondary);
+  background: transparent; border: none; cursor: pointer;
+  padding: 4px 9px; border-radius: 6px;
+  transition: color 0.12s ease, background 0.12s ease;
+  position: relative;
+}
+
+.instrument-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+.instrument-btn.active {
+  color: var(--accent);
+  background: var(--accent-bg);
+  font-weight: 800;
+}
+
+.instrument-btn.active::after {
+  content: '';
+  position: absolute; bottom: -1px; left: 4px; right: 4px;
+  height: 1.5px; background: var(--accent);
+  border-radius: 1px; opacity: 0.6;
+}
+
+/* ─── Mode Toggle Pill ───────────────────────────────────────────────────── */
+.mode-pill {
+  display: inline-flex; gap: 2px; padding: 3px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.mode-pill button {
+  padding: 5px 16px; border-radius: 6px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.7rem; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  cursor: pointer; transition: all 0.15s ease; border: none;
+}
+
+.mode-pill button.active {
+  background: var(--accent); color: #ffffff;
+  box-shadow: 0 1px 4px rgba(37, 99, 235, 0.3), 0 2px 8px rgba(37, 99, 235, 0.14);
+}
+
+body.dark-mode .mode-pill button.active {
+  box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+}
+
+.mode-pill button:not(.active) {
+  background: transparent; color: var(--text-secondary);
+}
+.mode-pill button:not(.active):hover { color: var(--text-primary); background: var(--bg-hover); }
+
+/* ─── Segment Button (SegBtn) ────────────────────────────────────────────── */
+.seg-group {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.seg-btn {
+  padding: 5px 14px;
+  border-radius: 6px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.7rem; font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer; border: none; transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.seg-btn.active {
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 1px 4px rgba(37, 99, 235, 0.3), 0 2px 8px rgba(37, 99, 235, 0.14);
+}
+
+body.dark-mode .seg-btn.active {
+  box-shadow: 0 2px 10px rgba(59, 130, 246, 0.3);
+}
+
+.seg-btn:not(.active) {
+  background: transparent; color: var(--text-secondary);
+}
+.seg-btn:not(.active):hover { color: var(--text-primary); background: var(--bg-hover); }
+.seg-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* ─── Run / Backtest Button ──────────────────────────────────────────────── */
+.run-btn {
+  background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 100%);
+  color: #ffffff;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.75rem; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  border: none; border-radius: 8px; cursor: pointer;
+  transition: all 0.18s ease;
+  box-shadow: 0 1px 3px rgba(37, 99, 235, 0.28), 0 4px 12px rgba(37, 99, 235, 0.14);
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+}
+
+.run-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.36), 0 6px 20px rgba(37, 99, 235, 0.18);
+  transform: translateY(-1px);
+}
+
+.run-btn:active:not(:disabled) { transform: scale(0.98); }
+
+.run-btn:disabled {
+  background: var(--bg-elevated); color: var(--text-muted);
+  box-shadow: none; cursor: not-allowed; transform: none;
+}
+
+body.dark-mode .run-btn {
+  background: linear-gradient(135deg, #2563eb 0%, #3b82f6 100%);
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.22), 0 0 20px rgba(59, 130, 246, 0.08);
+}
+
+body.dark-mode .run-btn:hover:not(:disabled) {
+  background: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%);
+  box-shadow: 0 2px 8px rgba(59, 130, 246, 0.35), 0 0 28px rgba(59, 130, 246, 0.18);
+}
+
+body.dark-mode .run-btn:disabled {
+  background: var(--bg-elevated); color: var(--text-muted); box-shadow: none;
+}
+
+/* ─── Leg Card ───────────────────────────────────────────────────────────── */
+.leg-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 10px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.leg-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+
+body.dark-mode .leg-card {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+}
+
+body.dark-mode .leg-card:hover {
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.08), 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.leg-index-badge {
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent); color: #ffffff;
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.62rem; font-weight: 600;
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+}
+
+/* ─── Stat Tile ──────────────────────────────────────────────────────────── */
+.stat-tile {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px; padding: 10px 12px; text-align: center;
+  transition: border-color 0.15s, box-shadow 0.15s; cursor: default;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.stat-tile:hover { border-color: var(--border-default); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.07); }
+
+body.dark-mode .stat-tile { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2); }
+
+.stat-tile .s-label {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.6rem; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 4px;
+}
+
+.stat-tile .s-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.88rem; font-weight: 600;
+  letter-spacing: -0.03em; line-height: 1;
+}
+
+/* ─── Chart Wrapper ──────────────────────────────────────────────────────── */
+.chart-panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: 12px; padding: 18px 20px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+}
+
+body.dark-mode .chart-panel { box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25); }
+
+.chart-panel-title {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.65rem; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-secondary); margin-bottom: 14px;
+  display: flex; align-items: center; gap: 6px;
+}
+
+/* ─── Data Table ─────────────────────────────────────────────────────────── */
+.trading-table thead th {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.6rem; font-weight: 700;
+  letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--text-muted); background: var(--bg-elevated);
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-default);
+  white-space: nowrap;
+}
+
+.trading-table tbody td {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem; padding: 7px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.trading-table tbody tr:hover td { background: var(--bg-hover); }
+
+.trading-table tbody tr.day-row td {
+  background: var(--bg-elevated);
+  font-family: 'Outfit', sans-serif;
+  font-weight: 600; font-size: 0.75rem;
+}
+
+/* ─── Badge ──────────────────────────────────────────────────────────────── */
+.exit-badge {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.55rem; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 4px;
+  border: 1px solid;
+}
+
+/* ─── Monthly Returns Table ──────────────────────────────────────────────── */
+.monthly-grid th {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.55rem; font-weight: 700;
+  letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--text-muted); background: var(--bg-elevated);
+  padding: 7px 8px; border: 1px solid var(--border-subtle); text-align: center;
+}
+
+.monthly-grid td {
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.7rem;
+  padding: 6px 8px; border: 1px solid var(--border-subtle);
+  text-align: right;
+}
+
+/* ─── Profit / Loss / Warning Text ───────────────────────────────────────── */
+.text-profit  { color: var(--profit); }
+.text-loss    { color: var(--loss); }
+.text-warning { color: var(--warning); }
+
+/* ─── Animations ─────────────────────────────────────────────────────────── */
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeSlideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulseSubtle {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.75; }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+
+.animate-results { animation: fadeSlideUp 0.25s ease-out both; }
+.animate-pulse-subtle { animation: pulseSubtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+/* ─── KPI Summary Cards (Results Panel) ─────────────────────────────────── */
+.kpi-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-top-width: 3px;
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+  transition: box-shadow 0.15s ease;
+}
+
+body.dark-mode .kpi-card { box-shadow: 0 2px 10px rgba(0,0,0,0.25); }
+.kpi-card:hover { box-shadow: 0 2px 10px rgba(0,0,0,0.09); }
+
+.kpi-card .kpi-label {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.58rem; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 6px;
+}
+
+.kpi-card .kpi-value {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 1.45rem; font-weight: 600;
+  letter-spacing: -0.03em; line-height: 1.1;
+}
+
+/* ─── Results Header ─────────────────────────────────────────────────────── */
+.results-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-surface);
+}
+
+.results-title {
+  font-family: 'Outfit', sans-serif;
+  font-size: 1.25rem; font-weight: 800;
+  color: var(--text-primary); letter-spacing: -0.03em;
+}
+
+.results-meta {
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.72rem; color: var(--text-secondary);
+  margin-top: 3px;
+}
+
+/* ─── Dark Mode: override hardcoded Tailwind warning boxes ───────────────── */
+body.dark-mode .bg-yellow-50 {
+  background-color: rgba(245, 158, 11, 0.1) !important;
+  border-color: rgba(245, 158, 11, 0.3) !important;
+  color: #fbbf24 !important;
+}
+body.dark-mode .border-yellow-300 { border-color: rgba(245, 158, 11, 0.3) !important; }
+body.dark-mode .text-yellow-800 { color: #fbbf24 !important; }
+body.dark-mode .text-yellow-600 { color: #f59e0b !important; }
+body.dark-mode .text-yellow-500 { color: #f59e0b !important; }
+
+/* ─── Dark Mode: smooth panel backgrounds ────────────────────────────────── */
+body.dark-mode .bg-surface { background-color: var(--bg-surface) !important; }
+body.dark-mode .bg-elevated { background-color: var(--bg-elevated) !important; }

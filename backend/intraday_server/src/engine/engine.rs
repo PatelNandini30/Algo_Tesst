@@ -104,7 +104,7 @@ fn run_day(
             (entry_px - exit_px) as f64 / 100.0
         } else {
             (exit_px - entry_px) as f64 / 100.0
-        } * leg.quantity as f64;
+        };
 
         let expiry_date_str = expiry_map.get(&expiry_idx)
             .map(|d| d.format("%Y-%m-%d").to_string())

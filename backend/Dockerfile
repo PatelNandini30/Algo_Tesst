@@ -39,7 +39,12 @@ RUN pip install --no-cache-dir \
         /wheels/native/*.whl \
         -r requirements.txt
 
-RUN apt-get update -qq && apt-get install -y --no-install-recommends vmtouch && rm -rf /var/lib/apt/lists/*
+COPY certs/sonicwall-dpi-ssl.crt /usr/local/share/ca-certificates/sonicwall-dpi-ssl.crt
+RUN apt-get update -qq -o Acquire::https::Verify-Peer=false \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && apt-get install -y --no-install-recommends vmtouch \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 RUN mkdir -p /data/cleaned_csvs /data/expiryData /data/strikeData /data/Filter

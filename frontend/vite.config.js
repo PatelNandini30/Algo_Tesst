@@ -7,6 +7,10 @@ export default defineConfig({
     port: 3000,
     host: '0.0.0.0',  // accessible from network
     proxy: {
+      '/api/intraday': {
+        target: 'http://localhost:8001',
+        changeOrigin: true,
+      },
       '/api': {
         target: 'http://localhost:8000',
         changeOrigin: true,

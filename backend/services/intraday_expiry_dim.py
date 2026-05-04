@@ -10,14 +10,16 @@ def load(path: str) -> Dict[date, int]:
         return {}
     with open(path, "r") as f:
         raw = json.load(f)
-    return {date.fromisoformat(k): int(v) for k, v in raw.items()}
+    # Format on disk: {idx_str: date_str} — matches the Rust engine's expectation.
+    return {date.fromisoformat(v): int(k) for k, v in raw.items()}
 
 
 def save(path: str, dim: Dict[date, int]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
+    # Write as {idx_str: date_str} — compatible with Rust engine (serde HashMap<String,String>).
     with open(tmp, "w") as f:
-        json.dump({k.isoformat(): v for k, v in dim.items()}, f, sort_keys=True)
+        json.dump({str(v): k.isoformat() for k, v in dim.items()}, f, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)

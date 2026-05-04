@@ -2,7 +2,7 @@
 import numpy as np
 import polars as pl
 
-from backend.services.intraday_snapshot.format import (
+from .format import (
     MINUTES_PER_DAY, STRIKE_RADIUS, STRIKES_IN_CHAIN, OPT_TYPES,
 )
 

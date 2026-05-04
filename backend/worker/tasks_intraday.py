@@ -5,7 +5,7 @@ import logging
 from datetime import date
 
 from worker.celery import celery_app
-from backend.services import intraday_publish
+from services import intraday_publish
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def ingest_intraday_csv(self, symbol: str, csv_path: str, format_hint: str = "cl
 )
 def execute_intraday_backtest(self, config: dict) -> bytes:
     """Run intraday backtest and return Arrow IPC bytes."""
-    from backend.services.intraday_engine import run_intraday_backtest
+    from services.intraday_engine import run_intraday_backtest
     symbol = config.get("symbol", "?")
     date_from = config.get("date_from", "?")
     date_to = config.get("date_to", "?")

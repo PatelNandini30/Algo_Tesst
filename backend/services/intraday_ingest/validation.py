@@ -2,7 +2,7 @@
 from datetime import date, timedelta
 import polars as pl
 
-from backend.services.intraday_ingest.base import IntradayValidationError
+from .base import IntradayValidationError
 
 PK_COLUMNS = ("ts_min", "expiry_date", "strike_x100", "opt_type")
 STRIKE_STEP_X100 = {
@@ -55,9 +55,11 @@ def validate(df: pl.DataFrame, *, trade_date: date, symbol: str) -> None:
     if bad_ohlc > 0:
         raise IntradayValidationError(f"{bad_ohlc} rows have OHLC out of order")
 
-    # 6) Expiry sanity: must be on/after trade_date and within 90 days
+    # 6) Expiry sanity: must be on/after trade_date.
+    # NSE NIFTY has long-dated options (LEAPS) up to ~5 years; existing data shows
+    # expiry distances up to 1821 days. Upper bound removed.
     earliest_allowed = trade_date
-    latest_allowed = trade_date + timedelta(days=90)
+    latest_allowed = trade_date + timedelta(days=2000)
     bad_expiry = df.filter(
         (pl.col("expiry_date") < earliest_allowed)
         | (pl.col("expiry_date") > latest_allowed)

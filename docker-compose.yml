@@ -161,9 +161,8 @@ services:
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     command:
-      - granian
-      - --interface
-      - asgi
+      - uvicorn
+      - main:app
       - --host
       - "0.0.0.0"
       - --port
@@ -172,7 +171,6 @@ services:
       - "1"
       - --loop
       - uvloop
-      - main:app
     environment:
       <<: *backend-env
       DB_STATEMENT_TIMEOUT: "1800000"
@@ -458,6 +456,7 @@ services:
       RUST_LOG: info
     volumes:
       - algo_cache:/data
+      - /data/intraday:/data/intraday
     depends_on:
       - redis
     restart: unless-stopped

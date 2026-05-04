@@ -66,66 +66,686 @@ const formatDateToDdMmYyyy = (value) => {
   return value;
 };
 
+const IntradayFullReport = ({ rows, onClose, showCloseButton }) => {
+  const [sortDir, setSortDir] = useState('asc');
+  const [page, setPage] = useState(1);
+  const PAGE_SIZE = 10;
+
+  if (rows.length === 0) {
+    return (
+      <div className="bg-surface rounded-lg border border-default shadow-sm p-6 text-center text-secondary text-sm">
+        {showCloseButton && onClose && (
+          <button onClick={onClose} className="float-right text-muted hover:text-primary"><X size={16} /></button>
+        )}
+        No trades found for the selected date range and strategy.
+      </div>
+    );
+  }
+
+  // Group by date for AlgoTest-style hierarchical Index
+  const byDate = useMemo(() => {
+    const m = new Map();
+    rows.forEach(r => {
+      const d = r.date;
+      if (!m.has(d)) m.set(d, []);
+      m.get(d).push(r);
+    });
+    return m;
+  }, [rows]);
+
+  const sortedDates = useMemo(() => {
+    const dates = Array.from(byDate.keys()).sort();
+    return sortDir === 'asc' ? dates : dates.reverse();
+  }, [byDate, sortDir]);
+
+  // Day-level P&L aggregates (stats + charts are per trade-day, not per leg)
+  const dayPnls = useMemo(() => {
+    const dMap = new Map();
+    rows.forEach(r => {
+      if (!dMap.has(r.date)) dMap.set(r.date, 0);
+      dMap.set(r.date, dMap.get(r.date) + (Number(r.pnl) || 0));
+    });
+    return Array.from(dMap.values());
+  }, [rows]);
+
+  const totalPnl = rows.reduce((s, r) => s + (Number(r.pnl) || 0), 0);
+  const tradeDays = byDate.size;
+  const winners = dayPnls.filter(p => p > 0);
+  const losers  = dayPnls.filter(p => p <= 0);
+  const winRate = tradeDays > 0 ? (winners.length / tradeDays * 100).toFixed(1) : '0';
+  const avgWin  = winners.length > 0 ? (winners.reduce((s, p) => s + p, 0) / winners.length).toFixed(2) : '0';
+  const avgLoss = losers.length  > 0 ? (losers.reduce( (s, p) => s + p, 0) / losers.length ).toFixed(2) : '0';
+
+  // Equity curve + drawdown — one point per trade day (date on x-axis)
+  const dayChartData = useMemo(() => {
+    const dMap = new Map();
+    rows.forEach(r => {
+      if (!dMap.has(r.date)) dMap.set(r.date, 0);
+      dMap.set(r.date, dMap.get(r.date) + (Number(r.pnl) || 0));
+    });
+    const dates = Array.from(dMap.keys()).sort();
+    let cum = 0, pk = 0;
+    return dates.map(date => {
+      const net = Math.round(dMap.get(date) * 100) / 100;
+      cum = Math.round((cum + net) * 100) / 100;
+      if (cum > pk) pk = cum;
+      const ddPct = pk > 0 ? parseFloat(((pk - cum) / pk * 100).toFixed(2)) : 0;
+      return { date, net, cumulative: cum, drawdown: -ddPct };
+    });
+  }, [rows]);
+
+  const maxDDPct = Math.max(0, ...dayChartData.map(d => -d.drawdown));
+
+  // Monthly returns
+  const monthlyData = useMemo(() => {
+    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const byYM = {};
+    rows.forEach(r => {
+      const parts = (r.date || '').split('-');
+      if (parts.length !== 3) return;
+      const yr = parts[0]; const mm = parseInt(parts[1], 10) - 1;
+      if (!byYM[yr]) byYM[yr] = Array(12).fill(0);
+      byYM[yr][mm] = Math.round((byYM[yr][mm] + (Number(r.pnl) || 0)) * 100) / 100;
+    });
+    return Object.entries(byYM).sort().map(([yr, mos]) => ({
+      year: yr, months: mos,
+      total: Math.round(mos.reduce((s, v) => s + v, 0) * 100) / 100,
+    }));
+  }, [rows]);
+
+  const equityDomain = useMemo(() => {
+    const vals = dayChartData.map(d => d.cumulative);
+    if (!vals.length) return ['auto', 'auto'];
+    const min = Math.min(...vals); const max = Math.max(...vals);
+    const pad = (max - min) * 0.05 || 10;
+    return [parseFloat((min - pad).toFixed(2)), parseFloat((max + pad).toFixed(2))];
+  }, [dayChartData]);
+
+  const fmtDateShort = (d) => {
+    if (!d) return '';
+    const p = String(d).split('-');
+    if (p.length !== 3) return d;
+    const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `${M[parseInt(p[1], 10) - 1] || p[1]} '${p[0].slice(2)}`;
+  };
+
+  const IntradayTooltip = ({ active, payload, label }) => {
+    if (!active || !payload || !payload.length) return null;
+    return (
+      <div className="bg-base border border-strong rounded-lg p-3 shadow-xl text-xs">
+        <p className="text-muted mb-1">{label}</p>
+        {payload.map((e, i) => (
+          <p key={i} style={{ color: e.stroke || e.fill }} className="font-semibold">
+            {e.name}: {e.dataKey === 'drawdown' ? `${Number(e.value).toFixed(2)}%` : `₹${Number(e.value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+          </p>
+        ))}
+      </div>
+    );
+  };
+
+  // Build hierarchical report rows: day-summary + leg-detail
+  // Index numbering ALWAYS starts at 1 for first day, regardless of sort
+  const reportRows = useMemo(() => {
+    const out = [];
+    sortedDates.forEach((date, dayIdx) => {
+      const legs = byDate.get(date);
+      const dayPnl = legs.reduce((s, l) => s + (Number(l.pnl) || 0), 0);
+      const dayQty = legs.reduce((s, l) => s + (Number(l.quantity) || 0), 0);
+      const earliestEntry = legs.reduce((acc, l) => (!acc || (l.entry_time && l.entry_time < acc) ? l.entry_time : acc), null);
+      const latestExit    = legs.reduce((acc, l) => (!acc || (l.exit_time  && l.exit_time  > acc) ? l.exit_time  : acc), null);
+      out.push({
+        kind: 'day',
+        index: `${dayIdx + 1}`,
+        entryDate: date, exitDate: date,
+        entryTime: earliestEntry, exitTime: latestExit,
+        qty: dayQty,
+        pnl: dayPnl,
+      });
+      legs.forEach((leg, legIdx) => {
+        out.push({
+          kind: 'leg',
+          index: `${dayIdx + 1}.${legIdx + 1}`,
+          entryDate: date, exitDate: date,
+          entryTime: leg.entry_time, exitTime: leg.exit_time,
+          type: leg.opt_type,
+          strike: leg.strike,
+          bs: leg.action,
+          qty: leg.quantity,
+          entryPrice: leg.entry_price,
+          exitPrice: leg.exit_price,
+          exitReason: leg.exit_reason,
+          pnl: leg.pnl,
+        });
+      });
+    });
+    return out;
+  }, [sortedDates, byDate]);
+
+  // Pagination operates over DAYS, not rows — so a multi-leg day stays together
+  const totalDays = sortedDates.length;
+  const totalPages = Math.max(1, Math.ceil(totalDays / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const startDayIdx = (safePage - 1) * PAGE_SIZE;
+  const endDayIdx = Math.min(startDayIdx + PAGE_SIZE, totalDays);
+  const visibleDates = new Set(sortedDates.slice(startDayIdx, endDayIdx));
+  const visibleRows = reportRows.filter(r => visibleDates.has(r.entryDate));
+
+  const tradeCountStart = startDayIdx + 1;
+  const tradeCountEnd = endDayIdx;
+
+  const exportToExcel = async () => {
+    if (rows.length === 0) return;
+
+    const sorted = [...rows].sort((a, b) => {
+      const d = String(a.date || '').localeCompare(String(b.date || ''));
+      return d !== 0 ? d : String(a.entry_time || '').localeCompare(String(b.entry_time || ''));
+    });
+
+    const dateMap = new Map();
+    sorted.forEach(r => {
+      if (!dateMap.has(r.date)) dateMap.set(r.date, []);
+      dateMap.get(r.date).push(r);
+    });
+
+    const sortedDates = Array.from(dateMap.keys()).sort();
+    let cumPnl = 0, runPeak = 0;
+    const dayStats = sortedDates.map((date, dayIdx) => {
+      const legs = dateMap.get(date);
+      const netPnl = Math.round(legs.reduce((s, r) => s + (Number(r.pnl) || 0), 0) * 100) / 100;
+      cumPnl = Math.round((cumPnl + netPnl) * 100) / 100;
+      if (cumPnl > runPeak) runPeak = cumPnl;
+      const dd    = Math.round((runPeak - cumPnl) * 100) / 100;
+      const pctDd = runPeak > 0 ? Math.round((dd / runPeak) * 10000) / 100 : 0;
+      return { date, dayIdx, legs, netPnl, cumPnl, peak: runPeak, dd, pctDd };
+    });
+
+    // ─── Palette ────────────────────────────────────────────────────────────
+    const C = {
+      navyBg:   { argb: 'FF1F3864' }, navyText: { argb: 'FFFFFFFF' },
+      sectionBg:{ argb: 'FF2C5F8A' }, sectionTx:{ argb: 'FFFFFFFF' },
+      headerBg: { argb: 'FF34495E' }, headerTx: { argb: 'FFFFFFFF' },
+      subHdrBg: { argb: 'FFD6E4F7' }, subHdrTx: { argb: 'FF1F3864' },
+      greenBg:  { argb: 'FFD4EFDF' }, greenTx:  { argb: 'FF1E7E34' },
+      redBg:    { argb: 'FFFDE8E8' }, redTx:    { argb: 'FFC0392B' },
+      labelBg:  { argb: 'FFF2F6FA' }, altRow:   { argb: 'FFF9FBFD' },
+      border:   { argb: 'FFB0C4D8' }, white:    { argb: 'FFFFFFFF' },
+    };
+    const thinBorder = (color = C.border) => ({
+      top: { style: 'thin', color }, left: { style: 'thin', color },
+      bottom: { style: 'thin', color }, right: { style: 'thin', color },
+    });
+    const boldFont = (sz = 11, color = { argb: 'FF000000' }) => ({ bold: true,  size: sz, color, name: 'Calibri' });
+    const normFont = (sz = 10, color = { argb: 'FF000000' }) => ({ bold: false, size: sz, color, name: 'Calibri' });
+    const centerAlign = { horizontal: 'center', vertical: 'middle' };
+    const leftAlign   = { horizontal: 'left',   vertical: 'middle' };
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'AlgoTest Backtest';
+    wb.created = new Date();
+    wb.calcProperties = { fullCalcOnLoad: true };
+
+    // ════ SHEET 1: TRADE SHEET ════
+    const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state: 'frozen', ySplit: 1 }] });
+    const colDefs = [
+      { header: 'Index',       key: 'idx',        width: 10 },
+      { header: 'Entry Date',  key: 'entryDate',  width: 13 },
+      { header: 'Entry Time',  key: 'entryTime',  width: 10 },
+      { header: 'Exit Date',   key: 'exitDate',   width: 13 },
+      { header: 'Exit Time',   key: 'exitTime',   width: 10 },
+      { header: 'Expiry',      key: 'expiry',     width: 12 },
+      { header: 'Type',        key: 'type',       width:  8 },
+      { header: 'Strike',      key: 'strike',     width: 10 },
+      { header: 'B/S',         key: 'bs',         width:  7 },
+      { header: 'Qty',         key: 'qty',        width:  7 },
+      { header: 'Entry Price', key: 'entryPrice', width: 12 },
+      { header: 'Exit Price',  key: 'exitPrice',  width: 11 },
+      { header: 'MAE',         key: 'mae',        width:  9 },
+      { header: 'MFE',         key: 'mfe',        width:  9 },
+      { header: 'P&L',         key: 'legPnl',     width: 10 },
+      { header: 'Net P&L',     key: 'netPnl',     width: 10 },
+      { header: 'Cumulative',  key: 'cumulative', width: 12 },
+      { header: 'Peak',        key: 'peak',       width: 10 },
+      { header: 'DD',          key: 'dd',         width: 10 },
+      { header: '%DD',         key: 'pctDd',      width:  9 },
+      { header: 'Exit Reason', key: 'exitReason', width: 14 },
+    ];
+    ws1.columns = colDefs.map(c => ({ key: c.key, width: c.width }));
+
+    const hdrRow = ws1.addRow(colDefs.map(c => c.header));
+    hdrRow.eachCell(cell => {
+      cell.font = boldFont(10, C.navyText);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    hdrRow.height = 22;
+
+    const legPnlCol = colDefs.findIndex(c => c.key === 'legPnl') + 1;
+    const netPnlCol = colDefs.findIndex(c => c.key === 'netPnl') + 1;
+    const n = v => (v != null && v !== '' && Number.isFinite(Number(v))) ? Math.round(Number(v) * 100) / 100 : '';
+
+    let rowIdx = 0;
+    dayStats.forEach(({ date, dayIdx, legs, netPnl, cumPnl: cum, peak: pk, dd, pctDd }) => {
+      legs.forEach((leg, legIdx) => {
+        const first = legIdx === 0;
+        const pnlV = n(leg.pnl);
+        const r = ws1.addRow([
+          `${dayIdx + 1}.${legIdx + 1}`,
+          date,
+          leg.entry_time  || '',
+          date,
+          leg.exit_time   || '',
+          leg.expiry      || '',
+          leg.opt_type    || '',
+          n(leg.strike),
+          leg.action      || '',
+          leg.quantity != null ? Number(leg.quantity) : '',
+          n(leg.entry_price),
+          n(leg.exit_price),
+          n(leg.mae),
+          n(leg.mfe),
+          pnlV,
+          first ? netPnl : '',
+          first ? cum    : '',
+          first ? pk     : '',
+          first ? dd     : '',
+          first ? pctDd  : '',
+          leg.exit_reason || '',
+        ]);
+        const bg = rowIdx % 2 === 0 ? C.white : C.altRow;
+        r.eachCell(cell => {
+          cell.font   = normFont(10);
+          cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: bg };
+          cell.border = thinBorder();
+          cell.alignment = { vertical: 'middle' };
+          if (typeof cell.value === 'number') {
+            cell.numFmt = Number.isInteger(cell.value) ? '0' : '#,##0.00';
+          }
+        });
+        if (typeof pnlV === 'number') {
+          const c = r.getCell(legPnlCol);
+          c.font = boldFont(10, pnlV >= 0 ? C.greenTx : C.redTx);
+          c.fill = { type: 'pattern', pattern: 'solid', fgColor: pnlV >= 0 ? C.greenBg : C.redBg };
+        }
+        if (first && typeof netPnl === 'number') {
+          const c = r.getCell(netPnlCol);
+          c.font = boldFont(10, netPnl >= 0 ? C.greenTx : C.redTx);
+          c.fill = { type: 'pattern', pattern: 'solid', fgColor: netPnl >= 0 ? C.greenBg : C.redBg };
+        }
+        rowIdx++;
+      });
+    });
+
+    // ════ SHEET 2: SUMMARY ════
+    const ws2 = wb.addWorksheet('Summary');
+    ws2.columns = [{ width: 30 }, { width: 20 }, { width: 4 }, { width: 30 }, { width: 20 }];
+
+    const addTitle2 = (text, rn) => {
+      ws2.mergeCells(`A${rn}:E${rn}`);
+      const cell = ws2.getCell(`A${rn}`);
+      cell.value = text; cell.font = boldFont(13, C.navyText);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.navyBg };
+      cell.alignment = centerAlign; ws2.getRow(rn).height = 26;
+    };
+    const addSection2 = (text, rn) => {
+      ws2.mergeCells(`A${rn}:E${rn}`);
+      const cell = ws2.getCell(`A${rn}`);
+      cell.value = '  ' + text; cell.font = boldFont(11, C.sectionTx);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.sectionBg };
+      cell.alignment = leftAlign; ws2.getRow(rn).height = 20;
+    };
+    const addKv2 = (label, value, rn, col = 'A', alt = false, vc = null) => {
+      const vCol = String.fromCharCode(col.charCodeAt(0) + 1);
+      const lCell = ws2.getCell(`${col}${rn}`);
+      const vCell = ws2.getCell(`${vCol}${rn}`);
+      lCell.value = label; vCell.value = value;
+      lCell.font  = boldFont(10, { argb: 'FF2C3E50' });
+      lCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: alt ? C.altRow : C.labelBg };
+      lCell.alignment = leftAlign; lCell.border = thinBorder(C.border);
+      const numVal = typeof value === 'number' ? value : parseFloat(String(value || '').replace(/[+%₹,]/g, ''));
+      const autoColor = vc || (isNaN(numVal) ? null : numVal >= 0 ? C.greenTx : C.redTx);
+      vCell.font  = boldFont(10, autoColor || { argb: 'FF1A1A2E' });
+      vCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: alt ? C.altRow : C.white };
+      vCell.alignment = leftAlign; vCell.border = thinBorder(C.border);
+      ws2.getRow(rn).height = 18;
+    };
+
+    const winners  = dayStats.filter(d => d.netPnl > 0);
+    const losers   = dayStats.filter(d => d.netPnl <= 0);
+    const totalPnl2 = Math.round(dayStats.reduce((s, d) => s + d.netPnl, 0) * 100) / 100;
+    const winRateN  = dayStats.length > 0 ? +(winners.length / dayStats.length * 100).toFixed(2) : 0;
+    const lossPctN  = dayStats.length > 0 ? +(losers.length  / dayStats.length * 100).toFixed(2) : 0;
+    const avgWinN   = winners.length > 0 ? +(winners.reduce((s, d) => s + d.netPnl, 0) / winners.length).toFixed(2) : 0;
+    const avgLossN  = losers.length  > 0 ? +(losers.reduce( (s, d) => s + d.netPnl, 0) / losers.length ).toFixed(2) : 0;
+    const maxWinN   = dayStats.length > 0 ? Math.max(...dayStats.map(d => d.netPnl)) : 0;
+    const maxLossN  = dayStats.length > 0 ? Math.min(...dayStats.map(d => d.netPnl)) : 0;
+    const maxDdN    = dayStats.length > 0 ? Math.max(...dayStats.map(d => d.dd))     : 0;
+    const maxDdPctN = dayStats.length > 0 ? Math.max(...dayStats.map(d => d.pctDd))  : 0;
+    let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
+    dayStats.forEach(d => {
+      if (d.netPnl > 0) { curW++; maxWinStreak  = Math.max(maxWinStreak,  curW); curL = 0; }
+      else               { curL++; maxLossStreak = Math.max(maxLossStreak, curL); curW = 0; }
+    });
+
+    addTitle2('  INTRADAY BACKTEST SUMMARY', 1);
+    ws2.mergeCells('A2:E2');
+    const subCell2 = ws2.getCell('A2');
+    subCell2.value = `Generated: ${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
+    subCell2.font  = normFont(10, { argb: 'FF555555' });
+    subCell2.alignment = centerAlign;
+    subCell2.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
+    ws2.getRow(2).height = 16;
+
+    let sRow = 4;
+    addSection2('PERFORMANCE OVERVIEW', sRow++);
+    addKv2('Total P&L',             `₹${totalPnl2.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow, 'A', false, totalPnl2 >= 0 ? C.greenTx : C.redTx);
+    addKv2('No. of Trade Days',     dayStats.length,   sRow++, 'D', false, { argb: 'FF1A1A2E' });
+    addKv2('Win %',                 `${winRateN}%`,    sRow,   'A', true,  C.greenTx);
+    addKv2('Loss %',                `${lossPctN}%`,    sRow++, 'D', true,  C.redTx);
+    addKv2('Avg Profit on Winners', `₹${avgWinN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,  sRow,   'A', false, C.greenTx);
+    addKv2('Avg Loss on Losers',    `₹${avgLossN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow++, 'D', false, C.redTx);
+    addKv2('Max Profit (Single Day)', `₹${maxWinN.toLocaleString('en-IN',  { minimumFractionDigits: 2 })}`, sRow,   'A', true, C.greenTx);
+    addKv2('Max Loss (Single Day)',   `₹${maxLossN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow++, 'D', true, C.redTx);
+    sRow++;
+
+    addSection2('RISK METRICS', sRow++);
+    addKv2('Max Drawdown',          `₹${maxDdN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow,   'A', false, C.redTx);
+    addKv2('Max Drawdown %',        `${maxDdPctN.toFixed(2)}%`, sRow++, 'D', false, C.redTx);
+    sRow++;
+
+    addSection2('CONSISTENCY & STREAKS', sRow++);
+    addKv2('Max Win Streak',        `${maxWinStreak} days`,  sRow,   'A', false, C.greenTx);
+    addKv2('Max Losing Streak',     `${maxLossStreak} days`, sRow++, 'D', false, C.redTx);
+    sRow++;
+
+    addSection2('MONTHLY RETURNS (₹ Net P&L)', sRow++);
+    const MONTHS2 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const mthHdr2 = ['Year', ...MONTHS2, 'Total'];
+    for (let ci = 0; ci < mthHdr2.length; ci++) {
+      ws2.getColumn(ci + 1).width = ci === 0 ? 8 : ci <= 12 ? 9 : 10;
+    }
+    const mHdrRow2 = ws2.getRow(sRow);
+    mthHdr2.forEach((h, ci) => {
+      const cell = mHdrRow2.getCell(ci + 1);
+      cell.value = h; cell.font = boldFont(10, C.navyText);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign; cell.border = thinBorder();
+    });
+    mHdrRow2.height = 20;
+    sRow++;
+
+    const byYM = {};
+    dayStats.forEach(({ date, netPnl: np }) => {
+      const parts = date.split('-');
+      if (parts.length !== 3) return;
+      const yr = parts[0].length === 4 ? parts[0] : parts[2];
+      const mm = parseInt(parts[0].length === 4 ? parts[1] : parts[1], 10) - 1;
+      if (!byYM[yr]) byYM[yr] = Array(12).fill(0);
+      byYM[yr][mm] = Math.round((byYM[yr][mm] + np) * 100) / 100;
+    });
+    Object.entries(byYM).sort().forEach(([yr, mos], ri) => {
+      const total = Math.round(mos.reduce((s, v) => s + v, 0) * 100) / 100;
+      const r2 = ws2.getRow(sRow);
+      [yr, ...mos, total].forEach((val, ci) => {
+        const cell = r2.getCell(ci + 1);
+        cell.value = val;
+        const num = typeof val === 'number' ? val : parseFloat(String(val || '').replace(/[%,]/g, ''));
+        const isValCol = ci >= 1 && ci <= 13;
+        if (isValCol && !isNaN(num) && num !== 0) {
+          cell.font = boldFont(10, num >= 0 ? C.greenTx : C.redTx);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: num >= 0 ? C.greenBg : C.redBg };
+        } else if (ci === 0) {
+          cell.font = boldFont(10, C.subHdrTx);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
+        } else {
+          cell.font = normFont(10);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      sRow++;
+    });
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `intraday_backtest_${new Date().toISOString().split('T')[0]}.xlsx`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="animate-results">
+      {showCloseButton && onClose && (
+        <button onClick={onClose} className="float-right p-1 rounded transition-colors" style={{ color: 'var(--text-muted)' }}
+          onMouseEnter={e => e.currentTarget.style.color = 'var(--text-primary)'}
+          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}><X size={15} /></button>
+      )}
+      <div className="mb-4 flex items-center gap-2">
+        <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.6rem', fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-muted)', borderLeft: '2px solid var(--accent)', paddingLeft: '8px' }}>Intraday Results</span>
+      </div>
+
+      {/* Stats grid */}
+      <div className="grid grid-cols-3 gap-2 mb-5 sm:grid-cols-6">
+        {[
+          { label: 'Total P&L',  value: `₹${totalPnl.toFixed(2)}`, color: totalPnl >= 0 ? 'var(--profit)' : 'var(--loss)' },
+          { label: 'Trade Days', value: tradeDays, color: 'var(--text-primary)' },
+          { label: 'Win Rate',   value: `${winRate}%`, color: Number(winRate) >= 50 ? 'var(--profit)' : 'var(--loss)' },
+          { label: 'Avg Win',    value: `₹${avgWin}`, color: 'var(--profit)' },
+          { label: 'Avg Loss',   value: `₹${avgLoss}`, color: 'var(--loss)' },
+          { label: 'Max DD',     value: `${maxDDPct.toFixed(2)}%`, color: maxDDPct > 0 ? 'var(--loss)' : 'var(--text-secondary)' },
+        ].map(({ label, value, color }) => (
+          <div key={label} className="stat-tile">
+            <div className="s-label">{label}</div>
+            <div className="s-value" style={{ color }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Equity Curve */}
+      <div className="chart-panel mb-4">
+        <h3 className="chart-panel-title">Equity Curve (Cumulative P&L)</h3>
+        <ResponsiveContainer width="100%" height={280}>
+          <AreaChart data={dayChartData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
+            <defs>
+              <linearGradient id="intradayEquityGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%"  stopColor="var(--chart-equity)" stopOpacity={0.15} />
+                <stop offset="95%" stopColor="var(--chart-equity)" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
+            <XAxis dataKey="date" stroke="var(--border-default)"
+              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
+              tickFormatter={fmtDateShort} interval="preserveStartEnd" minTickGap={50} />
+            <YAxis stroke="var(--border-default)"
+              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
+              tickFormatter={v => v.toFixed(0)} domain={equityDomain} />
+            <Tooltip content={<IntradayTooltip />} />
+            <ReferenceLine y={0} stroke="var(--border-strong)" strokeWidth={1} />
+            <Area type="monotone" dataKey="cumulative" name="Cumulative P&L"
+              stroke="var(--chart-equity)" strokeWidth={2}
+              fill="url(#intradayEquityGrad)"
+              isAnimationActive={false} connectNulls dot={false}
+              baseValue={equityDomain[0]} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Drawdown Chart */}
+      <div className="chart-panel mb-4">
+        <h3 className="chart-panel-title">Drawdown (%)</h3>
+        <ResponsiveContainer width="100%" height={220}>
+          <AreaChart data={dayChartData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
+            <XAxis dataKey="date" stroke="var(--border-default)"
+              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
+              tickFormatter={fmtDateShort} interval="preserveStartEnd" minTickGap={50} />
+            <YAxis stroke="var(--border-default)"
+              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
+              tickFormatter={v => `${v.toFixed(1)}%`} />
+            <Tooltip content={<IntradayTooltip />} />
+            <ReferenceLine y={0} stroke="var(--border-strong)" strokeWidth={1} />
+            <Area type="monotone" dataKey="drawdown" name="Drawdown"
+              stroke="var(--chart-drawdown)" strokeWidth={1.5}
+              fill="var(--loss-bg)"
+              isAnimationActive={false} connectNulls dot={false} baseValue={0} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Monthly Returns */}
+      {monthlyData.length > 0 && (() => {
+        const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return (
+          <div className="chart-panel mb-4 overflow-x-auto">
+            <h3 className="chart-panel-title">Monthly Returns (₹ Net P&L)</h3>
+            <table className="w-full text-xs border-collapse" style={{ minWidth: 700 }}>
+              <thead>
+                <tr className="bg-base">
+                  <th className="px-2 py-1.5 text-center font-semibold text-secondary border border-default">Year</th>
+                  {MONTHS.map(m => (
+                    <th key={m} className="px-2 py-1.5 text-center font-semibold text-secondary border border-default">{m}</th>
+                  ))}
+                  <th className="px-2 py-1.5 text-center font-semibold text-secondary border border-default">Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monthlyData.map(({ year, months, total }) => (
+                  <tr key={year}>
+                    <td className="px-2 py-1.5 text-center font-semibold text-primary border border-default bg-hover">{year}</td>
+                    {months.map((v, i) => (
+                      <td key={i}
+                        className={`px-2 py-1.5 text-right border border-default ${v > 0 ? 'text-profit' : v < 0 ? 'text-loss' : 'text-muted'}`}
+                        style={v > 0 ? { background: 'var(--profit-bg)' } : v < 0 ? { background: 'var(--loss-bg)' } : {}}>
+                        {v !== 0 ? v.toFixed(0) : '—'}
+                      </td>
+                    ))}
+                    <td className={`px-2 py-1.5 text-right font-semibold border border-default ${total > 0 ? 'text-profit' : total < 0 ? 'text-loss' : 'text-muted'}`}>
+                      {total.toFixed(0)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })()}
+
+      {/* Full Report header — sort + range + download */}
+      <div className="flex items-center justify-between flex-wrap gap-3 mb-2 pt-2 border-t border-default">
+        <span className="text-base font-semibold text-primary">Full Report</span>
+        <div className="flex items-center gap-3 flex-wrap text-xs">
+          <span className="text-secondary">Sort By:</span>
+          <span className="px-2 py-1 rounded bg-base text-primary">Entry date</span>
+          <div className="inline-flex rounded border border-default overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setSortDir('asc')}
+              className={`px-3 py-1 text-xs ${sortDir === 'asc' ? 'bg-accent text-white' : 'bg-surface text-secondary hover:bg-hover'}`}
+            >Asc</button>
+            <button
+              type="button"
+              onClick={() => setSortDir('desc')}
+              className={`px-3 py-1 text-xs ${sortDir === 'desc' ? 'bg-accent text-white' : 'bg-surface text-secondary hover:bg-hover'}`}
+            >Desc</button>
+          </div>
+          <span className="text-secondary">
+            Showing <strong className="text-primary">{tradeCountStart}-{tradeCountEnd}</strong> trade days out of <strong className="text-primary">{totalDays}</strong>
+          </span>
+        </div>
+      </div>
+
+      {/* Full Report table */}
+      <div className="overflow-x-auto border border-default rounded-lg">
+        <table className="w-full border-collapse trading-table">
+          <thead>
+            <tr>
+              <th className="text-center">Index</th>
+              <th className="text-left">Entry Date</th>
+              <th className="text-left">Entry Time</th>
+              <th className="text-left">Exit Date</th>
+              <th className="text-left">Exit Time</th>
+              <th className="text-center">Type</th>
+              <th className="text-right">Strike</th>
+              <th className="text-center">B/S</th>
+              <th className="text-right">Qty</th>
+              <th className="text-right">Entry ₹</th>
+              <th className="text-right">Exit ₹</th>
+              <th className="text-right">P&amp;L</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visibleRows.map((r) => {
+              const isDay = r.kind === 'day';
+              const pnlVal = Number(r.pnl);
+              return (
+                <tr key={r.index} className={isDay ? 'day-row' : ''}>
+                  <td className="text-center" style={{ color: isDay ? 'var(--accent)' : 'var(--text-muted)' }}>{r.index}</td>
+                  <td>{r.entryDate}</td>
+                  <td>{r.entryTime || '—'}</td>
+                  <td>{r.exitDate}</td>
+                  <td>{r.exitTime || '—'}</td>
+                  <td className="text-center" style={{ color: r.type === 'CE' ? 'var(--chart-equity)' : r.type === 'PE' ? 'var(--loss)' : 'var(--text-secondary)' }}>{!isDay ? r.type : ''}</td>
+                  <td className="text-right">{!isDay && r.strike != null ? Number(r.strike).toFixed(0) : ''}</td>
+                  <td className="text-center" style={{ color: r.bs === 'SELL' ? 'var(--loss)' : 'var(--profit)' }}>{!isDay ? r.bs : ''}</td>
+                  <td className="text-right">{r.qty != null ? r.qty : ''}</td>
+                  <td className="text-right">{!isDay && r.entryPrice != null ? Number(r.entryPrice).toFixed(2) : ''}</td>
+                  <td className="text-right">{!isDay && r.exitPrice != null ? Number(r.exitPrice).toFixed(2) : ''}</td>
+                  <td className="text-right font-semibold" style={{ color: pnlVal >= 0 ? 'var(--profit)' : 'var(--loss)' }}>
+                    {pnlVal.toFixed(2)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Pagination + Download */}
+      <div className="mt-3 flex items-center justify-between flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={exportToExcel}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all"
+          style={{ fontFamily: 'Outfit, sans-serif', letterSpacing: '0.06em', color: 'var(--accent)', border: '1px solid var(--accent-bg)', background: 'var(--accent-bg)' }}
+          onMouseEnter={e => e.currentTarget.style.boxShadow = '0 0 12px var(--accent-glow)'}
+          onMouseLeave={e => e.currentTarget.style.boxShadow = 'none'}
+        >
+          <Download size={12} /> DOWNLOAD XLSX
+        </button>
+        <div className="flex items-center gap-1 text-xs">
+          <button type="button" disabled={safePage <= 1} onClick={() => setPage(1)}
+            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">«</button>
+          <button type="button" disabled={safePage <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}
+            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">‹</button>
+          {Array.from({ length: Math.min(6, totalPages) }, (_, i) => {
+            // Always show first page, current ±2, last page
+            const p = i + 1;
+            return (
+              <button key={p} type="button" onClick={() => setPage(p)}
+                className={`px-2.5 py-1 rounded border ${p === safePage ? 'border-accent bg-accent text-white' : 'border-default text-secondary hover:bg-hover'}`}>{p}</button>
+            );
+          })}
+          <button type="button" disabled={safePage >= totalPages} onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">›</button>
+          <button type="button" disabled={safePage >= totalPages} onClick={() => setPage(totalPages)}
+            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">»</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
 
   // Intraday backtest returns a flat array of trade objects with entry_time / exit_time fields.
   if (Array.isArray(results)) {
-    const rows = results;
-    const totalPnl = rows.reduce((s, r) => s + (Number(r.pnl) || 0), 0);
-    const hasTime = rows.length > 0 && rows[0]?.entry_time !== undefined;
-    return (
-      <div className="bg-surface rounded-lg border border-default shadow-sm p-4">
-        {showCloseButton && onClose && (
-          <button onClick={onClose} className="float-right text-muted hover:text-primary"><X size={16} /></button>
-        )}
-        <div className="mb-3 flex items-center gap-4">
-          <span className="text-sm font-semibold text-primary">Intraday Results</span>
-          <span className="text-sm text-secondary">{rows.length} trades</span>
-          <span className={`text-sm font-semibold ${totalPnl >= 0 ? 'text-profit' : 'text-loss'}`}>
-            Total P&L: {totalPnl.toFixed(2)}
-          </span>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-xs border-collapse">
-            <thead>
-              <tr className="bg-base">
-                <th className="px-3 py-2 text-left font-semibold text-secondary">Date</th>
-                <th className="px-3 py-2 text-left font-semibold text-secondary">Symbol</th>
-                <th className="px-3 py-2 text-left font-semibold text-secondary">Strike</th>
-                <th className="px-3 py-2 text-left font-semibold text-secondary">Type</th>
-                <th className="px-3 py-2 text-left font-semibold text-secondary">B/S</th>
-                {hasTime && <th className="px-3 py-2 text-left font-semibold text-secondary">Entry Time</th>}
-                <th className="px-3 py-2 text-right font-semibold text-secondary">Entry Price</th>
-                {hasTime && <th className="px-3 py-2 text-left font-semibold text-secondary">Exit Time</th>}
-                <th className="px-3 py-2 text-right font-semibold text-secondary">Exit Price</th>
-                <th className="px-3 py-2 text-left font-semibold text-secondary">Reason</th>
-                <th className="px-3 py-2 text-right font-semibold text-secondary">P&L</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, i) => (
-                <tr key={i} className={i % 2 === 0 ? 'bg-surface' : 'bg-hover'}>
-                  <td className="px-3 py-1.5">{row.date}</td>
-                  <td className="px-3 py-1.5">{row.symbol}</td>
-                  <td className="px-3 py-1.5 text-right">{row.strike != null ? (row.strike / 100).toFixed(0) : '—'}</td>
-                  <td className="px-3 py-1.5">{row.opt_type}</td>
-                  <td className="px-3 py-1.5">{row.action}</td>
-                  {hasTime && <td className="px-3 py-1.5">{row.entry_time}</td>}
-                  <td className="px-3 py-1.5 text-right">{row.entry_price != null ? (row.entry_price / 100).toFixed(2) : '—'}</td>
-                  {hasTime && <td className="px-3 py-1.5">{row.exit_time}</td>}
-                  <td className="px-3 py-1.5 text-right">{row.exit_price != null ? (row.exit_price / 100).toFixed(2) : '—'}</td>
-                  <td className="px-3 py-1.5">{renderExitReasonBadge(row.exit_reason)}</td>
-                  <td className={`px-3 py-1.5 text-right font-medium ${Number(row.pnl) >= 0 ? 'text-profit' : 'text-loss'}`}>
-                    {Number(row.pnl).toFixed(2)}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    );
+    return <IntradayFullReport rows={results} onClose={onClose} showCloseButton={showCloseButton} />;
   }
 
   useEffect(() => {
@@ -1016,34 +1636,31 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           className={`${showCloseButton ? "max-w-[1400px] mx-auto min-h-screen px-4 py-6" : "w-full mx-auto"} bg-surface rounded-xl shadow-2xl`}
         >
           {/* Header */}
-          <div className="flex justify-between items-center px-6 py-5 border-b border-default">
-          <div>
-            <h2 className="text-2xl font-bold text-primary">Backtest Results</h2>
-            <p className="text-sm text-secondary mt-1">
-              {stats.totalTrades} trades • {results.meta?.date_range || ''}
-              {slippagePct > 0 ? ` • ${slippagePct}% slippage` : ''}
-              {chargesEnabled ? ' • Zerodha txn charges applied' : ''}
-            </p>
-            {filterInfo && (
-              <span className="mt-2 inline-flex items-center rounded-full border border-subtle bg-hover px-3 py-1 text-xs font-semibold text-blue-700">
-                {filterInfo}
-              </span>
-            )}
-          </div>
-            <div className="flex gap-3">
-              <button
-                onClick={exportToCSV}
-                className="flex items-center gap-2 px-4 py-2 bg-accent text-inverse text-white rounded-lg hover:bg-blue-700 transition-colors font-medium text-sm"
-              >
-                <Download size={16} />
-                Export Excel
+          <div className="results-header">
+            <div>
+              <h2 className="results-title">Backtest Results</h2>
+              <p className="results-meta mt-1">
+                {stats.totalTrades} trades · {results.meta?.date_range || ''}
+                {slippagePct > 0 ? ` · ${slippagePct}% slippage` : ''}
+                {chargesEnabled ? ' · Zerodha charges applied' : ''}
+              </p>
+              {filterInfo && (
+                <span className="mt-2 inline-flex items-center rounded-full px-3 py-0.5 text-xs font-semibold"
+                  style={{ background: 'var(--accent-bg)', color: 'var(--accent)', border: '1px solid var(--border-accent)' }}>
+                  {filterInfo}
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2 items-center">
+              <button onClick={exportToCSV} className="run-btn px-4 py-2" style={{ fontSize: '0.7rem', borderRadius: '7px' }}>
+                <Download size={14} /> Export Excel
               </button>
               {showCloseButton && (
-                <button
-                  onClick={onClose}
-                  className="p-2 hover:bg-base rounded-lg transition-colors"
-                >
-                  <X size={22} className="text-secondary" />
+                <button onClick={onClose} className="p-2 rounded-lg transition-colors"
+                  style={{ color: 'var(--text-muted)', background: 'transparent' }}
+                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                  <X size={18} />
                 </button>
               )}
             </div>
@@ -1051,7 +1668,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
           {/* Summary Cards */}
           {filteredWarnings.length > 0 && (
-            <div className="mb-3 px-4 py-2 rounded-lg border border-yellow-300 bg-yellow-50 text-xs text-yellow-800">
+            <div className="mb-3 px-4 py-2 rounded-lg text-xs" style={{ border: '1px solid var(--warning-border, rgba(245,158,11,0.4))', background: 'var(--warning-bg)', color: 'var(--warning)' }}>
               {filteredWarnings.map((msg, idx) => (
                 <p key={`${msg}-${idx}`} className="leading-tight">
                   ⚠️ {msg}
@@ -1059,7 +1676,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               ))}
             </div>
           )}
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6 bg-gradient-to-br from-gray-50 to-gray-100">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6" style={{ background: 'var(--bg-base)' }}>
             <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
               <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">Total P&L</p>
               <p className={`text-2xl font-bold ${stats.totalPnLPct >= 0 ? 'text-profit' : 'text-loss'}`}>
@@ -1097,10 +1714,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           </div>
 
           {/* Charts */}
-          <div className="p-6 space-y-6 bg-hover">
+          <div className="p-6 space-y-6" style={{ background: 'var(--bg-elevated)' }}>
             {/* Equity Curve */}
-            <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
-              <h3 className="text-base font-bold text-primary mb-4">Equity Curve (Cumulative P&L)</h3>
+            <div className="chart-panel">
+              <h3 className="chart-panel-title">Equity Curve (Cumulative P&L)</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
               <ResponsiveContainer width="100%" height={300}>
                 <AreaChart data={equityData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
@@ -1146,8 +1763,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
 
             {/* Drawdown */}
-            <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
-              <h3 className="text-base font-bold text-primary mb-4">Drawdown</h3>
+            <div className="chart-panel">
+              <h3 className="chart-panel-title">Drawdown</h3>
               <div style={{ position: 'relative', zIndex: 0 }}>
               <ResponsiveContainer width="100%" height={260}>
                 <AreaChart data={drawdownData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
@@ -1235,8 +1852,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               if (!rows || rows.length === 0) return null;
 
               return (
-              <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
-                <h3 className="text-base font-bold text-primary mb-4">Monthly Returns</h3>
+              <div className="chart-panel">
+                <h3 className="chart-panel-title">Monthly Returns</h3>
                 <div className="overflow-x-auto">
                   <table className="min-w-full text-sm">
                     <thead>
@@ -1282,7 +1899,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
             {/* Detailed Statistics Summary */}
             <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
-              <h3 className="text-sm font-bold text-primary mb-3">Detailed Statistics</h3>
+              <h3 className="chart-panel-title">Detailed Statistics</h3>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-2 text-xs">
                 <div className="border-b border-default pb-2">
                   <p className="font-bold text-primary mb-0.5">Overall Profit</p>
@@ -1378,7 +1995,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             </div>
 
             {/* Full Report Table */}
-            <div className="bg-surface rounded-xl p-6 shadow-sm border border-default">
+            <div className="chart-panel">
               <div className="flex justify-between items-center mb-4">
                 <h3 className="text-base font-bold text-primary">Full Report</h3>
                 <div className="text-sm text-secondary">
@@ -1388,7 +2005,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">
                   <thead>
-                    <tr className="bg-base border-b-2 border-gray-400">
+                    <tr className="bg-base border-b-2 border-strong">
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Index</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Entry Date</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Exit Date</th>
@@ -1437,7 +2054,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             const legPercentPnl = entrySpotForPct > 1000
                               ? (legNetPnlPoints / entrySpotForPct) * 100
                               : 0;
-                            const rowBg = rowIdx % 2 === 0 ? 'bg-white' : 'bg-slate-50';
+                            const rowBg = rowIdx % 2 === 0 ? '' : 'bg-elevated';
                             const exitDateValue = (() => {
                               const ownExit = getVisibleExitDate(leg);
                               if (ownExit && String(ownExit).trim() !== '') return ownExit;
@@ -1461,7 +2078,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-secondary">
                                   {position}
                                   {isReEntryRow && (
-                                    <span className={`ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${isLazy ? 'bg-violet-100 text-violet-700' : 'bg-blue-100 text-blue-700'}`}>
+                                    <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold" style={{ background: 'var(--accent-bg)', color: 'var(--accent)', border: '1px solid var(--accent)' }}>
                                       {isLazy ? `LAZY-${leg['Lazy Leg Name'] || 'LEG'}` : `RE-${leg['ReEntryTrigger']}`}
                                     </span>
                                   )}
@@ -1470,7 +2087,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{entryPrice.toFixed(2)}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{exitPrice.toFixed(2)}</td>
                                 {chargesEnabled && (
-                                  <td className="px-3 py-2 text-xs text-right text-orange-600">
+                                  <td className="px-3 py-2 text-xs text-right text-warning">
                                     {(() => {
                                       const c = parseFloat(leg['Charges']);
                                       return Number.isFinite(c) ? `₹${c.toFixed(2)}` : '—';
@@ -1509,7 +2126,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               : 0;
                             
                             return (
-                              <tr key={`${group.tradeNumber}-${legIdx}`} className={legIdx % 2 === 0 ? 'border-b border-default bg-white' : 'border-b border-default bg-slate-50'}>
+                              <tr key={`${group.tradeNumber}-${legIdx}`} className={legIdx % 2 === 0 ? 'border-b border-default' : 'border-b border-default bg-elevated'}>
                                 {isFirstLeg ? (
                                   <>
                                     <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.legs[0]['Index'] || group.tradeNumber}</td>
@@ -1541,7 +2158,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{entryPrice.toFixed(2)}</td>
                                 <td className="px-3 py-2 text-xs text-right text-secondary">{exitPrice.toFixed(2)}</td>
                                 {chargesEnabled && (
-                                  <td className="px-3 py-2 text-xs text-right text-orange-600">
+                                  <td className="px-3 py-2 text-xs text-right text-warning">
                                     {(() => {
                                       const c = parseFloat(leg['Charges']);
                                       return Number.isFinite(c) ? `₹${c.toFixed(2)}` : '—';
@@ -1578,17 +2195,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                             // Charges column is handled as its own <td> below, so excluded here.
                             const emptyCellSpan = 11 + (bufferStrikeEnabled ? 1 : 0);
                             return (
-                              <tr className={groupIdx % 2 === 0 ? 'border-b-2 border-strong bg-white' : 'border-b-2 border-strong bg-slate-50'}>
+                              <tr className={groupIdx % 2 === 0 ? 'border-b-2 border-strong' : 'border-b-2 border-strong bg-elevated'}>
                                 <td colSpan={emptyCellSpan}></td>
                                 {chargesEnabled && (
-                                  <td className="px-3 py-2 text-right text-xs font-bold text-orange-600">
+                                  <td className="px-3 py-2 text-right text-xs font-bold text-warning">
                                     ₹{totalChargesInr.toFixed(2)}
                                   </td>
                                 )}
-                                <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                                <td className={`px-3 py-2 text-right text-xs font-bold ${tradeNetPnlPoints >= 0 ? 'text-profit' : 'text-loss'}`}>
                                   {tradeNetPnlPoints >= 0 ? '+' : ''}{tradeNetPnlPoints.toFixed(2)}
                                 </td>
-                                <td className={`px-3 py-2 text-right text-xs font-bold ${tradePctPnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                                <td className={`px-3 py-2 text-right text-xs font-bold ${tradePctPnl >= 0 ? 'text-profit' : 'text-loss'}`}>
                                   {tradePctPnl >= 0 ? '+' : ''}{tradePctPnl.toFixed(2)}%
                                 </td>
                               </tr>

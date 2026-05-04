@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
 import Toggle from './ui/Toggle';
-import IntradayFields from './IntradayFields';
+import CalendarPicker from './ui/CalendarPicker';
+import TimeInput from './ui/TimeInput';
 import IntradaySlowPathWarning from './IntradaySlowPathWarning';
 
 // Convert DD/MM/YYYY to YYYY-MM-DD for API
@@ -281,19 +282,28 @@ const DateInput = ({ value, onChange, placeholder }) => {
     <input
       ref={inputRef}
       type="text"
-      placeholder={placeholder || 'DD/MM/YYYY'}
+      placeholder={placeholder || 'DD / MM / YYYY'}
       value={localDisplay}
       onChange={handleChange}
       onFocus={handleFocus}
       onBlur={handleBlur}
       onPaste={handlePaste}
       onKeyDown={handleKeyDown}
-      className="h-8 px-3 border rounded text-sm w-36 font-mono transition-colors duration-150"
       style={{
-        borderColor: isFocused ? 'var(--border-accent)' : 'var(--border-default)',
+        fontFamily: 'IBM Plex Mono, monospace',
+        fontSize: '0.82rem',
+        fontWeight: 500,
+        letterSpacing: '0.04em',
+        width: '148px',
+        height: '38px',
+        padding: '0 12px',
+        borderRadius: '8px',
+        border: `1.5px solid ${isFocused ? 'var(--accent)' : 'var(--border-default)'}`,
         backgroundColor: 'var(--bg-input)',
-        boxShadow: isFocused ? '0 0 0 3px var(--accent-bg)' : 'none',
-        outline: 'none'
+        color: 'var(--text-primary)',
+        boxShadow: isFocused ? '0 0 0 3px var(--accent-glow)' : '0 1px 2px rgba(0,0,0,0.04)',
+        outline: 'none',
+        transition: 'border-color 0.15s ease, box-shadow 0.15s ease',
       }}
     />
   );
@@ -393,27 +403,19 @@ const Tooltip = ({ text }) => {
 };
 
 const SegBtn = ({ options, value, onChange, size = 'md' }) => {
-  const sizeClasses = size === 'sm' ? 'px-2 py-0.5 text-xs' : 'px-3 py-1 text-xs';
-  
   return (
-    <div className="inline-flex rounded-md border border-subtle bg-hover p-0.5 overflow-hidden">
-      {options.map((opt, i) => {
+    <div className="seg-group">
+      {options.map((opt) => {
         const disabled = Boolean(opt.disabled);
+        const isActive = value === opt.value;
         return (
           <button
             key={opt.value}
             type="button"
-            onClick={() => {
-              if (disabled) return;
-              onChange(opt.value);
-            }}
-            className={`${sizeClasses} font-medium transition-colors rounded ${
-              disabled
-                ? 'text-muted cursor-not-allowed'
-                : value === opt.value
-                  ? 'bg-surface text-primary shadow-sm ring-1 ring-black/5'
-                  : 'text-secondary hover:bg-hover'
-            }`}
+            onClick={() => { if (!disabled) onChange(opt.value); }}
+            disabled={disabled}
+            className={`seg-btn${isActive ? ' active' : ''}${disabled ? ' disabled' : ''}`}
+            style={size === 'sm' ? { padding: '4px 10px', fontSize: '0.66rem' } : {}}
           >
             {opt.label}
           </button>
@@ -504,7 +506,7 @@ const LazyLegModal = ({
       <option value="LAZY_LEG">Lazy Leg</option>
     </>
   );
-  const inputClass = 'h-8 px-2 border border-strong rounded text-xs bg-surface';
+  const inputClass = 'h-8 px-2 border border-default rounded text-xs bg-surface';
 
   return (
     <div className="fixed inset-0 bg-black/40 z-[100] flex items-center justify-center p-4">
@@ -684,11 +686,25 @@ const LazyLegModal = ({
 };
 
 const StrategyBuilder = () => {
+  const [isDark, setIsDark] = useState(() => {
+    const saved = localStorage.getItem('sl-theme');
+    return saved ? saved === 'dark' : false;
+  });
+
+  useEffect(() => {
+    if (isDark) {
+      document.body.classList.add('dark-mode');
+    } else {
+      document.body.classList.remove('dark-mode');
+    }
+    localStorage.setItem('sl-theme', isDark ? 'dark' : 'light');
+  }, [isDark]);
+
   const [instrument, setInstrument] = useState('NIFTY');
   const [underlying, setUnderlying] = useState('cash');
   const [strategyType, setStrategyType] = useState('positional');
   const [expiryBasis, setExpiryBasis] = useState('weekly');
-  const [entryDaysBefore, setEntryDaysBefore] = useState(0);
+  const [entryDaysBefore, setEntryDaysBefore] = useState(2);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
   const [delayTime, setDelayTime] = useState('09:15');
   const [squareOffMode, setSquareOffMode] = useState('partial');
@@ -821,8 +837,8 @@ const [slippagePct, setSlippagePct] = useState(0);
     entryMode: 'dte',
   });
   const [strSegments, setStrSegments] = useState({ '5x1': [], '5x2': [] });
-  const [startDate, setStartDate] = useState('20/02/2025');
-  const [endDate, setEndDate] = useState('20/02/2026');
+  const [startDate, setStartDate] = useState('01/08/2024');
+  const [endDate, setEndDate] = useState('28/04/2026');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
@@ -1902,6 +1918,16 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
   }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
 
+  const strikeTypeToIntradayOffset = (strikeType, optType) => {
+    if (!strikeType || strikeType === 'atm') return 0;
+    const m = String(strikeType).toLowerCase().match(/^(itm|otm)(\d+)$/);
+    if (!m) return 0;
+    const n = parseInt(m[2], 10);
+    const isCE = (optType || '').toUpperCase() === 'CE';
+    if (m[1] === 'otm') return isCE ? n : -n;
+    return isCE ? -n : n;
+  };
+
   const runIntradayBacktest = useCallback(async () => {
     if (legs.length === 0) { setError('Please add at least one leg'); return; }
     if (loading) return;
@@ -1913,38 +1939,81 @@ const [slippagePct, setSlippagePct] = useState(0);
     setSlowPath(false);
     const optLegs = legs.filter(l => l.segment !== 'futures');
     if (optLegs.length === 0) { setError('Intraday mode requires at least one options leg'); setLoading(false); return; }
+    if (instrument !== 'NIFTY') { setError('Intraday backtest is currently available for NIFTY only. Import data for other symbols to enable them.'); setLoading(false); return; }
     const payload = {
       symbol: instrument,
       date_from: toApiDate(startDate),
       date_to: toApiDate(endDate),
       entry_time: intradayEntryTime,
       square_off_time: intradaySquareOffTime,
-      legs: optLegs.map(l => ({
-        opt_type: l.option_type === 'call' ? 'CE' : 'PE',
-        action: l.position === 'sell' ? 'SELL' : 'BUY',
-        strike_selection: { mode: 'ATM', value: 0 },
-        expiry: (l.expiry || 'weekly').toUpperCase(),
-        quantity: l.lot || 1,
-        sl: l.intraday_sl || null,
-        target: l.intraday_target || null,
-      })),
+      legs: optLegs.map(l => {
+        const optType = l.option_type === 'call' ? 'CE' : 'PE';
+        const slMode = (l.stop_loss_mode || 'POINTS').includes('PERCENT') ? 'percent' : 'points';
+        const tgtMode = (l.target_mode || 'POINTS').includes('PERCENT') ? 'percent' : 'points';
+        return {
+          opt_type: optType,
+          action: l.position === 'sell' ? 'SELL' : 'BUY',
+          strike_selection: { mode: 'ATM', value: strikeTypeToIntradayOffset(l.strike_type, optType) },
+          expiry: (l.expiry || 'weekly').toUpperCase(),
+          quantity: l.lot || 1,
+          sl: l.stop_loss_enabled && l.stop_loss_value != null
+            ? { type: slMode, value: Number(l.stop_loss_value) }
+            : null,
+          target: l.target_enabled && l.target_value != null
+            ? { type: tgtMode, value: Number(l.target_value) }
+            : null,
+        };
+      }),
     };
     try {
-      const res = await fetch('/api/intraday/backtest', {
+      const submitRes = await fetch('/api/intraday/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!res.ok) {
-        const errBody = await res.json().catch(() => null);
-        throw new Error(errBody?.detail || `Server error (${res.status})`);
+      if (!submitRes.ok) {
+        const errBody = await submitRes.json().catch(() => null);
+        throw new Error(errBody?.detail || `Server error (${submitRes.status})`);
       }
-      setSlowPath(res.headers.get('X-Slow-Path') === 'true');
-      const buffer = await res.arrayBuffer();
-      const { decodeTradesheet } = await import('../utils/arrowDecoder.js');
-      const trades = decodeTradesheet(buffer);
-      setResults(trades);
-      setDisplayResults(trades);
+      setSlowPath(submitRes.headers.get('X-Slow-Path') === 'true');
+
+      // The intraday API returns either:
+      //   200 + Arrow IPC body when result is cached in Redis (synchronous return), or
+      //   202 + JSON {"job_id":...} when work was queued — must be polled.
+      const submitCt = submitRes.headers.get('content-type') || '';
+      if (submitCt.includes('arrow') || submitCt.includes('octet-stream')) {
+        const buffer = await submitRes.arrayBuffer();
+        const { decodeTradesheet } = await import('../utils/arrowDecoder.js');
+        const trades = decodeTradesheet(buffer);
+        setResults(trades);
+        setDisplayResults(trades);
+        return;
+      }
+
+      const { job_id } = await submitRes.json();
+
+      // Poll until done or failed
+      const POLL_INTERVAL_MS = 800;
+      const MAX_POLLS = 150; // ~2 minutes
+      let polls = 0;
+      while (polls < MAX_POLLS) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        polls++;
+        const pollRes = await fetch(`/api/intraday/jobs/${job_id}`);
+        const ct = pollRes.headers.get('content-type') || '';
+        if (ct.includes('arrow') || ct.includes('octet-stream')) {
+          const buffer = await pollRes.arrayBuffer();
+          const { decodeTradesheet } = await import('../utils/arrowDecoder.js');
+          const trades = decodeTradesheet(buffer);
+          setResults(trades);
+          setDisplayResults(trades);
+          return;
+        }
+        const body = await pollRes.json().catch(() => ({}));
+        if (body.status === 'failed') throw new Error(body.error || 'Backtest failed');
+        // still queued/running — keep polling
+      }
+      throw new Error('Intraday backtest timed out after 2 minutes');
     } catch (err) {
       setError(err.message || 'Intraday backtest failed');
     } finally {
@@ -1953,38 +2022,60 @@ const [slippagePct, setSlippagePct] = useState(0);
   }, [legs, loading, startDate, endDate, intradayEntryTime, intradaySquareOffTime, instrument]);
 
   return (
-    <div className="min-h-screen bg-hover" style={{ fontFamily: 'Inter, sans-serif' }}>
+    <div className="min-h-screen bg-base">
       {/* Header */}
-      <div className="bg-surface border-b border-default px-6 py-3">
+      <header className="app-header px-6 py-3">
         <div className="max-w-screen-2xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-accent text-inverse rounded flex items-center justify-center">
-                <span className="text-white font-bold text-sm">SL</span>
-              </div>
-              <span className="font-bold text-lg text-primary">StrategyLab</span>
+            <div className="logo-mark"><span>SL</span></div>
+            <div className="flex flex-col leading-none">
+              <span className="app-name">StrategyLab</span>
+              <span className="app-tagline mt-0.5">Options Backtester</span>
             </div>
-            <span className="text-xs text-muted bg-base px-2 py-1 rounded">Backtest Builder</span>
           </div>
           <div className="flex items-center gap-4 text-sm">
-            <span className="text-secondary">{instrument}</span>
-            <span className="text-muted">•</span>
-            <span className="text-secondary">{legs.length} Legs Active</span>
-            <button className="flex items-center gap-1.5 px-3 py-1.5 text-accent hover:bg-hover rounded text-sm font-medium transition-colors">
-              <Save size={14} />
-              Save
+            <div className="flex items-center gap-2">
+              <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.7rem', fontWeight: 700, color: 'var(--accent)', letterSpacing: '-0.01em' }}>{instrument}</span>
+              <span className="text-muted text-xs">•</span>
+              <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.68rem', color: 'var(--text-secondary)' }}>{legs.length} leg{legs.length !== 1 ? 's' : ''}</span>
+            </div>
+            {/* Theme Toggle */}
+            <button
+              type="button"
+              onClick={() => setIsDark(d => !d)}
+              title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-md transition-all"
+              style={{
+                fontFamily: 'Outfit, sans-serif', fontSize: '0.6rem', fontWeight: 700,
+                letterSpacing: '0.08em', textTransform: 'uppercase',
+                color: 'var(--text-secondary)', background: 'var(--bg-elevated)',
+                border: '1px solid var(--border-default)', cursor: 'pointer',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border-default)'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
+            >
+              {isDark ? <Sun size={12} /> : <Moon size={12} />}
+              {isDark ? 'Light' : 'Dark'}
+            </button>
+            <button className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all"
+              style={{ fontFamily: 'Outfit, sans-serif', color: 'var(--text-secondary)', background: 'transparent', border: '1px solid var(--border-default)', letterSpacing: '0.06em' }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border-default)'; e.currentTarget.style.color = 'var(--text-secondary)'; }}>
+              <Save size={12} />
+              SAVE
             </button>
           </div>
         </div>
-      </div>
+      </header>
 
       <div className="max-w-screen-2xl mx-auto px-6 py-4">
-        <div className="mb-4 bg-surface border border-default shadow-sm">
+        {/* Instrument Strip */}
+        <div className="mb-4 bg-surface border border-default rounded-lg">
           <div className="grid grid-cols-1 md:grid-cols-2">
             {INDEX_GROUPS.map(group => (
               <div key={group.key} className="px-4 py-3 border-b md:border-b-0 md:border-r last:border-r-0 border-subtle">
-                <div className="text-sm font-semibold text-primary">{group.title}</div>
-                <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1">
+                <div className="mb-2" style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.6rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>{group.title}</div>
+                <div className="flex flex-wrap gap-x-1 gap-y-1">
                   {group.symbols.map(symbol => {
                     const cfg = getIndexConfig(symbol);
                     const active = instrument === symbol;
@@ -1993,9 +2084,8 @@ const [slippagePct, setSlippagePct] = useState(0);
                         key={symbol}
                         type="button"
                         onClick={() => selectInstrument(symbol)}
-                        className={`text-xs font-semibold transition-colors ${
-                          active ? 'text-accent' : 'text-secondary hover:text-primary'
-                        }`}
+                        className="instrument-btn"
+                        style={active ? { color: 'var(--accent)', background: 'var(--accent-bg)' } : {}}
                         title={cfg.subtitle}
                       >
                         {symbol}
@@ -2015,80 +2105,48 @@ const [slippagePct, setSlippagePct] = useState(0);
             {/* Configuration Card */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
                 <div className="px-4 py-3 border-b border-subtle">
-                  <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Configuration</h3>
+                  <h3 className="section-heading">Configuration</h3>
             </div>
             <div className="p-4 space-y-4">
                 {/* Backtest Mode toggle */}
                 <div>
-                  <label className="block text-xs font-medium text-secondary mb-2">Backtest Mode</label>
-                  <div style={{ display: 'flex', gap: 8 }}>
-                    {['eod', 'intraday'].map((m) => (
+                  <label className="field-label">Backtest Mode</label>
+                  <div className="mode-pill">
+                    {[{ v: 'eod', label: 'EOD' }, { v: 'intraday', label: 'Intraday' }].map(({ v, label }) => (
                       <button
-                        key={m}
+                        key={v}
                         type="button"
-                        onClick={() => setBacktestMode(m)}
-                        style={{
-                          padding: '4px 16px',
-                          borderRadius: 4,
-                          border: '1px solid #ccc',
-                          background: backtestMode === m ? '#1890ff' : '#fff',
-                          color: backtestMode === m ? '#fff' : '#333',
-                          cursor: 'pointer',
-                          fontWeight: backtestMode === m ? 600 : 400,
-                          textTransform: 'capitalize',
-                        }}
+                        onClick={() => setBacktestMode(v)}
+                        className={backtestMode === v ? 'active' : ''}
                       >
-                        {m === 'eod' ? 'EOD' : 'Intraday'}
+                        {label}
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Intraday-specific fields */}
+                {/* Intraday-specific timing fields */}
                 {backtestMode === 'intraday' && (
                   <>
                     <IntradaySlowPathWarning visible={slowPath} />
-                    <IntradayFields
-                      entryTime={intradayEntryTime}
-                      squareOffTime={intradaySquareOffTime}
-                      legs={legs.map(l => ({
-                        opt_type: l.option_type === 'call' ? 'CE' : 'PE',
-                        action: l.position === 'sell' ? 'SELL' : 'BUY',
-                        sl: l.intraday_sl ?? null,
-                        target: l.intraday_target ?? null,
-                      }))}
-                      onEntryTimeChange={setIntradayEntryTime}
-                      onSquareOffChange={setIntradaySquareOffTime}
-                      onLegSlChange={(idx, sl) => {
-                        const legId = legs[idx]?.id;
-                        if (legId != null) updateLeg(legId, 'intraday_sl', sl);
-                      }}
-                      onLegTargetChange={(idx, target) => {
-                        const legId = legs[idx]?.id;
-                        if (legId != null) updateLeg(legId, 'intraday_target', target);
-                      }}
-                    />
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="field-label">Entry Time</label>
+                        <TimeInput value={intradayEntryTime} onChange={setIntradayEntryTime} min="09:15" max="15:14" step={60} />
+                      </div>
+                      <div>
+                        <label className="field-label">Square-off Time</label>
+                        <TimeInput value={intradaySquareOffTime} onChange={setIntradaySquareOffTime} min="09:16" max="15:30" step={60} />
+                      </div>
+                    </div>
                   </>
                 )}
 
-                {/* Strategy Type */}
-                <div>
-                  <label className="block text-xs font-medium text-secondary mb-2">Strategy</label>
-                  <SegBtn
-                    options={[
-                      { value: 'intraday', label: 'Intraday' },
-                      { value: 'btst', label: 'BTST' },
-                      { value: 'positional', label: 'Positional' },
-                    ]}
-                    value={strategyType}
-                    onChange={setStrategyType}
-                  />
-                </div>
 
                 {/* Instrument */}
                 <div>
-                  <label className="block text-xs font-medium text-secondary mb-2">Index</label>
-                  <div className="h-9 px-3 border border-strong rounded text-sm bg-base flex items-center justify-between">
+                  <label className="field-label">Index</label>
+                  <div className="h-9 px-3 border border-default rounded text-sm bg-base flex items-center justify-between">
                     <span className="font-semibold text-primary">{instrument}</span>
                     <span className="text-xs text-muted">{indexConfig.subtitle}</span>
                   </div>
@@ -2096,7 +2154,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                 {/* Underlying */}
                 <div>
-                  <label className="block text-xs font-medium text-secondary mb-2">Underlying</label>
+                  <label className="field-label">Underlying</label>
                   <SegBtn
                     options={[
                       { value: 'cash', label: 'Cash', disabled: hasFuturesLeg },
@@ -2107,14 +2165,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                   />
                 </div>
 
-                {/* Expiry Basis */}
-                {strategyType === 'positional' && (
+                {/* Expiry Basis — EOD only */}
+                {backtestMode === 'eod' && (
                   <div>
-                    <label className="block text-xs font-medium text-secondary mb-2">Expires on</label>
+                    <label className="field-label">Expires on</label>
                     <select
                       value={expiryBasis}
                       onChange={e => setExpiryBasis(e.target.value)}
-                      className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
+                      className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
                     >
                       {expiryBasisOptions.map(opt => (
                         <option key={opt.value} value={opt.value}>{opt.label}</option>
@@ -2123,25 +2181,25 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
-                {/* Entry/Exit Days */}
-                {strategyType === 'positional' && (
+                {/* Entry/Exit Days — EOD only */}
+                {backtestMode === 'eod' && (
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-xs font-medium text-secondary mb-2">Entry (days before expiry)</label>
+                      <label className="field-label">Entry (days before expiry)</label>
                       <select
                         value={entryDaysBefore}
                         onChange={e => setEntryDaysBefore(+e.target.value)}
-                        className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
+                        className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
                       >
                         {daysOptions.map(d => <option key={d}>{d}</option>)}
                       </select>
                     </div>
                     <div>
-                      <label className="block text-xs font-medium text-secondary mb-2">Exit (days before expiry)</label>
+                      <label className="field-label">Exit (days before expiry)</label>
                       <select
                         value={exitDaysBefore}
                         onChange={e => setExitDaysBefore(+e.target.value)}
-                        className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
+                        className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
                       >
                         {daysOptions.map(d => <option key={d}>{d}</option>)}
                       </select>
@@ -2149,7 +2207,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
-                {strategyType === 'positional' && legs.length > 0 && legs.every(l => l.segment === 'futures') && legs.some(l => l.expiry === 'next_monthly') && (
+                {backtestMode === 'eod' && legs.length > 0 && legs.every(l => l.segment === 'futures') && legs.some(l => l.expiry === 'next_monthly') && (
                   <div className="text-[11px] text-muted mt-1">
                     Futures Next Monthly: entry anchored to <strong>current</strong> monthly expiry, exit anchored to <strong>next</strong> monthly expiry. All Entry/Exit DTE combinations are valid.
                   </div>
@@ -2359,7 +2417,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                   )}
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-secondary mb-2">Slippage %</label>
+                  <label className="field-label">Slippage %</label>
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
@@ -2371,7 +2429,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         const numeric = Number(prev);
                         return Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
                       })}
-                      className="w-full h-9 px-3 border border-strong rounded text-sm bg-surface"
+                      className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
                     />
                     <span className="text-xs text-muted">%</span>
                   </div>
@@ -2405,7 +2463,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             {/* Legwise Controls Card */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
                 <div className="px-4 py-3 border-b border-subtle">
-                  <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Legwise Controls</h3>
+                  <h3 className="section-heading">Legwise Controls</h3>
               </div>
               <div className="p-4 space-y-3">
                 <div className="flex items-center justify-between">
@@ -2424,7 +2482,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             {/* Overall Settings Card */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
                 <div className="px-4 py-3 border-b border-subtle">
-                  <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Overall Settings</h3>
+                  <h3 className="section-heading">Overall Settings</h3>
               </div>
               <div className="p-4 space-y-4">
                 {/* Overall Stop Loss */}
@@ -2438,7 +2496,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <select
                         value={overallSLType}
                         onChange={e => setOverallSLType(e.target.value)}
-                        className="flex-1 h-8 px-2 border border-strong rounded text-xs bg-surface"
+                        className="flex-1 h-8 px-2 border border-default rounded text-xs bg-surface"
                       >
                         <option value="max_loss">Max Loss </option>
                         <option value="total_premium_pct"> Total Premium %</option>
@@ -2447,7 +2505,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         type="number"
                         value={overallSLValue}
                         onChange={e => setOverallSLValue(e.target.value === '' ? '' : +e.target.value)}
-                        className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
+                        className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
                         placeholder={overallSLType === 'max_loss' ? '₹' : '%'}
                       />
                     </div>
@@ -2465,7 +2523,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <select
                         value={overallTgtType}
                         onChange={e => setOverallTgtType(e.target.value)}
-                        className="flex-1 h-8 px-2 border border-strong rounded text-xs bg-surface"
+                        className="flex-1 h-8 px-2 border border-default rounded text-xs bg-surface"
                       >
                         <option value="max_profit">Max Profit</option>
                         <option value="total_premium_pct">% of Premium</option>
@@ -2474,7 +2532,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         type="number"
                         value={overallTgtValue}
                         onChange={e => setOverallTgtValue(e.target.value === '' ? '' : +e.target.value)}
-                        className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
+                        className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
                         placeholder={overallTgtType === 'max_profit' ? '₹' : '%'}
                       />
                     </div>
@@ -2492,14 +2550,14 @@ const [slippagePct, setSlippagePct] = useState(0);
             {/* ── Top configurator panel ── */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
               <div className="px-4 py-2.5 border-b border-subtle flex items-center gap-2">
-                <h3 className="text-xs font-bold text-secondary uppercase tracking-wide">Leg Builder</h3>
+                <h3 className="section-heading">Leg Builder</h3>
                 <Tooltip text="Configure your leg settings then click Add Leg." />
               </div>
               <div className="px-4 py-3 flex flex-wrap items-end gap-3">
 
                 {/* Segment */}
                 <div>
-                  <label className="block text-xs text-muted mb-1">Select segments</label>
+                  <label className="field-label">Select segments</label>
                   <SegBtn
                     options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }]}
                     value={draftLeg.segment}
@@ -2513,16 +2571,16 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                 {/* Total Lot */}
                 <div>
-                  <label className="block text-xs text-muted mb-1">Total Lot</label>
+                  <label className="field-label">Total Lot</label>
                   <input type="number" min={1} value={draftLeg.lot}
                     onChange={e => setDraftLeg(prev => ({ ...prev, lot: Math.max(1, parseInt(e.target.value) || 1) }))}
-                    className="w-16 h-8 px-2 border border-strong rounded text-xs text-center bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400"
+                    className="w-16 h-8 px-2 border border-default rounded text-xs text-center bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40"
                   />
                 </div>
 
                 {/* Position */}
                 <div>
-                  <label className="block text-xs text-muted mb-1">Position</label>
+                  <label className="field-label">Position</label>
                   <SegBtn
                     options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
                     value={draftLeg.position}
@@ -2533,7 +2591,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {/* Option Type */}
                 {draftLeg.segment === 'options' && (
                   <div>
-                    <label className="block text-xs text-muted mb-1">Option Type</label>
+                    <label className="field-label">Option Type</label>
                     <SegBtn
                       options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
                       value={draftLeg.option_type}
@@ -2544,10 +2602,10 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                 {/* Expiry */}
                 <div>
-                  <label className="block text-xs text-muted mb-1">Expiry</label>
+                  <label className="field-label">Expiry</label>
                   <select value={draftLeg.expiry}
                     onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
-                    className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-36">
+                    className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-36">
                     {(draftLeg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
                       <option key={opt.value} value={opt.value}>{opt.label}</option>
                     ))}
@@ -2557,10 +2615,10 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {/* Strike Criteria */}
                 {draftLeg.segment === 'options' && (
                   <div>
-                    <label className="block text-xs text-muted mb-1">Strike Criteria</label>
+                    <label className="field-label">Strike Criteria</label>
                     <select value={draftLeg.strike_criteria}
                       onChange={e => setDraftLeg(prev => ({ ...prev, strike_criteria: e.target.value }))}
-                      className="h-8 px-2 border border-strong rounded text-xs bg-surface text-secondary focus:outline-none focus:ring-2 focus:ring-blue-400 w-44">
+                      className="h-8 px-2 border border-default rounded text-xs bg-surface text-secondary focus:outline-none focus:ring-2 focus:ring-accent/40 w-44">
                       <option value="strike_type">Strike Type</option>
                       <option value="premium_range">Premium Range</option>
                       <option value="closest_premium">Closest Premium</option>
@@ -2577,7 +2635,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <select
                           value={draftLeg.straddle_direction ?? '+'}
                           onChange={e => setDraftLeg(prev => ({ ...prev, straddle_direction: e.target.value }))}
-                          className="h-6 px-2 border border-strong rounded text-xs bg-surface"
+                          className="h-7 px-2 border border-default rounded text-xs bg-surface"
                         >
                           <option value="+">+</option>
                           <option value="-">-</option>
@@ -2590,7 +2648,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                           step="0.1"
                           min="0"
                           max="10"
-                          className="w-16 h-6 px-2 border border-strong rounded text-xs text-center"
+                          className="w-16 h-7 px-2 border border-default rounded text-xs text-center"
                         />
                         <span className="text-xs text-muted whitespace-nowrap">× ATM Straddle Price )</span>
                       </div>
@@ -2603,10 +2661,10 @@ const [slippagePct, setSlippagePct] = useState(0);
                   <div>
                     {(draftLeg.strike_criteria === 'strike_type' || draftLeg.strike_criteria === 'synthetic_future') && (
                       <>
-                        <label className="block text-xs text-muted mb-1">Strike Type</label>
+                        <label className="field-label">Strike Type</label>
                         <select value={draftLeg.strike_type}
                           onChange={e => setDraftLeg(prev => ({ ...prev, strike_type: e.target.value }))}
-                          className="h-8 px-2 border border-strong rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-blue-400 w-28">
+                          className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-28">
                           {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                         </select>
                       </>
@@ -2616,16 +2674,16 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <>
                         <div className="flex gap-2">
                           <div>
-                            <label className="block text-xs text-muted mb-1">Lower Range</label>
+                            <label className="field-label">Lower Range</label>
                             <input type="number" min={0} placeholder="Lower" value={draftLeg.premium_min || ''}
                               onChange={e => setDraftLeg(prev => ({ ...prev, premium_min: +e.target.value }))}
-                              className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
+                              className="w-20 h-8 px-2 border border-default rounded text-xs text-center" />
                           </div>
                           <div>
-                            <label className="block text-xs text-muted mb-1">Upper Range</label>
+                            <label className="field-label">Upper Range</label>
                             <input type="number" min={0} placeholder="Upper" value={draftLeg.premium_max || ''}
                               onChange={e => setDraftLeg(prev => ({ ...prev, premium_max: +e.target.value }))}
-                              className="w-20 h-8 px-2 border border-strong rounded text-xs text-center" />
+                              className="w-20 h-8 px-2 border border-default rounded text-xs text-center" />
                           </div>
                         </div>
                       </>
@@ -2633,22 +2691,22 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                     {(draftLeg.strike_criteria === 'closest_premium' || draftLeg.strike_criteria === 'premium_gte' || draftLeg.strike_criteria === 'premium_lte') && (
                       <>
-                        <label className="block text-xs text-muted mb-1">Premium</label>
+                        <label className="field-label">Premium</label>
                         <input type="number" min={0} placeholder="Premium" value={draftLeg.premium_value || ''}
                           onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: +e.target.value }))}
-                          className="w-24 h-8 px-2 border border-strong rounded text-xs text-center" />
+                          className="w-24 h-8 px-2 border border-default rounded text-xs text-center" />
                       </>
                     )}
 
                     {draftLeg.strike_criteria === 'pct_of_atm' && (
                       <>
-                        <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                        <label className="field-label">&nbsp;</label>
                         <div className="flex items-center gap-1 h-8">
                           <span className="text-xs text-muted whitespace-nowrap">ATM</span>
                           <select
                             value={draftLeg.pct_direction ?? '-'}
                             onChange={e => setDraftLeg(prev => ({ ...prev, pct_direction: e.target.value }))}
-                            className="h-8 px-2 border border-strong rounded text-xs bg-surface"
+                            className="h-8 px-2 border border-default rounded text-xs bg-surface"
                           >
                             <option value="-">-</option>
                             <option value="+">+</option>
@@ -2659,7 +2717,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                             step="0.1"
                             value={draftLeg.pct_value ?? 0}
                             onChange={e => setDraftLeg(prev => ({ ...prev, pct_value: parseFloat(e.target.value) || 0 }))}
-                            className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
+                            className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
                           />
                           <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
                         </div>
@@ -2668,7 +2726,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                     {draftLeg.strike_criteria === 'atm_straddle_prem_pct' && (
                       <>
-                        <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                        <label className="field-label">&nbsp;</label>
                         <div className="flex items-center gap-1 h-8">
                           <span className="text-xs text-muted whitespace-nowrap">ATM Straddle Premium %</span>
                           <input
@@ -2677,7 +2735,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                             step="0.1"
                             value={draftLeg.atm_straddle_prem_pct ?? 0}
                             onChange={e => setDraftLeg(prev => ({ ...prev, atm_straddle_prem_pct: parseFloat(e.target.value) || 0 }))}
-                            className="w-20 h-8 px-2 border border-strong rounded text-xs text-center"
+                            className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
                           />
                           <span className="text-xs text-muted whitespace-nowrap">%</span>
                         </div>
@@ -2689,7 +2747,8 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {/* Add Leg */}
                 <div className="ml-auto">
                   <button type="button" onClick={addLegFromDraft} disabled={legs.length >= 6}
-                    className="h-9 px-6 bg-blue-700 hover:bg-blue-800 disabled:opacity-40 text-white text-sm font-semibold rounded transition-colors shadow-sm">
+                    className="run-btn add-leg-btn h-9 px-6">
+                    <Plus size={13} />
                     Add Leg
                   </button>
                 </div>
@@ -2700,7 +2759,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             {legs.length > 0 && (
               <div className="bg-surface rounded-lg border border-default shadow-sm">
                 <div className="px-4 py-2.5 border-b border-subtle">
-                  <h3 className="text-xs font-bold text-secondary uppercase tracking-wide">Legs <span className="font-normal text-muted ml-1">({legs.length}/6)</span></h3>
+                  <h3 className="section-heading">Legs <span style={{ fontWeight: 400, fontSize: '0.55rem', color: 'var(--text-muted)', marginLeft: '4px' }}>({legs.length}/6)</span></h3>
                 </div>
                 <div className="p-3 space-y-3">
                   {trailSLWarning && (
@@ -2716,14 +2775,25 @@ const [slippagePct, setSlippagePct] = useState(0);
                     </div>
                   )}
                   {legs.map((leg, idx) => (
-                    <div key={leg.id} className="border border-default rounded-lg overflow-hidden">
-                      <div className="bg-gradient-to-r from-blue-50 to-blue-100 px-3 py-2 flex items-center justify-between border-b border-blue-200">
-                        <span className="text-xs font-bold text-blue-900">
-                          Leg {idx + 1} | {leg.segment === 'options' ? `${leg.position.toUpperCase()} ${leg.option_type.toUpperCase()}` : 'FUTURE'} | {leg.expiry}
-                        </span>
+                    <div key={leg.id} className="leg-card overflow-hidden">
+                      <div className="px-3 py-2 flex items-center justify-between border-b border-subtle"
+                        style={{ background: 'var(--bg-elevated)' }}>
                         <div className="flex items-center gap-2">
-                          <span className="text-xs text-accent font-medium">{leg.lot * getLotSize(instrument, startDate)} units</span>
-                          <button onClick={() => removeLeg(leg.id)} className="p-1 text-muted hover:text-loss hover:bg-loss-bg rounded transition-colors">
+                          <span className="leg-index-badge">{idx + 1}</span>
+                          <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '0.04em' }}>
+                            {leg.segment === 'options'
+                              ? `${leg.position === 'sell' ? 'SELL' : 'BUY'} ${leg.option_type === 'call' ? 'CALL' : 'PUT'}`
+                              : 'FUTURE'}
+                          </span>
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.65rem' }}>·</span>
+                          <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.68rem', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{leg.expiry}</span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.65rem', fontWeight: 700, color: 'var(--accent)' }}>{leg.lot * getLotSize(instrument, startDate)} units</span>
+                          <button onClick={() => removeLeg(leg.id)} className="p-1 rounded transition-colors"
+                            style={{ color: 'var(--text-muted)' }}
+                            onMouseEnter={e => { e.currentTarget.style.color = 'var(--loss)'; e.currentTarget.style.background = 'var(--loss-bg)'; }}
+                            onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'transparent'; }}>
                             <Trash2 size={13} />
                           </button>
                         </div>
@@ -2738,7 +2808,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         {/* Basic fields */}
                         <div className="flex flex-wrap items-end gap-3">
                           <div>
-                            <label className="block text-xs text-muted mb-1">Segment</label>
+                            <label className="field-label">Segment</label>
                             <SegBtn size="sm"
                               options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
                               value={leg.segment}
@@ -2751,19 +2821,19 @@ const [slippagePct, setSlippagePct] = useState(0);
                             />
                           </div>
                           <div>
-                            <label className="block text-xs text-muted mb-1">Lots</label>
+                            <label className="field-label">Lots</label>
                             <input type="number" min={1} value={leg.lot}
                               onChange={e => updateLeg(leg.id, 'lot', parseInt(e.target.value) || 1)}
-                              className="w-16 h-7 px-2 border border-strong rounded text-xs text-center bg-surface" />
+                              className="w-16 h-7 px-2 border border-default rounded text-xs text-center bg-surface" />
                           </div>
                           <div>
-                            <label className="block text-xs text-muted mb-1">Position</label>
+                            <label className="field-label">Position</label>
                             <div className="flex items-center gap-2">
                               <SegBtn size="sm"
                                 options={[{ value: 'buy', label: 'Buy' }, { value: 'sell', label: 'Sell' }]}
                                 value={leg.position} onChange={v => updateLeg(leg.id, 'position', v)} />
                               {strFilter.enabled && (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-hover text-blue-700 border border-blue-200">
+                                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: 'var(--accent-bg)', color: 'var(--accent)', border: '1px solid var(--accent)', opacity: 0.85 }}>
                                   STR
                                 </span>
                               )}
@@ -2771,16 +2841,16 @@ const [slippagePct, setSlippagePct] = useState(0);
                           </div>
                           {leg.segment === 'options' && (
                             <div>
-                              <label className="block text-xs text-muted mb-1">Option Type</label>
+                              <label className="field-label">Option Type</label>
                               <SegBtn size="sm"
                                 options={[{ value: 'call', label: 'Call' }, { value: 'put', label: 'Put' }]}
                                 value={leg.option_type} onChange={v => updateLeg(leg.id, 'option_type', v)} />
                             </div>
                           )}
                           <div>
-                            <label className="block text-xs text-muted mb-1">Expiry</label>
+                            <label className="field-label">Expiry</label>
                             <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
-                              className="h-7 px-2 border border-strong rounded text-xs bg-surface w-28">
+                              className="h-7 px-2 border border-default rounded text-xs bg-surface w-28">
                               {(leg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
                                 <option key={opt.value} value={opt.value}>{opt.label}</option>
                               ))}
@@ -2789,9 +2859,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                           {leg.segment === 'options' && (
                             <>
                               <div>
-                                <label className="block text-xs text-muted mb-1">Strike Criteria</label>
+                                <label className="field-label">Strike Criteria</label>
                                 <select value={leg.strike_criteria} onChange={e => updateLeg(leg.id, 'strike_criteria', e.target.value)}
-                                  className="h-7 px-2 border border-strong rounded text-xs bg-surface text-secondary w-36">
+                                  className="h-7 px-2 border border-default rounded text-xs bg-surface text-secondary w-36">
                                   <option value="strike_type">Strike Type</option>
                                   <option value="premium_range">Premium Range</option>
                                   <option value="closest_premium">Closest Premium</option>
@@ -2808,7 +2878,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                     <select
                                       value={leg.straddle_direction ?? '+'}
                                       onChange={e => updateLeg(leg.id, 'straddle_direction', e.target.value)}
-                                      className="h-6 px-2 border border-strong rounded text-xs bg-surface"
+                                      className="h-7 px-2 border border-default rounded text-xs bg-surface"
                                     >
                                       <option value="+">+</option>
                                       <option value="-">-</option>
@@ -2821,7 +2891,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                       step="0.1"
                                       min="0"
                                       max="10"
-                                      className="w-16 h-6 px-2 border border-strong rounded text-xs text-center"
+                                      className="w-16 h-7 px-2 border border-default rounded text-xs text-center"
                                     />
                                     <span className="text-xs text-muted whitespace-nowrap">× ATM Straddle Price )</span>
                                   </div>
@@ -2831,9 +2901,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                                 <div>
                                   {(leg.strike_criteria === 'strike_type' || leg.strike_criteria === 'synthetic_future') && (
                                     <>
-                                      <label className="block text-xs text-muted mb-1">Strike Type</label>
+                                      <label className="field-label">Strike Type</label>
                                       <select value={leg.strike_type} onChange={e => updateLeg(leg.id, 'strike_type', e.target.value)}
-                                        className="h-7 px-2 border border-strong rounded text-xs bg-surface w-24">
+                                        className="h-7 px-2 border border-default rounded text-xs bg-surface w-24">
                                         {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                                       </select>
                                     </>
@@ -2842,38 +2912,38 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   {leg.strike_criteria === 'premium_range' && (
                                     <div className="flex gap-2">
                                       <div>
-                                        <label className="block text-xs text-muted mb-1">Lower Range</label>
+                                        <label className="field-label">Lower Range</label>
                                         <input type="number" min={0} placeholder="Lower" value={leg.premium_min || ''}
                                           onChange={e => updateLeg(leg.id, 'premium_min', +e.target.value)}
-                                          className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
+                                          className="w-16 h-7 px-1 border border-default rounded text-xs text-center" />
                                       </div>
                                       <div>
-                                        <label className="block text-xs text-muted mb-1">Upper Range</label>
+                                        <label className="field-label">Upper Range</label>
                                         <input type="number" min={0} placeholder="Upper" value={leg.premium_max || ''}
                                           onChange={e => updateLeg(leg.id, 'premium_max', +e.target.value)}
-                                          className="w-16 h-7 px-1 border border-strong rounded text-xs text-center" />
+                                          className="w-16 h-7 px-1 border border-default rounded text-xs text-center" />
                                       </div>
                                     </div>
                                   )}
 
                                   {(leg.strike_criteria === 'closest_premium' || leg.strike_criteria === 'premium_gte' || leg.strike_criteria === 'premium_lte') && (
                                     <>
-                                      <label className="block text-xs text-muted mb-1">Premium</label>
+                                      <label className="field-label">Premium</label>
                                       <input type="number" min={0} placeholder="Premium" value={leg.premium_value || ''}
                                         onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
-                                        className="w-20 h-7 px-1 border border-strong rounded text-xs text-center" />
+                                        className="w-20 h-7 px-1 border border-default rounded text-xs text-center" />
                                     </>
                                   )}
 
                                   {leg.strike_criteria === 'pct_of_atm' && (
                                     <>
-                                      <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                                      <label className="field-label">&nbsp;</label>
                                       <div className="flex items-center gap-1">
                                         <span className="text-xs text-muted whitespace-nowrap">ATM</span>
                                         <select
                                           value={leg.pct_direction ?? '-'}
                                           onChange={e => updateLeg(leg.id, 'pct_direction', e.target.value)}
-                                          className="h-7 px-2 border border-strong rounded text-xs bg-surface"
+                                          className="h-7 px-2 border border-default rounded text-xs bg-surface"
                                         >
                                           <option value="-">-</option>
                                           <option value="+">+</option>
@@ -2884,7 +2954,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                           step="0.1"
                                           value={leg.pct_value ?? 0}
                                           onChange={e => updateLeg(leg.id, 'pct_value', parseFloat(e.target.value) || 0)}
-                                          className="w-14 h-7 px-1 border border-strong rounded text-xs text-center"
+                                          className="w-14 h-7 px-1 border border-default rounded text-xs text-center"
                                         />
                                         <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
                                       </div>
@@ -2893,7 +2963,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                                   {leg.strike_criteria === 'atm_straddle_prem_pct' && (
                                     <>
-                                      <label className="block text-xs text-muted mb-1">&nbsp;</label>
+                                      <label className="field-label">&nbsp;</label>
                                       <div className="flex items-center gap-1">
                                         <span className="text-xs text-muted whitespace-nowrap">ATM Straddle Premium %</span>
                                         <input
@@ -2902,7 +2972,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                           step="0.1"
                                           value={leg.atm_straddle_prem_pct ?? 0}
                                           onChange={e => updateLeg(leg.id, 'atm_straddle_prem_pct', parseFloat(e.target.value) || 0)}
-                                          className="w-14 h-7 px-1 border border-strong rounded text-xs text-center"
+                                          className="w-14 h-7 px-1 border border-default rounded text-xs text-center"
                                         />
                                         <span className="text-xs text-muted whitespace-nowrap">%</span>
                                       </div>
@@ -2921,26 +2991,26 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <Toggle enabled={leg.target_enabled} onToggle={(val) => updateLeg(leg.id, 'target_enabled', val !== undefined ? Boolean(val) : !leg.target_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                               {leg.target_enabled && (<>
-                                <select value={leg.target_mode} onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.target_mode} onChange={e => updateLeg(leg.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="UNDERLYING_POINTS">Underlying Pts</option>
                                   <option value="PERCENT">Percent (%)</option>
                                   <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
-                                <input type="number" min={0} value={leg.target_value ?? ''} onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                                <input type="number" min={0} value={leg.target_value ?? ''} onChange={e => updateLeg(leg.id, 'target_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
                               <Toggle enabled={leg.stop_loss_enabled} onToggle={(val) => updateLeg(leg.id, 'stop_loss_enabled', val !== undefined ? Boolean(val) : !leg.stop_loss_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                               {leg.stop_loss_enabled && (<>
-                                <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="UNDERLYING_POINTS">Underlying Pts</option>
                                   <option value="PERCENT">Percent (%)</option>
                                   <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
-                                <input type="number" min={0} value={leg.stop_loss_value ?? ''} onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                                <input type="number" min={0} value={leg.stop_loss_value ?? ''} onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
@@ -2948,12 +3018,12 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
                               <Tooltip text="For every X profit, trail SL by Y." />
                               {leg.trail_sl_enabled && (<>
-                                <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.trail_sl_mode} onChange={e => updateLeg(leg.id, 'trail_sl_mode', e.target.value)} className="w-16 h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points</option>
                                   <option value="PERCENT">Percent</option>
                                 </select>
-                                <input type="number" min={0} placeholder="X" value={leg.trail_sl_trigger ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
-                                <input type="number" min={0} placeholder="Y" value={leg.trail_sl_move ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
+                                <input type="number" min={0} placeholder="X" value={leg.trail_sl_trigger ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_trigger', e.target.value === '' ? null : +e.target.value)} className="w-12 h-7 px-1 border border-default rounded text-xs text-center" />
+                                <input type="number" min={0} placeholder="Y" value={leg.trail_sl_move ?? ''} onChange={e => updateLeg(leg.id, 'trail_sl_move', e.target.value === '' ? null : +e.target.value)} className="w-12 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>)}
                             </div>
                           </div>
@@ -2962,14 +3032,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <Toggle enabled={leg.re_entry_target_enabled} onToggle={(val) => updateLeg(leg.id, 're_entry_target_enabled', val !== undefined ? Boolean(val) : !leg.re_entry_target_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
                               {leg.re_entry_target_enabled && (<>
-                                <select value={leg.re_entry_target_mode} onChange={e => handleReEntryModeSelect(leg.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.re_entry_target_mode} onChange={e => handleReEntryModeSelect(leg.id, 'target', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
-                                <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.re_entry_target_count} onChange={e => updateLeg(leg.id, 're_entry_target_count', +e.target.value)} className="w-10 h-7 px-1 border border-default rounded text-xs bg-surface">
                                   {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
@@ -2996,14 +3066,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <Toggle enabled={leg.re_entry_sl_enabled} onToggle={(val) => updateLeg(leg.id, 're_entry_sl_enabled', val !== undefined ? Boolean(val) : !leg.re_entry_sl_enabled)} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
                               {leg.re_entry_sl_enabled && (<>
-                                <select value={leg.re_entry_sl_mode} onChange={e => handleReEntryModeSelect(leg.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.re_entry_sl_mode} onChange={e => handleReEntryModeSelect(leg.id, 'sl', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
-                                <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={leg.re_entry_sl_count} onChange={e => updateLeg(leg.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-7 px-1 border border-default rounded text-xs bg-surface">
                                   {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>)}
@@ -3038,8 +3108,8 @@ const [slippagePct, setSlippagePct] = useState(0);
             {Object.keys(lazyLegs).length > 0 && (
               <div className="bg-surface rounded-lg border border-default shadow-sm overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-subtle">
-                  <h3 className="text-xs font-bold text-secondary uppercase tracking-wide">
-                    Lazy Legs <span className="text-muted font-medium normal-case">({lazyLegList.length}/10)</span>
+                  <h3 className="section-heading">
+                    Lazy Legs <span style={{ fontWeight: 400, fontSize: '0.55rem', color: 'var(--text-muted)', marginLeft: '4px' }}>({lazyLegList.length}/10)</span>
                   </h3>
                 </div>
                 <div className="divide-y divide-subtle">
@@ -3060,25 +3130,25 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <div className="flex flex-wrap items-end gap-3">
                         <label className="text-xs text-muted">
                           Lots
-                          <input type="number" min={1} value={ll.lot || 1} onChange={e => updateLazyLeg(ll.id, 'lot', parseInt(e.target.value, 10) || 1)} className="block mt-1 w-14 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                          <input type="number" min={1} value={ll.lot || 1} onChange={e => updateLazyLeg(ll.id, 'lot', parseInt(e.target.value, 10) || 1)} className="block mt-1 w-14 h-7 px-1 border border-default rounded text-xs text-center bg-surface" />
                         </label>
                         <label className="text-xs text-muted">
                           Position
-                          <select value={ll.position || 'sell'} onChange={e => updateLazyLeg(ll.id, 'position', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                          <select value={ll.position || 'sell'} onChange={e => updateLazyLeg(ll.id, 'position', e.target.value)} className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface">
                             <option value="buy">Buy</option>
                             <option value="sell">Sell</option>
                           </select>
                         </label>
                         <label className="text-xs text-muted">
                           Option Type
-                          <select value={ll.option_type || 'call'} onChange={e => updateLazyLeg(ll.id, 'option_type', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                          <select value={ll.option_type || 'call'} onChange={e => updateLazyLeg(ll.id, 'option_type', e.target.value)} className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface">
                             <option value="call">Call</option>
                             <option value="put">Put</option>
                           </select>
                         </label>
                         <label className="text-xs text-muted">
                           Expiry
-                          <select value={ll.expiry || defaultOptionExpiry} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                          <select value={ll.expiry || defaultOptionExpiry} onChange={e => updateLazyLeg(ll.id, 'expiry', e.target.value)} className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface">
                             {optionExpiryOptions.map(opt => (
                               <option key={opt.value} value={opt.value}>{opt.label}</option>
                             ))}
@@ -3086,7 +3156,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         </label>
                         <label className="text-xs text-muted">
                           Strike Criteria
-                          <select value={ll.strike_criteria || 'strike_type'} onChange={e => updateLazyLeg(ll.id, 'strike_criteria', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface">
+                          <select value={ll.strike_criteria || 'strike_type'} onChange={e => updateLazyLeg(ll.id, 'strike_criteria', e.target.value)} className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface">
                             <option value="strike_type">Strike Type</option>
                             <option value="closest_premium">Closest Premium</option>
                             <option value="premium_range">Premium Range</option>
@@ -3095,23 +3165,23 @@ const [slippagePct, setSlippagePct] = useState(0);
                         {ll.strike_criteria === 'closest_premium' ? (
                           <label className="text-xs text-muted">
                             Premium
-                            <input type="number" min={0} value={ll.premium_value || 0} onChange={e => updateLazyLeg(ll.id, 'premium_value', +e.target.value)} className="block mt-1 w-20 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                            <input type="number" min={0} value={ll.premium_value || 0} onChange={e => updateLazyLeg(ll.id, 'premium_value', +e.target.value)} className="block mt-1 w-20 h-7 px-1 border border-default rounded text-xs text-center bg-surface" />
                           </label>
                         ) : ll.strike_criteria === 'premium_range' ? (
                           <div className="flex gap-2">
                             <label className="text-xs text-muted">
                               Min
-                              <input type="number" min={0} value={ll.premium_min || 0} onChange={e => updateLazyLeg(ll.id, 'premium_min', +e.target.value)} className="block mt-1 w-16 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                              <input type="number" min={0} value={ll.premium_min || 0} onChange={e => updateLazyLeg(ll.id, 'premium_min', +e.target.value)} className="block mt-1 w-16 h-7 px-1 border border-default rounded text-xs text-center bg-surface" />
                             </label>
                             <label className="text-xs text-muted">
                               Max
-                              <input type="number" min={0} value={ll.premium_max || 0} onChange={e => updateLazyLeg(ll.id, 'premium_max', +e.target.value)} className="block mt-1 w-16 h-7 px-1 border border-strong rounded text-xs text-center bg-surface" />
+                              <input type="number" min={0} value={ll.premium_max || 0} onChange={e => updateLazyLeg(ll.id, 'premium_max', +e.target.value)} className="block mt-1 w-16 h-7 px-1 border border-default rounded text-xs text-center bg-surface" />
                             </label>
                           </div>
                         ) : (
                           <label className="text-xs text-muted">
                             Strike Type
-                            <select value={ll.strike_type || 'atm'} onChange={e => updateLazyLeg(ll.id, 'strike_type', e.target.value)} className="block mt-1 h-7 px-2 border border-strong rounded text-xs bg-surface w-24">
+                            <select value={ll.strike_type || 'atm'} onChange={e => updateLazyLeg(ll.id, 'strike_type', e.target.value)} className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface w-24">
                               {strikeTypeOpts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                             </select>
                           </label>
@@ -3125,11 +3195,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                             {ll.target_enabled && (
                               <>
-                                <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="PERCENT">Percent (%)</option>
                                 </select>
-                                <input type="number" min={0} value={ll.target_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'target_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                                <input type="number" min={0} value={ll.target_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'target_value', +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>
                             )}
                           </div>
@@ -3138,11 +3208,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                             {ll.stop_loss_enabled && (
                               <>
-                                <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="PERCENT">Percent (%)</option>
                                 </select>
-                                <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                                <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>
                             )}
                           </div>
@@ -3157,14 +3227,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
                             {ll.re_entry_target_enabled && (
                               <>
-                                <select value={ll.re_entry_target_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={ll.re_entry_target_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'target', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
-                                <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-7 px-1 border border-default rounded text-xs bg-surface">
                                   {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>
@@ -3175,14 +3245,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
                             {ll.re_entry_sl_enabled && (
                               <>
-                                <select value={ll.re_entry_sl_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={ll.re_entry_sl_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'sl', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="RE_ASAP">RE ASAP</option>
                                   <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                                   <option value="RE_MOMENTUM">RE MOMENTUM</option>
                                   <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
                                   <option value="LAZY_LEG">Lazy Leg</option>
                                 </select>
-                                <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                                <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-7 px-1 border border-default rounded text-xs bg-surface">
                                   {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                                 </select>
                               </>
@@ -3297,11 +3367,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                         {ll.target_enabled && (
                           <>
-                            <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS">Points (Pts)</option>
                               <option value="PERCENT">Percent (%)</option>
                             </select>
-                            <input type="number" min={0} value={ll.target_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'target_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                            <input type="number" min={0} value={ll.target_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'target_value', +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                           </>
                         )}
                       </div>
@@ -3310,11 +3380,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                         {ll.stop_loss_enabled && (
                           <>
-                            <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS">Points (Pts)</option>
                               <option value="PERCENT">Percent (%)</option>
                             </select>
-                            <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                            <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                           </>
                         )}
                       </div>
@@ -3323,12 +3393,12 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
                         {ll.trail_sl_enabled && (
                           <>
-                            <select value={ll.trail_sl_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'trail_sl_mode', e.target.value)} className="w-16 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.trail_sl_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'trail_sl_mode', e.target.value)} className="w-16 h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS">Points</option>
                               <option value="PERCENT">Percent</option>
                             </select>
-                            <input type="number" min={0} placeholder="X" value={ll.trail_sl_trigger ?? 0} onChange={e => updateLazyLeg(ll.id, 'trail_sl_trigger', +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
-                            <input type="number" min={0} placeholder="Y" value={ll.trail_sl_move ?? 0} onChange={e => updateLazyLeg(ll.id, 'trail_sl_move', +e.target.value)} className="w-12 h-6 px-1 border border-strong rounded text-xs text-center" />
+                            <input type="number" min={0} placeholder="X" value={ll.trail_sl_trigger ?? 0} onChange={e => updateLazyLeg(ll.id, 'trail_sl_trigger', +e.target.value)} className="w-12 h-7 px-1 border border-default rounded text-xs text-center" />
+                            <input type="number" min={0} placeholder="Y" value={ll.trail_sl_move ?? 0} onChange={e => updateLazyLeg(ll.id, 'trail_sl_move', +e.target.value)} className="w-12 h-7 px-1 border border-default rounded text-xs text-center" />
                           </>
                         )}
                       </div>
@@ -3340,18 +3410,18 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on Tgt</span>
                         {ll.re_entry_target_enabled && (
                           <>
-                            <select value={ll.re_entry_target_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.re_entry_target_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'target', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="RE_ASAP">RE ASAP</option>
                               <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                               <option value="RE_MOMENTUM">RE MOMENTUM</option>
                               <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
                               <option value="LAZY_LEG">Lazy Leg</option>
                             </select>
-                            <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.re_entry_target_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_target_count', +e.target.value)} className="w-10 h-7 px-1 border border-default rounded text-xs bg-surface">
                               {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                             </select>
                             {ll.re_entry_target_mode === 'LAZY_LEG' && (
-                              <select value={ll.child_lazy_leg_target_id || ''} onChange={e => attachLazyLegToLazyParent(ll.id, 'target', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <select value={ll.child_lazy_leg_target_id || ''} onChange={e => attachLazyLegToLazyParent(ll.id, 'target', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                 <option value="">Select</option>
                                 {lazyLegList.filter(opt => opt.id !== ll.id).map(opt => <option key={opt.id} value={opt.id}>{opt.name}</option>)}
                               </select>
@@ -3364,18 +3434,18 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Re-entry on SL</span>
                         {ll.re_entry_sl_enabled && (
                           <>
-                            <select value={ll.re_entry_sl_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.re_entry_sl_mode || 'RE_ASAP'} onChange={e => handleLazyReEntryModeSelect(ll.id, 'sl', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="RE_ASAP">RE ASAP</option>
                               <option value="RE_ASAP_REV">RE ASAP &#8629;</option>
                               <option value="RE_MOMENTUM">RE MOMENTUM</option>
                               <option value="RE_MOMENTUM_REV">RE MOMENTUM &#8629;</option>
                               <option value="LAZY_LEG">Lazy Leg</option>
                             </select>
-                            <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.re_entry_sl_count || 1} onChange={e => updateLazyLeg(ll.id, 're_entry_sl_count', +e.target.value)} className="w-10 h-7 px-1 border border-default rounded text-xs bg-surface">
                               {Array.from({ length: 20 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}</option>)}
                             </select>
                             {ll.re_entry_sl_mode === 'LAZY_LEG' && (
-                              <select value={ll.child_lazy_leg_sl_id || ''} onChange={e => attachLazyLegToLazyParent(ll.id, 'sl', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                              <select value={ll.child_lazy_leg_sl_id || ''} onChange={e => attachLazyLegToLazyParent(ll.id, 'sl', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                 <option value="">Select</option>
                                 {lazyLegList.filter(opt => opt.id !== ll.id).map(opt => <option key={opt.id} value={opt.id}>{opt.name}</option>)}
                               </select>
@@ -3388,13 +3458,13 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Simple Momentum</span>
                         {ll.simple_momentum_enabled && (
                           <>
-                            <select value={ll.simple_momentum_mode || 'POINTS_UP'} onChange={e => updateLazyLeg(ll.id, 'simple_momentum_mode', e.target.value)} className="h-6 px-1 border border-strong rounded text-xs bg-surface">
+                            <select value={ll.simple_momentum_mode || 'POINTS_UP'} onChange={e => updateLazyLeg(ll.id, 'simple_momentum_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS_UP">Points Up</option>
                               <option value="POINTS_DOWN">Points Down</option>
                               <option value="PERCENT_UP">Percent Up</option>
                               <option value="PERCENT_DOWN">Percent Down</option>
                             </select>
-                            <input type="number" min={0} value={ll.simple_momentum_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'simple_momentum_value', +e.target.value)} className="w-14 h-6 px-1 border border-strong rounded text-xs text-center" />
+                            <input type="number" min={0} value={ll.simple_momentum_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'simple_momentum_value', +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
                           </>
                         )}
                       </div>
@@ -3407,16 +3477,24 @@ const [slippagePct, setSlippagePct] = useState(0);
         )}
 
         {/* Date Range Bar */}
-        <div className="mt-4 bg-surface rounded-lg border border-default shadow-sm px-5 py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-secondary">Start Date</label>
-                <DateInput value={startDate} onChange={handleStartDateChange} />
+        <div className="mt-4 bg-surface rounded-lg border border-default shadow-sm px-5 py-4">
+          <div className="flex items-end justify-between gap-4">
+            <div className="flex items-end gap-3">
+              {/* Start Date */}
+              <div>
+                <label className="field-label">Start Date</label>
+                <CalendarPicker value={startDate} onChange={handleStartDateChange} />
               </div>
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-secondary">End Date</label>
-                <DateInput value={endDate} onChange={handleEndDateChange} />
+              {/* Arrow separator */}
+              <div style={{
+                height: '38px', display: 'flex', alignItems: 'center', paddingBottom: '1px',
+                color: 'var(--text-muted)', fontSize: '0.8rem',
+                fontFamily: 'IBM Plex Mono, monospace', userSelect: 'none',
+              }}>→</div>
+              {/* End Date */}
+              <div>
+                <label className="field-label">End Date</label>
+                <CalendarPicker value={endDate} onChange={handleEndDateChange} />
               </div>
             </div>
             {strFilter.enabled && strFilter.summary?.range && (() => {
@@ -3429,7 +3507,8 @@ const [slippagePct, setSlippagePct] = useState(0);
                 <button
                   type="button"
                   onClick={() => setShowFullRange(true)}
-                  className="px-3 py-1.5 text-xs font-medium text-blue-700 bg-hover border border-blue-200 rounded-lg hover:bg-hover transition-colors"
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg transition-colors"
+                  style={{ color: 'var(--accent)', background: 'var(--accent-bg)', border: '1px solid var(--border-accent)' }}
                 >
                   Load Full Range ({formatSummaryDateInput(strFilter.summary.range.from)} → {formatSummaryDateInput(strFilter.summary.range.to)})
                 </button>
@@ -3445,7 +3524,7 @@ const [slippagePct, setSlippagePct] = useState(0);
         {displayResults && (
           <div className="mt-4">
             {displayResults?.meta?.str_enabled && (
-              <div className="mb-3 text-xs text-blue-700 bg-hover border border-blue-200 rounded px-3 py-2 inline-block">
+              <div className="mb-3 text-xs text-accent rounded px-3 py-2 inline-block" style={{ background: 'var(--accent-bg)', border: '1px solid var(--accent)', opacity: 0.9 }}>
                 STR {displayResults?.meta?.str_type}: {displayResults?.meta?.trades_before_str_filter} -&gt; {displayResults?.meta?.trades_after_str_filter}
               </div>
             )}
@@ -3527,32 +3606,29 @@ const [slippagePct, setSlippagePct] = useState(0);
           </div>
         )}
 
-        {/* Run Backtest Button - Bottom */}
-        <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50 flex flex-col items-center gap-2">
+        {/* Run Backtest Button — fixed bottom-center */}
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2">
           <button
             onClick={backtestMode === 'intraday' ? runIntradayBacktest : runBacktest}
             disabled={!canRunBacktest}
-            className={`flex items-center gap-3 px-10 py-3 rounded-full text-white shadow-xl transition duration-200 transform ${
-              loading ? 'from-green-500 to-emerald-500 animate-pulse bg-gradient-to-r scale-100 hover:scale-[1.02]' : 'bg-gradient-to-r from-emerald-500 to-lime-500 hover:scale-[1.02]'
-            } ${!canRunBacktest ? 'opacity-60 cursor-not-allowed' : ''}`}
+            className="run-btn px-10 py-3 rounded-full"
           >
             {loading ? (
               <>
-                <Loader2 size={18} className="animate-spin" />
-                <span className="text-sm font-semibold">Running Backtest…</span>
+                <Loader2 size={16} className="animate-spin" />
+                <span>Running…</span>
               </>
             ) : (
               <>
-                <Play size={18} />
-                <span className="text-sm font-semibold">Run Backtest</span>
+                <Play size={15} />
+                <span>Run Backtest</span>
               </>
             )}
           </button>
-          {jobStatusLabel && (
-            <div className="mt-2 text-xs text-center text-secondary">{jobStatusLabel}</div>
-          )}
-          {cacheWarmLabel && (
-            <div className="mt-1 text-xs text-center text-secondary">{cacheWarmLabel}</div>
+          {(jobStatusLabel || cacheWarmLabel) && (
+            <div style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.6rem', color: 'var(--text-secondary)', letterSpacing: '0.04em', textAlign: 'center' }}>
+              {jobStatusLabel || cacheWarmLabel}
+            </div>
           )}
         </div>
         {lazyLegModal.open && (

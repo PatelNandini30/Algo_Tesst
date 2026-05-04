@@ -2,7 +2,7 @@
 from datetime import date
 import polars as pl
 
-from backend.services.intraday_ingest.base import (
+from .base import (
     BaseFormatHandler,
     register_handler,
 )

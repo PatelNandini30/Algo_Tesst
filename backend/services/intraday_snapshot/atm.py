@@ -2,7 +2,7 @@
 from typing import Iterable, List
 import polars as pl
 
-from backend.services.intraday_snapshot.format import MINUTES_PER_DAY
+from .format import MINUTES_PER_DAY
 
 
 def atm_per_minute(
