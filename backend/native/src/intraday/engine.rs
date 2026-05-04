@@ -187,6 +187,8 @@ mod tests {
             quantity: 1,
             sl: Some(ExitCond { kind: "percent".into(), value: 50.0 }),
             target: Some(ExitCond { kind: "percent".into(), value: 50.0 }),
+            trailing_sl: None,
+            breakeven: None,
         };
         let (sl, tgt) = compute_thresholds(&leg, 10000); // entry = 100.00
         assert_eq!(sl, Some(15000));   // 100 + 50% = 150

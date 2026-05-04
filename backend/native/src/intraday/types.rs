@@ -10,6 +10,20 @@ pub struct StrategySpec {
     pub legs: Vec<LegSpec>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct TrailingSlSpec {
+    /// Profit % at which trailing SL activates (e.g. 30.0 = when SELL premium drops 30%)
+    pub trigger_pct: f64,
+    /// Trail distance as % of entry premium (e.g. 30.0 = SL trails at 30% above min seen)
+    pub trail_pct: f64,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct BreakevenSpec {
+    /// Profit % at which SL moves to breakeven (e.g. 30.0 = after 30% profit, SL = entry)
+    pub trigger_pct: f64,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct LegSpec {
     pub opt_type: String,   // "CE" | "PE"
@@ -19,6 +33,8 @@ pub struct LegSpec {
     pub quantity: u32,
     pub sl: Option<ExitCond>,
     pub target: Option<ExitCond>,
+    pub trailing_sl: Option<TrailingSlSpec>,
+    pub breakeven: Option<BreakevenSpec>,
 }
 
 #[derive(Deserialize, Debug)]

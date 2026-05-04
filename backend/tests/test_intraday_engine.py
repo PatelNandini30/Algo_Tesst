@@ -152,5 +152,36 @@ class TestIntradayEngineGolden(unittest.TestCase):
         self.assertAlmostEqual(row["pnl"], 100.0)   # SELL: entry - exit = 200 - 100
 
 
+class TestTrailingSLParse(unittest.TestCase):
+    def test_parse_leg_with_trailing_sl(self):
+        """StrategySpec with trailing_sl must parse without error."""
+        import algotest_native as n
+        config = {
+            "symbol": "NIFTY",
+            "date_from": "2024-01-01",
+            "date_to": "2024-01-01",
+            "entry_time": "09:20",
+            "square_off_time": "15:15",
+            "legs": [{
+                "opt_type": "CE",
+                "action": "SELL",
+                "strike_selection": {"mode": "ATM", "value": 0},
+                "expiry": "WEEKLY",
+                "quantity": 1,
+                "sl": {"type": "percent", "value": 100.0},
+                "target": None,
+                "trailing_sl": {"trigger_pct": 30.0, "trail_pct": 30.0},
+            }]
+        }
+        import tempfile, os, json
+        with tempfile.TemporaryDirectory() as tmp:
+            sym = os.path.join(tmp, "NIFTY")
+            os.makedirs(os.path.join(sym, "snapshots"))
+            with open(os.path.join(sym, "expiries.json"), "w") as f:
+                json.dump({}, f)
+            result = n.run_intraday_backtest(json.dumps(config), tmp)
+            self.assertIsInstance(result, list)
+
+
 if __name__ == "__main__":
     unittest.main()
