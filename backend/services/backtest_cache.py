@@ -343,3 +343,55 @@ def clear_backtest_cache() -> bool:
 def get_cache_stats() -> Dict[str, Any]:
     """Get cache statistics."""
     return get_backtest_cache().get_stats()
+
+
+# ── Intraday result cache ──────────────────────────────────────────────────
+
+INTRADAY_RESULT_TTL = 7 * 24 * 3600  # 7 days
+
+_intraday_redis = None
+_intraday_redis_lock = __import__('threading').Lock()
+
+
+def get_redis():
+    """Return a raw Redis client (binary mode) for intraday cache ops."""
+    global _intraday_redis
+    if _intraday_redis is None:
+        with _intraday_redis_lock:
+            if _intraday_redis is None:
+                try:
+                    r = redis.Redis(
+                        host=REDIS_HOST,
+                        port=REDIS_PORT,
+                        db=REDIS_DB,
+                        password=REDIS_PASSWORD,
+                        decode_responses=False,
+                        socket_connect_timeout=5,
+                        socket_timeout=5,
+                    )
+                    r.ping()
+                    _intraday_redis = r
+                except Exception as exc:
+                    logger.warning("[REDIS] intraday client unavailable: %s", exc)
+                    return None
+    return _intraday_redis
+
+
+def intraday_cache_key(hash_hex: str) -> str:
+    return f"intraday:result:{hash_hex}"
+
+
+def get_intraday_result(hash_hex: str) -> Optional[bytes]:
+    """Return cached Arrow IPC bytes or None on miss."""
+    r = get_redis()
+    if r is None:
+        return None
+    return r.get(intraday_cache_key(hash_hex))
+
+
+def set_intraday_result(hash_hex: str, arrow_bytes: bytes) -> None:
+    """Cache Arrow IPC bytes with 7-day TTL."""
+    r = get_redis()
+    if r is None:
+        return
+    r.setex(intraday_cache_key(hash_hex), INTRADAY_RESULT_TTL, arrow_bytes)
