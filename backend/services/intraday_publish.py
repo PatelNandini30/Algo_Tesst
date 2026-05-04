@@ -105,6 +105,28 @@ def publish(
     )
 
 
+def publish_intraday_csv(
+    symbol: str,
+    csv_path: str,
+    *,
+    format_hint: str = "clean_2023",
+    data_root: str | None = None,
+) -> None:
+    """Derive trading date from CSV filename (YYYY-MM-DD.csv) then call publish()."""
+    import re
+    if data_root is None:
+        data_root = os.environ.get("INTRADAY_DATA_DIR", "/data/intraday")
+    stem = re.sub(r"\.csv$", "", os.path.basename(csv_path), flags=re.IGNORECASE)
+    trading_date = date.fromisoformat(stem)
+    publish(
+        symbol=symbol,
+        trading_date=trading_date,
+        source_path=csv_path,
+        data_root=data_root,
+        source_format_name=format_hint,
+    )
+
+
 def _synthesize_spot_if_missing(cleaned: pl.DataFrame, spot_source_path: str = None) -> pl.DataFrame:
     if spot_source_path:
         raise NotImplementedError("real spot ingest in Plan E")

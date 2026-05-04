@@ -30,6 +30,19 @@ def ingest_intraday(
 
 
 @celery_app.task(
+    name="worker.tasks_intraday.ingest_intraday_csv",
+    bind=True,
+    max_retries=3,
+    acks_late=True,
+)
+def ingest_intraday_csv(self, symbol: str, csv_path: str, format_hint: str = "clean_2023") -> dict:
+    """Ingest one intraday CSV file into Parquet + DaySnapshot + manifest."""
+    logger.info("[ingest] symbol=%s path=%s", symbol, csv_path)
+    intraday_publish.publish_intraday_csv(symbol, csv_path, format_hint=format_hint)
+    return {"status": "ok", "symbol": symbol, "csv_path": csv_path}
+
+
+@celery_app.task(
     name="worker.tasks_intraday.execute_intraday_backtest",
     bind=True,
     max_retries=0,
