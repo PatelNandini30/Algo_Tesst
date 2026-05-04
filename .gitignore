@@ -9,3 +9,4 @@ cleaned_csvs/
 .worktrees/
 .~lock.*
 *.docx~
+node_modules/
