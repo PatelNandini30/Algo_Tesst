@@ -4,6 +4,8 @@ import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
 import Toggle from './ui/Toggle';
+import IntradayFields from './IntradayFields';
+import IntradaySlowPathWarning from './IntradaySlowPathWarning';
 
 // Convert DD/MM/YYYY to YYYY-MM-DD for API
 const toApiDate = (displayStr) => {
@@ -837,6 +839,10 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
   const [cacheWarmReady, setCacheWarmReady] = useState(false);
   const [cacheWarmLabel, setCacheWarmLabel] = useState('');
+  const [backtestMode, setBacktestMode] = useState('eod'); // 'eod' | 'intraday'
+  const [intradayEntryTime, setIntradayEntryTime] = useState('09:20');
+  const [intradaySquareOffTime, setIntradaySquareOffTime] = useState('15:15');
+  const [slowPath, setSlowPath] = useState(false);
 
   const latestEntrySpot = useMemo(() => {
     const firstTrade = displayResults?.trades?.[0];
@@ -1896,6 +1902,56 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
   }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
 
+  const runIntradayBacktest = useCallback(async () => {
+    if (legs.length === 0) { setError('Please add at least one leg'); return; }
+    if (loading) return;
+    setLoading(true);
+    setError(null);
+    setResults(null);
+    setRawResults(null);
+    setDisplayResults(null);
+    setSlowPath(false);
+    const optLegs = legs.filter(l => l.segment !== 'futures');
+    if (optLegs.length === 0) { setError('Intraday mode requires at least one options leg'); setLoading(false); return; }
+    const payload = {
+      symbol: instrument,
+      date_from: toApiDate(startDate),
+      date_to: toApiDate(endDate),
+      entry_time: intradayEntryTime,
+      square_off_time: intradaySquareOffTime,
+      legs: optLegs.map(l => ({
+        opt_type: l.option_type === 'call' ? 'CE' : 'PE',
+        action: l.position === 'sell' ? 'SELL' : 'BUY',
+        strike_selection: { mode: 'ATM', value: 0 },
+        expiry: (l.expiry || 'weekly').toUpperCase(),
+        quantity: l.lot || 1,
+        sl: l.intraday_sl || null,
+        target: l.intraday_target || null,
+      })),
+    };
+    try {
+      const res = await fetch('/api/intraday/backtest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => null);
+        throw new Error(errBody?.detail || `Server error (${res.status})`);
+      }
+      setSlowPath(res.headers.get('X-Slow-Path') === 'true');
+      const buffer = await res.arrayBuffer();
+      const { decodeTradesheet } = await import('../utils/arrowDecoder.js');
+      const trades = decodeTradesheet(buffer);
+      setResults(trades);
+      setDisplayResults(trades);
+    } catch (err) {
+      setError(err.message || 'Intraday backtest failed');
+    } finally {
+      setLoading(false);
+    }
+  }, [legs, loading, startDate, endDate, intradayEntryTime, intradaySquareOffTime, instrument]);
+
   return (
     <div className="min-h-screen bg-hover" style={{ fontFamily: 'Inter, sans-serif' }}>
       {/* Header */}
@@ -1962,6 +2018,59 @@ const [slippagePct, setSlippagePct] = useState(0);
                   <h3 className="text-sm font-semibold text-secondary uppercase tracking-wide border-l-4 border-accent-border pl-3">Configuration</h3>
             </div>
             <div className="p-4 space-y-4">
+                {/* Backtest Mode toggle */}
+                <div>
+                  <label className="block text-xs font-medium text-secondary mb-2">Backtest Mode</label>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    {['eod', 'intraday'].map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => setBacktestMode(m)}
+                        style={{
+                          padding: '4px 16px',
+                          borderRadius: 4,
+                          border: '1px solid #ccc',
+                          background: backtestMode === m ? '#1890ff' : '#fff',
+                          color: backtestMode === m ? '#fff' : '#333',
+                          cursor: 'pointer',
+                          fontWeight: backtestMode === m ? 600 : 400,
+                          textTransform: 'capitalize',
+                        }}
+                      >
+                        {m === 'eod' ? 'EOD' : 'Intraday'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Intraday-specific fields */}
+                {backtestMode === 'intraday' && (
+                  <>
+                    <IntradaySlowPathWarning visible={slowPath} />
+                    <IntradayFields
+                      entryTime={intradayEntryTime}
+                      squareOffTime={intradaySquareOffTime}
+                      legs={legs.map(l => ({
+                        opt_type: l.option_type === 'call' ? 'CE' : 'PE',
+                        action: l.position === 'sell' ? 'SELL' : 'BUY',
+                        sl: l.intraday_sl ?? null,
+                        target: l.intraday_target ?? null,
+                      }))}
+                      onEntryTimeChange={setIntradayEntryTime}
+                      onSquareOffChange={setIntradaySquareOffTime}
+                      onLegSlChange={(idx, sl) => {
+                        const legId = legs[idx]?.id;
+                        if (legId != null) updateLeg(legId, 'intraday_sl', sl);
+                      }}
+                      onLegTargetChange={(idx, target) => {
+                        const legId = legs[idx]?.id;
+                        if (legId != null) updateLeg(legId, 'intraday_target', target);
+                      }}
+                    />
+                  </>
+                )}
+
                 {/* Strategy Type */}
                 <div>
                   <label className="block text-xs font-medium text-secondary mb-2">Strategy</label>
@@ -3421,7 +3530,7 @@ const [slippagePct, setSlippagePct] = useState(0);
         {/* Run Backtest Button - Bottom */}
         <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 z-50 flex flex-col items-center gap-2">
           <button
-            onClick={runBacktest}
+            onClick={backtestMode === 'intraday' ? runIntradayBacktest : runBacktest}
             disabled={!canRunBacktest}
             className={`flex items-center gap-3 px-10 py-3 rounded-full text-white shadow-xl transition duration-200 transform ${
               loading ? 'from-green-500 to-emerald-500 animate-pulse bg-gradient-to-r scale-100 hover:scale-[1.02]' : 'bg-gradient-to-r from-emerald-500 to-lime-500 hover:scale-[1.02]'
