@@ -1,7 +1,5 @@
 # Pandas 2.x compatibility - MUST be first before pandas is imported anywhere
 import pandas as pd
-import uvloop
-uvloop.install()
 import logging
 from contextlib import asynccontextmanager
 
@@ -25,6 +23,7 @@ pd.Series.sort_values = _patched_series_sort
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import ORJSONResponse
 import os
 import sys
 import psutil
@@ -53,7 +52,8 @@ app = FastAPI(
     title="AlgoTest Clone API",
     version="1.0.0",
     description="Complete backtesting API for options strategies",
-    lifespan=lifespan
+    lifespan=lifespan,
+    default_response_class=ORJSONResponse,
 )
 
 # Compress payloads > 1KB

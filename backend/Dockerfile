@@ -46,8 +46,6 @@ RUN groupadd -r appuser && useradd -r -s /sbin/nologin -g appuser appuser
 RUN chown -R appuser:appuser /app /data
 
 ENV MALLOC_ARENA_MAX=2
-ENV UVICORN_LOOP=uvloop
-ENV UVICORN_WORKERS=2
 ENV PYTHONOPTIMIZE=2
 ENV PYTHONDONTWRITEBYTECODE=1
 
@@ -55,4 +53,4 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--workers", "2"]
+CMD ["granian", "--interface", "asgi", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--loop", "uvloop", "main:app"]
