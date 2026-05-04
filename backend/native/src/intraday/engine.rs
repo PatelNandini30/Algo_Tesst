@@ -54,6 +54,96 @@ fn compute_thresholds(leg: &LegSpec, entry_x100: i32) -> (Option<i32>, Option<i3
     (sl_x100, tgt_x100)
 }
 
+/// Scan one leg's price path and return (exit_offset, reason).
+/// Handles: fixed SL, target, trailing SL, breakeven SL.
+/// `prices` is the close-price slice from entry+1 to sqoff (inclusive).
+/// `sqoff_offset` is the index within `prices` that corresponds to square-off.
+pub fn scan_exit_stateful(
+    leg: &LegSpec,
+    entry_x100: i32,
+    prices: &[i32],
+    sqoff_offset: usize,
+) -> (usize, &'static str) {
+    let is_sell = leg.action == "SELL";
+
+    let mut sl_thr = leg.sl.as_ref().map(|c| {
+        let delta = match c.kind.as_str() {
+            "percent" => ((entry_x100 as f64) * c.value / 100.0).round() as i32,
+            _ => (c.value * 100.0).round() as i32,
+        };
+        if is_sell { entry_x100 + delta } else { entry_x100 - delta }
+    });
+
+    let tgt_thr = leg.target.as_ref().map(|c| {
+        let delta = match c.kind.as_str() {
+            "percent" => ((entry_x100 as f64) * c.value / 100.0).round() as i32,
+            _ => (c.value * 100.0).round() as i32,
+        };
+        if is_sell { entry_x100 - delta } else { entry_x100 + delta }
+    });
+
+    let mut best_seen = entry_x100;
+    let mut trailing_active = false;
+
+    for (offset, &px) in prices.iter().enumerate().take(sqoff_offset + 1) {
+        if is_sell { if px < best_seen { best_seen = px; } }
+        else       { if px > best_seen { best_seen = px; } }
+
+        if let Some(ref ts) = leg.trailing_sl {
+            if !trailing_active {
+                let profit_pct = if is_sell {
+                    (entry_x100 - px) as f64 / entry_x100 as f64 * 100.0
+                } else {
+                    (px - entry_x100) as f64 / entry_x100 as f64 * 100.0
+                };
+                if profit_pct >= ts.trigger_pct { trailing_active = true; }
+            }
+            if trailing_active {
+                let new_sl = if is_sell {
+                    ((best_seen as f64) * (1.0 + ts.trail_pct / 100.0)).round() as i32
+                } else {
+                    ((best_seen as f64) * (1.0 - ts.trail_pct / 100.0)).round() as i32
+                };
+                if let Some(ref mut sl) = sl_thr {
+                    if is_sell && new_sl < *sl { *sl = new_sl; }
+                    if !is_sell && new_sl > *sl { *sl = new_sl; }
+                } else {
+                    sl_thr = Some(new_sl);
+                }
+            }
+        }
+
+        if let Some(ref be) = leg.breakeven {
+            let profit_pct = if is_sell {
+                (entry_x100 - px) as f64 / entry_x100 as f64 * 100.0
+            } else {
+                (px - entry_x100) as f64 / entry_x100 as f64 * 100.0
+            };
+            if profit_pct >= be.trigger_pct {
+                if let Some(ref mut sl) = sl_thr {
+                    if is_sell && entry_x100 < *sl { *sl = entry_x100; }
+                    if !is_sell && entry_x100 > *sl { *sl = entry_x100; }
+                }
+            }
+        }
+
+        if let Some(sl) = sl_thr {
+            if (is_sell && px >= sl) || (!is_sell && px <= sl) {
+                let reason = if trailing_active { "TRAIL_SL" } else { "SL" };
+                return (offset, reason);
+            }
+        }
+
+        if let Some(tgt) = tgt_thr {
+            if (is_sell && px <= tgt) || (!is_sell && px >= tgt) {
+                return (offset, "TARGET");
+            }
+        }
+    }
+
+    (sqoff_offset, "SQOFF")
+}
+
 fn mae_mfe(snap: &Snapshot, e: usize, s: usize, t: usize, entry_idx: usize, exit_idx: usize, is_sell: bool) -> (f64, f64) {
     let entry_px = snap.chain_val(e, s, t, 0, entry_idx) as f64;
     let (mut min_px, mut max_px) = (entry_px, entry_px);
@@ -100,19 +190,14 @@ pub fn run_day(
         let entry_px = snap.chain_val(e, s, t, 0, entry_idx);
         if entry_px <= 0 { continue; }
 
-        let (sl_thr, tgt_thr) = compute_thresholds(leg, entry_px);
         let is_sell = leg.action == "SELL";
 
-        let mut exit_idx = sqoff_idx;
-        let mut exit_reason = "SQOFF";
-
-        for m in (entry_idx + 1)..=sqoff_idx {
-            let px = snap.chain_val(e, s, t, 0, m);
-            let hit_sl = sl_thr.map_or(false, |thr| if is_sell { px >= thr } else { px <= thr });
-            let hit_tgt = tgt_thr.map_or(false, |thr| if is_sell { px <= thr } else { px >= thr });
-            if hit_sl { exit_idx = m; exit_reason = "SL"; break; }
-            if hit_tgt { exit_idx = m; exit_reason = "TARGET"; break; }
-        }
+        let prices: Vec<i32> = ((entry_idx + 1)..=sqoff_idx)
+            .map(|m| snap.chain_val(e, s, t, 0, m))
+            .collect();
+        let sqoff_offset = prices.len().saturating_sub(1);
+        let (exit_offset, exit_reason) = scan_exit_stateful(leg, entry_px, &prices, sqoff_offset);
+        let exit_idx = entry_idx + 1 + exit_offset;
 
         let exit_px = snap.chain_val(e, s, t, 0, exit_idx);
         let (mae, mfe) = mae_mfe(snap, e, s, t, entry_idx, exit_idx, is_sell);
@@ -174,6 +259,30 @@ mod tests {
         assert_eq!(strike_step("NIFTY"), 5000);
         assert_eq!(strike_step("BANKNIFTY"), 10000);
         assert_eq!(strike_step("MIDCPNIFTY"), 2500);
+    }
+
+    #[test]
+    fn test_trailing_sl_activates_and_trails() {
+        use crate::intraday::types::{ExitCond, LegSpec, StrikeSelection, TrailingSlSpec};
+        let leg = LegSpec {
+            opt_type: "CE".into(),
+            action: "SELL".into(),
+            strike_selection: StrikeSelection { mode: "ATM".into(), value: 0 },
+            expiry: "WEEKLY".into(),
+            quantity: 1,
+            sl: Some(ExitCond { kind: "percent".into(), value: 100.0 }),
+            target: None,
+            trailing_sl: Some(TrailingSlSpec { trigger_pct: 30.0, trail_pct: 30.0 }),
+            breakeven: None,
+        };
+        // entry=10000. trigger fires when price <= 10000*(1-0.30)=7000 (idx 3)
+        // min seen at trigger = 7000 → trail SL = 7000*1.30 = 9100
+        // at idx 4 price hits 6000 → new min → trail SL = 6000*1.30 = 7800
+        // at idx 8 price = 7800 → trail SL hit
+        let prices: Vec<i32> = vec![10000, 9000, 8000, 7000, 6000, 6500, 7000, 7500, 7800, 8500];
+        let (exit_idx, reason) = scan_exit_stateful(&leg, 10000, &prices, 9);
+        assert_eq!(exit_idx, 8);
+        assert_eq!(reason, "TRAIL_SL");
     }
 
     #[test]
