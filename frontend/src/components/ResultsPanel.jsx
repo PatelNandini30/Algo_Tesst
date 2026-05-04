@@ -69,6 +69,65 @@ const formatDateToDdMmYyyy = (value) => {
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
   if (!results) return null;
 
+  // Intraday backtest returns a flat array of trade objects with entry_time / exit_time fields.
+  if (Array.isArray(results)) {
+    const rows = results;
+    const totalPnl = rows.reduce((s, r) => s + (Number(r.pnl) || 0), 0);
+    const hasTime = rows.length > 0 && rows[0]?.entry_time !== undefined;
+    return (
+      <div className="bg-surface rounded-lg border border-default shadow-sm p-4">
+        {showCloseButton && onClose && (
+          <button onClick={onClose} className="float-right text-muted hover:text-primary"><X size={16} /></button>
+        )}
+        <div className="mb-3 flex items-center gap-4">
+          <span className="text-sm font-semibold text-primary">Intraday Results</span>
+          <span className="text-sm text-secondary">{rows.length} trades</span>
+          <span className={`text-sm font-semibold ${totalPnl >= 0 ? 'text-profit' : 'text-loss'}`}>
+            Total P&L: {totalPnl.toFixed(2)}
+          </span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs border-collapse">
+            <thead>
+              <tr className="bg-base">
+                <th className="px-3 py-2 text-left font-semibold text-secondary">Date</th>
+                <th className="px-3 py-2 text-left font-semibold text-secondary">Symbol</th>
+                <th className="px-3 py-2 text-left font-semibold text-secondary">Strike</th>
+                <th className="px-3 py-2 text-left font-semibold text-secondary">Type</th>
+                <th className="px-3 py-2 text-left font-semibold text-secondary">B/S</th>
+                {hasTime && <th className="px-3 py-2 text-left font-semibold text-secondary">Entry Time</th>}
+                <th className="px-3 py-2 text-right font-semibold text-secondary">Entry Price</th>
+                {hasTime && <th className="px-3 py-2 text-left font-semibold text-secondary">Exit Time</th>}
+                <th className="px-3 py-2 text-right font-semibold text-secondary">Exit Price</th>
+                <th className="px-3 py-2 text-left font-semibold text-secondary">Reason</th>
+                <th className="px-3 py-2 text-right font-semibold text-secondary">P&L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => (
+                <tr key={i} className={i % 2 === 0 ? 'bg-surface' : 'bg-hover'}>
+                  <td className="px-3 py-1.5">{row.date}</td>
+                  <td className="px-3 py-1.5">{row.symbol}</td>
+                  <td className="px-3 py-1.5 text-right">{row.strike != null ? (row.strike / 100).toFixed(0) : '—'}</td>
+                  <td className="px-3 py-1.5">{row.opt_type}</td>
+                  <td className="px-3 py-1.5">{row.action}</td>
+                  {hasTime && <td className="px-3 py-1.5">{row.entry_time}</td>}
+                  <td className="px-3 py-1.5 text-right">{row.entry_price != null ? (row.entry_price / 100).toFixed(2) : '—'}</td>
+                  {hasTime && <td className="px-3 py-1.5">{row.exit_time}</td>}
+                  <td className="px-3 py-1.5 text-right">{row.exit_price != null ? (row.exit_price / 100).toFixed(2) : '—'}</td>
+                  <td className="px-3 py-1.5">{renderExitReasonBadge(row.exit_reason)}</td>
+                  <td className={`px-3 py-1.5 text-right font-medium ${Number(row.pnl) >= 0 ? 'text-profit' : 'text-loss'}`}>
+                    {Number(row.pnl).toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+
   useEffect(() => {
     console.log('[ResultsPanel] mounted (single instance check)');
     return () => {
