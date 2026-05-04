@@ -1,3 +1,5 @@
+use chrono::NaiveDate;
+use crate::intraday::calendar::pick_expiry_e as cal_pick;
 use crate::intraday::snapshot::Snapshot;
 use crate::intraday::types::{LegSpec, StrategySpec, TradeRecord};
 use std::collections::HashMap;
@@ -25,16 +27,6 @@ fn strike_step(symbol: &str) -> i32 {
     }
 }
 
-/// Pick expiry_e index in snapshot for a given expiry type.
-/// WEEKLY → expiry_e=0 (nearest), MONTHLY → expiry_e=1 (or last of month).
-/// Simple heuristic for now; full calendar logic added in Plan E.
-fn pick_expiry_e(expiry_str: &str) -> usize {
-    match expiry_str {
-        "WEEKLY" | "NEXT_WEEKLY" => 0,
-        "MONTHLY" | "NEXT_MONTHLY" => 1,
-        _ => 0,
-    }
-}
 
 fn compute_thresholds(leg: &LegSpec, entry_x100: i32) -> (Option<i32>, Option<i32>) {
     let sl_x100 = leg.sl.as_ref().map(|c| {
@@ -164,6 +156,7 @@ fn mae_mfe(snap: &Snapshot, e: usize, s: usize, t: usize, entry_idx: usize, exit
 pub fn run_day(
     snap: &Snapshot,
     expiry_map: &HashMap<i16, String>,
+    expiry_list: &[(i16, NaiveDate)],
     spec: &StrategySpec,
     date_str: &str,
 ) -> Vec<TradeRecord> {
@@ -171,9 +164,23 @@ pub fn run_day(
     let entry_idx = time_to_idx(&spec.entry_time).min(snap.minute_count - 1);
     let sqoff_idx = time_to_idx(&spec.square_off_time).min(snap.minute_count - 1);
 
+    let trade_date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+
+    // Build expiry list scoped to what this snapshot actually contains
+    let snap_expiry_list: Vec<(i16, NaiveDate)> = (0..snap.expiry_count)
+        .filter_map(|e| {
+            let idx = snap.expiry_idx(e);
+            expiry_list.iter().find(|(i, _)| *i == idx).map(|(_, d)| (idx, *d))
+        })
+        .collect();
+
     let mut records = Vec::new();
     for leg in &spec.legs {
-        let e = pick_expiry_e(&leg.expiry);
+        let e = match cal_pick(&leg.expiry, trade_date, &snap_expiry_list) {
+            Some(e) => e,
+            None => continue,
+        };
         if e >= snap.expiry_count { continue; }
 
         // ATM at entry minute

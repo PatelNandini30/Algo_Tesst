@@ -44,6 +44,14 @@ pub fn run_intraday_backtest(
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("load expiries: {e}"))
     })?;
 
+    let mut expiry_list: Vec<(i16, NaiveDate)> = expiry_map
+        .iter()
+        .filter_map(|(idx, date_str)| {
+            NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok().map(|d| (*idx, d))
+        })
+        .collect();
+    expiry_list.sort_by_key(|(_, d)| *d);
+
     let date_from = NaiveDate::parse_from_str(&spec.date_from, "%Y-%m-%d").map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad date_from: {e}"))
     })?;
@@ -61,7 +69,7 @@ pub fn run_intraday_backtest(
         if snap_path.exists() {
             match Snapshot::open(&snap_path) {
                 Ok(snap) => {
-                    let records = run_day(&snap, &expiry_map, &spec, &date_str);
+                    let records = run_day(&snap, &expiry_map, &expiry_list, &spec, &date_str);
                     for rec in records {
                         let row = PyDict::new(py);
                         row.set_item("date", &rec.date)?;
