@@ -1070,6 +1070,58 @@ _bulk_expiry_df: Optional[pl.DataFrame] = None
 _bulk_loaded_key: Optional[str] = None
 
 
+def _compute_missing_date_ranges(cmin: str, cmax: str, rfrom: str, rto: str) -> list:
+    """Given a cache covering [cmin, cmax] and a request for [rfrom, rto], return a list
+    of (from, to) tuples for the date ranges that still need to be loaded from DB.
+    Returns [] when the cache fully covers the request."""
+    from datetime import datetime, timedelta
+
+    def _parse(s):
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+
+    def _shift(d, n):
+        return (d + timedelta(days=n)).isoformat()
+
+    cmin_d, cmax_d = _parse(cmin), _parse(cmax)
+    rfrom_d, rto_d = _parse(rfrom), _parse(rto)
+    missing = []
+    if rfrom_d < cmin_d:
+        missing.append((rfrom_d.isoformat(), _shift(cmin_d, -1)))
+    if rto_d > cmax_d:
+        missing.append((_shift(cmax_d, 1), rto_d.isoformat()))
+    return missing
+
+
+def _merge_polars_with_pandas(existing: Optional[pl.DataFrame], new_dfs: list) -> Optional[pl.DataFrame]:
+    """Concat existing pl.DataFrame with one or more pandas DataFrames; dedupe on
+    the option primary key and sort by Date. Used by the delta-load path so we
+    never keep stale duplicates if a date range overlaps."""
+    parts = []
+    if existing is not None and not existing.is_empty():
+        parts.append(existing)
+    for df in new_dfs:
+        if df is not None and not df.empty:
+            parts.append(pl.from_pandas(df))
+    if not parts:
+        return existing
+    if len(parts) == 1:
+        combined = parts[0]
+    else:
+        combined = pl.concat(parts, how="vertical_relaxed")
+        try:
+            combined = combined.unique(
+                subset=["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice"],
+                keep="last",
+            )
+        except Exception:
+            pass
+    try:
+        combined = combined.sort("Date")
+    except Exception:
+        pass
+    return combined
+
+
 def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
     """
     Load ALL option data for symbol/date-range into memory ONCE.
@@ -1091,18 +1143,26 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
     parquet_path = Path(PARQUET_CACHE_DIR) / f"{key}.parquet"
 
     cached_data_valid = False
-    
+    # Date ranges still needed from DB. None = full range needed; [] = cache covers all;
+    # [(from, to), ...] = delta-load only these missing slices.
+    delta_ranges: Optional[list] = None
+
     if _is_full_range_loaded(symbol_upper) and _bulk_options_df is not None:
         # Validate cached data covers the requested date range
-        min_date = str(_bulk_options_df["Date"].min())
-        max_date = str(_bulk_options_df["Date"].max())
+        min_date = str(_bulk_options_df["Date"].min())[:10]
+        max_date = str(_bulk_options_df["Date"].max())[:10]
         if min_date <= from_date and max_date >= to_date:
             logger.info(f"[BULK] Full range already loaded for {symbol_upper} ({min_date} to {max_date})")
             cached_data_valid = True
+            delta_ranges = []
         else:
-            logger.info(f"[BULK] Cached data ({min_date} to {max_date}) doesn't cover requested range ({from_date} to {to_date}) - reloading")
-            _full_range_loaded = False
-            _bulk_options_df = None
+            # Don't discard! Compute only the missing slices.
+            delta_ranges = _compute_missing_date_ranges(min_date, max_date, from_date, to_date)
+            logger.info(
+                "[BULK] In-memory cache (%s->%s) partial for request (%s->%s); delta-loading %s",
+                min_date, max_date, from_date, to_date, delta_ranges,
+            )
+            cached_data_valid = True
     else:
         if parquet_path.exists():
             age = time.time() - os.path.getmtime(parquet_path)
@@ -1115,43 +1175,63 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
                     _bulk_loaded_key = cache_key
                     elapsed_cache = time.perf_counter() - start_cache
                     logger.info(f"[BULK] Loaded from Parquet cache in {elapsed_cache:.2f}s")
-                    
-                    # Verify Parquet data covers requested range
+
                     if _bulk_options_df is not None and not _bulk_options_df.is_empty():
-                        min_date = str(_bulk_options_df["Date"].min())
-                        max_date = str(_bulk_options_df["Date"].max())
+                        min_date = str(_bulk_options_df["Date"].min())[:10]
+                        max_date = str(_bulk_options_df["Date"].max())[:10]
                         if min_date > from_date or max_date < to_date:
-                            logger.info(f"[BULK] Parquet data ({min_date} to {max_date}) doesn't cover requested range ({from_date} to {to_date}) - will reload from DB")
-                            _full_range_loaded = False
-                            _bulk_options_df = None
+                            # Don't discard! Delta-load only the missing slices.
+                            delta_ranges = _compute_missing_date_ranges(min_date, max_date, from_date, to_date)
+                            logger.info(
+                                "[BULK] Parquet (%s->%s) partial for request (%s->%s); delta-loading %s",
+                                min_date, max_date, from_date, to_date, delta_ranges,
+                            )
+                            cached_data_valid = True
                         else:
                             cached_data_valid = True
+                            delta_ranges = []
                 except Exception as exc:
                     logger.warning(f"[BULK] Parquet cache load failed: {exc}")
+                    _bulk_options_df = None
 
         if not _is_full_range_loaded(symbol_upper):
             cached_df = _load_full_range_from_redis(symbol_upper)
             if cached_df is not None and not cached_df.is_empty():
-                # Verify Redis data covers requested range
-                min_date = str(cached_df["Date"].min())
-                max_date = str(cached_df["Date"].max())
+                min_date = str(cached_df["Date"].min())[:10]
+                max_date = str(cached_df["Date"].max())[:10]
                 if min_date <= from_date and max_date >= to_date:
                     _bulk_options_df = cached_df
                     _full_range_loaded = True
                     _full_range_symbol = symbol_upper
                     _bulk_loaded_key = cache_key
                     cached_data_valid = True
+                    delta_ranges = []
                     logger.info("[BULK] Loaded from Redis cache for %s (%s to %s)", symbol_upper, min_date, max_date)
                 else:
-                    logger.info("[BULK] Redis data (%s to %s) doesn't cover requested range (%s to %s) - will reload", min_date, max_date, from_date, to_date)
+                    _bulk_options_df = cached_df
+                    _full_range_loaded = True
+                    _full_range_symbol = symbol_upper
+                    _bulk_loaded_key = cache_key
+                    delta_ranges = _compute_missing_date_ranges(min_date, max_date, from_date, to_date)
+                    cached_data_valid = True
+                    logger.info(
+                        "[BULK] Redis cache (%s->%s) partial for request (%s->%s); delta-loading %s",
+                        min_date, max_date, from_date, to_date, delta_ranges,
+                    )
 
     need_full_range_load = not cached_data_valid
+    if need_full_range_load:
+        load_mode = "FULL DB LOAD"
+    elif delta_ranges:
+        load_mode = f"DELTA LOAD {delta_ranges}"
+    else:
+        load_mode = "using cache"
     logger.info(
         "[BULK] Loading %s %s -> %s (%s)",
         symbol_upper,
         from_date,
         to_date,
-        "FORCING DB LOAD" if need_full_range_load else "using cache"
+        load_mode,
     )
     start_time = time.perf_counter()
 
@@ -1168,34 +1248,86 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
 
     repo = MarketDataRepository(get_engine())
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        options_future = (
-            executor.submit(repo.get_options_bulk, symbol_upper, from_date, to_date)
-            if need_full_range_load else None
-        )
+    # Decide what to fetch from DB:
+    #   need_full_range_load=True → no cache at all → query full requested range
+    #   delta_ranges=[] → cache covers everything → no options query needed
+    #   delta_ranges=[...] → cache is partial → query only the missing slices
+    options_load_ranges: list = []
+    if need_full_range_load:
+        options_load_ranges = [(from_date, to_date)]
+    elif delta_ranges:
+        options_load_ranges = list(delta_ranges)
+
+    with ThreadPoolExecutor(max_workers=max(3, len(options_load_ranges) + 2)) as executor:
+        options_futures = [
+            executor.submit(repo.get_options_bulk, symbol_upper, r_from, r_to)
+            for (r_from, r_to) in options_load_ranges
+        ]
         spot_future = executor.submit(repo.get_spot_data, symbol_upper, from_date, to_date)
         expiry_future = executor.submit(repo.get_expiry_data, symbol_upper, "weekly")
 
-        options_df = options_future.result() if options_future else None
+        options_results = [f.result() for f in options_futures]
         spot_df = spot_future.result()
         expiry_df = expiry_future.result()
 
-    if options_df is not None and not options_df.empty:
-        pl_options = pl.from_pandas(options_df)
-        _bulk_options_df = pl_options
+    options_loaded_from_db = any(df is not None and not df.empty for df in options_results)
+
+    if need_full_range_load:
+        # Replacing whatever was in memory with a fresh full-range load.
+        merged_options = options_results[0] if options_results else None
+        if merged_options is not None and not merged_options.empty:
+            _bulk_options_df = pl.from_pandas(merged_options)
+        elif _bulk_options_df is None:
+            _bulk_options_df = pl.DataFrame()
+            logger.warning("[BULK] No option data available (cache and DB)")
+    elif options_loaded_from_db:
+        # Delta path: merge new slices into the cache we already had.
+        before_rows = len(_bulk_options_df) if _bulk_options_df is not None else 0
+        _bulk_options_df = _merge_polars_with_pandas(_bulk_options_df, options_results)
+        after_rows = len(_bulk_options_df) if _bulk_options_df is not None else 0
+        logger.info(
+            "[BULK] Delta-merged %d new option rows (was %d, now %d)",
+            sum(0 if df is None else len(df) for df in options_results),
+            before_rows,
+            after_rows,
+        )
+
+    if _bulk_options_df is not None and not _bulk_options_df.is_empty():
         _full_range_loaded = True
         _full_range_symbol = symbol_upper
         _bulk_loaded_key = cache_key
-        logger.info(f"[BULK] Loaded {len(_bulk_options_df)} option rows")
-        try:
-            pl_options.write_parquet(parquet_path)
-            logger.info("[BULK] Saved to Parquet cache")
-        except Exception as exc:
-            logger.warning(f"[BULK] Failed to save Parquet cache: {exc}")
-        _store_full_range_in_redis(symbol_upper, pl_options)
-    elif options_df is None and _bulk_options_df is None:
-        _bulk_options_df = pl.DataFrame()
-        logger.warning("[BULK] No option data available (cache and DB)")
+        if options_loaded_from_db:
+            try:
+                # After a delta or full load, save the (possibly expanded) Parquet.
+                # Skip only when the in-memory result is strictly narrower than the
+                # existing Parquet (defensive — should not happen in delta mode).
+                _should_save = True
+                if parquet_path.exists():
+                    try:
+                        _ex = pl.scan_parquet(parquet_path).select(["Date"]).collect()
+                        _ex_min = str(_ex["Date"].min())[:10]
+                        _ex_max = str(_ex["Date"].max())[:10]
+                        _new_min = str(_bulk_options_df["Date"].min())[:10]
+                        _new_max = str(_bulk_options_df["Date"].max())[:10]
+                        if _new_min > _ex_min or _new_max < _ex_max:
+                            logger.info(
+                                "[BULK] Keeping wider Parquet (%s->%s); new data (%s->%s) is narrower - skipping overwrite",
+                                _ex_min, _ex_max, _new_min, _new_max,
+                            )
+                            _should_save = False
+                    except Exception:
+                        pass
+                if _should_save:
+                    _bulk_options_df.write_parquet(parquet_path)
+                    logger.info(
+                        "[BULK] Saved Parquet cache (%s rows, %s -> %s)",
+                        len(_bulk_options_df),
+                        str(_bulk_options_df["Date"].min())[:10],
+                        str(_bulk_options_df["Date"].max())[:10],
+                    )
+            except Exception as exc:
+                logger.warning(f"[BULK] Failed to save Parquet cache: {exc}")
+            _store_full_range_in_redis(symbol_upper, _bulk_options_df)
 
     logger.info("[BULK] Loading spot...")
     if not spot_df.empty:

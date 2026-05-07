@@ -1,4 +1,4 @@
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{Datelike, NaiveDate};
 
 /// Pick snapshot expiry_e index from the list of (snapshot_e, expiry_date) pairs.
 /// `expiry_type`: "WEEKLY" | "NEXT_WEEKLY" | "MONTHLY" | "NEXT_MONTHLY"
@@ -11,10 +11,12 @@ pub fn pick_expiry_e(
 ) -> Option<usize> {
     match expiry_type {
         "WEEKLY" => {
+            // Pick nearest upcoming expiry — no weekday filter because NIFTY moved
+            // from Thursday to Tuesday weekly expiry in Sep 2025.
             expiries
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, d))| *d >= trade_date && d.weekday() == Weekday::Thu)
+                .filter(|(_, (_, d))| *d >= trade_date)
                 .min_by_key(|(_, (_, d))| *d)
                 .map(|(e, _)| e)
         }
@@ -22,7 +24,7 @@ pub fn pick_expiry_e(
             let mut candidates: Vec<_> = expiries
                 .iter()
                 .enumerate()
-                .filter(|(_, (_, d))| *d > trade_date && d.weekday() == Weekday::Thu)
+                .filter(|(_, (_, d))| *d > trade_date)
                 .collect();
             candidates.sort_by_key(|(_, (_, d))| *d);
             candidates.get(1).map(|(e, _)| *e)
@@ -43,7 +45,6 @@ pub fn pick_expiry_e(
                 .filter(|(_, (_, d))| {
                     d.year() == target_month.year()
                         && d.month() == target_month.month()
-                        && d.weekday() == Weekday::Thu
                 })
                 .max_by_key(|(_, (_, d))| *d)
                 .map(|(e, _)| e)
@@ -62,7 +63,6 @@ pub fn pick_expiry_e(
                 .filter(|(_, (_, d))| {
                     d.year() == next_month.year()
                         && d.month() == next_month.month()
-                        && d.weekday() == Weekday::Thu
                 })
                 .max_by_key(|(_, (_, d))| *d)
                 .map(|(e, _)| e)
@@ -87,7 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pick_monthly_returns_last_thursday_of_month() {
+    fn test_pick_monthly_returns_last_expiry_of_month() {
         let expiries = vec![
             (0i16, NaiveDate::from_ymd_opt(2024, 1, 4).unwrap()),
             (1, NaiveDate::from_ymd_opt(2024, 1, 11).unwrap()),
@@ -95,5 +95,31 @@ mod tests {
         ];
         let e = pick_expiry_e("MONTHLY", NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), &expiries);
         assert_eq!(e, Some(2));
+    }
+
+    #[test]
+    fn test_pick_weekly_tuesday_regime() {
+        // Post-Sep 2025: NIFTY weekly expiries are on Tuesday, not Thursday.
+        let expiries = vec![
+            (0i16, NaiveDate::from_ymd_opt(2026, 1, 6).unwrap()),  // Tuesday
+            (1, NaiveDate::from_ymd_opt(2026, 1, 13).unwrap()), // Tuesday
+            (2, NaiveDate::from_ymd_opt(2026, 1, 20).unwrap()), // Tuesday
+            (3, NaiveDate::from_ymd_opt(2026, 1, 27).unwrap()), // Tuesday
+        ];
+        let e = pick_expiry_e("WEEKLY", NaiveDate::from_ymd_opt(2026, 1, 7).unwrap(), &expiries);
+        assert_eq!(e, Some(1)); // 2026-01-13 is the nearest expiry >= 2026-01-07
+    }
+
+    #[test]
+    fn test_pick_monthly_tuesday_regime() {
+        // January 2026 has only Tuesday expiries — monthly should pick the last one.
+        let expiries = vec![
+            (0i16, NaiveDate::from_ymd_opt(2026, 1, 6).unwrap()),
+            (1, NaiveDate::from_ymd_opt(2026, 1, 13).unwrap()),
+            (2, NaiveDate::from_ymd_opt(2026, 1, 20).unwrap()),
+            (3, NaiveDate::from_ymd_opt(2026, 1, 27).unwrap()),
+        ];
+        let e = pick_expiry_e("MONTHLY", NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(), &expiries);
+        assert_eq!(e, Some(3)); // 2026-01-27 is the last expiry in January
     }
 }

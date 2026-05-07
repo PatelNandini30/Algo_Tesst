@@ -41,6 +41,8 @@ def build_fast_lookup(options_df, spot_df, cache_key_override: Optional[str] = N
     """
     Convert bulk Polars DataFrames into Python dicts for O(1) lookups.
     Called once per backtest, before the engine loop.
+    When Rust is available, skip the Python dict build (~30s for 3.7M rows) —
+    the build_cache regeneration ensures the Rust feather covers the full data range.
     """
     global _opt_lookup, _spot_lookup, _strikes_index, _is_built, _build_symbol, _loaded_cache_key
     t0 = time.perf_counter()
@@ -152,7 +154,9 @@ def get_option_price_fast(
         try:
             from services.rust_fast_path import get_option_price as _rust_get_option_price
             result = _rust_get_option_price(date=date, index=index, strike=strike, opt_type=opt_type, expiry=expiry)
-            return None if result is None else float(result)
+            if result is not None:
+                return float(result)
+            # Rust returned None (date outside feather range) — fall through to Python dict
         except Exception:
             pass
     if not _is_built:
@@ -174,7 +178,9 @@ def get_spot_price_fast(date, index: str) -> Optional[float]:
         try:
             from services.rust_fast_path import get_spot_price as _rust_get_spot_price
             result = _rust_get_spot_price(date=date, index=index)
-            return None if result is None else float(result)
+            if result is not None:
+                return float(result)
+            # Rust returned None — fall through to Python dict
         except Exception:
             pass
     if not _is_built:

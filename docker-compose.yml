@@ -59,6 +59,7 @@ x-backend-env: &backend-env
   FAST_LOOKUP_MODE: auto
   FAST_LOOKUP_MIN_YEARS: "2.0"
   FAST_LOOKUP_RANGE_FILTER: "0"
+  FAST_LOOKUP_NATIVE_SCANS: "1"
   # Route small ranges to a separate worker so they do not wait behind a long run.
   BACKTEST_FAST_QUEUE_MAX_DAYS: "550"
   # API warm-cache waits for the Celery worker cache, not only backend memory.
@@ -161,8 +162,9 @@ services:
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     command:
-      - uvicorn
-      - main:app
+      - granian
+      - --interface
+      - asgi
       - --host
       - "0.0.0.0"
       - --port
@@ -171,6 +173,7 @@ services:
       - "1"
       - --loop
       - uvloop
+      - main:app
     environment:
       <<: *backend-env
       DB_STATEMENT_TIMEOUT: "1800000"

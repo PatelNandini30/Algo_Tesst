@@ -479,6 +479,27 @@ def _get_ohlc_for_leg_on_date(index, date_str, leg, expiry):
         if result is not None:
             return result
 
+    # Fast path: use Rust/fast-lookup close as OHLC proxy when partition is not built.
+    # Equivalent to old behaviour — partition data also had Close-only (no High/Low).
+    try:
+        from services.fast_lookup import get_option_price_fast as _gop_fast
+        _strike = _safe_float(leg.get('strike'))
+        _otype = str(leg.get('option_type', '') or '').upper()
+        if _otype in ('CALL', 'C'):
+            _otype = 'CE'
+        elif _otype in ('PUT', 'P'):
+            _otype = 'PE'
+        _expiry_cands = _expiry_candidates(expiry)
+        _expiry_s = _expiry_cands[0] if _expiry_cands else None
+        if _strike is not None and _otype in ('CE', 'PE') and _expiry_s:
+            _close = _gop_fast(date=date_str, index=index, strike=_strike,
+                               opt_type=_otype, expiry=_expiry_s)
+            if _close is not None:
+                _c = float(_close)
+                return (_c, _c)
+    except Exception:
+        pass
+
     try:
         bhav_df = load_bhavcopy(date_str)
     except Exception:
@@ -679,6 +700,31 @@ def snap_to_strike_interval(ref_price: float, strike_interval: int) -> float:
     return float(round(ref_price / strike_interval) * strike_interval)
 
 
+def _normalize_leg_strike_interval(value, fallback):
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed in (50, 100) else fallback
+
+
+def _effective_strike_interval(leg_config, fallback):
+    strike_selection = leg_config.get('strike_selection') if isinstance(leg_config, dict) else {}
+    selection_interval = None
+    if isinstance(strike_selection, dict):
+        selection_interval = (
+            strike_selection.get('strike_interval')
+            or strike_selection.get('strike_gap')
+            or strike_selection.get('interval')
+        )
+    configured_interval = (
+        leg_config.get('strike_interval')
+        or leg_config.get('strike_gap')
+        or leg_config.get('interval')
+        or selection_interval
+    )
+    return _normalize_leg_strike_interval(configured_interval, fallback)
+
 
 def _normalize_sl_tgt_type(mode_str):
     """
@@ -734,6 +780,7 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
     option_type     = leg_config.get('option_type', 'CE')
     strike_sel      = leg_config.get('strike_selection', 'ATM')
     strike_sel_type = str(leg_config.get('strike_selection_type', '')).upper().strip()
+    strike_interval = _effective_strike_interval(leg_config, strike_interval)
 
     # Accept dict form of strike_selection
     if not strike_sel_type and isinstance(strike_sel, dict):
@@ -2978,7 +3025,8 @@ def run_algotest_backtest(params):
 
     entry_dte = _coerce_int(params.get('entry_dte', 2), 2, 'Entry')
     exit_dte = _coerce_int(params.get('exit_dte', 0), 0, 'Exit')
-    _log(f"[DEBUG] Received entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={params.get('expiry_type', 'WEEKLY')}, keys={list(params.keys())}")
+    rollover_toggle = bool(params.get('rollover_toggle', False))
+    _log(f"[DEBUG] Received entry_dte={entry_dte}, exit_dte={exit_dte}, expiry_type={params.get('expiry_type', 'WEEKLY')}, rollover_toggle={rollover_toggle}, keys={list(params.keys())}")
     legs_config = params.get('legs', [])
     # Read super_trend_config ONLY from its dedicated key.
     # Never fall back to filter_config — they are separate concepts.
@@ -3058,6 +3106,7 @@ def run_algotest_backtest(params):
         _log("[WARN] filter_entry_mode='fixed' requested but no active filter/STR — falling back to DTE mode. "
              f"(str_enabled={str_enabled}, filter_enabled={filter_enabled}, "
              f"filter_config={filter_config})")
+    fixed_late_entry  = bool(params.get('fixed_late_entry',  False))
     
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -3156,6 +3205,9 @@ def run_algotest_backtest(params):
     
     _etype = expiry_type.upper()
     _is_next = _etype in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
+    # Rollover mode: treat WEEKLY/MONTHLY as NEXT_WEEKLY/NEXT_MONTHLY — exit anchors to next expiry
+    # and same-day re-entry (entry == prev exit) is allowed.
+    _rollover_mode = rollover_toggle and _etype in ('WEEKLY', 'MONTHLY')
 
     if expiry_day_of_week is not None:
         expiry_dates = get_custom_expiry_dates(index, expiry_day_of_week, from_date, to_date)
@@ -3210,7 +3262,7 @@ def run_algotest_backtest(params):
         #
         # For mixed / non-next strategies both dates use the same anchor (current_exp).
         schedule_anchor = current_exp
-        if _all_legs_next and next_exp is not None:
+        if (_all_legs_next or _rollover_mode) and next_exp is not None:
             entry_date = calculate_trading_days_before_expiry(
                 expiry_date=current_exp,
                 days_before=entry_dte,
@@ -3257,7 +3309,7 @@ def run_algotest_backtest(params):
         # Skip these trades entirely. For NEXT_WEEKLY/NEXT_MONTHLY, continue with normal logic
         # (entry on current expiry, exit on next expiry).
         _force_next_expiry = False
-        _is_next_expiry_type = expiry_type.upper() in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1') or _all_legs_next
+        _is_next_expiry_type = expiry_type.upper() in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1') or _all_legs_next or _rollover_mode
 
         if entry_date == exit_date:
             if _is_next_expiry_type and next_exp is not None:
@@ -3277,6 +3329,7 @@ def run_algotest_backtest(params):
             'entry_date':        entry_date,
             'exit_date':         exit_date,
             '_force_next_expiry': _force_next_expiry,
+            '_rollover_mode':    _rollover_mode,
         })
 
     if schedule:
@@ -3383,9 +3436,23 @@ def run_algotest_backtest(params):
 
             schedule_idx = 0
             while schedule_idx < len(seg_expiries):
-                # Advance until we find the next expiry whose expiry_date is > current_entry
-                while (schedule_idx < len(seg_expiries) and
-                       pd.Timestamp(seg_expiries[schedule_idx]['expiry_date']) <= current_entry_ts):
+                # Advance past expiries whose anchor has already passed.
+                # For NEXT_WEEKLY/NEXT_MONTHLY the anchor (current_expiry) can equal
+                # the late-entry date — use strict < so that row is not skipped.
+                # For WEEKLY/MONTHLY use <= (can't trade a contract on its own expiry day).
+                while schedule_idx < len(seg_expiries):
+                    _adv_rec = seg_expiries[schedule_idx]
+                    _adv_rollover = _adv_rec.get('_rollover_mode', False)
+                    if _adv_rollover:
+                        # Rollover: contract lives until exit_date (next expiry). Only
+                        # skip when the actual contract has already expired.
+                        _adv_stale = pd.Timestamp(_adv_rec['exit_date']) < current_entry_ts
+                    elif _all_legs_next:
+                        _adv_stale = pd.Timestamp(_adv_rec['expiry_date']) < current_entry_ts
+                    else:
+                        _adv_stale = pd.Timestamp(_adv_rec['expiry_date']) <= current_entry_ts
+                    if not _adv_stale:
+                        break
                     schedule_idx += 1
 
                 if schedule_idx >= len(seg_expiries):
@@ -3422,6 +3489,7 @@ def run_algotest_backtest(params):
                     'current_expiry':      rec.get('current_expiry', rec['expiry_date']),
                     'next_expiry':         rec.get('next_expiry',    rec['expiry_date']),
                     '_force_next_expiry':  rec.get('_force_next_expiry', False),
+                    '_rollover_mode':      rec.get('_rollover_mode', False),
                     'clamped_exit':        clamped_exit,
                 })
 
@@ -3435,7 +3503,15 @@ def run_algotest_backtest(params):
                     candidate_entry    = pd.Timestamp(candidate['entry_date'])
                     candidate_expiry   = pd.Timestamp(candidate['expiry_date'])
 
-                    if candidate_expiry <= prev_exit_ts:
+                    rec_is_rollover = candidate.get('_rollover_mode', False)
+                    # For rollover the contract lives until exit_date (next expiry),
+                    # so staleness is determined by exit_date, not expiry_date.
+                    _cand_stale = (
+                        pd.Timestamp(candidate['exit_date']) <= prev_exit_ts
+                        if rec_is_rollover else
+                        candidate_expiry <= prev_exit_ts
+                    )
+                    if _cand_stale:
                         temp_idx += 1
                         continue
 
@@ -3443,7 +3519,35 @@ def run_algotest_backtest(params):
                         temp_idx += 1
                         continue
 
-                    if candidate_entry <= prev_exit_ts:
+                    # Rollover: same-day entry (candidate_entry == prev_exit_ts) is valid
+                    # (exiting one contract and entering the next on the same day).  Only
+                    # treat the entry as "past" when it is strictly before prev_exit_ts.
+                    _entry_is_past = (
+                        candidate_entry < prev_exit_ts
+                        if rec_is_rollover else
+                        candidate_entry <= prev_exit_ts
+                    )
+                    if _entry_is_past:
+                        if fixed_late_entry or rec_is_rollover:
+                            # DTE window already passed — enter on the next trading day
+                            # after the previous exit instead of skipping this expiry.
+                            late_entry = _next_trading_day_after(trading_calendar, prev_exit_ts)
+                            # For NEXT_WEEKLY/NEXT_MONTHLY/rollover the contract expires at
+                            # next_expiry, not current_expiry. Use the actual contract
+                            # expiry as the boundary so entering on the current expiry
+                            # day (valid for next-week contracts) is not rejected.
+                            _contract_exp = (
+                                pd.Timestamp(candidate.get('next_expiry') or candidate_expiry)
+                                if (_all_legs_next or rec_is_rollover) else candidate_expiry
+                            )
+                            if (late_entry is None
+                                    or pd.Timestamp(late_entry) >= _contract_exp
+                                    or pd.Timestamp(late_entry) > seg_end):
+                                temp_idx += 1
+                                continue
+                            next_entry_ts = pd.Timestamp(late_entry)
+                            schedule_idx  = temp_idx
+                            break
                         temp_idx += 1
                         continue
 
@@ -3460,11 +3564,19 @@ def run_algotest_backtest(params):
                     break
 
         else:
+            _dte_last_exit = None
             for rec in schedule:
                 if rec.get('entry_date') is None or rec.get('exit_date') is None:
                     continue
                 entry_ts = pd.Timestamp(rec['entry_date'])
                 if entry_ts < seg_start or entry_ts > seg_end:
+                    continue
+                _rec_rollover = rec.get('_rollover_mode', False)
+                # Rollover and NEXT_WEEKLY: each trade is on a different contract so
+                # date overlap between consecutive trades is intentional — bypass entirely.
+                _bypass_overlap = _all_legs_next or _rec_rollover
+                if not _bypass_overlap and _dte_last_exit is not None and entry_ts <= _dte_last_exit:
+                    _log(f"[DTE] skip entry {entry_ts.date()} — overlaps prev exit {_dte_last_exit.date()}")
                     continue
                 exit_ts = pd.Timestamp(rec['exit_date'])
                 clamped_exit = False
@@ -3476,6 +3588,7 @@ def run_algotest_backtest(params):
                     if last_day is None or pd.Timestamp(last_day) < entry_ts:
                         continue
                     exit_ts = pd.Timestamp(last_day)
+                _dte_last_exit = exit_ts
                 seg_entries.append({
                     'segment':             segment,
                     'entry_date':          rec['entry_date'],
@@ -3484,6 +3597,7 @@ def run_algotest_backtest(params):
                     'current_expiry':      rec.get('current_expiry', rec['expiry_date']),
                     'next_expiry':         rec.get('next_expiry',    rec['expiry_date']),
                     '_force_next_expiry':  rec.get('_force_next_expiry', False),
+                    '_rollover_mode':      rec.get('_rollover_mode', False),
                     'clamped_exit':        clamped_exit,
                 })
 
@@ -3523,6 +3637,7 @@ def run_algotest_backtest(params):
             _sched_current_exp   = trade_entry.get('current_expiry') or expiry_date
             _sched_next_exp      = trade_entry.get('next_expiry')    or expiry_date
             _force_next_expiry   = trade_entry.get('_force_next_expiry', False)
+            _trade_rollover_mode = trade_entry.get('_rollover_mode', False)
             clamped_exit = trade_entry['clamped_exit']
             trade_id += 1
             _log(f"--- Segment {segment['label']} | Trade {trade_id}/{total_entries} ---")
@@ -3868,7 +3983,7 @@ def run_algotest_backtest(params):
                         # when the global basis is NEXT_WEEKLY/NEXT_MONTHLY).
                         _leg_expiry_raw = str(leg_config.get('expiry', 'WEEKLY') or 'WEEKLY').upper()
                         _is_leg_next = _leg_expiry_raw in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
-                        if _force_next_expiry or _is_leg_next:
+                        if _force_next_expiry or _is_leg_next or _trade_rollover_mode:
                             leg_options_expiry = pd.Timestamp(_sched_next_exp)
                         else:
                             leg_options_expiry = pd.Timestamp(_sched_current_exp)

@@ -53,8 +53,12 @@ def build_day_snapshot(
         symbol=symbol, trade_date=trade_date, expiry_count=len(expiry_indices)
     )
 
-    spot_bytes = b"".join(spot_arrays[c].tobytes() for c in
-                          ("open_x100", "high_x100", "low_x100", "close_x100"))
+    # Interleaved per-minute: [o0,h0,l0,c0, o1,h1,l1,c1, ...] to match Rust reader
+    spot_interleaved = np.stack([
+        spot_arrays["open_x100"], spot_arrays["high_x100"],
+        spot_arrays["low_x100"], spot_arrays["close_x100"],
+    ], axis=1)  # shape (375, 4)
+    spot_bytes = spot_interleaved.tobytes()
 
     expiry_payloads = []
     for eidx in expiry_indices:
@@ -70,12 +74,12 @@ def build_day_snapshot(
         )
         expiry_header = struct.pack("<h", eidx)  # int16
         atm_bytes = atm_arr.tobytes()
-        chain_bytes = b"".join([
-            chain["close"].tobytes(),
-            chain["high"].tobytes(),
-            chain["low"].tobytes(),
-            chain["volume"].tobytes(),
-        ])
+        # Rust chain_val uses (s, t, field, m) indexing — stack fields at axis=2
+        # Each chain array is shape (11, 2, 375); stacked → (11, 2, 4, 375)
+        chain_arr = np.stack([
+            chain["close"], chain["high"], chain["low"], chain["volume"],
+        ], axis=2)
+        chain_bytes = chain_arr.tobytes()
         expiry_payloads.append(expiry_header + atm_bytes + chain_bytes)
 
     return header + spot_bytes + b"".join(expiry_payloads)

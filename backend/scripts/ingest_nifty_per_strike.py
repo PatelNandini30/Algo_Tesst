@@ -206,6 +206,10 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true",
                    help="Re-ingest dates already in the SQLite manifest")
+    p.add_argument("--name-list", metavar="FILE",
+                   help="Text file with one filename per line (workaround for GVFS os.listdir bug)")
+    p.add_argument("--flush-lag", type=int, default=150, metavar="DAYS",
+                   help="Flush completed trade dates when expiry advances past date+DAYS (default 150)")
     args = p.parse_args(argv)
 
     source_dir = Path(args.source_dir)
@@ -228,7 +232,12 @@ def main(argv=None) -> int:
     expiry_max = target_end + timedelta(days=120)
 
     file_list: list[tuple[date, str]] = []
-    for name in os.listdir(source_dir):
+    if args.name_list:
+        with open(args.name_list) as f:
+            names = [l.strip() for l in f if l.strip()]
+    else:
+        names = os.listdir(source_dir)
+    for name in names:
         exp = _parse_file_expiry(name)
         if exp and expiry_min <= exp <= expiry_max:
             file_list.append((exp, str(source_dir / name)))
@@ -255,14 +264,10 @@ def main(argv=None) -> int:
         publish_fn = None
 
     # Streaming accumulator: group rows by trade date.
-    # A trade date D is safe to flush only after ALL files that could contain
-    # data for D have been processed. NSE long-dated options can be listed up to
-    # ~270 days before expiry. The file set upper bound is target_end + 120 days,
-    # so worst-case lag = (target_end + 120 days) - target_start.
-    # Using 400 days is always safe: no mid-run flushing occurs, all dates are
-    # held until the final flush. Peak RAM is bounded to the full date range's
-    # data (~2-3 GB for a 5-month window), which is safe for a single instance.
-    FLUSH_LAG = timedelta(days=400)
+    # A trade date D is safe to flush once all files with expiry <= D+FLUSH_LAG
+    # have been processed. NIFTY options expire within 90 days of listing, so
+    # 150 days is safe and keeps peak RAM bounded to ~150 days of data (~2-3 GB).
+    FLUSH_LAG = timedelta(days=args.flush_lag)
 
     by_date: dict[date, list[pl.DataFrame]] = defaultdict(list)
     ok = fail = skip = 0

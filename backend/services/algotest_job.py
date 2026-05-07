@@ -401,7 +401,17 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 stage_t = time.perf_counter()
                 bulk_load_options(index, effective_from, effective_to)
                 logger.info("[JOB_PERF] bulk_load_options %.2fs", time.perf_counter() - stage_t)
-                if _should_build_fast_lookup(payload, effective_from, effective_to):
+                # Always build fast lookup if Rust is already loaded (feather shortcut
+                # makes this free — 0 ms), OR if the span exceeds the threshold.
+                # Skipping it when Rust is active but span < threshold leaves all
+                # option price lookups falling back to raw DB queries.
+                _rust_active = False
+                try:
+                    from services import rust_fast_path as _rf
+                    _rust_active = _rf.is_available() and _rf._loaded_cache_key is not None
+                except Exception:
+                    pass
+                if _rust_active or _should_build_fast_lookup(payload, effective_from, effective_to):
                     stage_t = time.perf_counter()
                     _build_fast_lookup_from_bulk(index, effective_from, effective_to)
                     logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)

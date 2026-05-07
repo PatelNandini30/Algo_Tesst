@@ -41,6 +41,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const fileInputRef = useRef(null);
   const dropdownRef = useRef(null);
   const [entryMode, setEntryMode] = useState('dte');
+  const [lateEntry, setLateEntry] = useState(false);
 
   const selectedOption = useMemo(
     () => STR_FILTER_OPTIONS.find(opt => opt.value === selected) ?? STR_FILTER_OPTIONS[0],
@@ -169,21 +170,23 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
       summary: enabled ? summaryPayload : null,
       segments: payloadSegments,
       entryMode,
+      lateEntry: entryMode === 'fixed' ? lateEntry : false,
     };
 
     const prevState = prevFilterChangeRef.current;
     const stateChanged = !prevState ||
-      prevState.enabled !== filterState.enabled ||
-      prevState.configId !== filterState.configId ||
-      prevState.segments !== filterState.segments ||
-      prevState.entryMode !== filterState.entryMode;
+      prevState.enabled   !== filterState.enabled   ||
+      prevState.configId  !== filterState.configId  ||
+      prevState.segments  !== filterState.segments  ||
+      prevState.entryMode !== filterState.entryMode ||
+      prevState.lateEntry !== filterState.lateEntry;
 
     prevFilterChangeRef.current = filterState;
 
     if (!stateChanged) return;
 
     onFilterChange?.(filterState);
-  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, entryMode, onFilterChange]);
+  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, entryMode, lateEntry, onFilterChange]);
 
   const previewRows = useMemo(() => {
     if (!enabled) return [];
@@ -358,6 +361,19 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                   ? 'Enter N days before each expiry within the segment. Current behaviour — unchanged.'
                   : 'Enter on segment start date, then re-enter the next trading day after each exit. Stays active throughout the segment with no gap.'}
               </p>
+              {entryMode === 'fixed' && (
+                <label className="flex items-center gap-2 cursor-pointer select-none mt-1">
+                  <input
+                    type="checkbox"
+                    checked={lateEntry}
+                    onChange={e => setLateEntry(e.target.checked)}
+                    className="w-3.5 h-3.5 rounded accent-blue-600 cursor-pointer"
+                  />
+                  <span className="text-[11px] text-secondary">
+                    Late entry — if DTE window has passed, enter next trading day after exit (no expiry skipped)
+                  </span>
+                </label>
+              )}
             </div>
 
             {previewRows.length > 0 && (

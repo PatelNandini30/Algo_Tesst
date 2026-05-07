@@ -10,3 +10,7 @@ cleaned_csvs/
 .~lock.*
 *.docx~
 node_modules/
+backend/native/target/
+frontend/dist/
+.claude/
+nifty_data/

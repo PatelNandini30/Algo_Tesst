@@ -91,7 +91,13 @@ def warm_backtest_cache_task(self, params: dict):
         self.update_state(state='PROCESSING', meta={'status': 'Warming worker data cache'})
         stats = bulk_load_options(index, from_date, to_date)
         fast_lookup_built = False
-        if _should_build_fast_lookup(params or {}, from_date, to_date):
+        _rust_active = False
+        try:
+            from services import rust_fast_path as _rf
+            _rust_active = _rf.is_available() and _rf._loaded_cache_key is not None
+        except Exception:
+            pass
+        if _rust_active or _should_build_fast_lookup(params or {}, from_date, to_date):
             self.update_state(state='PROCESSING', meta={'status': 'Warming worker lookup cache'})
             _build_fast_lookup_from_bulk(index, from_date, to_date)
             fast_lookup_built = True

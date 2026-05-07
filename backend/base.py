@@ -307,6 +307,21 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     Filter by symbol, parse Date, filter to date range
     Return DataFrame: Date, Close
     """
+    # Fast path: reconstruct from in-memory spot lookup table only when it covers
+    # the whole requested range. A partial stale spot table would build the
+    # trading calendar from the wrong year.
+    sym_upper = symbol.upper()
+    from_iso = str(from_date)[:10]
+    to_iso = str(to_date)[:10]
+    if _spot_lookup_covers_range(sym_upper, from_iso, to_iso):
+        rows = [(d, c) for (d, s), c in _spot_lookup_table.items()
+                if s == sym_upper and from_iso <= d <= to_iso]
+        if rows:
+            rows.sort(key=lambda x: x[0])
+            df = pd.DataFrame(rows, columns=['Date', 'Close'])
+            df['Date'] = pd.to_datetime(df['Date'])
+            return df.reset_index(drop=True)
+
     if _use_postgres():
         try:
             pg_df = _repo.get_spot_data(symbol=symbol, from_date=from_date, to_date=to_date)
@@ -369,6 +384,7 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     
     return df[['Date', 'Close']].reset_index(drop=True)
 
+@lru_cache(maxsize=32)
 def load_expiry(index: str, expiry_type: str) -> pd.DataFrame:
     """
     Read ./expiryData/{index}.csv (weekly) or ./expiryData/{index}_Monthly.csv
@@ -1403,8 +1419,45 @@ _bulk_bhav_by_date: dict = {}
 _bhav_by_date_symbol: str = None
 _bhav_by_date_from: str = None
 _bhav_by_date_to: str = None
+# True when Rust Arrow IPC cache is active — Python partition can be skipped
+_rust_lookup_active: bool = False
 # O(1) guard — replaces the O(n) key scan in _load_date_data_on_demand
 _loaded_on_demand_dates: set = set()
+
+
+def _spot_lookup_covers_range(symbol: str, from_date: str, to_date: str) -> bool:
+    """Return True only when the in-memory spot table spans the requested range."""
+    if not _spot_lookup_table:
+        return False
+    sym_upper = str(symbol).upper()
+    from_iso = str(from_date)[:10]
+    to_iso = str(to_date)[:10]
+    dates = [d for (d, s) in _spot_lookup_table.keys() if s == sym_upper]
+    if not dates:
+        return False
+    return min(dates) <= from_iso and max(dates) >= to_iso
+
+
+def _load_spot_lookup_from_feather(symbol: str) -> bool:
+    """Refresh spot lookup from the full Rust feather cache when available."""
+    global _spot_lookup_table
+    try:
+        from services import rust_fast_path as _rf
+        sym_upper = str(symbol).upper()
+        spot_feather = _rf._cache_root() / f"arrow-v2:bulk:{sym_upper}:full" / "spot.feather"
+        if not spot_feather.exists():
+            return False
+        spot_tmp = pl.read_ipc(spot_feather)
+        if spot_tmp is None or spot_tmp.is_empty():
+            return False
+        s_dates = _series_to_iso_date_list(spot_tmp["Date"])
+        s_closes = spot_tmp["Close"].to_list()
+        _spot_lookup_table = {(d, sym_upper): c for d, c in zip(s_dates, s_closes)}
+        _spot_lookup_cache.clear()
+        return True
+    except Exception as exc:
+        logger.debug("[BULK] Spot feather refresh failed: %s", exc)
+        return False
 
 
 def _bump_lookup_cache_epoch():
@@ -1450,7 +1503,8 @@ def _cached_spot_lookup(epoch: int, date_str: str, index_upper: str, db_path: st
         if val is not None:
             _spot_lookup_cache[cache_key] = val
             return val
-        return None
+        if _spot_lookup_covers_range(index_upper, date_str, date_str):
+            return None
 
     try:
         if _bulk_loaded and _bulk_spot_df is not None and not _bulk_spot_df.empty:
@@ -3059,28 +3113,92 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
     global _option_lookup_table, _future_lookup_table, _spot_lookup_table
     global _bhav_by_date_symbol, _bhav_by_date_from, _bhav_by_date_to
+    global _rust_lookup_active
 
     sym_upper = symbol.upper()
     requested_from = pd.to_datetime(from_date)
     requested_to = pd.to_datetime(to_date)
 
-    # Fast early return: partitioned data already covers this symbol/range.
-    # Per-date option lookup dicts are built lazily by _build_option_lookup(),
-    # so do not require _option_lookup_cache to be pre-populated here.
-    if (_bulk_bhav_by_date
+    # Fast early return: either Python partition or Rust already covers this range.
+    if ((_bulk_bhav_by_date or _rust_lookup_active)
             and _bhav_by_date_symbol == sym_upper
             and _bhav_by_date_from is not None
             and pd.to_datetime(_bhav_by_date_from) <= requested_from
             and pd.to_datetime(_bhav_by_date_to) >= requested_to):
-        _bulk_loaded = True
-        _bulk_date_range = (from_date, to_date)
-        return {
-            "options_rows": len(_option_lookup_cache),
-            "spot_rows": len(_spot_lookup_table),
-            "expiry_rows": 0,
-            "loaded_key": f"{symbol}:{from_date}:{to_date}",
-            "cache_hit": True,
-        }
+        if _rust_lookup_active and not _spot_lookup_covers_range(sym_upper, from_date, to_date):
+            _load_spot_lookup_from_feather(sym_upper)
+        if not _spot_lookup_covers_range(sym_upper, from_date, to_date):
+            logger.info(
+                "[BULK] Cached option range covers %s→%s but spot cache is narrower — refreshing load",
+                from_date, to_date,
+            )
+        else:
+            _bulk_loaded = True
+            _bulk_date_range = (from_date, to_date)
+            return {
+                "options_rows": len(_option_lookup_cache) if not _rust_lookup_active else 0,
+                "spot_rows": len(_spot_lookup_table),
+                "expiry_rows": 0,
+                "loaded_key": f"{symbol}:{from_date}:{to_date}",
+                "cache_hit": True,
+            }
+
+    # Rust feather shortcut: if Arrow IPC files exist on disk, activate Rust directly
+    # — no DB query, no Python partition, no Parquet read needed.
+    # IMPORTANT: verify the feather actually covers the requested date range before
+    # activating, otherwise dates outside the feather return None and generate no trades.
+    if not _rust_lookup_active or not _spot_lookup_covers_range(sym_upper, from_date, to_date):
+        try:
+            from services import rust_fast_path as _rf
+            if _rf.is_available():
+                _rust_ck = f"bulk:{sym_upper}:full"
+                _feather_dir = _rf._cache_root() / f"arrow-v2:{_rust_ck}"
+                _opt_feather = _feather_dir / "options.feather"
+                _spt_feather = _feather_dir / "spot.feather"
+                if _opt_feather.exists() and _spt_feather.exists():
+                    # Check the feather's actual date coverage before trusting it
+                    _feather_covers = False
+                    try:
+                        _fdf = pl.read_ipc(_opt_feather, n_rows=1, memory_map=False)
+                        _fdf_full = pl.scan_ipc(_opt_feather).select(["Date"]).collect()
+                        _fmin = str(_fdf_full["Date"].min())[:10]
+                        _fmax = str(_fdf_full["Date"].max())[:10]
+                        _feather_covers = (_fmin <= from_date and _fmax >= to_date)
+                        if not _feather_covers:
+                            logger.info(
+                                "[BULK] Rust feather (%s→%s) doesn't cover request (%s→%s) — falling through to Parquet/DB load",
+                                _fmin, _fmax, from_date, to_date,
+                            )
+                    except Exception as _fe:
+                        logger.debug("[BULK] Feather range check failed: %s", _fe)
+                    if _feather_covers and _rf.build_cache(None, None, cache_key=_rust_ck):
+                        logger.info("[BULK] Rust feather shortcut: activated %s — skipping DB/Parquet for %s", _rust_ck, sym_upper)
+                        _rust_lookup_active = True
+                        _bhav_by_date_symbol = sym_upper
+                        _bhav_by_date_from = _fmin
+                        _bhav_by_date_to = _fmax
+                        _bulk_loaded = True
+                        _bulk_date_range = (from_date, to_date)
+                        # Tell data_loader the correct cache key so build_fast_lookup
+                        # recognises Rust is already loaded and does NOT try to reload
+                        # with a wrong derived key (which would corrupt Rust's state).
+                        try:
+                            import services.data_loader as _dl_mod
+                            _dl_mod._bulk_loaded_key = _rust_ck
+                        except Exception:
+                            pass
+                        # Load spot into _spot_lookup_table directly from feather file
+                        # (dl_bulk_load was skipped, so _bulk_spot_df in data_loader is None)
+                        _load_spot_lookup_from_feather(sym_upper)
+                        return {
+                            "options_rows": 0,
+                            "spot_rows": len(_spot_lookup_table),
+                            "expiry_rows": 0,
+                            "loaded_key": f"{symbol}:{from_date}:{to_date}",
+                            "rust_feather_hit": True,
+                        }
+        except Exception as _exc:
+            logger.debug("[BULK] Rust feather shortcut failed: %s", _exc)
 
     result = dl_bulk_load(symbol, from_date, to_date)
     _bump_lookup_cache_epoch()
@@ -3116,6 +3234,18 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         )
         return options_df
 
+    # Check if Rust native will handle lookups. If the extension is available,
+    # build_fast_lookup is about to load the feather — so the expensive Python
+    # per-date partition (~40s for 3M rows) is wasted work. Skip it.
+    # Edge case: if build_cache later fails, lookups fall through to DB queries
+    # (rare; the feather generation is well-tested).
+    def _rust_now_active() -> bool:
+        try:
+            from services import rust_fast_path as _rf
+            return _rf.is_available()
+        except Exception:
+            return False
+
     # Check Redis / in-memory Polars DF covers the full requested range
     lookup_loaded_from_redis = False
     options_df = get_bulk_options_df()
@@ -3123,25 +3253,40 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         min_date = str(options_df["Date"].min())
         max_date = str(options_df["Date"].max())
         if min_date <= from_date and max_date >= to_date:
-            hot_df = _partition_bulk_options(_slice_bulk_options(options_df))
-            _bulk_bhav_df = hot_df
+            if _rust_now_active():
+                # Rust handles all lookups — skip the expensive Python partition.
+                logger.info("[BULK] Rust active — skipping partition of %s rows", options_df.height)
+                _rust_lookup_active = True
+                _bhav_by_date_from = min_date
+                _bhav_by_date_to   = max_date
+            else:
+                hot_df = _partition_bulk_options(_slice_bulk_options(options_df))
+                _bulk_bhav_df = hot_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
             _bhav_by_date_symbol = sym_upper
-            _bhav_by_date_from   = from_date
-            _bhav_by_date_to     = to_date
+            if not _rust_lookup_active:
+                _bhav_by_date_from   = from_date
+                _bhav_by_date_to     = to_date
             lookup_loaded_from_redis = True
 
     if not lookup_loaded_from_redis:
         options_df = get_bulk_options_df()
         if options_df is not None and not options_df.is_empty():
-            hot_df = _partition_bulk_options(_slice_bulk_options(options_df))
-            _bulk_bhav_df = hot_df
+            if _rust_now_active():
+                logger.info("[BULK] Rust active — skipping partition of %s rows", options_df.height)
+                _rust_lookup_active = True
+                _bhav_by_date_from = str(options_df["Date"].min())
+                _bhav_by_date_to   = str(options_df["Date"].max())
+            else:
+                hot_df = _partition_bulk_options(_slice_bulk_options(options_df))
+                _bulk_bhav_df = hot_df
             _bulk_loaded = True
             _bulk_date_range = (from_date, to_date)
             _bhav_by_date_symbol = sym_upper
-            _bhav_by_date_from   = from_date
-            _bhav_by_date_to     = to_date
+            if not _rust_lookup_active:
+                _bhav_by_date_from = from_date
+                _bhav_by_date_to   = to_date
 
     spot_df = get_bulk_spot_df()
     if spot_df is not None and not spot_df.is_empty():
@@ -3178,6 +3323,7 @@ def bulk_force_clear():
     """
     global _bulk_bhav_df, _bulk_spot_df, _bulk_loaded, _bulk_date_range
     global _bhav_by_date_symbol, _bhav_by_date_from, _bhav_by_date_to
+    global _rust_lookup_active
 
     dl_bulk_clear()
 
@@ -3189,6 +3335,7 @@ def bulk_force_clear():
     _bhav_by_date_symbol = None
     _bhav_by_date_from   = None
     _bhav_by_date_to     = None
+    _rust_lookup_active  = False
 
 
 def fast_get_option_premium(

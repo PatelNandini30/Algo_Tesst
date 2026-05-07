@@ -7,8 +7,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Response
 from celery.result import AsyncResult
 
-from backend.schemas.intraday import IntradayBacktestRequest
-from backend.services import backtest_cache
+from schemas.intraday import IntradayBacktestRequest
+from services import backtest_cache
 from worker.celery import celery_app
 
 logger = logging.getLogger(__name__)

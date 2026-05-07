@@ -6,9 +6,11 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::RwLock;
 
+use ahash::AHashMap;
 use arrow_array::{
     Array, ArrayRef, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array, Int64Array,
     LargeStringArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_ipc::reader::FileReader;
 use arrow_schema::DataType;
@@ -19,11 +21,32 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use pyo3::wrap_pyfunction;
 
-#[derive(Default)]
+// Compact integer-keyed cache: dramatically reduces memory vs String-keyed HashMaps.
+// (i32, u16, i64, u8, i32) uses ~20 bytes/key vs ~104 bytes for (String×4, i64).
+// For 4.3M rows: ~172MB vs ~650MB — eliminates memory-pressure swapping on HDD boxes.
 struct MarketCache {
-    options: HashMap<(String, String, i64, String, String), f64>,
-    spot: HashMap<(String, String), f64>,
-    strikes: HashMap<(String, String, String, String), Vec<(f64, f64)>>,
+    // (date_days, symbol_id, strike_i64, opttype_id, expiry_days) → close
+    options: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    // (date_days, symbol_id) → spot_close
+    spot: AHashMap<(i32, u16), f64>,
+    // (date_days, symbol_id, expiry_days, opttype_id) → sorted [(strike, close)]
+    strikes: AHashMap<(i32, u16, i32, u8), Vec<(f64, f64)>>,
+    // Symbol interning: name → u16 id
+    symbol_ids: AHashMap<String, u16>,
+    // Reverse: id → name (for debug / serialisation)
+    symbol_names: Vec<String>,
+}
+
+impl Default for MarketCache {
+    fn default() -> Self {
+        MarketCache {
+            options: AHashMap::new(),
+            spot: AHashMap::new(),
+            strikes: AHashMap::new(),
+            symbol_ids: AHashMap::new(),
+            symbol_names: Vec::new(),
+        }
+    }
 }
 
 static CACHE: Lazy<RwLock<Option<MarketCache>>> = Lazy::new(|| RwLock::new(None));
@@ -153,27 +176,20 @@ fn to_iso_date_from_array(array: &ArrayRef, row: usize) -> Option<String> {
             let dt = base.and_hms_opt(0, 0, 0)? + chrono::Duration::milliseconds(ms);
             Some(dt.date().format("%Y-%m-%d").to_string())
         }),
-        DataType::Timestamp(_, _) => array
-            .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-            .map(|arr| {
-                let ms = arr.value(row);
-                let base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
-                (base + chrono::Duration::milliseconds(ms))
-                    .date()
-                    .format("%Y-%m-%d")
-                    .to_string()
-            })
-            .or_else(|| {
-                array.as_any().downcast_ref::<TimestampMicrosecondArray>().map(|arr| {
-                    let us = arr.value(row);
-                    let base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
-                    (base + chrono::Duration::microseconds(us))
-                        .date()
-                        .format("%Y-%m-%d")
-                        .to_string()
-                })
-            }),
+        DataType::Timestamp(_, _) => {
+            let base = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+            if let Some(arr) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+                Some((base + chrono::Duration::seconds(arr.value(row))).date().format("%Y-%m-%d").to_string())
+            } else if let Some(arr) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                Some((base + chrono::Duration::milliseconds(arr.value(row))).date().format("%Y-%m-%d").to_string())
+            } else if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                Some((base + chrono::Duration::microseconds(arr.value(row))).date().format("%Y-%m-%d").to_string())
+            } else if let Some(arr) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                Some((base + chrono::Duration::nanoseconds(arr.value(row))).date().format("%Y-%m-%d").to_string())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -207,28 +223,52 @@ fn to_i64_strike(strike: f64) -> i64 {
     (strike * 100.0).round() as i64
 }
 
+// Parse "YYYY-MM-DD" (or longer) to days-since-epoch (i32).
+fn date_str_to_days(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.len() < 10 { return None; }
+    let y: i32 = s[..4].parse().ok()?;
+    let m: u32 = s[5..7].parse().ok()?;
+    let d: u32 = s[8..10].parse().ok()?;
+    let dt = NaiveDate::from_ymd_opt(y, m, d)?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    Some((dt - epoch).num_days() as i32)
+}
+
+// Fast days-since-epoch (Date32 raw value) → "YYYY-MM-DD" string.
+fn days_to_date_str(days: i32, base: NaiveDate) -> String {
+    (base + Duration::days(days as i64)).format("%Y-%m-%d").to_string()
+}
+
+// "CE" → 0, anything else → 1.
+fn opt_type_to_id(s: &str) -> u8 {
+    if s.trim().eq_ignore_ascii_case("CE") { 0 } else { 1 }
+}
+
 fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type: &str, expiry: &str) -> Option<f64> {
     let cache = CACHE.read().ok()?;
     let cache = cache.as_ref()?;
-    cache
-        .options
-        .get(&(
-            normalize_date_str(date),
-            index.trim().to_uppercase(),
-            to_i64_strike(strike),
-            opt_type.trim().to_uppercase(),
-            normalize_date_str(expiry),
-        ))
-        .copied()
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let strike_key = to_i64_strike(strike);
+    let type_id = opt_type_to_id(opt_type);
+    let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
+    cache.options.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
 }
 
 fn lookup_spot_price(date: &str, index: &str) -> Option<f64> {
     let cache = CACHE.read().ok()?;
     let cache = cache.as_ref()?;
-    cache
-        .spot
-        .get(&(normalize_date_str(date), index.trim().to_uppercase()))
-        .copied()
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_upper = index.trim().to_uppercase();
+    // Try named symbol first, then fallback to id 0 (single-symbol feathers store under id 0 with empty name)
+    if let Some(&sym_id) = cache.symbol_ids.get(&sym_upper) {
+        if let Some(v) = cache.spot.get(&(date_days, sym_id)).copied() {
+            return Some(v);
+        }
+    }
+    // Fallback: empty-string symbol (feathers without Symbol column stored under id u16::MAX)
+    cache.spot.get(&(date_days, u16::MAX)).copied()
 }
 
 fn load_table_from_path(path: &str) -> PyResult<Vec<arrow_array::RecordBatch>> {
@@ -253,95 +293,111 @@ fn load_table_from_path(path: &str) -> PyResult<Vec<arrow_array::RecordBatch>> {
     Ok(batches)
 }
 
+// Get or insert a symbol into the interning table, returning its u16 id.
+fn intern_symbol(ids: &mut AHashMap<String, u16>, names: &mut Vec<String>, sym: &str) -> u16 {
+    if let Some(&id) = ids.get(sym) {
+        return id;
+    }
+    let id = names.len() as u16;
+    names.push(sym.to_string());
+    ids.insert(sym.to_string(), id);
+    id
+}
+
+// Arrow columns can be either Utf8 (StringArray) or LargeUtf8 (LargeStringArray).
+// Polars writes LargeStringArray by default; handle both to avoid silently skipping batches.
+enum AnyStrArray<'a> {
+    Sm(&'a StringArray),
+    Lg(&'a LargeStringArray),
+}
+impl<'a> AnyStrArray<'a> {
+    fn from_col(col: &'a dyn Array) -> Option<Self> {
+        if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+            return Some(AnyStrArray::Sm(a));
+        }
+        if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+            return Some(AnyStrArray::Lg(a));
+        }
+        None
+    }
+    fn is_null(&self, i: usize) -> bool {
+        match self { AnyStrArray::Sm(a) => a.is_null(i), AnyStrArray::Lg(a) => a.is_null(i) }
+    }
+    fn value(&self, i: usize) -> &str {
+        match self { AnyStrArray::Sm(a) => a.value(i), AnyStrArray::Lg(a) => a.value(i) }
+    }
+}
+
 fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot_batches: Vec<arrow_array::RecordBatch>) -> MarketCache {
     let mut cache = MarketCache::default();
+    let base_date = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
-    for batch in options_batches {
+    // Pre-allocate capacity to avoid rehashing on 4M+ rows
+    let total_rows: usize = options_batches.iter().map(|b| b.num_rows()).sum();
+    cache.options.reserve(total_rows);
+    cache.strikes.reserve(total_rows / 8);  // rough estimate of unique (date,sym,exp,type) keys
+
+    // Date-days string cache: avoids repeated chrono formatting for ~2000 unique dates
+    let mut date_str_cache: AHashMap<i32, String> = AHashMap::with_capacity(4096);
+
+    for batch in &options_batches {
         let schema = batch.schema();
-        let idx_date = schema.index_of("Date").ok();
-        let idx_symbol = schema.index_of("Symbol").ok();
-        let idx_expiry = schema.index_of("ExpiryDate").ok();
-        let idx_type = schema.index_of("OptionType").ok();
-        let idx_strike = schema.index_of("StrikePrice").ok();
-        let idx_close = schema.index_of("Close").ok();
-        let (Some(idx_date), Some(idx_symbol), Some(idx_expiry), Some(idx_type), Some(idx_strike), Some(idx_close)) =
-            (idx_date, idx_symbol, idx_expiry, idx_type, idx_strike, idx_close)
-        else {
-            continue;
+        let (idx_date, idx_symbol, idx_expiry, idx_type, idx_strike, idx_close) = match (
+            schema.index_of("Date").ok(),
+            schema.index_of("Symbol").ok(),
+            schema.index_of("ExpiryDate").ok(),
+            schema.index_of("OptionType").ok(),
+            schema.index_of("StrikePrice").ok(),
+            schema.index_of("Close").ok(),
+        ) {
+            (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
+            _ => continue,
         };
 
-        let date_col = batch.column(idx_date).clone();
-        let symbol_col = batch.column(idx_symbol).clone();
-        let expiry_col = batch.column(idx_expiry).clone();
-        let type_col = batch.column(idx_type).clone();
-        let strike_col = batch.column(idx_strike).clone();
-        let close_col = batch.column(idx_close).clone();
+        // Downcast columns once outside the row loop — critical for performance.
+        // Accept both Utf8 (StringArray) and LargeUtf8 (LargeStringArray) — Polars writes large_string.
+        let Some(date_arr) = batch.column(idx_date).as_any().downcast_ref::<Date32Array>() else { continue };
+        let Some(expiry_arr) = batch.column(idx_expiry).as_any().downcast_ref::<Date32Array>() else { continue };
+        let Some(symbol_arr) = AnyStrArray::from_col(batch.column(idx_symbol).as_ref()) else { continue };
+        let Some(type_arr) = AnyStrArray::from_col(batch.column(idx_type).as_ref()) else { continue };
+        let Some(strike_arr) = batch.column(idx_strike).as_any().downcast_ref::<Float64Array>() else { continue };
+        let Some(close_arr) = batch.column(idx_close).as_any().downcast_ref::<Float64Array>() else { continue };
 
         for row in 0..batch.num_rows() {
-            let date_s = match to_iso_date_from_array(&date_col, row) {
-                Some(v) => v,
-                None => continue,
-            };
-            let expiry_s = match to_iso_date_from_array(&expiry_col, row) {
-                Some(v) => v,
-                None => continue,
-            };
-            let symbol_s = if symbol_col.is_null(row) {
-                continue;
+            if date_arr.is_null(row) || expiry_arr.is_null(row)
+                || symbol_arr.is_null(row) || type_arr.is_null(row)
+                || strike_arr.is_null(row) || close_arr.is_null(row) { continue; }
+
+            let date_days = date_arr.value(row);
+            let expiry_days = expiry_arr.value(row);
+            let strike_v = strike_arr.value(row);
+            let close_v = close_arr.value(row);
+
+            let sym_raw = symbol_arr.value(row).trim();
+            if sym_raw.is_empty() { continue; }
+            // intern_symbol needs mut refs; we use a temporary uppercase string
+            let sym_upper_owned;
+            let sym_upper = if sym_raw.bytes().all(|b| b.is_ascii_uppercase()) {
+                sym_raw
             } else {
-                match symbol_col.data_type() {
-                    DataType::Utf8 => symbol_col
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .map(|arr| arr.value(row).trim().to_uppercase()),
-                    DataType::LargeUtf8 => symbol_col
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .map(|arr| arr.value(row).trim().to_uppercase()),
-                    _ => None,
-                }
+                sym_upper_owned = sym_raw.to_uppercase();
+                &sym_upper_owned
             };
-            let symbol_s = match symbol_s {
-                Some(v) if !v.is_empty() => v,
-                _ => continue,
-            };
-            let opt_type_s = if type_col.is_null(row) {
-                continue;
-            } else {
-                match type_col.data_type() {
-                    DataType::Utf8 => type_col
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .map(|arr| arr.value(row).trim().to_uppercase()),
-                    DataType::LargeUtf8 => type_col
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .map(|arr| arr.value(row).trim().to_uppercase()),
-                    _ => None,
-                }
-            };
-            let opt_type_s = match opt_type_s {
-                Some(v) if !v.is_empty() => v,
-                _ => continue,
-            };
-            let strike_v = match to_f64_from_array(&strike_col, row) {
-                Some(v) => v,
-                None => continue,
-            };
-            let close_v = match to_f64_from_array(&close_col, row) {
-                Some(v) => v,
-                None => continue,
-            };
+            let sym_id = intern_symbol(&mut cache.symbol_ids, &mut cache.symbol_names, sym_upper);
+
+            let type_raw = type_arr.value(row).trim();
+            let type_id = opt_type_to_id(type_raw);
+
             let strike_key = to_i64_strike(strike_v);
-            cache.options.insert(
-                (date_s.clone(), symbol_s.clone(), strike_key, opt_type_s.clone(), expiry_s.clone()),
-                close_v,
-            );
-            cache
-                .strikes
-                .entry((date_s, symbol_s, expiry_s, opt_type_s))
+
+            cache.options.insert((date_days, sym_id, strike_key, type_id, expiry_days), close_v);
+            cache.strikes
+                .entry((date_days, sym_id, expiry_days, type_id))
                 .or_default()
                 .push((strike_v, close_v));
+
+            // Populate date_str_cache lazily (used only for debug/logging, not critical path)
+            date_str_cache.entry(date_days).or_insert_with(|| days_to_date_str(date_days, base_date));
         }
     }
 
@@ -349,52 +405,65 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
         values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    for batch in spot_batches {
+    // Spot batches
+    let total_spot: usize = spot_batches.iter().map(|b| b.num_rows()).sum();
+    cache.spot.reserve(total_spot + 16);
+
+    for batch in &spot_batches {
         let schema = batch.schema();
-        let idx_date = schema.index_of("Date").ok();
-        let idx_close = schema.index_of("Close").ok();
-        let (Some(idx_date), Some(idx_close)) = (idx_date, idx_close) else {
+        let (Some(idx_date), Some(idx_close)) = (schema.index_of("Date").ok(), schema.index_of("Close").ok()) else { continue };
+        let idx_symbol = schema.index_of("Symbol").ok();
+
+        let Some(date_arr) = batch.column(idx_date).as_any().downcast_ref::<Date32Array>() else {
+            // Fallback for non-Date32 spot (legacy)
+            let date_col = batch.column(idx_date).clone();
+            let close_col = batch.column(idx_close).clone();
+            let sym_col = idx_symbol.map(|i| batch.column(i).clone());
+            for row in 0..batch.num_rows() {
+                let date_s = match to_iso_date_from_array(&date_col, row) { Some(v) => v, None => continue };
+                let date_days = match date_str_to_days(&date_s) { Some(v) => v, None => continue };
+                let close_v = match to_f64_from_array(&close_col, row) { Some(v) => v, None => continue };
+                let sym_id = if let Some(ref sc) = sym_col {
+                    if sc.is_null(row) { continue; }
+                    let sym = match sc.data_type() {
+                        DataType::Utf8 => sc.as_any().downcast_ref::<StringArray>().map(|a| a.value(row).trim().to_uppercase()),
+                        _ => None,
+                    };
+                    match sym {
+                        Some(s) if !s.is_empty() => intern_symbol(&mut cache.symbol_ids, &mut cache.symbol_names, &s),
+                        _ => u16::MAX,
+                    }
+                } else { u16::MAX };
+                cache.spot.insert((date_days, sym_id), close_v);
+            }
             continue;
         };
-        let idx_symbol = schema.index_of("Symbol").ok();
-        let date_col = batch.column(idx_date).clone();
-        let close_col = batch.column(idx_close).clone();
-        let symbol_col = idx_symbol.map(|i| batch.column(i).clone());
-        let has_symbol = symbol_col.is_some();
+
+        let Some(close_arr) = batch.column(idx_close).as_any().downcast_ref::<Float64Array>() else { continue };
+        let sym_arr = idx_symbol.and_then(|i| batch.column(i).as_any().downcast_ref::<StringArray>());
 
         for row in 0..batch.num_rows() {
-            let date_s = match to_iso_date_from_array(&date_col, row) {
-                Some(v) => v,
-                None => continue,
-            };
-            let symbol_s = if has_symbol {
-                let col = symbol_col.as_ref().unwrap();
-                if col.is_null(row) {
-                    continue;
-                }
-                match col.data_type() {
-                    DataType::Utf8 => col
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .map(|arr| arr.value(row).trim().to_uppercase()),
-                    DataType::LargeUtf8 => col
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .map(|arr| arr.value(row).trim().to_uppercase()),
-                    _ => None,
+            if date_arr.is_null(row) || close_arr.is_null(row) { continue; }
+            let date_days = date_arr.value(row);
+            let close_v = close_arr.value(row);
+            let sym_id = if let Some(arr) = sym_arr {
+                if arr.is_null(row) { u16::MAX } else {
+                    let sym_raw = arr.value(row).trim();
+                    if sym_raw.is_empty() { u16::MAX } else {
+                        let sym_upper_owned;
+                        let sym_upper = if sym_raw.bytes().all(|b| b.is_ascii_uppercase()) {
+                            sym_raw
+                        } else {
+                            sym_upper_owned = sym_raw.to_uppercase();
+                            &sym_upper_owned
+                        };
+                        intern_symbol(&mut cache.symbol_ids, &mut cache.symbol_names, sym_upper)
+                    }
                 }
             } else {
-                Some(String::new())
+                u16::MAX  // no Symbol column: store under sentinel id
             };
-            let symbol_s = match symbol_s {
-                Some(v) => v,
-                None => continue,
-            };
-            let close_v = match to_f64_from_array(&close_col, row) {
-                Some(v) => v,
-                None => continue,
-            };
-            cache.spot.insert((date_s, symbol_s), close_v);
+            cache.spot.insert((date_days, sym_id), close_v);
         }
     }
 
@@ -448,16 +517,11 @@ fn get_strikes_for_date(
         Some(v) => v,
         None => return Vec::new(),
     };
-    cache
-        .strikes
-        .get(&(
-            normalize_date_str(&date),
-            index.trim().to_uppercase(),
-            normalize_date_str(&expiry),
-            opt_type.trim().to_uppercase(),
-        ))
-        .cloned()
-        .unwrap_or_default()
+    let date_days = match date_str_to_days(&normalize_date_str(&date)) { Some(v) => v, None => return Vec::new() };
+    let expiry_days = match date_str_to_days(&normalize_date_str(&expiry)) { Some(v) => v, None => return Vec::new() };
+    let sym_id = match cache.symbol_ids.get(&index.trim().to_uppercase()) { Some(&id) => id, None => return Vec::new() };
+    let type_id = opt_type_to_id(&opt_type);
+    cache.strikes.get(&(date_days, sym_id, expiry_days, type_id)).cloned().unwrap_or_default()
 }
 
 fn py_any_to_string_opt(obj: Option<&PyAny>) -> Option<String> {

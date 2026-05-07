@@ -20,6 +20,7 @@ dependencies = [
 name = "algotest_native"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",

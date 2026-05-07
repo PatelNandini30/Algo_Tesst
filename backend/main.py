@@ -37,7 +37,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Include routers
 from routers import backtest, expiry, strategies
 from routers.upload import router as upload_router
-from backend.routers.intraday import router as intraday_router
+from routers.intraday import router as intraday_router
 
 @asynccontextmanager
 async def lifespan(app):

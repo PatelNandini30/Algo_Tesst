@@ -352,6 +352,23 @@ const getLotSize = (index, tradeDate) => {
 const STRIKE_INTERVALS = Object.fromEntries(
   Object.entries(INDEX_CONFIG).map(([symbol, config]) => [symbol, config.strikeInterval])
 );
+const STRIKE_INTERVAL_OPTIONS = [50, 100];
+const normalizeStrikeInterval = (value) => {
+  const parsed = Number(value);
+  return STRIKE_INTERVAL_OPTIONS.includes(parsed) ? parsed : 50;
+};
+
+const StrikeIntervalSelect = ({ value, onChange, className = '' }) => (
+  <select
+    value={normalizeStrikeInterval(value)}
+    onChange={e => onChange(normalizeStrikeInterval(e.target.value))}
+    className={className}
+  >
+    {STRIKE_INTERVAL_OPTIONS.map(interval => (
+      <option key={interval} value={interval}>{interval}</option>
+    ))}
+  </select>
+);
 
 function getBufferPreview(value, unit, applyTo, posAbove, posBelow, indexName = 'NIFTY') {
   const spot = 25000;
@@ -435,6 +452,7 @@ const createDefaultLazyLeg = (index = 1) => ({
   expiry: 'weekly',
   strike_criteria: 'strike_type',
   strike_type: 'atm',
+  strike_interval: 50,
   premium_value: 0,
   premium_min: 0,
   premium_max: 0,
@@ -549,6 +567,14 @@ const LazyLegModal = ({
                 <option value="closest_premium">Closest Premium</option>
                 <option value="premium_range">Premium Range</option>
               </select>
+            </label>
+            <label className="text-xs text-secondary">
+              Strike Gap
+              <StrikeIntervalSelect
+                value={form.strike_interval}
+                onChange={value => set('strike_interval', value)}
+                className={`${inputClass} mt-1 w-full`}
+              />
             </label>
             {form.strike_criteria === 'strike_type' && (
               <label className="text-xs text-secondary">
@@ -704,6 +730,7 @@ const StrategyBuilder = () => {
   const [underlying, setUnderlying] = useState('cash');
   const [strategyType, setStrategyType] = useState('positional');
   const [expiryBasis, setExpiryBasis] = useState('weekly');
+  const [rolloverToggle, setRolloverToggle] = useState(false);
   const [entryDaysBefore, setEntryDaysBefore] = useState(2);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
   const [delayTime, setDelayTime] = useState('09:15');
@@ -738,6 +765,7 @@ const StrategyBuilder = () => {
   const normalizeLegForSelectedIndex = useCallback((leg) => ({
     ...leg,
     expiry: normalizeExpiryForIndex(leg.expiry, instrument, leg.segment),
+    strike_interval: normalizeStrikeInterval(leg.strike_interval),
     re_entry_target_mode: normalizeReEntryMode(leg.re_entry_target_mode),
     re_entry_sl_mode: normalizeReEntryMode(leg.re_entry_sl_mode),
   }), [instrument]);
@@ -793,6 +821,7 @@ const [slippagePct, setSlippagePct] = useState(0);
     expiry: 'weekly',
     strike_criteria: 'strike_type',
     strike_type: 'atm',
+    strike_interval: 50,
     premium_value: 0,
     premium_min: 0,
     premium_max: 0,
@@ -839,6 +868,8 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [strSegments, setStrSegments] = useState({ '5x1': [], '5x2': [] });
   const [startDate, setStartDate] = useState('01/08/2024');
   const [endDate, setEndDate] = useState('28/04/2026');
+  // Track per-instrument whether the user has manually edited dates
+  const userEditedDatesRef = useRef(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
@@ -921,14 +952,44 @@ const [slippagePct, setSlippagePct] = useState(0);
   }, [isValidDate]);
 
   const handleStartDateChange = (formatted) => {
+    userEditedDatesRef.current = true;
     setStartDate(formatted);
     evaluateDateValidation(formatted, endDate);
   };
 
   const handleEndDateChange = (formatted) => {
+    userEditedDatesRef.current = true;
     setEndDate(formatted);
     evaluateDateValidation(startDate, formatted);
   };
+
+  // On mount and on instrument change, default the end date to the last available
+  // date in the data (and start date to ~2 years before it). Skip if user has
+  // already edited the dates manually.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/data/dates?index=${encodeURIComponent(instrument)}`);
+        if (!res.ok) return;
+        const { min_date, max_date } = await res.json();
+        if (cancelled || !max_date || userEditedDatesRef.current) return;
+        const toDDMMYYYY = (iso) => {
+          const [y, m, d] = iso.split('-');
+          return `${d}/${m}/${y}`;
+        };
+        // Start defaults to 01/01/2025; end defaults to the last available data date.
+        const startStr = '01/01/2025';
+        const endStr = toDDMMYYYY(max_date);
+        setStartDate(startStr);
+        setEndDate(endStr);
+        evaluateDateValidation(startStr, endStr);
+      } catch (e) {
+        // network or parse error — keep the hardcoded defaults
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [instrument, evaluateDateValidation]);
 
   const stopJobPolling = useCallback(() => {
     if (jobPollRef.current) {
@@ -1324,6 +1385,7 @@ const [slippagePct, setSlippagePct] = useState(0);
     setDraftLeg(prev => ({
       ...prev,
       strike_type: 'atm',
+      strike_interval: normalizeStrikeInterval(prev.strike_interval),
       premium_value: 0,
       premium_min: 0,
       premium_max: 0,
@@ -1530,9 +1592,11 @@ const [slippagePct, setSlippagePct] = useState(0);
       lots: ll.lot || 1,
       option_type: optType === 'call' ? 'CE' : 'PE',
       expiry: normalizeExpiryForIndex(ll.expiry || defaultOptionExpiry, instrument, 'options').toUpperCase(),
+      strike_interval: normalizeStrikeInterval(ll.strike_interval),
       strike_selection: {
         type: strikeType,
         strike_type: (ll.strike_type || 'atm').toUpperCase(),
+        strike_interval: normalizeStrikeInterval(ll.strike_interval),
         premium: ll.premium_value || 0,
         lower: ll.premium_min || 0,
         upper: ll.premium_max || 0,
@@ -1590,9 +1654,11 @@ const [slippagePct, setSlippagePct] = useState(0);
         const rawOpt = (l.option_type || '').toLowerCase();
         leg.option_type = rawOpt === 'call' ? 'CE' : rawOpt === 'put' ? 'PE' : l.option_type.toUpperCase();
         leg.expiry = normalizeExpiryForIndex(l.expiry, instrument, 'options').toUpperCase();
+        leg.strike_interval = normalizeStrikeInterval(l.strike_interval);
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
           strike_type: l.strike_type.toUpperCase(),
+          strike_interval: normalizeStrikeInterval(l.strike_interval),
           premium: l.premium_value,
           lower: l.premium_min,
           upper: l.premium_max,
@@ -1697,6 +1763,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       underlying,
       strategy_type: strategyType,
       expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
+      rollover_toggle: rolloverToggle && ['weekly', 'monthly'].includes(expiryBasis),
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
       square_off_mode: squareOffMode,
@@ -1727,6 +1794,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
       super_trend_config: (strFilter.enabled && strFilter.configId !== 'custom') ? strFilter.configId : 'None',
       filter_entry_mode: strFilter.enabled ? (strFilter.entryMode || 'dte') : 'dte',
+      fixed_late_entry: strFilter.enabled && strFilter.entryMode === 'fixed' ? Boolean(strFilter.lateEntry) : false,
       str_filter: strFilter.enabled
         ? { enabled: true, config: strFilter.configId }
         : { enabled: false },
@@ -1799,7 +1867,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       .some(l => l.expiry === 'monthly');
     const hasCurrentExpiryLegs = hasCurrentExpiryOptionLegs || hasCurrentExpiryFuturesLegs;
 
-    if (hasCurrentExpiryLegs) {
+    if (hasCurrentExpiryLegs && !rolloverToggle) {
       const basisLabel = hasCurrentExpiryOptionLegs
         ? (expiryBasis === 'weekly' ? 'Weekly' : 'Monthly')
         : 'Monthly Futures';
@@ -1916,7 +1984,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       setJobStatusLabel('');
       setError(err.message || 'Backtest queue failed');
     }
-  }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
+  }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, rolloverToggle, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
 
   const strikeTypeToIntradayOffset = (strikeType, optType) => {
     if (!strikeType || strikeType === 'atm') return 0;
@@ -2210,6 +2278,27 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {backtestMode === 'eod' && legs.length > 0 && legs.every(l => l.segment === 'futures') && legs.some(l => l.expiry === 'next_monthly') && (
                   <div className="text-[11px] text-muted mt-1">
                     Futures Next Monthly: entry anchored to <strong>current</strong> monthly expiry, exit anchored to <strong>next</strong> monthly expiry. All Entry/Exit DTE combinations are valid.
+                  </div>
+                )}
+
+                {/* Rollover Toggle — EOD weekly/monthly only */}
+                {backtestMode === 'eod' && ['weekly', 'monthly'].includes(expiryBasis) && (
+                  <div className="bg-surface shadow-sm border border-default rounded-xl p-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
+                          Re-entry Rollover
+                        </span>
+                        <span className="text-[11px] text-muted pl-2">
+                          Exit anchors to next expiry. Same-day rollover: exit one contract and enter the next on the same day.
+                        </span>
+                      </div>
+                      <Toggle
+                        enabled={rolloverToggle}
+                        onToggle={(val) => setRolloverToggle(val !== undefined ? Boolean(val) : !rolloverToggle)}
+                        size="sm"
+                      />
+                    </div>
                   </div>
                 )}
 
@@ -2656,6 +2745,17 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
+                {backtestMode === 'eod' && draftLeg.segment === 'options' && (
+                  <div>
+                    <label className="field-label">Strike Gap</label>
+                    <StrikeIntervalSelect
+                      value={draftLeg.strike_interval}
+                      onChange={value => setDraftLeg(prev => ({ ...prev, strike_interval: value }))}
+                      className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-24"
+                    />
+                  </div>
+                )}
+
                 {/* Strike Type / Premium */}
                 {draftLeg.segment === 'options' && draftLeg.strike_criteria !== 'straddle_width' && (
                   <div>
@@ -2897,6 +2997,16 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   </div>
                                 )}
                               </div>
+                              {backtestMode === 'eod' && (
+                                <div>
+                                  <label className="field-label">Strike Gap</label>
+                                  <StrikeIntervalSelect
+                                    value={leg.strike_interval}
+                                    onChange={value => updateLeg(leg.id, 'strike_interval', value)}
+                                    className="h-7 px-2 border border-default rounded text-xs bg-surface w-20"
+                                  />
+                                </div>
+                              )}
                               {leg.strike_criteria !== 'straddle_width' && (
                                 <div>
                                   {(leg.strike_criteria === 'strike_type' || leg.strike_criteria === 'synthetic_future') && (
@@ -3162,6 +3272,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <option value="premium_range">Premium Range</option>
                           </select>
                         </label>
+                        <label className="text-xs text-muted">
+                          Strike Gap
+                          <StrikeIntervalSelect
+                            value={ll.strike_interval}
+                            onChange={value => updateLazyLeg(ll.id, 'strike_interval', value)}
+                            className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface w-20"
+                          />
+                        </label>
                         {ll.strike_criteria === 'closest_premium' ? (
                           <label className="text-xs text-muted">
                             Premium
@@ -3333,6 +3451,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <option value="closest_premium">Closest Premium</option>
                         <option value="premium_range">Premium Range</option>
                       </select>
+                    </label>
+                    <label className="text-xs text-secondary">
+                      Strike Gap
+                      <StrikeIntervalSelect
+                        value={ll.strike_interval}
+                        onChange={value => updateLazyLeg(ll.id, 'strike_interval', value)}
+                        className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface"
+                      />
                     </label>
                     {ll.strike_criteria === 'closest_premium' ? (
                       <label className="text-xs text-secondary">
