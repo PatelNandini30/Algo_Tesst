@@ -1085,7 +1085,9 @@ const [slippagePct, setSlippagePct] = useState(0);
   };
 
   // When filter is toggled ON, automatically set date range to filter's start/end
-  // Limit to last 5 years to avoid memory/disk issues
+  // Default start is capped at 01/01/2019
+  const STR_DEFAULT_START = '01/01/2019';
+  const STR_DEFAULT_START_DATE = new Date('2019-01-01');
   const prevFilterEnabledRef = useRef(false);
   const lastAutoDateRef = useRef(null);
   const [showFullRange, setShowFullRange] = useState(false);
@@ -1093,62 +1095,54 @@ const [slippagePct, setSlippagePct] = useState(0);
     if (strFilter.enabled && !prevFilterEnabledRef.current && strFilter.summary?.range) {
       const filterStart = formatSummaryDateInput(strFilter.summary.range.from);
       const filterEnd = formatSummaryDateInput(strFilter.summary.range.to);
-      
-      // Check if filter range is larger than 5 years
+
       const filterStartDate = new Date(strFilter.summary.range.from);
-      const fiveYearsAgo = new Date();
-      fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
-      const needsLimited = filterStartDate < fiveYearsAgo;
-      
+      const needsLimited = filterStartDate < STR_DEFAULT_START_DATE;
+
       if (needsLimited && !showFullRange) {
-        // Use 5 years ago as start
-        const proposedStart = formatSummaryDateInput(fiveYearsAgo.toISOString().split('T')[0]);
-        if (proposedStart && filterEnd) {
-          setStartDate(proposedStart);
+        if (filterEnd) {
+          setStartDate(STR_DEFAULT_START);
           setEndDate(filterEnd);
-          lastAutoDateRef.current = `${proposedStart}|${filterEnd}`;
-          evaluateDateValidation(proposedStart, filterEnd);
+          lastAutoDateRef.current = `${STR_DEFAULT_START}|${filterEnd}`;
+          userEditedDatesRef.current = true;
+          evaluateDateValidation(STR_DEFAULT_START, filterEnd);
         }
       } else {
-        // Use full filter range
         if (filterStart && filterEnd) {
           setStartDate(filterStart);
           setEndDate(filterEnd);
           lastAutoDateRef.current = `${filterStart}|${filterEnd}`;
+          userEditedDatesRef.current = true;
           evaluateDateValidation(filterStart, filterEnd);
         }
       }
     }
     prevFilterEnabledRef.current = strFilter.enabled;
-    // Reset showFullRange when filter is disabled
     if (!strFilter.enabled) {
       setShowFullRange(false);
+      userEditedDatesRef.current = false;
     }
   }, [strFilter.enabled, strFilter.summary?.range, evaluateDateValidation, showFullRange]);
 
   // Also update dates when range changes (e.g., different filter config selected)
   useEffect(() => {
     if (!strFilter.enabled || !strFilter.summary?.range) return;
-    
+
     const filterStart = formatSummaryDateInput(strFilter.summary.range.from);
     const filterEnd = formatSummaryDateInput(strFilter.summary.range.to);
-    
+
     const filterStartDate = new Date(strFilter.summary.range.from);
-    const fiveYearsAgo = new Date();
-    fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
-    const needsLimited = filterStartDate < fiveYearsAgo;
-    
-    const proposedStart = (needsLimited && !showFullRange) 
-      ? formatSummaryDateInput(fiveYearsAgo.toISOString().split('T')[0])
-      : filterStart;
-    
+    const needsLimited = filterStartDate < STR_DEFAULT_START_DATE;
+
+    const proposedStart = (needsLimited && !showFullRange) ? STR_DEFAULT_START : filterStart;
+
     if (!proposedStart || !filterEnd) return;
-    // Only auto-update if dates haven't been manually changed (compare with last auto-set values)
     const currentAutoKey = `${proposedStart}|${filterEnd}`;
     if (lastAutoDateRef.current === currentAutoKey) return;
     setStartDate(proposedStart);
     setEndDate(filterEnd);
     lastAutoDateRef.current = currentAutoKey;
+    userEditedDatesRef.current = true;
     evaluateDateValidation(proposedStart, filterEnd);
   }, [
     strFilter.enabled,
@@ -1795,6 +1789,9 @@ const [slippagePct, setSlippagePct] = useState(0);
       super_trend_config: (strFilter.enabled && strFilter.configId !== 'custom') ? strFilter.configId : 'None',
       filter_entry_mode: strFilter.enabled ? (strFilter.entryMode || 'dte') : 'dte',
       fixed_late_entry: strFilter.enabled && strFilter.entryMode === 'fixed' ? Boolean(strFilter.lateEntry) : false,
+      min_days_to_entry: strFilter.enabled && strFilter.entryMode === 'min_days'
+        ? (parseInt(strFilter.minDaysToEntry) || 3)
+        : 0,
       str_filter: strFilter.enabled
         ? { enabled: true, config: strFilter.configId }
         : { enabled: false },

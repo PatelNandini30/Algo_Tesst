@@ -42,6 +42,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const dropdownRef = useRef(null);
   const [entryMode, setEntryMode] = useState('dte');
   const [lateEntry, setLateEntry] = useState(false);
+  const [minDaysToEntry, setMinDaysToEntry] = useState(3);
 
   const selectedOption = useMemo(
     () => STR_FILTER_OPTIONS.find(opt => opt.value === selected) ?? STR_FILTER_OPTIONS[0],
@@ -171,22 +172,24 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
       segments: payloadSegments,
       entryMode,
       lateEntry: entryMode === 'fixed' ? lateEntry : false,
+      minDaysToEntry: entryMode === 'min_days' ? minDaysToEntry : 0,
     };
 
     const prevState = prevFilterChangeRef.current;
     const stateChanged = !prevState ||
-      prevState.enabled   !== filterState.enabled   ||
-      prevState.configId  !== filterState.configId  ||
-      prevState.segments  !== filterState.segments  ||
-      prevState.entryMode !== filterState.entryMode ||
-      prevState.lateEntry !== filterState.lateEntry;
+      prevState.enabled        !== filterState.enabled        ||
+      prevState.configId       !== filterState.configId       ||
+      prevState.segments       !== filterState.segments       ||
+      prevState.entryMode      !== filterState.entryMode      ||
+      prevState.lateEntry      !== filterState.lateEntry      ||
+      prevState.minDaysToEntry !== filterState.minDaysToEntry;
 
     prevFilterChangeRef.current = filterState;
 
     if (!stateChanged) return;
 
     onFilterChange?.(filterState);
-  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, entryMode, lateEntry, onFilterChange]);
+  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, entryMode, lateEntry, minDaysToEntry, onFilterChange]);
 
   const previewRows = useMemo(() => {
     if (!enabled) return [];
@@ -350,6 +353,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                 >
                   <option value="dte">DTE Entry — N days before each expiry</option>
                   <option value="fixed">Fixed Entry — Pinned to segment start</option>
+                  <option value="min_days">Min. Days to Entry — Skip first cycle if too close</option>
                 </select>
                 <ChevronDown
                   size={14}
@@ -357,9 +361,9 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                 />
               </div>
               <p className="text-[11px] text-muted leading-relaxed">
-                {entryMode === 'dte'
-                  ? 'Enter N days before each expiry within the segment. Current behaviour — unchanged.'
-                  : 'Enter on segment start date, then re-enter the next trading day after each exit. Stays active throughout the segment with no gap.'}
+                {entryMode === 'dte' && 'Enter N days before each expiry within the segment. Current behaviour — unchanged.'}
+                {entryMode === 'fixed' && 'Enter on segment start date, then re-enter the next trading day after each exit. Stays active throughout the segment with no gap.'}
+                {entryMode === 'min_days' && 'Skip the first expiry cycle if fewer than N trading days remain from segment start. Trade 1 then begins at that expiry day; subsequent re-entries follow your rollover settings.'}
               </p>
               {entryMode === 'fixed' && (
                 <label className="flex items-center gap-2 cursor-pointer select-none mt-1">
@@ -373,6 +377,28 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                     Late entry — if DTE window has passed, enter next trading day after exit (no expiry skipped)
                   </span>
                 </label>
+              )}
+              {entryMode === 'min_days' && (
+                <div className="space-y-1.5 mt-1">
+                  <p className="text-[11px] text-muted">Minimum trading days from segment start to first expiry:</p>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {[1, 2, 3, 4, 5].map(n => (
+                      <button
+                        key={n}
+                        type="button"
+                        onClick={() => setMinDaysToEntry(n)}
+                        className={`px-2.5 py-1 text-[11px] font-medium rounded-md border transition-colors ${
+                          minDaysToEntry === n
+                            ? 'bg-blue-600 text-white border-blue-600'
+                            : 'bg-hover text-secondary border-default hover:border-blue-400'
+                        }`}
+                      >
+                        {n}{n === 3 ? ' ★' : ''}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-muted">★ = recommended for weekly options</p>
+                </div>
               )}
             </div>
 

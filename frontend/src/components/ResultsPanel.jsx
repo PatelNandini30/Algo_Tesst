@@ -1125,6 +1125,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const hasFutures = sourceTrades.some(t => (t['Type']||'').toUpperCase() === 'FUT');
     const hasStr     = showStrSegment && sourceTrades.some(t => t['STR Segment']);
     const hasBuffer  = bufferStrikeEnabled;
+    const hasSpotAdj = Boolean(results?.meta?.spot_adjustment_enabled);
     const hasReEntry = sourceTrades.some(t => (
       Boolean(t['ReEntryIndex'] || t['ReEntryTrigger'] || t['ReEntryMode']) || isLazyLegRow(t)
     ));
@@ -1217,7 +1218,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
       'B/S',
       ...(hasReEntry ? ['Re-Entry Type'] : []),
-      'Qty','Raw Entry Price','Entry Price','Raw Exit Price','Exit Price','MAE','MFE',
+      'Qty',
+      ...(hasSpotAdj ? ['Raw Entry Price'] : []),
+      'Entry Price',
+      ...(hasSpotAdj ? ['Raw Exit Price'] : []),
+      'Exit Price','MAE','MFE',
       ...(hasTradeMae ? ['Net MAE 1','Net MAE 2','Final MAE'] : []),
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
@@ -1320,7 +1325,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         cell.fill   = { type:'pattern', pattern:'solid', fgColor: bg };
         cell.border = thinBorder();
         cell.alignment = { vertical:'middle' };
-        // Ensure numeric cells are not formatted as text so Excel formulas work
+        // Coerce string numbers to actual numbers so Excel formulas (VLOOKUP etc.) work
+        if (typeof cell.value === 'string' && cell.value !== '') {
+          const n = Number(cell.value);
+          if (!isNaN(n)) cell.value = n;
+        }
         if (typeof cell.value === 'number') {
           cell.numFmt = Number.isInteger(cell.value) ? '0' : '#,##0.00';
         }

@@ -84,12 +84,6 @@ def get_lot_size_for_index(symbol: str | None, entry_date) -> int:
     d = pd.Timestamp(entry_date)
 
     if index == "NIFTY":
-        if d < pd.Timestamp("2010-10-01"):
-            return 200
-        if d < pd.Timestamp("2015-10-29"):
-            return 50
-        if d < pd.Timestamp("2019-11-01"):
-            return 75
         return 65
 
     if index == "BANKNIFTY":

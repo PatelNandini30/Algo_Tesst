@@ -715,6 +715,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 'buffer_strike_apply_to': payload.get('buffer_strike_apply_to', 'both'),
                 'buffer_position_above': payload.get('buffer_position_above', True),
                 'buffer_position_below': payload.get('buffer_position_below', True),
+                'spot_adjustment_enabled': bool(payload.get('spot_adjustment_enabled', False)),
                 'date_range': f"{effective_from} to {effective_to}",
             }),
             'cached': False,

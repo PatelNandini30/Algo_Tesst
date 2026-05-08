@@ -3107,7 +3107,9 @@ def run_algotest_backtest(params):
              f"(str_enabled={str_enabled}, filter_enabled={filter_enabled}, "
              f"filter_config={filter_config})")
     fixed_late_entry  = bool(params.get('fixed_late_entry',  False))
-    
+    min_days_to_entry = int(params.get('min_days_to_entry', 0) or 0)
+    min_days_mode     = (filter_entry_mode == 'min_days') and (str_enabled or filter_enabled)
+
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
     #   'max_loss'           → overall_sl_value is a fixed ₹ amount
@@ -3262,7 +3264,10 @@ def run_algotest_backtest(params):
         #
         # For mixed / non-next strategies both dates use the same anchor (current_exp).
         schedule_anchor = current_exp
-        if (_all_legs_next or _rollover_mode) and next_exp is not None:
+        # Only NEXT_WEEKLY / NEXT_MONTHLY anchor exit to next_exp.
+        # WEEKLY/MONTHLY rollover anchors exit to current_exp (each trade lives within ONE cycle;
+        # the same-day chain into the next cycle's contract is handled by the re-entry override).
+        if _all_legs_next and next_exp is not None:
             entry_date = calculate_trading_days_before_expiry(
                 expiry_date=current_exp,
                 days_before=entry_dte,
@@ -3312,10 +3317,13 @@ def run_algotest_backtest(params):
         _is_next_expiry_type = expiry_type.upper() in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1') or _all_legs_next or _rollover_mode
 
         if entry_date == exit_date:
-            if _is_next_expiry_type and next_exp is not None:
+            if _is_next_expiry_type and next_exp is not None and not _rollover_mode:
                 exit_date = next_exp
                 _force_next_expiry = True
                 _log(f"  INFO: Entry == Exit on expiry day (NEXT expiry type) → exit shifted to next expiry {next_exp.date()}, forcing next-expiry contract")
+            elif _rollover_mode:
+                # Rollover ON: keep the record. Re-entry override chains same-day into the next cycle's contract.
+                _log(f"  INFO: Entry == Exit ({entry_date.date()}) under rollover — record kept (same-day chain at re-entry)")
             else:
                 _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
                 _log(f"  INFO: Entry == Exit ({entry_date.date()}) for {expiry_type} → skipping (entry_dte == exit_dte results in ~0 P&L with previous-day close data)")
@@ -3515,30 +3523,31 @@ def run_algotest_backtest(params):
                         temp_idx += 1
                         continue
 
+                    # Rollover: re-entry ALWAYS chains same-day on prev_exit_ts (the new
+                    # rollover semantic: each cycle is its own trade, with same-day re-entry
+                    # into the next cycle's contract). The schedule's T-N entry_date is
+                    # ignored; we use prev_exit_ts as the actual entry.
+                    if rec_is_rollover:
+                        if prev_exit_ts > seg_end:
+                            temp_idx += 1
+                            continue
+                        next_entry_ts = prev_exit_ts
+                        schedule_idx  = temp_idx
+                        break
+
                     if candidate_entry < seg_start or candidate_entry > seg_end:
                         temp_idx += 1
                         continue
 
-                    # Rollover: same-day entry (candidate_entry == prev_exit_ts) is valid
-                    # (exiting one contract and entering the next on the same day).  Only
-                    # treat the entry as "past" when it is strictly before prev_exit_ts.
-                    _entry_is_past = (
-                        candidate_entry < prev_exit_ts
-                        if rec_is_rollover else
-                        candidate_entry <= prev_exit_ts
-                    )
+                    _entry_is_past = candidate_entry <= prev_exit_ts
                     if _entry_is_past:
-                        if fixed_late_entry or rec_is_rollover:
+                        if fixed_late_entry:
                             # DTE window already passed — enter on the next trading day
                             # after the previous exit instead of skipping this expiry.
                             late_entry = _next_trading_day_after(trading_calendar, prev_exit_ts)
-                            # For NEXT_WEEKLY/NEXT_MONTHLY/rollover the contract expires at
-                            # next_expiry, not current_expiry. Use the actual contract
-                            # expiry as the boundary so entering on the current expiry
-                            # day (valid for next-week contracts) is not rejected.
                             _contract_exp = (
                                 pd.Timestamp(candidate.get('next_expiry') or candidate_expiry)
-                                if (_all_legs_next or rec_is_rollover) else candidate_expiry
+                                if _all_legs_next else candidate_expiry
                             )
                             if (late_entry is None
                                     or pd.Timestamp(late_entry) >= _contract_exp
@@ -3565,13 +3574,73 @@ def run_algotest_backtest(params):
 
         else:
             _dte_last_exit = None
+            _min_days_skip_to = None  # expiry to use as entry after a min_days skip
             for rec in schedule:
                 if rec.get('entry_date') is None or rec.get('exit_date') is None:
                     continue
-                entry_ts = pd.Timestamp(rec['entry_date'])
+                entry_ts      = pd.Timestamp(rec['entry_date'])
+                _rec_rollover = rec.get('_rollover_mode', False)
+
+                # ── Mode 3: first-trade-only override ────────────────────────
+                if min_days_mode and _dte_last_exit is None:
+                    _cur_exp = pd.Timestamp(rec.get('current_expiry') or rec['expiry_date'])
+                    # Bound check uses current_expiry (T-N entry may fall before seg_start)
+                    if _cur_exp < seg_start:
+                        continue
+                    elif _cur_exp > seg_end:
+                        # Out-of-segment expiry — but if a prior short cycle already stored
+                        # a pending entry date inside the segment, use this rec as the
+                        # clamped-exit target and fall through (exit will be clamped below).
+                        if _min_days_skip_to is not None and _min_days_skip_to <= seg_end:
+                            entry_ts = _min_days_skip_to
+                            _min_days_skip_to = None
+                            _log(f"[MIN_DAYS] deferred entry={entry_ts.date()} using out-of-seg expiry {_cur_exp.date()} → exit will clamp to {seg_end.date()}")
+                        else:
+                            continue
+                    else:
+                        _idx_s = int(np.searchsorted(
+                            trading_calendar_arr, seg_start.normalize().to_numpy(), side='left'))
+                        _idx_x = int(np.searchsorted(
+                            trading_calendar_arr, _cur_exp.normalize().to_numpy(), side='left'))
+                        _dte_gap = _idx_x - _idx_s
+                        if _dte_gap >= min_days_to_entry:
+                            # No shift — Trade 1 enters at seg_start (or at the skipped
+                            # expiry date if a prior short cycle was skipped).
+                            entry_ts = _min_days_skip_to if _min_days_skip_to is not None else seg_start
+                            _min_days_skip_to = None
+                            _log(f"[MIN_DAYS] {_cur_exp.date()} DTE={_dte_gap} ≥ {min_days_to_entry} — no shift, entry={entry_ts.date()}")
+                        else:
+                            # SHIFT — entry forced to current_exp; meaningful only when
+                            # rec.exit_date > current_exp (rollover ON or NEXT_*).
+                            if pd.Timestamp(rec['exit_date']) > _cur_exp:
+                                entry_ts = _cur_exp
+                                _min_days_skip_to = None
+                                _log(f"[MIN_DAYS] {_cur_exp.date()} DTE={_dte_gap} < {min_days_to_entry} — SHIFT, entry={_cur_exp.date()}")
+                            else:
+                                # rec.exit == current_exp ⇒ skip cycle; remember the expiry so
+                                # the next cycle enters on this date instead of seg_start.
+                                _min_days_skip_to = _cur_exp
+                                _log(f"[MIN_DAYS] {_cur_exp.date()} DTE={_dte_gap} < {min_days_to_entry} — skip cycle, next entry={_cur_exp.date()}")
+                                continue
+
+                # ── Rollover same-day chain (re-entries) ─────────────────────
+                if _rec_rollover and _dte_last_exit is not None:
+                    entry_ts = _dte_last_exit
+
+                # ── First trade in DTE + rollover when entry==exit ───────────
+                # T-N/T-N rollover schedules have entry==exit (e.g. T-0/T-0 → both = current_exp).
+                # Without this override the first trade would be 0-day with ~0 P&L.
+                # Anchor first entry to seg_start so Trade 1 = seg_start → current_exp,
+                # then the same-day chain takes over for re-entries.
+                if (
+                    _rec_rollover and _dte_last_exit is None and not min_days_mode
+                    and entry_ts == pd.Timestamp(rec['exit_date'])
+                    and entry_ts > seg_start
+                ):
+                    entry_ts = seg_start
+
                 if entry_ts < seg_start or entry_ts > seg_end:
                     continue
-                _rec_rollover = rec.get('_rollover_mode', False)
                 # Rollover and NEXT_WEEKLY: each trade is on a different contract so
                 # date overlap between consecutive trades is intentional — bypass entirely.
                 _bypass_overlap = _all_legs_next or _rec_rollover
@@ -3585,13 +3654,25 @@ def run_algotest_backtest(params):
                     last_day = _last_trading_day_on_or_before(
                         trading_calendar, seg_end
                     )
-                    if last_day is None or pd.Timestamp(last_day) < entry_ts:
+                    if last_day is None or pd.Timestamp(last_day) <= entry_ts:
+                        # last_day == entry_ts would be a 0-day clamped trade with ~0 P&L.
+                        # Without this skip, the rollover same-day chain produces one such
+                        # 0-day trade per remaining schedule record (all collapsed to seg_end).
                         continue
                     exit_ts = pd.Timestamp(last_day)
+                # Final guard: a 0-day trade (entry_ts == exit_ts) carries no P&L. This
+                # can also happen for the very first DTE+rollover record under T-N/T-N
+                # (e.g. T-0/T-0) — skip it; the same-day chain takes over from the next
+                # record using whichever date precedes it.
+                if exit_ts <= entry_ts:
+                    if _dte_last_exit is None:
+                        # No prior anchor — seed _dte_last_exit so the chain still works
+                        _dte_last_exit = exit_ts
+                    continue
                 _dte_last_exit = exit_ts
                 seg_entries.append({
                     'segment':             segment,
-                    'entry_date':          rec['entry_date'],
+                    'entry_date':          entry_ts,
                     'exit_date':           exit_ts,
                     'expiry_date':         rec['expiry_date'],
                     'current_expiry':      rec.get('current_expiry', rec['expiry_date']),
@@ -3983,7 +4064,10 @@ def run_algotest_backtest(params):
                         # when the global basis is NEXT_WEEKLY/NEXT_MONTHLY).
                         _leg_expiry_raw = str(leg_config.get('expiry', 'WEEKLY') or 'WEEKLY').upper()
                         _is_leg_next = _leg_expiry_raw in ('NEXT_WEEKLY', 'WEEKLY_T1', 'NEXT_MONTHLY', 'MONTHLY_T1')
-                        if _force_next_expiry or _is_leg_next or _trade_rollover_mode:
+                        # New rollover semantic: each trade lives within ONE cycle and uses
+                        # that cycle's CURRENT-expiry contract. Only NEXT_WEEKLY/NEXT_MONTHLY
+                        # (or _force_next_expiry) routes to next_expiry.
+                        if _force_next_expiry or _is_leg_next:
                             leg_options_expiry = pd.Timestamp(_sched_next_exp)
                         else:
                             leg_options_expiry = pd.Timestamp(_sched_current_exp)
