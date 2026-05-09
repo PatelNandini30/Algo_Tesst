@@ -130,6 +130,55 @@ class MarketDataRepository:
         df["ExpiryDate"] = pd.to_datetime(df["ExpiryDate"])
         return df
 
+    def get_ohlc_for_option_range(
+        self,
+        symbol: str,
+        from_date: str,
+        to_date: str,
+        expiry: str,
+        option_type: str,
+        strike: float,
+    ):
+        """
+        Return (max_high, min_low) for a specific option contract across a date range.
+        Uses idx_option_symbol_date_expiry_strike_type — one indexed heap-read per window
+        instead of one full-date bhavcopy query per day.
+        Returns None if no data found.
+        """
+        cols = self._table_columns("option_data")
+        if not cols:
+            return None
+        date_col = self._pick(cols, "trade_date", "date")
+        high_col = self._pick_any(cols, ["high_price", "high"], None)
+        low_col = self._pick_any(cols, ["low_price", "low"], None)
+        if high_col is None or low_col is None:
+            return None
+        expiry_col = self._pick(cols, "expiry_date", "expiry")
+        q = text(
+            f"""
+            SELECT MAX({high_col}) AS max_high, MIN({low_col}) AS min_low
+            FROM option_data
+            WHERE symbol = :symbol
+              AND {date_col} >= :from_date
+              AND {date_col} <= :to_date
+              AND {expiry_col} = :expiry
+              AND option_type = :option_type
+              AND ABS(strike_price - :strike) <= 0.5
+            """
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(q, {
+                "symbol": str(symbol).upper(),
+                "from_date": from_date,
+                "to_date": to_date,
+                "expiry": expiry,
+                "option_type": str(option_type).upper(),
+                "strike": float(strike),
+            }).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return float(row[0]), float(row[1])
+
     def get_spot_data(self, symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
         cols = self._table_columns("spot_data")
         if not cols:
@@ -436,6 +485,8 @@ class MarketDataRepository:
             return pd.DataFrame()
         date_col  = self._pick(cols, "trade_date", "date")
         close_col = self._pick(cols, "close_price", "close")
+        high_col  = self._pick_any(cols, ["high_price", "high"], close_col)
+        low_col   = self._pick_any(cols, ["low_price",  "low"],  close_col)
 
         from_date = _normalize_sql_date(from_date, "1900-01-01")
         to_date = _normalize_sql_date(to_date, "2099-12-31")
@@ -448,6 +499,8 @@ class MarketDataRepository:
                 expiry_date     AS "ExpiryDate",
                 option_type     AS "OptionType",
                 strike_price    AS "StrikePrice",
+                {high_col}      AS "High",
+                {low_col}       AS "Low",
                 {close_col}     AS "Close"
             FROM option_data
             WHERE symbol      = :symbol

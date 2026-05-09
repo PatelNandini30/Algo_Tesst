@@ -1326,7 +1326,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         cell.border = thinBorder();
         cell.alignment = { vertical:'middle' };
         // Coerce string numbers to actual numbers so Excel formulas (VLOOKUP etc.) work
-        if (typeof cell.value === 'string' && cell.value !== '') {
+        const _colKey = keyOrder[colNum - 1];
+        const _dateColsSet = new Set(['Entry Date','Exit Date','Expiry','Leg Exit Date','Lazy Entry Date','Lazy Exit Date']);
+        if (_dateColsSet.has(_colKey) && typeof cell.value === 'string' && cell.value !== '') {
+          const _dp = cell.value.split('-');
+          if (_dp.length === 3) {
+            const _d = new Date(Date.UTC(parseInt(_dp[2], 10), parseInt(_dp[1], 10) - 1, parseInt(_dp[0], 10)));
+            if (!isNaN(_d.getTime())) { cell.value = _d; cell.numFmt = 'DD-MMM-YYYY'; }
+          }
+        } else if (typeof cell.value === 'string' && cell.value !== '') {
           const n = Number(cell.value);
           if (!isNaN(n)) cell.value = n;
         }
@@ -1520,13 +1528,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     };
 
     const byYM = {};
+    const byYMPct = {};
     groupedTrades.forEach(group => {
       const exitDate = group?.exitDate || '';
       const ym = parseToYearMonth(exitDate);
       if (!ym) return;
-      const net = Number(group?.totalPnl ?? 0) || 0;
-      if (!byYM[ym.year]) byYM[ym.year] = Array(12).fill(0);
-      byYM[ym.year][ym.monthIdx] = (byYM[ym.year][ym.monthIdx] || 0) + net;
+      const net  = Number(group?.totalPnl ?? 0) || 0;
+      const spot = Number(group?.entrySpot ?? 0) || 0;
+      const pct  = spot > 0 ? (net / spot) * 100 : 0;
+      if (!byYM[ym.year])    byYM[ym.year]    = Array(12).fill(0);
+      if (!byYMPct[ym.year]) byYMPct[ym.year] = Array(12).fill(0);
+      byYM[ym.year][ym.monthIdx]    = (byYM[ym.year][ym.monthIdx]    || 0) + net;
+      byYMPct[ym.year][ym.monthIdx] = (byYMPct[ym.year][ym.monthIdx] || 0) + pct;
     });
 
     const mthData = Object.entries(byYM).sort().map(([yr, mos]) => {
@@ -1552,6 +1565,63 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         } else {
           cell.font = normFont(10);
           cell.fill = { type:'pattern', pattern:'solid', fgColor: ri%2===0?C.white:C.altRow };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      row++;
+    });
+
+    // ── SECTION 4b: Monthly Returns (% P&L) ─────────────────────────────────
+    row++;
+    addSectionHeader('📅  MONTHLY RETURNS (% Net P&L)', row++);
+
+    const mthHdrPct = ['Year',...MONTHS,'Total'];
+    const mthColsPct = mthHdrPct.length;
+    for (let ci = 0; ci < mthColsPct; ci++) {
+      ws2.getColumn(ci+1).width = ci===0 ? 8 : 9;
+    }
+
+    const hdrRowPct = ws2.getRow(row);
+    mthHdrPct.forEach((h, ci) => {
+      const cell = hdrRowPct.getCell(ci+1);
+      cell.value = h;
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    hdrRowPct.height = 20;
+    row++;
+
+    const mthDataPct = Object.entries(byYMPct).sort().map(([yr, mos]) => {
+      const total = mos.reduce((s, v) => s + v, 0);
+      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2)];
+    });
+
+    mthDataPct.forEach((dataRow, ri) => {
+      const r2 = ws2.getRow(row);
+      dataRow.forEach((val, ci) => {
+        const cell = r2.getCell(ci+1);
+        const isValCol   = ci >= 1 && ci <= 12;
+        const isTotalCol = ci === 13;
+        if (isValCol || isTotalCol) {
+          cell.value = typeof val === 'number' ? val / 100 : val;
+          cell.numFmt = '0.00%';
+        } else {
+          cell.value = val;
+        }
+        const num = typeof val === 'number' ? val : parseFloat(String(val || ''));
+        if ((isValCol || isTotalCol) && !isNaN(num) && num !== 0) {
+          cell.font = boldFont(10, num >= 0 ? C.greenTx : C.redTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: num >= 0 ? C.greenBg : C.redBg };
+        } else if (ci === 0) {
+          cell.font = boldFont(10, C.subHdrTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: C.subHdrBg };
+        } else {
+          cell.font = normFont(10);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
         }
         cell.alignment = centerAlign;
         cell.border = thinBorder();

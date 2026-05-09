@@ -124,7 +124,13 @@ def _write_feather(df, path: Path, columns: List[str]) -> None:
         ]
         if date_cols:
             df = df.with_columns([pl.col(c).cast(pl.Date) for c in date_cols])
-        table = df.select(columns).to_arrow()
+        available = [c for c in columns if c in df.columns]
+        if set(columns) - set(available):
+            logger.warning(
+                "[RUST_FAST] feather write: columns missing from df, skipping: %s",
+                sorted(set(columns) - set(available)),
+            )
+        table = df.select(available).to_arrow()
         feather.write_feather(table, path, compression="uncompressed")
     except Exception as exc:
         logger.warning("[RUST_FAST] feather write failed for %s: %s", path, exc)
@@ -256,8 +262,33 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                 if not _fix_feather_date_format(p):
                     logger.warning("[RUST_FAST] could not fix %s, deleting for regeneration", p.name)
                     p.unlink()
+        # Force regeneration if feather exists but is missing High/Low columns,
+        # but ONLY when the incoming options_df actually has those columns.
+        # If the caller's data lacks High/Low (e.g. bulk-loaded from Parquet/DB
+        # which only has Close), skip the regen to avoid an infinite delete-rewrite loop.
+        if options_path.exists():
+            try:
+                import polars as _pl_schema
+                _hdr = _pl_schema.read_ipc(str(options_path), n_rows=0)
+                if "High" not in _hdr.columns or "Low" not in _hdr.columns:
+                    _df_has_ohlc = (
+                        options_df is not None
+                        and not options_df.is_empty()
+                        and "High" in options_df.columns
+                        and "Low" in options_df.columns
+                    )
+                    if _df_has_ohlc:
+                        logger.info("[RUST_FAST] options.feather missing High/Low — forcing regeneration")
+                        options_path.unlink()
+                        if options_df is None:
+                            return False
+                    else:
+                        logger.debug("[RUST_FAST] options.feather missing High/Low but caller data also lacks them — keeping feather")
+            except Exception as _sc:
+                logger.debug("[RUST_FAST] schema check failed: %s", _sc)
+
         if not options_path.exists() or not spot_path.exists():
-            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Close"])
+            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "High", "Low", "Close"])
             _write_feather(spot_df, spot_path, ["Date", "Symbol", "Close"] if "Symbol" in getattr(spot_df, "columns", []) else ["Date", "Close"])
         native.load_cache(str(options_path), str(spot_path))
         _loaded_cache_key = key

@@ -265,6 +265,7 @@ from base import (
     normalize_filter_segments,
     # load_base2,  # Commented out - not using base2 filter
     load_bhavcopy,
+    load_ohlc_for_leg_range,
     compute_analytics,
     build_pivot,
     calculate_strike_from_premium_range,
@@ -284,6 +285,12 @@ from base import (
 )
 
 from services.data_loader import get_loader
+
+# Per-process cache for bhavcopy DataFrames used during MAE/MFE calculation.
+# Historical data never changes, so caching across backtest runs is safe.
+# Keyed by date string; capped to avoid runaway memory on HDD systems.
+_bhav_ohlc_cache: dict = {}
+_BHAV_OHLC_CACHE_MAX = 300
 
 
 def _last_trading_day_on_or_before(trading_calendar_df, target_date):
@@ -362,10 +369,10 @@ def _ohlc_from_polars(date_df, index, leg, expiry):
         return None
 
     cols = set(date_df.columns)
-    high_col = 'High' if 'High' in cols else 'Close'
-    low_col = 'Low' if 'Low' in cols else 'Close'
-    if high_col not in cols or low_col not in cols or 'Symbol' not in cols:
+    if 'High' not in cols or 'Low' not in cols or 'Symbol' not in cols:
         return None
+    high_col = 'High'
+    low_col = 'Low'
 
     filtered = date_df.filter(pl.col('Symbol') == str(index).upper())
     if filtered.is_empty():
@@ -426,10 +433,10 @@ def _ohlc_from_pandas(date_df, index, leg, expiry):
     if date_df is None or date_df.empty or 'Symbol' not in date_df.columns:
         return None
 
-    high_col = 'High' if 'High' in date_df.columns else 'Close'
-    low_col = 'Low' if 'Low' in date_df.columns else 'Close'
-    if high_col not in date_df.columns or low_col not in date_df.columns:
+    if 'High' not in date_df.columns or 'Low' not in date_df.columns:
         return None
+    high_col = 'High'
+    low_col = 'Low'
 
     filtered = date_df[date_df['Symbol'].astype(str).str.upper() == str(index).upper()].copy()
     if filtered.empty:
@@ -479,30 +486,22 @@ def _get_ohlc_for_leg_on_date(index, date_str, leg, expiry):
         if result is not None:
             return result
 
-    # Fast path: use Rust/fast-lookup close as OHLC proxy when partition is not built.
-    # Equivalent to old behaviour — partition data also had Close-only (no High/Low).
-    try:
-        from services.fast_lookup import get_option_price_fast as _gop_fast
-        _strike = _safe_float(leg.get('strike'))
-        _otype = str(leg.get('option_type', '') or '').upper()
-        if _otype in ('CALL', 'C'):
-            _otype = 'CE'
-        elif _otype in ('PUT', 'P'):
-            _otype = 'PE'
-        _expiry_cands = _expiry_candidates(expiry)
-        _expiry_s = _expiry_cands[0] if _expiry_cands else None
-        if _strike is not None and _otype in ('CE', 'PE') and _expiry_s:
-            _close = _gop_fast(date=date_str, index=index, strike=_strike,
-                               opt_type=_otype, expiry=_expiry_s)
-            if _close is not None:
-                _c = float(_close)
-                return (_c, _c)
-    except Exception:
-        pass
+    # Fast-lookup only has Close — skip it here so we fall through to
+    # load_bhavcopy() which fetches real high_price / low_price from Postgres.
 
-    try:
-        bhav_df = load_bhavcopy(date_str)
-    except Exception:
+    if date_str not in _bhav_ohlc_cache:
+        if len(_bhav_ohlc_cache) >= _BHAV_OHLC_CACHE_MAX:
+            # Evict the oldest half when the cap is hit.
+            evict = list(_bhav_ohlc_cache.keys())[:_BHAV_OHLC_CACHE_MAX // 2]
+            for k in evict:
+                del _bhav_ohlc_cache[k]
+        try:
+            _bhav_ohlc_cache[date_str] = load_bhavcopy(date_str)
+        except Exception:
+            _bhav_ohlc_cache[date_str] = None
+
+    bhav_df = _bhav_ohlc_cache[date_str]
+    if bhav_df is None:
         return None
     return _ohlc_from_pandas(bhav_df, index, leg, expiry)
 
@@ -545,13 +544,45 @@ def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, posit
     except Exception:
         return None, None
 
+    expiry = _get_leg_expiry(leg, trade)
+    start_str = _date_key(start)
+    end_str = _date_key(end)
+
+    if not _is_future_leg(leg):
+        opt = str(leg.get('option_type', '') or '').upper()
+        if opt in ('CALL', 'C'):
+            opt = 'CE'
+        elif opt in ('PUT', 'P'):
+            opt = 'PE'
+        strike = _safe_float(leg.get('strike'))
+        expiry_cands = _expiry_candidates(expiry)
+        expiry_str = expiry_cands[0] if expiry_cands else None
+
+        if strike is not None and opt in ('CE', 'PE') and expiry_str and start_str and end_str:
+            result = load_ohlc_for_leg_range(
+                symbol=index,
+                from_date=start_str,
+                to_date=end_str,
+                expiry=expiry_str,
+                option_type=opt,
+                strike=strike,
+            )
+            if result is not None:
+                return _calculate_mae_mfe_from_extremes(
+                    entry_price=entry_price,
+                    position=position,
+                    entry_spot=entry_spot,
+                    max_high=result[0],
+                    min_low=result[1],
+                )
+
+    # Fallback: per-day loop (futures or when range query returns nothing).
     cal = trading_calendar_df.copy()
     cal['date'] = pd.to_datetime(cal['date'])
     window = cal[(cal['date'] >= start) & (cal['date'] <= end)]
     if window.empty:
         return None, None
 
-    expiry = _get_leg_expiry(leg, trade)
     highs = []
     lows = []
     for date_value in window['date']:
@@ -3109,6 +3140,8 @@ def run_algotest_backtest(params):
     fixed_late_entry  = bool(params.get('fixed_late_entry',  False))
     min_days_to_entry = int(params.get('min_days_to_entry', 0) or 0)
     min_days_mode     = (filter_entry_mode == 'min_days') and (str_enabled or filter_enabled)
+    no_rollover          = bool(params.get('no_rollover', False))
+    no_rollover_min_days = int(params.get('no_rollover_min_days', 0) or 0)
 
     # ── Overall Stop Loss ──────────────────────────────────────────────────────
     # overall_sl_type:
@@ -3305,9 +3338,24 @@ def run_algotest_backtest(params):
             continue
 
         if entry_date > exit_date:
-            _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
-            _log(f"  WARNING: Entry ({entry_date}) after exit ({exit_date}) - skipping")
-            continue
+            if _rollover_mode and next_exp is not None:
+                # T-0/T-1 (and similar) rollover: exit_dte > entry_dte relative to the same
+                # anchor gives entry > exit. Re-anchor exit to next_exp so the trade holds
+                # from current expiry day until T-N before the next expiry.
+                exit_date = calculate_trading_days_before_expiry(
+                    expiry_date=next_exp,
+                    days_before=exit_dte,
+                    trading_calendar_df=trading_calendar
+                )
+                exit_date = pd.Timestamp(exit_date) if exit_date is not None else None
+                if exit_date is None or entry_date > exit_date:
+                    _log(f"  WARNING: Entry ({entry_date}) still after exit ({exit_date}) after rollover re-anchor — skipping")
+                    continue
+                _log(f"  INFO: Rollover T-{entry_dte}/T-{exit_dte}: exit re-anchored to next expiry {next_exp.date()} → exit={exit_date.date()}")
+            else:
+                _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
+                _log(f"  WARNING: Entry ({entry_date}) after exit ({exit_date}) - skipping")
+                continue
 
         # For WEEKLY/MONTHLY: when entry_dte == exit_dte (> 0), entry and exit are on the same
         # or adjacent days. Since we use previous-day close data, this results in near-zero P&L.
@@ -3682,6 +3730,26 @@ def run_algotest_backtest(params):
                     'clamped_exit':        clamped_exit,
                 })
 
+        if no_rollover and seg_entries:
+            _first = seg_entries[0]
+            _first_exp = pd.Timestamp(_first.get('current_expiry') or _first['expiry_date'])
+            _idx_s = int(np.searchsorted(
+                trading_calendar_arr, seg_start.normalize().to_numpy(), side='left'))
+            _idx_e = int(np.searchsorted(
+                trading_calendar_arr, _first_exp.normalize().to_numpy(), side='left'))
+            _days_to_first_exp = _idx_e - _idx_s
+            if no_rollover_min_days >= 1 and _days_to_first_exp <= no_rollover_min_days and len(seg_entries) >= 2:
+                _second = seg_entries[1]
+                _first = dict(_first)
+                _first['exit_date']      = _second['exit_date']
+                _first['next_expiry']    = _second.get('next_expiry', _second['expiry_date'])
+                _first['_rollover_mode'] = True
+                _log(f"[NO_ROLLOVER] Near-expiry ({_days_to_first_exp}d ≤ {no_rollover_min_days}) — exit extended to {pd.Timestamp(_first['exit_date']).date()}")
+                seg_entries = [_first]
+            else:
+                seg_entries = seg_entries[:1]
+                _log(f"[NO_ROLLOVER] 1 trade per segment (first expiry {_first_exp.date()}, {_days_to_first_exp}d from seg_start)")
+
         segment_records.append({
             'segment': segment,
             'entries': seg_entries,
@@ -3709,8 +3777,11 @@ def run_algotest_backtest(params):
     cumulative = 100.0   # base 100, matches Excel seed
     peak       = 100.0
     
+    _seg_fixed_strikes = {}  # (seg_label, leg_idx) → strike saved from first trade in segment
+
     for seg_scope in segment_records:
         segment = seg_scope['segment']
+        _seg_label = segment.get('label', str(id(segment)))
         for entry_idx, trade_entry in enumerate(seg_scope['entries'], 1):
             entry_date = trade_entry['entry_date']
             exit_date = trade_entry['exit_date']
@@ -4091,14 +4162,25 @@ def run_algotest_backtest(params):
                             '_buffer_position_above': buffer_position_above,
                             '_buffer_position_below': buffer_position_below,
                         }
-                        strike, buffer_offset, buffer_ref_price = _resolve_strike(
-                            leg_config=leg_config_with_buffer,
-                            entry_date=entry_date,
-                            entry_spot=entry_spot,
-                            expiry_date=leg_options_expiry,
-                            strike_interval=strike_interval,
-                            index=index,
-                        )
+                        _fs_key = (_seg_label, leg_idx)
+                        _rollover_strike_mode = str(leg_config.get('rollover_strike_mode') or 'fresh').lower()
+                        if _rollover_strike_mode == 'fixed' and entry_idx > 1 and _fs_key in _seg_fixed_strikes:
+                            strike = _seg_fixed_strikes[_fs_key]
+                            buffer_offset = 0
+                            buffer_ref_price = None
+                            _log(f"      [FIXED_STRIKE] leg {leg_idx+1}: reusing strike={strike} from first trade")
+                        else:
+                            strike, buffer_offset, buffer_ref_price = _resolve_strike(
+                                leg_config=leg_config_with_buffer,
+                                entry_date=entry_date,
+                                entry_spot=entry_spot,
+                                expiry_date=leg_options_expiry,
+                                strike_interval=strike_interval,
+                                index=index,
+                            )
+                            if _rollover_strike_mode == 'fixed' and entry_idx == 1 and strike is not None:
+                                _seg_fixed_strikes[_fs_key] = strike
+                                _log(f"      [FIXED_STRIKE] leg {leg_idx+1}: saved strike={strike} for future rollovers")
 
                         if strike is None:
                             _log(f"      WARNING: No qualifying strike found for leg {leg_idx+1} — skipping")
@@ -5010,7 +5092,16 @@ def run_algotest_backtest(params):
 
     trades_df = pd.DataFrame(trades_flat)
     _log(f"[DEBUG] trades_df created: {len(trades_df)} rows, cols: {list(trades_df.columns)[:10]}")
-    
+
+    # Drop same-day entry/exit rows — they always carry 0 P&L on close-based data
+    # and appear as rollover-chain artifacts.
+    if not trades_df.empty and 'Entry Date' in trades_df.columns and 'Exit Date' in trades_df.columns:
+        before = len(trades_df)
+        trades_df = trades_df[trades_df['Entry Date'] != trades_df['Exit Date']].copy()
+        dropped = before - len(trades_df)
+        if dropped:
+            _log(f"[FILTER] Dropped {dropped} same-day entry/exit row(s) from tradesheet")
+
     # ========== AGGREGATE LEGS INTO TRADES FOR ANALYTICS ==========
     if trades_df.empty:
         _log("[DEBUG] trades_df is empty after DataFrame creation!")

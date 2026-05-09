@@ -502,6 +502,26 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     return result
 
 
+def load_ohlc_for_leg_range(symbol, from_date, to_date, expiry, option_type, strike):
+    """
+    Return (max_high, min_low) for one option leg across a date range.
+    Single indexed query — O(1) per leg vs O(days) bhavcopy queries.
+    """
+    if _use_postgres():
+        try:
+            return _repo.get_ohlc_for_option_range(
+                symbol=symbol,
+                from_date=from_date,
+                to_date=to_date,
+                expiry=expiry,
+                option_type=option_type,
+                strike=strike,
+            )
+        except Exception:
+            pass
+    return None
+
+
 async def load_bhavcopy_async(date_str: str) -> pd.DataFrame:
     """
     Async version of load_bhavcopy - runs in thread pool to avoid blocking event loop
@@ -3190,6 +3210,21 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                         # Load spot into _spot_lookup_table directly from feather file
                         # (dl_bulk_load was skipped, so _bulk_spot_df in data_loader is None)
                         _load_spot_lookup_from_feather(sym_upper)
+                        # Populate _bulk_bhav_by_date from the feather so that
+                        # MAE/MFE OHLC lookups use in-memory Polars data instead
+                        # of per-leg DB queries (which were causing 17s regressions).
+                        try:
+                            if not _bulk_bhav_by_date:
+                                _opt_full = pl.read_ipc(str(_opt_feather), memory_map=False)
+                                if "High" in _opt_full.columns and "Low" in _opt_full.columns:
+                                    for _dv, _sub in _opt_full.partition_by("Date", as_dict=True).items():
+                                        _bulk_bhav_by_date[str(_dv)[:10]] = _sub
+                                    logger.info(
+                                        "[BULK] Populated %d dates from feather for OHLC lookups",
+                                        len(_bulk_bhav_by_date),
+                                    )
+                        except Exception as _pe:
+                            logger.debug("[BULK] Could not build _bulk_bhav_by_date from feather: %s", _pe)
                         return {
                             "options_rows": 0,
                             "spot_rows": len(_spot_lookup_table),

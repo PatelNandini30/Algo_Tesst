@@ -731,6 +731,8 @@ const StrategyBuilder = () => {
   const [strategyType, setStrategyType] = useState('positional');
   const [expiryBasis, setExpiryBasis] = useState('weekly');
   const [rolloverToggle, setRolloverToggle] = useState(false);
+  const [noRollover, setNoRollover] = useState(false);
+  const [noRolloverMinDays, setNoRolloverMinDays] = useState(0);
   const [entryDaysBefore, setEntryDaysBefore] = useState(2);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
   const [delayTime, setDelayTime] = useState('09:15');
@@ -1372,6 +1374,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       simple_momentum_enabled: false, simple_momentum_mode: 'POINTS_UP', simple_momentum_value: 0,
       straddle_multiplier: normalizedDraft.straddle_multiplier ?? 0.5,
       straddle_direction: normalizedDraft.straddle_direction ?? '+',
+      rollover_strike_mode: 'fresh',
     }]);
     if (draftLeg.segment === 'futures') {
       setUnderlying('futures');
@@ -1668,6 +1671,9 @@ const [slippagePct, setSlippagePct] = useState(0);
           leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
           leg.straddle_direction = l.straddle_direction ?? '+';
         }
+        if (rolloverToggle || noRollover) {
+          leg.rollover_strike_mode = l.rollover_strike_mode || 'fresh';
+        }
       }
       if (segmentType === 'futures') {
         leg.expiry = (l.expiry || 'monthly').toLowerCase();
@@ -1757,7 +1763,9 @@ const [slippagePct, setSlippagePct] = useState(0);
       underlying,
       strategy_type: strategyType,
       expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
-      rollover_toggle: rolloverToggle && ['weekly', 'monthly'].includes(expiryBasis),
+      rollover_toggle: (rolloverToggle || (noRollover && strFilter.enabled)) && ['weekly', 'monthly'].includes(expiryBasis),
+      no_rollover: noRollover && strFilter.enabled && ['weekly', 'monthly'].includes(expiryBasis),
+      no_rollover_min_days: noRollover ? noRolloverMinDays : 0,
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
       square_off_mode: squareOffMode,
@@ -1864,7 +1872,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       .some(l => l.expiry === 'monthly');
     const hasCurrentExpiryLegs = hasCurrentExpiryOptionLegs || hasCurrentExpiryFuturesLegs;
 
-    if (hasCurrentExpiryLegs && !rolloverToggle) {
+    if (hasCurrentExpiryLegs && !rolloverToggle && !noRollover) {
       const basisLabel = hasCurrentExpiryOptionLegs
         ? (expiryBasis === 'weekly' ? 'Weekly' : 'Monthly')
         : 'Monthly Futures';
@@ -2296,6 +2304,51 @@ const [slippagePct, setSlippagePct] = useState(0);
                         size="sm"
                       />
                     </div>
+                  </div>
+                )}
+
+                {/* No Rollover */}
+                {backtestMode === 'eod' && strFilter.enabled && ['weekly', 'monthly'].includes(expiryBasis) && (
+                  <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
+                          No Rollover
+                        </span>
+                        <span className="text-[11px] text-muted pl-2">
+                          Take only the first trade per STR segment. No re-entry until next segment.
+                        </span>
+                      </div>
+                      <Toggle
+                        enabled={noRollover}
+                        onToggle={() => setNoRollover(p => !p)}
+                        size="sm"
+                      />
+                    </div>
+                    {noRollover && (
+                      <div className="space-y-2 pt-2 border-t border-default">
+                        <p className="text-[11px] font-medium text-secondary pl-2">Min. days to expiry</p>
+                        <p className="text-[10px] text-muted pl-2">
+                          If segment starts within N days of expiry, exit extends to next expiry instead.
+                        </p>
+                        <div className="flex gap-2 pl-2">
+                          {[0, 1, 2, 3, 4].map(n => (
+                            <button
+                              key={n}
+                              type="button"
+                              onClick={() => setNoRolloverMinDays(n)}
+                              className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                noRolloverMinDays === n
+                                  ? 'bg-accent text-white border-accent'
+                                  : 'border-default text-secondary hover:bg-hover'
+                              }`}
+                            >
+                              {n === 0 ? 'Off' : n}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -3090,6 +3143,32 @@ const [slippagePct, setSlippagePct] = useState(0);
                             </>
                           )}
                         </div>
+
+                        {/* Strike on Rollover — shown when rollover or no-rollover is active */}
+                        {leg.segment === 'options' && (rolloverToggle || noRollover) && (
+                          <div className="flex items-center gap-2 pt-1">
+                            <span className="text-xs text-muted whitespace-nowrap">Strike on Roll</span>
+                            {['fresh', 'fixed'].map(mode => (
+                              <button
+                                key={mode}
+                                type="button"
+                                onClick={() => updateLeg(leg.id, 'rollover_strike_mode', mode)}
+                                className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                  (leg.rollover_strike_mode || 'fresh') === mode
+                                    ? 'bg-accent text-white border-accent'
+                                    : 'border-default text-secondary hover:bg-hover'
+                                }`}
+                              >
+                                {mode === 'fresh' ? 'Fresh' : 'Fixed'}
+                              </button>
+                            ))}
+                            <span className="text-[10px] text-muted">
+                              {(leg.rollover_strike_mode || 'fresh') === 'fixed'
+                                ? 'Keep same strike across expiries'
+                                : 'Re-select strike each expiry'}
+                            </span>
+                          </div>
+                        )}
 
                         {/* Advanced controls */}
                         <div className="pt-2 border-t border-subtle space-y-2">
