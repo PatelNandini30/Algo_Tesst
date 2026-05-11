@@ -1430,9 +1430,11 @@ _bulk_loaded = False
 _bulk_date_range = None
 
 # HIGH-PERFORMANCE CACHE: Pre-indexed lookup tables
-_option_lookup_table = {}  # (date, symbol, strike, opt_type, expiry) -> premium
-_future_lookup_table = {}  # (date, symbol, expiry) -> future_price
-_spot_lookup_table   = {}  # (date, symbol) -> spot_price
+_option_lookup_table      = {}  # (date, symbol, strike, opt_type, expiry) -> premium
+_future_lookup_table      = {}  # (date, symbol, expiry) -> future_price
+_spot_lookup_table        = {}  # (date, symbol) -> spot_price
+_option_high_lookup_cache = {}  # (date, index) -> {(strike, opt, expiry): high}
+_option_low_lookup_cache  = {}  # (date, index) -> {(strike, opt, expiry): low}
 # Pre-partitioned per-date Polars slices for fast lookups
 _bulk_bhav_by_date: dict = {}
 # Tracks what symbol/range is currently partitioned in _bulk_bhav_by_date
@@ -1705,6 +1707,8 @@ def clear_lookup_caches(clear_partitions: bool = True):
     _option_lookup_table.clear()
     _future_lookup_table.clear()
     _spot_lookup_table.clear()
+    _option_high_lookup_cache.clear()
+    _option_low_lookup_cache.clear()
     if clear_partitions:
         _bulk_bhav_by_date.clear()
         _loaded_on_demand_dates.clear()
@@ -1887,6 +1891,8 @@ def clear_fast_lookup_caches():
     _option_lookup_table.clear()
     _future_lookup_table.clear()
     _spot_lookup_table.clear()
+    _option_high_lookup_cache.clear()
+    _option_low_lookup_cache.clear()
     _loaded_on_demand_dates.clear()
     _bulk_bhav_df = None
     _bulk_spot_df = None
@@ -2382,6 +2388,82 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
         opt_match = _normalize_option_type(option_type)
         strike_key = int(round(float(strike)))
         return _cached_option_lookup(_lookup_cache_epoch, date_str, str(index).upper(), strike_key, opt_match, expiry_str)
+    except Exception:
+        return None
+
+
+def _build_option_ohlc_lookup(date_str: str, index: str):
+    """Populate _option_high_lookup_cache and _option_low_lookup_cache for a date+index."""
+    cache_key = (date_str, index)
+    if cache_key in _option_high_lookup_cache:
+        return
+
+    highs: dict = {}
+    lows: dict = {}
+    try:
+        if _bulk_loaded and _bulk_bhav_by_date:
+            date_df = _bulk_bhav_by_date.get(date_str)
+            if date_df is not None and not date_df.is_empty():
+                opt_df = date_df.filter(
+                    (pl.col("Symbol") == index) &
+                    (pl.col("OptionType").is_in(["CE", "PE"]))
+                )
+                if not opt_df.is_empty():
+                    strikes  = opt_df["StrikePrice"].cast(pl.Int64).to_list()
+                    types    = opt_df["OptionType"].to_list()
+                    expiries = opt_df["ExpiryDate"].cast(pl.Date).cast(pl.Utf8).to_list()
+                    if "High" in opt_df.columns:
+                        for s, t, e, h in zip(strikes, types, expiries, opt_df["High"].to_list()):
+                            if h is not None:
+                                highs[(s, t, e)] = float(h)
+                    if "Low" in opt_df.columns:
+                        for s, t, e, lv in zip(strikes, types, expiries, opt_df["Low"].to_list()):
+                            if lv is not None:
+                                lows[(s, t, e)] = float(lv)
+    except Exception:
+        pass
+
+    _option_high_lookup_cache[cache_key] = highs
+    _option_low_lookup_cache[cache_key] = lows
+
+
+def _ohlc_lookup(cache: dict, date_str: str, index: str, strike_key: int, opt_match: str, expiry_str: str):
+    """O(1) lookup from an OHLC cache dict with ±1-day expiry tolerance."""
+    lookup = cache.get((date_str, index), {})
+    result = lookup.get((strike_key, opt_match, expiry_str))
+    if result is not None:
+        return result
+    exp_ts = pd.Timestamp(expiry_str)
+    result = lookup.get((strike_key, opt_match, (exp_ts + pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+    if result is not None:
+        return result
+    return lookup.get((strike_key, opt_match, (exp_ts - pd.Timedelta(days=1)).strftime('%Y-%m-%d')))
+
+
+def get_option_high_from_db(date, index, strike, option_type, expiry):
+    """Return the day's HIGH price for an option contract. None if unavailable."""
+    try:
+        date_str   = _normalize_lookup_date(date)
+        expiry_str = pd.Timestamp(expiry).strftime('%Y-%m-%d')
+        opt_match  = _normalize_option_type(option_type)
+        strike_key = int(round(float(strike)))
+        index_upper = str(index).upper()
+        _build_option_ohlc_lookup(date_str, index_upper)
+        return _ohlc_lookup(_option_high_lookup_cache, date_str, index_upper, strike_key, opt_match, expiry_str)
+    except Exception:
+        return None
+
+
+def get_option_low_from_db(date, index, strike, option_type, expiry):
+    """Return the day's LOW price for an option contract. None if unavailable."""
+    try:
+        date_str   = _normalize_lookup_date(date)
+        expiry_str = pd.Timestamp(expiry).strftime('%Y-%m-%d')
+        opt_match  = _normalize_option_type(option_type)
+        strike_key = int(round(float(strike)))
+        index_upper = str(index).upper()
+        _build_option_ohlc_lookup(date_str, index_upper)
+        return _ohlc_lookup(_option_low_lookup_cache, date_str, index_upper, strike_key, opt_match, expiry_str)
     except Exception:
         return None
 

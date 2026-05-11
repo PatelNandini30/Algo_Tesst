@@ -28,6 +28,75 @@ fi
 # Navigate to project directory
 cd "$(dirname "$0")"
 
+# ── Rust wheel (compiled once, outside Docker, cached in named volumes) ──────
+# Rust is compiled by the maturin Docker image and the .whl is saved to
+# backend/prebuilt/. Docker never compiles Rust — it just copies the wheel.
+# Named volumes (algo_cargo_*) persist the Cargo cache so only changed Rust
+# files recompile on subsequent runs (seconds, not minutes).
+echo ""
+echo "[RUST] Checking native extension wheel..."
+mkdir -p backend/prebuilt
+
+RUST_HASH=$(find backend/native/src -name "*.rs" 2>/dev/null | sort | xargs md5sum 2>/dev/null; \
+            md5sum backend/native/Cargo.toml backend/native/Cargo.lock 2>/dev/null)
+RUST_HASH=$(echo "$RUST_HASH" | md5sum | cut -d' ' -f1)
+STORED_RUST_HASH=$(cat .rust_wheel_hash 2>/dev/null || echo "")
+WHEEL_EXISTS=$(ls backend/prebuilt/*.whl 2>/dev/null | wc -l)
+
+if [ "$RUST_HASH" != "$STORED_RUST_HASH" ] || [ "$WHEEL_EXISTS" -eq 0 ]; then
+    echo "  Native code changed — compiling Rust wheel..."
+    rm -f backend/prebuilt/*.whl
+    docker run --rm \
+        -v "$(pwd)/backend/certs/sonicwall-dpi-ssl.crt:/tmp/sonicwall-dpi-ssl.crt:ro" \
+        -v "$(pwd)/backend/native:/project" \
+        -v "$(pwd)/backend/prebuilt:/output" \
+        -v "algo_cargo_registry:/root/.cargo/registry" \
+        -v "algo_cargo_git:/root/.cargo/git" \
+        -v "algo_native_target:/project/target" \
+        -e CARGO_BUILD_JOBS=4 \
+        -e CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git \
+        -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
+        ghcr.io/pyo3/maturin:latest \
+        sh -c "cat /etc/pki/tls/certs/ca-bundle.crt /tmp/sonicwall-dpi-ssl.crt > /tmp/ca.crt && \
+               export SSL_CERT_FILE=/tmp/ca.crt CARGO_HTTP_CAINFO=/tmp/ca.crt && \
+               git config --global http.sslVerify false && \
+               maturin build --release \
+                 --interpreter /opt/python/cp311-cp311/bin/python3 \
+                 --manifest-path /project/Cargo.toml \
+                 --out /output"
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Rust wheel build failed."
+        exit 1
+    fi
+    echo "$RUST_HASH" > .rust_wheel_hash
+    echo "  Wheel ready: $(ls backend/prebuilt/*.whl | xargs basename)"
+else
+    echo "  Rust wheel up to date — skipping compilation."
+    echo "  Wheel: $(ls backend/prebuilt/*.whl 2>/dev/null | xargs basename 2>/dev/null)"
+fi
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── Base image (pip + system packages only — no Rust) ────────────────────────
+# Rebuilds only when requirements.txt or the Rust wheel changes.
+echo ""
+echo "[BASE] Checking backend base image..."
+DEPS_HASH=$(md5sum backend/requirements.txt $(ls backend/prebuilt/*.whl 2>/dev/null) 2>/dev/null | md5sum | cut -d' ' -f1)
+STORED_HASH=$(cat .deps_build_hash 2>/dev/null || echo "")
+
+if ! docker image inspect algo-backend-base:latest > /dev/null 2>&1 || [ "$DEPS_HASH" != "$STORED_HASH" ]; then
+    echo "  Rebuilding base image (pip + system packages)..."
+    docker build -f backend/Dockerfile.base -t algo-backend-base:latest ./backend
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Base image build failed. Check output above."
+        exit 1
+    fi
+    echo "$DEPS_HASH" > .deps_build_hash
+    echo "  Base image ready."
+else
+    echo "  Base image is current — skipping rebuild."
+fi
+# ────────────────────────────────────────────────────────────────────────────
+
 # Check if containers are already healthy
 echo ""
 echo "[0/5] Checking existing containers..."

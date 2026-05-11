@@ -62,6 +62,13 @@ def apply_fast_lookup_patches() -> None:
     ):
         if _original_check_leg_stop_loss_target is None:
             raise RuntimeError("Original check_leg_stop_loss_target not available")
+        # Rust path does not support sl_buffer_value — fall back to Python when any leg uses it
+        if any(lg.get('sl_buffer_value') is not None for lg in (legs_config or [])):
+            return _original_check_leg_stop_loss_target(
+                entry_date, exit_date, expiry_date, entry_spot,
+                legs_config, index, trading_calendar, square_off_mode,
+                slippage_pct=slippage_pct,
+            )
         return _rf.check_leg_stop_loss_target_rust(
             entry_date,
             exit_date,

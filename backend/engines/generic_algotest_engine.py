@@ -282,6 +282,8 @@ from base import (
     resolve_futures_pnl_with_rollover,
     get_futures_exit_date,
     get_futures_rollover_entry_date,
+    get_option_high_from_db,
+    get_option_low_from_db,
 )
 
 from services.data_loader import get_loader
@@ -1339,6 +1341,15 @@ def _copy_sl_tgt_to_leg(leg_dict, leg_src):
         leg_dict['target']      = None
         leg_dict['target_type'] = 'pct'
 
+    if 'slWithBuffer' in leg_src and isinstance(leg_src['slWithBuffer'], dict):
+        leg_dict['sl_buffer_value'] = leg_src['slWithBuffer'].get('value')
+        leg_dict['sl_buffer_type']  = _normalize_sl_tgt_type(leg_src['slWithBuffer'].get('mode'))
+        leg_dict['sl_buffer_pct']   = leg_src['slWithBuffer'].get('buffer_pct', 0)
+    else:
+        leg_dict['sl_buffer_value'] = None
+        leg_dict['sl_buffer_type']  = 'pct'
+        leg_dict['sl_buffer_pct']   = 0
+
 
 def _copy_trail_sl_to_leg(leg_dict, leg_src):
     """
@@ -1619,16 +1630,20 @@ def _execute_lazy_leg(
     if lazy_check and lazy_check[0].get('triggered'):
         actual_exit_date = pd.Timestamp(lazy_check[0].get('exit_date') or exit_ts)
         exit_reason = lazy_check[0].get('exit_reason', 'EXPIRY')
-        new_raw_exit = get_option_premium_from_db(
-            date=actual_exit_date.strftime('%Y-%m-%d'),
-            index=index,
-            strike=strike,
-            option_type=option_type,
-            expiry=ll_expiry.strftime('%Y-%m-%d'),
-        )
-        if new_raw_exit is None:
-            fallback_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
-            new_raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=strike, option_type=option_type)
+        _lazy_override = lazy_check[0].get('exit_price_override')
+        if _lazy_override is not None:
+            new_raw_exit = _lazy_override
+        else:
+            new_raw_exit = get_option_premium_from_db(
+                date=actual_exit_date.strftime('%Y-%m-%d'),
+                index=index,
+                strike=strike,
+                option_type=option_type,
+                expiry=ll_expiry.strftime('%Y-%m-%d'),
+            )
+            if new_raw_exit is None:
+                fallback_spot = get_spot_price_from_db(actual_exit_date, index) or entry_spot
+                new_raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=strike, option_type=option_type)
         new_exit = _apply_slippage(new_raw_exit, position, 'exit', slippage_pct)
         lazy_leg['exit_date'] = actual_exit_date
         lazy_leg['_lazy_exit_date'] = actual_exit_date
@@ -2166,16 +2181,20 @@ def _execute_per_leg_reentry(
                         f"for further re-entry (leg={leg_config.get('leg_number', '?')})"
                     )
 
-            raw_exit = get_option_premium_from_db(
-                date=actual_exit_date.strftime('%Y-%m-%d'),
-                index=index,
-                strike=re_strike_value,
-                option_type=option_type,
-                expiry=pd.Timestamp(expiry_date).strftime('%Y-%m-%d'),
-            )
-            if raw_exit is None:
-                fallback_spot = get_spot_price_from_db(actual_exit_date, index) or re_spot
-                raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=re_strike_value, option_type=option_type)
+            _re_override = re_check[0].get('exit_price_override') if (re_check and re_check[0].get('triggered')) else None
+            if _re_override is not None:
+                raw_exit = _re_override
+            else:
+                raw_exit = get_option_premium_from_db(
+                    date=actual_exit_date.strftime('%Y-%m-%d'),
+                    index=index,
+                    strike=re_strike_value,
+                    option_type=option_type,
+                    expiry=pd.Timestamp(expiry_date).strftime('%Y-%m-%d'),
+                )
+                if raw_exit is None:
+                    fallback_spot = get_spot_price_from_db(actual_exit_date, index) or re_spot
+                    raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=re_strike_value, option_type=option_type)
                 _log(
                     f"[REENTRY] Fallback exit premium used for strike {re_strike_value} "
                     f"on {actual_exit_date.strftime('%Y-%m-%d')} (spot={fallback_spot})"
@@ -2304,13 +2323,12 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
     """
     # Quick exit: nothing to check
     has_any_sl_target = any(
-        (lg.get('stop_loss') is not None or lg.get('target') is not None or lg.get('trail_sl_enabled'))
+        (lg.get('stop_loss') is not None or lg.get('target') is not None or
+         lg.get('trail_sl_enabled') or lg.get('sl_buffer_value') is not None)
         for lg in legs_config
     )
     if not has_any_sl_target:
         return None
-    
-
 
     # O(log n) searchsorted instead of full DataFrame boolean scan
     _tc_arr = trading_calendar['date'].values.astype('datetime64[ns]')
@@ -2382,7 +2400,9 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             'entry_prem': entry_prem,
         }
 
-    for check_date in holding_days:
+    leg_exit_overrides: dict = {}  # li -> raw buffer exit price (pre-slippage)
+
+    for _day_idx, check_date in enumerate(holding_days):
         all_triggered = all(r['triggered'] for r in leg_results)
         if all_triggered:
             break  # Nothing left to check
@@ -2394,12 +2414,17 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
             if leg_results[li]['triggered']:
                 continue  # Already done
 
-            sl_val   = leg.get('stop_loss')
-            sl_type  = _normalize_sl_tgt_type(leg.get('stop_loss_type', 'pct'))
-            tgt_val  = leg.get('target')
-            tgt_type = _normalize_sl_tgt_type(leg.get('target_type', 'pct'))
+            sl_val        = leg.get('stop_loss')
+            sl_type       = _normalize_sl_tgt_type(leg.get('stop_loss_type', 'pct'))
+            tgt_val       = leg.get('target')
+            tgt_type      = _normalize_sl_tgt_type(leg.get('target_type', 'pct'))
+            sl_buf_val    = leg.get('sl_buffer_value')
+            sl_buf_pct    = leg.get('sl_buffer_pct', 0)
+            sl_buf_type   = _normalize_sl_tgt_type(leg.get('sl_buffer_type', 'pct'))
 
-            if sl_val is None and tgt_val is None and not leg.get('trail_sl_enabled'):
+            has_sl_buffer = sl_buf_val is not None and sl_buf_pct > 0
+
+            if sl_val is None and tgt_val is None and not leg.get('trail_sl_enabled') and not has_sl_buffer:
                 continue  # No SL/Target/Trail-SL for this leg
             
             position = leg['position']
@@ -2566,9 +2591,71 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                             hit_tsl = True
                             _log(f"    [TSL] Leg {li+1} BUY: FIRED. current={cp:.2f} <= SL={ts['current_sl_level']:.2f}")
 
+            # ── Evaluate SL with Buffer ───────────────────────────────────────
+            hit_sl_buffer = False
+            if has_sl_buffer and cp is not None:
+                sl_buf_abs = abs(sl_buf_val)
+                if sl_buf_type == 'pct':
+                    hit_sl_buffer = adverse_pct >= sl_buf_abs
+                elif sl_buf_type == 'points':
+                    hit_sl_buffer = adverse_premium_pts >= sl_buf_abs
+                elif sl_buf_type == 'underlying_pts':
+                    hit_sl_buffer = adverse_spot_pts >= sl_buf_abs
+                elif sl_buf_type == 'underlying_pct':
+                    hit_sl_buffer = adverse_spot_pct >= sl_buf_abs
+
+                if hit_sl_buffer and segment not in ('FUTURES', 'FUTURE'):
+                    # Gap detection: was the previous holding day below the threshold?
+                    is_gap = True
+                    if _day_idx > 0:
+                        prev_date = holding_days[_day_idx - 1]
+                        prev_raw = get_option_premium_from_db(
+                            date=prev_date.strftime('%Y-%m-%d'),
+                            index=index,
+                            strike=strike,
+                            option_type=option_type,
+                            expiry=pd.Timestamp(_sl_expiry).strftime('%Y-%m-%d'),
+                        )
+                        if prev_raw is not None and entry_premium:
+                            prev_move = prev_raw - entry_premium
+                            prev_adverse = prev_move if position == 'SELL' else -prev_move
+                            if sl_buf_type == 'pct':
+                                prev_adverse_val = (prev_adverse / entry_premium * 100) if entry_premium else 0
+                            elif sl_buf_type == 'points':
+                                prev_adverse_val = prev_adverse
+                            elif sl_buf_type in ('underlying_pts', 'underlying_pct'):
+                                prev_spot = get_spot_price_from_db(prev_date, index)
+                                if prev_spot is not None and entry_spot:
+                                    prev_spot_move = prev_spot - entry_spot
+                                    opt_upper = (option_type or 'CE').upper()
+                                    if opt_upper in ('CE', 'CALL', 'C'):
+                                        prev_adv_spot = prev_spot_move if position == 'SELL' else -prev_spot_move
+                                    else:
+                                        prev_adv_spot = -prev_spot_move if position == 'SELL' else prev_spot_move
+                                    prev_adverse_val = (prev_adv_spot / entry_spot * 100) if sl_buf_type == 'underlying_pct' else prev_adv_spot
+                                else:
+                                    prev_adverse_val = 0
+                            else:
+                                prev_adverse_val = 0
+                            is_gap = prev_adverse_val < sl_buf_abs
+
+                    if is_gap:
+                        _sl_exp_str = pd.Timestamp(_sl_expiry).strftime('%Y-%m-%d')
+                        if position == 'SELL':
+                            buffer_price = current_premium_raw * (1 + sl_buf_pct / 100.0)
+                            day_high = get_option_high_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                            override = min(buffer_price, day_high) if day_high is not None else buffer_price
+                        else:
+                            buffer_price = current_premium_raw * (1 - sl_buf_pct / 100.0)
+                            day_low = get_option_low_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                            override = max(buffer_price, day_low) if day_low is not None else buffer_price
+                        leg_exit_overrides[li] = round(override, 2)
+
             if hit_sl or hit_tgt:
                 reason = 'STOP_LOSS' if hit_sl else 'TARGET'
                 newly_triggered_this_day.append((li, check_date, reason))
+            elif hit_sl_buffer:
+                newly_triggered_this_day.append((li, check_date, 'STOP_LOSS_BUFFER'))
             elif hit_tsl:
                 newly_triggered_this_day.append((li, check_date, 'TRAIL_SL'))
 
@@ -2585,6 +2672,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                                 'triggered': True,
                                 'exit_date': trigger_date,
                                 'exit_reason': trigger_reason,
+                                'exit_price_override': leg_exit_overrides.get(li2),
                             }
                         else:
                             # Collateral exit — mark as COMPLETE_*
@@ -2601,6 +2689,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                         'triggered': True,
                         'exit_date': tdate,
                         'exit_reason': treason,
+                        'exit_price_override': leg_exit_overrides.get(li),
                     }
 
     return leg_results
@@ -3169,6 +3258,7 @@ def run_algotest_backtest(params):
         overall_target_type  = 'total_premium_pct'
         overall_target_value = _legacy_tgt_pct
 
+    rollover_min_days_to_expiry = int(params.get('rollover_min_days_to_expiry', 0) or 0)
     square_off_mode = params.get('square_off_mode', 'partial')  # 'partial' | 'complete'
     underlying_type = str(params.get('underlying', 'cash') or 'cash').lower().strip()
     if underlying_type not in ('cash', 'futures'):
@@ -4146,6 +4236,26 @@ def run_algotest_backtest(params):
                         _log(f"      [LEG EXPIRY DEBUG] _sched_current_exp={_sched_current_exp} | _sched_next_exp={_sched_next_exp}")
                         _log(f"      [LEG EXPIRY DEBUG] → resolved leg_options_expiry={leg_options_expiry.strftime('%Y-%m-%d')}")
 
+                        # Min-days-to-expiry rollover: if trading days from entry to resolved expiry
+                        # is ≤ threshold, advance the contract one expiry forward.
+                        if _rollover_mode and rollover_min_days_to_expiry > 0:
+                            _entry_norm = np.datetime64(pd.Timestamp(entry_date).normalize(), 'ns')
+                            _exp_norm   = np.datetime64(leg_options_expiry.normalize(), 'ns')
+                            _idx_entry  = int(np.searchsorted(trading_calendar_arr, _entry_norm, side='right'))
+                            _idx_exp    = int(np.searchsorted(trading_calendar_arr, _exp_norm,   side='right'))
+                            _days_to_exp = _idx_exp - _idx_entry
+                            if _days_to_exp <= rollover_min_days_to_expiry:
+                                _prev_exp = leg_options_expiry
+                                if leg_options_expiry == pd.Timestamp(_sched_current_exp):
+                                    # current week/month → advance to next
+                                    leg_options_expiry = pd.Timestamp(_sched_next_exp)
+                                else:
+                                    # already on next expiry → look up the one after in expiry_df
+                                    _later = expiry_df[expiry_df['Current Expiry'] > leg_options_expiry]
+                                    if not _later.empty:
+                                        leg_options_expiry = pd.Timestamp(_later.iloc[0]['Current Expiry'])
+                                _log(f"      [MIN_DTE] days_to_exp={_days_to_exp} ≤ {rollover_min_days_to_expiry} → {_prev_exp.strftime('%Y-%m-%d')} → {leg_options_expiry.strftime('%Y-%m-%d')}")
+
                         # Store resolved expiry in leg_config so SL checker can use it
                         leg_config = {**leg_config, '_resolved_expiry': leg_options_expiry}
 
@@ -4335,7 +4445,7 @@ def run_algotest_backtest(params):
                     square_off_mode=square_off_mode,
                     slippage_pct=slippage_pct,
                 )
-            
+
                 # ========== STEP 8C-2: UPDATE EXIT PREMIUMS BASED ON PER-LEG EXIT DATES ==========
                 # If per-leg stop loss triggered, recalculate exit premiums using actual exit dates
                 if per_leg_results is not None:
@@ -4347,14 +4457,18 @@ def run_algotest_backtest(params):
                             if tleg.get('segment') == 'OPTION':
                                 # Recalculate option exit premium using leg's resolved expiry
                                 _leg_expiry_8c = tleg.get('_resolved_expiry') or expiry_date
-                                new_exit_premium = get_option_premium_from_db(
-                                    date=actual_leg_exit_date.strftime('%Y-%m-%d'),
-                                    index=index,
-                                    strike=tleg['strike'],
-                                    option_type=tleg['option_type'],
-                                    expiry=pd.Timestamp(_leg_expiry_8c).strftime('%Y-%m-%d')
-                                )
-                            
+                                _override_8c = leg_result.get('exit_price_override')
+                                if _override_8c is not None:
+                                    new_exit_premium = _override_8c
+                                else:
+                                    new_exit_premium = get_option_premium_from_db(
+                                        date=actual_leg_exit_date.strftime('%Y-%m-%d'),
+                                        index=index,
+                                        strike=tleg['strike'],
+                                        option_type=tleg['option_type'],
+                                        expiry=pd.Timestamp(_leg_expiry_8c).strftime('%Y-%m-%d')
+                                    )
+
                                 if new_exit_premium is not None:
                                     tleg['market_exit_premium'] = new_exit_premium
                                     tleg['raw_exit_premium'] = new_exit_premium
@@ -4563,12 +4677,12 @@ def run_algotest_backtest(params):
                 # Net P&L in points (no quantity multiplication)
                 net_pnl = total_ce_pnl + total_pe_pnl + total_fut_pnl
 
-                # pct_pnl = round((net_pnl / entry_spot) * 100, 2) — matches AlgoTest Excel
                 pct_pnl = round((net_pnl / entry_spot) * 100, 2) if entry_spot != 0 else 0.0
                 net_pnl_pct = pct_pnl / 100.0
 
-                # Cumulative: additive % P&L from base 100 (matches AlgoTest Excel formula exactly)
-                cumulative = cumulative + pct_pnl
+                # Compound cumulative: each trade multiplies current equity
+                _pct_precise = (net_pnl / entry_spot) * 100 if entry_spot != 0 else 0.0
+                cumulative = cumulative * (1 + _pct_precise / 100)
                 peak       = max(cumulative, peak)
                 dd         = cumulative - peak           # zero or negative
                 pct_dd     = (dd / peak) if peak != 0 else 0.0   # decimal
@@ -4695,8 +4809,8 @@ def run_algotest_backtest(params):
                     trade_record['total_pe_pnl'] = (trade_record.get('total_pe_pnl', 0) or 0) + _reentry_pe_points
                     trade_record['total_fut_pnl'] = (trade_record.get('total_fut_pnl', 0) or 0) + _reentry_fut_points
                     trade_record['net_pnl'] = (trade_record.get('net_pnl', 0) or 0) + _reentry_points
-                    re_pct_pnl = round((_reentry_points / entry_spot) * 100, 2) if entry_spot != 0 else 0.0
-                    cumulative = cumulative + re_pct_pnl
+                    re_pct_pnl = (_reentry_points / entry_spot) * 100 if entry_spot != 0 else 0.0
+                    cumulative = cumulative * (1 + re_pct_pnl / 100)
                     peak = max(cumulative, peak)
                     dd = cumulative - peak
                     pct_dd = (dd / peak) if peak != 0 else 0.0
@@ -4896,10 +5010,10 @@ def run_algotest_backtest(params):
 
                 # Cumulative/Peak/DD/%DD only on Leg 1 rows, blank for all others
                 if is_first_leg:
-                    row_cumulative = round(trade.get('cumulative', 100.0), 2)
-                    row_peak       = round(trade.get('peak',       100.0), 2)
-                    row_dd         = round(trade.get('dd',           0.0), 2)
-                    row_pct_dd     = round(trade.get('pct_dd',       0.0) * 100, 4)  # decimal → percentage
+                    row_cumulative = trade.get('cumulative', 100.0)
+                    row_peak       = trade.get('peak',       100.0)
+                    row_dd         = trade.get('dd',           0.0)
+                    row_pct_dd     = trade.get('pct_dd',       0.0) * 100  # decimal → percentage
                 else:
                     row_cumulative = None
                     row_peak       = None

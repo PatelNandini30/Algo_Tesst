@@ -1,3 +1,6 @@
+.deps_build_hash
+.rust_wheel_hash
+backend/prebuilt/
 .graphify_detect.json
 .graphify_python
 graphify-out/

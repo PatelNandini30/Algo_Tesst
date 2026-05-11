@@ -252,10 +252,10 @@ const IntradayFullReport = ({ rows, onClose, showCloseButton }) => {
     const dayStats = sortedDates.map((date, dayIdx) => {
       const legs = dateMap.get(date);
       const netPnl = Math.round(legs.reduce((s, r) => s + (Number(r.pnl) || 0), 0) * 100) / 100;
-      cumPnl = Math.round((cumPnl + netPnl) * 100) / 100;
+      cumPnl = cumPnl + netPnl;
       if (cumPnl > runPeak) runPeak = cumPnl;
-      const dd    = Math.round((runPeak - cumPnl) * 100) / 100;
-      const pctDd = runPeak > 0 ? Math.round((dd / runPeak) * 10000) / 100 : 0;
+      const dd    = runPeak - cumPnl;
+      const pctDd = runPeak > 0 ? (dd / runPeak) * 100 : 0;
       return { date, dayIdx, legs, netPnl, cumPnl, peak: runPeak, dd, pctDd };
     });
 
@@ -1243,7 +1243,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       const toN  = v => (v!=null&&v!==''&&!isNaN(parseFloat(v))) ? parseFloat(v) : '';
       const r    = mainRow || legs[0];
       const tradeMae = calcTradeMae(legs);
-      tm[k] = { net:+net.toFixed(2), pct:+(spot>0?(net/spot)*100:0).toFixed(2),
+      tm[k] = { net, pct:(spot>0?(net/spot)*100:0),
                 netMae1:tradeMae?.netMae1 ?? '', netMae2:tradeMae?.netMae2 ?? '', finalMae:tradeMae?.finalMae ?? '',
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
                 dd:toN(r['DD']), pctDd:toN(r['%DD']) };
@@ -1277,11 +1277,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         );
         else val=trade[key];
         if (val==null||(typeof val==='number'&&isNaN(val))||val==='NaN') val='';
-        if (typeof val==='number'&&!Number.isInteger(val)) {
-          val = ['MAE','MFE','Net MAE 1','Net MAE 2','Final MAE'].includes(key)
-            ? Math.round(val * 10000) / 10000
-            : Math.round(val*100)/100;
-        }
         row[key]=val;
       }
       return row;
@@ -1416,7 +1411,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     let row = 4;
 
     // ── SECTION 1: Performance Overview ─────────────────────────────────────
-    addSectionHeader('📊  PERFORMANCE OVERVIEW', row++);
+    addSectionHeader('PERFORMANCE OVERVIEW', row++);
 
     const profitColor = stats.totalPnLPct >= 0 ? C.greenTx : C.redTx;
     const kv = (l,v,r,col='A',alt=false,vc=null) => addKvRow(l,v,r,col,alt,vc);
@@ -1438,10 +1433,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     kv('Max Profit (Single Trade)', `₹${(+stats.maxWin).toLocaleString('en-IN',{minimumFractionDigits:2})}`, row, 'A', false, C.greenTx);
     kv('Max Loss (Single Trade)',   `₹${(+stats.maxLoss).toLocaleString('en-IN',{minimumFractionDigits:2})}`, row++, 'D', false, C.redTx);
 
+    kv('CAGR (Options)', `${stats.cagr>=0?'+':''}${(+stats.cagr).toFixed(2)}%`, row, 'A', true, stats.cagr>=0?C.greenTx:C.redTx);
+    kv('CAGR (Spot)',    `${stats.cagrSpot>=0?'+':''}${(+stats.cagrSpot).toFixed(2)}%`, row++, 'D', true, stats.cagrSpot>=0?C.greenTx:C.redTx);
+
     row++; // blank
 
     // ── SECTION 2: Risk Metrics ─────────────────────────────────────────────
-    addSectionHeader('⚠️  RISK METRICS', row++);
+    addSectionHeader('RISK METRICS', row++);
 
     const mddColor = C.redTx;
     kv('Max Drawdown',     `${(+stats.maxDDPct).toFixed(2)}%`,  row, 'A', false, mddColor);
@@ -1451,7 +1449,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const ddPeriod = (stats.mddStartDate && stats.mddEndDate) ? `${stats.mddStartDate}  →  ${stats.mddEndDate}` : '—';
     ws2.mergeCells(`A${row}:E${row}`);
     const ddCell = ws2.getCell(`A${row}`);
-    ddCell.value = `📅  Drawdown Period:  ${ddPeriod}`;
+    ddCell.value = `Drawdown Period:  ${ddPeriod}`;
     ddCell.font  = boldFont(10, C.redTx);
     ddCell.fill  = { type:'pattern', pattern:'solid', fgColor: C.redBg };
     ddCell.alignment = centerAlign;
@@ -1465,7 +1463,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     row++;
 
     // ── SECTION 3: Consistency ──────────────────────────────────────────────
-    addSectionHeader('🏆  CONSISTENCY & STREAKS', row++);
+    addSectionHeader('CONSISTENCY & STREAKS', row++);
 
     kv('Max Win Streak',    `${stats.maxWinStreak} trades`,   row, 'A', false, C.greenTx);
     kv('Max Losing Streak', `${stats.maxLossStreak} trades`,  row++, 'D', false, C.redTx);
@@ -1473,7 +1471,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     row++;
 
     // ── SECTION 4: Monthly Returns ──────────────────────────────────────────
-    addSectionHeader('📅  MONTHLY RETURNS (₹ Net P&L)', row++);
+    addSectionHeader('MONTHLY RETURNS (₹ Net P&L)', row++);
 
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     const mthHdr = ['Year',...MONTHS,'Total','Max DD','DD Days','R/MDD'];
@@ -1575,7 +1573,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // ── SECTION 4b: Monthly Returns (% P&L) ─────────────────────────────────
     row++;
-    addSectionHeader('📅  MONTHLY RETURNS (% Net P&L)', row++);
+    addSectionHeader('MONTHLY RETURNS (% Net P&L)', row++);
 
     const mthHdrPct = ['Year',...MONTHS,'Total'];
     const mthColsPct = mthHdrPct.length;
@@ -1986,7 +1984,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                     {stats.totalPnLPct >= 0 ? '+' : ''}{stats.totalPnLPct.toFixed(2)}%
                   </p>
                 </div>
-                
+
+                <div className="border-b border-default pb-2">
+                  <p className="font-bold text-primary mb-0.5">CAGR</p>
+                  <p className={`font-normal ${stats.cagr >= 0 ? 'text-profit' : 'text-loss'}`}>
+                    {stats.cagr >= 0 ? '+' : ''}{stats.cagr.toFixed(2)}%
+                  </p>
+                </div>
+
                 <div className="border-b border-default pb-2">
                   <p className="font-bold text-primary mb-0.5">No. of Trades</p>
                   <p className="font-normal text-primary">{stats.totalTrades}</p>

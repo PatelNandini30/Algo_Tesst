@@ -462,6 +462,10 @@ const createDefaultLazyLeg = (index = 1) => ({
   stop_loss_enabled: false,
   stop_loss_mode: 'POINTS',
   stop_loss_value: 0,
+  sl_buffer_enabled: false,
+  sl_buffer_mode: 'POINTS',
+  sl_buffer_value: null,
+  sl_buffer_pct: null,
   trail_sl_enabled: false,
   trail_sl_mode: 'POINTS',
   trail_sl_trigger: 0,
@@ -731,6 +735,7 @@ const StrategyBuilder = () => {
   const [strategyType, setStrategyType] = useState('positional');
   const [expiryBasis, setExpiryBasis] = useState('weekly');
   const [rolloverToggle, setRolloverToggle] = useState(false);
+  const [rolloverMinDaysToExpiry, setRolloverMinDaysToExpiry] = useState(0);
   const [noRollover, setNoRollover] = useState(false);
   const [noRolloverMinDays, setNoRolloverMinDays] = useState(0);
   const [entryDaysBefore, setEntryDaysBefore] = useState(2);
@@ -1366,6 +1371,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       ...normalizedDraft,
       target_enabled: false, target_mode: 'POINTS', target_value: 0,
       stop_loss_enabled: false, stop_loss_mode: 'POINTS', stop_loss_value: 0,
+      sl_buffer_enabled: false, sl_buffer_mode: 'POINTS', sl_buffer_value: null, sl_buffer_pct: null,
       trail_sl_enabled: false, trail_sl_mode: 'POINTS', trail_sl_trigger: 0, trail_sl_move: 0,
       re_entry_target_enabled: false, re_entry_target_mode: 'RE_ASAP', re_entry_target_count: 1,
       re_entry_sl_enabled: false, re_entry_sl_mode: 'RE_ASAP', re_entry_sl_count: 1,
@@ -1608,6 +1614,9 @@ const [slippagePct, setSlippagePct] = useState(0);
     if (ll.stop_loss_enabled && ll.stop_loss_value > 0) {
       serialized.stopLoss = { mode: ll.stop_loss_mode, value: ll.stop_loss_value };
     }
+    if (ll.sl_buffer_enabled && ll.sl_buffer_value > 0 && ll.sl_buffer_pct > 0) {
+      serialized.slWithBuffer = { mode: ll.sl_buffer_mode, value: ll.sl_buffer_value, buffer_pct: ll.sl_buffer_pct };
+    }
     if (ll.trail_sl_enabled) {
       serialized.trailSL = { mode: ll.trail_sl_mode, trigger: ll.trail_sl_trigger, move: ll.trail_sl_move };
     }
@@ -1703,6 +1712,15 @@ const [slippagePct, setSlippagePct] = useState(0);
         };
       }
 
+      // SL with Buffer - only send if enabled AND both value and buffer% are set
+      if (l.sl_buffer_enabled && l.sl_buffer_value != null && l.sl_buffer_value > 0 && l.sl_buffer_pct != null && l.sl_buffer_pct > 0) {
+        leg.slWithBuffer = {
+          mode: l.sl_buffer_mode,
+          value: l.sl_buffer_value,
+          buffer_pct: l.sl_buffer_pct,
+        };
+      }
+
       // Trail SL - only send if enabled
       if (l.trail_sl_enabled) {
         leg.trailSL = {
@@ -1763,8 +1781,9 @@ const [slippagePct, setSlippagePct] = useState(0);
       underlying,
       strategy_type: strategyType,
       expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
-      rollover_toggle: (rolloverToggle || (noRollover && strFilter.enabled)) && ['weekly', 'monthly'].includes(expiryBasis),
-      no_rollover: noRollover && strFilter.enabled && ['weekly', 'monthly'].includes(expiryBasis),
+      rollover_toggle: (rolloverToggle || noRollover) && ['weekly', 'monthly'].includes(expiryBasis),
+      rollover_min_days_to_expiry: rolloverToggle ? rolloverMinDaysToExpiry : 0,
+      no_rollover: noRollover && ['weekly', 'monthly'].includes(expiryBasis),
       no_rollover_min_days: noRollover ? noRolloverMinDays : 0,
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
@@ -2288,7 +2307,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                 {/* Rollover Toggle — EOD weekly/monthly only */}
                 {backtestMode === 'eod' && ['weekly', 'monthly'].includes(expiryBasis) && (
-                  <div className="bg-surface shadow-sm border border-default rounded-xl p-4">
+                  <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <div className="flex flex-col gap-0.5">
                         <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
@@ -2304,11 +2323,35 @@ const [slippagePct, setSlippagePct] = useState(0);
                         size="sm"
                       />
                     </div>
+                    {rolloverToggle && (
+                      <div className="space-y-2 pt-2 border-t border-default">
+                        <p className="text-[11px] font-medium text-secondary pl-2">Min. days to expiry</p>
+                        <p className="text-[10px] text-muted pl-2">
+                          If entry falls within N days of current expiry, use next expiry's contract instead.
+                        </p>
+                        <div className="flex gap-2 pl-2">
+                          {(expiryBasis === 'monthly' ? [0, 1, 2, 3, 4, 5, 6, 7] : [0, 1, 2, 3, 4]).map(n => (
+                            <button
+                              key={n}
+                              type="button"
+                              onClick={() => setRolloverMinDaysToExpiry(n)}
+                              className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                rolloverMinDaysToExpiry === n
+                                  ? 'bg-accent text-white border-accent'
+                                  : 'border-default text-secondary hover:bg-hover'
+                              }`}
+                            >
+                              {n === 0 ? 'Off' : n}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
                 {/* No Rollover */}
-                {backtestMode === 'eod' && strFilter.enabled && ['weekly', 'monthly'].includes(expiryBasis) && (
+                {backtestMode === 'eod' && ['weekly', 'monthly'].includes(expiryBasis) && (
                   <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <div className="flex flex-col gap-0.5">
@@ -2316,7 +2359,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                           No Rollover
                         </span>
                         <span className="text-[11px] text-muted pl-2">
-                          Take only the first trade per STR segment. No re-entry until next segment.
+                          Take only the first trade per segment. No re-entry until the next expiry cycle.
                         </span>
                       </div>
                       <Toggle
@@ -3187,7 +3230,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
-                              <Toggle enabled={leg.stop_loss_enabled} onToggle={(val) => updateLeg(leg.id, 'stop_loss_enabled', val !== undefined ? Boolean(val) : !leg.stop_loss_enabled)} size="sm" />
+                              <Toggle enabled={leg.stop_loss_enabled} onToggle={(val) => { const nv = val !== undefined ? Boolean(val) : !leg.stop_loss_enabled; updateLeg(leg.id, 'stop_loss_enabled', nv); if (nv) updateLeg(leg.id, 'sl_buffer_enabled', false); }} size="sm" />
                               <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                               {leg.stop_loss_enabled && (<>
                                 <select value={leg.stop_loss_mode} onChange={e => updateLeg(leg.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
@@ -3197,6 +3240,21 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="UNDERLYING_PERCENT">Underlying %</option>
                                 </select>
                                 <input type="number" min={0} value={leg.stop_loss_value ?? ''} onChange={e => updateLeg(leg.id, 'stop_loss_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
+                              </>)}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <Toggle enabled={leg.sl_buffer_enabled} onToggle={(val) => { const nv = val !== undefined ? Boolean(val) : !leg.sl_buffer_enabled; updateLeg(leg.id, 'sl_buffer_enabled', nv); if (nv) updateLeg(leg.id, 'stop_loss_enabled', false); }} size="sm" />
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">SL with Buffer</span>
+                              {leg.sl_buffer_enabled && (<>
+                                <select value={leg.sl_buffer_mode} onChange={e => updateLeg(leg.id, 'sl_buffer_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="UNDERLYING_POINTS">Underlying Pts</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                  <option value="UNDERLYING_PERCENT">Underlying %</option>
+                                </select>
+                                <input type="number" min={0} value={leg.sl_buffer_value ?? ''} onChange={e => updateLeg(leg.id, 'sl_buffer_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
+                                <span className="text-xs text-secondary whitespace-nowrap">Buf%</span>
+                                <input type="number" min={0} max={100} value={leg.sl_buffer_pct ?? ''} onChange={e => updateLeg(leg.id, 'sl_buffer_pct', e.target.value === '' ? null : +e.target.value)} className="w-12 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>)}
                             </div>
                             <div className="flex items-center gap-2">
@@ -3398,7 +3456,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                             )}
                           </div>
                           <div className="flex items-center gap-2">
-                            <Toggle enabled={ll.stop_loss_enabled} onToggle={(val) => updateLazyLeg(ll.id, 'stop_loss_enabled', val !== undefined ? Boolean(val) : !ll.stop_loss_enabled)} size="sm" />
+                            <Toggle enabled={ll.stop_loss_enabled} onToggle={(val) => { const nv = val !== undefined ? Boolean(val) : !ll.stop_loss_enabled; updateLazyLeg(ll.id, 'stop_loss_enabled', nv); if (nv) updateLazyLeg(ll.id, 'sl_buffer_enabled', false); }} size="sm" />
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                             {ll.stop_loss_enabled && (
                               <>
@@ -3407,6 +3465,21 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="PERCENT">Percent (%)</option>
                                 </select>
                                 <input type="number" min={0} value={ll.stop_loss_value ?? 0} onChange={e => updateLazyLeg(ll.id, 'stop_loss_value', +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
+                              </>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Toggle enabled={ll.sl_buffer_enabled} onToggle={(val) => { const nv = val !== undefined ? Boolean(val) : !ll.sl_buffer_enabled; updateLazyLeg(ll.id, 'sl_buffer_enabled', nv); if (nv) updateLazyLeg(ll.id, 'stop_loss_enabled', false); }} size="sm" />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">SL with Buffer</span>
+                            {ll.sl_buffer_enabled && (
+                              <>
+                                <select value={ll.sl_buffer_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'sl_buffer_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                  <option value="POINTS">Points (Pts)</option>
+                                  <option value="PERCENT">Percent (%)</option>
+                                </select>
+                                <input type="number" min={0} value={ll.sl_buffer_value ?? ''} onChange={e => updateLazyLeg(ll.id, 'sl_buffer_value', e.target.value === '' ? null : +e.target.value)} className="w-14 h-7 px-1 border border-default rounded text-xs text-center" />
+                                <span className="text-xs text-secondary whitespace-nowrap">Buf%</span>
+                                <input type="number" min={0} max={100} value={ll.sl_buffer_pct ?? ''} onChange={e => updateLazyLeg(ll.id, 'sl_buffer_pct', e.target.value === '' ? null : +e.target.value)} className="w-12 h-7 px-1 border border-default rounded text-xs text-center" />
                               </>
                             )}
                           </div>
