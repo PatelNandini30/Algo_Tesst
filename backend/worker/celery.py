@@ -38,6 +38,7 @@ celery_app.conf.update(
         'worker.tasks.run_algotest_job': {'queue': 'backtests'},
         'worker.tasks.warm_backtest_cache_task': {'queue': 'backtests'},
         # Fast queue is selected explicitly by routers/backtest.py for short ranges.
+        'worker.tasks.run_optimize_job': {'queue': 'optimize'},
         'worker.tasks.load_data_task': {'queue': 'uploads'},
         'worker.tasks.migrate_csv_task': {'queue': 'uploads'},
     },

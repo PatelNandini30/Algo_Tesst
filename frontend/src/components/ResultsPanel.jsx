@@ -1123,7 +1123,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const hasCalls   = sourceTrades.some(t => ['CE','CALL'].includes((t['Type']||'').toUpperCase()));
     const hasPuts    = sourceTrades.some(t => ['PE','PUT'].includes((t['Type']||'').toUpperCase()));
     const hasFutures = sourceTrades.some(t => (t['Type']||'').toUpperCase() === 'FUT');
-    const hasStr     = showStrSegment && sourceTrades.some(t => t['STR Segment']);
+    const hasStr          = showStrSegment && sourceTrades.some(t => t['STR Segment']);
+    const hasFilterSegment = showStrSegment && sourceTrades.some(t => t['Filter Segment']);
     const hasBuffer  = bufferStrikeEnabled;
     const hasSpotAdj = Boolean(results?.meta?.spot_adjustment_enabled);
     const hasReEntry = sourceTrades.some(t => (
@@ -1173,6 +1174,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     const roundMae = (value) => Math.round(value * 10000) / 10000;
 
+    const isBuyLeg  = (row) => String(row?.['B/S'] || '').toUpperCase() === 'BUY';
+    const isSellLeg = (row) => String(row?.['B/S'] || '').toUpperCase() === 'SELL';
+
     const calcTradeMae = (legs) => {
       const futureLegs = legs.filter(isFutureRow);
       const optionLegs = legs.filter(isOptionRow);
@@ -1196,6 +1200,28 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         };
       }
 
+      // Options-only trade with at least one BUY and at least one SELL option leg:
+      // pair the SELL-side MAE with the BUY-side MFE (and vice versa) to model
+      // the two legs as directionally hedging each other. (Per user spec.)
+      const buyOptionLegs  = optionLegs.filter(isBuyLeg);
+      const sellOptionLegs = optionLegs.filter(isSellLeg);
+      if (buyOptionLegs.length > 0 && sellOptionLegs.length > 0) {
+        const buyMae  = sumRequired(buyOptionLegs,  'MAE');
+        const buyMfe  = sumRequired(buyOptionLegs,  'MFE');
+        const sellMae = sumRequired(sellOptionLegs, 'MAE');
+        const sellMfe = sumRequired(sellOptionLegs, 'MFE');
+        if ([buyMae, buyMfe, sellMae, sellMfe].some(v => v == null)) return null;
+
+        const netMae1 = sellMae + buyMfe;
+        const netMae2 = sellMfe + buyMae;
+        return {
+          netMae1: roundMae(netMae1),
+          netMae2: roundMae(netMae2),
+          finalMae: roundMae(Math.min(netMae1, netMae2)),
+        };
+      }
+
+      // All option legs same side (all BUY or all SELL) — naive sum.
       const netMae1 = optionMae;
       const netMae2 = optionMfe;
       return {
@@ -1210,6 +1236,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const TRADE_COLS = new Set([
       'Net MAE 1','Net MAE 2','Final MAE',
       'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
+      'Lowest NAV','Actual Live DD',
     ]);
     const keyOrder = [
       'Trade','Leg','Index','Entry Date','Exit Date','Expiry',
@@ -1227,9 +1254,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
-      'Net P&L','% P&L','Cumulative','Peak','DD','%DD',
+      'Net P&L','% P&L','Cumulative','Peak','DD','%DD','Lowest NAV','Actual Live DD',
       'Exit Reason',
       ...(hasStr ? ['STR Segment'] : []),
+      ...(hasFilterSegment ? ['Filter Segment'] : []),
     ];
 
     const tm = {};
@@ -1248,6 +1276,29 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
                 dd:toN(r['DD']), pctDd:toN(r['%DD']) };
     });
+
+    // Compute Lowest NAV and Actual Live DD in trade order.
+    // Lowest NAV = prev_closing_NAV × (1 + finalMae / 100)  — worst equity point during the trade
+    // Actual Live DD = (lowestNav / peak − 1) × 100         — % drawdown from peak using that intra-trade low
+    {
+      const sortedTmKeys = Object.keys(tm).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+      let prevCum = 100;
+      sortedTmKeys.forEach(k => {
+        const t = tm[k];
+        const mae  = (t.finalMae !== '' && t.finalMae != null) ? t.finalMae  : null;
+        const peak = (t.peak      !== '' && t.peak      != null) ? t.peak     : null;
+        if (mae != null && peak != null && peak !== 0) {
+          const lowestNav   = Math.round(prevCum * (1 + mae / 100) * 100) / 100;
+          const actualLiveDD = Math.round((lowestNav / peak - 1) * 10000) / 100;
+          t.lowestNav    = lowestNav;
+          t.actualLiveDD = actualLiveDD;
+        } else {
+          t.lowestNav    = '';
+          t.actualLiveDD = '';
+        }
+        if (t.cumulative !== '' && t.cumulative != null) prevCum = t.cumulative;
+      });
+    }
 
     const written = new Set();
     const cleanedTrades = sortedTrades.map(trade => {
@@ -1268,6 +1319,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='Peak')  val=m.peak;
           else if (key==='DD')    val=m.dd;
           else if (key==='%DD')   val=m.pctDd;
+          else if (key==='Lowest NAV') val=m.lowestNav;
+          else if (key==='Actual Live DD') val=m.actualLiveDD;
         } else if (key==='Leg' && isLazyLegRow(trade)) val=trade['Lazy Leg Name'] || trade[key];
         else if (key==='Re-Entry Type') val=getReEntryType(trade);
         else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
@@ -1295,8 +1348,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Column widths
     const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
-      'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry Type':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'MAE':9,'MFE':9,'Net MAE 1':10,'Net MAE 2':10,'Final MAE':10,'Net P&L':10,'% P&L':8,'Cumulative':11,
-      'Exit Reason':14,'Expiry':12,'STR Segment':14 };
+      'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry Type':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'MAE':9,'MFE':9,'Net MAE 1':10,'Net MAE 2':10,'Final MAE':10,'Net P&L':10,'% P&L':8,'Cumulative':11,'Peak':10,'DD':9,'%DD':8,'Lowest NAV':13,'Actual Live DD':15,
+      'Exit Reason':14,'Expiry':12,'STR Segment':14,'Filter Segment':18 };
     ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 
     // Header row style
@@ -1413,28 +1466,169 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     // ── SECTION 1: Performance Overview ─────────────────────────────────────
     addSectionHeader('PERFORMANCE OVERVIEW', row++);
 
-    const profitColor = stats.totalPnLPct >= 0 ? C.greenTx : C.redTx;
     const kv = (l,v,r,col='A',alt=false,vc=null) => addKvRow(l,v,r,col,alt,vc);
 
-    kv('Overall Profit',   `${stats.totalPnLPct>=0?'+':''}${stats.totalPnLPct.toFixed(2)}%`, row, 'A', false, profitColor);
-    kv('No. of Trades',    stats.totalTrades, row++, 'D', false, { argb:'FF1A1A2E' });
+    // ── Research team's formulas, computed in JS ─────────────────────────────
+    // % P&L per trade (Trade Sheet column) is in percentage points (e.g., 0.23 = 0.23%).
+    // Net P&L per trade is in ₹. These mirror the research team's SUM/AVG/COUNTIF
+    // formulas from Summary Sample.xlsx, but written as plain values.
+    let _sumPctJS = 0, _sumPosPctJS = 0, _sumNegPctJS = 0;
+    let _winCntJS = 0, _lossCntJS = 0, _totalCntJS = 0;
+    let _sumNetJS = 0, _maxNetJS = -Infinity, _minNetJS = Infinity;
+    let _finalCumJS = 100, _spotCumJS = 100;
+    let _minEntryMs = null, _maxExitMs = null;
+    const _parseDate = (s) => {
+      if (s instanceof Date) return s.getTime();
+      if (typeof s !== 'string' || !s) return null;
+      const parts = s.includes('/') ? s.split('/') : s.split('-');
+      if (parts.length !== 3) return null;
+      let y, m, d;
+      if (parts[0].length === 4) { y = +parts[0]; m = +parts[1]-1; d = +parts[2]; }
+      else { d = +parts[0]; m = +parts[1]-1; y = +parts[2]; }
+      const t = Date.UTC(y, m, d);
+      return Number.isFinite(t) ? t : null;
+    };
+    for (const t of cleanedTrades) {
+      const p = t['% P&L']; const n = t['Net P&L'];
+      if (typeof p === 'number' && Number.isFinite(p)) {
+        _sumPctJS += p; _totalCntJS++;
+        if (p > 0) { _sumPosPctJS += p; _winCntJS++; }
+        else if (p < 0) { _sumNegPctJS += p; _lossCntJS++; }
+      }
+      if (typeof n === 'number' && Number.isFinite(n)) {
+        _sumNetJS += n;
+        if (n > _maxNetJS) _maxNetJS = n;
+        if (n < _minNetJS) _minNetJS = n;
+      }
+      const cum = t['Cumulative'];
+      if (typeof cum === 'number' && Number.isFinite(cum)) _finalCumJS = cum;
+      const eS = +t['Entry Spot'], xS = +t['Exit Spot'];
+      if (typeof n === 'number' && Number.isFinite(n) && Number.isFinite(eS) && Number.isFinite(xS) && eS > 0) {
+        _spotCumJS *= (xS / eS);
+      }
+      const eD = _parseDate(t['Entry Date']);
+      const xD = _parseDate(t['Exit Date']);
+      if (eD != null && (_minEntryMs == null || eD < _minEntryMs)) _minEntryMs = eD;
+      if (xD != null && (_maxExitMs == null || xD > _maxExitMs)) _maxExitMs = xD;
+    }
+    if (!Number.isFinite(_maxNetJS)) _maxNetJS = 0;
+    if (!Number.isFinite(_minNetJS)) _minNetJS = 0;
+    const _avgWinPctJS  = _winCntJS  > 0 ? (_sumPosPctJS / _winCntJS)  : 0;
+    const _avgLossPctJS = _lossCntJS > 0 ? (_sumNegPctJS / _lossCntJS) : 0;
+    const _winRateJS    = _totalCntJS > 0 ? (_winCntJS  / _totalCntJS) * 100 : 0;
+    const _lossRateJS   = _totalCntJS > 0 ? (_lossCntJS / _totalCntJS) * 100 : 0;
+    const _avgNetJS     = _totalCntJS > 0 ? (_sumNetJS  / _totalCntJS) : 0;
+    // Expectancy = (Win% × AvgWin - Loss% × |AvgLoss|) / |AvgLoss|, using decimals
+    const _expectancyJS = _avgLossPctJS !== 0
+      ? (((_winRateJS/100) * _avgWinPctJS - (_lossRateJS/100) * Math.abs(_avgLossPctJS)) / Math.abs(_avgLossPctJS))
+      : 0;
+    const _yearsJS = (_minEntryMs != null && _maxExitMs != null)
+      ? (_maxExitMs - _minEntryMs) / (365.25 * 86400000)
+      : 0;
+    const _optCagrPctJS = _yearsJS > 0 && _finalCumJS > 0
+      ? (Math.pow(_finalCumJS / 100, 1 / _yearsJS) - 1) * 100 : 0;
+    const _spotCagrPctJS = _yearsJS > 0 && _spotCumJS > 0
+      ? (Math.pow(_spotCumJS / 100, 1 / _yearsJS) - 1) * 100 : 0;
+    // ROI vs Spot uses spot sum gated by Net P&L being a number (first-leg rows only)
+    let _spotSumGatedJS = 0;
+    for (const t of cleanedTrades) {
+      const np = t['Net P&L'];
+      if (typeof np === 'number' && Number.isFinite(np)) {
+        const sp = +t['Spot P&L']; if (Number.isFinite(sp)) _spotSumGatedJS += sp;
+      }
+    }
 
-    kv('Win %',            `${(+stats.winRate).toFixed(2)}%`,  row, 'A', true, C.greenTx);
-    kv('Loss %',           `${(+stats.lossPct).toFixed(2)}%`,  row++, 'D', true, C.redTx);
+    const profitColor = _sumPctJS >= 0 ? C.greenTx : C.redTx;
+    const _fmtPct = (v, signed=true) => `${signed && v>=0?'+':''}${(+v).toFixed(2)}%`;
+    const _fmtCurrency = (v) => `₹${(+v).toLocaleString('en-IN',{minimumFractionDigits:2})}`;
 
-    kv('Avg Profit on Winners', `${(+stats.avgWinPct).toFixed(2)}%`,  row, 'A', false, C.greenTx);
-    kv('Avg Loss on Losers',    `${(+stats.avgLossPct).toFixed(2)}%`, row++, 'D', false, C.redTx);
+    kv('Overall Profit', _fmtPct(_sumPctJS), row, 'A', false, profitColor);
+    kv('No. of Trades',  _totalCntJS,        row++, 'D', false, { argb:'FF1A1A2E' });
 
-    kv('Avg Profit per Trade', `${stats.avgProfitPerTrade>=0?'+':''}${(+stats.avgProfitPerTrade).toFixed(2)}%`, row, 'A', true,
-       stats.avgProfitPerTrade>=0?C.greenTx:C.redTx);
-    kv('Expectancy Ratio',  `${(+stats.expectancy).toFixed(4)}`, row++, 'D', true,
-       stats.expectancy>=0?C.greenTx:C.redTx);
+    kv('Win %',  `${_winRateJS.toFixed(2)}%`,  row, 'A', true, C.greenTx);
+    kv('Loss %', `${_lossRateJS.toFixed(2)}%`, row++, 'D', true, C.redTx);
 
-    kv('Max Profit (Single Trade)', `₹${(+stats.maxWin).toLocaleString('en-IN',{minimumFractionDigits:2})}`, row, 'A', false, C.greenTx);
-    kv('Max Loss (Single Trade)',   `₹${(+stats.maxLoss).toLocaleString('en-IN',{minimumFractionDigits:2})}`, row++, 'D', false, C.redTx);
+    kv('Avg Profit on Winners', `${_avgWinPctJS.toFixed(2)}%`,  row, 'A', false, C.greenTx);
+    kv('Avg Loss on Losers',    `${_avgLossPctJS.toFixed(2)}%`, row++, 'D', false, C.redTx);
 
-    kv('CAGR (Options)', `${stats.cagr>=0?'+':''}${(+stats.cagr).toFixed(2)}%`, row, 'A', true, stats.cagr>=0?C.greenTx:C.redTx);
-    kv('CAGR (Spot)',    `${stats.cagrSpot>=0?'+':''}${(+stats.cagrSpot).toFixed(2)}%`, row++, 'D', true, stats.cagrSpot>=0?C.greenTx:C.redTx);
+    kv('Avg Profit per Trade', `${_avgNetJS>=0?'+':''}${_avgNetJS.toFixed(2)}`, row, 'A', true,
+       _avgNetJS>=0?C.greenTx:C.redTx);
+    kv('Expectancy Ratio', _expectancyJS.toFixed(4), row++, 'D', true,
+       _expectancyJS>=0?C.greenTx:C.redTx);
+
+    kv('Max Profit (Single Trade)', _fmtCurrency(_maxNetJS), row, 'A', false, C.greenTx);
+    kv('Max Loss (Single Trade)',   _fmtCurrency(_minNetJS), row++, 'D', false, C.redTx);
+
+    kv('CAGR (Options)', _fmtPct(_optCagrPctJS),  row, 'A', true, _optCagrPctJS>=0?C.greenTx:C.redTx);
+    kv('CAGR (Spot)',    _fmtPct(_spotCagrPctJS), row++, 'D', true, _spotCagrPctJS>=0?C.greenTx:C.redTx);
+
+    // ── ROI vs SPOT block (Type / Sum / ROI vs Spot, research team layout) ───
+    if (cleanedTrades.length > 0) {
+      row++; // spacer
+
+      // Per-side sums (research team's =SUM(...) formulas, computed in JS)
+      let _ceSumJS = 0, _peSumJS = 0, _futSumJS = 0;
+      for (const t of cleanedTrades) {
+        const ce = +t['CE P&L']; if (Number.isFinite(ce)) _ceSumJS += ce;
+        const pe = +t['PE P&L']; if (Number.isFinite(pe)) _peSumJS += pe;
+        const fu = +t['FUT P&L']; if (Number.isFinite(fu)) _futSumJS += fu;
+      }
+
+      // Header: Type | Sum | (gap) | ROI vs Spot
+      const _hdr = (col, txt) => {
+        const c = ws2.getCell(`${col}${row}`);
+        c.value = txt;
+        c.font = boldFont(10, C.navyText);
+        c.fill = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
+        c.alignment = centerAlign;
+        c.border = thinBorder();
+      };
+      _hdr('A','Type'); _hdr('B','Sum');
+      ws2.mergeCells(`D${row}:E${row}`);
+      _hdr('D','ROI vs Spot');
+      ws2.getCell(`D${row}`).alignment = centerAlign;
+      ws2.getRow(row).height = 20;
+      const _hdrRow = row; row++;
+
+      const _addTypeRow = (label, value) => {
+        const lC = ws2.getCell(`A${row}`);
+        const vC = ws2.getCell(`B${row}`);
+        lC.value = label;
+        lC.font = boldFont(10, { argb:'FF2C3E50' });
+        lC.fill = { type:'pattern', pattern:'solid', fgColor: C.labelBg };
+        lC.alignment = leftAlign;
+        lC.border = thinBorder(C.border);
+        vC.value = (+value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        vC.font = boldFont(10, value >= 0 ? C.greenTx : C.redTx);
+        vC.fill = { type:'pattern', pattern:'solid', fgColor: C.white };
+        vC.alignment = leftAlign;
+        vC.border = thinBorder(C.border);
+        ws2.getRow(row).height = 18;
+      };
+
+      // Determine numerator for ROI: CE+PE if both, else single side, else FUT, else Net
+      const _optionsSumJS = (hasCalls && hasPuts) ? (_ceSumJS + _peSumJS)
+        : (hasPuts ? _peSumJS : (hasCalls ? _ceSumJS : (hasFutures ? _futSumJS : _sumNetJS)));
+      const _roiPctJS = _spotSumGatedJS !== 0 ? (_optionsSumJS / _spotSumGatedJS) * 100 : 0;
+
+      // ROI value in D-E of the first data row (Spot P&L row)
+      const _spotRow = row;
+      ws2.mergeCells(`D${_spotRow}:E${_spotRow}`);
+      const _roiVal = ws2.getCell(`D${_spotRow}`);
+      _roiVal.value = _fmtPct(_roiPctJS);
+      _roiVal.font = boldFont(11, _roiPctJS >= 0 ? C.greenTx : C.redTx);
+      _roiVal.fill = { type:'pattern', pattern:'solid', fgColor: C.white };
+      _roiVal.alignment = centerAlign;
+      _roiVal.border = thinBorder(C.border);
+
+      // Rows
+      _addTypeRow('Spot P&L', _spotSumGatedJS); row++;
+      if (hasCalls) { _addTypeRow('CE P&L', _ceSumJS); row++; }
+      if (hasPuts)  { _addTypeRow('PE P&L', _peSumJS); row++; }
+      if (hasFutures) { _addTypeRow('FUT P&L', _futSumJS); row++; }
+      if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS); row++; }
+      _addTypeRow('Net P&L', _sumNetJS); row++;
+    }
 
     row++; // blank
 
@@ -1442,8 +1636,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     addSectionHeader('RISK METRICS', row++);
 
     const mddColor = C.redTx;
-    kv('Max Drawdown',     `${(+stats.maxDDPct).toFixed(2)}%`,  row, 'A', false, mddColor);
-    kv('Max DD Days',      stats.mddDuration,                    row++, 'D', false, mddColor);
+    const _maxDDPctJS = stats.maxDDPct ?? 0; // already in percent points
+    kv('Max Drawdown', `${_maxDDPctJS.toFixed(2)}%`, row, 'A', false, mddColor);
+    kv('Max DD Days', stats.mddDuration, row++, 'D', false, mddColor);
 
     // Full-width DD period
     const ddPeriod = (stats.mddStartDate && stats.mddEndDate) ? `${stats.mddStartDate}  →  ${stats.mddEndDate}` : '—';
@@ -1457,8 +1652,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     ws2.getRow(row).height = 18;
     row++;
 
-    kv('Return / MaxDD',     `${(+stats.carMdd).toFixed(2)}`,       row, 'A', true);
-    kv('Reward to Risk',     `${(+stats.rewardToRisk).toFixed(2)}`,  row++, 'D', true);
+    // Return / MaxDD = ABS(Options CAGR / Max Drawdown)  — research team's formula
+    // Reward to Risk = ABS(AvgWin / AvgLoss)
+    const _carMddJS = _maxDDPctJS !== 0 ? Math.abs(_optCagrPctJS / _maxDDPctJS) : 0;
+    const _rewardJS = _avgLossPctJS !== 0 ? Math.abs(_avgWinPctJS / _avgLossPctJS) : 0;
+    kv('Return / MaxDD', _carMddJS.toFixed(2),  row, 'A', true);
+    kv('Reward to Risk', _rewardJS.toFixed(2),  row++, 'D', true);
 
     row++;
 
@@ -1620,6 +1819,178 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         } else {
           cell.font = normFont(10);
           cell.fill = { type:'pattern', pattern:'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      row++;
+    });
+
+    // ── SECTION 5: Live DD & Outlier Analysis ─────────────────────────────────
+    row++;
+    addSectionHeader('LIVE DD & OUTLIER ANALYSIS', row++);
+
+    // Build per-trade (% P&L, Actual Live DD) pairs — one entry per unique trade
+    const _tradePairs = [];
+    Object.keys(tm).sort((a, b) => parseInt(a, 10) - parseInt(b, 10)).forEach(k => {
+      const t = tm[k];
+      const pct = (typeof t.pct === 'number' && Number.isFinite(t.pct)) ? t.pct : null;
+      const ldd = (typeof t.actualLiveDD === 'number' && Number.isFinite(t.actualLiveDD)) ? t.actualLiveDD : null;
+      if (pct !== null) _tradePairs.push({ pct, ldd, idx: _tradePairs.length });
+    });
+    const _nTrades = _tradePairs.length;
+    const _byPctDesc = [..._tradePairs].sort((a, b) => b.pct - a.pct);
+
+    // Outlier P&L accumulations (top/bottom N by % P&L)
+    const _posOutlier1Pct = _nTrades > 0 ? _byPctDesc[0].pct : 0;
+    const _posOutlier2Pct = _nTrades > 1 ? _byPctDesc[0].pct + _byPctDesc[1].pct : _posOutlier1Pct;
+    const _posOutlier3Pct = _nTrades > 2 ? _byPctDesc[0].pct + _byPctDesc[1].pct + _byPctDesc[2].pct : _posOutlier2Pct;
+    const _negOutlier1Pct = _nTrades > 0 ? _byPctDesc[_nTrades - 1].pct : 0;
+    const _negOutlier2Pct = _nTrades > 1 ? _byPctDesc[_nTrades - 1].pct + _byPctDesc[_nTrades - 2].pct : _negOutlier1Pct;
+    const _negOutlier3Pct = _nTrades > 2 ? _byPctDesc[_nTrades - 1].pct + _byPctDesc[_nTrades - 2].pct + _byPctDesc[_nTrades - 3].pct : _negOutlier2Pct;
+
+    // Live DD min/avg excluding top excTop and bottom excBot trades by % P&L rank
+    const _liveDDExcStats = (excTop, excBot) => {
+      const excIdx = new Set([
+        ..._byPctDesc.slice(0, excTop).map(p => p.idx),
+        ..._byPctDesc.slice(Math.max(0, _nTrades - excBot)).map(p => p.idx),
+      ]);
+      const filtered = _tradePairs.filter(p => !excIdx.has(p.idx) && p.ldd !== null);
+      if (filtered.length === 0) return { min: 0, avg: 0 };
+      const ldds = filtered.map(p => p.ldd);
+      return {
+        min: +Math.min(...ldds).toFixed(2),
+        avg: +(ldds.reduce((s, v) => s + v, 0) / ldds.length).toFixed(2),
+      };
+    };
+
+    const _allLDDs = _tradePairs.filter(p => p.ldd !== null).map(p => p.ldd);
+    const _actualLiveDDMin = _allLDDs.length > 0 ? +Math.min(..._allLDDs).toFixed(2) : 0;
+    const _actualLiveDDAvg = _allLDDs.length > 0
+      ? +(_allLDDs.reduce((s, v) => s + v, 0) / _allLDDs.length).toFixed(2) : 0;
+    const _liveDDNoO1 = _liveDDExcStats(1, 1);
+    const _liveDDNoO2 = _liveDDExcStats(2, 2);
+    const _liveDDNoO3 = _liveDDExcStats(3, 3);
+    const _carMddLiveJS = _actualLiveDDMin !== 0
+      ? +(_optCagrPctJS / Math.abs(_actualLiveDDMin)).toFixed(2) : 0;
+
+    // KV summary rows
+    kv('Actual Live DD (min)', `${_actualLiveDDMin.toFixed(2)}%`, row, 'A', false, C.redTx);
+    kv('Avg Actual Live DD',   `${_actualLiveDDAvg.toFixed(2)}%`, row++, 'D', false, C.redTx);
+    kv('CAR/MDD (Booked)',     _carMddJS.toFixed(2),              row, 'A', true,
+       _carMddJS >= 0 ? C.greenTx : C.redTx);
+    kv('CAR/MDD Live',         _carMddLiveJS.toFixed(2),          row++, 'D', true,
+       _carMddLiveJS >= 0 ? C.greenTx : C.redTx);
+
+    row++;
+
+    // Outlier table — 5 columns
+    ws2.getColumn(1).width = 28;
+    ws2.getColumn(2).width = 22;
+    ws2.getColumn(3).width = 22;
+    ws2.getColumn(4).width = 22;
+    ws2.getColumn(5).width = 24;
+
+    const _oHdrs = ['Outlier Set', '+ve Outlier (% P&L)', '-ve Outlier (% P&L)', 'Actual Live DD (%)', 'Avg Actual Live DD (%)'];
+    const _oHdrRow = ws2.getRow(row);
+    _oHdrs.forEach((h, ci) => {
+      const cell = _oHdrRow.getCell(ci + 1);
+      cell.value = h;
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    _oHdrRow.height = 20;
+    row++;
+
+    const _oRows = [
+      ['All Trades',         _fmtPct(_posOutlier1Pct), _fmtPct(_negOutlier1Pct), `${_actualLiveDDMin.toFixed(2)}%`, `${_actualLiveDDAvg.toFixed(2)}%`],
+      ['Without Outlier 1',  _fmtPct(_posOutlier1Pct), _fmtPct(_negOutlier1Pct), `${_liveDDNoO1.min.toFixed(2)}%`, `${_liveDDNoO1.avg.toFixed(2)}%`],
+      ['Without Outlier 2',  _fmtPct(_posOutlier2Pct), _fmtPct(_negOutlier2Pct), `${_liveDDNoO2.min.toFixed(2)}%`, `${_liveDDNoO2.avg.toFixed(2)}%`],
+      ['Without Outlier 3',  _fmtPct(_posOutlier3Pct), _fmtPct(_negOutlier3Pct), `${_liveDDNoO3.min.toFixed(2)}%`, `${_liveDDNoO3.avg.toFixed(2)}%`],
+    ];
+
+    _oRows.forEach((dataRow, ri) => {
+      const r2 = ws2.getRow(row);
+      dataRow.forEach((val, ci) => {
+        const cell = r2.getCell(ci + 1);
+        cell.value = val;
+        const bg = ri % 2 === 0 ? C.white : C.altRow;
+        if (ci === 0) {
+          cell.font = boldFont(10, { argb: 'FF2C3E50' });
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.labelBg };
+        } else if (ci === 1) {
+          cell.font = boldFont(10, C.greenTx);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri === 0 ? C.greenBg : bg };
+        } else {
+          cell.font = boldFont(10, C.redTx);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri === 0 ? C.redBg : bg };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      row++;
+    });
+
+    row++;
+
+    // ── SECTION 6: Quarterly Returns ──────────────────────────────────────────
+    addSectionHeader('QUARTERLY RETURNS (₹ Net P&L)', row++);
+
+    // Indian market quarters: Mar(Jan-Mar), Jun(Apr-Jun), Sep(Jul-Sep), Dec(Oct-Dec)
+    const QUARTERS = ['Mar', 'Jun', 'Sep', 'Dec'];
+    const _getQtrIdx = (monthIdx) => {
+      if (monthIdx <= 2) return 0;
+      if (monthIdx <= 5) return 1;
+      if (monthIdx <= 8) return 2;
+      return 3;
+    };
+
+    const byYQ = {};
+    groupedTrades.forEach(group => {
+      const ym = parseToYearMonth(group?.exitDate || '');
+      if (!ym) return;
+      const net = Number(group?.totalPnl ?? 0) || 0;
+      const q = _getQtrIdx(ym.monthIdx);
+      if (!byYQ[ym.year]) byYQ[ym.year] = Array(4).fill(0);
+      byYQ[ym.year][q] += net;
+    });
+
+    const qtrHdrLabels = ['Year', ...QUARTERS, 'Total'];
+    const qtrHdrRowEl = ws2.getRow(row);
+    qtrHdrLabels.forEach((h, ci) => {
+      const cell = qtrHdrRowEl.getCell(ci + 1);
+      cell.value = h;
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    qtrHdrRowEl.height = 20;
+    row++;
+
+    Object.entries(byYQ).sort().forEach(([yr, qtrs], ri) => {
+      const total = qtrs.reduce((s, v) => s + v, 0);
+      const dataRow = [yr, ...qtrs.map(v => +v.toFixed(2)), +total.toFixed(2)];
+      const r2 = ws2.getRow(row);
+      dataRow.forEach((val, ci) => {
+        const cell = r2.getCell(ci + 1);
+        cell.value = val;
+        const num = typeof val === 'number' ? val : parseFloat(String(val || ''));
+        const isValCol = ci >= 1 && ci <= 4;
+        const isTotalCol = ci === 5;
+        if ((isValCol || isTotalCol) && !isNaN(num) && num !== 0) {
+          cell.font = boldFont(10, num >= 0 ? C.greenTx : C.redTx);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: num >= 0 ? C.greenBg : C.redBg };
+        } else if (ci === 0) {
+          cell.font = boldFont(10, C.subHdrTx);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
+        } else {
+          cell.font = normFont(10);
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
         }
         cell.alignment = centerAlign;
         cell.border = thinBorder();
@@ -1987,7 +2358,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
                 <div className="border-b border-default pb-2">
                   <p className="font-bold text-primary mb-0.5">CAGR</p>
-                  <p className={`font-normal ${stats.cagr >= 0 ? 'text-profit' : 'text-loss'}`}>
+                  <p className="font-normal text-primary">
                     {stats.cagr >= 0 ? '+' : ''}{stats.cagr.toFixed(2)}%
                   </p>
                 </div>

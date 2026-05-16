@@ -38,6 +38,10 @@ _loaded_cache_key: Optional[str] = None
 # Used to detect when the on-disk feather has been replaced under us, so we can
 # reload Rust's in-memory cache instead of reusing stale data.
 _loaded_cache_signature: Optional[tuple] = None
+# Tracks the directory that holds the most recently loaded feather pair.
+# Set by build_cache; read by get_loaded_feather_root() so the optimizer
+# parent can hand the path to child workers (skip DB reload entirely).
+_loaded_feather_root: Optional[str] = None
 
 
 def _load_native():
@@ -188,7 +192,7 @@ def _file_signature(p: Path) -> tuple:
 
 
 def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
-    global _loaded_cache_key, _loaded_cache_signature
+    global _loaded_cache_key, _loaded_cache_signature, _loaded_feather_root
     native = _load_native()
     if native is None:
         return False
@@ -262,41 +266,78 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                 if not _fix_feather_date_format(p):
                     logger.warning("[RUST_FAST] could not fix %s, deleting for regeneration", p.name)
                     p.unlink()
-        # Force regeneration if feather exists but is missing High/Low columns,
+        # Force regeneration if feather exists but is missing Open/High/Low,
         # but ONLY when the incoming options_df actually has those columns.
-        # If the caller's data lacks High/Low (e.g. bulk-loaded from Parquet/DB
+        # If the caller's data lacks them (e.g. bulk-loaded from Parquet/DB
         # which only has Close), skip the regen to avoid an infinite delete-rewrite loop.
         if options_path.exists():
             try:
                 import polars as _pl_schema
                 _hdr = _pl_schema.read_ipc(str(options_path), n_rows=0)
-                if "High" not in _hdr.columns or "Low" not in _hdr.columns:
+                _required = ("Open", "High", "Low")
+                if any(c not in _hdr.columns for c in _required):
                     _df_has_ohlc = (
                         options_df is not None
                         and not options_df.is_empty()
-                        and "High" in options_df.columns
-                        and "Low" in options_df.columns
+                        and all(c in options_df.columns for c in _required)
                     )
                     if _df_has_ohlc:
-                        logger.info("[RUST_FAST] options.feather missing High/Low — forcing regeneration")
+                        logger.info("[RUST_FAST] options.feather missing Open/High/Low — forcing regeneration")
                         options_path.unlink()
                         if options_df is None:
                             return False
                     else:
-                        logger.debug("[RUST_FAST] options.feather missing High/Low but caller data also lacks them — keeping feather")
+                        logger.debug("[RUST_FAST] options.feather missing Open/High/Low but caller data also lacks them — keeping feather")
             except Exception as _sc:
                 logger.debug("[RUST_FAST] schema check failed: %s", _sc)
 
         if not options_path.exists() or not spot_path.exists():
-            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "High", "Low", "Close"])
+            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close"])
             _write_feather(spot_df, spot_path, ["Date", "Symbol", "Close"] if "Symbol" in getattr(spot_df, "columns", []) else ["Date", "Close"])
         native.load_cache(str(options_path), str(spot_path))
         _loaded_cache_key = key
         _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))
+        _loaded_feather_root = str(root)
         logger.info("[RUST_FAST] cache loaded from %s", root)
         return True
     except Exception as exc:
         logger.warning("[RUST_FAST] build_cache failed: %s", exc)
+        return False
+
+
+def get_loaded_feather_root() -> Optional[str]:
+    """Return the directory of the most recently loaded feather pair, or None."""
+    return _loaded_feather_root
+
+
+def load_cache_from_root(root: str) -> bool:
+    """
+    Load the Rust MarketCache from a pre-built feather directory.
+
+    Skips all DB access and Python bulk-load. Used by optimizer workers when
+    the parent process has already built the feather — workers just mmap the
+    same on-disk files via the OS page cache (no extra disk I/O after the
+    first load).
+    """
+    global _loaded_cache_key, _loaded_cache_signature, _loaded_feather_root
+    native = _load_native()
+    if native is None:
+        return False
+    p = Path(root)
+    options_path = p / "options.feather"
+    spot_path = p / "spot.feather"
+    if not options_path.exists() or not spot_path.exists():
+        logger.warning("[RUST_FAST] load_cache_from_root: feather missing at %s", root)
+        return False
+    try:
+        native.load_cache(str(options_path), str(spot_path))
+        _loaded_cache_key = root
+        _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))
+        _loaded_feather_root = root
+        logger.info("[RUST_FAST] cache loaded from pre-built feather at %s", root)
+        return True
+    except Exception as exc:
+        logger.warning("[RUST_FAST] load_cache_from_root failed: %s", exc)
         return False
 
 

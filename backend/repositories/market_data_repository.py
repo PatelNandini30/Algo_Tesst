@@ -487,6 +487,7 @@ class MarketDataRepository:
         close_col = self._pick(cols, "close_price", "close")
         high_col  = self._pick_any(cols, ["high_price", "high"], close_col)
         low_col   = self._pick_any(cols, ["low_price",  "low"],  close_col)
+        open_col  = self._pick_any(cols, ["open_price", "open"], close_col)
 
         from_date = _normalize_sql_date(from_date, "1900-01-01")
         to_date = _normalize_sql_date(to_date, "2099-12-31")
@@ -499,6 +500,7 @@ class MarketDataRepository:
                 expiry_date     AS "ExpiryDate",
                 option_type     AS "OptionType",
                 strike_price    AS "StrikePrice",
+                {open_col}      AS "Open",
                 {high_col}      AS "High",
                 {low_col}       AS "Low",
                 {close_col}     AS "Close"

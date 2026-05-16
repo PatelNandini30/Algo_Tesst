@@ -1,4 +1,6 @@
 mod intraday;
+mod optimizer;
+mod simulate;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -27,6 +29,12 @@ use pyo3::wrap_pyfunction;
 struct MarketCache {
     // (date_days, symbol_id, strike_i64, opttype_id, expiry_days) → close
     options: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    // Same key → day HIGH price. Used by SL-with-Buffer slice 4b.
+    options_high: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    // Same key → day LOW price. Used by SL-with-Buffer slice 4b.
+    options_low: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    // Same key → day OPEN price. Used by SL-with-Buffer gap detection.
+    options_open: AHashMap<(i32, u16, i64, u8, i32), f64>,
     // (date_days, symbol_id) → spot_close
     spot: AHashMap<(i32, u16), f64>,
     // (date_days, symbol_id, expiry_days, opttype_id) → sorted [(strike, close)]
@@ -41,6 +49,9 @@ impl Default for MarketCache {
     fn default() -> Self {
         MarketCache {
             options: AHashMap::new(),
+            options_high: AHashMap::new(),
+            options_low: AHashMap::new(),
+            options_open: AHashMap::new(),
             spot: AHashMap::new(),
             strikes: AHashMap::new(),
             symbol_ids: AHashMap::new(),
@@ -51,7 +62,7 @@ impl Default for MarketCache {
 
 static CACHE: Lazy<RwLock<Option<MarketCache>>> = Lazy::new(|| RwLock::new(None));
 
-fn round2(v: f64) -> f64 {
+pub(crate) fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
@@ -129,7 +140,7 @@ fn normalize_slippage_pct(value: f64) -> f64 {
     value
 }
 
-fn apply_slippage(price: f64, position: &str, side: &str, slippage_pct: f64) -> f64 {
+pub(crate) fn apply_slippage(price: f64, position: &str, side: &str, slippage_pct: f64) -> f64 {
     let pct = normalize_slippage_pct(slippage_pct);
     if pct <= 0.0 {
         return round2(price);
@@ -245,7 +256,7 @@ fn opt_type_to_id(s: &str) -> u8 {
     if s.trim().eq_ignore_ascii_case("CE") { 0 } else { 1 }
 }
 
-fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type: &str, expiry: &str) -> Option<f64> {
+pub(crate) fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type: &str, expiry: &str) -> Option<f64> {
     let cache = CACHE.read().ok()?;
     let cache = cache.as_ref()?;
     let date_days = date_str_to_days(&normalize_date_str(date))?;
@@ -256,7 +267,82 @@ fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type: &str, exp
     cache.options.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
 }
 
-fn lookup_spot_price(date: &str, index: &str) -> Option<f64> {
+/// Day HIGH for one option contract on one date. None if absent from cache
+/// (older feathers may not include High). Used by SL-with-Buffer (slice 4b).
+pub(crate) fn lookup_option_high(
+    date: &str,
+    index: &str,
+    strike: f64,
+    opt_type: &str,
+    expiry: &str,
+) -> Option<f64> {
+    let cache = CACHE.read().ok()?;
+    let cache = cache.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let strike_key = to_i64_strike(strike);
+    let type_id = opt_type_to_id(opt_type);
+    let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
+    cache.options_high.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+}
+
+/// Day LOW for one option contract on one date. None if absent.
+pub(crate) fn lookup_option_low(
+    date: &str,
+    index: &str,
+    strike: f64,
+    opt_type: &str,
+    expiry: &str,
+) -> Option<f64> {
+    let cache = CACHE.read().ok()?;
+    let cache = cache.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let strike_key = to_i64_strike(strike);
+    let type_id = opt_type_to_id(opt_type);
+    let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
+    cache.options_low.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+}
+
+/// Day OPEN for one option contract on one date. None if absent. Used by
+/// SL-with-Buffer to detect gap-past-SL at the open.
+pub(crate) fn lookup_option_open(
+    date: &str,
+    index: &str,
+    strike: f64,
+    opt_type: &str,
+    expiry: &str,
+) -> Option<f64> {
+    let cache = CACHE.read().ok()?;
+    let cache = cache.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let strike_key = to_i64_strike(strike);
+    let type_id = opt_type_to_id(opt_type);
+    let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
+    cache.options_open.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+}
+
+/// Return the full strike chain for one (date, index, expiry, opt_type) as
+/// a sorted `Vec<(strike, close_premium)>`. None if the cache lacks data.
+pub(crate) fn lookup_strikes_for_date(
+    date: &str,
+    index: &str,
+    expiry: &str,
+    opt_type: &str,
+) -> Option<Vec<(f64, f64)>> {
+    let cache = CACHE.read().ok()?;
+    let cache = cache.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
+    let type_id = opt_type_to_id(opt_type);
+    cache.strikes
+        .get(&(date_days, sym_id, expiry_days, type_id))
+        .cloned()
+}
+
+pub(crate) fn lookup_spot_price(date: &str, index: &str) -> Option<f64> {
     let cache = CACHE.read().ok()?;
     let cache = cache.as_ref()?;
     let date_days = date_str_to_days(&normalize_date_str(date))?;
@@ -353,6 +439,11 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
             (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => (a, b, c, d, e, f),
             _ => continue,
         };
+        // Open/High/Low are optional — older feathers may not have them.
+        // SL-with-Buffer features that need these will return None when missing.
+        let idx_high = schema.index_of("High").ok();
+        let idx_low = schema.index_of("Low").ok();
+        let idx_open = schema.index_of("Open").ok();
 
         // Downcast columns once outside the row loop — critical for performance.
         // Accept both Utf8 (StringArray) and LargeUtf8 (LargeStringArray) — Polars writes large_string.
@@ -362,6 +453,18 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
         let Some(type_arr) = AnyStrArray::from_col(batch.column(idx_type).as_ref()) else { continue };
         let Some(strike_arr) = batch.column(idx_strike).as_any().downcast_ref::<Float64Array>() else { continue };
         let Some(close_arr) = batch.column(idx_close).as_any().downcast_ref::<Float64Array>() else { continue };
+        let high_arr = idx_high.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
+        let low_arr = idx_low.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
+        let open_arr = idx_open.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
+        if high_arr.is_some() {
+            cache.options_high.reserve(batch.num_rows());
+        }
+        if low_arr.is_some() {
+            cache.options_low.reserve(batch.num_rows());
+        }
+        if open_arr.is_some() {
+            cache.options_open.reserve(batch.num_rows());
+        }
 
         for row in 0..batch.num_rows() {
             if date_arr.is_null(row) || expiry_arr.is_null(row)
@@ -389,8 +492,24 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
             let type_id = opt_type_to_id(type_raw);
 
             let strike_key = to_i64_strike(strike_v);
+            let key = (date_days, sym_id, strike_key, type_id, expiry_days);
 
-            cache.options.insert((date_days, sym_id, strike_key, type_id, expiry_days), close_v);
+            cache.options.insert(key, close_v);
+            if let Some(h) = high_arr {
+                if !h.is_null(row) {
+                    cache.options_high.insert(key, h.value(row));
+                }
+            }
+            if let Some(l) = low_arr {
+                if !l.is_null(row) {
+                    cache.options_low.insert(key, l.value(row));
+                }
+            }
+            if let Some(o) = open_arr {
+                if !o.is_null(row) {
+                    cache.options_open.insert(key, o.value(row));
+                }
+            }
             cache.strikes
                 .entry((date_days, sym_id, expiry_days, type_id))
                 .or_default()
@@ -1044,5 +1163,10 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_leg_stop_loss_target, m)?)?;
     m.add_function(wrap_pyfunction!(check_overall_stop_loss_target, m)?)?;
     m.add_function(wrap_pyfunction!(intraday::pyfuncs::run_intraday_backtest, m)?)?;
+    m.add_function(wrap_pyfunction!(optimizer::batch_compute_metrics, m)?)?;
+    m.add_function(wrap_pyfunction!(optimizer::run_optimization_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate::simulate_trades_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate::resolve_trade_specs, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
     Ok(())
 }

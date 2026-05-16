@@ -307,6 +307,13 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     Filter by symbol, parse Date, filter to date range
     Return DataFrame: Date, Close
     """
+    # Process-local cache — same (symbol, date range) is requested once per
+    # optimizer combo but the result is identical every time. Cache avoids
+    # repeated DB queries (≈1.2s each) across all combos in one worker run.
+    _cache_key = (symbol.upper(), str(from_date)[:10], str(to_date)[:10])
+    if _cache_key in _strike_data_cache:
+        return _strike_data_cache[_cache_key].copy()
+
     # Fast path: reconstruct from in-memory spot lookup table only when it covers
     # the whole requested range. A partial stale spot table would build the
     # trading calendar from the wrong year.
@@ -320,12 +327,16 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
             rows.sort(key=lambda x: x[0])
             df = pd.DataFrame(rows, columns=['Date', 'Close'])
             df['Date'] = pd.to_datetime(df['Date'])
-            return df.reset_index(drop=True)
+            result = df.reset_index(drop=True)
+            _strike_data_cache[_cache_key] = result
+            return result.copy()
 
     if _use_postgres():
         try:
             pg_df = _repo.get_spot_data(symbol=symbol, from_date=from_date, to_date=to_date)
-            return pg_df.reset_index(drop=True)
+            result = pg_df.reset_index(drop=True)
+            _strike_data_cache[_cache_key] = result
+            return result.copy()
         except Exception:
             if not ALLOW_CSV_FALLBACK:
                 raise RuntimeError("PostgreSQL strike data lookup failed and CSV fallback is disabled.")
@@ -341,19 +352,19 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
         f"{symbol.capitalize()}_strike_data.csv",
         f"{symbol.title()}_strike_data.csv",
     ]
-    
+
     file_path = None
     for filename in possible_filenames:
         test_path = os.path.join(STRIKE_DATA_DIR, filename)
         if os.path.exists(test_path):
             file_path = test_path
             break
-    
+
     if file_path is None:
         raise FileNotFoundError(f"Strike data file not found for symbol {symbol}. Tried: {possible_filenames}")
-    
+
     df = pd.read_csv(file_path)
-    
+
     # Handle multiple date formats like in existing code
     format_list = ["%Y-%m-%d", "%d-%m-%Y", "%y-%m-%d", "%d-%m-%y", "%d-%b-%Y", "%d-%b-%y"]
     for format_type in format_list:
@@ -362,11 +373,11 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
             break
         except:
             continue
-    
+
     # If still not datetime, try dayfirst=True
     if not pd.api.types.is_datetime64_any_dtype(df['Date']):
         df['Date'] = pd.to_datetime(df['Date'], dayfirst=True)
-    
+
     # Filter by instrument type if column exists (guards against FUT data leaking into spot data)
     instrument_col = next((col for col in df.columns if str(col).strip().lower() == 'instrument'), None)
     if instrument_col is not None:
@@ -377,12 +388,14 @@ def get_strike_data(symbol: str, from_date: str, to_date: str) -> pd.DataFrame:
     from_dt = pd.to_datetime(from_date)
     to_dt = pd.to_datetime(to_date)
     df = df[(df['Date'] >= from_dt) & (df['Date'] <= to_dt)]
-    
+
     # Filter by symbol (ticker) if column exists
     if 'Ticker' in df.columns:
         df = df[df['Ticker'] == symbol]
-    
-    return df[['Date', 'Close']].reset_index(drop=True)
+
+    result = df[['Date', 'Close']].reset_index(drop=True)
+    _strike_data_cache[_cache_key] = result
+    return result.copy()
 
 @lru_cache(maxsize=32)
 def load_expiry(index: str, expiry_type: str) -> pd.DataFrame:
@@ -502,14 +515,61 @@ def load_bhavcopy(date_str: str) -> pd.DataFrame:
     return result
 
 
+def _get_ohlc_range_from_feather(symbol: str, from_date: str, to_date: str, expiry: str, option_type: str, strike: float):
+    """Return (max_high, min_low) for one option leg from the Arrow IPC feather.
+    Uses Polars predicate pushdown — avoids full partition load and DB round-trips.
+    """
+    try:
+        from services import rust_fast_path as _rf
+        sym_upper = str(symbol).upper()
+        feather = _rf._cache_root() / f"arrow-v2:bulk:{sym_upper}:full" / "options.feather"
+        if not feather.exists():
+            return None
+        opt = str(option_type).upper()
+        if opt in ('CALL', 'C'):
+            opt = 'CE'
+        elif opt in ('PUT', 'P'):
+            opt = 'PE'
+        expiry_dt = pd.to_datetime(expiry).date()
+        from_dt   = pd.to_datetime(from_date).date()
+        to_dt     = pd.to_datetime(to_date).date()
+        strike_f  = float(strike)
+        result = (
+            pl.scan_ipc(str(feather))
+            .filter(
+                (pl.col("Symbol") == sym_upper) &
+                (pl.col("OptionType") == opt) &
+                ((pl.col("StrikePrice") - strike_f).abs() <= 0.5) &
+                (pl.col("ExpiryDate") == expiry_dt) &
+                (pl.col("Date") >= from_dt) &
+                (pl.col("Date") <= to_dt)
+            )
+            .select([
+                pl.col("High").max().alias("max_high"),
+                pl.col("Low").min().alias("min_low"),
+            ])
+            .collect()
+        )
+        if result.is_empty():
+            return None
+        max_high = result["max_high"][0]
+        min_low  = result["min_low"][0]
+        if max_high is None or min_low is None:
+            return None
+        return float(max_high), float(min_low)
+    except Exception:
+        return None
+
+
 def load_ohlc_for_leg_range(symbol, from_date, to_date, expiry, option_type, strike):
     """
     Return (max_high, min_low) for one option leg across a date range.
     Single indexed query — O(1) per leg vs O(days) bhavcopy queries.
+    Falls back to Arrow feather when the DB returns None (e.g. missing strike/expiry).
     """
     if _use_postgres():
         try:
-            return _repo.get_ohlc_for_option_range(
+            result = _repo.get_ohlc_for_option_range(
                 symbol=symbol,
                 from_date=from_date,
                 to_date=to_date,
@@ -517,8 +577,13 @@ def load_ohlc_for_leg_range(symbol, from_date, to_date, expiry, option_type, str
                 option_type=option_type,
                 strike=strike,
             )
+            if result is not None:
+                return result
         except Exception:
             pass
+    # DB returned None or is unavailable — try feather before the slow per-day fallback.
+    if _rust_lookup_active:
+        return _get_ohlc_range_from_feather(symbol, from_date, to_date, expiry, option_type, strike)
     return None
 
 
@@ -1196,31 +1261,35 @@ def calculate_trading_days_before_expiry(expiry_date, days_before, trading_calen
     else:
         expiry_ts = pd.Timestamp(expiry_date)
     
-    # Ensure trading_calendar_df['date'] is also Timestamp
-    df = trading_calendar_df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    
+    # Ensure trading_calendar_df['date'] is datetime64 — skip copy/convert when
+    # already correct (the engine always passes a pre-typed calendar).
+    if pd.api.types.is_datetime64_any_dtype(trading_calendar_df['date']):
+        df = trading_calendar_df
+    else:
+        df = trading_calendar_df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+
     # Get all trading days BEFORE expiry (use <= to include expiry day for days_before=0)
     if days_before == 0:
         # For days_before=0, include the expiry day itself
         trading_days = df[df['date'] <= expiry_ts].sort_values('date', ascending=False)
     else:
         trading_days = df[df['date'] < expiry_ts].sort_values('date', ascending=False)
-    
+
     if days_before == 0:
         # Entry on expiry day itself - return the closest trading day <= expiry
         if not trading_days.empty:
             return trading_days.iloc[0]['date']
         return expiry_ts
-    
+
     # Validate enough trading days exist
     if len(trading_days) < days_before:
         return None  # Don't raise, just return None
-    
+
     # Get the Nth trading day before expiry
     # Index is 0-based, so days_before=1 means index 0, days_before=2 means index 1
     entry_date = trading_days.iloc[days_before - 1]['date']
-    
+
     return entry_date
 
 
@@ -1435,6 +1504,8 @@ _future_lookup_table      = {}  # (date, symbol, expiry) -> future_price
 _spot_lookup_table        = {}  # (date, symbol) -> spot_price
 _option_high_lookup_cache = {}  # (date, index) -> {(strike, opt, expiry): high}
 _option_low_lookup_cache  = {}  # (date, index) -> {(strike, opt, expiry): low}
+_strike_data_cache: Dict[tuple, "pd.DataFrame"] = {}  # (symbol, from_date, to_date) -> spot df
+_option_open_lookup_cache = {}  # (date, index) -> {(strike, opt, expiry): open}
 # Pre-partitioned per-date Polars slices for fast lookups
 _bulk_bhav_by_date: dict = {}
 # Tracks what symbol/range is currently partitioned in _bulk_bhav_by_date
@@ -1443,6 +1514,10 @@ _bhav_by_date_from: str = None
 _bhav_by_date_to: str = None
 # True when Rust Arrow IPC cache is active — Python partition can be skipped
 _rust_lookup_active: bool = False
+# Set of symbols for which the feather has already been read into
+# _bulk_bhav_by_date (lazy OHLC fallback for SL-with-Buffer / MAE-MFE when
+# the Rust fast-path skipped the partition step).
+_feather_ohlc_loaded_symbols: set = set()
 # O(1) guard — replaces the O(n) key scan in _load_date_data_on_demand
 _loaded_on_demand_dates: set = set()
 
@@ -1709,6 +1784,7 @@ def clear_lookup_caches(clear_partitions: bool = True):
     _spot_lookup_table.clear()
     _option_high_lookup_cache.clear()
     _option_low_lookup_cache.clear()
+    _option_open_lookup_cache.clear()
     if clear_partitions:
         _bulk_bhav_by_date.clear()
         _loaded_on_demand_dates.clear()
@@ -1893,6 +1969,7 @@ def clear_fast_lookup_caches():
     _spot_lookup_table.clear()
     _option_high_lookup_cache.clear()
     _option_low_lookup_cache.clear()
+    _option_open_lookup_cache.clear()
     _loaded_on_demand_dates.clear()
     _bulk_bhav_df = None
     _bulk_spot_df = None
@@ -2392,18 +2469,88 @@ def get_option_premium_from_db(date, index, strike, option_type, expiry, db_path
         return None
 
 
+def _load_ohlc_partition_from_feather(symbol: str) -> bool:
+    """One-shot lazy: read the Rust feather and populate _bulk_bhav_by_date.
+
+    Returns True if the partition got populated (or was already populated for
+    this symbol). False if no feather exists / read failed.
+
+    Only loads the date window currently active for this backtest
+    (_bhav_by_date_from/_bhav_by_date_to) to avoid reading all 7+ years on
+    every SL-with-Buffer / MAE-MFE miss.
+    """
+    global _feather_ohlc_loaded_symbols
+    sym_upper = (symbol or "").upper()
+    if sym_upper in _feather_ohlc_loaded_symbols:
+        return True
+    try:
+        from services import rust_fast_path as _rf
+        feather = _rf._cache_root() / f"arrow-v2:bulk:{sym_upper}:full" / "options.feather"
+        if not feather.exists():
+            return False
+        scan = pl.scan_ipc(str(feather))
+        if _bhav_by_date_from and _bhav_by_date_to:
+            try:
+                _from_dt = pd.to_datetime(_bhav_by_date_from).date()
+                _to_dt   = pd.to_datetime(_bhav_by_date_to).date()
+                scan = scan.filter(
+                    (pl.col("Date").cast(pl.Date) >= _from_dt) &
+                    (pl.col("Date").cast(pl.Date) <= _to_dt)
+                )
+            except Exception:
+                pass
+        opt_full = scan.collect()
+        if opt_full.is_empty():
+            return False
+        if "High" not in opt_full.columns or "Low" not in opt_full.columns:
+            return False
+        for date_val, sub_df in opt_full.partition_by("Date", as_dict=True).items():
+            key = str(date_val)[:10] if not isinstance(date_val, tuple) else str(date_val[0])[:10]
+            _bulk_bhav_by_date.setdefault(key, sub_df)
+        _feather_ohlc_loaded_symbols.add(sym_upper)
+        logger.info(
+            "[BULK] Lazy-loaded OHLC partition from feather for %s: %d dates",
+            sym_upper, len(_bulk_bhav_by_date),
+        )
+        return True
+    except Exception as exc:
+        logger.debug("[BULK] Lazy OHLC feather load failed for %s: %s", sym_upper, exc)
+        return False
+
+
 def _build_option_ohlc_lookup(date_str: str, index: str):
-    """Populate _option_high_lookup_cache and _option_low_lookup_cache for a date+index."""
+    """Populate _option_high_lookup_cache, _option_low_lookup_cache, and _option_open_lookup_cache for a date+index."""
     cache_key = (date_str, index)
     if cache_key in _option_high_lookup_cache:
         return
 
     highs: dict = {}
     lows: dict = {}
+    opens: dict = {}
     try:
+        date_df = None
         if _bulk_loaded and _bulk_bhav_by_date:
             date_df = _bulk_bhav_by_date.get(date_str)
-            if date_df is not None and not date_df.is_empty():
+        # Fallback: when Rust fast-path is active the bulk DF isn't partitioned
+        # into `_bulk_bhav_by_date`, but the full DF is still kept in
+        # services.data_loader. Filter it lazily here so OHLC features (e.g.
+        # SL-with-Buffer) still work without paying the partition cost.
+        if (date_df is None or date_df.is_empty()):
+            try:
+                from services.data_loader import get_bulk_options_df
+                _full = get_bulk_options_df()
+                if _full is not None and not _full.is_empty():
+                    date_df = _full.filter(pl.col("Date").cast(pl.Utf8).str.slice(0, 10) == date_str)
+            except Exception:
+                date_df = None
+        # Last-resort fallback: read the Rust feather directly. The Rust fast-path
+        # path through bulk_load_options() may have skipped both Python partition
+        # AND the polars DF (services.data_loader._bulk_options_df is None when
+        # the feather shortcut activates without going through dl_bulk_load).
+        if (date_df is None or (hasattr(date_df, 'is_empty') and date_df.is_empty())):
+            if _load_ohlc_partition_from_feather(index):
+                date_df = _bulk_bhav_by_date.get(date_str)
+        if date_df is not None and not date_df.is_empty():
                 opt_df = date_df.filter(
                     (pl.col("Symbol") == index) &
                     (pl.col("OptionType").is_in(["CE", "PE"]))
@@ -2420,11 +2567,16 @@ def _build_option_ohlc_lookup(date_str: str, index: str):
                         for s, t, e, lv in zip(strikes, types, expiries, opt_df["Low"].to_list()):
                             if lv is not None:
                                 lows[(s, t, e)] = float(lv)
+                    if "Open" in opt_df.columns:
+                        for s, t, e, op in zip(strikes, types, expiries, opt_df["Open"].to_list()):
+                            if op is not None:
+                                opens[(s, t, e)] = float(op)
     except Exception:
         pass
 
     _option_high_lookup_cache[cache_key] = highs
-    _option_low_lookup_cache[cache_key] = lows
+    _option_low_lookup_cache[cache_key]  = lows
+    _option_open_lookup_cache[cache_key] = opens
 
 
 def _ohlc_lookup(cache: dict, date_str: str, index: str, strike_key: int, opt_match: str, expiry_str: str):
@@ -2464,6 +2616,20 @@ def get_option_low_from_db(date, index, strike, option_type, expiry):
         index_upper = str(index).upper()
         _build_option_ohlc_lookup(date_str, index_upper)
         return _ohlc_lookup(_option_low_lookup_cache, date_str, index_upper, strike_key, opt_match, expiry_str)
+    except Exception:
+        return None
+
+
+def get_option_open_from_db(date, index, strike, option_type, expiry):
+    """Return the day's OPEN price for an option contract. None if unavailable."""
+    try:
+        date_str   = _normalize_lookup_date(date)
+        expiry_str = pd.Timestamp(expiry).strftime('%Y-%m-%d')
+        opt_match  = _normalize_option_type(option_type)
+        strike_key = int(round(float(strike)))
+        index_upper = str(index).upper()
+        _build_option_ohlc_lookup(date_str, index_upper)
+        return _ohlc_lookup(_option_open_lookup_cache, date_str, index_upper, strike_key, opt_match, expiry_str)
     except Exception:
         return None
 
@@ -3253,60 +3419,36 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
         try:
             from services import rust_fast_path as _rf
             if _rf.is_available():
-                _rust_ck = f"bulk:{sym_upper}:full"
-                _feather_dir = _rf._cache_root() / f"arrow-v2:{_rust_ck}"
-                _opt_feather = _feather_dir / "options.feather"
-                _spt_feather = _feather_dir / "spot.feather"
-                if _opt_feather.exists() and _spt_feather.exists():
-                    # Check the feather's actual date coverage before trusting it
-                    _feather_covers = False
+                _range_filter_active = os.environ.get("FAST_LOOKUP_RANGE_FILTER", "0") == "1"
+
+                def _try_feather_shortcut(ck, opt_path, spt_path, fmin=None, fmax=None):
+                    """Activate Rust feather shortcut for the given cache key. Returns True on success."""
+                    global _rust_lookup_active, _bhav_by_date_symbol, _bhav_by_date_from
+                    global _bhav_by_date_to, _bulk_loaded, _bulk_date_range
+                    if not _rf.build_cache(None, None, cache_key=ck):
+                        return False
+                    logger.info("[BULK] Rust feather shortcut: activated %s — skipping DB/Parquet for %s", ck, sym_upper)
+                    _rust_lookup_active = True
+                    _bhav_by_date_symbol = sym_upper
+                    _bhav_by_date_from = fmin or from_date
+                    _bhav_by_date_to = fmax or to_date
+                    _bulk_loaded = True
+                    _bulk_date_range = (from_date, to_date)
                     try:
-                        _fdf = pl.read_ipc(_opt_feather, n_rows=1, memory_map=False)
-                        _fdf_full = pl.scan_ipc(_opt_feather).select(["Date"]).collect()
-                        _fmin = str(_fdf_full["Date"].min())[:10]
-                        _fmax = str(_fdf_full["Date"].max())[:10]
-                        _feather_covers = (_fmin <= from_date and _fmax >= to_date)
-                        if not _feather_covers:
-                            logger.info(
-                                "[BULK] Rust feather (%s→%s) doesn't cover request (%s→%s) — falling through to Parquet/DB load",
-                                _fmin, _fmax, from_date, to_date,
-                            )
-                    except Exception as _fe:
-                        logger.debug("[BULK] Feather range check failed: %s", _fe)
-                    if _feather_covers and _rf.build_cache(None, None, cache_key=_rust_ck):
-                        logger.info("[BULK] Rust feather shortcut: activated %s — skipping DB/Parquet for %s", _rust_ck, sym_upper)
-                        _rust_lookup_active = True
-                        _bhav_by_date_symbol = sym_upper
-                        _bhav_by_date_from = _fmin
-                        _bhav_by_date_to = _fmax
-                        _bulk_loaded = True
-                        _bulk_date_range = (from_date, to_date)
-                        # Tell data_loader the correct cache key so build_fast_lookup
-                        # recognises Rust is already loaded and does NOT try to reload
-                        # with a wrong derived key (which would corrupt Rust's state).
-                        try:
-                            import services.data_loader as _dl_mod
-                            _dl_mod._bulk_loaded_key = _rust_ck
-                        except Exception:
-                            pass
-                        # Load spot into _spot_lookup_table directly from feather file
-                        # (dl_bulk_load was skipped, so _bulk_spot_df in data_loader is None)
-                        _load_spot_lookup_from_feather(sym_upper)
-                        # Populate _bulk_bhav_by_date from the feather so that
-                        # MAE/MFE OHLC lookups use in-memory Polars data instead
-                        # of per-leg DB queries (which were causing 17s regressions).
-                        try:
-                            if not _bulk_bhav_by_date:
-                                _opt_full = pl.read_ipc(str(_opt_feather), memory_map=False)
-                                if "High" in _opt_full.columns and "Low" in _opt_full.columns:
-                                    for _dv, _sub in _opt_full.partition_by("Date", as_dict=True).items():
-                                        _bulk_bhav_by_date[str(_dv)[:10]] = _sub
-                                    logger.info(
-                                        "[BULK] Populated %d dates from feather for OHLC lookups",
-                                        len(_bulk_bhav_by_date),
-                                    )
-                        except Exception as _pe:
-                            logger.debug("[BULK] Could not build _bulk_bhav_by_date from feather: %s", _pe)
+                        import services.data_loader as _dl_mod
+                        _dl_mod._bulk_loaded_key = ck
+                    except Exception:
+                        pass
+                    _load_spot_lookup_from_feather(sym_upper)
+                    return True
+
+                # 1. Range-specific feather shortcut (preferred — smaller, built by optimizer)
+                _range_ck = f"bulk:{sym_upper}:{from_date}:{to_date}"
+                _range_dir = _rf._cache_root() / f"arrow-v2:{_range_ck}"
+                _range_opt = _range_dir / "options.feather"
+                _range_spt = _range_dir / "spot.feather"
+                if _range_opt.exists() and _range_spt.exists():
+                    if _try_feather_shortcut(_range_ck, _range_opt, _range_spt):
                         return {
                             "options_rows": 0,
                             "spot_rows": len(_spot_lookup_table),
@@ -3314,6 +3456,41 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                             "loaded_key": f"{symbol}:{from_date}:{to_date}",
                             "rust_feather_hit": True,
                         }
+
+                # 2. Full feather shortcut (skipped when FAST_LOOKUP_RANGE_FILTER=1 so that
+                #    a fresh DB load builds the range-specific feather on disk for future runs)
+                if not _range_filter_active:
+                    _rust_ck = f"bulk:{sym_upper}:full"
+                    _feather_dir = _rf._cache_root() / f"arrow-v2:{_rust_ck}"
+                    _opt_feather = _feather_dir / "options.feather"
+                    _spt_feather = _feather_dir / "spot.feather"
+                    if _opt_feather.exists() and _spt_feather.exists():
+                        _feather_covers = False
+                        try:
+                            _fdf_full = pl.scan_ipc(_opt_feather).select(["Date"]).collect()
+                            _fmin = str(_fdf_full["Date"].min())[:10]
+                            _fmax = str(_fdf_full["Date"].max())[:10]
+                            _feather_covers = (_fmin <= from_date and _fmax >= to_date)
+                            if not _feather_covers:
+                                logger.info(
+                                    "[BULK] Rust feather (%s→%s) doesn't cover request (%s→%s) — falling through to Parquet/DB load",
+                                    _fmin, _fmax, from_date, to_date,
+                                )
+                        except Exception as _fe:
+                            logger.debug("[BULK] Feather range check failed: %s", _fe)
+                        if _feather_covers and _try_feather_shortcut(_rust_ck, _opt_feather, _spt_feather, _fmin, _fmax):
+                            return {
+                                "options_rows": 0,
+                                "spot_rows": len(_spot_lookup_table),
+                                "expiry_rows": 0,
+                                "loaded_key": f"{symbol}:{from_date}:{to_date}",
+                                "rust_feather_hit": True,
+                            }
+                else:
+                    logger.info(
+                        "[BULK] FAST_LOOKUP_RANGE_FILTER=1 and no range feather for %s %s→%s — doing DB load to build it",
+                        sym_upper, from_date, to_date,
+                    )
         except Exception as _exc:
             logger.debug("[BULK] Rust feather shortcut failed: %s", _exc)
 
@@ -3453,6 +3630,7 @@ def bulk_force_clear():
     _bhav_by_date_from   = None
     _bhav_by_date_to     = None
     _rust_lookup_active  = False
+    _feather_ohlc_loaded_symbols.clear()
 
 
 def fast_get_option_premium(

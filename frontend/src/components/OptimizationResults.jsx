@@ -1,0 +1,665 @@
+/**
+ * OptimizationResults — polls the optimize job, renders the master-summary
+ * table, and exports the 37-col Excel.
+ *
+ * Props:
+ *   jobId         — running job id (falsy = closed)
+ *   totalCombos   — expected total runs (from enqueue)
+ *   objective     — ranking metric key
+ *   onClose       — closer
+ *   onApplyCombo  — (combo) callback used to push a row's parameter overrides
+ *                   back into the StrategyBuilder state
+ */
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Download, X, Loader2, Settings, ArrowDown, ArrowUp } from 'lucide-react';
+import ExcelJS from 'exceljs';
+import { MASTER_SUMMARY_COLUMNS } from '../utils/strategyParamSchema';
+
+const POLL_MS = 1500;
+const FETCH_LIMIT = 500;
+
+// Build a human-readable column header from a payload path like
+// "legs.0.stopLoss.value" → "Leg 1 SL %".
+function friendlyParamLabel(path) {
+  if (!path) return '';
+  const parts = String(path).split('.');
+  // legs.<i>.<field>.value | trigger | move | mode | etc.
+  if (parts[0] === 'legs' && parts.length >= 3) {
+    const idx = Number(parts[1]);
+    const field = parts[2];
+    const sub = parts[3] || '';
+    const legName = `Leg ${isFinite(idx) ? idx + 1 : '?'}`;
+    const friendlyField = {
+      stopLoss: 'SL',
+      targetProfit: 'TP',
+      trailSL: 'Trail',
+      slWithBuffer: 'SLB',
+      lots: 'Lots',
+      strike_interval: 'Strike Interval',
+      strike_selection: 'Strike',
+    }[field] || field;
+    const friendlySub = sub === 'value' ? '%'
+      : sub === 'trigger' ? 'Trigger'
+      : sub === 'move' ? 'Move'
+      : sub === 'mode' ? 'Mode'
+      : sub === 'buffer_pct' ? 'Buffer %'
+      : sub ? sub : '';
+    return [legName, friendlyField, friendlySub].filter(Boolean).join(' ');
+  }
+  // Top-level keys
+  const FRIENDLY_TOP = {
+    entry_dte: 'Entry DTE',
+    exit_dte: 'Exit DTE',
+    slippage_pct: 'Slippage %',
+    overall_sl_value: 'Overall SL',
+    overall_target_value: 'Overall TP',
+    buffer_strike_value: 'Buffer Strike',
+    spot_adjustment_pct: 'Spot Adj %',
+    spot_adjustment_direction: 'Spot Adj Dir',
+  };
+  if (FRIENDLY_TOP[path]) return FRIENDLY_TOP[path];
+  // Fallback: title-case the dotted path
+  return parts
+    .map((p) => p.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()))
+    .join(' ');
+}
+
+export default function OptimizationResults({
+  jobId,
+  totalCombos,
+  objective: defaultObjective,
+  onClose,
+  onApplyCombo,
+}) {
+  const [meta, setMeta] = useState(null);
+  const [rows, setRows] = useState([]);
+  const [sortKey, setSortKey] = useState(defaultObjective || 'total_pnl');
+  const [order, setOrder] = useState('desc');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const pollRef = useRef(null);
+
+  const fetchAll = useCallback(async () => {
+    if (!jobId) return;
+    const url = `/api/optimize/jobs/${jobId}/results?offset=0&limit=${FETCH_LIMIT}&sort_by=${sortKey}&order=${order}`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      setRows(data.rows || []);
+      setMeta(data.meta || null);
+    } catch (e) {
+      setError(String(e.message || e));
+    }
+  }, [jobId, sortKey, order]);
+
+  // Poll while running.
+  useEffect(() => {
+    if (!jobId) return undefined;
+    setLoading(true);
+    fetchAll().finally(() => setLoading(false));
+    pollRef.current = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/optimize/jobs/${jobId}`);
+        if (!r.ok) return;
+        const data = await r.json();
+        setMeta(data.meta || null);
+        if (data.status === 'success' || data.status === 'failed') {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          fetchAll();
+        } else {
+          // Refresh partial results so the table fills in as combos complete.
+          fetchAll();
+        }
+      } catch {
+        // swallow — polling will retry
+      }
+    }, POLL_MS);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [jobId, fetchAll]);
+
+  const done = meta?.done ?? 0;
+  const total = meta?.total ?? totalCombos ?? 0;
+  const progressPct = total > 0 ? Math.round((done / total) * 100) : 0;
+  const status = meta?.status || 'running';
+  const eta = meta?.eta_seconds;
+  const phase = meta?.phase || 'running';
+
+  // Discover optimized-parameter columns from rows. Each row carries the
+  // combo dict under `row.combo` — keys are payload paths like
+  // "legs.0.stopLoss.value". We render one column per unique key, in the
+  // order they first appear across all rows, immediately after Sr. No.
+  const paramColumns = useMemo(() => {
+    const seen = [];
+    const seenSet = new Set();
+    for (const r of rows) {
+      const combo = r.combo || {};
+      for (const k of Object.keys(combo)) {
+        if (!seenSet.has(k)) {
+          seenSet.add(k);
+          seen.push({ key: k, label: friendlyParamLabel(k) });
+        }
+      }
+    }
+    return seen;
+  }, [rows]);
+
+  // Detect which leg types are present so conditional columns can be hidden.
+  // A leg type is "present" if any row has a non-zero value for its P&L key.
+  const legPresence = useMemo(() => {
+    let hasCE = false;
+    let hasPE = false;
+    let hasSpot = false;
+    for (const r of rows) {
+      const s = r.summary || {};
+      if (!hasCE && s.ce_pnl_total != null && Math.abs(Number(s.ce_pnl_total)) > 0.01) hasCE = true;
+      if (!hasPE && s.pe_pnl_total != null && Math.abs(Number(s.pe_pnl_total)) > 0.01) hasPE = true;
+      if (!hasSpot && s.long_spot_pnl != null && Math.abs(Number(s.long_spot_pnl)) > 0.01) hasSpot = true;
+      if (hasCE && hasPE && hasSpot) break;
+    }
+    return { hasCE, hasPE, hasSpot };
+  }, [rows]);
+
+  // Filter MASTER_SUMMARY_COLUMNS based on which leg types are actually present.
+  const visibleColumns = useMemo(() => {
+    return MASTER_SUMMARY_COLUMNS.filter((c) => {
+      if (!c.conditional) return true;
+      return legPresence[c.conditional] === true;
+    });
+  }, [legPresence]);
+
+  // Per-combo timing stats — computed from the elapsed_ms field each row carries.
+  const timingStats = useMemo(() => {
+    const durs = rows.map((r) => Number(r.elapsed_ms)).filter((d) => isFinite(d) && d > 0);
+    if (!durs.length) return null;
+    const totalMs = durs.reduce((a, b) => a + b, 0);
+    const avg = totalMs / durs.length;
+    const min = Math.min(...durs);
+    const max = Math.max(...durs);
+    return { totalMs, avgMs: avg, minMs: min, maxMs: max, count: durs.length };
+  }, [rows]);
+
+  function toggleSort(key) {
+    if (sortKey === key) {
+      setOrder(order === 'desc' ? 'asc' : 'desc');
+    } else {
+      setSortKey(key);
+      setOrder('desc');
+    }
+  }
+
+  async function exportExcel() {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Optimization Summary');
+    // Build header with Sr.No first, then optimized-param cols, then Duration, then master summary.
+    const headers = [
+      'Sr. No.',
+      ...paramColumns.map((p) => p.label),
+      'Duration (ms)',
+      ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => c.label),
+    ];
+    ws.addRow(headers);
+    ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } };
+    ws.getRow(1).alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.views = [{ state: 'frozen', xSplit: 1 + paramColumns.length, ySplit: 1 }];
+
+    rows.forEach((row, i) => {
+      const summary = row.summary || {};
+      const cols = row.combo_columns || {};
+      const combo = row.combo || {};
+      const arr = [
+        i + 1,
+        ...paramColumns.map((p) => combo[p.key]),
+        row.elapsed_ms != null ? Number(row.elapsed_ms) : null,
+        ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => {
+          if (c.key in cols) return cols[c.key];
+          if (c.key in summary) return summary[c.key];
+          return summary[c.key];
+        }),
+      ];
+      ws.addRow(arr);
+    });
+    ws.columns.forEach((col) => {
+      col.width = 16;
+    });
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `optimize_${jobId}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  async function downloadTradesheets() {
+    try {
+      const r = await fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        alert(err.detail || 'Failed to download tradesheets');
+        return;
+      }
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `optimize_${jobId.slice(0, 8)}_tradesheets.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {
+      alert('Failed to download tradesheets');
+    }
+  }
+
+  async function cancelJob() {
+    if (!jobId) return;
+    try {
+      await fetch(`/api/optimize/jobs/${jobId}`, { method: 'DELETE' });
+    } catch {}
+    onClose && onClose();
+  }
+
+  if (!jobId) return null;
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.55)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+      }}
+    >
+      <div
+        style={{
+          width: 'min(1320px, 98vw)',
+          maxHeight: '94vh',
+          background: 'var(--bg-surface, #fff)',
+          color: 'var(--text-primary, #111)',
+          borderRadius: 12,
+          boxShadow: '0 24px 80px rgba(0,0,0,0.45)',
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+          border: '1px solid var(--border-strong, #d1d5db)',
+        }}
+      >
+        {/* Header */}
+        <div
+          style={{
+            padding: '14px 20px',
+            borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+          }}
+        >
+          <div>
+            <h2 style={{ fontSize: 16, fontWeight: 600, margin: 0 }}>
+              Optimization Results
+            </h2>
+            <div style={{ fontSize: 11, opacity: 0.6, marginTop: 2 }}>
+              Job <code>{jobId.slice(0, 8)}</code> · ranking by{' '}
+              <strong>{sortKey}</strong>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {status === 'running' && (
+              <span
+                style={{
+                  fontSize: 11,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+              >
+                <Loader2 size={12} className="animate-spin" />
+                {phase === 'loading_data'
+                  ? 'Loading market data…'
+                  : `${done}/${total} (${progressPct}%)${eta ? ` · ETA ~${Math.round(eta / 60)}m` : ''}`}
+              </span>
+            )}
+            {timingStats && (
+              <span
+                style={{
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                  background: 'var(--bg-elevated, #f0fdf4)',
+                  border: '1px solid var(--border-strong, #d1d5db)',
+                  borderRadius: 4,
+                  padding: '4px 8px',
+                  color: 'var(--text-secondary, #166534)',
+                }}
+                title="Per-combo runtime — sampled from completed combos so far"
+              >
+                avg {timingStats.avgMs.toFixed(1)}ms · min {timingStats.minMs.toFixed(1)} · max {timingStats.maxMs.toFixed(1)}
+              </span>
+            )}
+            <button
+              onClick={exportExcel}
+              disabled={rows.length === 0}
+              style={{
+                padding: '6px 12px',
+                fontSize: 11,
+                border: '1px solid var(--border-strong, #d1d5db)',
+                borderRadius: 6,
+                background: 'transparent',
+                cursor: rows.length === 0 ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                opacity: rows.length === 0 ? 0.4 : 1,
+              }}
+            >
+              <Download size={12} /> Export XLSX
+            </button>
+            <button
+              onClick={downloadTradesheets}
+              disabled={status !== 'success' || rows.length === 0}
+              style={{
+                padding: '6px 12px',
+                fontSize: 11,
+                border: '1px solid var(--border-strong, #d1d5db)',
+                borderRadius: 6,
+                background: 'transparent',
+                cursor: (status !== 'success' || rows.length === 0) ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                opacity: (status !== 'success' || rows.length === 0) ? 0.4 : 1,
+              }}
+              title={status !== 'success' ? 'Available after run completes' : 'Download all tradesheets as ZIP'}
+            >
+              <Download size={12} /> Download Tradesheets ZIP
+            </button>
+            {status === 'running' && (
+              <button
+                onClick={cancelJob}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 11,
+                  border: '1px solid var(--border-strong, #d1d5db)',
+                  borderRadius: 6,
+                  background: 'transparent',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel run
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              aria-label="Close"
+              style={{
+                background: 'transparent',
+                border: 0,
+                cursor: 'pointer',
+              }}
+            >
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+
+        {/* Progress bar */}
+        {status === 'running' && (
+          <div
+            style={{ height: 3, background: 'var(--border, #f1f5f9)' }}
+          >
+            <div
+              style={{
+                width: `${progressPct}%`,
+                height: '100%',
+                background: 'var(--accent, #2563eb)',
+                transition: 'width 0.3s ease',
+              }}
+            />
+          </div>
+        )}
+
+        {/* Body */}
+        <div style={{ flex: 1, overflow: 'auto', padding: 0 }}>
+          {error && (
+            <div
+              style={{
+                margin: 12,
+                padding: 8,
+                border: '1px solid var(--loss-border, #fecaca)',
+                background: 'var(--loss-bg, #fef2f2)',
+                color: 'var(--loss, #991b1b)',
+                borderRadius: 6,
+                fontSize: 12,
+              }}
+            >
+              {error}
+            </div>
+          )}
+          <table
+            style={{
+              width: '100%',
+              borderCollapse: 'collapse',
+              fontSize: 11,
+              fontFamily: 'IBM Plex Mono, monospace',
+            }}
+          >
+            <thead
+              style={{
+                position: 'sticky',
+                top: 0,
+                background: 'var(--bg-surface, #fff)',
+                zIndex: 1,
+                boxShadow: '0 1px 0 var(--border-strong, #e5e7eb)',
+              }}
+            >
+              <tr>
+                {visibleColumns.map((c, idx) => {
+                  const th = (
+                    <th
+                      key={`${c.key}-${idx}`}
+                      onClick={() => c.key !== 'sr_no' && toggleSort(c.key)}
+                      style={{
+                        padding: '8px 6px',
+                        textAlign: 'left',
+                        borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+                        cursor: c.key === 'sr_no' ? 'default' : 'pointer',
+                        whiteSpace: 'nowrap',
+                        fontSize: 10,
+                        letterSpacing: '0.03em',
+                        background:
+                          c.key === 'sr_no'
+                            ? 'var(--bg-elevated,#f9fafb)'
+                            : 'transparent',
+                      }}
+                    >
+                      {c.label}
+                      {sortKey === c.key && !c.dup && (
+                        order === 'desc' ? (
+                          <ArrowDown size={10} style={{ marginLeft: 4 }} />
+                        ) : (
+                          <ArrowUp size={10} style={{ marginLeft: 4 }} />
+                        )
+                      )}
+                    </th>
+                  );
+                  // Inject the optimized-param headers right after the Sr. No.
+                  if (c.key === 'sr_no') {
+                    return [
+                      th,
+                      ...paramColumns.map((p, pi) => (
+                        <th
+                          key={`pcol-${p.key}-${pi}`}
+                          style={{
+                            padding: '8px 6px',
+                            textAlign: 'left',
+                            borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+                            whiteSpace: 'nowrap',
+                            fontSize: 10,
+                            letterSpacing: '0.03em',
+                            background: 'var(--bg-elevated,#fef3c7)',
+                            color: '#92400e',
+                            fontWeight: 600,
+                          }}
+                          title={`Optimized parameter: ${p.key}`}
+                        >
+                          {p.label}
+                        </th>
+                      )),
+                      <th
+                        key="duration-header"
+                        style={{
+                          padding: '8px 6px',
+                          textAlign: 'right',
+                          borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+                          whiteSpace: 'nowrap',
+                          fontSize: 10,
+                          letterSpacing: '0.03em',
+                          background: 'var(--bg-elevated,#dcfce7)',
+                          color: 'var(--accent, #166534)',
+                          fontWeight: 600,
+                        }}
+                        title="Wall-clock time spent running this single combination"
+                      >
+                        Duration (ms)
+                      </th>,
+                    ];
+                  }
+                  return th;
+                })}
+                <th
+                  style={{
+                    padding: '8px 6px',
+                    borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+                    textAlign: 'right',
+                  }}
+                >
+                  Apply
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={visibleColumns.length + paramColumns.length + 1}
+                    style={{ padding: 20, textAlign: 'center', opacity: 0.5 }}
+                  >
+                    {status === 'running'
+                      ? 'Waiting for first results…'
+                      : 'No results.'}
+                  </td>
+                </tr>
+              )}
+              {rows.map((row, i) => {
+                const summary = row.summary || {};
+                const cols = row.combo_columns || {};
+                const combo = row.combo || {};
+                return (
+                  <tr key={row.combo_id ?? i}>
+                    {visibleColumns.map((c, idx) => {
+                      let v;
+                      if (c.key === 'sr_no') v = i + 1;
+                      else if (c.key in cols) v = cols[c.key];
+                      else v = summary[c.key];
+                      const cell = (
+                        <td
+                          key={`${c.key}-${idx}`}
+                          style={{
+                            padding: '6px 6px',
+                            borderBottom: '1px solid var(--border, #f1f5f9)',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {formatCell(v)}
+                        </td>
+                      );
+                      if (c.key === 'sr_no') {
+                        const dur = row.elapsed_ms;
+                        return [
+                          cell,
+                          ...paramColumns.map((p, pi) => (
+                            <td
+                              key={`pcol-${p.key}-${pi}`}
+                              style={{
+                                padding: '6px 6px',
+                                borderBottom: '1px solid var(--border, #f1f5f9)',
+                                whiteSpace: 'nowrap',
+                                background: 'var(--bg-elevated,#fffbeb)',
+                                fontWeight: 500,
+                              }}
+                            >
+                              {formatCell(combo[p.key])}
+                            </td>
+                          )),
+                          <td
+                            key="duration-cell"
+                            style={{
+                              padding: '6px 6px',
+                              borderBottom: '1px solid var(--border, #f1f5f9)',
+                              whiteSpace: 'nowrap',
+                              textAlign: 'right',
+                              background: 'var(--bg-elevated,#f0fdf4)',
+                              fontFamily: 'monospace',
+                              fontSize: 10,
+                            }}
+                          >
+                            {dur != null ? Number(dur).toFixed(1) : '—'}
+                          </td>,
+                        ];
+                      }
+                      return cell;
+                    })}
+                    <td
+                      style={{
+                        padding: '6px 6px',
+                        borderBottom: '1px solid var(--border, #f1f5f9)',
+                        textAlign: 'right',
+                      }}
+                    >
+                      <button
+                        onClick={() =>
+                          onApplyCombo && onApplyCombo(row.combo || {})
+                        }
+                        title="Apply this combination back to the strategy builder"
+                        style={{
+                          background: 'transparent',
+                          border: '1px solid var(--border-strong, #d1d5db)',
+                          borderRadius: 4,
+                          padding: '2px 6px',
+                          cursor: 'pointer',
+                          fontSize: 10,
+                        }}
+                      >
+                        <Settings size={10} style={{ marginRight: 4 }} />
+                        Apply
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatCell(v) {
+  if (v == null || v === '') return '—';
+  if (typeof v === 'number') {
+    if (Number.isInteger(v)) return v.toString();
+    return v.toFixed(2);
+  }
+  return String(v);
+}

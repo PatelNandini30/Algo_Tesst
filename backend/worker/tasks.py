@@ -66,6 +66,34 @@ def run_algotest_job(self, params: dict):
 
 
 @celery_app.task(bind=True)
+def run_optimize_job(self, spec: dict):
+    """Execute an optimization sweep.
+
+    Args:
+        spec: dict with keys
+            base_payload, param_specs, method, sample_n, objective,
+            algorithm, seed
+    """
+    try:
+        from services.optimizer.runner import run_optimization
+        self.update_state(state='PROCESSING', meta={'status': 'Starting optimization'})
+        result = run_optimization(
+            job_id=self.request.id,
+            base_payload=spec.get('base_payload') or {},
+            param_specs=spec.get('param_specs') or [],
+            method=spec.get('method') or 'exhaustive',
+            sample_n=spec.get('sample_n'),
+            objective=spec.get('objective') or 'total_pnl',
+            algorithm=spec.get('algorithm'),
+            seed=spec.get('seed'),
+            parallelism=spec.get('parallelism'),
+        )
+        return _sanitize_result(result)
+    except Exception as e:
+        return _sanitize_result({'status': 'error', 'message': str(e)})
+
+
+@celery_app.task(bind=True)
 def warm_backtest_cache_task(self, params: dict):
     """Warm bulk and native lookup caches inside the backtest worker process."""
     try:

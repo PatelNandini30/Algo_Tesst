@@ -92,6 +92,9 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
         body: formData,
       });
 
+      if (!res.ok) {
+        throw new Error(`Server error ${res.status}`);
+      }
       const data = await res.json();
       if (!data.success) {
         throw new Error(data.message || 'Failed to parse CSV');
@@ -103,7 +106,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
     } catch (err) {
       setUploadError(err.message || 'Failed to upload CSV');
       setCustomSegments([]);
-      setCsvFileName('');
+      // Keep csvFileName so the user can see which file failed
     } finally {
       setCsvUploading(false);
       if (fileInputRef.current) {

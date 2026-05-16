@@ -1,0 +1,1332 @@
+//! Phase 2b — Rust trade simulation (first slice).
+//!
+//! Scope today
+//! -----------
+//! `simulate_trades_batch(trade_specs)` takes a list of pre-resolved trade
+//! specifications and returns the priced + P&L'd trade rows. The
+//! orchestration (entry-date computation, strike selection, exit-date
+//! resolution) stays in Python for now — only the per-trade price lookup
+//! and slippage / P&L arithmetic moves to Rust.
+//!
+//! Why incremental
+//! ---------------
+//! The Python engine is ~3,000 lines with rollover, lazy legs, filters, STR,
+//! re-entry, futures legs, etc. A "rip-and-replace" Rust port would take 1–2
+//! weeks. Instead we move the smallest verifiable slice now, gated by the
+//! parity tests in `backend/tests/test_engine_parity.py`. Subsequent slices
+//! migrate more of the orchestration into Rust:
+//!
+//!   slice 1 (this file): per-trade lookup + slippage + P&L      ← now
+//!   slice 2:              expiry-date iteration + entry/exit DTE
+//!   slice 3:              strike selection (pct_of_atm, ATM offsets)
+//!   slice 4:              SL/Target/Trail per-leg
+//!   slice 5:              overall SL/Target
+//!   slice 6:              rollover + re-entry
+//!   slice 7:              filters (STR, custom segments)
+//!
+//! Input shape
+//! -----------
+//! A Python list of dicts, each describing one trade:
+//!     {
+//!       "trade_id":     int,
+//!       "leg_id":       int,
+//!       "index":        "NIFTY",
+//!       "entry_date":   "2024-01-08",   // YYYY-MM-DD
+//!       "exit_date":    "2024-01-10",
+//!       "expiry":       "2024-01-11",
+//!       "strike":       21500.0,
+//!       "option_type":  "CE" | "PE",
+//!       "position":     "SELL" | "BUY",
+//!       "lots":         1,
+//!       "lot_size":     50,
+//!       "slippage_pct": 0.0
+//!     }
+//!
+//! Output shape
+//! ------------
+//! A Python list of dicts, one per input, with these keys added:
+//!     {
+//!       ...input fields preserved...,
+//!       "entry_price":     f64,    // post-slippage
+//!       "exit_price":      f64,    // post-slippage
+//!       "raw_entry_price": f64,    // pre-slippage
+//!       "raw_exit_price":  f64,    // pre-slippage
+//!       "entry_spot":      f64,
+//!       "exit_spot":       f64,
+//!       "net_pnl":         f64,    // sign-correct for SELL vs BUY
+//!       "missing":         bool    // true if any lookup failed
+//!     }
+//!
+//! Failed lookups (missing price for that date/strike/expiry) produce a row
+//! with `missing=true` and zeros — caller decides whether to drop or report.
+
+use std::collections::HashMap;
+
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
+use rayon::prelude::*;
+
+use crate::{
+    apply_slippage, lookup_option_high, lookup_option_low, lookup_option_open,
+    lookup_option_price, lookup_spot_price, lookup_strikes_for_date, round2,
+};
+
+// ── Slice 2 helpers ─────────────────────────────────────────────────────────
+
+/// Mirrors `base.calculate_trading_days_before_expiry` exactly.
+///
+/// * `days_before == 0` → most-recent trading day with date ≤ expiry
+/// * `days_before  > 0` → the `days_before`-th trading day strictly before
+///   expiry (1-based: days_before=1 means the day right before expiry).
+///
+/// `trading_days` MUST be sorted ascending (caller's responsibility) and
+/// contain dates as ISO `YYYY-MM-DD` strings.
+fn trading_day_before(
+    expiry: &str,
+    days_before: u32,
+    trading_days: &[String],
+) -> Option<String> {
+    if trading_days.is_empty() {
+        return None;
+    }
+    // Find rightmost index where day < expiry (or ≤ expiry for days_before=0).
+    // Trading days are ascending, so binary search by string compare works
+    // because ISO dates sort lexicographically.
+    let cutoff = expiry.to_string();
+    let idx_after = if days_before == 0 {
+        // Want the last day ≤ expiry → search for first day > expiry.
+        trading_days.partition_point(|d| d.as_str() <= cutoff.as_str())
+    } else {
+        // Want trading days strictly before expiry.
+        trading_days.partition_point(|d| d.as_str() < cutoff.as_str())
+    };
+    if idx_after == 0 {
+        return None;
+    }
+    if days_before == 0 {
+        return Some(trading_days[idx_after - 1].clone());
+    }
+    let want = days_before as usize;
+    if idx_after < want {
+        return None;
+    }
+    Some(trading_days[idx_after - want].clone())
+}
+
+/// Mirrors `base.calculate_strike_from_selection` exactly.
+///
+/// Supported selections: `ATM`, `ITM1..N`, `OTM1..N`. Other modes
+/// (PCT_OF_ATM, premium-based) belong to a future slice — return None here
+/// and the caller falls back to the Python path.
+fn atm_offset_strike(
+    spot_price: f64,
+    strike_interval: f64,
+    selection: &str,
+    option_type: &str,
+) -> Option<f64> {
+    if strike_interval <= 0.0 {
+        return None;
+    }
+    let atm = (spot_price / strike_interval).round() * strike_interval;
+    let sel = selection.trim().to_uppercase();
+    if sel == "ATM" {
+        return Some(atm);
+    }
+    let is_call = matches!(option_type.trim().to_uppercase().as_str(), "CE" | "CALL" | "C");
+    if let Some(rest) = sel.strip_prefix("ITM") {
+        let n: i32 = rest.parse().ok()?;
+        let offset = (n as f64) * strike_interval;
+        return Some(if is_call { atm - offset } else { atm + offset });
+    }
+    if let Some(rest) = sel.strip_prefix("OTM") {
+        let n: i32 = rest.parse().ok()?;
+        let offset = (n as f64) * strike_interval;
+        return Some(if is_call { atm + offset } else { atm - offset });
+    }
+    None
+}
+
+// ── Slice 2 PyO3 entry point ────────────────────────────────────────────────
+
+/// Every strike-selection mode the Python engine supports. New modes are
+/// added here, and `extract_leg_cfgs` is the single place that recognises
+/// new payload shapes.
+#[derive(Debug, Clone)]
+enum StrikeSel {
+    Fixed(String),                  // ATM, ITM1..N, OTM1..N
+    PctOfAtm { value: f64, direction: String },  // e.g. 0.5% OTM
+    AtmStraddlePremPct(f64),        // value in percent — uses ATM straddle premium
+    StraddleWidth { multiplier: f64, direction: String },
+    ClosestPremium(f64),
+    PremiumGte(f64),
+    PremiumLte(f64),
+    PremiumRange { lower: f64, upper: f64 },
+}
+
+/// Features that the engine supports but Phase 2b slice 2 does not yet.
+/// If any leg/payload sets one of these, `resolve_trade_specs` returns an
+/// empty list and the Python engine handles the run — guaranteeing no
+/// silently-wrong numbers reach the user.
+#[derive(Debug, Clone)]
+struct UnsupportedReason(pub String);
+
+#[derive(Debug, Clone)]
+struct LegCfg {
+    option_type: String,
+    position: String,
+    lots: i64,
+    strike_interval: f64,
+    strike: StrikeSel,
+}
+
+fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
+    let sel_obj = leg.get_item("strike_selection").ok().flatten()?;
+    let sel = sel_obj.downcast::<PyDict>().ok()?;
+    let mode = sel
+        .get_item("type").ok().flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_else(|| "strike_type".to_string())
+        .to_lowercase();
+    let read_f64 = |k: &str| -> Option<f64> {
+        sel.get_item(k).ok().flatten().and_then(|v| v.extract::<f64>().ok())
+    };
+    let read_str = |k: &str| -> Option<String> {
+        sel.get_item(k).ok().flatten().and_then(|v| v.extract::<String>().ok())
+    };
+    match mode.as_str() {
+        "strike_type" | "" => {
+            let st = read_str("strike_type").unwrap_or_else(|| "ATM".to_string());
+            Some(StrikeSel::Fixed(st.to_uppercase()))
+        }
+        // UI's compact form: {type: "ATM"} | {type: "ITM1"} | {type: "OTM2"} | …
+        // Treat any token starting with ATM/ITM/OTM as a direct Fixed selector.
+        m if m.starts_with("atm") || m.starts_with("itm") || m.starts_with("otm") => {
+            Some(StrikeSel::Fixed(mode.to_uppercase()))
+        }
+        "pct_of_atm" => Some(StrikeSel::PctOfAtm {
+            value: read_f64("value").unwrap_or(0.0),
+            direction: read_str("direction").unwrap_or_else(|| "OTM".to_string()),
+        }),
+        "atm_straddle_prem_pct" => {
+            Some(StrikeSel::AtmStraddlePremPct(read_f64("value").unwrap_or(0.0)))
+        }
+        "straddle_width" => Some(StrikeSel::StraddleWidth {
+            multiplier: read_f64("straddle_multiplier").unwrap_or(0.5),
+            direction: read_str("straddle_direction").unwrap_or_else(|| "+".to_string()),
+        }),
+        "closest_premium" => Some(StrikeSel::ClosestPremium(read_f64("premium").unwrap_or(0.0))),
+        "premium_gte" => Some(StrikeSel::PremiumGte(read_f64("premium").unwrap_or(0.0))),
+        "premium_lte" => Some(StrikeSel::PremiumLte(read_f64("premium").unwrap_or(0.0))),
+        "premium_range" => Some(StrikeSel::PremiumRange {
+            lower: read_f64("lower").unwrap_or(0.0),
+            upper: read_f64("upper").unwrap_or(0.0),
+        }),
+        _ => None,
+    }
+}
+
+fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<UnsupportedReason>)> {
+    let mut out: Vec<LegCfg> = Vec::new();
+    let legs_obj = payload.get_item("legs").ok().flatten();
+    let legs = match legs_obj {
+        Some(v) => v.downcast::<PyList>()?,
+        None => return Ok((out, None)),
+    };
+    for item in legs.iter() {
+        let leg = item.downcast::<PyDict>()?;
+
+        // Reject features we don't yet support. The Python engine handles them.
+        // The list is kept in sync with the engine's per-leg config keys.
+        // SL / Target / Trail SL are slice 4 — Python wrapper calls the
+        // existing check_leg_stop_loss_target. SL-with-Buffer is slice 4b —
+        // Python wrapper calls apply_sl_with_buffer_batch in this module.
+        let blockers = [
+            "simpleMomentum",
+            "rollover_strike_mode",
+        ];
+        for key in blockers {
+            if let Ok(Some(v)) = leg.get_item(key) {
+                // Treat as set only if the dict has a non-null "mode" or "value".
+                if let Ok(d) = v.downcast::<PyDict>() {
+                    let has_mode = d.get_item("mode").ok().flatten().is_some();
+                    let has_value = d.get_item("value").ok().flatten().is_some();
+                    if has_mode || has_value {
+                        return Ok((vec![], Some(UnsupportedReason(format!(
+                            "leg has '{}' set — Rust slice 2 does not yet handle it", key
+                        )))));
+                    }
+                }
+            }
+        }
+
+        // Slice 6: re-entry. RE_ASAP mode is orchestrated in Python (engine_rust.py)
+        // using Rust for the inner pricing + SL check calls. Reject any other mode
+        // (RE_MOMENTUM, _REV variants) since the orchestrator doesn't handle them yet.
+        for key in ["reEntryOnSL", "reEntryOnTarget"] {
+            if let Ok(Some(v)) = leg.get_item(key) {
+                if let Ok(d) = v.downcast::<PyDict>() {
+                    let mode_str = d.get_item("mode").ok().flatten()
+                        .and_then(|m| m.extract::<String>().ok())
+                        .unwrap_or_default()
+                        .to_uppercase();
+                    if !mode_str.is_empty() && mode_str != "RE_ASAP" {
+                        return Ok((vec![], Some(UnsupportedReason(format!(
+                            "leg has '{}' with mode '{}' — only RE_ASAP supported in Rust path", key, mode_str
+                        )))));
+                    }
+                    // lazy leg config is slice 10 — not yet supported.
+                    let has_lazy = d.get_item("lazyLegConfig").ok().flatten().is_some()
+                        || d.get_item("lazy_leg_config").ok().flatten().is_some();
+                    if has_lazy {
+                        return Ok((vec![], Some(UnsupportedReason(format!(
+                            "leg has '{}' with lazyLegConfig — slice 10 not yet supported", key
+                        )))));
+                    }
+                }
+            }
+        }
+
+        // Futures legs use a totally different code path.
+        let segment = leg
+            .get_item("segment").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_default()
+            .to_uppercase();
+        if segment == "FUTURES" {
+            return Ok((vec![], Some(UnsupportedReason(
+                "futures legs not yet supported in Rust path".to_string()
+            ))));
+        }
+
+        let strike = match extract_strike_sel(leg) {
+            Some(s) => s,
+            None => return Ok((vec![], Some(UnsupportedReason(
+                "unknown strike_selection.type".to_string()
+            )))),
+        };
+
+        let strike_interval = leg
+            .get_item("strike_interval").ok().flatten()
+            .and_then(|v| v.extract::<f64>().ok())
+            .unwrap_or(50.0);
+
+        out.push(LegCfg {
+            option_type: leg
+                .get_item("option_type").ok().flatten()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_else(|| "CE".to_string()),
+            position: leg
+                .get_item("position").ok().flatten()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_else(|| "SELL".to_string()),
+            lots: leg
+                .get_item("lots").ok().flatten()
+                .and_then(|v| v.extract::<i64>().ok())
+                .unwrap_or(1),
+            strike_interval,
+            strike,
+        });
+    }
+    Ok((out, None))
+}
+
+/// Returns `Some(reason)` when the payload uses a strategy-level feature
+/// that Rust slice 2 does not yet handle. Caller falls back to the Python
+/// engine so we never emit wrong numbers.
+///
+/// Slice 6 (2026-05): `rollover_toggle` is now supported for WEEKLY / MONTHLY
+/// expiry types — see `build_rollover_schedule` below. Other expiry types
+/// (NEXT_WEEKLY etc.) still block because `_rollover_mode` requires WEEKLY/MONTHLY
+/// in the Python engine (see generic_algotest_engine.py:3408).
+fn check_strategy_blockers(payload: &PyDict) -> Option<UnsupportedReason> {
+    let truthy = |k: &str| -> bool {
+        payload
+            .get_item(k).ok().flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false)
+    };
+    let extract_str = |k: &str| -> String {
+        payload
+            .get_item(k).ok().flatten()
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_default()
+            .to_uppercase()
+    };
+
+    // rollover_toggle is supported only for WEEKLY/MONTHLY — Python engine
+    // gates _rollover_mode on the same condition. Otherwise fall back.
+    if truthy("rollover_toggle") {
+        let etype = extract_str("expiry_type");
+        if etype != "WEEKLY" && etype != "MONTHLY" {
+            return Some(UnsupportedReason(format!(
+                "rollover_toggle active but expiry_type={} not WEEKLY/MONTHLY", etype
+            )));
+        }
+    }
+
+    let blockers = [
+        ("no_rollover",              truthy("no_rollover")),
+        ("buffer_strike_enabled",    truthy("buffer_strike_enabled")),
+    ];
+    for (name, hit) in blockers {
+        if hit {
+            return Some(UnsupportedReason(format!(
+                "strategy-level feature '{}' active — Rust slice 2 falls back to Python", name
+            )));
+        }
+    }
+    None
+}
+
+/// Trading-day gap from `from_date` (exclusive) to `to_date` (inclusive),
+/// matching the Python engine's `idx_target - idx_entry` with side='right'
+/// searchsorted (generic_algotest_engine.py:3696-3704, 3977-3979).
+///
+/// For `from = Mon Jan 6, to = Thu Jan 9` (both trading days): gap = 3.
+/// For `from = to`: gap = 0.
+fn trading_day_gap(from_date: &str, to_date: &str, trading_days: &[String]) -> u32 {
+    // side='right' equivalent: partition_point(|d| d <= target)
+    let idx_from = trading_days.partition_point(|d| d.as_str() <= from_date);
+    let idx_to   = trading_days.partition_point(|d| d.as_str() <= to_date);
+    if idx_to > idx_from { (idx_to - idx_from) as u32 } else { 0 }
+}
+
+/// Build a rollover trade schedule mirroring the Python engine's behavior
+/// when `rollover_toggle = True` and `expiry_type in ('WEEKLY','MONTHLY')`.
+///
+/// Returns a Vec of (trade_id, entry_date, exit_date, leg_expiry, original_expiry)
+/// where:
+///   * trade_id: 1-based sequence
+///   * entry_date: same-day chain from previous trade's SCHEDULED exit (not extended)
+///   * exit_date: original scheduled exit, possibly extended to next_expiry when
+///                trading-day gap (entry → original_expiry) ≤ rollover_min_days
+///   * leg_expiry: original cur_expiry, advanced to next_expiry when min-DTE triggers
+///   * original_expiry: the cur_expiry from the schedule (used as the chain anchor)
+///
+/// Python references:
+///   - Schedule construction:   engines/generic_algotest_engine.py:3441-3502
+///   - Same-day chain:           engines/generic_algotest_engine.py:3841-3902
+///   - Trade-level min-DTE:      engines/generic_algotest_engine.py:3971-3991
+///   - Per-leg contract advance: engines/generic_algotest_engine.py:4350-4366
+fn build_rollover_schedule(
+    expiry_dates: &[String],
+    trading_days: &[String],
+    entry_dte: u32,
+    exit_dte: u32,
+    rollover_min_days: u32,
+) -> Vec<(i64, String, String, String, String)> {
+    let mut out: Vec<(i64, String, String, String, String)> = Vec::new();
+    if expiry_dates.is_empty() || trading_days.is_empty() {
+        return out;
+    }
+
+    // Step 1: build initial schedule records (entry/exit relative to current expiry).
+    // expiry_dates must be sorted ascending; the caller passes them sorted.
+    let mut sched: Vec<(String, String, String, String)> = Vec::new(); // (entry, exit, cur_exp, next_exp)
+    for (i, cur_exp) in expiry_dates.iter().enumerate() {
+        let entry = match trading_day_before(cur_exp, entry_dte, trading_days) {
+            Some(v) => v,
+            None => continue,
+        };
+        let scheduled_exit = match trading_day_before(cur_exp, exit_dte, trading_days) {
+            Some(v) => v,
+            None => continue,
+        };
+        let next_exp = if i + 1 < expiry_dates.len() {
+            expiry_dates[i + 1].clone()
+        } else {
+            cur_exp.clone()
+        };
+        sched.push((entry, scheduled_exit, cur_exp.clone(), next_exp));
+    }
+
+    // Step 2: walk records, applying same-day chain (entry N = prev scheduled exit).
+    // Trade 1 keeps its scheduled entry (no prior anchor).
+    let mut trade_id: i64 = 0;
+    let mut prev_scheduled_exit: Option<String> = None;
+    for (sched_entry, sched_exit, cur_exp, next_exp) in &sched {
+        let actual_entry = match prev_scheduled_exit.as_ref() {
+            Some(prev) => prev.clone(),
+            None => sched_entry.clone(),
+        };
+
+        // Skip 0-day trades (entry >= exit). For T-0/T-0 first record this is
+        // common; the chain takes over from the next record. Python: 3886-3890.
+        if actual_entry >= *sched_exit {
+            // Seed the chain anchor even if we don't emit, so the chain continues.
+            if prev_scheduled_exit.is_none() {
+                prev_scheduled_exit = Some(sched_exit.clone());
+            } else {
+                prev_scheduled_exit = Some(sched_exit.clone());
+            }
+            continue;
+        }
+
+        // Step 3: apply min-DTE extension to determine actual exit + leg expiry.
+        // Trading-day gap from actual_entry to cur_exp (the original target).
+        let mut actual_exit = sched_exit.clone();
+        let mut leg_expiry = cur_exp.clone();
+        if rollover_min_days > 0 {
+            let gap = trading_day_gap(&actual_entry, cur_exp, trading_days);
+            if gap <= rollover_min_days {
+                actual_exit = next_exp.clone();
+                leg_expiry = next_exp.clone();
+            }
+        }
+
+        trade_id += 1;
+        out.push((trade_id, actual_entry, actual_exit, leg_expiry, cur_exp.clone()));
+        // Chain uses SCHEDULED exit (pre-extension) per Python engine semantics.
+        prev_scheduled_exit = Some(sched_exit.clone());
+    }
+
+    out
+}
+
+/// Closest-premium picker matching the Python engine's tie-breaking.
+///
+/// Primary key: |premium - target| (closer wins)
+/// Tie-break 1: |strike - atm_strike| (closer to ATM wins)
+/// Tie-break 2: for CE prefer HIGHER strike, for PE prefer LOWER strike
+fn pick_by_premium<'a>(
+    candidates: &'a [(f64, f64)],
+    target: f64,
+    atm: f64,
+    is_call: bool,
+) -> Option<&'a (f64, f64)> {
+    candidates.iter().min_by(|a, b| {
+        let da = (a.1 - target).abs();
+        let db = (b.1 - target).abs();
+        da.partial_cmp(&db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let sa = (a.0 - atm).abs();
+                let sb = (b.0 - atm).abs();
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                if is_call {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            })
+    })
+}
+
+/// Compute the strike price for one leg on one entry date.
+///
+/// Falls back to None (caller skips the trade or falls back to Python) when
+/// the entry_date has no usable option chain data for the requested mode.
+fn compute_strike_for_leg(
+    leg: &LegCfg,
+    entry_date: &str,
+    expiry: &str,
+    index: &str,
+    entry_spot: f64,
+) -> Option<f64> {
+    let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
+    let is_call = leg.option_type.eq_ignore_ascii_case("CE")
+        || leg.option_type.eq_ignore_ascii_case("CALL")
+        || leg.option_type.eq_ignore_ascii_case("C");
+
+    match &leg.strike {
+        StrikeSel::Fixed(sel) => {
+            atm_offset_strike(entry_spot, leg.strike_interval, sel, &leg.option_type)
+        }
+        StrikeSel::PctOfAtm { value, direction } => {
+            // Match Python exactly: shift = spot × pct / 100; only "-"
+            // subtracts, everything else (including "OTM", "ITM", "+") adds.
+            // The OTM/ITM-to-sign mapping is the UI's job — by the time the
+            // payload reaches us, direction is just "+" or "-" in practice.
+            let dir = direction.trim();
+            let shift = entry_spot * value / 100.0;
+            let raw = if dir == "-" {
+                entry_spot - shift
+            } else {
+                entry_spot + shift
+            };
+            Some((raw / leg.strike_interval).round() * leg.strike_interval)
+        }
+        StrikeSel::ClosestPremium(target) => {
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            pick_by_premium(&chain, *target, atm, is_call).map(|(s, _)| *s)
+        }
+        StrikeSel::PremiumGte(target) => {
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            let qualifying: Vec<(f64, f64)> = chain
+                .into_iter()
+                .filter(|(_, p)| *p >= *target)
+                .collect();
+            if qualifying.is_empty() {
+                return None;
+            }
+            pick_by_premium(&qualifying, *target, atm, is_call).map(|(s, _)| *s)
+        }
+        StrikeSel::PremiumLte(target) => {
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            let qualifying: Vec<(f64, f64)> = chain
+                .into_iter()
+                .filter(|(_, p)| *p <= *target)
+                .collect();
+            if qualifying.is_empty() {
+                return None;
+            }
+            pick_by_premium(&qualifying, *target, atm, is_call).map(|(s, _)| *s)
+        }
+        StrikeSel::PremiumRange { lower, upper } => {
+            // Mirrors base.calculate_strike_from_premium_range exactly:
+            // pick the in-range strike whose premium is closest to the
+            // UPPER bound (equivalently: highest premium in-range), with
+            // ATM-distance and direction tie-breakers.
+            let _ = lower;  // lower is only used to filter, not to pick
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            let qualifying: Vec<(f64, f64)> = chain
+                .into_iter()
+                .filter(|(_, p)| *p >= *lower && *p <= *upper)
+                .collect();
+            if qualifying.is_empty() {
+                return None;
+            }
+            pick_by_premium(&qualifying, *upper, atm, is_call).map(|(s, _)| *s)
+        }
+        StrikeSel::StraddleWidth { multiplier, direction } => {
+            // shift = multiplier × (ATM CE + ATM PE), then snap.
+            let ce = lookup_option_price(entry_date, index, atm, "CE", expiry)?;
+            let pe = lookup_option_price(entry_date, index, atm, "PE", expiry)?;
+            let shift = *multiplier * (ce + pe);
+            let raw = if direction.trim() == "-" {
+                atm - shift
+            } else {
+                atm + shift
+            };
+            Some((raw / leg.strike_interval).round() * leg.strike_interval)
+        }
+        StrikeSel::AtmStraddlePremPct(pct) => {
+            // target premium = pct% × (ATM CE + ATM PE), then closest-premium
+            // for the leg's option type.
+            let ce = lookup_option_price(entry_date, index, atm, "CE", expiry)?;
+            let pe = lookup_option_price(entry_date, index, atm, "PE", expiry)?;
+            let target = (pct / 100.0) * (ce + pe);
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            pick_by_premium(&chain, target, atm, is_call).map(|(s, _)| *s)
+        }
+    }
+}
+
+/// Slice 2 — resolve every (entry_date, exit_date, strike, leg) tuple for
+/// the given strategy payload and trading calendar.
+///
+/// Inputs
+/// ------
+/// payload         strategy config (uses `index`, `entry_dte`, `exit_dte`,
+///                 `legs[]`, `slippage_pct`, etc.)
+/// expiry_dates    list of ISO YYYY-MM-DD weekly/monthly expiries in range
+/// trading_days    list of ISO YYYY-MM-DD trading days in range
+/// lot_size        contract lot size for the index
+///
+/// Output
+/// ------
+/// A `PyList` of trade-spec dicts. The list is **empty** if the payload
+/// uses any feature this slice does not yet handle — the caller MUST detect
+/// the empty result and fall back to the Python engine.
+///
+/// Currently supported:
+///   * Strike modes: ATM, ITM1..N, OTM1..N, pct_of_atm
+///   * Single or multi-leg strategies with same entry/exit DTE
+///   * Slippage
+/// Not yet supported (caller falls back to Python):
+///   * Per-leg SL / Target / Trail SL / SL-with-Buffer / Re-entry
+///   * Strategy-level Overall SL / Target
+///   * Rollover, No-Rollover, Spot Adjustment, Buffer Strike
+///   * STR filter, custom date filter
+///   * Futures legs
+///   * Strike modes: atm_straddle_prem_pct, straddle_width, premium_*
+#[pyfunction]
+pub fn resolve_trade_specs(
+    payload: &PyDict,
+    expiry_dates: Vec<String>,
+    trading_days: Vec<String>,
+    lot_size: i64,
+    spot_by_date: HashMap<String, f64>,
+) -> PyResult<PyObject> {
+    let py = payload.py();
+    let out = PyList::empty(py);
+
+    if let Some(_reason) = check_strategy_blockers(payload) {
+        return Ok(out.into());
+    }
+    let (legs, leg_blocker) = extract_leg_cfgs(payload)?;
+    if legs.is_empty() || leg_blocker.is_some() {
+        return Ok(out.into());
+    }
+
+    let index = payload
+        .get_item("index").ok().flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_else(|| "NIFTY".to_string());
+    let entry_dte: u32 = payload
+        .get_item("entry_dte").ok().flatten()
+        .and_then(|v| v.extract::<u32>().ok())
+        .unwrap_or(1);
+    let exit_dte: u32 = payload
+        .get_item("exit_dte").ok().flatten()
+        .and_then(|v| v.extract::<u32>().ok())
+        .unwrap_or(0);
+    let slippage_pct = payload
+        .get_item("slippage_pct").ok().flatten()
+        .and_then(|v| v.extract::<f64>().ok())
+        .unwrap_or(0.0);
+
+    let mut td: Vec<String> = trading_days;
+    td.sort();
+    let mut expiries_sorted: Vec<String> = expiry_dates.clone();
+    expiries_sorted.sort();
+
+    // Slice 6: rollover_toggle support for WEEKLY/MONTHLY. When active, use
+    // the rollover schedule builder which handles same-day chain + min-DTE
+    // extension. Otherwise use the simple "one trade per expiry" path.
+    let rollover_active = {
+        let truthy = payload
+            .get_item("rollover_toggle").ok().flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
+        let etype = payload
+            .get_item("expiry_type").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_default()
+            .to_uppercase();
+        truthy && (etype == "WEEKLY" || etype == "MONTHLY")
+    };
+
+    if rollover_active {
+        let rollover_min_days: u32 = payload
+            .get_item("rollover_min_days_to_expiry").ok().flatten()
+            .and_then(|v| v.extract::<u32>().ok())
+            .unwrap_or(0);
+        let schedule = build_rollover_schedule(
+            &expiries_sorted, &td, entry_dte, exit_dte, rollover_min_days,
+        );
+        for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry) in &schedule {
+            let entry_spot = match spot_by_date.get(entry_date) {
+                Some(&v) if v > 0.0 => v,
+                _ => continue,
+            };
+            for (leg_idx, leg) in legs.iter().enumerate() {
+                let strike = match compute_strike_for_leg(
+                    leg, entry_date, leg_expiry, &index, entry_spot,
+                ) {
+                    Some(v) => v,
+                    None => return Ok(PyList::empty(py).into()),
+                };
+                let d = PyDict::new(py);
+                d.set_item("trade_id", *trade_id)?;
+                d.set_item("leg_id", (leg_idx + 1) as i64)?;
+                d.set_item("index", &index)?;
+                d.set_item("entry_date", entry_date)?;
+                d.set_item("exit_date", exit_date)?;
+                d.set_item("expiry", leg_expiry)?;
+                d.set_item("strike", round2(strike))?;
+                d.set_item("option_type", &leg.option_type)?;
+                d.set_item("position", &leg.position)?;
+                d.set_item("lots", leg.lots)?;
+                d.set_item("lot_size", lot_size)?;
+                d.set_item("slippage_pct", slippage_pct)?;
+                out.append(d)?;
+            }
+        }
+        return Ok(out.into());
+    }
+
+    let mut next_trade_id: i64 = 1;
+    for expiry in &expiry_dates {
+        let entry_date = match trading_day_before(expiry, entry_dte, &td) {
+            Some(v) => v,
+            None => continue,
+        };
+        let exit_date = match trading_day_before(expiry, exit_dte, &td) {
+            Some(v) => v,
+            None => continue,
+        };
+        if entry_date > exit_date {
+            continue;
+        }
+        // Spot is supplied by Python — it has the authoritative data path
+        // (Postgres, parquet, feather) and may be wider than the Rust feather.
+        let entry_spot = match spot_by_date.get(&entry_date) {
+            Some(&v) if v > 0.0 => v,
+            _ => continue,
+        };
+
+        let trade_id = next_trade_id;
+        next_trade_id += 1;
+        for (leg_idx, leg) in legs.iter().enumerate() {
+            let strike = match compute_strike_for_leg(leg, &entry_date, expiry, &index, entry_spot) {
+                Some(v) => v,
+                None => {
+                    // Strike mode not yet implemented for this leg — drop the
+                    // ENTIRE strategy run rather than emit a partial result.
+                    return Ok(PyList::empty(py).into());
+                }
+            };
+            let d = PyDict::new(py);
+            d.set_item("trade_id", trade_id)?;
+            d.set_item("leg_id", (leg_idx + 1) as i64)?;
+            d.set_item("index", &index)?;
+            d.set_item("entry_date", &entry_date)?;
+            d.set_item("exit_date", &exit_date)?;
+            d.set_item("expiry", expiry)?;
+            d.set_item("strike", round2(strike))?;
+            d.set_item("option_type", &leg.option_type)?;
+            d.set_item("position", &leg.position)?;
+            d.set_item("lots", leg.lots)?;
+            d.set_item("lot_size", lot_size)?;
+            d.set_item("slippage_pct", slippage_pct)?;
+            out.append(d)?;
+        }
+    }
+    Ok(out.into())
+}
+
+#[derive(Debug, Clone)]
+struct TradeSpec {
+    trade_id: i64,
+    leg_id: i64,
+    index: String,
+    entry_date: String,
+    exit_date: String,
+    expiry: String,
+    strike: f64,
+    option_type: String,
+    position: String,
+    lots: i64,
+    lot_size: i64,
+    slippage_pct: f64,
+}
+
+#[derive(Debug, Clone)]
+struct TradeResult {
+    entry_price: f64,
+    exit_price: f64,
+    raw_entry_price: f64,
+    raw_exit_price: f64,
+    entry_spot: f64,
+    exit_spot: f64,
+    net_pnl: f64,
+    missing: bool,
+}
+
+fn extract_str(dict: &PyDict, key: &str) -> String {
+    dict.get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default()
+}
+
+fn extract_f64(dict: &PyDict, key: &str) -> f64 {
+    dict.get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+fn extract_i64(dict: &PyDict, key: &str) -> i64 {
+    dict.get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn dict_to_spec(dict: &PyDict) -> TradeSpec {
+    TradeSpec {
+        trade_id: extract_i64(dict, "trade_id"),
+        leg_id: extract_i64(dict, "leg_id"),
+        index: extract_str(dict, "index"),
+        entry_date: extract_str(dict, "entry_date"),
+        exit_date: extract_str(dict, "exit_date"),
+        expiry: extract_str(dict, "expiry"),
+        strike: extract_f64(dict, "strike"),
+        option_type: extract_str(dict, "option_type"),
+        position: extract_str(dict, "position"),
+        lots: extract_i64(dict, "lots"),
+        lot_size: extract_i64(dict, "lot_size"),
+        slippage_pct: extract_f64(dict, "slippage_pct"),
+    }
+}
+
+fn simulate_one(s: &TradeSpec) -> TradeResult {
+    let raw_entry = lookup_option_price(
+        &s.entry_date,
+        &s.index,
+        s.strike,
+        &s.option_type,
+        &s.expiry,
+    );
+    let raw_exit = lookup_option_price(
+        &s.exit_date,
+        &s.index,
+        s.strike,
+        &s.option_type,
+        &s.expiry,
+    );
+
+    let entry_spot = lookup_spot_price(&s.entry_date, &s.index).unwrap_or(0.0);
+    let exit_spot = lookup_spot_price(&s.exit_date, &s.index).unwrap_or(0.0);
+
+    let missing = raw_entry.is_none() || raw_exit.is_none();
+    if missing {
+        return TradeResult {
+            entry_price: 0.0,
+            exit_price: 0.0,
+            raw_entry_price: 0.0,
+            raw_exit_price: 0.0,
+            entry_spot: round2(entry_spot),
+            exit_spot: round2(exit_spot),
+            net_pnl: 0.0,
+            missing: true,
+        };
+    }
+
+    let raw_entry = raw_entry.unwrap();
+    let raw_exit = raw_exit.unwrap();
+
+    let entry_px = apply_slippage(raw_entry, &s.position, "entry", s.slippage_pct);
+    let exit_px = apply_slippage(raw_exit, &s.position, "exit", s.slippage_pct);
+
+    // Engine convention: Net P&L is in PREMIUM POINTS, not rupees.
+    // For SELL: net = entry - exit   (we receive entry, pay exit)
+    // For BUY : net = exit - entry
+    // Quantity (lots × lot_size) is informational and downstream uses it
+    // to compute Turnover, NOT to scale Net P&L. compute_analytics works
+    // off these per-share points and produces a points-based cumulative.
+    let is_sell = s.position.trim().eq_ignore_ascii_case("SELL");
+    let net_pnl = if is_sell {
+        round2(entry_px - exit_px)
+    } else {
+        round2(exit_px - entry_px)
+    };
+
+    TradeResult {
+        entry_price: entry_px,
+        exit_price: exit_px,
+        raw_entry_price: round2(raw_entry),
+        raw_exit_price: round2(raw_exit),
+        entry_spot: round2(entry_spot),
+        exit_spot: round2(exit_spot),
+        net_pnl,
+        missing: false,
+    }
+}
+
+fn result_to_dict(py: Python<'_>, spec: &TradeSpec, r: &TradeResult) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    d.set_item("trade_id", spec.trade_id)?;
+    d.set_item("leg_id", spec.leg_id)?;
+    d.set_item("index", &spec.index)?;
+    d.set_item("entry_date", &spec.entry_date)?;
+    d.set_item("exit_date", &spec.exit_date)?;
+    d.set_item("expiry", &spec.expiry)?;
+    d.set_item("strike", spec.strike)?;
+    d.set_item("option_type", &spec.option_type)?;
+    d.set_item("position", &spec.position)?;
+    d.set_item("lots", spec.lots)?;
+    d.set_item("lot_size", spec.lot_size)?;
+    d.set_item("slippage_pct", spec.slippage_pct)?;
+    d.set_item("entry_price", r.entry_price)?;
+    d.set_item("exit_price", r.exit_price)?;
+    d.set_item("raw_entry_price", r.raw_entry_price)?;
+    d.set_item("raw_exit_price", r.raw_exit_price)?;
+    d.set_item("entry_spot", r.entry_spot)?;
+    d.set_item("exit_spot", r.exit_spot)?;
+    d.set_item("net_pnl", r.net_pnl)?;
+    d.set_item("missing", r.missing)?;
+    Ok(d.into())
+}
+
+/// Simulate a batch of pre-resolved trades. See module docstring.
+///
+/// Lookups hit the shared Rust market cache (CACHE in lib.rs); slippage and
+/// P&L computation are pure functions. The batch is parallelised across
+/// CPU cores with rayon, with the Python GIL released for the compute.
+#[pyfunction]
+pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
+    let py = trades.py();
+
+    let mut specs: Vec<TradeSpec> = Vec::with_capacity(trades.len());
+    for obj in trades.iter() {
+        let dict = obj.downcast::<PyDict>()?;
+        specs.push(dict_to_spec(dict));
+    }
+
+    // Release GIL while rayon scans the batch. lookup_option_price uses an
+    // RwLock<Option<MarketCache>>::read() — safe to call from many threads.
+    let mut results: Vec<TradeResult> = py.allow_threads(|| {
+        specs.par_iter().map(simulate_one).collect()
+    });
+
+    // Post-process to match the Python engine's row-level conventions:
+    //   1. Drop EVERY leg of any trade where at least one leg is `missing`.
+    //      The Python engine skips the whole trade if it can't price one
+    //      leg — emitting a partial row would diverge from the snapshot.
+    //   2. For surviving trades, the row with the LOWEST leg_id reports
+    //      the SUM of all per-leg net_pnl as its own net_pnl. Other legs
+    //      keep their per-leg net_pnl as-is. This mirrors the engine's
+    //      "Trade Net P&L" column layout that the parity tests check.
+    let mut bad_trades: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (s, r) in specs.iter().zip(results.iter()) {
+        if r.missing {
+            bad_trades.insert(s.trade_id);
+        }
+    }
+
+    let mut trade_totals: std::collections::HashMap<i64, (f64, i64)> = std::collections::HashMap::new();
+    for (s, r) in specs.iter().zip(results.iter()) {
+        if bad_trades.contains(&s.trade_id) {
+            continue;
+        }
+        let entry = trade_totals.entry(s.trade_id).or_insert((0.0, i64::MAX));
+        entry.0 += r.net_pnl;
+        if s.leg_id < entry.1 {
+            entry.1 = s.leg_id;
+        }
+    }
+    // Only the FIRST row matching the lowest leg_id gets the trade total.
+    // Subsequent rows with the same (trade_id, leg_id) are re-entries (slice 6) —
+    // they keep their per-leg net_pnl. This matches the Python engine where
+    // the parent row reports the trade-aggregated Net P&L and each re-entry
+    // row reports its own per-leg P&L.
+    let mut total_assigned: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (s, r) in specs.iter().zip(results.iter_mut()) {
+        if let Some(&(total, lowest_leg)) = trade_totals.get(&s.trade_id) {
+            if s.leg_id == lowest_leg && !total_assigned.contains(&s.trade_id) {
+                r.net_pnl = round2(total);
+                total_assigned.insert(s.trade_id);
+            }
+        }
+    }
+
+    let out = PyList::empty(py);
+    for (spec, result) in specs.iter().zip(results.iter()) {
+        if bad_trades.contains(&spec.trade_id) {
+            continue;
+        }
+        out.append(result_to_dict(py, spec, result)?)?;
+    }
+    Ok(out.into())
+}
+
+// ── Slice 4b: SL-with-Buffer ───────────────────────────────────────────────
+//
+// Mirrors the Python algorithm at engines/generic_algotest_engine.py
+// (`_compute_sl_buffer_exit` + the per-leg loop in `check_leg_stop_loss_target`).
+//
+// Two branches by mode:
+//
+//   pct / points (option-price level):
+//     1. Compute SL_price from entry_premium + sl_buffer_value.
+//          SELL pct  : entry * (1 + v/100)        SELL points : entry + v
+//          BUY  pct  : entry * (1 - v/100)        BUY  points : entry - v
+//     2. Each holding day, fetch day Open/High/Low for the option.
+//     3. If day_open is known AND on the gap side of SL_price (open>SL for SELL,
+//        open<SL for BUY): GAP. Exit = open*(1±buf%/100) capped at day_high/low.
+//     4. Else if day_high>=SL (SELL) or day_low<=SL (BUY): intraday hit. Exit at
+//        SL_price exactly (NO buffer applied).
+//     5. Else: no SL hit today.
+//
+//   underlying_pts / underlying_pct (spot-anchored):
+//     Detect via adverse-vs-threshold on spot. On the day of hit, look back one
+//     day: if yesterday's spot move was below threshold, treat as a gap and
+//     apply buffer to today's option open (capped). Otherwise no override —
+//     caller's normal exit-price logic uses today's close.
+
+use pyo3::types::PyTuple;
+
+#[derive(Debug, Clone)]
+struct SlBufferCfg {
+    enabled: bool,
+    value: f64,
+    mode: String,        // pct / points / underlying_pts / underlying_pct
+    buffer_pct: f64,
+    entry_premium: f64,
+    entry_spot: f64,
+}
+
+fn extract_sl_buffer_cfg(leg: &PyDict, entry_premium: f64, entry_spot: f64) -> SlBufferCfg {
+    let sl_buf = match leg.get_item("slWithBuffer").ok().flatten() {
+        Some(v) => match v.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return SlBufferCfg {
+                enabled: false, value: 0.0, mode: String::new(), buffer_pct: 0.0,
+                entry_premium, entry_spot,
+            },
+        },
+        None => return SlBufferCfg {
+            enabled: false, value: 0.0, mode: String::new(), buffer_pct: 0.0,
+            entry_premium, entry_spot,
+        },
+    };
+    let value = sl_buf.get_item("value").ok().flatten()
+        .and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
+    let mode = sl_buf.get_item("mode").ok().flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .map(|s| {
+            let s = s.to_uppercase().replace(' ', "_").replace('-', "_");
+            match s.as_str() {
+                "PERCENT" | "PCT" | "%" => "pct".to_string(),
+                "POINTS" | "PT" | "PTS" => "points".to_string(),
+                "UNDERLYING_POINTS" | "UNDERLYING_PTS" => "underlying_pts".to_string(),
+                "UNDERLYING_PCT" | "UNDERLYING_PERCENT" => "underlying_pct".to_string(),
+                _ => s.to_lowercase(),
+            }
+        })
+        .unwrap_or_else(|| "pct".to_string());
+    let buffer_pct = sl_buf.get_item("buffer_pct").ok().flatten()
+        .and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
+    let enabled = value != 0.0;
+    SlBufferCfg { enabled, value, mode, buffer_pct, entry_premium, entry_spot }
+}
+
+/// Compute the adverse move on `check_date` against entry, per the engine's
+/// mode-specific formula. Returns None if data is missing.
+fn adverse_value(
+    cfg: &SlBufferCfg,
+    check_date: &str,
+    expiry: &str,
+    index: &str,
+    strike: f64,
+    opt_type: &str,
+    position: &str,
+) -> Option<f64> {
+    let is_sell = position.eq_ignore_ascii_case("SELL");
+    let is_call = opt_type.eq_ignore_ascii_case("CE")
+        || opt_type.eq_ignore_ascii_case("CALL");
+    match cfg.mode.as_str() {
+        "pct" | "points" => {
+            let cp = lookup_option_price(check_date, index, strike, opt_type, expiry)?;
+            let move_pts = cp - cfg.entry_premium;
+            let adverse_pts = if is_sell { move_pts } else { -move_pts };
+            if cfg.mode == "points" {
+                Some(adverse_pts)
+            } else if cfg.entry_premium.abs() > 0.0 {
+                Some(adverse_pts / cfg.entry_premium * 100.0)
+            } else {
+                None
+            }
+        }
+        "underlying_pts" | "underlying_pct" => {
+            let spot = lookup_spot_price(check_date, index)?;
+            let spot_move = spot - cfg.entry_spot;
+            // CE+SELL: adverse if spot up; CE+BUY: adverse if spot down
+            // PE+SELL: adverse if spot down; PE+BUY: adverse if spot up
+            let adverse_spot = if is_call {
+                if is_sell { spot_move } else { -spot_move }
+            } else if is_sell { -spot_move } else { spot_move };
+            if cfg.mode == "underlying_pts" {
+                Some(adverse_spot)
+            } else if cfg.entry_spot.abs() > 0.0 {
+                Some(adverse_spot / cfg.entry_spot * 100.0)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Python signature:
+///   apply_sl_with_buffer_batch(
+///       specs: List[dict],           # priced trades (have entry_price, entry_spot)
+///       legs_payload: List[dict],    # original payload legs (1 per spec.leg_id)
+///       trading_days: List[str],
+///   ) -> List[Optional[Tuple[str, float]]]
+///
+/// Returns one entry per spec: `None` if SL-with-Buffer didn't fire (or isn't
+/// enabled), else `(trigger_date, override_price)`. Caller applies the
+/// override directly — no re-pricing needed.
+#[pyfunction]
+pub fn apply_sl_with_buffer_batch(
+    specs: &PyList,
+    legs_payload: &PyList,
+    trading_days: Vec<String>,
+) -> PyResult<PyObject> {
+    let py = specs.py();
+    let mut td = trading_days;
+    td.sort();
+
+    let out = PyList::empty(py);
+    for spec_obj in specs.iter() {
+        let spec = spec_obj.downcast::<PyDict>()?;
+        let leg_id = spec.get_item("leg_id").ok().flatten()
+            .and_then(|v| v.extract::<i64>().ok()).unwrap_or(1);
+        let leg_idx = (leg_id - 1).max(0) as usize;
+        let leg_src = if leg_idx < legs_payload.len() {
+            legs_payload.get_item(leg_idx)?.downcast::<PyDict>()?
+        } else {
+            out.append(py.None())?;
+            continue;
+        };
+        let entry_premium = spec.get_item("entry_price").ok().flatten()
+            .and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
+        let entry_spot = spec.get_item("entry_spot").ok().flatten()
+            .and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
+        let cfg = extract_sl_buffer_cfg(leg_src, entry_premium, entry_spot);
+        if !cfg.enabled {
+            out.append(py.None())?;
+            continue;
+        }
+
+        let entry_date = spec.get_item("entry_date").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok()).unwrap_or_default();
+        let exit_date = spec.get_item("exit_date").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok()).unwrap_or_default();
+        let expiry = spec.get_item("expiry").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok()).unwrap_or_default();
+        let index = spec.get_item("index").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok()).unwrap_or_else(|| "NIFTY".to_string());
+        let strike = spec.get_item("strike").ok().flatten()
+            .and_then(|v| v.extract::<f64>().ok()).unwrap_or(0.0);
+        let opt_type = spec.get_item("option_type").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok()).unwrap_or_else(|| "CE".to_string());
+        let position = spec.get_item("position").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok()).unwrap_or_else(|| "SELL".to_string());
+
+        // Holding window: trading days STRICTLY AFTER entry, up to AND including exit.
+        let holding: Vec<&String> = td.iter()
+            .filter(|d| d.as_str() > entry_date.as_str() && d.as_str() <= exit_date.as_str())
+            .collect();
+        if holding.is_empty() {
+            out.append(py.None())?;
+            continue;
+        }
+
+        let abs_thr = cfg.value.abs();
+        let is_sell = position.eq_ignore_ascii_case("SELL");
+        let buffer_pct = cfg.buffer_pct;
+        let mut triggered: Option<(String, f64)> = None;
+
+        // Precompute the option-price SL level for pct/points modes.
+        let sl_price_opt: Option<f64> = match cfg.mode.as_str() {
+            "pct" => {
+                if cfg.entry_premium > 0.0 {
+                    Some(if is_sell {
+                        cfg.entry_premium * (1.0 + abs_thr / 100.0)
+                    } else {
+                        cfg.entry_premium * (1.0 - abs_thr / 100.0)
+                    })
+                } else { None }
+            }
+            "points" => {
+                if cfg.entry_premium > 0.0 {
+                    Some(if is_sell {
+                        cfg.entry_premium + abs_thr
+                    } else {
+                        cfg.entry_premium - abs_thr
+                    })
+                } else { None }
+            }
+            _ => None,
+        };
+
+        if let Some(sl_price) = sl_price_opt {
+            // pct / points: option-price level. Each day, check OHLC against SL.
+            for day in holding.iter() {
+                let day_str = day.as_str();
+                let day_open = lookup_option_open(day_str, &index, strike, &opt_type, &expiry);
+                let day_high = lookup_option_high(day_str, &index, strike, &opt_type, &expiry);
+                let day_low  = lookup_option_low (day_str, &index, strike, &opt_type, &expiry);
+
+                if is_sell {
+                    // Gap: open strictly above SL_price.
+                    if let Some(op) = day_open {
+                        if op > sl_price {
+                            let buf = op * (1.0 + buffer_pct / 100.0);
+                            let override_price = match day_high {
+                                Some(h) => buf.min(h),
+                                None => buf,
+                            };
+                            triggered = Some((day.to_string(), round2(override_price.max(0.0))));
+                            break;
+                        }
+                    }
+                    // Intraday hit needs day_high >= SL.
+                    if let Some(h) = day_high {
+                        if h >= sl_price {
+                            triggered = Some((day.to_string(), round2(sl_price.max(0.0))));
+                            break;
+                        }
+                    }
+                } else {
+                    if let Some(op) = day_open {
+                        if op < sl_price {
+                            let buf = op * (1.0 - buffer_pct / 100.0);
+                            let override_price = match day_low {
+                                Some(l) => buf.max(l),
+                                None => buf,
+                            };
+                            triggered = Some((day.to_string(), round2(override_price.max(0.0))));
+                            break;
+                        }
+                    }
+                    if let Some(l) = day_low {
+                        if l <= sl_price {
+                            triggered = Some((day.to_string(), round2(sl_price.max(0.0))));
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            // underlying_pts / underlying_pct: spot-anchored detection. The
+            // exit price is anchored to today's option HIGH (SELL) / LOW (BUY)
+            // — NEVER close. Apply buffer to today's open, then cap at high/low
+            // so the fill price reflects the worst-case realised intraday print.
+            for day in holding.iter() {
+                let day_str = day.as_str();
+                let current_adverse = adverse_value(
+                    &cfg, day_str, &expiry, &index, strike, &opt_type, &position,
+                );
+                let Some(cur) = current_adverse else { continue };
+                if cur < abs_thr {
+                    continue;
+                }
+                let day_open = lookup_option_open(day_str, &index, strike, &opt_type, &expiry);
+                let override_opt = if is_sell {
+                    let day_high = lookup_option_high(day_str, &index, strike, &opt_type, &expiry);
+                    match (day_open, day_high) {
+                        (Some(op), Some(h)) => Some((op * (1.0 + buffer_pct / 100.0)).min(h)),
+                        (Some(op), None)    => Some(op * (1.0 + buffer_pct / 100.0)),
+                        (None, Some(h))     => Some(h),
+                        (None, None)        => None,
+                    }
+                } else {
+                    let day_low = lookup_option_low(day_str, &index, strike, &opt_type, &expiry);
+                    match (day_open, day_low) {
+                        (Some(op), Some(l)) => Some((op * (1.0 - buffer_pct / 100.0)).max(l)),
+                        (Some(op), None)    => Some(op * (1.0 - buffer_pct / 100.0)),
+                        (None, Some(l))     => Some(l),
+                        (None, None)        => None,
+                    }
+                };
+                if let Some(price) = override_opt {
+                    triggered = Some((day.to_string(), round2(price.max(0.0))));
+                    break;
+                }
+                // No OHLC at all — skip (don't fire on bad data).
+            }
+        }
+
+        match triggered {
+            Some((d, p)) => {
+                let t = PyTuple::new(py, &[d.into_py(py), p.into_py(py)]);
+                out.append(t)?;
+            }
+            None => {
+                out.append(py.None())?;
+            }
+        }
+    }
+    Ok(out.into())
+}

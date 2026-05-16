@@ -613,11 +613,16 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
 
                 # FIX #3D: Date Range Filter — O(log n) bisect instead of O(n) loop
                 active_filter_segment = None
+                filter_segment_str = ""
                 if filter_enabled and _fs_starts:
                     entry_ts = current_entry
                     idx = _bisect.bisect_right(_fs_starts, entry_ts) - 1
                     if idx >= 0 and entry_ts <= _fs_ends[idx]:
                         active_filter_segment = filter_segments[idx]
+                        filter_segment_str = (
+                            f"{pd.Timestamp(active_filter_segment['start']).strftime('%d-%m-%Y')} -> "
+                            f"{pd.Timestamp(active_filter_segment['end']).strftime('%d-%m-%Y')}"
+                        )
                     else:
                         break
 
@@ -745,8 +750,9 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                             "Next Expiry": trade_fut_expiry,
                             "Future Expiry": trade_fut_expiry,
                             "Net P&L": leg_row["Net P&L"],
-                            "Exit Reason": exit_reason if str_enabled else "",
+                            "Exit Reason": exit_reason if (str_enabled or filter_enabled) else "",
                             "STR Segment": str_segment_str if str_enabled else "",
+                            "Filter Segment": filter_segment_str if filter_enabled else "",
                         }
                     )
 

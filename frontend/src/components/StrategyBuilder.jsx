@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
+import OptimizePanel from './OptimizePanel';
+import OptimizationResults from './OptimizationResults';
 import Toggle from './ui/Toggle';
 import CalendarPicker from './ui/CalendarPicker';
 import TimeInput from './ui/TimeInput';
@@ -895,6 +897,9 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [cacheWarmLabel, setCacheWarmLabel] = useState('');
   const [backtestMode, setBacktestMode] = useState('eod'); // 'eod' | 'intraday'
   const [intradayEntryTime, setIntradayEntryTime] = useState('09:20');
+  // Optimization panel state
+  const [optimPanelOpen, setOptimPanelOpen] = useState(false);
+  const [optimJob, setOptimJob] = useState(null); // { jobId, totalCombos, objective }
   const [intradaySquareOffTime, setIntradaySquareOffTime] = useState('15:15');
   const [slowPath, setSlowPath] = useState(false);
 
@@ -3881,31 +3886,78 @@ const [slippagePct, setSlippagePct] = useState(0);
           </div>
         )}
 
-        {/* Run Backtest Button — fixed bottom-center */}
+        {/* Run Backtest + Optimize Buttons — fixed bottom-center */}
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2">
-          <button
-            onClick={backtestMode === 'intraday' ? runIntradayBacktest : runBacktest}
-            disabled={!canRunBacktest}
-            className="run-btn px-10 py-3 rounded-full"
-          >
-            {loading ? (
-              <>
-                <Loader2 size={16} className="animate-spin" />
-                <span>Running…</span>
-              </>
-            ) : (
-              <>
-                <Play size={15} />
-                <span>Run Backtest</span>
-              </>
-            )}
-          </button>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={backtestMode === 'intraday' ? runIntradayBacktest : runBacktest}
+              disabled={!canRunBacktest}
+              className="run-btn px-10 py-3 rounded-full"
+            >
+              {loading ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" />
+                  <span>Running…</span>
+                </>
+              ) : (
+                <>
+                  <Play size={15} />
+                  <span>Run Backtest</span>
+                </>
+              )}
+            </button>
+            <button
+              onClick={() => setOptimPanelOpen(true)}
+              disabled={!canRunBacktest}
+              className="run-btn px-6 py-3 rounded-full"
+              style={{
+                background: 'var(--accent-bg, #eff6ff)',
+                color: 'var(--accent, #2563eb)',
+                border: '1px solid var(--accent, #2563eb)',
+              }}
+              title="Run an AmiBroker-style parameter sweep on this strategy"
+            >
+              <Beaker size={15} />
+              <span>Optimize</span>
+            </button>
+          </div>
           {(jobStatusLabel || cacheWarmLabel) && (
             <div style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.6rem', color: 'var(--text-secondary)', letterSpacing: '0.04em', textAlign: 'center' }}>
               {jobStatusLabel || cacheWarmLabel}
             </div>
           )}
         </div>
+        {optimPanelOpen && (
+          <OptimizePanel
+            isOpen={optimPanelOpen}
+            onClose={() => setOptimPanelOpen(false)}
+            basePayload={buildPayload()}
+            nLegs={legs.length}
+            onJobQueued={(info) => {
+              setOptimJob(info);
+              setOptimPanelOpen(false);
+            }}
+          />
+        )}
+        {optimJob && (
+          <OptimizationResults
+            jobId={optimJob.jobId}
+            totalCombos={optimJob.totalCombos}
+            objective={optimJob.objective}
+            onClose={() => setOptimJob(null)}
+            onApplyCombo={(combo) => {
+              // Best-effort: surface the combo as a JSON note in the status
+              // bar. Full "apply" semantics require remapping nested payload
+              // paths back into the StrategyBuilder state graph — this can be
+              // added incrementally.
+              const summary = Object.entries(combo)
+                .map(([k, v]) => `${k}=${v}`)
+                .join('  ');
+              setJobStatusLabel(`Applied combo: ${summary}`);
+              setOptimJob(null);
+            }}
+          />
+        )}
         {lazyLegModal.open && (
           <LazyLegModal
             isOpen={lazyLegModal.open}

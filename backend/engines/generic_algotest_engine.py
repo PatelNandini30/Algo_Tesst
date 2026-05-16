@@ -284,6 +284,7 @@ from base import (
     get_futures_rollover_entry_date,
     get_option_high_from_db,
     get_option_low_from_db,
+    get_option_open_from_db,
 )
 
 from services.data_loader import get_loader
@@ -1149,7 +1150,7 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         final_strike, offset, ref_price = _apply_strike_buffer_after_selection(best_strike)
         return final_strike, offset, ref_price
 
-    # ── % OF ATM: ATM ± (pct% of ATM strike) ──────────────────────────────────
+    # ── % OF ATM: spot ± (pct% of spot), snapped to strike interval ───────────
     if strike_sel_type == 'PCT_OF_ATM':
         pct = (
             leg_config.get('pct_value')
@@ -1167,10 +1168,10 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
             or '-'
         )
         direction = str(direction).strip()
-        shift = (atm_strike * pct) / 100.0
-        raw_strike = atm_strike - shift if direction == '-' else atm_strike + shift
+        shift = (entry_spot * pct) / 100.0
+        raw_strike = entry_spot - shift if direction == '-' else entry_spot + shift
         final = round(raw_strike / strike_interval) * strike_interval
-        _log(f"      PCT_OF_ATM: ATM={atm_strike}, pct={pct}, direction={direction} → {final}")
+        _log(f"      PCT_OF_ATM: spot={entry_spot}, pct={pct}, direction={direction} → {final}")
         final_strike, offset, ref_price = _apply_strike_buffer_after_selection(final)
         return final_strike, offset, ref_price
 
@@ -2195,10 +2196,10 @@ def _execute_per_leg_reentry(
                 if raw_exit is None:
                     fallback_spot = get_spot_price_from_db(actual_exit_date, index) or re_spot
                     raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=re_strike_value, option_type=option_type)
-                _log(
-                    f"[REENTRY] Fallback exit premium used for strike {re_strike_value} "
-                    f"on {actual_exit_date.strftime('%Y-%m-%d')} (spot={fallback_spot})"
-                )
+                    _log(
+                        f"[REENTRY] Fallback exit premium used for strike {re_strike_value} "
+                        f"on {actual_exit_date.strftime('%Y-%m-%d')} (spot={fallback_spot})"
+                    )
             exit_premium = _apply_slippage(raw_exit, position, 'exit', slippage_pct)
             leg_pnl = (exit_premium - entry_premium) if position == 'BUY' else (entry_premium - exit_premium)
 
@@ -2285,6 +2286,48 @@ def _apply_overall_sl_to_per_leg(per_leg_results, overall_date, overall_reason, 
             }
     return per_leg_results
 
+
+
+def _compute_sl_buffer_exit(position, sl_price, day_open, day_high, day_low, buffer_pct):
+    """
+    SL-with-Buffer exit logic for one (leg, day).
+
+    Returns (hit, override_price, kind).
+
+      hit=False, override=None, kind=None  → SL not touched today; carry trade.
+      hit=True, override, kind='INTRADAY'  → high (SELL) / low (BUY) crossed SL
+                                             with open on the SL-favorable side.
+                                             Exit at sl_price exactly (no buffer).
+      hit=True, override, kind='GAP'       → open is strictly past sl_price.
+                                             Exit at open × (1 ± buffer_pct/100)
+                                             capped at day_high (SELL) /
+                                             floored at day_low (BUY).
+
+    `kind` lets the caller emit a different exit reason for each scenario so the
+    tradesheet distinguishes a clean SL touch from a buffered gap fill.
+    """
+    if sl_price is None:
+        return False, None, None
+    is_sell = str(position).upper() == 'SELL'
+    if is_sell:
+        # Gap detection runs first — open strictly above SL means the market
+        # opened past our stop. Hit fires regardless of whether day_high is
+        # known; on a gap we cap at day_high if available, else uncapped buffer.
+        if day_open is not None and day_open > sl_price:
+            buffer_price = day_open * (1.0 + buffer_pct / 100.0)
+            override = min(buffer_price, day_high) if day_high is not None else buffer_price
+            return True, round(float(override), 2), 'GAP'
+        if day_high is None or day_high < sl_price:
+            return False, None, None
+        return True, round(float(sl_price), 2), 'INTRADAY'
+    else:
+        if day_open is not None and day_open < sl_price:
+            buffer_price = day_open * (1.0 - buffer_pct / 100.0)
+            override = max(buffer_price, day_low) if day_low is not None else buffer_price
+            return True, round(float(override), 2), 'GAP'
+        if day_low is None or day_low > sl_price:
+            return False, None, None
+        return True, round(float(sl_price), 2), 'INTRADAY'
 
 
 def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, legs_config,
@@ -2592,70 +2635,95 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                             _log(f"    [TSL] Leg {li+1} BUY: FIRED. current={cp:.2f} <= SL={ts['current_sl_level']:.2f}")
 
             # ── Evaluate SL with Buffer ───────────────────────────────────────
+            # Two-branch model:
+            #   • pct / points modes: SL is an option-price level. Detect via
+            #     day_high (SELL) / day_low (BUY). Gap = open strictly past SL.
+            #     Intraday hit -> exit at SL_price exactly (no buffer). Gap ->
+            #     exit at open*(1±buf%) capped at day_high/low.
+            #   • underlying_pts / underlying_pct: SL is spot-anchored, no clean
+            #     option-price level. Use adverse-spot vs threshold detection.
+            #     Gap = yesterday's spot move was below threshold; in that case
+            #     apply buffer to today's option open (capped). Otherwise let
+            #     the trade exit at today's close via the normal path (no
+            #     override stored).
             hit_sl_buffer = False
-            if has_sl_buffer and cp is not None:
+            sl_buffer_kind = None  # 'INTRADAY' | 'GAP' — drives exit reason suffix
+            if has_sl_buffer and segment not in ('FUTURES', 'FUTURE'):
                 sl_buf_abs = abs(sl_buf_val)
-                if sl_buf_type == 'pct':
-                    hit_sl_buffer = adverse_pct >= sl_buf_abs
-                elif sl_buf_type == 'points':
-                    hit_sl_buffer = adverse_premium_pts >= sl_buf_abs
-                elif sl_buf_type == 'underlying_pts':
-                    hit_sl_buffer = adverse_spot_pts >= sl_buf_abs
-                elif sl_buf_type == 'underlying_pct':
-                    hit_sl_buffer = adverse_spot_pct >= sl_buf_abs
+                _sl_exp_str = pd.Timestamp(_sl_expiry).strftime('%Y-%m-%d')
 
-                if hit_sl_buffer and segment not in ('FUTURES', 'FUTURE'):
-                    # Gap detection: was the previous holding day below the threshold?
-                    is_gap = True
-                    if _day_idx > 0:
-                        prev_date = holding_days[_day_idx - 1]
-                        prev_raw = get_option_premium_from_db(
-                            date=prev_date.strftime('%Y-%m-%d'),
-                            index=index,
-                            strike=strike,
-                            option_type=option_type,
-                            expiry=pd.Timestamp(_sl_expiry).strftime('%Y-%m-%d'),
-                        )
-                        if prev_raw is not None and entry_premium:
-                            prev_move = prev_raw - entry_premium
-                            prev_adverse = prev_move if position == 'SELL' else -prev_move
-                            if sl_buf_type == 'pct':
-                                prev_adverse_val = (prev_adverse / entry_premium * 100) if entry_premium else 0
-                            elif sl_buf_type == 'points':
-                                prev_adverse_val = prev_adverse
-                            elif sl_buf_type in ('underlying_pts', 'underlying_pct'):
-                                prev_spot = get_spot_price_from_db(prev_date, index)
-                                if prev_spot is not None and entry_spot:
-                                    prev_spot_move = prev_spot - entry_spot
-                                    opt_upper = (option_type or 'CE').upper()
-                                    if opt_upper in ('CE', 'CALL', 'C'):
-                                        prev_adv_spot = prev_spot_move if position == 'SELL' else -prev_spot_move
-                                    else:
-                                        prev_adv_spot = -prev_spot_move if position == 'SELL' else prev_spot_move
-                                    prev_adverse_val = (prev_adv_spot / entry_spot * 100) if sl_buf_type == 'underlying_pct' else prev_adv_spot
-                                else:
-                                    prev_adverse_val = 0
-                            else:
-                                prev_adverse_val = 0
-                            is_gap = prev_adverse_val < sl_buf_abs
-
-                    if is_gap:
-                        _sl_exp_str = pd.Timestamp(_sl_expiry).strftime('%Y-%m-%d')
+                if sl_buf_type in ('pct', 'points') and entry_premium:
+                    if sl_buf_type == 'pct':
                         if position == 'SELL':
-                            buffer_price = current_premium_raw * (1 + sl_buf_pct / 100.0)
-                            day_high = get_option_high_from_db(check_date, index, strike, option_type, _sl_exp_str)
-                            override = min(buffer_price, day_high) if day_high is not None else buffer_price
+                            sl_price = entry_premium * (1.0 + sl_buf_abs / 100.0)
                         else:
-                            buffer_price = current_premium_raw * (1 - sl_buf_pct / 100.0)
+                            sl_price = entry_premium * (1.0 - sl_buf_abs / 100.0)
+                    else:  # points
+                        if position == 'SELL':
+                            sl_price = entry_premium + sl_buf_abs
+                        else:
+                            sl_price = entry_premium - sl_buf_abs
+
+                    day_open = get_option_open_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                    day_high = get_option_high_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                    day_low  = get_option_low_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                    hit_sl_buffer, override, sl_buffer_kind = _compute_sl_buffer_exit(
+                        position, sl_price, day_open, day_high, day_low, sl_buf_pct,
+                    )
+                    if hit_sl_buffer and override is not None:
+                        leg_exit_overrides[li] = override
+
+                elif sl_buf_type in ('underlying_pts', 'underlying_pct') and cp is not None:
+                    if sl_buf_type == 'underlying_pts':
+                        hit_sl_buffer = adverse_spot_pts >= sl_buf_abs
+                    else:
+                        hit_sl_buffer = adverse_spot_pct >= sl_buf_abs
+
+                    if hit_sl_buffer:
+                        # Underlying-mode SL_BUFFER: exit is anchored to option HIGH
+                        # (SELL) / LOW (BUY) — NEVER today's close. The buffer is
+                        # applied to today's open, then capped at high/low so the
+                        # fill price reflects worst-case realised intraday print.
+                        # Underlying mode has no option-price SL_price, so we always
+                        # tag the reason as GAP (buffered open fill).
+                        sl_buffer_kind = 'GAP'
+                        day_open = get_option_open_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                        if position == 'SELL':
+                            day_high = get_option_high_from_db(check_date, index, strike, option_type, _sl_exp_str)
+                            if day_open is not None:
+                                buffer_price = day_open * (1 + sl_buf_pct / 100.0)
+                                override = min(buffer_price, day_high) if day_high is not None else buffer_price
+                            elif day_high is not None:
+                                override = day_high
+                            else:
+                                override = None
+                        else:
                             day_low = get_option_low_from_db(check_date, index, strike, option_type, _sl_exp_str)
-                            override = max(buffer_price, day_low) if day_low is not None else buffer_price
-                        leg_exit_overrides[li] = round(override, 2)
+                            if day_open is not None:
+                                buffer_price = day_open * (1 - sl_buf_pct / 100.0)
+                                override = max(buffer_price, day_low) if day_low is not None else buffer_price
+                            elif day_low is not None:
+                                override = day_low
+                            else:
+                                override = None
+                        if override is not None:
+                            leg_exit_overrides[li] = round(override, 2)
+                        else:
+                            # No OHLC at all — don't fire SL_BUFFER (better than
+                            # falling back to close, which the user has confirmed
+                            # is wrong for this feature).
+                            hit_sl_buffer = False
+                            sl_buffer_kind = None
 
             if hit_sl or hit_tgt:
                 reason = 'STOP_LOSS' if hit_sl else 'TARGET'
                 newly_triggered_this_day.append((li, check_date, reason))
             elif hit_sl_buffer:
-                newly_triggered_this_day.append((li, check_date, 'STOP_LOSS_BUFFER'))
+                # Split into INTRADAY (clean SL touch, exit at SL_price) vs
+                # GAP (buffered open fill capped at high/low). Tradesheet needs
+                # to distinguish so the user can audit each scenario.
+                sl_buf_reason = 'STOP_LOSS_BUFFER_GAP' if sl_buffer_kind == 'GAP' else 'STOP_LOSS_BUFFER'
+                newly_triggered_this_day.append((li, check_date, sl_buf_reason))
             elif hit_tsl:
                 newly_triggered_this_day.append((li, check_date, 'TRAIL_SL'))
 
@@ -3221,11 +3289,16 @@ def run_algotest_backtest(params):
     filter_entry_mode = str(
         params.get('filter_entry_mode', 'dte')
     ).lower().strip()
-    fixed_entry_mode = (filter_entry_mode == 'fixed') and (str_enabled or filter_enabled)
-    if filter_entry_mode == 'fixed' and not fixed_entry_mode:
-        _log("[WARN] filter_entry_mode='fixed' requested but no active filter/STR — falling back to DTE mode. "
-             f"(str_enabled={str_enabled}, filter_enabled={filter_enabled}, "
-             f"filter_config={filter_config})")
+    # Fixed-entry mode activates whenever filter_entry_mode == 'fixed'.
+    # The segment list comes from STR (if enabled), the custom CSV/base2 filter
+    # (if enabled), or the implicit global segment built below (date_from →
+    # date_to). Same code path for all three.
+    fixed_entry_mode = (filter_entry_mode == 'fixed')
+    logger.info(
+        "[MODE PROBE] filter_entry_mode=%r fixed_entry_mode=%s str_enabled=%s filter_enabled=%s rollover_toggle=%s min_days_to_expiry=%s",
+        filter_entry_mode, fixed_entry_mode, str_enabled, filter_enabled,
+        rollover_toggle, params.get('rollover_min_days_to_expiry'),
+    )
     fixed_late_entry  = bool(params.get('fixed_late_entry',  False))
     min_days_to_entry = int(params.get('min_days_to_entry', 0) or 0)
     min_days_mode     = (filter_entry_mode == 'min_days') and (str_enabled or filter_enabled)
@@ -3490,7 +3563,7 @@ def run_algotest_backtest(params):
             deduplicated_schedule.append(rec)
         schedule = deduplicated_schedule
 
-    if not schedule:
+    if not schedule and not fixed_entry_mode:
         return pd.DataFrame(), {}, {}
 
     _log(f"Schedule entries constructed: {len(schedule)}")
@@ -3549,20 +3622,59 @@ def run_algotest_backtest(params):
         seg_entries = []
 
         if fixed_entry_mode:
-            # Collect every expiry whose expiry_date falls on or after seg_start.
-            # Do NOT filter by DTE entry_date — in Fixed mode the first entry is
-            # always forced to seg_start regardless of where the DTE entry falls.
-            seg_expiries = []
-            for rec in schedule:
-                if rec.get('entry_date') is None or rec.get('exit_date') is None:
-                    continue
-                expiry_ts = pd.Timestamp(rec['expiry_date'])
-                if expiry_ts >= seg_start:
-                    seg_expiries.append(rec)
+            # NEW ALGORITHM (2026-05-13):
+            #
+            # In Fixed mode each segment produces an explicit chain of trades. The
+            # first trade anchors entry to seg_start; every subsequent trade
+            # re-enters on the SAME day as the previous trade's exit (the contract
+            # naturally rolls because we pick the next expiry forward).
+            #
+            # For each trade in the chain:
+            #   1. target_expiry := first expiry >= current_entry
+            #   2. if min_days_to_expiry extension applies (rollover ON and
+            #      days_from_entry_to_target <= rollover_min_days_to_expiry),
+            #      extend target to the next expiry.
+            #   3. trade_exit := target_expiry - exit_dte trading days.
+            #   4. clamp trade_exit to last trading day in segment if it overflows.
+            #   5. skip the cycle (advance past target_expiry) if exit <= entry.
+            #   6. emit; if clamped or no_rollover or rollover_toggle off, stop.
+            #   7. current_entry := trade_exit (same-day re-entry).
+            #
+            # entry_dte is intentionally ignored for the first entry — Fixed mode
+            # anchors to seg_start by definition. exit_dte applies to every cycle.
+            # fixed_late_entry is no longer needed (the chain always chains
+            # same-day) and is accepted for backwards compatibility but ignored.
 
-            seg_expiries.sort(key=lambda r: pd.Timestamp(r['expiry_date']))
+            # Build a sorted unique list of candidate expiries from the schedule.
+            # Use rec['expiry_date'] (the actual contract expiry) and keep the
+            # first matching rec around for downstream metadata.
+            # When schedule is empty (entry>exit for all DTE configs) but
+            # fixed_entry_mode is on, fall back to expiry_df directly — fixed
+            # mode ignores DTE-based entry/exit dates and builds its own chain.
+            expiry_rec_map = {}
+            if schedule:
+                for _rec in schedule:
+                    if _rec.get('expiry_date') is None:
+                        continue
+                    _exp_ts = pd.Timestamp(_rec['expiry_date'])
+                    if _exp_ts not in expiry_rec_map:
+                        expiry_rec_map[_exp_ts] = _rec
+            else:
+                for _, _erow in expiry_df.iterrows():
+                    _cur = pd.Timestamp(_erow['Current Expiry'])
+                    _nxt_raw = _erow.get('Next Expiry')
+                    _nxt = pd.Timestamp(_nxt_raw) if _nxt_raw is not None and pd.notna(_nxt_raw) else None
+                    if _cur not in expiry_rec_map:
+                        expiry_rec_map[_cur] = {
+                            'expiry_date':        _cur,
+                            'current_expiry':     _cur,
+                            'next_expiry':        _nxt,
+                            '_force_next_expiry': False,
+                            '_rollover_mode':     _rollover_mode,
+                        }
+            expiries_sorted = sorted(expiry_rec_map.keys())
 
-            if not seg_expiries:
+            if not expiries_sorted:
                 segment_records.append({'segment': segment, 'entries': []})
                 continue
 
@@ -3571,144 +3683,157 @@ def run_algotest_backtest(params):
                 trading_calendar,
                 seg_start - pd.Timedelta(days=1)
             )
-            if first_entry_ts is None:
+            if first_entry_ts is None or pd.Timestamp(first_entry_ts) > seg_end:
                 segment_records.append({'segment': segment, 'entries': []})
                 continue
 
             current_entry_ts = pd.Timestamp(first_entry_ts)
-            if current_entry_ts > seg_end:
+            last_in_seg = _last_trading_day_on_or_before(trading_calendar, seg_end)
+            if last_in_seg is None:
                 segment_records.append({'segment': segment, 'entries': []})
                 continue
+            last_in_seg = pd.Timestamp(last_in_seg)
 
-            schedule_idx = 0
-            while schedule_idx < len(seg_expiries):
-                # Advance past expiries whose anchor has already passed.
-                # For NEXT_WEEKLY/NEXT_MONTHLY the anchor (current_expiry) can equal
-                # the late-entry date — use strict < so that row is not skipped.
-                # For WEEKLY/MONTHLY use <= (can't trade a contract on its own expiry day).
-                while schedule_idx < len(seg_expiries):
-                    _adv_rec = seg_expiries[schedule_idx]
-                    _adv_rollover = _adv_rec.get('_rollover_mode', False)
-                    if _adv_rollover:
-                        # Rollover: contract lives until exit_date (next expiry). Only
-                        # skip when the actual contract has already expired.
-                        _adv_stale = pd.Timestamp(_adv_rec['exit_date']) < current_entry_ts
-                    elif _all_legs_next:
-                        _adv_stale = pd.Timestamp(_adv_rec['expiry_date']) < current_entry_ts
-                    else:
-                        _adv_stale = pd.Timestamp(_adv_rec['expiry_date']) <= current_entry_ts
-                    if not _adv_stale:
-                        break
-                    schedule_idx += 1
+            _exit_dte_safe = max(0, int(exit_dte))
+            _max_iters = max(20, len(expiries_sorted) * 4)
+            _iter = 0
 
-                if schedule_idx >= len(seg_expiries):
+            while current_entry_ts <= seg_end and _iter < _max_iters:
+                _iter += 1
+
+                # Invariant: entry must never precede seg_start
+                if current_entry_ts < seg_start:
                     break
 
-                rec = seg_expiries[schedule_idx]
-                expiry_ts = pd.Timestamp(rec['expiry_date'])
-
-                scheduled_exit_ts = pd.Timestamp(rec['exit_date'])
-                if scheduled_exit_ts <= current_entry_ts:
-                    exit_ts = expiry_ts  # exit window has passed, hold to expiry
-                else:
-                    exit_ts = scheduled_exit_ts
-
-                clamped_exit = False
-                if exit_ts > seg_end:
-                    last_day = _last_trading_day_on_or_before(
-                        trading_calendar, seg_end
-                    )
-                    if last_day is None or pd.Timestamp(last_day) <= current_entry_ts:
+                # Find first expiry >= current_entry
+                _target_idx = None
+                for _i, _e in enumerate(expiries_sorted):
+                    if _e >= current_entry_ts:
+                        _target_idx = _i
                         break
-                    exit_ts = pd.Timestamp(last_day)
-                    clamped_exit = True
+                if _target_idx is None:
+                    break
 
-                if current_entry_ts > exit_ts:
-                    schedule_idx += 1
+                target_expiry = expiries_sorted[_target_idx]
+
+                # Compute trading days strictly between current_entry and
+                # target_expiry (not counting either endpoint). This matches the
+                # user-facing semantics of "N days before expiry": for entry Mon
+                # 11-Feb and target Thu 14-Feb, the gap is Tue/Wed = 2 days.
+                try:
+                    # Trading-day gap from entry to target expiry. Use side='right'
+                    # on both ends so the difference equals the actual session count
+                    # between entry and expiry (e.g. Tue→Thu = 2, Wed→Thu = 1,
+                    # Thu→Thu = 0). Matches the per-trade and per-leg min-DTE checks
+                    # below so all three sites agree on what "N days before expiry"
+                    # means: rolls iff gap ≤ rollover_min_days_to_expiry.
+                    _idx_entry  = int(np.searchsorted(
+                        trading_calendar_arr,
+                        current_entry_ts.normalize().to_numpy(),
+                        side='right'))
+                    _idx_target = int(np.searchsorted(
+                        trading_calendar_arr,
+                        target_expiry.normalize().to_numpy(),
+                        side='right'))
+                    days_to_target = max(0, _idx_target - _idx_entry)
+                except Exception:
+                    days_to_target = 0
+
+                # min_days_to_expiry extension (only when rollover toggle is ON).
+                # If the gap between entry and target is too small, use the NEXT
+                # expiry instead. Threshold is inclusive ("≤ N days before expiry").
+                if (rollover_toggle
+                        and rollover_min_days_to_expiry > 0
+                        and days_to_target <= rollover_min_days_to_expiry
+                        and _target_idx + 1 < len(expiries_sorted)):
+                    _target_idx += 1
+                    target_expiry = expiries_sorted[_target_idx]
+
+                target_rec = expiry_rec_map[target_expiry]
+
+                # Compute exit = target_expiry - exit_dte trading days
+                try:
+                    _idx_exp = int(np.searchsorted(
+                        trading_calendar_arr,
+                        target_expiry.normalize().to_numpy(),
+                        side='right')) - 1
+                except Exception:
+                    _idx_exp = -1
+                if _idx_exp < 0:
+                    break
+                _idx_exit = _idx_exp - _exit_dte_safe
+                if _idx_exit < 0:
+                    break
+                exit_ts = pd.Timestamp(trading_calendar_arr[_idx_exit])
+
+                # 0-day or negative cycle (entry == target_expiry under T-0/T-0):
+                # keep the SAME-DAY entry, advance target to next expiry instead.
+                # This preserves the same-day chain semantics — Trade N+1 enters on
+                # Trade N's exit date with the next cycle's contract, rather than
+                # being pushed to the day AFTER expiry.
+                while exit_ts <= current_entry_ts:
+                    if _target_idx + 1 >= len(expiries_sorted):
+                        # No further expiry available — fall back to next-day skip.
+                        _next_after = _next_trading_day_after(trading_calendar, target_expiry)
+                        if _next_after is None or pd.Timestamp(_next_after) > seg_end:
+                            exit_ts = current_entry_ts  # signal break
+                            break
+                        current_entry_ts = pd.Timestamp(_next_after)
+                        break
+                    _target_idx += 1
+                    target_expiry = expiries_sorted[_target_idx]
+                    target_rec = expiry_rec_map[target_expiry]
+                    try:
+                        _idx_exp = int(np.searchsorted(
+                            trading_calendar_arr,
+                            target_expiry.normalize().to_numpy(),
+                            side='right')) - 1
+                    except Exception:
+                        _idx_exp = -1
+                    if _idx_exp < 0:
+                        exit_ts = current_entry_ts
+                        break
+                    _idx_exit = _idx_exp - _exit_dte_safe
+                    if _idx_exit < 0:
+                        exit_ts = current_entry_ts
+                        break
+                    exit_ts = pd.Timestamp(trading_calendar_arr[_idx_exit])
+                if exit_ts <= current_entry_ts:
+                    # Exhausted expiries without finding a viable forward target;
+                    # break out (we already attempted the next-day fallback above).
+                    if current_entry_ts > seg_end:
+                        break
                     continue
+
+                # Clamp to seg_end if exit overflows
+                clamped_exit = False
+                if exit_ts > last_in_seg:
+                    if last_in_seg <= current_entry_ts:
+                        break
+                    exit_ts = last_in_seg
+                    clamped_exit = True
 
                 seg_entries.append({
                     'segment':             segment,
                     'entry_date':          current_entry_ts,
                     'exit_date':           exit_ts,
-                    'expiry_date':         rec['expiry_date'],
-                    'current_expiry':      rec.get('current_expiry', rec['expiry_date']),
-                    'next_expiry':         rec.get('next_expiry',    rec['expiry_date']),
-                    '_force_next_expiry':  rec.get('_force_next_expiry', False),
-                    '_rollover_mode':      rec.get('_rollover_mode', False),
+                    'expiry_date':         target_expiry,
+                    'current_expiry':      target_rec.get('current_expiry', target_expiry),
+                    'next_expiry':         target_rec.get('next_expiry',    target_expiry),
+                    '_force_next_expiry':  target_rec.get('_force_next_expiry', False),
+                    '_rollover_mode':      target_rec.get('_rollover_mode', False),
                     'clamped_exit':        clamped_exit,
                 })
 
-                prev_exit_ts = exit_ts
-                schedule_idx += 1
+                if clamped_exit:
+                    break  # No more trades after the segment-end clamp
+                if no_rollover:
+                    break  # Single trade per segment (near-expiry extension applied post-loop)
+                if not rollover_toggle:
+                    break  # No chaining when re-entry rollover is off
 
-                next_entry_ts = None
-                temp_idx = schedule_idx
-                while temp_idx < len(seg_expiries):
-                    candidate          = seg_expiries[temp_idx]
-                    candidate_entry    = pd.Timestamp(candidate['entry_date'])
-                    candidate_expiry   = pd.Timestamp(candidate['expiry_date'])
-
-                    rec_is_rollover = candidate.get('_rollover_mode', False)
-                    # For rollover the contract lives until exit_date (next expiry),
-                    # so staleness is determined by exit_date, not expiry_date.
-                    _cand_stale = (
-                        pd.Timestamp(candidate['exit_date']) <= prev_exit_ts
-                        if rec_is_rollover else
-                        candidate_expiry <= prev_exit_ts
-                    )
-                    if _cand_stale:
-                        temp_idx += 1
-                        continue
-
-                    # Rollover: re-entry ALWAYS chains same-day on prev_exit_ts (the new
-                    # rollover semantic: each cycle is its own trade, with same-day re-entry
-                    # into the next cycle's contract). The schedule's T-N entry_date is
-                    # ignored; we use prev_exit_ts as the actual entry.
-                    if rec_is_rollover:
-                        if prev_exit_ts > seg_end:
-                            temp_idx += 1
-                            continue
-                        next_entry_ts = prev_exit_ts
-                        schedule_idx  = temp_idx
-                        break
-
-                    if candidate_entry < seg_start or candidate_entry > seg_end:
-                        temp_idx += 1
-                        continue
-
-                    _entry_is_past = candidate_entry <= prev_exit_ts
-                    if _entry_is_past:
-                        if fixed_late_entry:
-                            # DTE window already passed — enter on the next trading day
-                            # after the previous exit instead of skipping this expiry.
-                            late_entry = _next_trading_day_after(trading_calendar, prev_exit_ts)
-                            _contract_exp = (
-                                pd.Timestamp(candidate.get('next_expiry') or candidate_expiry)
-                                if _all_legs_next else candidate_expiry
-                            )
-                            if (late_entry is None
-                                    or pd.Timestamp(late_entry) >= _contract_exp
-                                    or pd.Timestamp(late_entry) > seg_end):
-                                temp_idx += 1
-                                continue
-                            next_entry_ts = pd.Timestamp(late_entry)
-                            schedule_idx  = temp_idx
-                            break
-                        temp_idx += 1
-                        continue
-
-                    next_entry_ts = candidate_entry
-                    schedule_idx  = temp_idx
-                    break
-
-                if next_entry_ts is None:
-                    break
-
-                current_entry_ts = next_entry_ts
-
-                if current_entry_ts > seg_end:
-                    break
+                # Same-day re-entry from this trade's exit
+                current_entry_ts = exit_ts
 
         else:
             _dte_last_exit = None
@@ -3779,10 +3904,14 @@ def run_algotest_backtest(params):
 
                 if entry_ts < seg_start or entry_ts > seg_end:
                     continue
-                # Rollover and NEXT_WEEKLY: each trade is on a different contract so
-                # date overlap between consecutive trades is intentional — bypass entirely.
-                _bypass_overlap = _all_legs_next or _rec_rollover
-                if not _bypass_overlap and _dte_last_exit is not None and entry_ts <= _dte_last_exit:
+                # NEXT_WEEKLY: each trade trades next-week's contract, so overlap with
+                # prior trade's current-week contract is intentional — bypass overlap check.
+                # For plain rollover we also allow same-day re-entry (entry == prev_exit, a
+                # natural chain), but BLOCK strict overlap (entry < prev_exit) which can
+                # happen when min_days_to_expiry rolls consecutive trades onto the same
+                # forward contract — that's two simultaneous positions on one contract.
+                _bypass_overlap = _all_legs_next
+                if not _bypass_overlap and _dte_last_exit is not None and entry_ts < _dte_last_exit:
                     _log(f"[DTE] skip entry {entry_ts.date()} — overlaps prev exit {_dte_last_exit.date()}")
                     continue
                 exit_ts = pd.Timestamp(rec['exit_date'])
@@ -3881,6 +4010,34 @@ def run_algotest_backtest(params):
             _force_next_expiry   = trade_entry.get('_force_next_expiry', False)
             _trade_rollover_mode = trade_entry.get('_rollover_mode', False)
             clamped_exit = trade_entry['clamped_exit']
+
+            # Trade-level min-days-to-expiry: if days_to_current_exp ≤ threshold,
+            # extend the trade's exit_date to next_expiry so the trade holds through
+            # current expiry into the next cycle's chain. The per-leg check below
+            # (~line 4244) advances the option contract; this keeps trade lifespan
+            # aligned with the new contract.
+            if _rollover_mode and rollover_min_days_to_expiry > 0:
+                _trade_cur_exp_ts   = pd.Timestamp(_sched_current_exp)
+                _trade_next_exp_ts  = pd.Timestamp(_sched_next_exp)
+                if _trade_next_exp_ts > _trade_cur_exp_ts:
+                    _trade_cur_exp_norm = np.datetime64(_trade_cur_exp_ts.normalize(), 'ns')
+                    _trade_entry_norm   = np.datetime64(pd.Timestamp(entry_date).normalize(), 'ns')
+                    _trade_idx_entry    = int(np.searchsorted(trading_calendar_arr, _trade_entry_norm, side='right'))
+                    _trade_idx_exp      = int(np.searchsorted(trading_calendar_arr, _trade_cur_exp_norm, side='right'))
+                    _trade_days_to_exp  = _trade_idx_exp - _trade_idx_entry
+                    if _trade_days_to_exp <= rollover_min_days_to_expiry:
+                        _new_exit_ts = _trade_next_exp_ts
+                        if _new_exit_ts > segment['end']:
+                            _last_day = _last_trading_day_on_or_before(trading_calendar, segment['end'])
+                            if _last_day is not None and pd.Timestamp(_last_day) > pd.Timestamp(entry_date):
+                                _new_exit_ts = pd.Timestamp(_last_day)
+                                clamped_exit = True
+                            else:
+                                _new_exit_ts = None
+                        if _new_exit_ts is not None and _new_exit_ts > pd.Timestamp(exit_date):
+                            _log(f"  [MIN_DTE TRADE] entry={pd.Timestamp(entry_date).date()} days_to_exp={_trade_days_to_exp} ≤ {rollover_min_days_to_expiry} — extending exit {pd.Timestamp(exit_date).date()} → {_new_exit_ts.date()}")
+                            exit_date = _new_exit_ts
+
             trade_id += 1
             _log(f"--- Segment {segment['label']} | Trade {trade_id}/{total_entries} ---")
             _log(f"  [EXPIRY DEBUG] expiry_type={expiry_type} | trade_entry keys={list(trade_entry.keys())}")
@@ -4447,17 +4604,27 @@ def run_algotest_backtest(params):
                 )
 
                 # ========== STEP 8C-2: UPDATE EXIT PREMIUMS BASED ON PER-LEG EXIT DATES ==========
-                # If per-leg stop loss triggered, recalculate exit premiums using actual exit dates
+                # If per-leg stop loss triggered, recalculate exit premiums using actual exit dates.
+                # Two cases both need this block:
+                #   (a) trigger date differs from scheduled exit  — re-fetch market premium for the
+                #       new (earlier) exit date.
+                #   (b) trigger date EQUALS the scheduled exit but SL-with-Buffer provided an
+                #       exit_price_override (SL_price for an intraday touch, or buffered open for a
+                #       gap) — the original close-based premium must be overwritten.
+                # The previous `if actual_leg_exit_date != exit_date:` gate skipped (b), letting
+                # SL-Buffer trades that triggered on the same day as the scheduled exit fall through
+                # to the close. This bug surfaced when single-day holds (entry Fri → exit Mon, or
+                # entry day → expiry day) had SL_BUFFER fire on the only holding day.
                 if per_leg_results is not None:
                     for li, tleg in enumerate(trade_legs):
                         leg_result = per_leg_results[li]
                         actual_leg_exit_date = leg_result['exit_date']
-                    
-                        if actual_leg_exit_date != exit_date:
+                        _override_8c = leg_result.get('exit_price_override')
+
+                        if _override_8c is not None or actual_leg_exit_date != exit_date:
                             if tleg.get('segment') == 'OPTION':
                                 # Recalculate option exit premium using leg's resolved expiry
                                 _leg_expiry_8c = tleg.get('_resolved_expiry') or expiry_date
-                                _override_8c = leg_result.get('exit_price_override')
                                 if _override_8c is not None:
                                     new_exit_premium = _override_8c
                                 else:
@@ -4577,15 +4744,20 @@ def run_algotest_backtest(params):
                             leg_exit_date = res['exit_date']
                             _log(f"  ⚡ Leg {li+1}: exit={leg_exit_date.strftime('%Y-%m-%d')} "
                                  f"reason={res['exit_reason']}")
-                            _recalc_leg_pnl(
-                                tleg=tleg,
-                                leg_exit_date=leg_exit_date,
-                                index=index,
-                                expiry_date=expiry_date,
-                                lot_size=lot_size_for_pnl,
-                                fallback_spot=entry_spot,
-                                slippage_pct=slippage_pct,
-                            )
+                            # Skip the re-fetch when step 8C-2 already set the
+                            # exit premium from an SL-with-Buffer override —
+                            # _recalc_leg_pnl uses today's close and would
+                            # overwrite the buffer price.
+                            if res.get('exit_price_override') is None:
+                                _recalc_leg_pnl(
+                                    tleg=tleg,
+                                    leg_exit_date=leg_exit_date,
+                                    index=index,
+                                    expiry_date=expiry_date,
+                                    lot_size=lot_size_for_pnl,
+                                    fallback_spot=entry_spot,
+                                    slippage_pct=slippage_pct,
+                                )
                             tleg['exit_reason'] = res['exit_reason']
 
                     if any_early:

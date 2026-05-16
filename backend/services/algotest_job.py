@@ -277,6 +277,185 @@ def _build_fast_lookup_from_bulk(index: str = None, from_date: str = None, to_da
         logger.warning("[FAST_LOOKUP] Build failed (non-fatal): %s", exc)
 
 
+def _try_rust_engine(payload, index, effective_from, effective_to):
+    """
+    Slice 11 — opt-in Rust orchestrator path.
+
+    Returns (trades_df, summary, pivot) or (None, None, None) when the Rust
+    path can't handle the payload (caller falls back to the Python engine).
+
+    Activation: set ENGINE_BACKEND=rust. Default unset / 'python' uses the
+    Python engine.
+
+    Known gaps vs Python (set ENGINE_BACKEND=python if these matter for you):
+      * MAE/MFE are always 0
+      * Exit Reason is always 'Expiry' regardless of SL/Target/Spot-Adj firing
+      * ReEntryIndex/Trigger/Mode tags missing (re-entry rows still produced)
+      * Buffer strike / futures / lazy legs / rollover / no_rollover /
+        filter_entry_mode='fixed'|'min_days' → orchestrator returns None →
+        falls back to Python.
+    """
+    from base import compute_analytics, build_pivot, get_spot_price_from_db, get_trading_calendar
+    from engines.generic_algotest_engine import get_lot_size
+    from services.engine_rust import run_rust_engine_pipeline, priced_to_tradesheet_records
+
+    days = pd.to_datetime(
+        get_trading_calendar(effective_from, effective_to)["date"]
+    ).sort_values().dt.strftime("%Y-%m-%d").tolist()
+    if not days:
+        return (None, None, None)
+
+    expiries_df = get_expiry_dates(
+        index,
+        payload.get("expiry_type", "weekly"),
+        effective_from,
+        effective_to,
+    )
+    if expiries_df is None or expiries_df.empty:
+        return (None, None, None)
+    col = "Current Expiry" if "Current Expiry" in expiries_df.columns else expiries_df.columns[0]
+    expiries = (
+        pd.to_datetime(expiries_df[col])
+        .sort_values()
+        .dt.strftime("%Y-%m-%d")
+        .unique()
+        .tolist()
+    )
+
+    spots = {}
+    for d in days:
+        v = get_spot_price_from_db(d, index)
+        if v is not None:
+            spots[d] = float(v)
+    if not spots:
+        return (None, None, None)
+
+    lot_size = get_lot_size(index, days[0])
+    priced = run_rust_engine_pipeline(
+        payload,
+        expiry_dates=expiries,
+        trading_days=days,
+        lot_size=int(lot_size),
+        spot_by_date=spots,
+        square_off_mode=payload.get("square_off_mode", "partial"),
+    )
+    if priced is None:
+        return (None, None, None)
+    if not priced:
+        return (pd.DataFrame(), {}, {"headers": [], "rows": []})
+
+    records = priced_to_tradesheet_records(priced, payload, int(lot_size))
+    trades_df = pd.DataFrame(records)
+    for c in ("Entry Date", "Exit Date"):
+        if c in trades_df.columns:
+            trades_df[c] = pd.to_datetime(trades_df[c], errors="coerce")
+
+    # Mirror engines/generic_algotest_engine.py:5256-5310 — aggregate per-leg
+    # rows into per-trade rows BEFORE running compute_analytics. Per-leg
+    # parent rows hold trade-total Net P&L (slice 6 convention); aggregating
+    # would double-count. So we sum CE/PE/FUT P&L per leg (each correctly
+    # per-leg) and recompute trade-level Net P&L = CE+PE+FUT.
+    aggregated = trades_df.groupby("Trade", as_index=False).agg({
+        "Entry Date": "first",
+        "Exit Date": "first",
+        "Entry Spot": "first",
+        "Exit Spot": "first",
+        "Spot P&L": "first",
+        "CE P&L": "sum",
+        "PE P&L": "sum",
+        "FUT P&L": "sum",
+        "Exit Reason": "first",
+    })
+    aggregated["Net P&L"] = aggregated["CE P&L"] + aggregated["PE P&L"] + aggregated["FUT P&L"]
+    entry_spot_series = aggregated["Entry Spot"].replace(0, float("nan"))
+    aggregated["% P&L"] = (aggregated["Net P&L"] / entry_spot_series * 100.0).round(2).fillna(0)
+
+    # Pre-compute Cumulative/Peak/DD/%DD using the same compound formula the
+    # Python engine uses (engines/generic_algotest_engine.py:4716). compute_analytics
+    # detects this pre-built series via its `has_series_b` gate (initial value
+    # in [90, 110]) and uses it instead of building its own additive series.
+    # Without this, summary CAGR diverges because compute_analytics seeds
+    # initial_capital from entry_spot (~21500) instead of the base-100 series.
+    aggregated = aggregated.sort_values("Entry Date").reset_index(drop=True)
+    cumulative = 100.0
+    peak = 100.0
+    cum_series = []
+    peak_series = []
+    dd_series = []
+    pct_dd_series = []
+    for _, r in aggregated.iterrows():
+        es = float(r["Entry Spot"]) if r["Entry Spot"] else 0.0
+        npl = float(r["Net P&L"]) if r["Net P&L"] else 0.0
+        pct_precise = (npl / es * 100.0) if es != 0 else 0.0
+        cumulative = cumulative * (1.0 + pct_precise / 100.0)
+        peak = max(cumulative, peak)
+        dd = cumulative - peak
+        pct_dd = (dd / peak) if peak != 0 else 0.0
+        cum_series.append(cumulative)
+        peak_series.append(peak)
+        dd_series.append(dd)
+        pct_dd_series.append(pct_dd)
+    aggregated["Cumulative"] = cum_series
+    aggregated["Peak"] = peak_series
+    aggregated["DD"] = dd_series
+    aggregated["%DD"] = pct_dd_series
+
+    # IMPORTANT — Python engine quirk match.
+    # The Python engine returns Entry/Exit Date as DD-MM-YYYY strings, then
+    # `compute_analytics` does `series.min()` / `series.max()` on them. With
+    # string-typed columns those calls do LEXICOGRAPHIC compare, so a date like
+    # "28-02-2024" compares greater than "27-03-2024". That makes Python's
+    # n_years (used in CAGR/CAR-MDD) consistently slightly wrong — but it is
+    # the engine's de-facto behavior and the user's "exact copy" requirement
+    # means we must reproduce it. So we serialize dates back to DD-MM-YYYY
+    # strings before handing to compute_analytics.
+    _df_for_analytics = aggregated.copy()
+    for c in ("Entry Date", "Exit Date"):
+        if c in _df_for_analytics.columns:
+            _df_for_analytics[c] = pd.to_datetime(_df_for_analytics[c]).dt.strftime("%d-%m-%Y")
+    _df_for_analytics, summary = compute_analytics(_df_for_analytics)
+    # Pull compute_analytics's added analytics columns back onto the canonical
+    # Timestamp-typed aggregated dataframe so downstream rendering keeps proper
+    # dtypes.
+    for col in ("Cumulative", "Peak", "DD", "%DD"):
+        if col in _df_for_analytics.columns:
+            aggregated[col] = _df_for_analytics[col].values
+
+    # Propagate per-trade Cumulative/Peak/DD/%DD onto the per-leg trades_df —
+    # Python convention: parent row (lowest Leg index per Trade) holds the
+    # trade-level value, other leg rows leave it None. Re-entry/lazy rows also
+    # get None. See engines/generic_algotest_engine.py:5107 — `row_cumulative`
+    # is only assigned for the parent leg.
+    trade_to_cum = {
+        str(r["Trade"]): {
+            "Cumulative": r.get("Cumulative"),
+            "Peak": r.get("Peak"),
+            "DD": r.get("DD"),
+            "%DD": r.get("%DD"),
+        }
+        for _, r in aggregated.iterrows()
+    }
+    parent_leg_seen = set()
+    cum, peak, dd, pdd = [], [], [], []
+    for _, row in trades_df.iterrows():
+        tid = str(row["Trade"])
+        if tid in parent_leg_seen:
+            cum.append(None); peak.append(None); dd.append(None); pdd.append(None)
+            continue
+        parent_leg_seen.add(tid)
+        v = trade_to_cum.get(tid, {})
+        cum.append(v.get("Cumulative"))
+        peak.append(v.get("Peak"))
+        dd.append(v.get("DD"))
+        pdd.append(v.get("%DD"))
+    trades_df["Cumulative"] = cum
+    trades_df["Peak"] = peak
+    trades_df["DD"] = dd
+    trades_df["%DD"] = pdd
+    pivot = build_pivot(aggregated, "Exit Date")
+    return (trades_df, summary, pivot)
+
+
 def _safe_clear_fast_lookup() -> None:
     try:
         clear_fast_lookup(clear_native=False)
@@ -417,7 +596,23 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)
                 logger.debug("[DEBUG] Calling run_algotest_backtest from=%s to=%s", effective_from, effective_to)
                 stage_t = time.perf_counter()
-                trades_df, engine_summary, engine_pivot = run_algotest_backtest(payload)
+                # Slice 11: ENGINE_BACKEND=rust runs the Phase 2b orchestrator
+                # for supported strategies (slices 1-8a) and falls back to the
+                # Python engine for anything else. Unset / 'python' uses the
+                # Python engine unconditionally (default for production).
+                trades_df = engine_summary = engine_pivot = None
+                if os.environ.get("ENGINE_BACKEND", "python").lower() == "rust":
+                    try:
+                        trades_df, engine_summary, engine_pivot = _try_rust_engine(
+                            payload, index, effective_from, effective_to
+                        )
+                    except Exception as exc:
+                        logger.warning("[ENGINE_RUST] failed (%s) — falling back to Python", exc)
+                        trades_df = None
+                    if trades_df is None:
+                        logger.info("[ENGINE_RUST] orchestrator rejected payload — Python engine")
+                if trades_df is None:
+                    trades_df, engine_summary, engine_pivot = run_algotest_backtest(payload)
                 logger.info("[JOB_PERF] run_algotest_backtest %.2fs", time.perf_counter() - stage_t)
                 logger.debug("[DEBUG] Backtest returned type=%s len=%s empty=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None', trades_df.empty if trades_df is not None else 'N/A')
                 stage_t = time.perf_counter()

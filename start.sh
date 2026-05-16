@@ -47,6 +47,7 @@ if [ "$RUST_HASH" != "$STORED_RUST_HASH" ] || [ "$WHEEL_EXISTS" -eq 0 ]; then
     echo "  Native code changed — compiling Rust wheel..."
     rm -f backend/prebuilt/*.whl
     docker run --rm \
+        --entrypoint sh \
         -v "$(pwd)/backend/certs/sonicwall-dpi-ssl.crt:/tmp/sonicwall-dpi-ssl.crt:ro" \
         -v "$(pwd)/backend/native:/project" \
         -v "$(pwd)/backend/prebuilt:/output" \
@@ -57,7 +58,7 @@ if [ "$RUST_HASH" != "$STORED_RUST_HASH" ] || [ "$WHEEL_EXISTS" -eq 0 ]; then
         -e CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git \
         -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
         ghcr.io/pyo3/maturin:latest \
-        sh -c "cat /etc/pki/tls/certs/ca-bundle.crt /tmp/sonicwall-dpi-ssl.crt > /tmp/ca.crt && \
+        -c "cat /etc/pki/tls/certs/ca-bundle.crt /tmp/sonicwall-dpi-ssl.crt > /tmp/ca.crt && \
                export SSL_CERT_FILE=/tmp/ca.crt CARGO_HTTP_CAINFO=/tmp/ca.crt && \
                git config --global http.sslVerify false && \
                maturin build --release \

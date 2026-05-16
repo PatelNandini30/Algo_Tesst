@@ -64,6 +64,9 @@ x-backend-env: &backend-env
   BACKTEST_FAST_QUEUE_MAX_DAYS: "550"
   # API warm-cache waits for the Celery worker cache, not only backend memory.
   WARM_CACHE_WAIT_SECONDS: "90"
+  # Try Rust engine for supported strategies (slices 1-5); auto-falls back to
+  # Python for buffer/futures/lazy/rollover/no-rollover/min_days/fixed-mode legs.
+  ENGINE_BACKEND: "rust"
 
 x-backend-volumes: &backend-volumes
   - ./cleaned_csvs:/data/cleaned_csvs:ro
@@ -71,6 +74,10 @@ x-backend-volumes: &backend-volumes
   - ./strikeData:/data/strikeData:ro
   - ./Filter:/data/Filter:ro
   - algo_cache:/data/cache
+  # Bind-mount backend source so .py edits on host hot-reload into containers
+  # without rebuilding the image. The Rust extension is loaded from
+  # /usr/local/lib/python3.11/site-packages, not from /app/native, so this is safe.
+  - ./backend:/app
 
 services:
   postgres:
@@ -157,6 +164,10 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      # provenance attestation is a Docker Hub SBOM feature; locally it
+      # adds 5-7 minutes to every rebuild and we don't use it. Off.
+      provenance: false
+    image: algotest-backend-app:latest
     container_name: algotest-backend
     restart: unless-stopped
     ports:
@@ -184,6 +195,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-algotest}
       POSTGRES_USER: ${POSTGRES_USER:-algotest}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
+      OPTIMIZE_PARALLELISM: "2"
     user: "0:0"
     volumes: *backend-volumes
     depends_on:
@@ -208,9 +220,7 @@ services:
       - algotest-network
 
   worker-backtests:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: algotest-backend-app:latest
     container_name: algotest-worker-backtests
     restart: unless-stopped
     command: >
@@ -218,7 +228,7 @@ services:
       --queues=backtests
       --concurrency=1
       -l info
-      --max-memory-per-child=2800000
+      --max-memory-per-child=3200000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -242,7 +252,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 3500M
+          memory: 5000M
           cpus: "4.0"
         reservations:
           memory: 512M
@@ -250,9 +260,7 @@ services:
       - algotest-network
 
   worker-backtests-fast:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: algotest-backend-app:latest
     container_name: algotest-worker-backtests-fast
     restart: unless-stopped
     command: >
@@ -260,7 +268,7 @@ services:
       --queues=backtests_fast
       --concurrency=1
       -l info
-      --max-memory-per-child=1800000
+      --max-memory-per-child=3200000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -284,17 +292,78 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2200M
+          memory: 5000M
           cpus: "2.0"
         reservations:
           memory: 256M
     networks:
       - algotest-network
 
+  worker-optimize:
+    # Profile-gated: not started by `docker compose up`. Bring up with:
+    #   docker compose --profile optimize up -d worker-optimize
+    # Shares the same image as worker-backtests; runs an exclusive 'optimize' queue
+    # so long parameter sweeps don't block normal backtests. Resident bulk
+    # cache benefits from concurrency=1 (sweep iterates inside one task).
+    profiles: ["optimize"]
+    image: algotest-backend-app:latest
+    container_name: algotest-worker-optimize
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery worker
+      --queues=optimize
+      --concurrency=1
+      -l info
+      --max-memory-per-child=2800000
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+    environment:
+      <<: *backend-env
+      BACKTEST_WORKERS: "1"
+      OPTIMIZE_MAX_COMBOS: "100000"
+      # Sequential mode. Python-multiprocessing parallelism for this
+      # workload is blocked by an interaction between Celery's billiard
+      # process model and the Rust feather cache's process-global state:
+      # fork inherits a partially-locked Rust RwLock; spawn/forkserver
+      # hit billiard's AuthenticationString pickle guard; billiard.Pool
+      # gets past that but children still stall after [FAST_LOOKUP]
+      # Cleared, likely on Postgres connection pool contention.
+      #
+      # The right fix is Phase 2b — port run_algotest_backtest to Rust
+      # and run combos in-process with rayon (no GIL, no fork, no DB
+      # round-trips per combo). Until then sequential is the safe path.
+      OPTIMIZE_PARALLELISM: "1"
+      FAST_LOOKUP_RANGE_FILTER: "1"
+    user: "0:0"
+    volumes: *backend-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A worker.celery inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          # Profile-gated, so it does NOT count against the 16 GB total budget
+          # at the top of this file when running the default stack. When the
+          # optimize profile is active, expect the user to be running fewer
+          # other workloads (e.g. not concurrent intraday backtests).
+          memory: 3200M
+          cpus: "4.0"
+        reservations:
+          memory: 256M
+    networks:
+      - algotest-network
+
   worker-uploads:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: algotest-backend-app:latest
     container_name: algotest-worker-uploads
     restart: unless-stopped
     command: >
@@ -358,9 +427,7 @@ services:
       - algotest-network
 
   worker-backtests-intraday:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: algotest-backend-app:latest
     container_name: algotest-worker-backtests-intraday
     restart: unless-stopped
     command: >
@@ -388,9 +455,7 @@ services:
       - algotest-network
 
   worker-backtests-intraday-slow:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: algotest-backend-app:latest
     container_name: algotest-worker-backtests-intraday-slow
     restart: unless-stopped
     command: >

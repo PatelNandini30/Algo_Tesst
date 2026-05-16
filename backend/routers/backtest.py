@@ -34,6 +34,39 @@ def _normalize_date(value: Any) -> str:
     return value
 
 
+_db_max_date_cache: dict = {}  # symbol -> ISO date string
+
+
+def _get_db_max_date(symbol: str) -> str | None:
+    """Return the latest date present in option_data for the given symbol.
+
+    Result cached per symbol per process to avoid hitting Postgres on every
+    request. Falls back to None if the lookup fails — callers should treat
+    that as "no clamp".
+    """
+    if not symbol:
+        return None
+    key = str(symbol).upper()
+    if key in _db_max_date_cache:
+        return _db_max_date_cache[key]
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT MAX(date)::text FROM option_data WHERE symbol = :s"),
+                {"s": key},
+            ).first()
+        max_date = row[0] if row and row[0] else None
+        _db_max_date_cache[key] = max_date
+        if max_date:
+            logger.info("[NORMALIZE] DB max date for %s cached as %s", key, max_date)
+        return max_date
+    except Exception as exc:
+        logger.warning("[NORMALIZE] DB max-date lookup failed for %s: %s", key, exc)
+        return None
+
+
 def _normalize_payload_dates(payload: dict) -> dict:
     normalized = dict(payload or {})
     from_date = _normalize_date(normalized.get("date_from") or normalized.get("from_date"))
@@ -42,6 +75,16 @@ def _normalize_payload_dates(payload: dict) -> dict:
         normalized["from_date"] = from_date
         normalized["date_from"] = from_date
     if to_date:
+        # Clamp to_date to the actual DB max for the symbol so requests past the
+        # data ceiling don't trigger a slow FULL DB LOAD. Cache is per-symbol per-process.
+        symbol = normalized.get("index") or normalized.get("symbol") or "NIFTY"
+        db_max = _get_db_max_date(symbol)
+        if db_max and to_date > db_max:
+            logger.info(
+                "[NORMALIZE] clamping to_date %s → %s (DB ceiling for %s)",
+                to_date, db_max, symbol,
+            )
+            to_date = db_max
         normalized["to_date"] = to_date
         normalized["date_to"] = to_date
     return normalized
