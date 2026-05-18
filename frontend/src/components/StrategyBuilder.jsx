@@ -834,7 +834,7 @@ const [slippagePct, setSlippagePct] = useState(0);
     premium_value: 0,
     premium_min: 0,
     premium_max: 0,
-    pct_direction: '-',
+    pct_atm_moneyness: 'OTM',
     pct_value: 0,
     atm_straddle_prem_pct: 0,
     straddle_multiplier: 0.5,
@@ -1397,7 +1397,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       premium_value: 0,
       premium_min: 0,
       premium_max: 0,
-      pct_direction: '-',
+      pct_atm_moneyness: 'OTM',
       pct_value: 0,
       expiry: normalizeExpiryForIndex(prev.expiry, instrument, prev.segment),
       atm_straddle_prem_pct: 0,
@@ -1676,7 +1676,15 @@ const [slippagePct, setSlippagePct] = useState(0);
         };
         if (l.strike_criteria === 'pct_of_atm') {
           leg.strike_selection.value = Number(l.pct_value) || 0;
-          leg.strike_selection.direction = String(l.pct_direction || '-');
+          // Compute +/- direction from ITM/OTM moneyness + option type.
+          // CE OTM = above spot (+), CE ITM = below spot (-)
+          // PE OTM = below spot (-), PE ITM = above spot (+)
+          const _isCE = ['call', 'ce'].includes((l.option_type || '').toLowerCase());
+          const _moneyness = l.pct_atm_moneyness
+            || (l.pct_direction === '+' ? (_isCE ? 'OTM' : 'ITM') : (_isCE ? 'ITM' : 'OTM'));
+          leg.strike_selection.direction = _isCE
+            ? (_moneyness === 'OTM' ? '+' : '-')
+            : (_moneyness === 'ITM' ? '+' : '-');
         }
         if (l.strike_criteria === 'atm_straddle_prem_pct') {
           leg.strike_selection.value = Number(l.atm_straddle_prem_pct) || 0;
@@ -2899,25 +2907,34 @@ const [slippagePct, setSlippagePct] = useState(0);
                     {draftLeg.strike_criteria === 'pct_of_atm' && (
                       <>
                         <label className="field-label">&nbsp;</label>
-                        <div className="flex items-center gap-1 h-8">
-                          <span className="text-xs text-muted whitespace-nowrap">ATM</span>
-                          <select
-                            value={draftLeg.pct_direction ?? '-'}
-                            onChange={e => setDraftLeg(prev => ({ ...prev, pct_direction: e.target.value }))}
-                            className="h-8 px-2 border border-default rounded text-xs bg-surface"
-                          >
-                            <option value="-">-</option>
-                            <option value="+">+</option>
-                          </select>
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.1"
-                            value={draftLeg.pct_value ?? 0}
-                            onChange={e => setDraftLeg(prev => ({ ...prev, pct_value: parseFloat(e.target.value) || 0 }))}
-                            className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
-                          />
-                          <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1 h-8">
+                            <select
+                              value={draftLeg.pct_atm_moneyness ?? 'OTM'}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, pct_atm_moneyness: e.target.value }))}
+                              className="h-8 px-2 border border-default rounded text-xs bg-surface font-medium"
+                            >
+                              <option value="OTM">OTM</option>
+                              <option value="ITM">ITM</option>
+                            </select>
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.1"
+                              value={draftLeg.pct_value ?? 0}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, pct_value: parseFloat(e.target.value) || 0 }))}
+                              className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
+                            />
+                            <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
+                          </div>
+                          <span className="text-xs text-muted">
+                            {(() => {
+                              const isCE = ['call', 'ce'].includes((draftLeg.option_type || '').toLowerCase());
+                              const m = draftLeg.pct_atm_moneyness ?? 'OTM';
+                              const up = isCE ? m === 'OTM' : m === 'ITM';
+                              return `strike = ATM ${up ? '+' : '−'}${draftLeg.pct_value ?? 0}%  (${up ? 'above' : 'below'} spot)`;
+                            })()}
+                          </span>
                         </div>
                       </>
                     )}
@@ -3146,25 +3163,34 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   {leg.strike_criteria === 'pct_of_atm' && (
                                     <>
                                       <label className="field-label">&nbsp;</label>
-                                      <div className="flex items-center gap-1">
-                                        <span className="text-xs text-muted whitespace-nowrap">ATM</span>
-                                        <select
-                                          value={leg.pct_direction ?? '-'}
-                                          onChange={e => updateLeg(leg.id, 'pct_direction', e.target.value)}
-                                          className="h-7 px-2 border border-default rounded text-xs bg-surface"
-                                        >
-                                          <option value="-">-</option>
-                                          <option value="+">+</option>
-                                        </select>
-                                        <input
-                                          type="number"
-                                          min="0"
-                                          step="0.1"
-                                          value={leg.pct_value ?? 0}
-                                          onChange={e => updateLeg(leg.id, 'pct_value', parseFloat(e.target.value) || 0)}
-                                          className="w-14 h-7 px-1 border border-default rounded text-xs text-center"
-                                        />
-                                        <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
+                                      <div className="flex flex-col gap-0.5">
+                                        <div className="flex items-center gap-1">
+                                          <select
+                                            value={leg.pct_atm_moneyness ?? 'OTM'}
+                                            onChange={e => updateLeg(leg.id, 'pct_atm_moneyness', e.target.value)}
+                                            className="h-7 px-2 border border-default rounded text-xs bg-surface font-medium"
+                                          >
+                                            <option value="OTM">OTM</option>
+                                            <option value="ITM">ITM</option>
+                                          </select>
+                                          <input
+                                            type="number"
+                                            min="0"
+                                            step="0.1"
+                                            value={leg.pct_value ?? 0}
+                                            onChange={e => updateLeg(leg.id, 'pct_value', parseFloat(e.target.value) || 0)}
+                                            className="w-14 h-7 px-1 border border-default rounded text-xs text-center"
+                                          />
+                                          <span className="text-xs text-muted whitespace-nowrap">% of ATM</span>
+                                        </div>
+                                        <span className="text-xs text-muted">
+                                          {(() => {
+                                            const isCE = ['call', 'ce'].includes((leg.option_type || '').toLowerCase());
+                                            const m = leg.pct_atm_moneyness ?? 'OTM';
+                                            const up = isCE ? m === 'OTM' : m === 'ITM';
+                                            return `ATM ${up ? '+' : '−'}${leg.pct_value ?? 0}%`;
+                                          })()}
+                                        </span>
                                       </div>
                                     </>
                                   )}
@@ -3825,6 +3851,8 @@ const [slippagePct, setSlippagePct] = useState(0);
                 exitDaysBefore,
                 spotAdjustmentEnabled,
                 spotAdjustmentDirection,
+                spotAdjustmentValue: normalizedSpotAdjustmentValue,
+                spotAdjustmentUnits,
               }}
             />
             <div className="flex flex-wrap items-center gap-4 px-4 py-3 bg-surface border border-default border-t-0 rounded-b-xl">

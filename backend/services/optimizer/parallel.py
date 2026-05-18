@@ -131,9 +131,10 @@ def _worker_entrypoint(
                 optim_extra = compute_optim_metrics(trades_df, summary)
                 flat_summary = {**summary, **optim_extra}
                 labels = label_combo(merged)
-                combo_label_safe = safe_filename(labels["combo_label"])
+                _combo_id = starting_combo_id + i
+                combo_label_safe = f"{_combo_id}_{safe_filename(labels['combo_label'])}"
                 row = {
-                    "combo_id": starting_combo_id + i,
+                    "combo_id": _combo_id,
                     "combo": combo,
                     "combo_label": labels["combo_label"],
                     "combo_label_safe": combo_label_safe,

@@ -762,7 +762,10 @@ const buildExcelFileName = (config) => {
       if (opt) parts.push(opt);
       const criteria = leg.strike_criteria || 'strike_type';
       if (criteria === 'pct_of_atm') {
-        parts.push('PCT');
+        const pctVal = leg.pct_value != null ? parseFloat(leg.pct_value) : 0;
+        const pctDir = (leg.pct_direction || '-') === '+' ? 'Plus' : 'Minus';
+        const pctStr = Number.isInteger(pctVal) ? String(pctVal) : parseFloat(pctVal.toFixed(2)).toString();
+        parts.push(`ATM_${pctDir}_${pctStr}PCT`);
       } else if (criteria === 'atm_straddle_prem_pct') {
         parts.push('STRADDLE');
       } else {
@@ -779,8 +782,14 @@ const buildExcelFileName = (config) => {
   if (exit)  parts.push(exit);
 
   if (config.spotAdjustmentEnabled) {
-    parts.push('SA');
-    parts.push((config.spotAdjustmentDirection || 'rise').toUpperCase());
+    const dir = (config.spotAdjustmentDirection || 'rise');
+    const val = config.spotAdjustmentValue;
+    const unit = (config.spotAdjustmentUnits || 'percent') === 'percent' ? 'PCT' : 'PTS';
+    const valStr = val != null
+      ? (Number.isInteger(val) ? String(val) : parseFloat(val.toFixed(2)).toString())
+      : '';
+    const saDir = dir === 'both' ? 'BOTH' : dir === 'fall' ? 'FALL' : 'RISE';
+    parts.push(`Spot_Adjustment_${saDir}${valStr ? `_${valStr}${unit}` : ''}`);
   }
 
   return parts.join('_') + '.xlsx';
@@ -1205,6 +1214,31 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       const parsed = parseFloat(String(value).replace(/[,%₹\s]/g, ''));
       return Number.isFinite(parsed) ? parsed : null;
     };
+    const pctOfBase = (pnlValue, baseValue) => {
+      const pnl = toNumber(pnlValue);
+      const base = toNumber(baseValue);
+      if (pnl == null || base == null || base === 0) return '';
+      return pnl / base;
+    };
+    const parseExportDateMs = (value) => {
+      if (value instanceof Date) return value.getTime();
+      if (value == null || value === '') return null;
+      const str = String(value).trim();
+      const parts = str.includes('/') ? str.split('/') : str.split('-');
+      if (parts.length !== 3) return null;
+      let year, month, day;
+      if (parts[0].length === 4) {
+        year = parseInt(parts[0], 10);
+        month = parseInt(parts[1], 10) - 1;
+        day = parseInt(parts[2], 10);
+      } else {
+        day = parseInt(parts[0], 10);
+        month = parseInt(parts[1], 10) - 1;
+        year = parseInt(parts[2], 10);
+      }
+      const ms = Date.UTC(year, month, day);
+      return Number.isFinite(ms) ? ms : null;
+    };
 
     const isFutureRow = (row) => String(row?.['Type'] || '').toUpperCase() === 'FUT';
     const isOptionRow = (row) => ['CE','CALL','PE','PUT'].includes(String(row?.['Type'] || '').toUpperCase());
@@ -1285,8 +1319,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Lowest NAV','Actual Live DD',
     ]);
     const keyOrder = [
-      'Trade','Leg','Index','Entry Date','Exit Date','Expiry',
-      'Entry Spot','Exit Spot','Spot P&L',
+      'Trade','Leg','Index','Entry Date','Exit Date','DTE','Expiry',
+      'Entry Spot','Exit Spot','Spot P&L','Spot P&L %',
       'Type','Strike',
       ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
       'B/S',
@@ -1296,8 +1330,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Entry Price',
       ...(hasSpotAdj ? ['Raw Exit Price'] : []),
       'Exit Price','MAE','MFE','Net MAE 1','Net MAE 2','Final MAE',
-      ...(hasCalls   ? ['CE P&L']  : []),
-      ...(hasPuts    ? ['PE P&L']  : []),
+      ...(hasCalls   ? ['CE P&L', 'CE P&L %']  : []),
+      ...(hasPuts    ? ['PE P&L', 'PE P&L %']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
       'Net P&L','% P&L','Cumulative','Peak','DD','%DD','Lowest NAV','Actual Live DD',
       'Exit Reason',
@@ -1370,6 +1404,22 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         else if (key==='Re-Entry Type') val=getReEntryType(trade);
         else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
         else if (key==='Exit Date') val=getVisibleExitDate(trade);
+        else if (key==='DTE') {
+          const entryMs = parseExportDateMs(trade['Entry Date']);
+          const exitMs = parseExportDateMs(getVisibleExitDate(trade));
+          val = entryMs != null && exitMs != null ? Math.round((exitMs - entryMs) / 86400000) : '';
+        }
+        else if (key==='Spot P&L %') {
+          let spotPnl = trade['Spot P&L'];
+          if (toNumber(spotPnl) == null) {
+            const entrySpot = toNumber(trade['Entry Spot']);
+            const exitSpot = toNumber(trade['Exit Spot']);
+            spotPnl = entrySpot != null && exitSpot != null ? exitSpot - entrySpot : null;
+          }
+          val = pctOfBase(spotPnl, trade['Entry Spot']);
+        }
+        else if (key==='CE P&L %') val=pctOfBase(trade['CE P&L'], trade['Exit Spot']);
+        else if (key==='PE P&L %') val=pctOfBase(trade['PE P&L'], trade['Exit Spot']);
         else if (key==='Expiry') val=formatDateToDdMmYyyy(
           trade['Future Expiry'] || trade['futures_expiry'] || trade['Expiry']
         );
@@ -1392,9 +1442,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state:'frozen', ySplit:1 }] });
 
     // Column widths
-    const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
+    const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'DTE':8,'Entry Spot':12,'Exit Spot':12,
       'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry Type':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'MAE':9,'MFE':9,'Net MAE 1':10,'Net MAE 2':10,'Final MAE':10,'Net P&L':10,'% P&L':8,'Cumulative':11,'Peak':10,'DD':9,'%DD':8,'Lowest NAV':13,'Actual Live DD':15,
-      'Exit Reason':14,'Expiry':12,'STR Segment':14,'Filter Segment':18 };
+      'Spot P&L %':10,'CE P&L %':10,'PE P&L %':10,'Exit Reason':14,'Expiry':12,'STR Segment':14,'Filter Segment':18 };
+    const truePctCols = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %']);
     ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 
     // Header row style
@@ -1432,7 +1483,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           if (!isNaN(n)) cell.value = n;
         }
         if (typeof cell.value === 'number') {
-          cell.numFmt = Number.isInteger(cell.value) ? '0' : '#,##0.00';
+          const _maeCol = ['MAE','MFE','Net MAE 1','Net MAE 2','Final MAE'].includes(_colKey);
+          cell.numFmt = truePctCols.has(_colKey)
+            ? '0.00%'
+            : _maeCol
+            ? '#,##0.0000'
+            : Number.isInteger(cell.value) ? '0' : '#,##0.00';
         }
       });
       // Color Net P&L and % P&L
@@ -1452,7 +1508,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     // ════════════════════════════════════════════════════════════════════════
     const ws2 = wb.addWorksheet('Summary');
     ws2.columns = [
-      { width: 30 },{ width: 20 },{ width: 4 },{ width: 30 },{ width: 20 },
+      { width: 30 },{ width: 20 },{ width: 12 },{ width: 30 },{ width: 20 },
     ];
 
     const addTitle = (text, rowNum, cols = 'A:E', bgColor = C.navyBg) => {
@@ -1613,10 +1669,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
       // Per-side sums (research team's =SUM(...) formulas, computed in JS)
       let _ceSumJS = 0, _peSumJS = 0, _futSumJS = 0;
+      let _cePctJS = 0, _pePctJS = 0, _spotPctJS = 0;
       for (const t of cleanedTrades) {
         const ce = +t['CE P&L']; if (Number.isFinite(ce)) _ceSumJS += ce;
         const pe = +t['PE P&L']; if (Number.isFinite(pe)) _peSumJS += pe;
         const fu = +t['FUT P&L']; if (Number.isFinite(fu)) _futSumJS += fu;
+        const cep = +t['CE P&L %']; if (Number.isFinite(cep)) _cePctJS += cep;
+        const pep = +t['PE P&L %']; if (Number.isFinite(pep)) _pePctJS += pep;
+        const spp = +t['Spot P&L %']; if (Number.isFinite(spp)) _spotPctJS += spp;
       }
 
       // Header: Type | Sum | (gap) | ROI vs Spot
@@ -1628,16 +1688,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         c.alignment = centerAlign;
         c.border = thinBorder();
       };
-      _hdr('A','Type'); _hdr('B','Sum');
+      _hdr('A','Type'); _hdr('B','Sum'); _hdr('C','%');
       ws2.mergeCells(`D${row}:E${row}`);
       _hdr('D','ROI vs Spot');
       ws2.getCell(`D${row}`).alignment = centerAlign;
       ws2.getRow(row).height = 20;
       const _hdrRow = row; row++;
 
-      const _addTypeRow = (label, value) => {
+      const _addTypeRow = (label, value, pct) => {
         const lC = ws2.getCell(`A${row}`);
         const vC = ws2.getCell(`B${row}`);
+        const pC = ws2.getCell(`C${row}`);
         lC.value = label;
         lC.font = boldFont(10, { argb:'FF2C3E50' });
         lC.fill = { type:'pattern', pattern:'solid', fgColor: C.labelBg };
@@ -1648,6 +1709,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         vC.fill = { type:'pattern', pattern:'solid', fgColor: C.white };
         vC.alignment = leftAlign;
         vC.border = thinBorder(C.border);
+        if (pct != null) {
+          pC.value = `${pct >= 0 ? '+' : ''}${(+pct).toFixed(2)}%`;
+          pC.font = boldFont(10, pct >= 0 ? C.greenTx : C.redTx);
+          pC.fill = { type:'pattern', pattern:'solid', fgColor: C.white };
+          pC.alignment = leftAlign;
+          pC.border = thinBorder(C.border);
+        }
         ws2.getRow(row).height = 18;
       };
 
@@ -1667,12 +1735,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       _roiVal.border = thinBorder(C.border);
 
       // Rows
-      _addTypeRow('Spot P&L', _spotSumGatedJS); row++;
-      if (hasCalls) { _addTypeRow('CE P&L', _ceSumJS); row++; }
-      if (hasPuts)  { _addTypeRow('PE P&L', _peSumJS); row++; }
-      if (hasFutures) { _addTypeRow('FUT P&L', _futSumJS); row++; }
-      if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS); row++; }
-      _addTypeRow('Net P&L', _sumNetJS); row++;
+      _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS); row++;
+      if (hasCalls) { _addTypeRow('CE P&L', _ceSumJS, _cePctJS); row++; }
+      if (hasPuts)  { _addTypeRow('PE P&L', _peSumJS, _pePctJS); row++; }
+      if (hasFutures) { _addTypeRow('FUT P&L', _futSumJS, null); row++; }
+      if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS, _cePctJS + _pePctJS); row++; }
+      _addTypeRow('Net P&L', _sumNetJS, _sumPctJS); row++;
     }
 
     row++; // blank

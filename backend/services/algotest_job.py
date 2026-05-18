@@ -288,7 +288,6 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     Python engine.
 
     Known gaps vs Python (set ENGINE_BACKEND=python if these matter for you):
-      * MAE/MFE are always 0
       * Exit Reason is always 'Expiry' regardless of SL/Target/Spot-Adj firing
       * ReEntryIndex/Trigger/Mode tags missing (re-entry rows still produced)
       * Buffer strike / futures / lazy legs / rollover / no_rollover /
@@ -299,8 +298,9 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     from engines.generic_algotest_engine import get_lot_size
     from services.engine_rust import run_rust_engine_pipeline, priced_to_tradesheet_records
 
+    _trading_cal_df = get_trading_calendar(effective_from, effective_to)
     days = pd.to_datetime(
-        get_trading_calendar(effective_from, effective_to)["date"]
+        _trading_cal_df["date"]
     ).sort_values().dt.strftime("%Y-%m-%d").tolist()
     if not days:
         return (None, None, None)
@@ -345,6 +345,37 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
         return (pd.DataFrame(), {}, {"headers": [], "rows": []})
 
     records = priced_to_tradesheet_records(priced, payload, int(lot_size))
+
+    # Compute MAE/MFE per leg using the same DB/feather range query the Python engine uses.
+    if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            from engines.generic_algotest_engine import _calculate_leg_mae_mfe
+            for rec in records:
+                opt_type = rec.get("Type", "")
+                if opt_type not in ("CE", "PE"):
+                    continue
+                leg = {
+                    'option_type': opt_type,
+                    'strike': rec.get("Strike"),
+                    'expiry': rec.get("Expiry"),
+                }
+                mae_val, mfe_val = _calculate_leg_mae_mfe(
+                    index=str(index).upper(),
+                    entry_date=rec.get("Entry Date"),
+                    exit_date=rec.get("Exit Date"),
+                    leg=leg,
+                    entry_price=rec.get("Entry Price"),
+                    position=rec.get("B/S", "SELL"),
+                    entry_spot=rec.get("Entry Spot"),
+                    trading_calendar_df=_trading_cal_df,
+                )
+                if mae_val is not None:
+                    rec["MAE"] = mae_val
+                if mfe_val is not None:
+                    rec["MFE"] = mfe_val
+        except Exception as _mae_exc:
+            logger.warning("[MAE/MFE] Rust path computation failed (non-fatal): %s", _mae_exc)
+
     trades_df = pd.DataFrame(records)
     for c in ("Entry Date", "Exit Date"):
         if c in trades_df.columns:
@@ -758,6 +789,18 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         and 'Net P&L' in trades_aggregated.columns
                         and 'Entry Spot' in trades_aggregated.columns
                         and 'Entry Date' in trades_aggregated.columns):
+                    # Re-sort by (Entry Date, Leg) with stable sort so Leg 1 always
+                    # precedes Leg 2+ within the same trade date. compute_analytics uses
+                    # pandas quicksort (unstable), which can put Leg 2 before Leg 1 for
+                    # same-date legs — causing cumcount()==0 to pick the wrong leg and
+                    # leaving Leg 1 with no cumulative (blank in the tradesheet).
+                    _leg_sort_cols = ['Entry Date']
+                    if 'Leg' in trades_aggregated.columns:
+                        _leg_sort_cols.append('Leg')
+                    trades_aggregated = trades_aggregated.sort_values(
+                        _leg_sort_cols, kind='stable'
+                    ).reset_index(drop=True)
+
                     _first_mask = trades_aggregated.groupby('Trade', sort=False).cumcount() == 0
                     _leg1 = trades_aggregated[_first_mask][
                         ['Trade', 'Net P&L', 'Entry Spot', 'Entry Date']

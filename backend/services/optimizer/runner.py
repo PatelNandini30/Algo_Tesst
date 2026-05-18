@@ -637,7 +637,7 @@ def run_optimization(
                 "combo_id": done + 1,
                 "combo": combo,
                 "combo_label": labels["combo_label"],
-                "combo_label_safe": safe_filename(labels["combo_label"]),
+                "combo_label_safe": f"{done + 1}_{safe_filename(labels['combo_label'])}",
                 "combo_columns": {
                     "expiry": labels["expiry"],
                     "shifting": labels["shifting"],

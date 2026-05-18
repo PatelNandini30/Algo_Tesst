@@ -14,6 +14,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, X, Loader2, Settings, ArrowDown, ArrowUp, FileDown } from 'lucide-react';
 import ExcelJS from 'exceljs';
 import { MASTER_SUMMARY_COLUMNS } from '../utils/strategyParamSchema';
+import buildTradeExcel from '../utils/buildTradeExcel';
 
 const POLL_MS = 1500;
 const FETCH_LIMIT = 500;
@@ -277,18 +278,65 @@ export default function OptimizationResults({
         alert(err.detail || `Failed to download tradesheet for combo ${comboId}`);
         return;
       }
-      const blob = await r.blob();
+
+      // Parse CSV text into array of objects
+      const csvText = await r.text();
+      const lines = csvText.split('\n').filter(Boolean);
+      if (lines.length < 2) {
+        alert(`No trade data returned for combo ${comboId}`);
+        return;
+      }
+
+      // Simple CSV parser — handles quoted fields containing commas/newlines
+      const parseCSVLine = (line) => {
+        const fields = [];
+        let cur = '';
+        let inQuote = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === '"') {
+            if (inQuote && line[i + 1] === '"') { cur += '"'; i++; }
+            else { inQuote = !inQuote; }
+          } else if (ch === ',' && !inQuote) {
+            fields.push(cur);
+            cur = '';
+          } else {
+            cur += ch;
+          }
+        }
+        fields.push(cur);
+        return fields;
+      };
+
+      const headers = parseCSVLine(lines[0]);
+      const parsedTrades = lines.slice(1).map(line => {
+        const values = parseCSVLine(line);
+        const obj = {};
+        headers.forEach((h, i) => { obj[h.trim()] = values[i] !== undefined ? values[i].trim() : ''; });
+        return obj;
+      });
+
+      // Find the corresponding summary and combo label from rows state
+      const matchingRow = rows.find(row => (row.combo_id ?? null) === comboId || String(row.combo_id) === String(comboId));
+      const summary     = matchingRow?.summary || {};
+      const comboLabel  = matchingRow?.combo_label || `Combo ${comboId}`;
+
+      const blob = await buildTradeExcel(parsedTrades, summary, { comboLabel });
+
+      // Derive filename from Content-Disposition or fallback
       const disposition = r.headers.get('Content-Disposition') || '';
       const match = disposition.match(/filename="?([^"]+)"?/);
-      const filename = match ? match[1] : `combo_${comboId}_tradesheet.csv`;
+      const csvFilename = match ? match[1] : `combo_${comboId}_tradesheet.csv`;
+      const xlsxFilename = csvFilename.replace(/\.csv$/i, '.xlsx');
+
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = filename;
+      a.download = xlsxFilename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-    } catch {
-      alert(`Failed to download tradesheet for combo ${comboId}`);
+    } catch (e) {
+      alert(`Failed to download tradesheet for combo ${comboId}: ${e?.message || e}`);
     } finally {
       setDownloadingRows((prev) => {
         const next = new Set(prev);
