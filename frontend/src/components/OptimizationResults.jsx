@@ -11,7 +11,7 @@
  *                   back into the StrategyBuilder state
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Download, X, Loader2, Settings, ArrowDown, ArrowUp } from 'lucide-react';
+import { Download, X, Loader2, Settings, ArrowDown, ArrowUp, FileDown } from 'lucide-react';
 import ExcelJS from 'exceljs';
 import { MASTER_SUMMARY_COLUMNS } from '../utils/strategyParamSchema';
 
@@ -77,6 +77,7 @@ export default function OptimizationResults({
   const [order, setOrder] = useState('desc');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [downloadingRows, setDownloadingRows] = useState(new Set());
   const pollRef = useRef(null);
 
   const fetchAll = useCallback(async () => {
@@ -264,6 +265,37 @@ export default function OptimizationResults({
       await fetch(`/api/optimize/jobs/${jobId}`, { method: 'DELETE' });
     } catch {}
     onClose && onClose();
+  }
+
+  async function downloadComboTradesheet(comboId) {
+    if (downloadingRows.has(comboId)) return;
+    setDownloadingRows((prev) => new Set(prev).add(comboId));
+    try {
+      const r = await fetch(`/api/optimize/jobs/${jobId}/combo/${comboId}/tradesheet`);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        alert(err.detail || `Failed to download tradesheet for combo ${comboId}`);
+        return;
+      }
+      const blob = await r.blob();
+      const disposition = r.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      const filename = match ? match[1] : `combo_${comboId}_tradesheet.csv`;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {
+      alert(`Failed to download tradesheet for combo ${comboId}`);
+    } finally {
+      setDownloadingRows((prev) => {
+        const next = new Set(prev);
+        next.delete(comboId);
+        return next;
+      });
+    }
   }
 
   if (!jobId) return null;
@@ -463,6 +495,15 @@ export default function OptimizationResults({
               }}
             >
               <tr>
+                <th
+                  style={{
+                    padding: '8px 6px',
+                    borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+                    width: 32,
+                    textAlign: 'center',
+                  }}
+                  title="Download individual tradesheet"
+                />
                 {visibleColumns.map((c, idx) => {
                   const th = (
                     <th
@@ -551,7 +592,7 @@ export default function OptimizationResults({
               {rows.length === 0 && (
                 <tr>
                   <td
-                    colSpan={visibleColumns.length + paramColumns.length + 1}
+                    colSpan={visibleColumns.length + paramColumns.length + 2}
                     style={{ padding: 20, textAlign: 'center', opacity: 0.5 }}
                   >
                     {status === 'running'
@@ -564,8 +605,38 @@ export default function OptimizationResults({
                 const summary = row.summary || {};
                 const cols = row.combo_columns || {};
                 const combo = row.combo || {};
+                const comboId = row.combo_id ?? (i + 1);
+                const isDownloading = downloadingRows.has(comboId);
                 return (
                   <tr key={row.combo_id ?? i}>
+                    <td
+                      style={{
+                        padding: '4px 6px',
+                        borderBottom: '1px solid var(--border, #f1f5f9)',
+                        textAlign: 'center',
+                        width: 32,
+                      }}
+                    >
+                      <button
+                        onClick={() => downloadComboTradesheet(comboId)}
+                        disabled={isDownloading}
+                        title={`Download tradesheet for combo ${comboId}`}
+                        style={{
+                          background: 'transparent',
+                          border: 'none',
+                          cursor: isDownloading ? 'wait' : 'pointer',
+                          padding: 2,
+                          color: 'var(--accent, #2563eb)',
+                          opacity: isDownloading ? 0.5 : 1,
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                        }}
+                      >
+                        {isDownloading
+                          ? <Loader2 size={13} className="animate-spin" />
+                          : <FileDown size={13} />}
+                      </button>
+                    </td>
                     {visibleColumns.map((c, idx) => {
                       let v;
                       if (c.key === 'sr_no') v = i + 1;

@@ -202,7 +202,6 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
         end: formatDateDisplay(seg.end),
       }));
     }
-    if (selected === 'base2') return [];
     const previewData = filterCatalog?.[selected]?.preview ?? [];
     return previewData.map(seg => ({
       start: formatDateDisplay(new Date(seg.start)),
@@ -213,9 +212,6 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const badgeText = useMemo(() => {
     if (!enabled) return 'Filter disabled';
     if (catalogLoading) return 'Loading segments…';
-    if (selected === 'base2' && activeFilterMeta?.display_range) {
-      return activeFilterMeta.display_range;
-    }
     if (summaryPayload && summaryPayload.range?.from && summaryPayload.range?.to) {
       return `${summaryPayload.count} segments · ${formatDateDisplay(summaryPayload.range.from)} → ${formatDateDisplay(summaryPayload.range.to)}`;
     }

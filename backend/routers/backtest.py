@@ -515,17 +515,12 @@ async def get_filter_segments():
             segments = base_get_filter_segments(config_key)
             serialized_segments = _serialize_segments(segments)
             summary_range = _range_from_segments(serialized_segments)
-            display_range = None
-            if config_key == "base2":
-                display_range = "Full DB date range (engine resolves)"
-
             filters[config_key] = {
                 "label": label,
                 "count": len(serialized_segments),
                 "segments": serialized_segments,
                 "preview": serialized_segments[:5],
                 "range": summary_range,
-                "display_range": display_range,
             }
 
         return {"success": True, "filters": filters}

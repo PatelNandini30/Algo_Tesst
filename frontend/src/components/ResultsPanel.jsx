@@ -740,7 +740,53 @@ const IntradayFullReport = ({ rows, onClose, showCloseButton }) => {
   );
 };
 
-const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false }) => {
+const buildExcelFileName = (config) => {
+  if (!config) return `backtest.xlsx`;
+
+  const parts = [config.instrument || 'backtest'];
+
+  (config.legs || []).forEach(leg => {
+    if (leg.segment === 'futures') {
+      parts.push((leg.position || 'sell').toUpperCase());
+      parts.push('FUT');
+      const exp = (leg.expiry || '').toUpperCase().replace('_', '');
+      if (exp) parts.push(exp);
+    } else {
+      parts.push((leg.position || 'sell').toUpperCase());
+      const opt = (() => {
+        const o = (leg.option_type || '').toLowerCase();
+        if (o === 'call') return 'CE';
+        if (o === 'put') return 'PE';
+        return o.toUpperCase();
+      })();
+      if (opt) parts.push(opt);
+      const criteria = leg.strike_criteria || 'strike_type';
+      if (criteria === 'pct_of_atm') {
+        parts.push('PCT');
+      } else if (criteria === 'atm_straddle_prem_pct') {
+        parts.push('STRADDLE');
+      } else {
+        parts.push((leg.strike_type || 'atm').toUpperCase());
+      }
+      const exp = (leg.expiry || '').toUpperCase().replace('_', '');
+      if (exp) parts.push(exp);
+    }
+  });
+
+  const entry = config.entryDaysBefore != null ? `T${config.entryDaysBefore}` : null;
+  const exit  = config.exitDaysBefore  != null ? `T${config.exitDaysBefore}`  : null;
+  if (entry) parts.push(entry);
+  if (exit)  parts.push(exit);
+
+  if (config.spotAdjustmentEnabled) {
+    parts.push('SA');
+    parts.push((config.spotAdjustmentDirection || 'rise').toUpperCase());
+  }
+
+  return parts.join('_') + '.xlsx';
+};
+
+const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false, strategyConfig }) => {
   if (!results) return null;
 
   // Intraday backtest returns a flat array of trade objects with entry_time / exit_time fields.
@@ -1249,8 +1295,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       ...(hasSpotAdj ? ['Raw Entry Price'] : []),
       'Entry Price',
       ...(hasSpotAdj ? ['Raw Exit Price'] : []),
-      'Exit Price','MAE','MFE',
-      ...(hasTradeMae ? ['Net MAE 1','Net MAE 2','Final MAE'] : []),
+      'Exit Price','MAE','MFE','Net MAE 1','Net MAE 2','Final MAE',
       ...(hasCalls   ? ['CE P&L']  : []),
       ...(hasPuts    ? ['PE P&L']  : []),
       ...(hasFutures ? ['FUT P&L'] : []),
@@ -1935,77 +1980,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       row++;
     });
 
-    row++;
-
-    // ── SECTION 6: Quarterly Returns ──────────────────────────────────────────
-    addSectionHeader('QUARTERLY RETURNS (₹ Net P&L)', row++);
-
-    // Indian market quarters: Mar(Jan-Mar), Jun(Apr-Jun), Sep(Jul-Sep), Dec(Oct-Dec)
-    const QUARTERS = ['Mar', 'Jun', 'Sep', 'Dec'];
-    const _getQtrIdx = (monthIdx) => {
-      if (monthIdx <= 2) return 0;
-      if (monthIdx <= 5) return 1;
-      if (monthIdx <= 8) return 2;
-      return 3;
-    };
-
-    const byYQ = {};
-    groupedTrades.forEach(group => {
-      const ym = parseToYearMonth(group?.exitDate || '');
-      if (!ym) return;
-      const net = Number(group?.totalPnl ?? 0) || 0;
-      const q = _getQtrIdx(ym.monthIdx);
-      if (!byYQ[ym.year]) byYQ[ym.year] = Array(4).fill(0);
-      byYQ[ym.year][q] += net;
-    });
-
-    const qtrHdrLabels = ['Year', ...QUARTERS, 'Total'];
-    const qtrHdrRowEl = ws2.getRow(row);
-    qtrHdrLabels.forEach((h, ci) => {
-      const cell = qtrHdrRowEl.getCell(ci + 1);
-      cell.value = h;
-      cell.font  = boldFont(10, C.navyText);
-      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
-      cell.alignment = centerAlign;
-      cell.border = thinBorder();
-    });
-    qtrHdrRowEl.height = 20;
-    row++;
-
-    Object.entries(byYQ).sort().forEach(([yr, qtrs], ri) => {
-      const total = qtrs.reduce((s, v) => s + v, 0);
-      const dataRow = [yr, ...qtrs.map(v => +v.toFixed(2)), +total.toFixed(2)];
-      const r2 = ws2.getRow(row);
-      dataRow.forEach((val, ci) => {
-        const cell = r2.getCell(ci + 1);
-        cell.value = val;
-        const num = typeof val === 'number' ? val : parseFloat(String(val || ''));
-        const isValCol = ci >= 1 && ci <= 4;
-        const isTotalCol = ci === 5;
-        if ((isValCol || isTotalCol) && !isNaN(num) && num !== 0) {
-          cell.font = boldFont(10, num >= 0 ? C.greenTx : C.redTx);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: num >= 0 ? C.greenBg : C.redBg };
-        } else if (ci === 0) {
-          cell.font = boldFont(10, C.subHdrTx);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
-        } else {
-          cell.font = normFont(10);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
-        }
-        cell.alignment = centerAlign;
-        cell.border = thinBorder();
-      });
-      r2.height = 18;
-      row++;
-    });
-
     // ── Download ─────────────────────────────────────────────────────────────
     const buffer = await wb.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
     a.href     = url;
-    a.download = `backtest_${new Date().toISOString().split('T')[0]}.xlsx`;
+    a.download = buildExcelFileName(strategyConfig);
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

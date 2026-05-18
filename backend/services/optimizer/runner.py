@@ -217,17 +217,36 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
     }
     try:
         import pandas as pd
-        from base import (
-            get_expiry_dates,
-            get_spot_price_from_db,
-            get_trading_calendar,
-        )
+        import base as _base_mod
+        from base import get_expiry_dates
         from engines.generic_algotest_engine import get_lot_size
 
         t0 = time.perf_counter()
-        days = pd.to_datetime(
-            get_trading_calendar(from_date, to_date)["date"]
-        ).sort_values().dt.strftime("%Y-%m-%d").tolist()
+
+        # Derive trading days + spots directly from the in-memory spot_lookup_table
+        # that was populated by the feather shortcut — avoids DB queries that fail
+        # when bhavcopy SQLite table is absent (PostgreSQL-only setups).
+        sym_upper = index.upper()
+        spot_table: Dict[str, float] = {}
+        if hasattr(_base_mod, "_spot_lookup_table") and _base_mod._spot_lookup_table:
+            for (d, s), v in _base_mod._spot_lookup_table.items():
+                if s == sym_upper and from_date <= d <= to_date:
+                    spot_table[d] = float(v)
+
+        if spot_table:
+            days = sorted(spot_table.keys())
+            spots = spot_table
+        else:
+            # Fallback: query DB — only reached when feather shortcut was skipped
+            from base import get_trading_calendar, get_spot_price_from_db
+            days = pd.to_datetime(
+                get_trading_calendar(from_date, to_date)["date"]
+            ).sort_values().dt.strftime("%Y-%m-%d").tolist()
+            spots = {}
+            for d in days:
+                v = get_spot_price_from_db(d, index)
+                if v is not None:
+                    spots[d] = float(v)
 
         expiry_type = payload.get("expiry_type", "weekly")
         df_exp = get_expiry_dates(index, expiry_type, from_date, to_date)
@@ -242,12 +261,6 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
                 .tolist()
             )
 
-        spots: Dict[str, float] = {}
-        for d in days:
-            v = get_spot_price_from_db(d, index)
-            if v is not None:
-                spots[d] = float(v)
-
         lot_size = int(get_lot_size(index, days[0])) if days else 0
 
         ctx["rust_context"] = {
@@ -257,11 +270,12 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
             "lot_size": lot_size,
         }
         logger.info(
-            "[OPTIM] rust_context preloaded in %.2fs (days=%d, expiries=%d, spots=%d)",
+            "[OPTIM] rust_context preloaded in %.2fs (days=%d, expiries=%d, spots=%d, source=%s)",
             time.perf_counter() - t0,
             len(days),
             len(expiries),
             len(spots),
+            "spot_lookup_table" if spot_table else "db_query",
         )
     except Exception as exc:
         logger.warning("[OPTIM] rust_context preload failed (combos will use python fallback): %s", exc)

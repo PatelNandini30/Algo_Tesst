@@ -184,6 +184,30 @@ def get_all_results(job_id: str) -> List[Dict[str, Any]]:
     return [json.loads(x) for x in raw]
 
 
+def get_combo_by_id(job_id: str, combo_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Return the result row for a specific combo_id (1-indexed integer).
+    combo_id is stored as insertion order (done + 1), so row is at index combo_id - 1.
+    Falls back to a full scan if the index miss (e.g. due to sorted view).
+    """
+    r = _redis()
+    if r is None:
+        return None
+    # Fast path: combo_id is 1-indexed insertion order
+    raw = r.lindex(_results_key(job_id), combo_id - 1)
+    if raw:
+        row = json.loads(raw)
+        if row.get("combo_id") == combo_id:
+            return row
+    # Slow fallback: linear scan (handles edge cases)
+    all_raw = r.lrange(_results_key(job_id), 0, -1)
+    for item in all_raw:
+        row = json.loads(item)
+        if row.get("combo_id") == combo_id:
+            return row
+    return None
+
+
 def maybe_spill_to_parquet(job_id: str) -> Optional[str]:
     """If results > OPTIM_SPILL_THRESHOLD, write Parquet and return path."""
     r = _redis()

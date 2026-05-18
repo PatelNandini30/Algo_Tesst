@@ -542,7 +542,12 @@ def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, posit
 
     try:
         end = pd.Timestamp(exit_date)
-        if pd.isna(end) or start > end:
+        if pd.isna(end):
+            return None, None
+        # For same-day trades (entry=exit), next_day > end — fall back to entry day itself
+        if start > end:
+            start = pd.Timestamp(entry_date)
+        if start > end:
             return None, None
     except Exception:
         return None, None
@@ -2926,8 +2931,12 @@ def _resolve_leg_exit(per_leg_results, trade_exit_date, trade_exit_reason, leg_i
     """
     if per_leg_results is not None and 0 <= leg_idx < len(per_leg_results):
         r = per_leg_results[leg_idx] or {}
+        if r.get('triggered'):
+            return (r.get('exit_date') or trade_exit_date,
+                    r.get('exit_reason', 'EXPIRY'))
+        # Leg not individually triggered — inherit trade-level reason (SPOT_ADJ, FILTER_END, …)
         return (r.get('exit_date') or trade_exit_date,
-                r.get('exit_reason', 'EXPIRY'))
+                trade_exit_reason or 'EXPIRY')
     return (trade_exit_date, trade_exit_reason or 'EXPIRY')
 
 
@@ -3120,6 +3129,97 @@ def check_overall_stop_loss_target(
     return None, None
 
 
+def _resolve_fixed_rollover_exit(
+    entry_ts,
+    expiries_sorted,
+    exit_dte,
+    rollover_min_days_to_expiry,
+    rollover_toggle,
+    trading_calendar_arr,
+    seg_end,
+    trading_calendar,
+):
+    """
+    Re-resolve the target expiry and exit date for a fixed-segment rollover
+    trade starting at entry_ts. Called only when spot adjustment caused an
+    early exit and the pre-computed chain entry is stale.
+
+    Mirrors the construction while-loop logic (lines 3708-3806) exactly so
+    that min_days, 0-day advance, and segment-end clamping all behave the
+    same way as during pre-computation.
+
+    Returns (target_expiry, exit_ts) or (None, None) if no valid slot found.
+    """
+    _exit_dte_safe = max(0, int(exit_dte))
+    seg_end_ts = pd.Timestamp(seg_end)
+
+    # Find first expiry >= entry_ts (same as construction line 3710)
+    _target_idx = None
+    for _i, _e in enumerate(expiries_sorted):
+        if _e >= entry_ts:
+            _target_idx = _i
+            break
+    if _target_idx is None:
+        return None, None
+
+    target_expiry = expiries_sorted[_target_idx]
+
+    # Apply rollover_min_days_to_expiry check (mirrors lines 3742-3750)
+    try:
+        _idx_entry  = int(np.searchsorted(
+            trading_calendar_arr, entry_ts.normalize().to_numpy(), side='right'))
+        _idx_target = int(np.searchsorted(
+            trading_calendar_arr, target_expiry.normalize().to_numpy(), side='right'))
+        days_to_target = max(0, _idx_target - _idx_entry)
+    except Exception:
+        days_to_target = 0
+
+    if (rollover_toggle
+            and rollover_min_days_to_expiry > 0
+            and days_to_target <= rollover_min_days_to_expiry
+            and _target_idx + 1 < len(expiries_sorted)):
+        _target_idx += 1
+        target_expiry = expiries_sorted[_target_idx]
+
+    # Compute exit = target_expiry - exit_dte trading days (mirrors lines 3754-3767)
+    try:
+        _idx_exp = int(np.searchsorted(
+            trading_calendar_arr, target_expiry.normalize().to_numpy(), side='right')) - 1
+    except Exception:
+        return None, None
+    if _idx_exp < 0:
+        return None, None
+    _idx_exit = _idx_exp - _exit_dte_safe
+    if _idx_exit < 0:
+        return None, None
+    exit_ts = pd.Timestamp(trading_calendar_arr[_idx_exit])
+
+    # Advance past 0-day trades — mirrors inner while at lines 3774-3800
+    while exit_ts <= entry_ts:
+        if _target_idx + 1 >= len(expiries_sorted):
+            return None, None
+        _target_idx += 1
+        target_expiry = expiries_sorted[_target_idx]
+        try:
+            _idx_exp = int(np.searchsorted(
+                trading_calendar_arr, target_expiry.normalize().to_numpy(), side='right')) - 1
+        except Exception:
+            return None, None
+        if _idx_exp < 0:
+            return None, None
+        _idx_exit = _idx_exp - _exit_dte_safe
+        if _idx_exit < 0:
+            return None, None
+        exit_ts = pd.Timestamp(trading_calendar_arr[_idx_exit])
+
+    # Clamp exit to last trading day in segment (mirrors lines 3808-3814)
+    if exit_ts > seg_end_ts:
+        _last_day = _last_trading_day_on_or_before(trading_calendar, seg_end_ts)
+        if _last_day is None or pd.Timestamp(_last_day) <= entry_ts:
+            return None, None
+        exit_ts = pd.Timestamp(_last_day)
+
+    return target_expiry, exit_ts
 
 
 
@@ -3295,9 +3395,11 @@ def run_algotest_backtest(params):
     # date_to). Same code path for all three.
     fixed_entry_mode = (filter_entry_mode == 'fixed')
     logger.info(
-        "[MODE PROBE] filter_entry_mode=%r fixed_entry_mode=%s str_enabled=%s filter_enabled=%s rollover_toggle=%s min_days_to_expiry=%s",
+        "[MODE PROBE] filter_entry_mode=%r fixed_entry_mode=%s str_enabled=%s filter_enabled=%s rollover_toggle=%s min_days_to_expiry=%s exit_dte=%s spot_adj_enabled=%s spot_adj_pct=%s spot_adj_dir=%s",
         filter_entry_mode, fixed_entry_mode, str_enabled, filter_enabled,
         rollover_toggle, params.get('rollover_min_days_to_expiry'),
+        params.get('exit_dte', 0), params.get('spot_adjustment_enabled', False),
+        params.get('spot_adjustment_pct', 1.0), params.get('spot_adjustment_direction', 'rise'),
     )
     fixed_late_entry  = bool(params.get('fixed_late_entry',  False))
     min_days_to_entry = int(params.get('min_days_to_entry', 0) or 0)
@@ -3970,8 +4072,10 @@ def run_algotest_backtest(params):
                 _log(f"[NO_ROLLOVER] 1 trade per segment (first expiry {_first_exp.date()}, {_days_to_first_exp}d from seg_start)")
 
         segment_records.append({
-            'segment': segment,
-            'entries': seg_entries,
+            'segment':         segment,
+            'entries':         seg_entries,
+            'expiries_sorted': expiries_sorted if fixed_entry_mode else [],
+            'expiry_rec_map':  expiry_rec_map  if fixed_entry_mode else {},
         })
         total_entries += len(seg_entries)
 
@@ -4001,6 +4105,15 @@ def run_algotest_backtest(params):
     for seg_scope in segment_records:
         segment = seg_scope['segment']
         _seg_label = segment.get('label', str(id(segment)))
+        # Spot-adj + rollover correction state — reset per segment.
+        # Only active for fixed_entry_mode (expiries_sorted non-empty) when rollover
+        # is on. Tracks the previous trade's actual exit so the next trade starts
+        # from there instead of the stale pre-computed entry.  Existing code paths
+        # are untouched when rollover_toggle is off or no spot adj fires.
+        _prev_actual_exit      = None
+        _seg_expiries          = seg_scope.get('expiries_sorted', [])
+        _seg_expiry_recmap     = seg_scope.get('expiry_rec_map', {})
+        _seg_original_count    = len(seg_scope['entries'])  # count before any synthetic appends
         for entry_idx, trade_entry in enumerate(seg_scope['entries'], 1):
             entry_date = trade_entry['entry_date']
             exit_date = trade_entry['exit_date']
@@ -4010,6 +4123,56 @@ def run_algotest_backtest(params):
             _force_next_expiry   = trade_entry.get('_force_next_expiry', False)
             _trade_rollover_mode = trade_entry.get('_rollover_mode', False)
             clamped_exit = trade_entry['clamped_exit']
+
+            # ── Spot-adj rollover correction ──────────────────────────────────
+            # When spot adjustment caused the previous trade to exit early, the
+            # pre-computed entry_date for THIS trade is stale (it was built from
+            # the original, later exit).  Re-resolve entry + expiry + exit from
+            # the actual previous exit date so the chain has no gap.
+            #
+            # Guard: only fires when –
+            #   • rollover_toggle is on (we're chaining trades)
+            #   • _prev_actual_exit is set and DIFFERS from the pre-computed
+            #     entry_date (i.e. spot adj actually moved the previous exit)
+            #   • _seg_expiries is non-empty (fixed_entry_mode only)
+            # Existing behaviour (no spot adj, or rollover off) is untouched.
+            if (rollover_toggle
+                    and _prev_actual_exit is not None
+                    and _seg_expiries
+                    and (_prev_actual_exit != pd.Timestamp(trade_entry['entry_date'])
+                         or trade_entry.get('_is_synthetic', False))):
+                _new_entry = _prev_actual_exit
+                _pre_exit  = pd.Timestamp(trade_entry['exit_date'])
+                if _new_entry >= _pre_exit:
+                    # Actual exit at or after this slot's scheduled exit — skip slot
+                    _prev_actual_exit = _pre_exit
+                    continue
+                _re_expiry, _re_exit = _resolve_fixed_rollover_exit(
+                    entry_ts=_new_entry,
+                    expiries_sorted=_seg_expiries,
+                    exit_dte=exit_dte,
+                    rollover_min_days_to_expiry=rollover_min_days_to_expiry,
+                    rollover_toggle=rollover_toggle,
+                    trading_calendar_arr=trading_calendar_arr,
+                    seg_end=segment['end'],
+                    trading_calendar=trading_calendar,
+                )
+                if _re_expiry is not None and _re_exit is not None:
+                    entry_date  = _new_entry
+                    expiry_date = _re_expiry
+                    exit_date   = _re_exit
+                    _re_rec            = _seg_expiry_recmap.get(_re_expiry, {})
+                    _sched_current_exp = _re_rec.get('current_expiry', _re_expiry)
+                    _sched_next_exp    = _re_rec.get('next_expiry',    _re_expiry)
+                    clamped_exit       = (_re_exit < pd.Timestamp(trade_entry['exit_date']))
+                    _log(
+                        f"  [SPOT_ADJ_ROLLOVER] entry overridden "
+                        f"{pd.Timestamp(trade_entry['entry_date']).strftime('%d/%m/%Y')} → "
+                        f"{entry_date.strftime('%d/%m/%Y')} | "
+                        f"expiry re-resolved → {_re_expiry.strftime('%d/%m/%Y')} | "
+                        f"exit → {_re_exit.strftime('%d/%m/%Y')}"
+                    )
+            # ─────────────────────────────────────────────────────────────────
 
             # Trade-level min-days-to-expiry: if days_to_current_exp ≤ threshold,
             # extend the trade's exit_date to next_expiry so the trade holds through
@@ -4118,6 +4281,11 @@ def run_algotest_backtest(params):
                         exit_date = adjusted_ts
                         base_exit_reason = 'SPOT_ADJ_RISE' if triggered_direction == 'RISE' else 'SPOT_ADJ_FALL'
                         _log(f"  Spot adjustment triggered on {adjusted_ts.strftime('%Y-%m-%d')} ({triggered_direction})")
+
+                # Track actual exit for rollover correction (spot-adj may have shortened it).
+                # Used by the next trade's entry override when rollover + fixed_entry_mode.
+                if rollover_toggle and _seg_expiries:
+                    _prev_actual_exit = pd.Timestamp(exit_date)
 
                 # ========== STEP 8: PROCESS EACH LEG ==========
                 trade_legs = []
@@ -4908,6 +5076,30 @@ def run_algotest_backtest(params):
                 trade_id_counter += 1
                 trade_record['trade_id'] = f"{trade_id_counter}"
                 all_trades.append(trade_record)
+
+                # Segment-end continuation: when the last pre-computed slot (any
+                # T-N exit mode, any expiry type) or a synthetic follow-on exits
+                # before seg_end, inject a synthetic slot to cover the remainder.
+                # Trigger: entry_idx >= _seg_original_count means we are on the
+                # last original slot or beyond (synthetic). Works for T-0, T-1,
+                # T-2 … T-N regardless of whether the slot is clamped or not.
+                if rollover_toggle and _seg_expiries and entry_idx >= _seg_original_count:
+                    _seg_end_ts = pd.Timestamp(segment['end'])
+                    _last_in_seg = _last_trading_day_on_or_before(trading_calendar, _seg_end_ts)
+                    if (_last_in_seg is not None
+                            and pd.Timestamp(_last_in_seg) > _prev_actual_exit):
+                        seg_scope['entries'].append({
+                            'segment':            segment,
+                            'entry_date':         _prev_actual_exit,
+                            'exit_date':          pd.Timestamp(_last_in_seg),
+                            'expiry_date':        trade_entry['expiry_date'],
+                            'current_expiry':     trade_entry.get('current_expiry', trade_entry['expiry_date']),
+                            'next_expiry':        trade_entry.get('next_expiry', trade_entry['expiry_date']),
+                            '_force_next_expiry': trade_entry.get('_force_next_expiry', False),
+                            '_rollover_mode':     trade_entry.get('_rollover_mode', False),
+                            'clamped_exit':       True,
+                            '_is_synthetic':      True,
+                        })
 
                 # ========== PER-LEG RE-ENTRY LOGIC ==========
                 _reentry_applied = False

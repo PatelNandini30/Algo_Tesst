@@ -2239,27 +2239,48 @@ _base2_segments_cache: Optional[list] = None
 
 def get_base2_segments() -> list:
     """
-    Generate base2 filter - returns single segment covering entire DB date range.
-    This represents the full available data range.
-    
-    Returns:
-        List with single dict: [{'start': min_date, 'end': max_date}]
+    Return base2 filter segments from super_trend_segments table (config='base2').
+    Falls back to CSV file at Filter/base2.csv if DB is unavailable.
     """
     global _base2_segments_cache
     if _base2_segments_cache is not None:
         return _base2_segments_cache
 
     try:
-        date_range = _repo.get_available_date_range()
-        min_date = date_range.get('min_date')
-        max_date = date_range.get('max_date')
-        if min_date and max_date:
-            _base2_segments_cache = [{'start': min_date, 'end': max_date}]
-        else:
-            _base2_segments_cache = []
+        df = _repo.get_super_trend_segments(config='base2', symbol='NIFTY')
+        if not df.empty:
+            starts = pd.to_datetime(df['start_date']).tolist()
+            ends   = pd.to_datetime(df['end_date']).tolist()
+            segs = [
+                {'start': s.to_pydatetime(), 'end': e.to_pydatetime()}
+                for s, e in zip(starts, ends) if e >= s
+            ]
+            segs.sort(key=lambda seg: seg['start'])
+            _base2_segments_cache = segs
+            return _base2_segments_cache
     except Exception:
-        _base2_segments_cache = []
+        pass
 
+    # CSV fallback
+    try:
+        csv_path = os.path.join(FILTER_DIR, 'base2.csv')
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            df.columns = [str(c).strip() for c in df.columns]
+            df['_start'] = pd.to_datetime(df['Start'].astype(str).str.strip(), dayfirst=True, errors='coerce')
+            df['_end']   = pd.to_datetime(df['End'].astype(str).str.strip(),   dayfirst=True, errors='coerce')
+            valid = df.dropna(subset=['_start', '_end'])
+            segs = [
+                {'start': row['_start'].to_pydatetime(), 'end': row['_end'].to_pydatetime()}
+                for _, row in valid.iterrows() if row['_end'] >= row['_start']
+            ]
+            segs.sort(key=lambda seg: seg['start'])
+            _base2_segments_cache = segs
+            return _base2_segments_cache
+    except Exception:
+        pass
+
+    _base2_segments_cache = []
     return _base2_segments_cache
 
 
@@ -3415,7 +3436,20 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     # — no DB query, no Python partition, no Parquet read needed.
     # IMPORTANT: verify the feather actually covers the requested date range before
     # activating, otherwise dates outside the feather return None and generate no trades.
-    if not _rust_lookup_active or not _spot_lookup_covers_range(sym_upper, from_date, to_date):
+    #
+    # Also enter when Rust is active but its loaded range doesn't cover the new request
+    # (_bhav_by_date_to < to_date). The fast early return above already handles the
+    # happy path; if we reach here with Rust active it means the range widened and we
+    # need to reload a covering feather (full or range-specific) before hitting the DB.
+    _rust_range_covers = (
+        _rust_lookup_active
+        and _bhav_by_date_symbol == sym_upper
+        and _bhav_by_date_from is not None
+        and _bhav_by_date_to is not None
+        and pd.to_datetime(_bhav_by_date_from) <= requested_from
+        and pd.to_datetime(_bhav_by_date_to) >= requested_to
+    )
+    if not _rust_range_covers or not _spot_lookup_covers_range(sym_upper, from_date, to_date):
         try:
             from services import rust_fast_path as _rf
             if _rf.is_available():

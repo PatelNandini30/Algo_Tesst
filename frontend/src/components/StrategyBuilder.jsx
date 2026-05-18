@@ -1369,7 +1369,7 @@ const [slippagePct, setSlippagePct] = useState(0);
   }, [rawResults, slippagePct, chargesEnabled]);
 
   const addLegFromDraft = () => {
-    if (legs.length >= 6) return;
+    if (legs.length >= 12) return;
     const normalizedDraft = normalizeLegForSelectedIndex(draftLeg);
     setLegs(prev => [...prev, {
       id: Date.now(),
@@ -2944,7 +2944,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
                 {/* Add Leg */}
                 <div className="ml-auto">
-                  <button type="button" onClick={addLegFromDraft} disabled={legs.length >= 6}
+                  <button type="button" onClick={addLegFromDraft} disabled={legs.length >= 12}
                     className="run-btn add-leg-btn h-9 px-6">
                     <Plus size={13} />
                     Add Leg
@@ -2957,7 +2957,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             {legs.length > 0 && (
               <div className="bg-surface rounded-lg border border-default shadow-sm">
                 <div className="px-4 py-2.5 border-b border-subtle">
-                  <h3 className="section-heading">Legs <span style={{ fontWeight: 400, fontSize: '0.55rem', color: 'var(--text-muted)', marginLeft: '4px' }}>({legs.length}/6)</span></h3>
+                  <h3 className="section-heading">Legs <span style={{ fontWeight: 400, fontSize: '0.55rem', color: 'var(--text-muted)', marginLeft: '4px' }}>({legs.length}/12)</span></h3>
                 </div>
                 <div className="p-3 space-y-3">
                   {trailSLWarning && (
@@ -3818,6 +3818,14 @@ const [slippagePct, setSlippagePct] = useState(0);
               showCloseButton={false}
               filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
               showStrSegment={strFilter.enabled}
+              strategyConfig={{
+                instrument,
+                legs,
+                entryDaysBefore,
+                exitDaysBefore,
+                spotAdjustmentEnabled,
+                spotAdjustmentDirection,
+              }}
             />
             <div className="flex flex-wrap items-center gap-4 px-4 py-3 bg-surface border border-default border-t-0 rounded-b-xl">
               <div className="flex items-center gap-2">

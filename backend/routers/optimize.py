@@ -250,6 +250,49 @@ async def download_tradesheets_zip(job_id: str):
     )
 
 
+@router.get("/optimize/jobs/{job_id}/combo/{combo_id}/tradesheet")
+async def download_combo_tradesheet(job_id: str, combo_id: int):
+    """
+    Return the tradesheet CSV for a single combination, looked up by combo_id.
+    The CSV is fetched on-demand — no re-run needed, file was written during the job.
+    """
+    meta = result_store.get_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    row = result_store.get_combo_by_id(job_id, combo_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Combo {combo_id} not found in job results")
+
+    combo_label_safe = row.get("combo_label_safe") or ""
+    if not combo_label_safe:
+        raise HTTPException(status_code=404, detail="Tradesheet not available for this combo")
+
+    trades_dir = result_store.get_trades_dir(job_id)
+    csv_path = os.path.join(trades_dir, f"{combo_label_safe}.csv")
+    # Validate path stays within trades_dir (prevent traversal)
+    if not os.path.abspath(csv_path).startswith(os.path.abspath(trades_dir)):
+        raise HTTPException(status_code=400, detail="Invalid combo label")
+    if not os.path.isfile(csv_path):
+        raise HTTPException(status_code=404, detail="Tradesheet file not found on disk")
+
+    filename = f"combo_{combo_id}_{combo_label_safe[:60]}.csv"
+
+    def _iter_file():
+        with open(csv_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _iter_file(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.delete("/optimize/jobs/{job_id}")
 async def cancel_optimize_job(job_id: str):
     """Revoke the Celery task and drop result data."""

@@ -143,7 +143,7 @@ class StrategyDefinition(BaseModel):
     """Complete strategy definition"""
     name: str
     description: Optional[str] = None
-    legs: List[Leg] = Field(min_items=1, max_items=10)
+    legs: List[Leg] = Field(min_items=1, max_items=12)
     index: str = "NIFTY"  # NIFTY, BANKNIFTY, FINNIFTY, etc.
     
     # Re-entry configuration

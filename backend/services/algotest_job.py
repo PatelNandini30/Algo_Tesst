@@ -744,19 +744,52 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 if 'Net P&L' in trades_aggregated.columns:
                     logger.debug("[DEBUG] Net P&L sample=%s", trades_aggregated['Net P&L'].head().tolist())
 
-                # Preserve engine-computed cumulative before compute_analytics drops and rewrites them
-                _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
-                _saved_final = {col: trades_aggregated[col].copy() for col in _cum_cols if col in trades_aggregated.columns}
-
                 trades_aggregated, result_summary = compute_analytics(trades_aggregated)
                 logger.debug("[DEBUG] Result summary=%s", result_summary)
                 result_pivot = build_pivot(trades_aggregated, "Exit Date")
 
-                # Restore correct additive-from-100 series (compute_analytics overwrites these)
-                for col, saved in _saved_final.items():
-                    trades_aggregated[col] = saved
+                # Recompute cumulative/peak/DD/%DD from scratch using first-leg rows.
+                # Each chunk's engine call resets cumulative to 100, so we must
+                # recompute globally across the combined dataset.
+                # First-leg rows carry the total trade P&L (not per-leg partial),
+                # so the compound formula gives the correct global series.
+                _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+                if ('Trade' in trades_aggregated.columns
+                        and 'Net P&L' in trades_aggregated.columns
+                        and 'Entry Spot' in trades_aggregated.columns
+                        and 'Entry Date' in trades_aggregated.columns):
+                    _first_mask = trades_aggregated.groupby('Trade', sort=False).cumcount() == 0
+                    _leg1 = trades_aggregated[_first_mask][
+                        ['Trade', 'Net P&L', 'Entry Spot', 'Entry Date']
+                    ].copy().sort_values('Entry Date').reset_index(drop=True)
 
-                # Export with correct cumulative values restored
+                    _pnl_s  = pd.to_numeric(_leg1['Net P&L'],   errors='coerce').fillna(0.0)
+                    _spot_s = pd.to_numeric(_leg1['Entry Spot'], errors='coerce').replace(0.0, np.nan)
+                    _pct_s  = (_pnl_s / _spot_s * 100.0).fillna(0.0)
+
+                    _cum, _pk = 100.0, 100.0
+                    _cum_map, _pk_map, _dd_map, _pct_dd_map = {}, {}, {}, {}
+                    for _i, (_, _r) in enumerate(_leg1.iterrows()):
+                        _p   = float(_pct_s.iloc[_i])
+                        _cum = _cum * (1.0 + _p / 100.0)
+                        _pk  = max(_pk, _cum)
+                        _dd  = _cum - _pk
+                        _pd  = (_dd / _pk * 100.0) if _pk != 0.0 else 0.0
+                        _tid = _r['Trade']
+                        _cum_map[_tid] = round(_cum, 6)
+                        _pk_map[_tid]  = round(_pk,  6)
+                        _dd_map[_tid]  = round(_dd,  6)
+                        _pct_dd_map[_tid] = round(_pd, 6)
+
+                    trades_aggregated['Cumulative'] = trades_aggregated['Trade'].map(_cum_map)
+                    trades_aggregated['Peak']       = trades_aggregated['Trade'].map(_pk_map)
+                    trades_aggregated['DD']         = trades_aggregated['Trade'].map(_dd_map)
+                    trades_aggregated['%DD']        = trades_aggregated['Trade'].map(_pct_dd_map)
+
+                    # Clear cumulative from non-first-leg rows (matches engine output style)
+                    _non_first = trades_aggregated.groupby('Trade', sort=False).cumcount() != 0
+                    trades_aggregated.loc[_non_first, _cum_cols] = None
+
                 all_trades = _convert_numpy(
                     _format_dates(trades_aggregated.to_dict('records'))
                 )
