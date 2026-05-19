@@ -26,11 +26,12 @@ placeholder).
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -89,8 +90,10 @@ def validate_request(
     raise OptimizationError(f"Unknown method: {method!r}")
 
 
-_RUST_BLOCKING_LEG_KEYS = ("simpleMomentum", "rollover_strike_mode")
-_RUST_BLOCKING_TOP_TRUTHY = ("rollover_toggle", "no_rollover", "buffer_strike_enabled", "fixed_late_entry")
+# fixed_late_entry is accepted for backwards compat in the Python engine but
+# explicitly ignored — the chain always chains same-day (py:3747). Safe to pass
+# through to the Rust path unchanged. No top-level truthy blockers remain.
+_RUST_BLOCKING_TOP_TRUTHY: Tuple[str, ...] = ()
 
 
 def _payload_is_rust_compatible(payload: Dict[str, Any]) -> bool:
@@ -103,25 +106,29 @@ def _payload_is_rust_compatible(payload: Dict[str, Any]) -> bool:
     for key in _RUST_BLOCKING_TOP_TRUTHY:
         if payload.get(key):
             return False
-    filter_mode = str(payload.get("filter_entry_mode") or "dte").lower().strip()
-    if filter_mode in ("fixed", "min_days"):
-        return False
+
+    # filter_entry_mode='fixed' and 'min_days': premium-based strike modes are
+    # now supported via the Rust feather (Slice 10a — _compute_strike_for_leg_python
+    # calls get_strikes_for_date when entry_date/expiry/index are provided).
+
     for leg in (payload.get("legs") or []):
         if not isinstance(leg, dict):
             continue
         segment = str(leg.get("segment") or "").upper()
+        # FUTURES with SL/Target/re-entry still fall back to Python; without
+        # those controls, _build_futures_specs handles them in the Rust path.
         if segment in ("FUTURES", "FUTURE"):
-            return False
-        for key in _RUST_BLOCKING_LEG_KEYS:
-            if isinstance(leg.get(key), dict) and leg.get(key):
-                return False
+            for risk_key in ("stopLoss", "targetProfit", "trailSL", "reEntryOnSL", "reEntryOnTarget"):
+                v = leg.get(risk_key)
+                if v and (not isinstance(v, dict) or any(v.values())):
+                    return False
+        # simpleMomentum: unimplemented in the engine — both Python and Rust ignore it safely.
+        # rollover_strike_mode='fixed': handled by _apply_fixed_rollover_strike (Slice 9b).
         for key in ("reEntryOnSL", "reEntryOnTarget"):
             cfg = leg.get(key)
             if isinstance(cfg, dict) and cfg:
                 mode = str(cfg.get("mode") or "RE_ASAP").upper()
-                if mode != "RE_ASAP":
-                    return False
-                if cfg.get("lazyLegConfig") or cfg.get("lazy_leg_config"):
+                if mode not in ("RE_ASAP", "RE_ASAP_REV", "LAZY_LEG", "RE_MOMENTUM", "RE_MOMENTUM_REV"):
                     return False
     return True
 
@@ -315,6 +322,304 @@ def set_rust_context(ctx: Optional[Dict[str, Any]]) -> None:
     _RUST_CONTEXT = ctx
 
 
+def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame") -> Optional[float]:
+    """
+    Compute finalMae for a group of trade legs.
+    Mirrors buildTradeExcel.js calcTradeMae function exactly.
+    Returns None when MAE/MFE are all zero (not yet computed).
+    """
+    def _sum(legs: "pd.DataFrame", col: str) -> Optional[float]:
+        vals = pd.to_numeric(legs[col], errors="coerce")
+        if vals.isna().any():
+            return None
+        return float(vals.sum())
+
+    opt_types = {"CE", "PE", "CALL", "PUT"}
+    opt_legs = trade_legs[trade_legs["Type"].str.upper().isin(opt_types)]
+    fut_legs = trade_legs[trade_legs["Type"].str.upper() == "FUT"]
+    if opt_legs.empty:
+        return None
+
+    opt_mae = _sum(opt_legs, "MAE")
+    opt_mfe = _sum(opt_legs, "MFE")
+    if opt_mae is None or opt_mfe is None:
+        return None
+    if opt_mae == 0.0 and opt_mfe == 0.0:
+        return None  # MAE/MFE columns not yet computed
+
+    if not fut_legs.empty:
+        fut_mae = _sum(fut_legs, "MAE")
+        fut_mfe = _sum(fut_legs, "MFE")
+        if fut_mae is None or fut_mfe is None:
+            return None
+        net_mae1 = fut_mfe + opt_mae
+        net_mae2 = opt_mfe + fut_mae
+    else:
+        buy_legs = opt_legs[opt_legs["B/S"].str.upper() == "BUY"]
+        sell_legs = opt_legs[opt_legs["B/S"].str.upper() == "SELL"]
+        if not buy_legs.empty and not sell_legs.empty:
+            buy_mae = _sum(buy_legs, "MAE")
+            buy_mfe = _sum(buy_legs, "MFE")
+            sell_mae = _sum(sell_legs, "MAE")
+            sell_mfe = _sum(sell_legs, "MFE")
+            if any(v is None for v in (buy_mae, buy_mfe, sell_mae, sell_mfe)):
+                return None
+            net_mae1 = sell_mae + buy_mfe  # type: ignore[operator]
+            net_mae2 = sell_mfe + buy_mae  # type: ignore[operator]
+        else:
+            net_mae1 = opt_mae
+            net_mae2 = opt_mfe
+
+    return round(min(net_mae1, net_mae2) * 10000) / 10000
+
+
+def _compute_mae_mfe_batch(
+    df: "pd.DataFrame",
+    index_str: str,
+    trading_days: List[str],
+) -> "pd.DataFrame":
+    """
+    Compute MAE/MFE for all option leg rows in df using ONE Polars feather scan.
+
+    Formula identical to _calculate_mae_mfe_from_extremes in
+    engines/generic_algotest_engine.py — no calculation changes:
+      SELL: mae=(entry-high)/spot*100, mfe=(entry-low)/spot*100
+      BUY:  mae=(low-entry)/spot*100,  mfe=(high-entry)/spot*100
+
+    Window: (next_trading_day_after(entry_date), exit_date] — same as Python
+    engine's _calculate_leg_mae_mfe.
+    """
+    if df.empty or not trading_days:
+        return df
+    if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return df
+
+    try:
+        import polars as pl
+        from services import rust_fast_path as _rf
+    except ImportError:
+        return df
+
+    sym_upper = index_str.upper()
+    try:
+        feather = _rf._cache_root() / f"arrow-v2:bulk:{sym_upper}:full" / "options.feather"
+        if not feather.exists():
+            return df
+    except Exception:
+        return df
+
+    td_sorted = sorted(set(trading_days))
+
+    # Per-row: gather window info
+    rows_data: List[Optional[Dict]] = []
+    for pos in range(len(df)):
+        row = df.iloc[pos]
+        opt_type = str(row.get("Type") or "").upper()
+        if opt_type not in ("CE", "PE"):
+            rows_data.append(None)
+            continue
+        strike = float(row.get("Strike") or 0.0)
+        entry_price = float(row.get("Entry Price") or 0.0)
+        entry_spot = float(row.get("Entry Spot") or 0.0)
+        position = str(row.get("B/S") or "SELL").upper()
+        if strike <= 0 or entry_spot <= 0:
+            rows_data.append(None)
+            continue
+        expiry_raw = row.get("Expiry")
+        entry_dt = row.get("Entry Date")
+        exit_dt = row.get("Exit Date")
+        if not expiry_raw or entry_dt is None or exit_dt is None:
+            rows_data.append(None)
+            continue
+        try:
+            import pandas as _pd
+            entry_str = _pd.Timestamp(entry_dt).strftime("%Y-%m-%d")
+            exit_str = _pd.Timestamp(exit_dt).strftime("%Y-%m-%d")
+            expiry_str = _pd.Timestamp(expiry_raw).strftime("%Y-%m-%d")
+        except Exception:
+            rows_data.append(None)
+            continue
+        # MAE/MFE window: next trading day after entry up to exit (same as Python engine)
+        idx = bisect.bisect_right(td_sorted, entry_str)
+        win_start = td_sorted[idx] if idx < len(td_sorted) else None
+        if win_start is None or win_start > exit_str:
+            win_start = entry_str  # same-day trade fallback
+        if win_start > exit_str:
+            rows_data.append(None)
+            continue
+        rows_data.append({
+            "pos": pos, "opt_type": opt_type, "strike": strike,
+            "expiry_str": expiry_str, "win_start": win_start, "win_end": exit_str,
+            "entry_price": entry_price, "position": position, "entry_spot": entry_spot,
+        })
+
+    valid_rows = [r for r in rows_data if r is not None]
+    if not valid_rows:
+        return df
+
+    scan_from_str = min(r["win_start"] for r in valid_rows)
+    scan_to_str = max(r["win_end"] for r in valid_rows)
+    try:
+        import pandas as _pd2
+        from_dt = _pd2.Timestamp(scan_from_str).date()
+        to_dt = _pd2.Timestamp(scan_to_str).date()
+    except Exception:
+        return df
+
+    # Build OR filter for unique (expiry, option_type, strike) combinations
+    unique_combos: Dict[Tuple, None] = {}
+    for r in valid_rows:
+        unique_combos[(r["expiry_str"], r["opt_type"], r["strike"])] = None
+
+    try:
+        import pandas as _pd3
+        f = pl.lit(False)
+        for (exp_str, opt, strike) in unique_combos:
+            exp_dt = _pd3.Timestamp(exp_str).date()
+            f = f | (
+                (pl.col("ExpiryDate") == exp_dt)
+                & (pl.col("OptionType") == opt)
+                & ((pl.col("StrikePrice") - strike).abs() <= 0.5)
+            )
+        ohlc_raw = (
+            pl.scan_ipc(str(feather))
+            .filter(
+                (pl.col("Symbol") == sym_upper)
+                & (pl.col("Date") >= from_dt)
+                & (pl.col("Date") <= to_dt)
+                & f
+            )
+            .select(["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"])
+            .collect()
+        )
+    except Exception as exc:
+        logger.debug("[OPTIM] MAE/MFE feather scan failed: %s", exc)
+        return df
+
+    if ohlc_raw.is_empty():
+        return df
+
+    # Convert to pandas MultiIndex for fast per-day lookup
+    try:
+        import pandas as _pd4
+        ohlc_pd = ohlc_raw.to_pandas()
+        ohlc_pd["date_str"] = _pd4.to_datetime(ohlc_pd["Date"]).dt.strftime("%Y-%m-%d")
+        ohlc_pd["expiry_str"] = _pd4.to_datetime(ohlc_pd["ExpiryDate"]).dt.strftime("%Y-%m-%d")
+        ohlc_pd["strike_r"] = ohlc_pd["StrikePrice"].round(0).astype(int)
+        ohlc_idx = ohlc_pd.set_index(["expiry_str", "OptionType", "strike_r", "date_str"])[["High", "Low"]]
+    except Exception as exc:
+        logger.debug("[OPTIM] MAE/MFE ohlc index build failed: %s", exc)
+        return df
+
+    df = df.copy()
+    mae_vals = list(df["MAE"]) if "MAE" in df.columns else [0.0] * len(df)
+    mfe_vals = list(df["MFE"]) if "MFE" in df.columns else [0.0] * len(df)
+
+    for r in valid_rows:
+        pos = r["pos"]
+        exp = r["expiry_str"]
+        opt = r["opt_type"]
+        strike_r = int(round(r["strike"]))
+        win_start = r["win_start"]
+        win_end = r["win_end"]
+        entry_price = r["entry_price"]
+        entry_spot = r["entry_spot"]
+        position = r["position"]
+
+        # Days in the OHLC window
+        lo = bisect.bisect_left(td_sorted, win_start)
+        hi = bisect.bisect_right(td_sorted, win_end)
+        window_days = td_sorted[lo:hi]
+
+        highs: List[float] = []
+        lows: List[float] = []
+        for d in window_days:
+            try:
+                row_ohlc = ohlc_idx.loc[(exp, opt, strike_r, d)]
+                # loc returns Series (single match) or DataFrame (rare duplicates)
+                if isinstance(row_ohlc, pd.DataFrame):
+                    row_ohlc = row_ohlc.iloc[0]
+                highs.append(float(row_ohlc["High"]))
+                lows.append(float(row_ohlc["Low"]))
+            except (KeyError, IndexError, TypeError):
+                pass
+
+        if not highs or not lows:
+            continue
+
+        max_high = max(highs)
+        min_low = min(lows)
+
+        # Same formula as _calculate_mae_mfe_from_extremes in generic_algotest_engine.py
+        if position == "SELL":
+            mae = (entry_price - max_high) / entry_spot
+            mfe = (entry_price - min_low) / entry_spot
+        else:
+            mae = (min_low - entry_price) / entry_spot
+            mfe = (max_high - entry_price) / entry_spot
+
+        mae_vals[pos] = round(mae * 100, 4)
+        mfe_vals[pos] = round(mfe * 100, 4)
+
+    df["MAE"] = mae_vals
+    df["MFE"] = mfe_vals
+    return df
+
+
+def _compute_live_dd_from_mae(
+    df: "pd.DataFrame",
+    aggregated: "pd.DataFrame",
+) -> "pd.DataFrame":
+    """
+    Add 'Lowest NAV During Trade' column to df using Final MAE per trade.
+
+    Formula (mirrors buildTradeExcel.js lines 253-272):
+        finalMae = min(netMae1, netMae2)  — from _calc_final_mae_for_trade
+        lowestNav = prevCum * (1 + finalMae/100)
+        (prevCum = Cumulative of the prior trade, starting at 100.0)
+
+    Only parent rows (first occurrence of each trade) carry the value;
+    secondary leg rows get None — matching Python engine convention.
+    """
+    if df.empty or "MAE" not in df.columns or "MFE" not in df.columns:
+        return df
+
+    df = df.copy()
+    prev_cum = 100.0
+    trade_lowest_nav: Dict[str, Optional[float]] = {}
+
+    # Process trades in the same sorted order used by cumulative computation
+    for _, agg_row in aggregated.iterrows():
+        tid = str(agg_row.get("Trade") or "")
+        if not tid:
+            continue
+        trade_legs = df[df["Trade"] == tid]
+        final_mae = _calc_final_mae_for_trade(trade_legs) if not trade_legs.empty else None
+        cum = agg_row.get("Cumulative")
+        if final_mae is not None:
+            trade_lowest_nav[tid] = round(prev_cum * (1.0 + float(final_mae) / 100.0) * 100) / 100
+        else:
+            trade_lowest_nav[tid] = None
+        if cum is not None:
+            try:
+                prev_cum = float(cum)
+            except (TypeError, ValueError):
+                pass
+
+    # Assign values to parent rows only
+    seen: set = set()
+    lnav_vals: List[Optional[float]] = []
+    for _, row in df.iterrows():
+        tid = str(row.get("Trade") or "")
+        if tid not in seen:
+            seen.add(tid)
+            lnav_vals.append(trade_lowest_nav.get(tid))
+        else:
+            lnav_vals.append(None)
+    df["Lowest NAV During Trade"] = lnav_vals
+    return df
+
+
 def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd.DataFrame, Dict[str, Any]]]:
     """
     Fastest path — call run_rust_engine_pipeline directly with the pre-computed
@@ -431,6 +736,15 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         df["Peak"] = pk_vals
         df["DD"] = dd_vals
         df["%DD"] = pdd_vals
+
+        # Compute MAE/MFE from the Arrow feather (ONE scan for all legs).
+        # Entry/Exit Date are still Timestamps here — good for the window computation.
+        _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
+        df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
+
+        # Compute 'Lowest NAV During Trade' from Final MAE (for backend metrics).
+        # Uses the sorted aggregated df so prevCum tracks correctly.
+        df = _compute_live_dd_from_mae(df, aggregated)
 
         # Format dates as DD-MM-YYYY strings to match backtest tradesheet output.
         for c in ("Entry Date", "Exit Date", "Leg Exit Date"):

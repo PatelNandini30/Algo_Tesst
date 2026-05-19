@@ -542,6 +542,100 @@ _register(
 )
 
 
+# ── Slice 9 (RE_ASAP_REV) ───────────────────────────────────────────────────
+# On SL fire the re-entry uses the REVERSED position (SELL → BUY). Same
+# parameters as single_leg_reentry_sl_re_asap except mode=RE_ASAP_REV.
+_register(
+    "reentry_re_asap_rev",
+    {
+        **_long_window_base(),
+        "legs": [
+            _leg(
+                option_type="CE",
+                strike_type="ATM",
+                stopLoss={"mode": "PERCENT", "value": 25},
+                reEntryOnSL={
+                    "mode": "RE_ASAP_REV",
+                    "count": 1,
+                },
+            ),
+        ],
+    },
+)
+
+# ── Slice 9b (rollover_strike_mode='fixed') ──────────────────────────────────
+# filter_entry_mode='fixed' chains trades same-day starting at from_date.
+# With rollover_strike_mode='fixed', all cycles in the segment reuse the
+# first cycle's ATM strike (verified: all 13 trades use strike=21750).
+_register(
+    "rollover_fixed_strike",
+    {
+        **_base(),
+        "filter_entry_mode": "fixed",
+        "rollover_toggle": True,
+        "rollover_min_days_to_expiry": 0,
+        "legs": [
+            _leg(
+                option_type="CE",
+                strike_type="ATM",
+                rollover_strike_mode="fixed",
+            ),
+        ],
+    },
+)
+
+# ── Slice RE_MOMENTUM (re-entry mode: scan for momentum signal post-SL) ───────
+# After the parent leg's SL fires, scan subsequent daily closes and re-enter
+# when price bounces back through the SL trigger level (momentum confirmed).
+_register(
+    "single_leg_reentry_sl_re_momentum",
+    {
+        **_long_window_base(),
+        "legs": [
+            _leg(
+                option_type="CE",
+                strike_type="ATM",
+                stopLoss={"mode": "PERCENT", "value": 25},
+                reEntryOnSL={
+                    "mode": "RE_MOMENTUM",
+                    "count": 1,
+                },
+            ),
+        ],
+    },
+)
+
+# ── Slice NEXT_WEEKLY (per-leg NEXT_WEEKLY expiry — calendar spread) ─────────
+# Single CE leg trading the NEXT week's expiry contract while the schedule
+# (entry/exit DTE) is anchored to the current weekly expiry cycle.
+# Python engine resolves leg_options_expiry = next_exp when leg.expiry='NEXT_WEEKLY'.
+_register(
+    "single_leg_next_weekly",
+    {
+        **_base(),
+        "legs": [
+            _leg(option_type="CE", strike_type="ATM", expiry="NEXT_WEEKLY"),
+        ],
+    },
+)
+
+# ── Slice 8b (filter_entry_mode='fixed') ─────────────────────────────────────
+# Like rollover_fixed_strike above but without fixed-strike locking.
+# Each rollover cycle resolves a fresh ATM strike, so strikes vary.
+_register(
+    "filter_entry_fixed",
+    {
+        **_base(),
+        "filter_entry_mode": "fixed",
+        "rollover_toggle": True,
+        "rollover_min_days_to_expiry": 0,
+        "legs": [
+            _leg(option_type="CE", strike_type="ATM"),
+        ],
+    },
+)
+
+
 def list_names() -> List[str]:
     return sorted(ARCHETYPES.keys())
 

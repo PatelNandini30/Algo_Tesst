@@ -88,6 +88,20 @@ SLICE_4_ARCHETYPES = (
     "single_leg_spot_adjustment_both",
     # Slice 8a — STR (super_trend) filter
     "single_leg_str_5x1",
+    # Slice NEXT_WEEKLY — per-leg NEXT_WEEKLY expiry (calendar spread)
+    "single_leg_next_weekly",
+    # Slice 10 — LAZY_LEG: on SL, enter a different option leg (PE BUY ATM)
+    "single_leg_lazy_pe_buy",
+    # Slice RE_MOMENTUM — scan for momentum signal before re-entering on SL
+    "single_leg_reentry_sl_re_momentum",
+    # Slice 8b — filter_entry_mode='fixed' with rollover chaining
+    "filter_entry_fixed",
+    # Slice 9 — RE_ASAP_REV: reversed-position re-entry on SL
+    "reentry_re_asap_rev",
+    # Slice 9b — rollover_strike_mode='fixed': reuse first cycle's strike
+    "rollover_fixed_strike",
+    # FUTURES — single-leg monthly futures SELL, no SL/Target
+    "single_leg_futures_monthly",
 )
 
 
@@ -131,13 +145,20 @@ def _make_archetype_test(name):
         if not priced:
             self.fail(f"engine_rust pipeline produced 0 trades for {name!r}")
 
+        def _snap_strike(s):
+            try:
+                return float(s)
+            except (TypeError, ValueError):
+                return 0.0
+
         snap_by_key = {
-            (t["Entry Date"], t["Exit Date"], float(t["Strike"]), t["Type"]): t
+            (t["Entry Date"], t["Exit Date"], _snap_strike(t["Strike"]), t["Type"]): t
             for t in snap["trades"]
         }
 
         for row in priced:
-            key = (row["entry_date"], row["exit_date"], row["strike"], row["option_type"])
+            strike_key = 0.0 if row.get("option_type") == "FUT" else row["strike"]
+            key = (row["entry_date"], row["exit_date"], strike_key, row["option_type"])
             snap_row = snap_by_key.get(key)
             if snap_row is None:
                 self.fail(
@@ -170,49 +191,6 @@ def _make_archetype_test(name):
 
 for _n in SLICE_4_ARCHETYPES:
     setattr(TestEngineRustPipeline, f"test_pipeline__{_n}", _make_archetype_test(_n))
-
-
-# ── Slice 9 fallback test ────────────────────────────────────────────────────
-# Futures legs aren't yet supported by the Rust orchestrator. The contract is
-# that `run_rust_engine_pipeline` returns None so the caller falls back to the
-# Python engine. This test pins that contract — if a future change accidentally
-# accepts a futures payload without proper Rust support, this fails fast.
-
-def _make_fallback_test(archetype_name):
-    def test(self):
-        from tests.parity import archetypes as _arche
-        payload = _arche.get(archetype_name)
-        from services.engine_rust import run_rust_engine_pipeline
-        priced = run_rust_engine_pipeline(
-            payload,
-            expiry_dates=self._expiries,
-            trading_days=self._days,
-            lot_size=LOT_SIZE_BY_INDEX[payload["index"]],
-            spot_by_date=self._spots,
-            square_off_mode=payload.get("square_off_mode", "partial"),
-        )
-        self.assertIsNone(
-            priced,
-            f"{archetype_name}: expected Rust orchestrator to return None so "
-            "the Python engine takes over, but it returned a result.",
-        )
-    test.__name__ = f"test_fallback__{archetype_name}"
-    return test
-
-
-SLICE_9_FALLBACK_ARCHETYPES = (
-    "single_leg_futures_monthly",
-)
-for _n in SLICE_9_FALLBACK_ARCHETYPES:
-    setattr(TestEngineRustPipeline, f"test_fallback__{_n}", _make_fallback_test(_n))
-
-# Slice 10 fallback — lazy legs are rejected by the Rust blocker added during
-# slice 6. Pin that contract.
-SLICE_10_FALLBACK_ARCHETYPES = (
-    "single_leg_lazy_pe_buy",
-)
-for _n in SLICE_10_FALLBACK_ARCHETYPES:
-    setattr(TestEngineRustPipeline, f"test_fallback__{_n}", _make_fallback_test(_n))
 
 
 if __name__ == "__main__":
