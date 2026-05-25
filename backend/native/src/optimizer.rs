@@ -33,9 +33,25 @@
 //! `services.optimizer.metrics.compute_optim_metrics`.
 
 use ahash::AHashMap;
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rayon::prelude::*;
+
+fn optim_pool() -> &'static rayon::ThreadPool {
+    static POOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
+        let n = std::env::var("RUST_SIM_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| (num_cpus::get()).min(4));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("optim rayon pool init failed")
+    });
+    &POOL
+}
 
 #[derive(Debug, Default, Clone)]
 struct TradeBatch {
@@ -287,12 +303,9 @@ pub fn batch_compute_metrics(tradesheets: &PyList) -> PyResult<PyObject> {
         let dict = obj.downcast::<PyDict>()?;
         batches.push(dict_to_batch(dict));
     }
-    // Release the GIL while rayon parallelises the CPU work.
+    // Release the GIL while rayon processes batches via the process-local pool.
     let results: Vec<ComboMetrics> = py.allow_threads(|| {
-        batches
-            .par_iter()
-            .map(compute_metrics_for_batch)
-            .collect()
+        optim_pool().install(|| batches.par_iter().map(compute_metrics_for_batch).collect())
     });
 
     let out = PyList::empty(py);

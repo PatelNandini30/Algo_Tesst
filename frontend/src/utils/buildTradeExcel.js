@@ -176,7 +176,7 @@ const getReEntryType = (trade) => {
  * @returns {Promise<Blob>}
  */
 export default async function buildTradeExcel(trades, summary, opts = {}) {
-  const { comboLabel = '', fromDate = '', toDate = '' } = opts;
+  const { comboLabel = '', fromDate = '', toDate = '', runConfig = null, comboValues = {} } = opts;
   const sourceTrades = trades || [];
 
   // ── Column detection ────────────────────────────────────────────────────────
@@ -197,11 +197,37 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const hasReEntry = sourceTrades.some(t =>
     t['ReEntryIndex'] || t['ReEntryTrigger'] || t['ReEntryMode'] || isLazyLegRow(t)
   );
+  const hasStrikeShift = sourceTrades.some(t => Boolean(t['Strike Shift Reason']));
   const hasStr          = sourceTrades.some(t => t['STR Segment']     && t['STR Segment']     !== '');
   const hasFilterSeg    = sourceTrades.some(t => t['Filter Segment'] && t['Filter Segment'] !== '');
 
   // ── Sort and group trades ──────────────────────────────────────────────────
+  // Primary sort: Entry Date so cascade re-entries (which have NEW higher
+  // trade IDs but earlier entry dates than later originals) appear right
+  // after their parent trade in chronological order.  Trade/Leg are
+  // tiebreakers so legs of the same trade stay grouped together.
+  const parseTradeDate = (raw) => {
+    if (!raw) return Infinity;
+    if (raw instanceof Date) return raw.getTime();
+    const s = String(raw).trim();
+    // Accept DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD
+    const m1 = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+    if (m1) {
+      const [, d, mo, y] = m1;
+      return Date.UTC(+y, +mo - 1, +d);
+    }
+    const m2 = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (m2) {
+      const [, y, mo, d] = m2;
+      return Date.UTC(+y, +mo - 1, +d);
+    }
+    const t = Date.parse(s);
+    return Number.isNaN(t) ? Infinity : t;
+  };
   const sortedTrades = [...sourceTrades].sort((a, b) => {
+    const dA = parseTradeDate(a['Entry Date'] || a.entry_date);
+    const dB = parseTradeDate(b['Entry Date'] || b.entry_date);
+    if (dA !== dB) return dA - dB;
     const tA = parseInt(a.Trade || a.trade || 1, 10);
     const tB = parseInt(b.Trade || b.trade || 1, 10);
     if (tA !== tB) return tA - tB;
@@ -234,8 +260,6 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       : legs.reduce((s, l) =>
           s + (parseFloat(l['CE P&L']) || 0) + (parseFloat(l['PE P&L']) || 0) + (parseFloat(l['FUT P&L']) || 0),
         0);
-    const toN        = v => (v != null && v !== '' && !isNaN(parseFloat(v))) ? parseFloat(v) : '';
-    const r          = mainRow || legs[0];
     const tradeMae   = calcTradeMae(legs);
     tm[k] = {
       net,
@@ -243,37 +267,83 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       netMae1:    tradeMae?.netMae1  ?? '',
       netMae2:    tradeMae?.netMae2  ?? '',
       finalMae:   tradeMae?.finalMae ?? '',
-      cumulative: toN(r['Cumulative']),
-      peak:       toN(r['Peak']),
-      dd:         toN(r['DD']),
-      pctDd:      toN(r['%DD']),
+      cumulative: '',
+      peak:       '',
+      dd:         '',
+      pctDd:      '',
     };
   });
 
-  // Lowest NAV and Actual Live DD
   {
-    const sortedTmKeys = Object.keys(tm).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+    // Iterate trades in CHRONOLOGICAL order (not trade_id order) so cascade
+    // re-entries — which have higher trade IDs but earlier entry dates than
+    // later originals — are processed in time sequence.  Use sortedTrades
+    // (already sorted by Entry Date earlier) and extract trade IDs in
+    // first-appearance order.
+    const _seenTm = new Set();
+    const sortedTmKeys = [];
+    sortedTrades.forEach(t => {
+      const k = String(t.Trade || t.trade || 1);
+      if (!_seenTm.has(k)) {
+        _seenTm.add(k);
+        if (tm[k]) sortedTmKeys.push(k);
+      }
+    });
+
+    // Recompute the booked equity curve exactly like the research-sheet
+    // formulas: cumulative compounds from prior visible trade rows using
+    // `% P&L`; peak is the running max; DD is blank at equity highs; %DD is
+    // the Excel ratio DD / Peak.
+    let cumulative = 100;
+    let peak = 100;
+    sortedTmKeys.forEach(k => {
+      const t = tm[k];
+      const pct = Number.isFinite(t.pct) ? t.pct : 0;
+      cumulative *= (1 + pct / 100);
+      peak = Math.max(peak, cumulative);
+      // At equity highs, drawdown is 0 (not blank).  Previously this used ''
+      // which left empty cells in the DD column for every winning streak row.
+      const dd = peak > cumulative ? cumulative - peak : 0;
+      t.cumulative = cumulative;
+      t.peak = peak;
+      t.dd = dd;
+      t.pctDd = peak !== 0 ? dd / peak : 0;
+    });
+
+    // Lowest NAV and Actual Live DD
+    // Excel formula: AS2=AN2 (first trade), AS_n=AN_(n-1)*(1+AR_n%) thereafter
     let prevCum = 100;
+    let firstTradeDone = false;
     sortedTmKeys.forEach(k => {
       const t    = tm[k];
       const mae  = (t.finalMae  !== '' && t.finalMae  != null) ? t.finalMae  : null;
       const peak = (t.peak      !== '' && t.peak      != null) ? t.peak      : null;
+      const cum  = (t.cumulative !== '' && t.cumulative != null) ? t.cumulative : null;
       if (mae != null && peak != null && peak !== 0) {
-        const lowestNav    = Math.round(prevCum * (1 + mae / 100) * 100) / 100;
-        const actualLiveDD = Math.round((lowestNav / peak - 1) * 10000) / 100;
+        // Research-team formula (matches column BE of research workbook):
+        //   Trade 1: lowestNav = cumulative
+        //   Trade N: lowestNav = prev_cumulative * (1 + Final MAE_N / 100)
+        // Store full float precision so the chain doesn't accumulate rounding
+        // error — Excel numFmt '#,##0.00' on the cell handles 2-decimal display.
+        const lowestNav = (!firstTradeDone && cum != null)
+          ? cum
+          : prevCum * (1 + mae / 100);
+        const actualLiveDD = (lowestNav / peak - 1) * 100;
         t.lowestNav    = lowestNav;
         t.actualLiveDD = actualLiveDD;
+        firstTradeDone = true;
       } else {
         t.lowestNav    = '';
         t.actualLiveDD = '';
+        firstTradeDone = true;
       }
-      if (t.cumulative !== '' && t.cumulative != null) prevCum = t.cumulative;
+      if (cum != null) prevCum = cum;
     });
   }
 
   // ── Key order ───────────────────────────────────────────────────────────────
   const keyOrder = [
-    'Trade', 'Leg', 'Index', 'Entry Date', 'Exit Date', 'DTE', 'Expiry',
+    'Trade', 'Leg', 'Index', 'Entry Date', 'Exit Date', 'Expiry',
     'Entry Spot', 'Exit Spot', 'Spot P&L', 'Spot P&L %',
     'Type', 'Strike',
     ...(hasBuffer   ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
@@ -289,14 +359,30 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     ...(hasFutures  ? ['FUT P&L'] : []),
     'Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Lowest NAV', 'Actual Live DD',
     'Exit Reason',
+    ...(hasStrikeShift ? ['Strike Shift Reason'] : []),
     ...(hasStr       ? ['STR Segment']     : []),
     ...(hasFilterSeg ? ['Filter Segment']  : []),
   ];
 
   // ── Build cleaned trade rows ────────────────────────────────────────────────
   const DATE_COLS  = new Set(['Entry Date', 'Exit Date', 'Expiry', 'Leg Exit Date', 'Lazy Entry Date', 'Lazy Exit Date']);
-  const TRUE_PCT_COLS = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %']);
+  const TRUE_PCT_COLS = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %', '%DD']);
   const MAE_COLS   = new Set(['MAE', 'MFE', 'Net MAE 1', 'Net MAE 2', 'Final MAE']);
+
+  // Build engine_tid → sequential display number (1, 2, 3, ...) based on
+  // FIRST appearance in chronological order.  This is what the "Index"
+  // column shows the user, so cascade trades (engine_tid=71+) get the
+  // correct sequential number for their chronological position
+  // (e.g. Trade=71 enters right after Trade=5, so its display Index is 6).
+  const _tidToIndexNo = {};
+  let _seqNo = 0;
+  for (const _t of sortedTrades) {
+    const _ek = String(_t.Trade || _t.trade || 1);
+    if (!(_ek in _tidToIndexNo)) {
+      _seqNo += 1;
+      _tidToIndexNo[_ek] = _seqNo;
+    }
+  }
 
   const written = new Set();
   const cleanedTrades = sortedTrades.map(trade => {
@@ -325,12 +411,13 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
         val = trade['Lazy Leg Name'] || trade[key];
       } else if (key === 'Re-Entry Type') {
         val = getReEntryType(trade);
+      } else if (key === 'Trade') {
+        // Show user-friendly sequential trade number instead of the engine's
+        // internal trade_id (which jumps to 71+ for cascade mini-trades).
+        // Same value as the "Index" column.
+        val = _tidToIndexNo[k] ?? parseInt(trade.Trade || trade.trade || 1, 10);
       } else if (key === 'Index') {
-        val = parseInt(trade.Trade || trade.trade || 1, 10);
-      } else if (key === 'DTE') {
-        const entryMs = parseDateMs(trade['Entry Date']);
-        const exitMs  = parseDateMs(trade['Exit Date']);
-        val = (entryMs != null && exitMs != null) ? Math.round((exitMs - entryMs) / 86400000) : '';
+        val = _tidToIndexNo[k] ?? parseInt(trade.Trade || trade.trade || 1, 10);
       } else if (key === 'Spot P&L %') {
         let spotPnl = trade['Spot P&L'];
         if (toNumber(spotPnl) == null) {
@@ -340,9 +427,9 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
         }
         val = pctOfBase(spotPnl, trade['Entry Spot']);
       } else if (key === 'CE P&L %') {
-        val = pctOfBase(trade['CE P&L'], trade['Exit Spot']);
+        val = pctOfBase(trade['CE P&L'], trade['Entry Spot']);
       } else if (key === 'PE P&L %') {
-        val = pctOfBase(trade['PE P&L'], trade['Exit Spot']);
+        val = pctOfBase(trade['PE P&L'], trade['Entry Spot']);
       } else {
         val = trade[key];
       }
@@ -367,7 +454,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state: 'frozen', ySplit: 1 }] });
 
   const colWidths = {
-    'Leg': 12, 'Entry Date': 13, 'Exit Date': 13, 'DTE': 8,
+    'Leg': 12, 'Entry Date': 13, 'Exit Date': 13,
     'Entry Spot': 12, 'Exit Spot': 12,
     'buffer_ref_price': 12, 'buffer_strike_offset': 10,
     'Re-Entry Type': 14,
@@ -377,7 +464,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     'Net P&L': 10, '% P&L': 8, 'Cumulative': 11, 'Peak': 10, 'DD': 9, '%DD': 8,
     'Lowest NAV': 13, 'Actual Live DD': 15,
     'Spot P&L %': 10, 'CE P&L %': 10, 'PE P&L %': 10,
-    'Exit Reason': 14, 'Expiry': 12, 'STR Segment': 14, 'Filter Segment': 22,
+    'Exit Reason': 14, 'Strike Shift Reason': 40, 'Expiry': 12, 'STR Segment': 14, 'Filter Segment': 22,
   };
 
   ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
@@ -520,8 +607,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     ? (Math.pow(_spotCumJS  / 100, 1 / _yearsJS) - 1) * 100 : 0;
   const _maxDDPctJS      = toNumber(S.max_dd_pct) ?? 0;
   const _maxDDPtsJS      = toNumber(S.max_dd_pts) ?? 0;
-  const _carMddJS        = _maxDDPctJS !== 0 ? Math.abs(_optCagrPctJS / _maxDDPctJS) : 0;
-  const _rewardJS        = _avgLossPctJS !== 0 ? Math.abs(_avgWinPctJS / _avgLossPctJS) : 0;
+  const _carMddJS        = _maxDDPctJS !== 0 ? (_optCagrPctJS / 100) / Math.abs(_maxDDPctJS) : 0;
   const _maxWinStreakJS  = toNumber(S.max_win_streak)  ?? 0;
   const _maxLossStreakJS = toNumber(S.max_loss_streak) ?? 0;
   const mddStartDate     = S.mdd_start_date || '';
@@ -532,9 +618,20 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     : (hasPuts ? _peSumJS : (hasCalls ? _ceSumJS : (hasFutures ? _futSumJS : _sumNetJS)));
   const _roiPctJS = _spotSumGatedJS !== 0 ? (_optionsSumJS / _spotSumGatedJS) * 100 : 0;
 
-  // Live DD outlier analysis (computed from tm)
+  // Live DD outlier analysis (computed from tm).  Iterate in chronological
+  // order so cascade trade IDs (which entered between earlier trade_ids) are
+  // placed in correct time sequence — same as the Live DD computation above.
   const _tradePairsDD = [];
-  Object.keys(tm).sort((a, b) => parseInt(a, 10) - parseInt(b, 10)).forEach(k => {
+  const _chronTmKeys = [];
+  const _seenChron = new Set();
+  sortedTrades.forEach(t => {
+    const k = String(t.Trade || t.trade || 1);
+    if (!_seenChron.has(k)) {
+      _seenChron.add(k);
+      if (tm[k]) _chronTmKeys.push(k);
+    }
+  });
+  _chronTmKeys.forEach(k => {
     const t = tm[k];
     const pct = (typeof t.pct === 'number' && Number.isFinite(t.pct)) ? t.pct : null;
     const ldd = (typeof t.actualLiveDD === 'number' && Number.isFinite(t.actualLiveDD)) ? t.actualLiveDD : null;
@@ -548,6 +645,11 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const _negO1 = _nTrades > 0 ? _byPctDesc[_nTrades - 1].pct : 0;
   const _negO2 = _nTrades > 1 ? _byPctDesc[_nTrades - 1].pct + _byPctDesc[_nTrades - 2].pct : _negO1;
   const _negO3 = _nTrades > 2 ? _byPctDesc[_nTrades - 1].pct + _byPctDesc[_nTrades - 2].pct + _byPctDesc[_nTrades - 3].pct : _negO2;
+
+  const _totalPctSum = _tradePairsDD.reduce((s, p) => s + p.pct, 0);
+  const _pctNoO1 = _totalPctSum - _posO1 - _negO1;
+  const _pctNoO2 = _totalPctSum - _posO2 - _negO2;
+  const _pctNoO3 = _totalPctSum - _posO3 - _negO3;
 
   const _liveDDExcStats = (excTop, excBot) => {
     const excIdx  = new Set([
@@ -565,7 +667,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const _liveDDNoO1     = _liveDDExcStats(1, 1);
   const _liveDDNoO2     = _liveDDExcStats(2, 2);
   const _liveDDNoO3     = _liveDDExcStats(3, 3);
-  const _carMddLiveJS   = _liveDDMin !== 0 ? +(_optCagrPctJS / Math.abs(_liveDDMin)).toFixed(2) : 0;
+  const _carMddLiveJS   = _liveDDMin !== 0 ? (_optCagrPctJS / 100) / Math.abs(_liveDDMin) : 0;
 
   const ws2 = wb.addWorksheet('Summary');
   ws2.columns = [
@@ -709,11 +811,11 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     ws2.getRow(row).height = 18;
   };
 
-  _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS); row++;
-  if (hasCalls)            { _addTypeRow('CE P&L',       _ceSumJS,                _cePctJS);             row++; }
-  if (hasPuts)             { _addTypeRow('PE P&L',        _peSumJS,                _pePctJS);             row++; }
-  if (hasFutures)          { _addTypeRow('FUT P&L',       _futSumJS,               null);                 row++; }
-  if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L',  _ceSumJS + _peSumJS,    _cePctJS + _pePctJS);  row++; }
+  _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS * 100); row++;
+  if (hasCalls)            { _addTypeRow('CE P&L',      _ceSumJS,               _cePctJS * 100);              row++; }
+  if (hasPuts)             { _addTypeRow('PE P&L',       _peSumJS,               _pePctJS * 100);              row++; }
+  if (hasFutures)          { _addTypeRow('FUT P&L',      _futSumJS,              null);                        row++; }
+  if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS,    (_cePctJS + _pePctJS) * 100); row++; }
   _addTypeRow('Net P&L', _sumNetJS, _sumPctJS); row++;
 
   row++;
@@ -735,8 +837,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   ws2.getRow(row).height = 18;
   row++;
 
-  kv('Return / MaxDD',  _carMddJS.toFixed(2),  row, 'A', true, _carMddJS >= 0 ? C.greenTx : C.redTx);
-  kv('Reward to Risk',  _rewardJS.toFixed(2),  row++, 'D', true);
+  kv('Return / MaxDD',  _carMddJS.toFixed(4),  row++, 'A', true, _carMddJS >= 0 ? C.greenTx : C.redTx);
 
   row++;
 
@@ -756,6 +857,21 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   for (let ci = 0; ci < mthHdr.length; ci++) {
     ws2.getColumn(ci + 1).width = ci === 0 ? 8 : ci <= 12 ? 9 : ci === 13 ? 10 : ci === 14 ? 18 : 10;
   }
+
+  const parseToYearMonth = (d) => {
+    if (!d && d !== 0) return null;
+    const s = String(d).trim();
+    if (!s) return null;
+    const parts = s.includes('/') ? s.split('/') : s.split('-');
+    if (parts.length !== 3) return null;
+    let dd2, mm2, yy2;
+    if (parts[0].length === 4) { yy2 = parts[0]; mm2 = parts[1]; dd2 = parts[2]; }
+    else                       { dd2 = parts[0]; mm2 = parts[1]; yy2 = parts[2]; }
+    const year     = String(yy2);
+    const monthIdx = parseInt(mm2, 10) - 1;
+    if (!year || !Number.isFinite(monthIdx) || monthIdx < 0 || monthIdx > 11) return null;
+    return { year, monthIdx };
+  };
 
   // Per-year max %DD (most negative running-DD value among first-leg rows in that year)
   const byYearMaxDD = {};
@@ -780,21 +896,6 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   });
   hdrRow.height = 20;
   row++;
-
-  const parseToYearMonth = (d) => {
-    if (!d && d !== 0) return null;
-    const s = String(d).trim();
-    if (!s) return null;
-    const parts = s.includes('/') ? s.split('/') : s.split('-');
-    if (parts.length !== 3) return null;
-    let dd2, mm2, yy2;
-    if (parts[0].length === 4) { yy2 = parts[0]; mm2 = parts[1]; dd2 = parts[2]; }
-    else                       { dd2 = parts[0]; mm2 = parts[1]; yy2 = parts[2]; }
-    const year     = String(yy2);
-    const monthIdx = parseInt(mm2, 10) - 1;
-    if (!year || !Number.isFinite(monthIdx) || monthIdx < 0 || monthIdx > 11) return null;
-    return { year, monthIdx };
-  };
 
   const byYM    = {};
   const byYMPct = {};
@@ -874,54 +975,189 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
 
   kv('Actual Live DD (min)', `${_liveDDMin.toFixed(2)}%`, row, 'A', false, C.redTx);
   kv('Avg Actual Live DD',   `${_liveDDAvg.toFixed(2)}%`, row++, 'D', false, C.redTx);
-  kv('CAR/MDD (Booked)',     _carMddJS.toFixed(2),         row, 'A', true,  _carMddJS    >= 0 ? C.greenTx : C.redTx);
-  kv('CAR/MDD Live',         _carMddLiveJS.toFixed(2),     row++, 'D', true, _carMddLiveJS >= 0 ? C.greenTx : C.redTx);
+  kv('CAR/MDD (Booked)',     _carMddJS.toFixed(4),         row, 'A', true,  _carMddJS    >= 0 ? C.greenTx : C.redTx);
+  kv('CAR/MDD Live',         _carMddLiveJS.toFixed(4),     row++, 'D', true, _carMddLiveJS >= 0 ? C.greenTx : C.redTx);
 
   row++;
 
-  ws2.getColumn(1).width = 28; ws2.getColumn(2).width = 22;
-  ws2.getColumn(3).width = 22; ws2.getColumn(4).width = 22; ws2.getColumn(5).width = 24;
+  // Outlier rows — exact Excel column names (Q/R/S/T, U/V/W/X, Y/Z/AA/AB)
+  kv('+ve Outlier 1',                        _fmtPct(_posO1),                  row, 'A', false, C.greenTx);
+  kv('-ve Outlier 1',                        _fmtPct(_negO1),                  row++, 'D', false, C.redTx);
+  kv('Actual Live DD Without Outlier 1',     `${_liveDDNoO1.min.toFixed(2)}%`, row, 'A', true,  C.redTx);
+  kv('Avg Actual Live DD Without Outlier 1', `${_liveDDNoO1.avg.toFixed(2)}%`, row++, 'D', true,  C.redTx);
+  kv('+ve Outlier 2',                        _fmtPct(_posO2),                  row, 'A', false, C.greenTx);
+  kv('-ve Outlier 2',                        _fmtPct(_negO2),                  row++, 'D', false, C.redTx);
+  kv('Actual Live DD Without Outlier 2',     `${_liveDDNoO2.min.toFixed(2)}%`, row, 'A', true,  C.redTx);
+  kv('Avg Actual Live DD Without Outlier 2', `${_liveDDNoO2.avg.toFixed(2)}%`, row++, 'D', true,  C.redTx);
+  kv('+ve Outlier 3',                        _fmtPct(_posO3),                  row, 'A', false, C.greenTx);
+  kv('-ve Outlier 3',                        _fmtPct(_negO3),                  row++, 'D', false, C.redTx);
+  kv('Actual Live DD Without Outlier 3',     `${_liveDDNoO3.min.toFixed(2)}%`, row, 'A', true,  C.redTx);
+  kv('Avg Actual Live DD Without Outlier 3', `${_liveDDNoO3.avg.toFixed(2)}%`, row++, 'D', true,  C.redTx);
 
-  const _oHdrs = ['Outlier Set', '+ve Outlier (% P&L)', '-ve Outlier (% P&L)', 'Actual Live DD (%)', 'Avg Actual Live DD (%)'];
-  const _oHdrRow = ws2.getRow(row);
-  _oHdrs.forEach((h, ci) => {
-    const cell = _oHdrRow.getCell(ci + 1);
-    cell.value = h;
-    cell.font  = boldFont(10, C.navyText);
-    cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
-    cell.alignment = centerAlign;
-    cell.border = thinBorder();
-  });
-  _oHdrRow.height = 20;
+  // CE + PE + P&L % Without Top N Outliers
+  // Formula: totalSum - posOutlierSum - negOutlierSum  (matches Excel C3-R3-Q3, C3-V3-U3, C3-Z3-Y3)
   row++;
-
   [
-    ['All Trades',        _fmtPct(_posO1), _fmtPct(_negO1), `${_liveDDMin.toFixed(2)}%`,      `${_liveDDAvg.toFixed(2)}%`],
-    ['Without Outlier 1', _fmtPct(_posO1), _fmtPct(_negO1), `${_liveDDNoO1.min.toFixed(2)}%`, `${_liveDDNoO1.avg.toFixed(2)}%`],
-    ['Without Outlier 2', _fmtPct(_posO2), _fmtPct(_negO2), `${_liveDDNoO2.min.toFixed(2)}%`, `${_liveDDNoO2.avg.toFixed(2)}%`],
-    ['Without Outlier 3', _fmtPct(_posO3), _fmtPct(_negO3), `${_liveDDNoO3.min.toFixed(2)}%`, `${_liveDDNoO3.avg.toFixed(2)}%`],
-  ].forEach((dataRow, ri) => {
+    ['CE + PE + P&L % Without Top 1 Outliers', _pctNoO1],
+    ['CE + PE + P&L % Without Top 2 Outliers', _pctNoO2],
+    ['CE + PE + P&L % Without Top 3 Outliers', _pctNoO3],
+  ].forEach(([label, val], ri) => {
     const r2 = ws2.getRow(row);
-    dataRow.forEach((val, ci) => {
-      const cell = r2.getCell(ci + 1);
-      cell.value = val;
-      const bg = ri % 2 === 0 ? C.white : C.altRow;
-      if (ci === 0) {
-        cell.font = boldFont(10, { argb: 'FF2C3E50' });
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.labelBg };
-      } else if (ci === 1) {
-        cell.font = boldFont(10, C.greenTx);
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri === 0 ? C.greenBg : bg };
-      } else {
-        cell.font = boldFont(10, C.redTx);
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri === 0 ? C.redBg : bg };
-      }
-      cell.alignment = centerAlign;
-      cell.border = thinBorder();
-    });
+    ws2.mergeCells(`A${row}:D${row}`);
+    const lCell = r2.getCell(1);
+    lCell.value = label;
+    lCell.font = boldFont(10, { argb: 'FF2C3E50' });
+    lCell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.labelBg : C.altRow };
+    lCell.alignment = leftAlign;
+    lCell.border = thinBorder();
+    const vCell = r2.getCell(5);
+    vCell.value = _fmtPct(val);
+    vCell.font = boldFont(10, val >= 0 ? C.greenTx : C.redTx);
+    vCell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
+    vCell.alignment = centerAlign;
+    vCell.border = thinBorder();
     r2.height = 18;
     row++;
   });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // SHEET 3 — CONFIGURATION  (optimizer run parameters + this combo's values)
+  // ════════════════════════════════════════════════════════════════════════════
+  if (runConfig) {
+    const ws3 = wb.addWorksheet('Configuration');
+    ws3.columns = [
+      { width: 32 }, { width: 18 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 18 },
+    ];
+
+    const cfg3TitleRow = (text, rowN, cols = 'A:F', bgColor = C.navyBg) => {
+      ws3.mergeCells(`A${rowN}:F${rowN}`);
+      const cell = ws3.getCell(`A${rowN}`);
+      cell.value = text;
+      cell.font  = boldFont(13, C.navyText);
+      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: bgColor };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      ws3.getRow(rowN).height = 26;
+    };
+
+    const cfg3SectionRow = (text, rowN) => {
+      ws3.mergeCells(`A${rowN}:F${rowN}`);
+      const cell = ws3.getCell(`A${rowN}`);
+      cell.value = '  ' + text;
+      cell.font  = boldFont(11, C.sectionTx);
+      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.sectionBg };
+      cell.alignment = { horizontal: 'left', vertical: 'middle' };
+      ws3.getRow(rowN).height = 20;
+    };
+
+    const cfg3KvRow = (label, value, rowN, isAlt = false, valColor = null) => {
+      ws3.mergeCells(`A${rowN}:C${rowN}`);
+      ws3.mergeCells(`D${rowN}:F${rowN}`);
+      const lCell = ws3.getCell(`A${rowN}`);
+      const vCell = ws3.getCell(`D${rowN}`);
+      lCell.value = label;
+      vCell.value = value;
+      lCell.font  = boldFont(10, { argb: 'FF2C3E50' });
+      lCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: isAlt ? C.altRow : C.labelBg };
+      lCell.alignment = { horizontal: 'left', vertical: 'middle' };
+      lCell.border = thinBorder(C.border);
+      const autoColor = valColor || { argb: 'FF1A1A2E' };
+      vCell.font  = boldFont(10, autoColor);
+      vCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: isAlt ? C.altRow : C.white };
+      vCell.alignment = { horizontal: 'left', vertical: 'middle' };
+      vCell.border = thinBorder(C.border);
+      ws3.getRow(rowN).height = 18;
+    };
+
+    let r3 = 1;
+
+    cfg3TitleRow('OPTIMIZER RUN CONFIGURATION', r3++);
+
+    // Subtitle — combo label + generated timestamp
+    ws3.mergeCells(`A${r3}:F${r3}`);
+    const sub3 = ws3.getCell(`A${r3}`);
+    const sub3Parts = [];
+    if (comboLabel) sub3Parts.push(comboLabel);
+    sub3Parts.push(`Generated: ${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`);
+    sub3.value     = sub3Parts.join('   ·   ');
+    sub3.font      = normFont(10, { argb: 'FF555555' });
+    sub3.alignment = { horizontal: 'center', vertical: 'middle' };
+    sub3.fill      = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
+    ws3.getRow(r3).height = 16;
+    r3++;
+
+    r3++; // blank
+    cfg3SectionRow('RUN SETTINGS', r3++);
+    cfg3KvRow('Search Method',    runConfig.methodLabel    || runConfig.method    || '—', r3++, false);
+    cfg3KvRow('Ranking Objective', runConfig.objectiveLabel || runConfig.objective || '—', r3++, true);
+    cfg3KvRow('Total Combinations', (runConfig.totalCombos || 0).toLocaleString(), r3++, false);
+    if (runConfig.sampleN != null) {
+      cfg3KvRow('Sample / Budget N', String(runConfig.sampleN), r3++, true);
+    }
+    if (runConfig.algorithm) {
+      cfg3KvRow('Algorithm', runConfig.algorithm.toUpperCase(), r3++, false);
+    }
+
+    // ── Parameter sweep ranges ─────────────────────────────────────────────
+    if (runConfig.paramSpecs && runConfig.paramSpecs.length > 0) {
+      r3++;
+      cfg3SectionRow('PARAMETER RANGES SWEPT', r3++);
+
+      // Header row
+      const pHdrCols = ['Parameter', 'Type', 'Min', 'Max', 'Step / Values', 'This Combo Value'];
+      const pHdr = ws3.getRow(r3);
+      pHdrCols.forEach((h, ci) => {
+        const cell = pHdr.getCell(ci + 1);
+        cell.value = h;
+        cell.font  = boldFont(10, C.navyText);
+        cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
+        cell.alignment = { horizontal: 'center', vertical: 'middle' };
+        cell.border = thinBorder();
+      });
+      pHdr.height = 20;
+      r3++;
+
+      // Normalize path for lookup in comboValues (paramSpecs use legs[0], combo uses legs.0)
+      const normPath = (p) => String(p || '').replace(/\[(\d+)\]/g, '.$1');
+
+      runConfig.paramSpecs.forEach((spec, si) => {
+        const isAlt = si % 2 !== 0;
+        const comboVal = comboValues[normPath(spec.path)] ?? comboValues[spec.path];
+        const comboValDisplay = comboVal != null ? String(comboVal) : '—';
+
+        const pRow = ws3.getRow(r3);
+        const rowData = [
+          spec.label || spec.path,
+          spec.kind === 'enum' ? 'Enum' : 'Range',
+          spec.kind === 'range' ? spec.min : '',
+          spec.kind === 'range' ? spec.max : '',
+          spec.kind === 'range'
+            ? `step ${spec.step}${spec.unit ? ' ' + spec.unit : ''}`
+            : (spec.values || []).join(', '),
+          comboValDisplay,
+        ];
+        rowData.forEach((val, ci) => {
+          const cell = pRow.getCell(ci + 1);
+          cell.value = val;
+          const bg = isAlt ? C.altRow : C.white;
+          if (ci === 0) {
+            cell.font = boldFont(10, { argb: 'FF2C3E50' });
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: isAlt ? C.altRow : C.labelBg };
+          } else if (ci === 5) {
+            // "This Combo Value" — highlight in accent
+            cell.font = boldFont(10, { argb: 'FF1E3A8A' });
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD6E4F7' } };
+          } else {
+            cell.font = normFont(10);
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: bg };
+          }
+          cell.alignment = { horizontal: ci === 0 ? 'left' : 'center', vertical: 'middle' };
+          cell.border = thinBorder(C.border);
+        });
+        pRow.height = 18;
+        r3++;
+      });
+    }
+  }
 
   // ── Serialize ──────────────────────────────────────────────────────────────
   const buf  = await wb.xlsx.writeBuffer();

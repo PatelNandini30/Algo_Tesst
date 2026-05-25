@@ -2,19 +2,22 @@
 Process-pool parallelism for the optimizer runner.
 
 Each child process:
-  1. Imports the engine and loads market data once (mmap'd Rust feather +
-     fresh DB engine — no inherited state).
-  2. Iterates its assigned combo batch.
+  1. Inherits the parent's Rust AHashMap cache via Linux copy-on-write fork.
+     Read-only pages are physically shared — no per-child reload, no memory
+     duplication.  After fork, inherited Redis/_db sockets are reset to avoid
+     cross-process socket sharing (the original forkserver deadlock source).
+  2. Iterates its assigned combo batch using the shared Rust cache.
   3. Writes per-combo results directly to Redis via result_store.
   4. Returns lightweight progress counts to the parent.
 
-We use the **spawn** start method (not fork). Fork-inheritance of the parent's
-Rust feather cache, SQLAlchemy engine, and Redis connection pool caused
-hard deadlocks after the first child's first DB query. Spawn pays a one-time
-~1s Python init cost per child but is rock-solid.
+We use the **fork** start method.  The old forkserver approach required each
+child to call load_cache_from_root() independently, rebuilding ~1680 MB of
+AHashMaps (Close/Open/High/Low × 8.4M rows).  With P=2 that is 3360 MB of
+duplicated heap memory in a 4 GB container → OOM kill (exitcode 255).
 
-The Rust feather is memory-mapped, so 4 spawn'd children all load() it and
-share the OS page cache — no extra disk I/O after the first load.
+With fork, the AHashMap pages are copy-on-write shared.  Children only
+fault-in private pages for their own working memory (~300 MB each), leaving
+~2.4 GB headroom in the 4 GB container for P=2.
 
 We deliberately do NOT pass DataFrames or large objects between processes —
 results stream to Redis, so the parent only collects `{done, failed}` ints.
@@ -76,11 +79,22 @@ def _worker_entrypoint(
     try:
         import sys
 
-        # Spawn'd children start with a near-empty sys.path. Re-add /app
-        # (or whatever directory holds backend modules).
+        # Re-add /app to sys.path in case it was dropped (harmless on fork).
         for candidate in ("/app", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))):
             if candidate and candidate not in sys.path:
                 sys.path.insert(0, candidate)
+
+        # After fork: reset inherited Redis client so each child gets its own
+        # connection.  The Rust AHashMap (read-only, CoW-inherited) is kept.
+        # Do NOT call engine.dispose() here — SQLAlchemy's pool lock may have
+        # been held by a parent thread that no longer exists in the child,
+        # causing a futex deadlock.  Children use the Rust cache exclusively
+        # (no DB queries), so the inherited DB connections are harmless.
+        try:
+            from services.optimizer import result_store as _rs_mod
+            _rs_mod._client = None  # force fresh Redis connection per child
+        except Exception:
+            pass
 
         from services.optimizer import result_store
         from services.optimizer.combo_labeler import label_combo, safe_filename
@@ -98,13 +112,20 @@ def _worker_entrypoint(
         obj = resolve_objective(objective_name)
 
         if prebuilt_feather_root:
-            # Fast path: parent pre-built the feather — just mmap it.
-            # No DB bulk-load, no 500MB peak memory per worker.
-            from services.rust_fast_path import load_cache_from_root
-            loaded = load_cache_from_root(prebuilt_feather_root)
+            # With fork, the parent's Rust AHashMap is inherited via CoW —
+            # check if it's already live before doing any disk I/O.
+            from services import rust_fast_path as _rfp
+            _cache_inherited = _rfp.is_available() and _rfp._loaded_cache_key is not None
+            if _cache_inherited:
+                loaded = True
+                logger.info("[OPTIM_PARALLEL] Rust cache inherited via fork — skipping reload")
+            else:
+                # forkserver / fresh process: mmap from disk (fallback path).
+                from services.rust_fast_path import load_cache_from_root
+                loaded = load_cache_from_root(prebuilt_feather_root)
             if not loaded:
                 logger.warning(
-                    "[OPTIM_PARALLEL] mmap of pre-built feather failed at %s — falling back to DB load",
+                    "[OPTIM_PARALLEL] cache unavailable at %s — falling back to DB load",
                     prebuilt_feather_root,
                 )
                 lean = _payload_is_rust_compatible(base_payload)
@@ -119,6 +140,12 @@ def _worker_entrypoint(
             lean = _payload_is_rust_compatible(base_payload)
             meta = _prepare_market_data(base_payload, lean=lean)
             set_rust_context(meta.get("rust_context"))
+
+        # Signal that this worker has started processing combos.
+        try:
+            result_store.update_progress(job_id, done=0, phase="running")
+        except Exception:
+            pass
 
         done = 0
         failures = 0
@@ -153,12 +180,23 @@ def _worker_entrypoint(
                 if flat_summary.get("count", 0) == 0:
                     failures += 1
                 result_store.append_result(job_id, row)
-                if not trades_df.empty:
+                result_store.increment_done(job_id)
+                _skip_ts = os.environ.get("OPTIMIZE_SKIP_TRADESHEETS", "0").strip().lower() in ("1", "true", "yes")
+                if not _skip_ts and not trades_df.empty:
                     result_store.write_combo_tradesheet(job_id, combo_label_safe, trades_df)
                 done += 1
+                logger.info(
+                    "[OPTIM] combo %d done | %s | trades=%d pnl=%.0f obj=%.4f | %.0fms",
+                    _combo_id,
+                    labels["combo_label"],
+                    int(flat_summary.get("count", 0) or 0),
+                    float(flat_summary.get("total_pnl", 0) or 0),
+                    float(row["objective_value"] or 0),
+                    elapsed_ms,
+                )
             except Exception as exc:
                 failures += 1
-                logger.warning("[OPTIM_PARALLEL] combo failed: %s", exc)
+                logger.warning("[OPTIM_PARALLEL] combo %d failed: %s", starting_combo_id + i, exc)
         return {"done": done, "failures": failures}
     except Exception as exc:
         logger.error("[OPTIM_PARALLEL] worker crashed: %s\n%s", exc, traceback.format_exc())
@@ -205,7 +243,7 @@ def run_parallel(
     # _prepare_market_data inside _worker_entrypoint.
     from billiard import get_context  # type: ignore
 
-    ctx = get_context("forkserver")
+    ctx = get_context("fork")
 
     t0 = time.perf_counter()
     pool = ctx.Pool(processes=parallelism)

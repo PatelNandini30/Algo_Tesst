@@ -483,6 +483,18 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     trades_df["Peak"] = peak
     trades_df["DD"] = dd
     trades_df["%DD"] = pdd
+
+    # Sort by Entry Date so cascade mini-trades (which have NEW higher
+    # trade_ids appended at the end by engine_rust._sa_reentry_specs) appear
+    # interleaved chronologically with the original trades.  Without this,
+    # the cascade re-entries pile up at the bottom of the tradesheet and
+    # users miss them when reading top-to-bottom.
+    if "Entry Date" in trades_df.columns and not trades_df.empty:
+        trades_df = trades_df.sort_values(
+            by=["Entry Date", "Trade", "Leg"],
+            kind="stable",
+        ).reset_index(drop=True)
+
     pivot = build_pivot(aggregated, "Exit Date")
     return (trades_df, summary, pivot)
 
@@ -621,7 +633,11 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                     _rust_active = _rf.is_available() and _rf._loaded_cache_key is not None
                 except Exception:
                     pass
-                if _rust_active or _should_build_fast_lookup(payload, effective_from, effective_to):
+                # When ENGINE_BACKEND=rust, always build/reload the Rust feather cache.
+                # If the feather was deleted (staleness check) the DB-load path has the
+                # data in memory; build_fast_lookup rebuilds the feather from that data.
+                _rust_engine_mode = os.environ.get("ENGINE_BACKEND", "python").lower() == "rust"
+                if _rust_active or _rust_engine_mode or _should_build_fast_lookup(payload, effective_from, effective_to):
                     stage_t = time.perf_counter()
                     _build_fast_lookup_from_bulk(index, effective_from, effective_to)
                     logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)

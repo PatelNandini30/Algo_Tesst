@@ -67,6 +67,29 @@ def validate_request(
         raise OptimizationError("Missing base strategy payload")
     if not param_specs:
         raise OptimizationError("No parameters selected for optimization")
+
+    # Validate that any spot_adjustment_pct values being swept are >= 0.1.
+    # A value of 0 (or near-0) means "trigger on every tick" which creates
+    # an effectively infinite cascade of bridge trades per trading day.
+    for spec in param_specs:
+        path = spec.get("path", "")
+        if "spot_adjustment_pct" in path or path == "spot_adjustment.pct":
+            from services.optimizer.param_expander import _expand_values
+            try:
+                vals = _expand_values(spec)
+            except Exception:
+                vals = []
+            for v in vals:
+                try:
+                    if float(v) < 0.1:
+                        raise OptimizationError(
+                            f"spot_adjustment_pct value {v} is too small (minimum 0.1). "
+                            "Values below 0.1% trigger on nearly every trading day and "
+                            "cause extremely long runtimes."
+                        )
+                except (TypeError, ValueError):
+                    pass
+
     grid_size = count_combinations(param_specs)
     if grid_size <= 0:
         raise OptimizationError("Empty parameter grid")
@@ -90,9 +113,6 @@ def validate_request(
     raise OptimizationError(f"Unknown method: {method!r}")
 
 
-# fixed_late_entry is accepted for backwards compat in the Python engine but
-# explicitly ignored — the chain always chains same-day (py:3747). Safe to pass
-# through to the Rust path unchanged. No top-level truthy blockers remain.
 _RUST_BLOCKING_TOP_TRUTHY: Tuple[str, ...] = ()
 
 
@@ -154,10 +174,10 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
 
     index = payload.get("index") or payload.get("symbol") or "NIFTY"
     from_date = _normalize_cache_date(
-        payload.get("from_date") or payload.get("date_from")
+        payload.get("_effective_from") or payload.get("from_date") or payload.get("date_from")
     )
     to_date = _normalize_cache_date(
-        payload.get("to_date") or payload.get("date_to")
+        payload.get("_effective_to") or payload.get("to_date") or payload.get("date_to")
     )
     logger.info("[OPTIM] _prepare_market_data: index=%r from_date=%r to_date=%r payload_keys=%s",
                 index, from_date, to_date, sorted(payload.keys()))
@@ -276,6 +296,35 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
             "spots": spots,
             "lot_size": lot_size,
         }
+        # Preload OHLC feather into memory once — eliminates ~12 s per-combo disk
+        # scan in _compute_mae_mfe_batch (pl.scan_ipc on HDD is the bottleneck).
+        try:
+            import polars as _pl
+            from services import rust_fast_path as _rf
+            _fpath = _rf._cache_root() / f"arrow-v2:bulk:{sym_upper}:full" / "options.feather"
+            if _fpath.exists():
+                _t1 = time.perf_counter()
+                _full_ohlc = _pl.read_ipc(str(_fpath))
+                # Pre-filter to strategy date range — reduces per-combo filter cost
+                # from ~15 ms (262 MB full df) to ~1 ms (date-range slice).
+                try:
+                    import pandas as _pd_dt
+                    _ohlc_from = _pd_dt.Timestamp(from_date).date()
+                    _ohlc_to = _pd_dt.Timestamp(to_date).date()
+                    ctx["rust_context"]["ohlc_df"] = _full_ohlc.filter(
+                        (_pl.col("Date") >= _ohlc_from) & (_pl.col("Date") <= _ohlc_to)
+                    )
+                    del _full_ohlc
+                except Exception as _fe:
+                    logger.warning("[OPTIM] ohlc_df date-range filter failed (%r→%r): %s", from_date, to_date, _fe)
+                    ctx["rust_context"]["ohlc_df"] = _full_ohlc
+                logger.info(
+                    "[OPTIM] preloaded OHLC feather into memory: %d rows in %.2fs",
+                    len(ctx["rust_context"]["ohlc_df"]), time.perf_counter() - _t1,
+                )
+        except Exception as _exc:
+            logger.warning("[OPTIM] OHLC feather preload skipped: %s", _exc)
+
         logger.info(
             "[OPTIM] rust_context preloaded in %.2fs (days=%d, expiries=%d, spots=%d, source=%s)",
             time.perf_counter() - t0,
@@ -309,6 +358,41 @@ def _teardown_market_data() -> None:
         bulk_clear_options()
     except Exception:
         pass
+
+
+def _warm_feather_page_cache(feather_root: str) -> None:
+    """Sequential read of all feather/arrow files in feather_root.
+
+    With fork, children inherit the parent's AHashMap via CoW and don't need
+    to read the feather at all.  This warm-up is kept as a safety net for the
+    fallback path (no pre-built cache) and ensures the feather pages are in
+    the OS page cache if a child ever needs to fall back to load_cache_from_root.
+
+    Parent reads ~575 MB sequentially in ~3-5 s on HDD; any child fallback
+    then hits RAM instead of disk.
+    """
+    import glob
+    try:
+        files = (
+            glob.glob(os.path.join(feather_root, "*.feather"))
+            + glob.glob(os.path.join(feather_root, "*.arrow"))
+        )
+        if not files:
+            return
+        t0 = time.perf_counter()
+        total_mb = 0.0
+        for fpath in files:
+            sz = os.path.getsize(fpath)
+            with open(fpath, "rb") as f:
+                while f.read(4 * 1024 * 1024):
+                    pass
+            total_mb += sz / (1024 * 1024)
+        logger.info(
+            "[OPTIM] page-cache warmed: %.1f MB in %.1fs (%d files)",
+            total_mb, time.perf_counter() - t0, len(files),
+        )
+    except Exception as exc:
+        logger.warning("[OPTIM] page-cache warm failed (non-fatal): %s", exc)
 
 
 # Per-worker Rust context cache. _prepare_market_data sets this; combos read
@@ -466,34 +550,73 @@ def _compute_mae_mfe_batch(
     except Exception:
         return df
 
-    # Build OR filter for unique (expiry, option_type, strike) combinations
+    # Build a small lookup DataFrame of the unique (expiry, option_type, strike_rounded)
+    # combinations we need, then JOIN against the date-range-filtered feather.
+    # This avoids building a Polars OR-filter tree that grows with n_unique_combos
+    # (a 750-clause OR on 3.87M rows took ~12-15 s/combo for 7-year runs).
+    # With a JOIN, the feather is filtered by date range only (cheap) and then
+    # matched via hash-join — O(n_rows) regardless of combo count.
+    import pandas as _pd3
+
     unique_combos: Dict[Tuple, None] = {}
     for r in valid_rows:
         unique_combos[(r["expiry_str"], r["opt_type"], r["strike"])] = None
 
     try:
-        import pandas as _pd3
-        f = pl.lit(False)
+        lookup_rows = []
         for (exp_str, opt, strike) in unique_combos:
             exp_dt = _pd3.Timestamp(exp_str).date()
-            f = f | (
-                (pl.col("ExpiryDate") == exp_dt)
-                & (pl.col("OptionType") == opt)
-                & ((pl.col("StrikePrice") - strike).abs() <= 0.5)
-            )
+            lookup_rows.append({
+                "ExpiryDate": exp_dt,
+                "OptionType": opt,
+                "strike_r": int(round(strike)),
+            })
+        lookup_df = pl.DataFrame(
+            lookup_rows,
+            schema={"ExpiryDate": pl.Date, "OptionType": pl.Utf8, "strike_r": pl.Int32},
+        )
+
+        date_filter = (
+            (pl.col("Symbol") == sym_upper)
+            & (pl.col("Date") >= from_dt)
+            & (pl.col("Date") <= to_dt)
+        )
+        _sel = ["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"]
+
+        # Use the preloaded in-memory DataFrame when available (avoids HDD scan).
+        _ctx = _RUST_CONTEXT
+        if _ctx is not None and "ohlc_df" not in _ctx:
+            try:
+                _days_sorted = sorted(_ctx.get("trading_days") or [])
+                if _days_sorted:
+                    import pandas as _pd_lz
+                    _lz_from = _pd_lz.Timestamp(_days_sorted[0]).date()
+                    _lz_to = _pd_lz.Timestamp(_days_sorted[-1]).date()
+                    _ctx["ohlc_df"] = pl.read_ipc(str(feather)).filter(
+                        (pl.col("Date") >= _lz_from) & (pl.col("Date") <= _lz_to)
+                    )
+                else:
+                    _ctx["ohlc_df"] = pl.read_ipc(str(feather))
+                logger.info("[OPTIM] lazily loaded OHLC feather: %d rows", len(_ctx["ohlc_df"]))
+            except Exception as _le:
+                logger.warning("[OPTIM] lazy feather load failed: %s", _le)
+
+        if _ctx and "ohlc_df" in _ctx:
+            date_filtered = _ctx["ohlc_df"].filter(date_filter).select(_sel)
+        else:
+            date_filtered = pl.scan_ipc(str(feather)).filter(date_filter).select(_sel).collect()
+
+        # Round strike to int for the join key (matches strike_r in lookup_df)
+        date_filtered = date_filtered.with_columns(
+            (pl.col("StrikePrice").round(0).cast(pl.Int32)).alias("strike_r")
+        )
         ohlc_raw = (
-            pl.scan_ipc(str(feather))
-            .filter(
-                (pl.col("Symbol") == sym_upper)
-                & (pl.col("Date") >= from_dt)
-                & (pl.col("Date") <= to_dt)
-                & f
-            )
-            .select(["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"])
-            .collect()
+            date_filtered
+            .join(lookup_df, on=["ExpiryDate", "OptionType", "strike_r"], how="inner")
+            .select(_sel)
         )
     except Exception as exc:
-        logger.debug("[OPTIM] MAE/MFE feather scan failed: %s", exc)
+        logger.debug("[OPTIM] MAE/MFE feather join failed: %s", exc)
         return df
 
     if ohlc_raw.is_empty():
@@ -586,9 +709,12 @@ def _compute_live_dd_from_mae(
 
     df = df.copy()
     prev_cum = 100.0
+    first_trade = True
     trade_lowest_nav: Dict[str, Optional[float]] = {}
 
-    # Process trades in the same sorted order used by cumulative computation
+    # Process trades in the same sorted order used by cumulative computation.
+    # Excel formula: AS2 = AN2 (first trade lowestNav = its own cumulative)
+    #                AS_n = AN_(n-1) * (1 + AR_n/100) for all subsequent trades
     for _, agg_row in aggregated.iterrows():
         tid = str(agg_row.get("Trade") or "")
         if not tid:
@@ -597,9 +723,13 @@ def _compute_live_dd_from_mae(
         final_mae = _calc_final_mae_for_trade(trade_legs) if not trade_legs.empty else None
         cum = agg_row.get("Cumulative")
         if final_mae is not None:
-            trade_lowest_nav[tid] = round(prev_cum * (1.0 + float(final_mae) / 100.0) * 100) / 100
+            if first_trade and cum is not None:
+                trade_lowest_nav[tid] = round(float(cum) * 100) / 100
+            else:
+                trade_lowest_nav[tid] = round(prev_cum * (1.0 + float(final_mae) / 100.0) * 100) / 100
         else:
             trade_lowest_nav[tid] = None
+        first_trade = False
         if cum is not None:
             try:
                 prev_cum = float(cum)
@@ -633,6 +763,12 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
     ctx = _RUST_CONTEXT
     if ctx is None:
         return None
+
+    # Note: T-0 entry (entry_dte=0) is now handled correctly in Rust via
+    # the settlement-price post-processing in run_rust_engine_pipeline —
+    # when entry_date == exit_date == expiry_date the exit_price is replaced
+    # with NSE intrinsic settlement (max(0,spot-strike) for CE). No fallback needed.
+
     try:
         import pandas as pd
         from base import compute_analytics
@@ -660,6 +796,60 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c], errors="coerce")
 
+        # ── Bridge-trade split ────────────────────────────────────────────────
+        # Bridge sub-trades (spot-adj re-entry cycles within the same trade
+        # window) share the parent's trade_id in the Rust priced rows.  Rust
+        # puts aggregate net_pnl only in the first row for each trade_id, so
+        # child rows show 0 / blank for Net P&L, Cumulative, Peak, DD, etc.
+        # Fix: give each bridge cycle its own unique trade_id so it appears as
+        # an independent trade — matching the regular Python backtest tradesheet.
+        #
+        # Two rows are part of the SAME trade (multi-leg) when they share both
+        # trade_id AND entry_date.  Different entry_date → different time window
+        # → bridge sub-trade → gets a new trade_id.
+        if not df.empty:
+            # Use (orig_trade_id, entry_date) as the dedup key so that ALL legs
+            # within the same bridge cycle (same entry date) get the SAME new
+            # trade_id.  The first entry_date seen for a given orig_trade_id is
+            # the "parent" cycle and keeps the original ID; subsequent distinct
+            # entry_dates are bridge cycles and each gets a fresh ID.
+            _orig_entry: dict = {}   # orig_trade_id → first entry_date seen
+            _key_to_tid: dict = {}   # (orig_trade_id, entry_date) → assigned trade_id
+            _next_btid = (
+                max((int(str(r.get("trade_id") or 0)) for r in priced), default=0) + 10000
+            )
+            _new_tids: list = []
+            try:
+                _ed_strs = df["Entry Date"].dt.strftime("%Y-%m-%d").fillna("").tolist()
+            except AttributeError:
+                _ed_strs = (
+                    pd.to_datetime(df["Entry Date"], errors="coerce")
+                    .dt.strftime("%Y-%m-%d").fillna("").tolist()
+                )
+            for _tid_raw, _ed in zip(df["Trade"].astype(str).tolist(), _ed_strs):
+                if _tid_raw not in _orig_entry:
+                    _orig_entry[_tid_raw] = _ed
+                key = (_tid_raw, _ed)
+                if key not in _key_to_tid:
+                    if _ed == _orig_entry[_tid_raw]:
+                        _key_to_tid[key] = _tid_raw   # original cycle → keep ID
+                    else:
+                        _key_to_tid[key] = str(_next_btid)  # bridge cycle → new ID
+                        _next_btid += 1
+                _new_tids.append(_key_to_tid[key])
+            df = df.copy()
+            df["Trade"] = _new_tids
+
+        # Recompute Net P&L and % P&L from per-leg values.
+        # Rust puts aggregate net_pnl in the parent row only; after splitting
+        # bridge sub-trades into their own trade_ids each needs P&L from its
+        # own CE/PE/FUT legs (already correct per priced_to_tradesheet_records).
+        # Net P&L and % P&L are computed at TRADE level (sum of all legs) and
+        # propagated to the first leg row only — matching the Python engine's
+        # tradesheet format. Per-leg values in CE P&L / PE P&L stay intact.
+        # (The trade-level aggregation happens in the groupby below; we just
+        # need the per-leg CE/PE values to be present for that sum to work.)
+
         # Mirror Python engine's per-trade aggregation + DD-MM date quirk so
         # CAGR/CAR-MDD match exactly. See services/algotest_job._try_rust_engine.
         aggregated = df.groupby("Trade", as_index=False).agg({
@@ -673,7 +863,7 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             "FUT P&L": "sum",
             "Exit Reason": "first",
         })
-        aggregated["Net P&L"] = aggregated["CE P&L"] + aggregated["PE P&L"] + aggregated["FUT P&L"]
+        aggregated["Net P&L"] = (aggregated["CE P&L"] + aggregated["PE P&L"] + aggregated["FUT P&L"]).round(4)
         es_series = aggregated["Entry Spot"].replace(0, float("nan"))
         aggregated["% P&L"] = (aggregated["Net P&L"] / es_series * 100.0).round(2).fillna(0)
 
@@ -709,22 +899,34 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         # Python convention: only the parent leg row of each trade carries these
         # values; extra leg rows get None. This matches the backtest tradesheet
         # format so exported CSVs look identical to regular backtest downloads.
+        # Build a lookup: trade_id → trade-level aggregated values.
+        # Net P&L on the first leg = CE+PE+FUT sum (trade total).
+        # % P&L on the first leg   = (trade_net_pnl / entry_spot) * 100.
+        # Subsequent legs get their own per-leg Net P&L and % P&L.
+        # Cumulative/Peak/DD/%DD are first-leg only, null on others.
+        # This mirrors generic_algotest_engine.py:5385-5426 exactly.
         trade_to_analytics = {
             str(r["Trade"]): {
                 "Cumulative": r.get("Cumulative"),
-                "Peak": r.get("Peak"),
-                "DD": r.get("DD"),
-                "%DD": r.get("%DD"),
+                "Peak":       r.get("Peak"),
+                "DD":         r.get("DD"),
+                "%DD":        r.get("%DD"),
+                "Net P&L":    r.get("Net P&L"),
+                "% P&L":      r.get("% P&L"),
             }
             for _, r in aggregated.iterrows()
         }
+        # Net P&L and % P&L (combined totals) shown on first leg only — null on
+        # subsequent legs — so summing the column gives per-trade counts, not
+        # inflated double-counts. Cumulative/Peak/DD/%DD follow the same rule.
         parent_seen: set = set()
-        c_vals, pk_vals, dd_vals, pdd_vals = [], [], [], []
+        c_vals, pk_vals, dd_vals, pdd_vals, net_vals, pct_vals = [], [], [], [], [], []
         for _, row in df.iterrows():
             tid = str(row["Trade"])
             if tid in parent_seen:
                 c_vals.append(None); pk_vals.append(None)
                 dd_vals.append(None); pdd_vals.append(None)
+                net_vals.append(None); pct_vals.append(None)
                 continue
             parent_seen.add(tid)
             v = trade_to_analytics.get(tid, {})
@@ -732,19 +934,35 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             pk_vals.append(v.get("Peak"))
             dd_vals.append(v.get("DD"))
             pdd_vals.append(v.get("%DD"))
+            net_vals.append(v.get("Net P&L"))
+            pct_vals.append(v.get("% P&L"))
         df["Cumulative"] = c_vals
-        df["Peak"] = pk_vals
-        df["DD"] = dd_vals
-        df["%DD"] = pdd_vals
+        df["Peak"]       = pk_vals
+        df["DD"]         = dd_vals
+        df["%DD"]        = pdd_vals
+        df["Net P&L"]    = net_vals
+        df["% P&L"]      = pct_vals
 
-        # Compute MAE/MFE from the Arrow feather (ONE scan for all legs).
-        # Entry/Exit Date are still Timestamps here — good for the window computation.
-        _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
-        df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
+        # MAE/MFE and Live DD: skip during batch optimizer runs (OPTIMIZE_SKIP_MAE_MFE=1).
+        # Saves ~1.5s/combo by skipping the per-combo Polars feather scan.
+        # Live DD metrics fall back to booked %DD — accurate enough for ranking.
+        # Full MAE/MFE is only needed for tradesheet downloads.
+        _skip_mae = os.environ.get("OPTIMIZE_SKIP_MAE_MFE", "0").strip().lower() in ("1", "true", "yes")
+        if not _skip_mae:
+            _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
+            df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
+            df = _compute_live_dd_from_mae(df, aggregated)
 
-        # Compute 'Lowest NAV During Trade' from Final MAE (for backend metrics).
-        # Uses the sorted aggregated df so prevCum tracks correctly.
-        df = _compute_live_dd_from_mae(df, aggregated)
+        # Sort by Entry Date so cascade mini-trades (which get NEW trade_ids
+        # appended at the end by engine_rust._sa_reentry_specs) interleave
+        # chronologically with the original trades — the tradesheet reads in
+        # natural order: orig trade → its cascade re-entries → next orig trade.
+        # Preserve leg order within a trade by using stable sort on (Entry Date, Trade, Leg).
+        if "Entry Date" in df.columns and not df.empty:
+            df = df.sort_values(
+                by=["Entry Date", "Trade", "Leg"],
+                kind="stable",
+            ).reset_index(drop=True)
 
         # Format dates as DD-MM-YYYY strings to match backtest tradesheet output.
         for c in ("Entry Date", "Exit Date", "Leg Exit Date"):
@@ -753,7 +971,8 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
 
         return df, summary
     except Exception as exc:
-        logger.debug("[OPTIM] rust fast path failed (%s) — falling back", exc)
+        logger.info("[OPTIM] rust fast path failed (%s) — falling back to Python\n%s",
+                    exc, traceback.format_exc())
         return None
 
 
@@ -774,10 +993,31 @@ def _run_single_backtest(payload: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[st
     # Python fallback — original path. Required when the payload uses a
     # feature the Rust slices don't yet cover (rollover, futures, lazy legs,
     # buffer strike, etc.).
+    import copy
     from engines.generic_algotest_engine import run_algotest_backtest
 
+    py_payload = payload
+
+    # entry_dte=0 with WEEKLY/MONTHLY expiry: Python engine skips these trades
+    # because entry_date == exit_date == expiry_day → 0 P&L.  The only valid
+    # real-world interpretation of T-0 is NEXT_WEEKLY/NEXT_MONTHLY (sell the
+    # *next* contract on the current expiry day, hold until the next expiry).
+    # Patch the payload so the Python engine produces the expected result.
+    #
+    # IMPORTANT: Do NOT apply this patch for filter_entry_mode='fixed'. The Python
+    # engine's fixed-entry while-loop already advances target_expiry when
+    # exit_date==entry_date (T-0/T-0 case), so no patch is needed. Worse, patching
+    # to NEXT_WEEKLY changes _rollover_mode = rollover_toggle and _etype in
+    # ('WEEKLY','MONTHLY') → False, silently dropping all same-day re-entry chains.
+    _entry_dte = int(payload.get("entry_dte") or 0)
+    _expiry = str(payload.get("expiry_type") or "WEEKLY").upper()
+    _filter_mode = str(payload.get("filter_entry_mode") or "dte").lower()
+    if _entry_dte == 0 and _expiry in ("WEEKLY", "MONTHLY") and _filter_mode != "fixed":
+        py_payload = copy.deepcopy(payload)
+        py_payload["expiry_type"] = "NEXT_" + _expiry  # WEEKLY→NEXT_WEEKLY, MONTHLY→NEXT_MONTHLY
+
     try:
-        df, engine_summary, _engine_pivot = run_algotest_backtest(payload)
+        df, engine_summary, _engine_pivot = run_algotest_backtest(py_payload)
     except Exception as exc:
         logger.warning("[OPTIM] engine failed for combo: %s", exc)
         return pd.DataFrame(), {}
@@ -828,6 +1068,17 @@ def run_optimization(
         extra={"sample_n": sample_n, "algorithm": algorithm},
     )
 
+    result_store.write_run_config(
+        job_id,
+        method=method,
+        objective=obj.name,
+        param_specs=list(param_specs),
+        base_payload=base_payload,
+        sample_n=sample_n,
+        algorithm=algorithm,
+        total_combos=total,
+    )
+
     # ── Parallel fast-path ──────────────────────────────────────────────────
     # Smart sampling needs the in-loop tell() feedback, so we always run it
     # sequentially. Exhaustive and Random are pure producers — safe to fan out.
@@ -860,6 +1111,12 @@ def run_optimization(
             _teardown_market_data()  # clear parent's Python dicts after feather is built
             if feather_root:
                 logger.info("[OPTIM] feather pre-built at %s — workers will mmap", feather_root)
+                # Pre-warm feather into the OS page cache before spawning workers.
+                # Each forkserver worker mmap-loads the feather independently; without
+                # this the first combo per worker triggers a cold 275 MB HDD read (~29 s).
+                # One sequential parent read here (~3-5 s) fills the page cache so
+                # all workers' first access is a RAM cache hit.
+                _warm_feather_page_cache(feather_root)
             else:
                 logger.warning("[OPTIM] feather_root not available — workers will each bulk-load")
 
@@ -877,6 +1134,11 @@ def run_optimization(
             for c in combos:
                 c.pop("__optim_callback__", None)
 
+            # Strip ohlc_df before pickling for workers — it's 275 MB and would
+            # be serialized once per worker process. Workers lazy-load from the
+            # mmap'd feather instead (OS page-cache shared, effectively zero cost).
+            _worker_ctx = {k: v for k, v in (prebuilt_rust_context or {}).items()
+                           if k != "ohlc_df"}
             agg = run_parallel(
                 job_id=job_id,
                 base_payload=base_payload,
@@ -887,11 +1149,20 @@ def run_optimization(
                     job_id, done=done, total=total
                 ),
                 prebuilt_feather_root=feather_root,
-                prebuilt_rust_context=prebuilt_rust_context,
+                prebuilt_rust_context=_worker_ctx,
             )
             spill_path = result_store.maybe_spill_to_parquet(job_id)
+            result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
             result_store.update_progress(job_id, done=agg["done"], total=total)
             result_store.mark_complete(job_id)
+            logger.info(
+                "[OPTIM] COMPLETE job=%s | %d/%d combos done | %d failures | P=%d",
+                job_id[:8],
+                agg["done"],
+                total,
+                agg.get("failures", 0),
+                parallelism,
+            )
             return {
                 "status": "success",
                 "total": agg["done"],
@@ -993,12 +1264,18 @@ def run_optimization(
 
         result_store.update_progress(job_id, done=done)
         result_store.mark_complete(job_id)
+        # Strip non-JSON-serializable objects (Polars DataFrame) before Celery
+        # serializes the task result.
+        _rc = {k: v for k, v in (market_meta.get("rust_context") or {}).items()
+               if k != "ohlc_df"}
+        _safe_meta = {**{k: v for k, v in market_meta.items() if k != "rust_context"},
+                      "rust_context": _rc}
         return {
             "status": "success",
             "total": done,
             "failures": failures,
             "parquet_path": spill_path,
-            "market_meta": market_meta,
+            "market_meta": _safe_meta,
         }
     except Exception as exc:
         msg = f"runner crashed: {exc}"

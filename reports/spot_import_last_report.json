@@ -1,5 +1,5 @@
 {
-  "started_at": "2026-04-27T09:42:16.492119",
+  "started_at": "2026-05-22T07:08:33.372739",
   "files": [
     {
       "file": "/home/user/Algo_Test_Software/strikeData/DailyNCAXISBANK.csv",
@@ -114,12 +114,14 @@
     {
       "file": "/home/user/Algo_Test_Software/strikeData/Nifty 50_strike_data.csv",
       "table": "spot_data",
-      "status": "completed",
-      "errors": [],
+      "status": "failed",
+      "errors": [
+        "deadlock detected\nDETAIL:  Process 10502 waits for ShareLock on transaction 24837; blocked by process 10503.\nProcess 10503 waits for ShareLock on transaction 24834; blocked by process 10502.\nHINT:  See server log for query details.\nCONTEXT:  while inserting index tuple (412,6) in relation \"spot_data\"\n"
+      ],
       "rows_read": 87033,
       "rows_skipped": 0,
       "rows_valid": 87033,
-      "rows_inserted": 87033,
+      "rows_inserted": 0,
       "rows_updated": 0
     },
     {
@@ -160,12 +162,12 @@
       "table": "spot_data",
       "status": "completed",
       "errors": [],
-      "rows_read": 4483,
+      "rows_read": 6084,
       "rows_skipped": 0,
-      "rows_valid": 4483,
-      "rows_inserted": 4483,
+      "rows_valid": 6084,
+      "rows_inserted": 6084,
       "rows_updated": 0
     }
   ],
-  "finished_at": "2026-04-27T09:42:16.492151"
+  "finished_at": "2026-05-22T07:08:33.372770"
 }

@@ -151,12 +151,21 @@ class MarketDataRepository:
         date_col = self._pick(cols, "trade_date", "date")
         high_col = self._pick_any(cols, ["high_price", "high"], None)
         low_col = self._pick_any(cols, ["low_price", "low"], None)
+        close_col = self._pick(cols, "close_price", "close")
         if high_col is None or low_col is None:
             return None
         expiry_col = self._pick(cols, "expiry_date", "expiry")
+        # Per-VALUE settled-price substitution: replace ONLY the zero side.
+        # When high > 0, use it as-is (pre-existing behavior). When high == 0,
+        # substitute settled_price (or close as last resort). Same rule applied
+        # independently to low. Matches the Rust feather's get_ohlc_range logic.
         q = text(
             f"""
-            SELECT MAX({high_col}) AS max_high, MIN({low_col}) AS min_low
+            SELECT
+                MAX(CASE WHEN {high_col} > 0 THEN {high_col}
+                         ELSE COALESCE(settled_price, {close_col}) END) AS max_high,
+                MIN(CASE WHEN {low_col} > 0 THEN {low_col}
+                         ELSE COALESCE(settled_price, {close_col}) END) AS min_low
             FROM option_data
             WHERE symbol = :symbol
               AND {date_col} >= :from_date
@@ -414,6 +423,7 @@ class MarketDataRepository:
                 {high_col} AS "High",
                 {low_col} AS "Low",
                 {close_col} AS "Close",
+                COALESCE(contracts, 0) AS "Contracts",
                 {date_col} AS "Date"
             FROM option_data
             WHERE {date_col} >= :from_date
@@ -503,7 +513,9 @@ class MarketDataRepository:
                 {open_col}      AS "Open",
                 {high_col}      AS "High",
                 {low_col}       AS "Low",
-                {close_col}     AS "Close"
+                {close_col}     AS "Close",
+                COALESCE(contracts, 0) AS "Contracts",
+                COALESCE(settled_price, {close_col}) AS "SettledPrice"
             FROM option_data
             WHERE symbol      = :symbol
               AND {date_col}  >= :from_date

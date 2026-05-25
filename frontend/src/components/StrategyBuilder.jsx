@@ -740,6 +740,11 @@ const StrategyBuilder = () => {
   const [rolloverMinDaysToExpiry, setRolloverMinDaysToExpiry] = useState(0);
   const [noRollover, setNoRollover] = useState(false);
   const [noRolloverMinDays, setNoRolloverMinDays] = useState(0);
+  // Strike-shift fallback: when the requested strike has no contract or zero
+  // turnover (stale price), shift this many strike intervals further from ATM
+  // in the originally-requested direction.  0 = no shift (drop trade if
+  // untradeable), 1 = try one step (default), 2+ = more aggressive.
+  const [strikeShiftMaxSteps, setStrikeShiftMaxSteps] = useState(1);
   const [entryDaysBefore, setEntryDaysBefore] = useState(2);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
   const [delayTime, setDelayTime] = useState('09:15');
@@ -899,7 +904,15 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [intradayEntryTime, setIntradayEntryTime] = useState('09:20');
   // Optimization panel state
   const [optimPanelOpen, setOptimPanelOpen] = useState(false);
-  const [optimJob, setOptimJob] = useState(null); // { jobId, totalCombos, objective }
+  const [optimJob, setOptimJob] = useState(null); // { jobId, totalCombos, objective, runConfig }
+  // Lifted optimizer panel state — survives panel close/reopen
+  const [optimChecked, setOptimChecked] = useState({});
+  const [optimSavedValues, setOptimSavedValues] = useState({});
+  const [optimMethod, setOptimMethod] = useState('exhaustive');
+  const [optimSampleN, setOptimSampleN] = useState(200);
+  const [optimAlgorithm, setOptimAlgorithm] = useState('cma-es');
+  const [optimObjective, setOptimObjective] = useState('total_pnl');
+  const [optimParallelism, setOptimParallelism] = useState(null);
   const [intradaySquareOffTime, setIntradaySquareOffTime] = useState('15:15');
   const [slowPath, setSlowPath] = useState(false);
 
@@ -1809,6 +1822,10 @@ const [slippagePct, setSlippagePct] = useState(0);
       buffer_strike_enabled: Boolean(bufferStrikeEnabled),
       buffer_strike_value: Number(bufferStrikeValue) || 0,
       buffer_strike_unit: String(bufferStrikeUnit || 'percent'),
+      // Strike-shift fallback steps: when the requested strike has no contract
+      // (or zero turnover/stale close), shift this many intervals further from
+      // ATM in the originally-requested direction.
+      strike_shift_max_steps: Number(strikeShiftMaxSteps) || 0,
       buffer_strike_apply_to: String(bufferStrikeApplyTo || 'both'),
       buffer_position_above: Boolean(bufferPositionAbove),
       buffer_position_below: Boolean(bufferPositionBelow),
@@ -2611,6 +2628,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                     </div>
                   )}
                 </div>
+                {/* Strike Shift on Missing Contract control removed —
+                    engine now always walks TOWARD ATM for zero-turnover
+                    strikes and surfaces the reason in the tradesheet column. */}
                 <div>
                   <label className="field-label">Slippage %</label>
                   <div className="flex items-center gap-2">
@@ -3969,6 +3989,13 @@ const [slippagePct, setSlippagePct] = useState(0);
             onClose={() => setOptimPanelOpen(false)}
             basePayload={buildPayload()}
             nLegs={legs.length}
+            checked={optimChecked} setChecked={setOptimChecked}
+            savedValues={optimSavedValues} setSavedValues={setOptimSavedValues}
+            method={optimMethod} setMethod={setOptimMethod}
+            sampleN={optimSampleN} setSampleN={setOptimSampleN}
+            algorithm={optimAlgorithm} setAlgorithm={setOptimAlgorithm}
+            objective={optimObjective} setObjective={setOptimObjective}
+            parallelism={optimParallelism} setParallelism={setOptimParallelism}
             onJobQueued={(info) => {
               setOptimJob(info);
               setOptimPanelOpen(false);
@@ -3980,6 +4007,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             jobId={optimJob.jobId}
             totalCombos={optimJob.totalCombos}
             objective={optimJob.objective}
+            runConfig={optimJob.runConfig}
             onClose={() => setOptimJob(null)}
             onApplyCombo={(combo) => {
               // Best-effort: surface the combo as a JSON note in the status

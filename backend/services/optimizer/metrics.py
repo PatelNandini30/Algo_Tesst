@@ -142,46 +142,94 @@ def car_mdd_live(summary: Dict[str, Any], live_dd_max: float) -> float:
 def _recompute_live_dd_after_dropping(trades: pd.DataFrame, drop_n: int) -> Dict[str, float]:
     """
     Drop the top-`drop_n` outlier trades (by absolute Net P&L %), rebuild the
-    cumulative NAV curve from scratch, and return the new Actual Live DD.
+    live NAV series, and return the new Actual Live DD.
 
-    Outlier definition: trades with the largest |Net P&L %|. If `Net P&L %`
-    is absent, fall back to |Net P&L|.
+    Uses Lowest NAV During Trade (MAE-based) when available — same methodology
+    as actual_live_dd() so the outlier-stripped values are comparable.  Falls
+    back to the booked cumulative approach when MAE data is absent.
+
+    Outlier definition: trades with the largest |% P&L| (or |Net P&L|).
     """
     if trades is None or trades.empty or drop_n <= 0:
         return {"max": 0.0, "avg": 0.0}
 
-    df = trades.copy()
-    rank_col = None
-    if "Net P&L %" in df.columns:
-        rank_col = pd.to_numeric(df["Net P&L %"], errors="coerce").fillna(0)
-    elif "Net P&L" in df.columns:
-        rank_col = pd.to_numeric(df["Net P&L"], errors="coerce").fillna(0)
-    elif "% P&L" in df.columns:
-        rank_col = pd.to_numeric(df["% P&L"], errors="coerce").fillna(0)
+    # Extract one parent row per trade (first row per Trade ID, sorted by Entry Date).
+    df_all = trades.copy()
+    if "Entry Date" in df_all.columns:
+        df_all = df_all.sort_values("Entry Date", na_position="last")
+    seen: set = set()
+    parent_idx = []
+    for idx, row in df_all.iterrows():
+        tid = str(row.get("Trade", ""))
+        if tid not in seen:
+            seen.add(tid)
+            parent_idx.append(idx)
+    df = df_all.loc[parent_idx].copy()
+
+    if df.empty:
+        return {"max": 0.0, "avg": 0.0}
+
+    # Rank column for outlier identification.
+    for _rcol in ("% P&L", "Net P&L %", "Net P&L"):
+        if _rcol in df.columns:
+            rank_series = pd.to_numeric(df[_rcol], errors="coerce").fillna(0)
+            break
     else:
         return {"max": 0.0, "avg": 0.0}
 
-    df["__rank__"] = rank_col.abs()
+    df = df.copy()
+    df["__rank__"] = rank_series.abs().values
     df = df.sort_values("__rank__", ascending=False).iloc[drop_n:].copy()
     df = df.drop(columns="__rank__")
     if df.empty:
         return {"max": 0.0, "avg": 0.0}
 
-    pnl_pct = (
-        pd.to_numeric(df["Net P&L %"], errors="coerce").fillna(0)
-        if "Net P&L %" in df.columns
-        else pd.to_numeric(df.get("% P&L", 0), errors="coerce").fillna(0)
-    )
-    cum_index = 100.0
+    # Re-sort chronologically for correct NAV accumulation.
+    if "Entry Date" in df.columns:
+        df = df.sort_values("Entry Date", na_position="last").reset_index(drop=True)
+
+    # Determine P&L% column.
+    pct_col = "% P&L" if "% P&L" in df.columns else ("Net P&L %" if "Net P&L %" in df.columns else None)
+
+    has_lnav = "Lowest NAV During Trade" in df.columns
+    has_cum = "Cumulative" in df.columns
+
+    cum_idx = 100.0
     peak = 100.0
-    lows_per_trade = []
-    for v in pnl_pct:
-        cum_index = cum_index * (1 + v / 100.0)
-        peak = max(peak, cum_index)
-        lows_per_trade.append(cum_index - peak)
-    if not lows_per_trade:
+    live_dd_list = []
+
+    for _, r in df.iterrows():
+        pct = float(pd.to_numeric(r.get(pct_col, 0) if pct_col else 0, errors="coerce") or 0)
+
+        if has_lnav and has_cum:
+            # Derive the Final MAE ratio from the stored Lowest NAV During Trade.
+            # Lowest NAV was stored as prev_cum * (1 + final_mae/100), so
+            # final_mae/100 = lnav / prev_cum - 1, independent of absolute NAV level.
+            lnav_orig = r.get("Lowest NAV During Trade")
+            cum_orig = r.get("Cumulative")
+            if (
+                lnav_orig is not None and not pd.isna(lnav_orig)
+                and cum_orig is not None and not pd.isna(cum_orig)
+            ):
+                denom = 1.0 + pct / 100.0
+                orig_prev_cum = float(cum_orig) / denom if denom != 0 else 100.0
+                if orig_prev_cum > 0:
+                    final_mae_ratio = float(lnav_orig) / orig_prev_cum - 1.0
+                    lowest_nav = cum_idx * (1.0 + final_mae_ratio)
+                else:
+                    lowest_nav = cum_idx * (1.0 + pct / 100.0)
+            else:
+                lowest_nav = cum_idx * (1.0 + pct / 100.0)
+        else:
+            lowest_nav = cum_idx * (1.0 + pct / 100.0)
+
+        cum_idx = cum_idx * (1.0 + pct / 100.0)
+        peak = max(peak, cum_idx)
+        live_dd_list.append(lowest_nav - peak)
+
+    if not live_dd_list:
         return {"max": 0.0, "avg": 0.0}
-    arr = np.array(lows_per_trade, dtype=float)
+    arr = np.array(live_dd_list, dtype=float)
     return {"max": round(float(arr.min()), 4), "avg": round(float(arr.mean()), 4)}
 
 

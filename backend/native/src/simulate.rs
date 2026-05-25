@@ -62,10 +62,10 @@
 
 use std::collections::HashMap;
 
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rayon::prelude::*;
-
 use crate::{
     apply_slippage, lookup_option_high, lookup_option_low, lookup_option_open,
     lookup_option_price, lookup_spot_price, lookup_strikes_for_date, round2,
@@ -205,7 +205,14 @@ fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
         }
         "pct_of_atm" => Some(StrikeSel::PctOfAtm {
             value: read_f64("value").unwrap_or(0.0),
-            direction: read_str("direction").unwrap_or_else(|| "OTM".to_string()),
+            // Default direction is empty (sign convention).  Previously this
+            // defaulted to "OTM" which discards the sign of `value` and always
+            // places strikes above spot for CE (or below for PE), making the
+            // negative half of an optimizer sweep collapse onto the positive
+            // half.  Empty direction lets the signed-offset branch run so
+            // negative values produce ITM strikes for CE / OTM for PE, and
+            // positive values produce the opposite — matching trader intent.
+            direction: read_str("direction").unwrap_or_default(),
         }),
         "atm_straddle_prem_pct" => {
             Some(StrikeSel::AtmStraddlePremPct(read_f64("value").unwrap_or(0.0)))
@@ -240,28 +247,12 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
         // SL / Target / Trail SL are slice 4 — Python wrapper calls the
         // existing check_leg_stop_loss_target. SL-with-Buffer is slice 4b —
         // Python wrapper calls apply_sl_with_buffer_batch in this module.
-        let blockers = [
-            "simpleMomentum",
-            "rollover_strike_mode",
-        ];
-        for key in blockers {
-            if let Ok(Some(v)) = leg.get_item(key) {
-                // Treat as set only if the dict has a non-null "mode" or "value".
-                if let Ok(d) = v.downcast::<PyDict>() {
-                    let has_mode = d.get_item("mode").ok().flatten().is_some();
-                    let has_value = d.get_item("value").ok().flatten().is_some();
-                    if has_mode || has_value {
-                        return Ok((vec![], Some(UnsupportedReason(format!(
-                            "leg has '{}' set — Rust slice 2 does not yet handle it", key
-                        )))));
-                    }
-                }
-            }
-        }
+        // simpleMomentum: not implemented in any engine (Python or Rust) — ignore safely.
+        // rollover_strike_mode='fixed': handled by _apply_fixed_rollover_strike (Slice 9b) — no blocker.
 
-        // Slice 6: re-entry. RE_ASAP mode is orchestrated in Python (engine_rust.py)
-        // using Rust for the inner pricing + SL check calls. Reject any other mode
-        // (RE_MOMENTUM, _REV variants) since the orchestrator doesn't handle them yet.
+        // Slice 6: re-entry. RE_ASAP and RE_ASAP_REV modes are orchestrated in
+        // Python (engine_rust.py) using Rust for the inner pricing + SL check calls.
+        // Reject any other mode (RE_MOMENTUM, etc.) — the orchestrator doesn't handle them.
         for key in ["reEntryOnSL", "reEntryOnTarget"] {
             if let Ok(Some(v)) = leg.get_item(key) {
                 if let Ok(d) = v.downcast::<PyDict>() {
@@ -269,19 +260,21 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
                         .and_then(|m| m.extract::<String>().ok())
                         .unwrap_or_default()
                         .to_uppercase();
-                    if !mode_str.is_empty() && mode_str != "RE_ASAP" {
+                    // RE_ASAP, RE_ASAP_REV, LAZY_LEG, RE_MOMENTUM, and RE_MOMENTUM_REV
+                    // are all handled by the Python orchestrator in engine_rust.py.
+                    // Rust only builds the base schedule; re-entry is post-processing.
+                    if !mode_str.is_empty()
+                        && mode_str != "RE_ASAP"
+                        && mode_str != "RE_ASAP_REV"
+                        && mode_str != "LAZY_LEG"
+                        && mode_str != "RE_MOMENTUM"
+                        && mode_str != "RE_MOMENTUM_REV"
+                    {
                         return Ok((vec![], Some(UnsupportedReason(format!(
-                            "leg has '{}' with mode '{}' — only RE_ASAP supported in Rust path", key, mode_str
+                            "leg has '{}' with mode '{}' — unsupported re-entry mode in Rust path", key, mode_str
                         )))));
                     }
-                    // lazy leg config is slice 10 — not yet supported.
-                    let has_lazy = d.get_item("lazyLegConfig").ok().flatten().is_some()
-                        || d.get_item("lazy_leg_config").ok().flatten().is_some();
-                    if has_lazy {
-                        return Ok((vec![], Some(UnsupportedReason(format!(
-                            "leg has '{}' with lazyLegConfig — slice 10 not yet supported", key
-                        )))));
-                    }
+                    // LAZY_LEG and RE_MOMENTUM handled in Python engine_rust.py.
                 }
             }
         }
@@ -330,51 +323,15 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
     Ok((out, None))
 }
 
-/// Returns `Some(reason)` when the payload uses a strategy-level feature
-/// that Rust slice 2 does not yet handle. Caller falls back to the Python
-/// engine so we never emit wrong numbers.
-///
-/// Slice 6 (2026-05): `rollover_toggle` is now supported for WEEKLY / MONTHLY
-/// expiry types — see `build_rollover_schedule` below. Other expiry types
-/// (NEXT_WEEKLY etc.) still block because `_rollover_mode` requires WEEKLY/MONTHLY
-/// in the Python engine (see generic_algotest_engine.py:3408).
-fn check_strategy_blockers(payload: &PyDict) -> Option<UnsupportedReason> {
-    let truthy = |k: &str| -> bool {
-        payload
-            .get_item(k).ok().flatten()
-            .and_then(|v| v.extract::<bool>().ok())
-            .unwrap_or(false)
-    };
-    let extract_str = |k: &str| -> String {
-        payload
-            .get_item(k).ok().flatten()
-            .and_then(|v| v.extract::<String>().ok())
-            .unwrap_or_default()
-            .to_uppercase()
-    };
-
-    // rollover_toggle is supported only for WEEKLY/MONTHLY — Python engine
-    // gates _rollover_mode on the same condition. Otherwise fall back.
-    if truthy("rollover_toggle") {
-        let etype = extract_str("expiry_type");
-        if etype != "WEEKLY" && etype != "MONTHLY" {
-            return Some(UnsupportedReason(format!(
-                "rollover_toggle active but expiry_type={} not WEEKLY/MONTHLY", etype
-            )));
-        }
-    }
-
-    let blockers = [
-        ("no_rollover",              truthy("no_rollover")),
-        ("buffer_strike_enabled",    truthy("buffer_strike_enabled")),
-    ];
-    for (name, hit) in blockers {
-        if hit {
-            return Some(UnsupportedReason(format!(
-                "strategy-level feature '{}' active — Rust slice 2 falls back to Python", name
-            )));
-        }
-    }
+/// Strategy-level feature gate. Returns Some(reason) to block payloads whose
+/// top-level fields are not yet handled. Leg-level checks are in extract_leg_cfgs.
+/// Currently no top-level blockers remain — all features handled or delegated to
+/// Python post-processing steps in engine_rust.py.
+fn check_strategy_blockers(_payload: &PyDict) -> Option<UnsupportedReason> {
+    // All top-level strategy features are now handled by either:
+    //   • the Rust resolve_trade_specs loop directly, or
+    //   • Python post-processing in engine_rust.py.
+    // Individual leg-level blockers live in extract_leg_cfgs.
     None
 }
 
@@ -514,36 +471,123 @@ fn pick_by_premium<'a>(
     })
 }
 
+/// Validate that `strike` has a tradeable contract on `entry_date` for the
+/// given (expiry, opt_type).  If the contract has zero turnover (stale close
+/// price), walk TOWARD ATM by `strike_interval` until a tradeable strike is
+/// found or ATM is reached.  Returns `(final_strike, shift_steps)` where
+/// shift_steps is 0 when the original strike was already tradeable.  Returns
+/// None if no tradeable strike exists within the walk window (rare).
+///
+/// Shift direction (toward ATM — more liquid strikes):
+///   - ITM CE (strike < ATM): walk UP toward ATM
+///   - OTM CE (strike > ATM): walk DOWN toward ATM
+///   - ITM PE (strike > ATM): walk DOWN toward ATM
+///   - OTM PE (strike < ATM): walk UP toward ATM
+///   - ATM (strike == ATM): no shift possible (already at ATM)
+fn validate_or_shift_strike(
+    strike: f64,
+    atm: f64,
+    interval: f64,
+    _is_call: bool,
+    entry_date: &str,
+    expiry: &str,
+    index: &str,
+    opt_type: &str,
+    _max_shifts: i32, // retained for API compat; cap is now distance-to-ATM
+) -> Option<(f64, i32)> {
+    use crate::OptionDataStatus;
+    // First check the requested strike's data status.
+    let status = crate::lookup_option_status(entry_date, index, strike, opt_type, expiry);
+    match status {
+        OptionDataStatus::Tradeable(px) => {
+            if px > 0.0 {
+                return Some((strike, 0)); // real price, no shift
+            }
+            return None;
+        }
+        OptionDataStatus::Missing => {
+            // No record for this strike on this date — DON'T shift.  The
+            // strike simply wasn't listed by NSE on this day; shifting would
+            // land us on an arbitrary strike that may not reflect intent.
+            return None;
+        }
+        OptionDataStatus::ZeroContracts => {
+            // Stale carry-over price — walk toward ATM to find liquid strike.
+        }
+    }
+    // Walk TOWARD ATM. Direction is opposite of (requested - atm).
+    let direction: f64 = if strike > atm + 1e-6 {
+        -1.0 // requested is above ATM → walk DOWN toward ATM
+    } else if strike < atm - 1e-6 {
+        1.0  // requested is below ATM → walk UP toward ATM
+    } else {
+        // Already at ATM and zero-turnover — nowhere to walk; give up.
+        return None;
+    };
+    // Cap at distance to ATM (inclusive) — never walk past ATM.
+    let dist = ((strike - atm).abs() / interval).round() as i32;
+    let max_walk = dist.max(1);
+    for step in 1..=max_walk {
+        let candidate = strike + direction * (step as f64) * interval;
+        if candidate <= 0.0 {
+            break;
+        }
+        if let OptionDataStatus::Tradeable(px) = crate::lookup_option_status(entry_date, index, candidate, opt_type, expiry) {
+            if px > 0.0 {
+                return Some((candidate, step));
+            }
+        }
+    }
+    None
+}
+
 /// Compute the strike price for one leg on one entry date.
 ///
 /// Falls back to None (caller skips the trade or falls back to Python) when
 /// the entry_date has no usable option chain data for the requested mode.
+/// Returns `(final_strike, requested_strike)` where requested_strike is the
+/// strike computed from the user's selection BEFORE any zero-turnover shift.
+/// If no shift was applied, both values are equal.
 fn compute_strike_for_leg(
     leg: &LegCfg,
     entry_date: &str,
     expiry: &str,
     index: &str,
     entry_spot: f64,
-) -> Option<f64> {
+    strike_shift_max: i32,
+) -> Option<(f64, f64)> {
     let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
     let is_call = leg.option_type.eq_ignore_ascii_case("CE")
         || leg.option_type.eq_ignore_ascii_case("CALL")
         || leg.option_type.eq_ignore_ascii_case("C");
 
-    match &leg.strike {
+    let computed: Option<f64> = match &leg.strike {
         StrikeSel::Fixed(sel) => {
             atm_offset_strike(entry_spot, leg.strike_interval, sel, &leg.option_type)
         }
         StrikeSel::PctOfAtm { value, direction } => {
-            // Match Python exactly: shift = spot × pct / 100; only "-"
-            // subtracts, everything else (including "OTM", "ITM", "+") adds.
-            // The OTM/ITM-to-sign mapping is the UI's job — by the time the
-            // payload reaches us, direction is just "+" or "-" in practice.
+            // Match Python exactly. Semantic directions (OTM/ITM) are moneyness
+            // labels and use abs(value), while raw +/- keeps signed-offset
+            // behavior for callers that intentionally sweep across zero.
             let dir = direction.trim();
-            let shift = entry_spot * value / 100.0;
-            let raw = if dir == "-" {
+            let dir_upper = dir.to_uppercase();
+            let raw = if dir_upper == "OTM" || dir_upper == "ITM" || dir_upper == "ATM" {
+                if dir_upper == "ATM" || *value == 0.0 {
+                    entry_spot
+                } else {
+                    let shift = entry_spot * value.abs() / 100.0;
+                    let above_spot = (dir_upper == "OTM" && is_call) || (dir_upper == "ITM" && !is_call);
+                    if above_spot {
+                        entry_spot + shift
+                    } else {
+                        entry_spot - shift
+                    }
+                }
+            } else if dir == "-" {
+                let shift = entry_spot * value / 100.0;
                 entry_spot - shift
             } else {
+                let shift = entry_spot * value / 100.0;
                 entry_spot + shift
             };
             Some((raw / leg.strike_interval).round() * leg.strike_interval)
@@ -611,7 +655,16 @@ fn compute_strike_for_leg(
             let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
             pick_by_premium(&chain, target, atm, is_call).map(|(s, _)| *s)
         }
-    }
+    };
+    let raw_strike = computed?;
+    // Strike-shift fallback for zero-turnover contracts: walk TOWARD ATM
+    // until a liquid strike is found (capped at ATM itself). Always-on; the
+    // legacy `strike_shift_max` arg is retained for ABI compat but ignored.
+    let (final_strike, _shift_steps) = validate_or_shift_strike(
+        raw_strike, atm, leg.strike_interval, is_call,
+        entry_date, expiry, index, &leg.option_type, strike_shift_max,
+    )?;
+    Some((final_strike, raw_strike))
 }
 
 /// Slice 2 — resolve every (entry_date, exit_date, strike, leg) tuple for
@@ -660,6 +713,14 @@ pub fn resolve_trade_specs(
     if legs.is_empty() || leg_blocker.is_some() {
         return Ok(out.into());
     }
+    // User-configurable strike-shift fallback for missing/illiquid contracts.
+    // Default 1: if the requested strike has no contract or zero close, shift
+    // ONE strike-interval further from ATM in the requested direction.
+    let strike_shift_max: i32 = payload
+        .get_item("strike_shift_max_steps").ok().flatten()
+        .and_then(|v| v.extract::<i64>().ok())
+        .map(|n| n.clamp(0, 50) as i32)
+        .unwrap_or(1);
 
     let index = payload
         .get_item("index").ok().flatten()
@@ -707,17 +768,25 @@ pub fn resolve_trade_specs(
         let schedule = build_rollover_schedule(
             &expiries_sorted, &td, entry_dte, exit_dte, rollover_min_days,
         );
-        for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry) in &schedule {
+        'rollover_trade: for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry) in &schedule {
             let entry_spot = match spot_by_date.get(entry_date) {
                 Some(&v) if v > 0.0 => v,
                 _ => continue,
             };
+            // Resolve all legs into a per-trade buffer first. If ANY leg's
+            // strike data is missing on this date, skip just THIS trade and
+            // continue with the next one — mirrors the Python engine's
+            // "skip trade on missing strike" behaviour. Previously we returned
+            // an empty PyList here which silently aborted the entire 8-year
+            // strategy run on the first missing strike (NSE data hole) and
+            // forced the slower Python engine fallback for ALL combos.
+            let mut leg_dicts: Vec<&PyDict> = Vec::with_capacity(legs.len());
             for (leg_idx, leg) in legs.iter().enumerate() {
-                let strike = match compute_strike_for_leg(
-                    leg, entry_date, leg_expiry, &index, entry_spot,
+                let (strike, requested_strike) = match compute_strike_for_leg(
+                    leg, entry_date, leg_expiry, &index, entry_spot, strike_shift_max,
                 ) {
                     Some(v) => v,
-                    None => return Ok(PyList::empty(py).into()),
+                    None => continue 'rollover_trade,
                 };
                 let d = PyDict::new(py);
                 d.set_item("trade_id", *trade_id)?;
@@ -727,11 +796,16 @@ pub fn resolve_trade_specs(
                 d.set_item("exit_date", exit_date)?;
                 d.set_item("expiry", leg_expiry)?;
                 d.set_item("strike", round2(strike))?;
+                d.set_item("requested_strike", round2(requested_strike))?;
+                d.set_item("strike_interval", leg.strike_interval)?;
                 d.set_item("option_type", &leg.option_type)?;
                 d.set_item("position", &leg.position)?;
                 d.set_item("lots", leg.lots)?;
                 d.set_item("lot_size", lot_size)?;
                 d.set_item("slippage_pct", slippage_pct)?;
+                leg_dicts.push(d);
+            }
+            for d in leg_dicts {
                 out.append(d)?;
             }
         }
@@ -739,7 +813,7 @@ pub fn resolve_trade_specs(
     }
 
     let mut next_trade_id: i64 = 1;
-    for expiry in &expiry_dates {
+    'dte_trade: for expiry in &expiry_dates {
         let entry_date = match trading_day_before(expiry, entry_dte, &td) {
             Some(v) => v,
             None => continue,
@@ -759,15 +833,14 @@ pub fn resolve_trade_specs(
         };
 
         let trade_id = next_trade_id;
-        next_trade_id += 1;
+        // Build per-trade legs in a buffer; commit only if ALL legs resolve.
+        // Skip the trade (not the whole strategy) when a strike is missing —
+        // matches the Python engine's per-trade tolerance for NSE data holes.
+        let mut leg_dicts: Vec<&PyDict> = Vec::with_capacity(legs.len());
         for (leg_idx, leg) in legs.iter().enumerate() {
-            let strike = match compute_strike_for_leg(leg, &entry_date, expiry, &index, entry_spot) {
+            let (strike, requested_strike) = match compute_strike_for_leg(leg, &entry_date, expiry, &index, entry_spot, strike_shift_max) {
                 Some(v) => v,
-                None => {
-                    // Strike mode not yet implemented for this leg — drop the
-                    // ENTIRE strategy run rather than emit a partial result.
-                    return Ok(PyList::empty(py).into());
-                }
+                None => continue 'dte_trade,
             };
             let d = PyDict::new(py);
             d.set_item("trade_id", trade_id)?;
@@ -777,13 +850,19 @@ pub fn resolve_trade_specs(
             d.set_item("exit_date", &exit_date)?;
             d.set_item("expiry", expiry)?;
             d.set_item("strike", round2(strike))?;
+            d.set_item("requested_strike", round2(requested_strike))?;
+            d.set_item("strike_interval", leg.strike_interval)?;
             d.set_item("option_type", &leg.option_type)?;
             d.set_item("position", &leg.position)?;
             d.set_item("lots", leg.lots)?;
             d.set_item("lot_size", lot_size)?;
             d.set_item("slippage_pct", slippage_pct)?;
+            leg_dicts.push(d);
+        }
+        for d in leg_dicts {
             out.append(d)?;
         }
+        next_trade_id += 1;
     }
     Ok(out.into())
 }
@@ -797,6 +876,8 @@ struct TradeSpec {
     exit_date: String,
     expiry: String,
     strike: f64,
+    requested_strike: f64,
+    strike_interval: f64,
     option_type: String,
     position: String,
     lots: i64,
@@ -841,6 +922,12 @@ fn extract_i64(dict: &PyDict, key: &str) -> i64 {
 }
 
 fn dict_to_spec(dict: &PyDict) -> TradeSpec {
+    let strike = extract_f64(dict, "strike");
+    // Default requested_strike to strike when absent (no shift was tracked).
+    let requested_strike = {
+        let v = extract_f64(dict, "requested_strike");
+        if v > 0.0 { v } else { strike }
+    };
     TradeSpec {
         trade_id: extract_i64(dict, "trade_id"),
         leg_id: extract_i64(dict, "leg_id"),
@@ -848,7 +935,9 @@ fn dict_to_spec(dict: &PyDict) -> TradeSpec {
         entry_date: extract_str(dict, "entry_date"),
         exit_date: extract_str(dict, "exit_date"),
         expiry: extract_str(dict, "expiry"),
-        strike: extract_f64(dict, "strike"),
+        strike,
+        requested_strike,
+        strike_interval: extract_f64(dict, "strike_interval"),
         option_type: extract_str(dict, "option_type"),
         position: extract_str(dict, "position"),
         lots: extract_i64(dict, "lots"),
@@ -930,6 +1019,8 @@ fn result_to_dict(py: Python<'_>, spec: &TradeSpec, r: &TradeResult) -> PyResult
     d.set_item("exit_date", &spec.exit_date)?;
     d.set_item("expiry", &spec.expiry)?;
     d.set_item("strike", spec.strike)?;
+    d.set_item("requested_strike", spec.requested_strike)?;
+    d.set_item("strike_interval", spec.strike_interval)?;
     d.set_item("option_type", &spec.option_type)?;
     d.set_item("position", &spec.position)?;
     d.set_item("lots", spec.lots)?;
@@ -946,11 +1037,35 @@ fn result_to_dict(py: Python<'_>, spec: &TradeSpec, r: &TradeResult) -> PyResult
     Ok(d.into())
 }
 
+/// Per-process rayon thread pool, initialized lazily on first use.
+///
+/// Using a local (non-global) pool means the parent Celery process never
+/// initialises it. After fork(), each child creates its own fresh pool with
+/// live threads — no inherited dead workers, no futex deadlock.
+/// RAYON_NUM_THREADS controls the size (default: min(cpu_count, 4)).
+fn sim_pool() -> &'static rayon::ThreadPool {
+    static POOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
+        // RUST_SIM_THREADS controls the local pool independently of the global
+        // rayon pool (which Polars may have already claimed via RAYON_NUM_THREADS).
+        let n = std::env::var("RUST_SIM_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| (num_cpus::get()).min(4));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .expect("sim rayon pool init failed")
+    });
+    &POOL
+}
+
 /// Simulate a batch of pre-resolved trades. See module docstring.
 ///
 /// Lookups hit the shared Rust market cache (CACHE in lib.rs); slippage and
-/// P&L computation are pure functions. The batch is parallelised across
-/// CPU cores with rayon, with the Python GIL released for the compute.
+/// P&L computation are pure functions. Uses a process-local rayon pool so
+/// forked optimizer workers each create their own fresh thread pool rather
+/// than inheriting the parent's (which would deadlock after fork).
 #[pyfunction]
 pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
     let py = trades.py();
@@ -961,10 +1076,10 @@ pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
         specs.push(dict_to_spec(dict));
     }
 
-    // Release GIL while rayon scans the batch. lookup_option_price uses an
-    // RwLock<Option<MarketCache>>::read() — safe to call from many threads.
+    // Release GIL while rayon scans the batch via the process-local pool.
+    // lookup_option_price uses RwLock::read() — safe from multiple threads.
     let mut results: Vec<TradeResult> = py.allow_threads(|| {
-        specs.par_iter().map(simulate_one).collect()
+        sim_pool().install(|| specs.par_iter().map(simulate_one).collect())
     });
 
     // Post-process to match the Python engine's row-level conventions:

@@ -1170,11 +1170,22 @@ def _resolve_strike(leg_config, entry_date, entry_spot, expiry_date, strike_inte
         direction = (
             leg_config.get('pct_direction')
             or (strike_sel.get('direction') if isinstance(strike_sel, dict) else None)
-            or '-'
+            or 'OTM'
         )
         direction = str(direction).strip()
-        shift = (entry_spot * pct) / 100.0
-        raw_strike = entry_spot - shift if direction == '-' else entry_spot + shift
+        direction_up = direction.upper()
+        if direction_up in ('OTM', 'ITM', 'ATM'):
+            if direction_up == 'ATM' or pct == 0.0:
+                raw_strike = entry_spot
+            else:
+                opt_type = str(leg_config.get('option_type') or '').upper().strip()
+                is_call = opt_type in ('CE', 'CALL', 'C')
+                shift = (entry_spot * abs(pct)) / 100.0
+                above_spot = (direction_up == 'OTM' and is_call) or (direction_up == 'ITM' and not is_call)
+                raw_strike = entry_spot + shift if above_spot else entry_spot - shift
+        else:
+            shift = (entry_spot * pct) / 100.0
+            raw_strike = entry_spot - shift if direction == '-' else entry_spot + shift
         final = round(raw_strike / strike_interval) * strike_interval
         _log(f"      PCT_OF_ATM: spot={entry_spot}, pct={pct}, direction={direction} → {final}")
         final_strike, offset, ref_price = _apply_strike_buffer_after_selection(final)
@@ -3634,9 +3645,26 @@ def run_algotest_backtest(params):
                 exit_date = next_exp
                 _force_next_expiry = True
                 _log(f"  INFO: Entry == Exit on expiry day (NEXT expiry type) → exit shifted to next expiry {next_exp.date()}, forcing next-expiry contract")
+            elif _rollover_mode and next_exp is not None:
+                # Both entry and exit anchor to the same expiry at equal DTEs → same date.
+                # Re-anchor exit to the same DTE relative to the NEXT expiry so the trade
+                # has a real holding period (same logic as the entry > exit rollover path).
+                # Trade the next-expiry contract since exit crosses into the next cycle.
+                new_exit = calculate_trading_days_before_expiry(
+                    expiry_date=next_exp,
+                    days_before=exit_dte,
+                    trading_calendar_df=trading_calendar
+                )
+                new_exit = pd.Timestamp(new_exit) if new_exit is not None else None
+                if new_exit is None or entry_date > new_exit:
+                    _log(f"  WARNING: Rollover exit re-anchor to next expiry failed → skipping")
+                    continue
+                exit_date = new_exit
+                _force_next_expiry = True
+                _log(f"  INFO: Entry == Exit ({entry_date.date()}) under rollover → exit re-anchored to T-{exit_dte} of next expiry {next_exp.date()} → {exit_date.date()}")
             elif _rollover_mode:
-                # Rollover ON: keep the record. Re-entry override chains same-day into the next cycle's contract.
-                _log(f"  INFO: Entry == Exit ({entry_date.date()}) under rollover — record kept (same-day chain at re-entry)")
+                _log(f"  INFO: Entry == Exit ({entry_date.date()}) under rollover, no next expiry — skipping")
+                continue
             else:
                 _log(f"--- Expiry {expiry_idx + 1}/{len(expiry_df)}: {schedule_anchor} ---")
                 _log(f"  INFO: Entry == Exit ({entry_date.date()}) for {expiry_type} → skipping (entry_dte == exit_dte results in ~0 P&L with previous-day close data)")
@@ -3922,7 +3950,9 @@ def run_algotest_backtest(params):
                     'expiry_date':         target_expiry,
                     'current_expiry':      target_rec.get('current_expiry', target_expiry),
                     'next_expiry':         target_rec.get('next_expiry',    target_expiry),
-                    '_force_next_expiry':  target_rec.get('_force_next_expiry', False),
+                    # Fixed mode has already resolved target_expiry as the correct contract;
+                    # _force_next_expiry is a DTE-mode flag and must not carry into fixed mode.
+                    '_force_next_expiry':  False,
                     '_rollover_mode':      target_rec.get('_rollover_mode', False),
                     'clamped_exit':        clamped_exit,
                 })
@@ -4111,6 +4141,7 @@ def run_algotest_backtest(params):
         # from there instead of the stale pre-computed entry.  Existing code paths
         # are untouched when rollover_toggle is off or no spot adj fires.
         _prev_actual_exit      = None
+        _prev_expiry           = None  # DTE mode: expiry of trade that triggered spot adj
         _seg_expiries          = seg_scope.get('expiries_sorted', [])
         _seg_expiry_recmap     = seg_scope.get('expiry_rec_map', {})
         _seg_original_count    = len(seg_scope['entries'])  # count before any synthetic appends
@@ -4130,17 +4161,48 @@ def run_algotest_backtest(params):
             # the original, later exit).  Re-resolve entry + expiry + exit from
             # the actual previous exit date so the chain has no gap.
             #
-            # Guard: only fires when –
-            #   • rollover_toggle is on (we're chaining trades)
-            #   • _prev_actual_exit is set and DIFFERS from the pre-computed
-            #     entry_date (i.e. spot adj actually moved the previous exit)
-            #   • _seg_expiries is non-empty (fixed_entry_mode only)
+            # Two branches:
+            #   DTE mode  (_seg_expiries empty) — use stored _prev_expiry directly.
+            #   Fixed mode (_seg_expiries set)  — re-resolve via expiry list.
             # Existing behaviour (no spot adj, or rollover off) is untouched.
             if (rollover_toggle
+                    and _prev_actual_exit is not None
+                    and not _seg_expiries
+                    and _prev_expiry is not None
+                    and _prev_actual_exit < _prev_expiry):
+                # DTE mode: fill [_prev_actual_exit, _prev_expiry] residual window.
+                _dte_new_entry = _prev_actual_exit
+                _dte_re_expiry = _prev_expiry
+                _prev_actual_exit = None  # consume — affects only one slot
+                _prev_expiry = None
+                if _dte_new_entry < pd.Timestamp(trade_entry['exit_date']):
+                    entry_date   = _dte_new_entry
+                    expiry_date  = _dte_re_expiry
+                    exit_date    = _dte_re_expiry
+                    clamped_exit = (exit_date < pd.Timestamp(trade_entry['exit_date']))
+                    # Re-entry is within the current expiry cycle — use _sched_current_exp
+                    # (not _sched_next_exp) for the option contract lookup.
+                    _force_next_expiry = False
+                    # When the chain skips ahead of the pre-computed slot order
+                    # (e.g. successive spot-adj triggers), the slot's stored
+                    # current_expiry no longer matches _dte_re_expiry. Pin it to
+                    # the actual contract expiry so leg_options_expiry is right.
+                    _sched_current_exp = _dte_re_expiry
+                    # Chain: after this re-entry exits at _dte_re_expiry, the NEXT slot
+                    # should start from there so the normal rollover chain continues.
+                    _prev_actual_exit = _dte_re_expiry
+                    _prev_expiry      = pd.Timestamp(trade_entry['exit_date'])
+                    _log(
+                        f"  [SPOT_ADJ_ROLLOVER_DTE] entry overridden "
+                        f"{pd.Timestamp(trade_entry['entry_date']).strftime('%d/%m/%Y')} → "
+                        f"{entry_date.strftime('%d/%m/%Y')} | expiry = {_dte_re_expiry.strftime('%d/%m/%Y')}"
+                    )
+            elif (rollover_toggle
                     and _prev_actual_exit is not None
                     and _seg_expiries
                     and (_prev_actual_exit != pd.Timestamp(trade_entry['entry_date'])
                          or trade_entry.get('_is_synthetic', False))):
+                # Fixed mode: re-resolve via expiry list (existing behaviour).
                 _new_entry = _prev_actual_exit
                 _pre_exit  = pd.Timestamp(trade_entry['exit_date'])
                 if _new_entry >= _pre_exit:
@@ -4164,6 +4226,8 @@ def run_algotest_backtest(params):
                     _re_rec            = _seg_expiry_recmap.get(_re_expiry, {})
                     _sched_current_exp = _re_rec.get('current_expiry', _re_expiry)
                     _sched_next_exp    = _re_rec.get('next_expiry',    _re_expiry)
+                    # _re_expiry is already the correct contract expiry; never force next.
+                    _force_next_expiry = False
                     clamped_exit       = (_re_exit < pd.Timestamp(trade_entry['exit_date']))
                     _log(
                         f"  [SPOT_ADJ_ROLLOVER] entry overridden "
@@ -4275,12 +4339,27 @@ def run_algotest_backtest(params):
                         adjusted_ts = pd.Timestamp(adjusted_date)
                         if adjusted_ts > scheduled_exit_ts:
                             adjusted_ts = scheduled_exit_ts
-                        expiry_ts = pd.Timestamp(expiry_date)
-                        if adjusted_ts > expiry_ts:
-                            adjusted_ts = expiry_ts
+                        # For rollover / NEXT_WEEKLY trades, expiry_date is the schedule
+                        # anchor (current_exp), which is earlier than scheduled_exit_ts
+                        # (next_exp). Clamping to expiry_date would clip the exit to the
+                        # entry date for T-0/T-0 trades.  apply_spot_adjustment_exit
+                        # already guarantees adjusted_date ≤ scheduled_exit_date, so the
+                        # first clamp above is sufficient; only apply the expiry_date clamp
+                        # for non-rollover trades where expiry_date == contract expiry.
+                        if not _force_next_expiry and not _trade_rollover_mode:
+                            expiry_ts = pd.Timestamp(expiry_date)
+                            if adjusted_ts > expiry_ts:
+                                adjusted_ts = expiry_ts
                         exit_date = adjusted_ts
                         base_exit_reason = 'SPOT_ADJ_RISE' if triggered_direction == 'RISE' else 'SPOT_ADJ_FALL'
                         _log(f"  Spot adjustment triggered on {adjusted_ts.strftime('%Y-%m-%d')} ({triggered_direction})")
+                        # DTE mode: record for residual-window re-entry on next slot.
+                        if rollover_toggle and not _seg_expiries:
+                            _prev_actual_exit = pd.Timestamp(exit_date)
+                            # Use the scheduled (pre-adjustment) exit as the target expiry.
+                            # For rollover T-0/T-0, expiry_date is the entry-cycle anchor
+                            # (already past) while scheduled_exit_ts is the contract's expiry.
+                            _prev_expiry = scheduled_exit_ts
 
                 # Track actual exit for rollover correction (spot-adj may have shortened it).
                 # Used by the next trade's entry override when rollover + fixed_entry_mode.

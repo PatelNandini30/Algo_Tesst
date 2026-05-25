@@ -1,94 +1,37 @@
 {
-  "started_at": "2026-04-27T10:01:26.694883",
-  "mode": "table",
-  "table_filter": "expiry_calendar",
-  "file_filter": null,
+  "started_at": "2026-05-22T07:24:20.098847",
+  "mode": "file",
+  "table_filter": null,
+  "file_filter": [
+    "/home/user/Algo_Test_Software/cleaned_csvs/2026-05-21.csv"
+  ],
   "dry_run": false,
   "force": false,
-  "workers": 10,
+  "workers": 1,
   "totals": {
-    "files_total": 6,
-    "files_completed": 2,
-    "files_skipped": 4,
+    "files_total": 1,
+    "files_completed": 1,
+    "files_skipped": 0,
     "files_failed": 0,
-    "rows_read": 734,
-    "rows_valid": 734,
+    "rows_read": 45678,
+    "rows_valid": 45678,
     "rows_skipped": 0,
-    "rows_inserted": 61,
-    "rows_updated": 673
+    "rows_inserted": 45678,
+    "rows_updated": 0
   },
   "validation": {},
   "files": [
     {
-      "file": "/home/user/Algo_Test_Software/expiryData/BANKNIFTY.csv",
-      "table": "expiry_calendar",
-      "status": "skipped",
-      "skip_reason": "already imported (ins=0, upd=442)",
-      "errors": [],
-      "rows_read": 0,
-      "rows_valid": 0,
-      "rows_skipped": 0,
-      "rows_inserted": 0,
-      "rows_updated": 0
-    },
-    {
-      "file": "/home/user/Algo_Test_Software/expiryData/BANKNIFTY_Monthly.csv",
-      "table": "expiry_calendar",
-      "status": "skipped",
-      "skip_reason": "already imported (ins=13, upd=71)",
-      "errors": [],
-      "rows_read": 0,
-      "rows_valid": 0,
-      "rows_skipped": 0,
-      "rows_inserted": 0,
-      "rows_updated": 0
-    },
-    {
-      "file": "/home/user/Algo_Test_Software/expiryData/MIDCPNIFTY.csv",
-      "table": "expiry_calendar",
-      "status": "skipped",
-      "skip_reason": "already imported (ins=0, upd=149)",
-      "errors": [],
-      "rows_read": 0,
-      "rows_valid": 0,
-      "rows_skipped": 0,
-      "rows_inserted": 0,
-      "rows_updated": 0
-    },
-    {
-      "file": "/home/user/Algo_Test_Software/expiryData/MIDCPNIFTY_Monthly.csv",
-      "table": "expiry_calendar",
-      "status": "skipped",
-      "skip_reason": "already imported (ins=0, upd=46)",
-      "errors": [],
-      "rows_read": 0,
-      "rows_valid": 0,
-      "rows_skipped": 0,
-      "rows_inserted": 0,
-      "rows_updated": 0
-    },
-    {
-      "file": "/home/user/Algo_Test_Software/expiryData/NIFTY.csv",
-      "table": "expiry_calendar",
+      "file": "/home/user/Algo_Test_Software/cleaned_csvs/2026-05-21.csv",
+      "table": "option_data",
       "status": "completed",
       "errors": [],
-      "rows_read": 415,
+      "rows_read": 45678,
       "rows_skipped": 0,
-      "rows_valid": 415,
-      "rows_inserted": 51,
-      "rows_updated": 364
-    },
-    {
-      "file": "/home/user/Algo_Test_Software/expiryData/NIFTY_Monthly.csv",
-      "table": "expiry_calendar",
-      "status": "completed",
-      "errors": [],
-      "rows_read": 319,
-      "rows_skipped": 0,
-      "rows_valid": 319,
-      "rows_inserted": 10,
-      "rows_updated": 309
+      "rows_valid": 45678,
+      "rows_inserted": 45678,
+      "rows_updated": 0
     }
   ],
-  "finished_at": "2026-04-27T10:01:26.694920"
+  "finished_at": "2026-05-22T07:24:20.099029"
 }

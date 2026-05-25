@@ -69,16 +69,21 @@ export default function OptimizationResults({
   jobId,
   totalCombos,
   objective: defaultObjective,
+  runConfig,
   onClose,
   onApplyCombo,
 }) {
   const [meta, setMeta] = useState(null);
+  const [jobStatus, setJobStatus] = useState('queued');
   const [rows, setRows] = useState([]);
   const [sortKey, setSortKey] = useState(defaultObjective || 'total_pnl');
   const [order, setOrder] = useState('desc');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [downloadingRows, setDownloadingRows] = useState(new Set());
+  const [configExpanded, setConfigExpanded] = useState(false);
+  const [zipDownloading, setZipDownloading] = useState(false);
+  const [zipProgress, setZipProgress] = useState(null);
   const pollRef = useRef(null);
 
   const fetchAll = useCallback(async () => {
@@ -105,12 +110,13 @@ export default function OptimizationResults({
         const r = await fetch(`/api/optimize/jobs/${jobId}`);
         if (!r.ok) return;
         const data = await r.json();
+        setJobStatus(data.status || 'queued');
         setMeta(data.meta || null);
         if (data.status === 'success' || data.status === 'failed') {
           clearInterval(pollRef.current);
           pollRef.current = null;
           fetchAll();
-        } else {
+        } else if (data.status !== 'queued') {
           // Refresh partial results so the table fills in as combos complete.
           fetchAll();
         }
@@ -126,7 +132,7 @@ export default function OptimizationResults({
   const done = meta?.done ?? 0;
   const total = meta?.total ?? totalCombos ?? 0;
   const progressPct = total > 0 ? Math.round((done / total) * 100) : 0;
-  const status = meta?.status || 'running';
+  const status = meta?.status || jobStatus || 'queued';
   const eta = meta?.eta_seconds;
   const phase = meta?.phase || 'running';
 
@@ -241,22 +247,50 @@ export default function OptimizationResults({
   }
 
   async function downloadTradesheets() {
+    if (zipDownloading) return;
+    setZipDownloading(true);
+    setZipProgress({ done: 0, total: 0, elapsed: 0 });
     try {
-      const r = await fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`);
-      if (!r.ok) {
+      // Backend builds ZIP in background.  200 → ready (file body), 202 →
+      // still building (poll progress).
+      const start = Date.now();
+      const maxWaitMs = 20 * 60 * 1000;  // 20 min hard cap
+      while (true) {
+        const r = await fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`);
+        if (r.status === 200) {
+          const blob = await r.blob();
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = `optimize_${jobId.slice(0, 8)}_tradesheets.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+          return;
+        }
+        if (r.status === 202) {
+          const info = await r.json().catch(() => ({}));
+          setZipProgress({
+            done: info.done || 0,
+            total: info.total || 0,
+            elapsed: info.elapsed_seconds || 0,
+          });
+          if (Date.now() - start > maxWaitMs) {
+            alert('ZIP build is taking longer than expected — refresh and try again.');
+            return;
+          }
+          await new Promise((res) => setTimeout(res, 2000));
+          continue;
+        }
         const err = await r.json().catch(() => ({}));
-        alert(err.detail || 'Failed to download tradesheets');
+        alert(err.detail || err.error || 'Failed to download tradesheets');
         return;
       }
-      const blob = await r.blob();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `optimize_${jobId.slice(0, 8)}_tradesheets.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    } catch {
-      alert('Failed to download tradesheets');
+    } catch (e) {
+      alert(`Failed to download tradesheets: ${e?.message || e}`);
+    } finally {
+      setZipDownloading(false);
+      setZipProgress(null);
     }
   }
 
@@ -321,7 +355,11 @@ export default function OptimizationResults({
       const summary     = matchingRow?.summary || {};
       const comboLabel  = matchingRow?.combo_label || `Combo ${comboId}`;
 
-      const blob = await buildTradeExcel(parsedTrades, summary, { comboLabel });
+      const blob = await buildTradeExcel(parsedTrades, summary, {
+        comboLabel,
+        runConfig,
+        comboValues: matchingRow?.combo || {},
+      });
 
       // Derive filename from Content-Disposition or fallback
       const disposition = r.headers.get('Content-Disposition') || '';
@@ -395,7 +433,7 @@ export default function OptimizationResults({
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            {status === 'running' && (
+            {(status === 'running' || status === 'queued') && (
               <span
                 style={{
                   fontSize: 11,
@@ -405,7 +443,9 @@ export default function OptimizationResults({
                 }}
               >
                 <Loader2 size={12} className="animate-spin" />
-                {phase === 'loading_data'
+                {status === 'queued'
+                  ? 'Queued — waiting for worker…'
+                  : phase === 'loading_data'
                   ? 'Loading market data…'
                   : `${done}/${total} (${progressPct}%)${eta ? ` · ETA ~${Math.round(eta / 60)}m` : ''}`}
               </span>
@@ -446,22 +486,33 @@ export default function OptimizationResults({
             </button>
             <button
               onClick={downloadTradesheets}
-              disabled={status !== 'success' || rows.length === 0}
+              disabled={status !== 'success' || rows.length === 0 || zipDownloading}
               style={{
                 padding: '6px 12px',
                 fontSize: 11,
                 border: '1px solid var(--border-strong, #d1d5db)',
                 borderRadius: 6,
                 background: 'transparent',
-                cursor: (status !== 'success' || rows.length === 0) ? 'not-allowed' : 'pointer',
+                cursor: (status !== 'success' || rows.length === 0 || zipDownloading) ? 'not-allowed' : 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 6,
                 opacity: (status !== 'success' || rows.length === 0) ? 0.4 : 1,
               }}
-              title={status !== 'success' ? 'Available after run completes' : 'Download all tradesheets as ZIP'}
+              title={
+                status !== 'success'
+                  ? 'Available after run completes'
+                  : zipDownloading
+                    ? 'ZIP is being built…'
+                    : 'Download all tradesheets as ZIP'
+              }
             >
-              <Download size={12} /> Download Tradesheets ZIP
+              <Download size={12} />
+              {zipDownloading
+                ? (zipProgress && zipProgress.total > 0
+                    ? `Building ZIP… ${zipProgress.done}/${zipProgress.total} (${Math.round(zipProgress.elapsed)}s)`
+                    : `Building ZIP…${zipProgress ? ` ${Math.round(zipProgress.elapsed)}s` : ''}`)
+                : 'Download Tradesheets ZIP'}
             </button>
             {status === 'running' && (
               <button
@@ -493,18 +544,91 @@ export default function OptimizationResults({
         </div>
 
         {/* Progress bar */}
-        {status === 'running' && (
+        {(status === 'running' || status === 'queued') && (
           <div
             style={{ height: 3, background: 'var(--border, #f1f5f9)' }}
           >
             <div
               style={{
-                width: `${progressPct}%`,
+                width: status === 'queued' ? '100%' : `${progressPct}%`,
                 height: '100%',
-                background: 'var(--accent, #2563eb)',
+                background: status === 'queued' ? 'var(--border-strong, #94a3b8)' : 'var(--accent, #2563eb)',
                 transition: 'width 0.3s ease',
+                animation: status === 'queued' ? 'pulse 1.5s ease-in-out infinite' : 'none',
               }}
             />
+          </div>
+        )}
+
+        {/* Run config bar */}
+        {runConfig && (
+          <div
+            style={{
+              borderBottom: '1px solid var(--border-strong, #e5e7eb)',
+              background: 'var(--bg-elevated, #f8fafc)',
+              fontSize: 11,
+              color: 'var(--text-secondary, #6b7280)',
+            }}
+          >
+            <div
+              onClick={() => setConfigExpanded((x) => !x)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '6px 16px',
+                cursor: 'pointer',
+                userSelect: 'none',
+              }}
+            >
+              <span style={{ fontSize: 10, opacity: 0.5 }}>{configExpanded ? '▼' : '▶'}</span>
+              <span style={{ fontWeight: 600, color: 'var(--text-primary, #111)' }}>Run Config</span>
+              <span style={{ opacity: 0.4 }}>·</span>
+              <span>Method: <strong style={{ color: 'var(--text-primary, #111)' }}>{runConfig.methodLabel}</strong></span>
+              <span style={{ opacity: 0.4 }}>·</span>
+              <span>Objective: <strong style={{ color: 'var(--text-primary, #111)' }}>{runConfig.objectiveLabel}</strong></span>
+              <span style={{ opacity: 0.4 }}>·</span>
+              <span><strong style={{ color: 'var(--text-primary, #111)' }}>{(runConfig.totalCombos || 0).toLocaleString()}</strong> combos</span>
+              <span style={{ marginLeft: 'auto', opacity: 0.4, fontSize: 10 }}>click to {configExpanded ? 'hide' : 'show'} param ranges</span>
+            </div>
+            {configExpanded && runConfig.paramSpecs && runConfig.paramSpecs.length > 0 && (
+              <div
+                style={{
+                  padding: '4px 16px 10px 32px',
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '6px 20px',
+                }}
+              >
+                {runConfig.paramSpecs.map((s) => (
+                  <div
+                    key={s.path}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      fontSize: 11,
+                      background: 'var(--bg-surface, #fff)',
+                      border: '1px solid var(--border-strong, #e5e7eb)',
+                      borderRadius: 4,
+                      padding: '2px 8px',
+                    }}
+                  >
+                    <span style={{ fontWeight: 600, color: 'var(--text-primary, #111)' }}>{s.label}</span>
+                    <span style={{ opacity: 0.5 }}>:</span>
+                    {s.kind === 'enum' ? (
+                      <span style={{ fontFamily: 'monospace' }}>{(s.values || []).join(', ')}</span>
+                    ) : (
+                      <span style={{ fontFamily: 'monospace' }}>
+                        {s.min} → {s.max}
+                        <span style={{ opacity: 0.6 }}> step {s.step}</span>
+                        {s.unit ? <span style={{ opacity: 0.5 }}> {s.unit}</span> : null}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

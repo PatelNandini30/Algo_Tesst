@@ -197,6 +197,29 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
     if native is None:
         return False
     try:
+        # Align options DF to spot DF's max date before writing.
+        # When Parquet options extend further than DB spot data (common when spot
+        # imports lag behind options imports), writing without trimming creates a
+        # feather pair where options_max > spot_max. The staleness check in
+        # base.py then deletes the feather on every request, forcing a 34-second
+        # DB load every time instead of using the feather shortcut. Trimming here
+        # ensures the pair is always internally consistent.
+        if (options_df is not None and not options_df.is_empty()
+                and spot_df is not None and not spot_df.is_empty()):
+            try:
+                import polars as _pl_trim
+                _opt_max = str(options_df["Date"].max())[:10]
+                _spt_max = str(spot_df["Date"].max())[:10]
+                if _spt_max < _opt_max:
+                    logger.debug(
+                        "[RUST_FAST] Trimming options DF from %s to spot max %s (spot behind Parquet)",
+                        _opt_max, _spt_max,
+                    )
+                    _spt_max_val = spot_df["Date"].max()
+                    options_df = options_df.filter(_pl_trim.col("Date") <= _spt_max_val)
+            except Exception as _trim_exc:
+                logger.debug("[RUST_FAST] options trim failed (non-fatal): %s", _trim_exc)
+
         key = _cache_key_for_df(options_df, spot_df, cache_key)
         root = _cache_root() / key
         root.mkdir(parents=True, exist_ok=True)
@@ -288,12 +311,71 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                             return False
                     else:
                         logger.debug("[RUST_FAST] options.feather missing Open/High/Low but caller data also lacks them — keeping feather")
+                # Contracts column is used by the strike-shift validator to
+                # detect zero-turnover (stale-price) strikes. Older feathers
+                # built before this column was added need to be regenerated
+                # so the toward-ATM shift can fire; without it every strike
+                # looks "tradeable" even when it has 0 contracts in Postgres.
+                # We delete the stale feather unconditionally: if options_df
+                # has Contracts the rewrite below picks it up; otherwise the
+                # caller falls back to a DB reload that re-creates the file.
+                if options_path.exists() and "Contracts" not in _hdr.columns:
+                    logger.info("[RUST_FAST] options.feather missing Contracts — forcing regeneration")
+                    options_path.unlink()
+                    if options_df is None:
+                        return False
+                # SettledPrice column is used as MAE/MFE fallback when High and
+                # Low are both 0 (illiquid strike with no intraday trades but a
+                # published settlement). Older feathers built before this column
+                # was added need to be regenerated.
+                if options_path.exists() and "SettledPrice" not in _hdr.columns:
+                    logger.info("[RUST_FAST] options.feather missing SettledPrice — forcing regeneration")
+                    options_path.unlink()
+                    if options_df is None:
+                        return False
             except Exception as _sc:
                 logger.debug("[RUST_FAST] schema check failed: %s", _sc)
 
         if not options_path.exists() or not spot_path.exists():
-            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close"])
+            # Contracts is additive — used by the strike-shift validator to skip
+            # zero-turnover (stale-price) records.  Older feather files without
+            # this column still work: the Rust cache treats absence as "tradeable"
+            # for backwards compatibility.
+            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close", "Contracts", "SettledPrice"])
             _write_feather(spot_df, spot_path, ["Date", "Symbol", "Close"] if "Symbol" in getattr(spot_df, "columns", []) else ["Date", "Close"])
+        # Memory guard: Rust AHashMaps use ~5× the feather file size at runtime
+        # (uncompressed IPC + AHashMap key/value storage + alignment overhead).
+        # Skip the load if that would leave less than 1 GB for the OS/other processes.
+        # RUST_CACHE_MAX_MEMORY_MB caps the cache size independently of available RAM
+        # (default 0 = uncapped). BULK_LOAD_MAX_MEMORY_MB is for Python bulk loading only.
+        _feather_bytes = options_path.stat().st_size if options_path.exists() else 0
+        _estimated_mb = _feather_bytes * 5 / (1024 ** 2)
+        _avail_mb = 0
+        try:
+            with open("/proc/meminfo") as _mf:
+                for _line in _mf:
+                    if _line.startswith("MemAvailable:"):
+                        _avail_mb = int(_line.split()[1]) // 1024
+                        break
+        except Exception:
+            pass  # unknown — proceed without check
+        _oom_risk = _avail_mb > 0 and _estimated_mb > (_avail_mb - 1024)
+        # Default 2500 MB keeps total worker RSS within the 3200 MB --max-memory-per-child
+        # limit (2500 MB cache + ~700 MB Python/Celery overhead). Override via env var.
+        _hard_cap_mb = int(os.environ.get("RUST_CACHE_MAX_MEMORY_MB", "2500"))
+        _cap_exceeded = _hard_cap_mb > 0 and _estimated_mb > _hard_cap_mb
+        if _oom_risk or _cap_exceeded:
+            reason = (
+                f"OOM risk (need ~{_estimated_mb:.0f} MB, only {_avail_mb - 1024:.0f} MB headroom)"
+                if _oom_risk
+                else f"exceeds RUST_CACHE_MAX_MEMORY_MB={_hard_cap_mb} MB"
+            )
+            logger.warning(
+                "[RUST_FAST] Skipping cache load — feather %.0f MB × 5 ≈ %.0f MB: %s. "
+                "Set RUST_CACHE_MAX_MEMORY_MB=0 to uncap or reduce feather size.",
+                _feather_bytes / (1024 ** 2), _estimated_mb, reason,
+            )
+            return False
         native.load_cache(str(options_path), str(spot_path))
         _loaded_cache_key = key
         _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))

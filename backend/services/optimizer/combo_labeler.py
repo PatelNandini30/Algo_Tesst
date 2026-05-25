@@ -25,8 +25,16 @@ from typing import Any, Dict, Optional
 from services.optimizer.param_expander import get_by_path
 
 
-def _strike_label(strike_selection: Optional[Dict[str, Any]]) -> str:
-    """Render a single leg's strike spec into '0.5%_OTM' / 'ATM' / '2.0%_ITM'."""
+def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str = "CE") -> str:
+    """Render a single leg's strike spec into '0.5%_OTM' / 'ATM' / '2.0%_ITM'.
+
+    option_type is required for pct_of_atm because the direction field is stored
+    as '+'/'-' (engine sign convention), not 'OTM'/'ITM'. The semantic meaning
+    of '+'/'-' flips between calls and puts:
+
+        CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
+        PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
+    """
     if not isinstance(strike_selection, dict):
         return "-"
     kind = (strike_selection.get("type") or "").lower()
@@ -38,9 +46,38 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]]) -> str:
             val = float(strike_selection.get("value", 0))
         except (TypeError, ValueError):
             val = 0.0
-        direction = (strike_selection.get("direction") or "OTM").upper()
-        # negative pct + OTM is unusual; keep raw sign
-        return f"{abs(val):g}%_{direction}"
+        raw_dir = str(strike_selection.get("direction") or "").strip()
+        is_call = option_type.upper().startswith("C")
+
+        if raw_dir.upper() in ("OTM", "ITM", "ATM"):
+            # Already a semantic label — use val as magnitude directly.
+            if val == 0.0 or raw_dir.upper() == "ATM":
+                return "ATM"
+            return f"{abs(val):g}%_{raw_dir.upper()}"
+
+        # Engine sign convention: "+" means add val% above ATM, "-" means below.
+        # Default (empty direction) matches the strike-picker default in
+        # engine_rust.py:_compute_strike_for_leg_python which does
+        #     raw = entry_spot - shift if direction == "-" else entry_spot + shift
+        # i.e. anything that isn't "-" behaves as "+" (add shift above ATM).
+        # Previously this defaulted to -1, which mislabeled positive values as
+        # ITM when the engine actually placed them OTM (above spot for CE).
+        # When the optimizer sweeps value through negative territory (e.g. val=-1
+        # with direction="+") the net offset is negative = below ATM = ITM for CE.
+        dir_sign = -1 if raw_dir == "-" else +1
+        net_offset = dir_sign * val
+        abs_val = abs(net_offset)
+
+        if abs_val == 0.0:
+            return "ATM"
+
+        # Above ATM (net_offset > 0): OTM for CE, ITM for PE.
+        # Below ATM (net_offset < 0): ITM for CE, OTM for PE.
+        if net_offset > 0:
+            direction = "OTM" if is_call else "ITM"
+        else:
+            direction = "ITM" if is_call else "OTM"
+        return f"{abs_val:g}%_{direction}"
     if kind == "atm_straddle_prem_pct":
         try:
             val = float(strike_selection.get("value", 0))
@@ -61,7 +98,7 @@ def _spot_adjustment_label(payload: Dict[str, Any]) -> str:
         return "NoAdjustment"
     direction = (payload.get("spot_adjustment_direction") or "").lower()
     try:
-        pct = float(payload.get("spot_adjustment_pct", 0))
+        pct = float(payload.get("spot_adjustment_value") or payload.get("spot_adjustment_pct") or 0)
     except (TypeError, ValueError):
         pct = 0.0
     pct_str = f"{pct:g}%"
@@ -146,8 +183,8 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     """
     ce_leg = _find_leg(payload, "CE")
     pe_leg = _find_leg(payload, "PE")
-    call_strike = _strike_label(ce_leg.get("strike_selection") if ce_leg else None)
-    put_strike = _strike_label(pe_leg.get("strike_selection") if pe_leg else None)
+    call_strike = _strike_label(ce_leg.get("strike_selection") if ce_leg else None, "CE")
+    put_strike = _strike_label(pe_leg.get("strike_selection") if pe_leg else None, "PE")
     call_pos = _position_label(ce_leg)
     put_pos = _position_label(pe_leg)
     spot_adj = _spot_adjustment_label(payload)

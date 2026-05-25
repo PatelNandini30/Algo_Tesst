@@ -763,9 +763,9 @@ const buildExcelFileName = (config) => {
       const criteria = leg.strike_criteria || 'strike_type';
       if (criteria === 'pct_of_atm') {
         const pctVal = leg.pct_value != null ? parseFloat(leg.pct_value) : 0;
-        const pctDir = (leg.pct_direction || '-') === '+' ? 'Plus' : 'Minus';
+        const moneyness = (leg.pct_atm_moneyness || 'OTM').toUpperCase();
         const pctStr = Number.isInteger(pctVal) ? String(pctVal) : parseFloat(pctVal.toFixed(2)).toString();
-        parts.push(`ATM_${pctDir}_${pctStr}PCT`);
+        parts.push(`ATM_${pctStr}PCT_${moneyness}`);
       } else if (criteria === 'atm_straddle_prem_pct') {
         parts.push('STRADDLE');
       } else {
@@ -1185,6 +1185,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const hasReEntry = sourceTrades.some(t => (
       Boolean(t['ReEntryIndex'] || t['ReEntryTrigger'] || t['ReEntryMode']) || isLazyLegRow(t)
     ));
+    const hasStrikeShift = sourceTrades.some(t => Boolean(t['Strike Shift Reason']));
 
     const getReEntryType = (trade) => {
       if (isLazyLegRow(trade)) return 'Lazy';
@@ -1195,7 +1196,24 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       return trade?.['ReEntryIndex'] ? 'Re-Entry' : '';
     };
 
+    // Primary sort: Entry Date so spot-adj re-entries (which carry NEW higher
+    // trade IDs but earlier entry dates than later originals) appear in
+    // chronological position instead of being dumped at the bottom.
+    const parseTradeDate = (raw) => {
+      if (!raw) return Infinity;
+      if (raw instanceof Date) return raw.getTime();
+      const s = String(raw).trim();
+      const m1 = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+      if (m1) { const [, d, mo, y] = m1; return Date.UTC(+y, +mo - 1, +d); }
+      const m2 = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+      if (m2) { const [, y, mo, d] = m2; return Date.UTC(+y, +mo - 1, +d); }
+      const t = Date.parse(s);
+      return Number.isNaN(t) ? Infinity : t;
+    };
     const sortedTrades = [...sourceTrades].sort((a, b) => {
+      const dA = parseTradeDate(a['Entry Date'] || a.entry_date);
+      const dB = parseTradeDate(b['Entry Date'] || b.entry_date);
+      if (dA !== dB) return dA - dB;
       const tA = parseInt(a.Trade||a.trade||1,10), tB = parseInt(b.Trade||b.trade||1,10);
       if (tA !== tB) return tA - tB;
       return parseInt(a.Leg||a.leg||1,10) - parseInt(b.Leg||b.leg||1,10);
@@ -1319,7 +1337,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Lowest NAV','Actual Live DD',
     ]);
     const keyOrder = [
-      'Trade','Leg','Index','Entry Date','Exit Date','DTE','Expiry',
+      'Trade','Leg','Index','Entry Date','Exit Date','Expiry',
       'Entry Spot','Exit Spot','Spot P&L','Spot P&L %',
       'Type','Strike',
       ...(hasBuffer ? ['buffer_ref_price', 'buffer_strike_offset'] : []),
@@ -1335,6 +1353,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       ...(hasFutures ? ['FUT P&L'] : []),
       'Net P&L','% P&L','Cumulative','Peak','DD','%DD','Lowest NAV','Actual Live DD',
       'Exit Reason',
+      ...(hasStrikeShift ? ['Strike Shift Reason'] : []),
       ...(hasStr ? ['STR Segment'] : []),
       ...(hasFilterSegment ? ['Filter Segment'] : []),
     ];
@@ -1353,30 +1372,63 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       tm[k] = { net, pct:(spot>0?(net/spot)*100:0),
                 netMae1:tradeMae?.netMae1 ?? '', netMae2:tradeMae?.netMae2 ?? '', finalMae:tradeMae?.finalMae ?? '',
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
-                dd:toN(r['DD']), pctDd:toN(r['%DD']) };
+                dd:toN(r['DD']), pctDd: (() => { const v = toN(r['%DD']); return v !== '' ? v / 100 : ''; })() };
     });
 
-    // Compute Lowest NAV and Actual Live DD in trade order.
-    // Lowest NAV = prev_closing_NAV × (1 + finalMae / 100)  — worst equity point during the trade
-    // Actual Live DD = (lowestNav / peak − 1) × 100         — % drawdown from peak using that intra-trade low
+    // Lowest NAV and Actual Live DD
+    // Excel formula: AS2=AN2 (first trade), AS_n=AN_(n-1)*(1+AR_n%) for all subsequent trades
+    // Walk in CHRONOLOGICAL (Entry Date) order, not by raw Trade ID — cascade
+    // re-entry mini-trades carry high engine IDs but appear chronologically
+    // between earlier originals, so sorting by parseInt(Trade ID) breaks the chain.
     {
-      const sortedTmKeys = Object.keys(tm).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+      const _seenTm = new Set();
+      const sortedTmKeys = [];
+      sortedTrades.forEach(_tr => {
+        const _k = String(_tr.Trade || _tr.trade || 1);
+        if (!_seenTm.has(_k)) {
+          _seenTm.add(_k);
+          if (tm[_k]) sortedTmKeys.push(_k);
+        }
+      });
       let prevCum = 100;
+      let firstTradeDone = false;
       sortedTmKeys.forEach(k => {
-        const t = tm[k];
-        const mae  = (t.finalMae !== '' && t.finalMae != null) ? t.finalMae  : null;
-        const peak = (t.peak      !== '' && t.peak      != null) ? t.peak     : null;
+        const t    = tm[k];
+        const mae  = (t.finalMae  !== '' && t.finalMae  != null) ? t.finalMae  : null;
+        const peak = (t.peak      !== '' && t.peak      != null) ? t.peak      : null;
+        const cum  = (t.cumulative !== '' && t.cumulative != null) ? t.cumulative : null;
         if (mae != null && peak != null && peak !== 0) {
-          const lowestNav   = Math.round(prevCum * (1 + mae / 100) * 100) / 100;
-          const actualLiveDD = Math.round((lowestNav / peak - 1) * 10000) / 100;
+          // Research-team formula (matches column BE of research workbook):
+          //   Trade 1: lowestNav = cumulative
+          //   Trade N: lowestNav = prev_cumulative * (1 + Final MAE_N / 100)
+          // Store full precision; cell numFmt '#,##0.00' renders 2 decimals.
+          const lowestNav = (!firstTradeDone && cum != null)
+            ? cum
+            : prevCum * (1 + mae / 100);
+          const actualLiveDD = (lowestNav / peak - 1) * 100;
           t.lowestNav    = lowestNav;
           t.actualLiveDD = actualLiveDD;
+          firstTradeDone = true;
         } else {
           t.lowestNav    = '';
           t.actualLiveDD = '';
+          firstTradeDone = true;
         }
-        if (t.cumulative !== '' && t.cumulative != null) prevCum = t.cumulative;
+        if (cum != null) prevCum = cum;
       });
+    }
+
+    // engine_tid → sequential display number based on first chronological
+    // appearance. Spot-adj re-entries get higher engine IDs (380+) but should
+    // show the user-friendly position they occupy in the sorted tradesheet.
+    const _tidToIndexNo = {};
+    let _seqNo = 0;
+    for (const _t of sortedTrades) {
+      const _ek = String(_t.Trade || _t.trade || 1);
+      if (!(_ek in _tidToIndexNo)) {
+        _seqNo += 1;
+        _tidToIndexNo[_ek] = _seqNo;
+      }
     }
 
     const written = new Set();
@@ -1402,13 +1454,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           else if (key==='Actual Live DD') val=m.actualLiveDD;
         } else if (key==='Leg' && isLazyLegRow(trade)) val=trade['Lazy Leg Name'] || trade[key];
         else if (key==='Re-Entry Type') val=getReEntryType(trade);
-        else if (key==='Index') val=parseInt(trade.Trade||trade.trade||1,10);
+        else if (key==='Index') val=_tidToIndexNo[k] ?? parseInt(trade.Trade||trade.trade||1,10);
+        else if (key==='Trade') val=_tidToIndexNo[k] ?? parseInt(trade.Trade||trade.trade||1,10);
         else if (key==='Exit Date') val=getVisibleExitDate(trade);
-        else if (key==='DTE') {
-          const entryMs = parseExportDateMs(trade['Entry Date']);
-          const exitMs = parseExportDateMs(getVisibleExitDate(trade));
-          val = entryMs != null && exitMs != null ? Math.round((exitMs - entryMs) / 86400000) : '';
-        }
         else if (key==='Spot P&L %') {
           let spotPnl = trade['Spot P&L'];
           if (toNumber(spotPnl) == null) {
@@ -1418,8 +1466,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           }
           val = pctOfBase(spotPnl, trade['Entry Spot']);
         }
-        else if (key==='CE P&L %') val=pctOfBase(trade['CE P&L'], trade['Exit Spot']);
-        else if (key==='PE P&L %') val=pctOfBase(trade['PE P&L'], trade['Exit Spot']);
+        else if (key==='CE P&L %') val=pctOfBase(trade['CE P&L'], trade['Entry Spot']);
+        else if (key==='PE P&L %') val=pctOfBase(trade['PE P&L'], trade['Entry Spot']);
         else if (key==='Expiry') val=formatDateToDdMmYyyy(
           trade['Future Expiry'] || trade['futures_expiry'] || trade['Expiry']
         );
@@ -1442,10 +1490,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state:'frozen', ySplit:1 }] });
 
     // Column widths
-    const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'DTE':8,'Entry Spot':12,'Exit Spot':12,
+    const colWidths = { 'Leg':12,'Entry Date':13,'Exit Date':13,'Entry Spot':12,'Exit Spot':12,
       'buffer_ref_price':12,'buffer_strike_offset':10,'Re-Entry Type':14,'Raw Entry Price':12,'Entry Price':12,'Raw Exit Price':12,'Exit Price':12,'MAE':9,'MFE':9,'Net MAE 1':10,'Net MAE 2':10,'Final MAE':10,'Net P&L':10,'% P&L':8,'Cumulative':11,'Peak':10,'DD':9,'%DD':8,'Lowest NAV':13,'Actual Live DD':15,
-      'Spot P&L %':10,'CE P&L %':10,'PE P&L %':10,'Exit Reason':14,'Expiry':12,'STR Segment':14,'Filter Segment':18 };
-    const truePctCols = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %']);
+      'Spot P&L %':10,'CE P&L %':10,'PE P&L %':10,'Exit Reason':14,'Strike Shift Reason':40,'Expiry':12,'STR Segment':14,'Filter Segment':18 };
+    const truePctCols = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %', '%DD']);
     ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 
     // Header row style
@@ -1619,10 +1667,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const _winRateJS    = _totalCntJS > 0 ? (_winCntJS  / _totalCntJS) * 100 : 0;
     const _lossRateJS   = _totalCntJS > 0 ? (_lossCntJS / _totalCntJS) * 100 : 0;
     const _avgNetJS     = _totalCntJS > 0 ? (_sumNetJS  / _totalCntJS) : 0;
-    // Expectancy = (Win% × AvgWin - Loss% × |AvgLoss|) / |AvgLoss|, using decimals
-    const _expectancyJS = _avgLossPctJS !== 0
-      ? (((_winRateJS/100) * _avgWinPctJS - (_lossRateJS/100) * Math.abs(_avgLossPctJS)) / Math.abs(_avgLossPctJS))
-      : 0;
+    // Use backend-computed expectancy (research-verified, same as sidebar display)
+    const _expectancyJS = typeof summary?.expectancy === 'number' ? summary.expectancy : 0;
     const _yearsJS = (_minEntryMs != null && _maxExitMs != null)
       ? (_maxExitMs - _minEntryMs) / (365.25 * 86400000)
       : 0;
@@ -1735,11 +1781,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       _roiVal.border = thinBorder(C.border);
 
       // Rows
-      _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS); row++;
-      if (hasCalls) { _addTypeRow('CE P&L', _ceSumJS, _cePctJS); row++; }
-      if (hasPuts)  { _addTypeRow('PE P&L', _peSumJS, _pePctJS); row++; }
+      _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS * 100); row++;
+      if (hasCalls) { _addTypeRow('CE P&L', _ceSumJS, _cePctJS * 100); row++; }
+      if (hasPuts)  { _addTypeRow('PE P&L', _peSumJS, _pePctJS * 100); row++; }
       if (hasFutures) { _addTypeRow('FUT P&L', _futSumJS, null); row++; }
-      if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS, _cePctJS + _pePctJS); row++; }
+      if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS, (_cePctJS + _pePctJS) * 100); row++; }
       _addTypeRow('Net P&L', _sumNetJS, _sumPctJS); row++;
     }
 
@@ -1765,12 +1811,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     ws2.getRow(row).height = 18;
     row++;
 
-    // Return / MaxDD = ABS(Options CAGR / Max Drawdown)  — research team's formula
-    // Reward to Risk = ABS(AvgWin / AvgLoss)
-    const _carMddJS = _maxDDPctJS !== 0 ? Math.abs(_optCagrPctJS / _maxDDPctJS) : 0;
-    const _rewardJS = _avgLossPctJS !== 0 ? Math.abs(_avgWinPctJS / _avgLossPctJS) : 0;
-    kv('Return / MaxDD', _carMddJS.toFixed(2),  row, 'A', true);
-    kv('Reward to Risk', _rewardJS.toFixed(2),  row++, 'D', true);
+    const _carMddJS = _maxDDPctJS !== 0 ? (_optCagrPctJS / 100) / Math.abs(_maxDDPctJS) : 0;
+    kv('Return / MaxDD', _carMddJS.toFixed(4),  row++, 'A', true);
 
     row++;
 
@@ -1839,17 +1881,26 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     const byYM = {};
     const byYMPct = {};
+    const byYMSpot = {};
+    const byYMSpotPct = {};
     groupedTrades.forEach(group => {
       const exitDate = group?.exitDate || '';
       const ym = parseToYearMonth(exitDate);
       if (!ym) return;
-      const net  = Number(group?.totalPnl ?? 0) || 0;
-      const spot = Number(group?.entrySpot ?? 0) || 0;
-      const pct  = spot > 0 ? (net / spot) * 100 : 0;
-      if (!byYM[ym.year])    byYM[ym.year]    = Array(12).fill(0);
-      if (!byYMPct[ym.year]) byYMPct[ym.year] = Array(12).fill(0);
-      byYM[ym.year][ym.monthIdx]    = (byYM[ym.year][ym.monthIdx]    || 0) + net;
-      byYMPct[ym.year][ym.monthIdx] = (byYMPct[ym.year][ym.monthIdx] || 0) + pct;
+      const net     = Number(group?.totalPnl ?? 0) || 0;
+      const eSpot   = Number(group?.entrySpot ?? 0) || 0;
+      const xSpot   = Number(group?.exitSpot  ?? 0) || 0;
+      const pct     = eSpot > 0 ? (net / eSpot) * 100 : 0;
+      const spotPnl = xSpot - eSpot;
+      const spotPct = eSpot > 0 ? (spotPnl / eSpot) * 100 : 0;
+      if (!byYM[ym.year])       byYM[ym.year]       = Array(12).fill(0);
+      if (!byYMPct[ym.year])    byYMPct[ym.year]    = Array(12).fill(0);
+      if (!byYMSpot[ym.year])   byYMSpot[ym.year]   = Array(12).fill(0);
+      if (!byYMSpotPct[ym.year])byYMSpotPct[ym.year]= Array(12).fill(0);
+      byYM[ym.year][ym.monthIdx]       = (byYM[ym.year][ym.monthIdx]       || 0) + net;
+      byYMPct[ym.year][ym.monthIdx]    = (byYMPct[ym.year][ym.monthIdx]    || 0) + pct;
+      byYMSpot[ym.year][ym.monthIdx]   = (byYMSpot[ym.year][ym.monthIdx]   || 0) + spotPnl;
+      byYMSpotPct[ym.year][ym.monthIdx]= (byYMSpotPct[ym.year][ym.monthIdx]|| 0) + spotPct;
     });
 
     const mthData = Object.entries(byYM).sort().map(([yr, mos]) => {
@@ -1940,6 +1991,109 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       row++;
     });
 
+    // ── SECTION 4c: Monthly Returns (₹ Spot P&L) ─────────────────────────────
+    row++;
+    addSectionHeader('MONTHLY RETURNS (₹ Spot P&L)', row++);
+
+    const mthHdrSpot = ['Year',...MONTHS,'Total'];
+    for (let ci = 0; ci < mthHdrSpot.length; ci++) {
+      ws2.getColumn(ci+1).width = ci===0 ? 8 : 9;
+    }
+    const hdrRowSpot = ws2.getRow(row);
+    mthHdrSpot.forEach((h, ci) => {
+      const cell = hdrRowSpot.getCell(ci+1);
+      cell.value = h;
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    hdrRowSpot.height = 20;
+    row++;
+
+    const mthDataSpot = Object.entries(byYMSpot).sort().map(([yr, mos]) => {
+      const total = mos.reduce((s, v) => s + v, 0);
+      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2)];
+    });
+    mthDataSpot.forEach((dataRow, ri) => {
+      const r2 = ws2.getRow(row);
+      dataRow.forEach((val, ci) => {
+        const cell = r2.getCell(ci+1);
+        cell.value = val;
+        const num = typeof val==='number' ? val : parseFloat(String(val||'').replace(/[%,]/g,''));
+        const isValCol = ci>=1 && ci<=12;
+        const isTotalCol = ci===13;
+        if ((isValCol||isTotalCol) && !isNaN(num) && num!==0) {
+          cell.font = boldFont(10, num>=0 ? C.greenTx : C.redTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: num>=0 ? C.greenBg : C.redBg };
+        } else if (ci===0) {
+          cell.font = boldFont(10, C.subHdrTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: C.subHdrBg };
+        } else {
+          cell.font = normFont(10);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: ri%2===0?C.white:C.altRow };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      row++;
+    });
+
+    // ── SECTION 4d: Monthly Returns (% Spot P&L) ─────────────────────────────
+    row++;
+    addSectionHeader('MONTHLY RETURNS (% Spot P&L)', row++);
+
+    const mthHdrSpotPct = ['Year',...MONTHS,'Total'];
+    for (let ci = 0; ci < mthHdrSpotPct.length; ci++) {
+      ws2.getColumn(ci+1).width = ci===0 ? 8 : 9;
+    }
+    const hdrRowSpotPct = ws2.getRow(row);
+    mthHdrSpotPct.forEach((h, ci) => {
+      const cell = hdrRowSpotPct.getCell(ci+1);
+      cell.value = h;
+      cell.font  = boldFont(10, C.navyText);
+      cell.fill  = { type:'pattern', pattern:'solid', fgColor: C.headerBg };
+      cell.alignment = centerAlign;
+      cell.border = thinBorder();
+    });
+    hdrRowSpotPct.height = 20;
+    row++;
+
+    const mthDataSpotPct = Object.entries(byYMSpotPct).sort().map(([yr, mos]) => {
+      const total = mos.reduce((s, v) => s + v, 0);
+      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2)];
+    });
+    mthDataSpotPct.forEach((dataRow, ri) => {
+      const r2 = ws2.getRow(row);
+      dataRow.forEach((val, ci) => {
+        const cell = r2.getCell(ci+1);
+        const isValCol   = ci >= 1 && ci <= 12;
+        const isTotalCol = ci === 13;
+        if (isValCol || isTotalCol) {
+          cell.value = typeof val === 'number' ? val / 100 : val;
+          cell.numFmt = '0.00%';
+        } else {
+          cell.value = val;
+        }
+        const num = typeof val === 'number' ? val : parseFloat(String(val||''));
+        if ((isValCol||isTotalCol) && !isNaN(num) && num!==0) {
+          cell.font = boldFont(10, num>=0 ? C.greenTx : C.redTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: num>=0 ? C.greenBg : C.redBg };
+        } else if (ci===0) {
+          cell.font = boldFont(10, C.subHdrTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: C.subHdrBg };
+        } else {
+          cell.font = normFont(10);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: ri%2===0?C.white:C.altRow };
+        }
+        cell.alignment = centerAlign;
+        cell.border = thinBorder();
+      });
+      r2.height = 18;
+      row++;
+    });
+
     // ── SECTION 5: Live DD & Outlier Analysis ─────────────────────────────────
     row++;
     addSectionHeader('LIVE DD & OUTLIER ANALYSIS', row++);
@@ -1962,6 +2116,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const _negOutlier1Pct = _nTrades > 0 ? _byPctDesc[_nTrades - 1].pct : 0;
     const _negOutlier2Pct = _nTrades > 1 ? _byPctDesc[_nTrades - 1].pct + _byPctDesc[_nTrades - 2].pct : _negOutlier1Pct;
     const _negOutlier3Pct = _nTrades > 2 ? _byPctDesc[_nTrades - 1].pct + _byPctDesc[_nTrades - 2].pct + _byPctDesc[_nTrades - 3].pct : _negOutlier2Pct;
+
+    const _totalPctSumO = _tradePairs.reduce((s, p) => s + p.pct, 0);
+    const _pctNoO1 = _totalPctSumO - _posOutlier1Pct - _negOutlier1Pct;
+    const _pctNoO2 = _totalPctSumO - _posOutlier2Pct - _negOutlier2Pct;
+    const _pctNoO3 = _totalPctSumO - _posOutlier3Pct - _negOutlier3Pct;
 
     // Live DD min/avg excluding top excTop and bottom excBot trades by % P&L rank
     const _liveDDExcStats = (excTop, excBot) => {
@@ -1986,64 +2145,55 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const _liveDDNoO2 = _liveDDExcStats(2, 2);
     const _liveDDNoO3 = _liveDDExcStats(3, 3);
     const _carMddLiveJS = _actualLiveDDMin !== 0
-      ? +(_optCagrPctJS / Math.abs(_actualLiveDDMin)).toFixed(2) : 0;
+      ? (_optCagrPctJS / 100) / Math.abs(_actualLiveDDMin) : 0;
 
     // KV summary rows
     kv('Actual Live DD (min)', `${_actualLiveDDMin.toFixed(2)}%`, row, 'A', false, C.redTx);
     kv('Avg Actual Live DD',   `${_actualLiveDDAvg.toFixed(2)}%`, row++, 'D', false, C.redTx);
-    kv('CAR/MDD (Booked)',     _carMddJS.toFixed(2),              row, 'A', true,
+    kv('CAR/MDD (Booked)',     _carMddJS.toFixed(4),              row, 'A', true,
        _carMddJS >= 0 ? C.greenTx : C.redTx);
-    kv('CAR/MDD Live',         _carMddLiveJS.toFixed(2),          row++, 'D', true,
+    kv('CAR/MDD Live',         _carMddLiveJS.toFixed(4),          row++, 'D', true,
        _carMddLiveJS >= 0 ? C.greenTx : C.redTx);
 
     row++;
 
     // Outlier table — 5 columns
-    ws2.getColumn(1).width = 28;
-    ws2.getColumn(2).width = 22;
-    ws2.getColumn(3).width = 22;
-    ws2.getColumn(4).width = 22;
-    ws2.getColumn(5).width = 24;
+    // Outlier rows — exact Excel column names (Q/R/S/T, U/V/W/X, Y/Z/AA/AB)
+    kv('+ve Outlier 1',                        _fmtPct(_posOutlier1Pct),          row, 'A', false, C.greenTx);
+    kv('-ve Outlier 1',                        _fmtPct(_negOutlier1Pct),          row++, 'D', false, C.redTx);
+    kv('Actual Live DD Without Outlier 1',     `${_liveDDNoO1.min.toFixed(2)}%`,  row, 'A', true,  C.redTx);
+    kv('Avg Actual Live DD Without Outlier 1', `${_liveDDNoO1.avg.toFixed(2)}%`,  row++, 'D', true,  C.redTx);
+    kv('+ve Outlier 2',                        _fmtPct(_posOutlier2Pct),          row, 'A', false, C.greenTx);
+    kv('-ve Outlier 2',                        _fmtPct(_negOutlier2Pct),          row++, 'D', false, C.redTx);
+    kv('Actual Live DD Without Outlier 2',     `${_liveDDNoO2.min.toFixed(2)}%`,  row, 'A', true,  C.redTx);
+    kv('Avg Actual Live DD Without Outlier 2', `${_liveDDNoO2.avg.toFixed(2)}%`,  row++, 'D', true,  C.redTx);
+    kv('+ve Outlier 3',                        _fmtPct(_posOutlier3Pct),          row, 'A', false, C.greenTx);
+    kv('-ve Outlier 3',                        _fmtPct(_negOutlier3Pct),          row++, 'D', false, C.redTx);
+    kv('Actual Live DD Without Outlier 3',     `${_liveDDNoO3.min.toFixed(2)}%`,  row, 'A', true,  C.redTx);
+    kv('Avg Actual Live DD Without Outlier 3', `${_liveDDNoO3.avg.toFixed(2)}%`,  row++, 'D', true,  C.redTx);
 
-    const _oHdrs = ['Outlier Set', '+ve Outlier (% P&L)', '-ve Outlier (% P&L)', 'Actual Live DD (%)', 'Avg Actual Live DD (%)'];
-    const _oHdrRow = ws2.getRow(row);
-    _oHdrs.forEach((h, ci) => {
-      const cell = _oHdrRow.getCell(ci + 1);
-      cell.value = h;
-      cell.font  = boldFont(10, C.navyText);
-      cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
-      cell.alignment = centerAlign;
-      cell.border = thinBorder();
-    });
-    _oHdrRow.height = 20;
+    // CE + PE + P&L % Without Top N Outliers
+    // Formula: totalSum - posOutlierSum - negOutlierSum  (matches Excel C3-R3-Q3, C3-V3-U3, C3-Z3-Y3)
     row++;
-
-    const _oRows = [
-      ['All Trades',         _fmtPct(_posOutlier1Pct), _fmtPct(_negOutlier1Pct), `${_actualLiveDDMin.toFixed(2)}%`, `${_actualLiveDDAvg.toFixed(2)}%`],
-      ['Without Outlier 1',  _fmtPct(_posOutlier1Pct), _fmtPct(_negOutlier1Pct), `${_liveDDNoO1.min.toFixed(2)}%`, `${_liveDDNoO1.avg.toFixed(2)}%`],
-      ['Without Outlier 2',  _fmtPct(_posOutlier2Pct), _fmtPct(_negOutlier2Pct), `${_liveDDNoO2.min.toFixed(2)}%`, `${_liveDDNoO2.avg.toFixed(2)}%`],
-      ['Without Outlier 3',  _fmtPct(_posOutlier3Pct), _fmtPct(_negOutlier3Pct), `${_liveDDNoO3.min.toFixed(2)}%`, `${_liveDDNoO3.avg.toFixed(2)}%`],
-    ];
-
-    _oRows.forEach((dataRow, ri) => {
+    [
+      ['CE + PE + P&L % Without Top 1 Outliers', _pctNoO1],
+      ['CE + PE + P&L % Without Top 2 Outliers', _pctNoO2],
+      ['CE + PE + P&L % Without Top 3 Outliers', _pctNoO3],
+    ].forEach(([label, val], ri) => {
       const r2 = ws2.getRow(row);
-      dataRow.forEach((val, ci) => {
-        const cell = r2.getCell(ci + 1);
-        cell.value = val;
-        const bg = ri % 2 === 0 ? C.white : C.altRow;
-        if (ci === 0) {
-          cell.font = boldFont(10, { argb: 'FF2C3E50' });
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.labelBg };
-        } else if (ci === 1) {
-          cell.font = boldFont(10, C.greenTx);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri === 0 ? C.greenBg : bg };
-        } else {
-          cell.font = boldFont(10, C.redTx);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri === 0 ? C.redBg : bg };
-        }
-        cell.alignment = centerAlign;
-        cell.border = thinBorder();
-      });
+      ws2.mergeCells(`A${row}:D${row}`);
+      const lCell = r2.getCell(1);
+      lCell.value = label;
+      lCell.font = boldFont(10, { argb: 'FF2C3E50' });
+      lCell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.labelBg : C.altRow };
+      lCell.alignment = leftAlign;
+      lCell.border = thinBorder();
+      const vCell = r2.getCell(5);
+      vCell.value = _fmtPct(val);
+      vCell.font = boldFont(10, val >= 0 ? C.greenTx : C.redTx);
+      vCell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
+      vCell.alignment = centerAlign;
+      vCell.border = thinBorder();
       r2.height = 18;
       row++;
     });

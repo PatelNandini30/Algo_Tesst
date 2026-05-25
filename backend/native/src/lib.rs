@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::RwLock;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use arrow_array::{
     Array, ArrayRef, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array, Int64Array,
     LargeStringArray, StringArray, TimestampMillisecondArray, TimestampMicrosecondArray,
@@ -35,10 +35,17 @@ struct MarketCache {
     options_low: AHashMap<(i32, u16, i64, u8, i32), f64>,
     // Same key → day OPEN price. Used by SL-with-Buffer gap detection.
     options_open: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    // Same key → day SETTLED price. Used as MAE/MFE high/low fallback when
+    // High and Low are both 0 (no intraday trades but settlement published).
+    options_settled: AHashMap<(i32, u16, i64, u8, i32), f64>,
     // (date_days, symbol_id) → spot_close
     spot: AHashMap<(i32, u16), f64>,
     // (date_days, symbol_id, expiry_days, opttype_id) → sorted [(strike, close)]
     strikes: AHashMap<(i32, u16, i32, u8), Vec<(f64, f64)>>,
+    // Strikes with `contracts == 0` (zero turnover) — treated as untradeable by
+    // the strike-shift validator (stale EOD prices carried over).  Empty when
+    // the feather lacks the Contracts column (backwards compatible).
+    untradeable: AHashSet<(i32, u16, i64, u8, i32)>,
     // Symbol interning: name → u16 id
     symbol_ids: AHashMap<String, u16>,
     // Reverse: id → name (for debug / serialisation)
@@ -52,8 +59,10 @@ impl Default for MarketCache {
             options_high: AHashMap::new(),
             options_low: AHashMap::new(),
             options_open: AHashMap::new(),
+            options_settled: AHashMap::new(),
             spot: AHashMap::new(),
             strikes: AHashMap::new(),
+            untradeable: AHashSet::new(),
             symbol_ids: AHashMap::new(),
             symbol_names: Vec::new(),
         }
@@ -256,6 +265,68 @@ fn opt_type_to_id(s: &str) -> u8 {
     if s.trim().eq_ignore_ascii_case("CE") { 0 } else { 1 }
 }
 
+/// Three-way status of a strike's data on a given (date, expiry):
+///   - `Tradeable(price)` → contract exists with non-zero turnover, price is real
+///   - `ZeroContracts`    → contract row exists but contracts==0 (stale close)
+///   - `Missing`          → no row at all in the cache for this strike/expiry
+///
+/// `validate_or_shift_strike` shifts ONLY on `ZeroContracts`.  For `Missing`
+/// the trade is dropped (the strike simply wasn't listed — shifting risks
+/// landing on a wildly different strike).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OptionDataStatus {
+    Tradeable(f64),
+    ZeroContracts,
+    Missing,
+}
+
+pub(crate) fn lookup_option_status(date: &str, index: &str, strike: f64, opt_type: &str, expiry: &str) -> OptionDataStatus {
+    let cache = match CACHE.read() {
+        Ok(c) => c,
+        Err(_) => return OptionDataStatus::Missing,
+    };
+    let cache = match cache.as_ref() { Some(c) => c, None => return OptionDataStatus::Missing };
+    let date_days = match date_str_to_days(&normalize_date_str(date)) { Some(v) => v, None => return OptionDataStatus::Missing };
+    let sym_id = match cache.symbol_ids.get(&index.trim().to_uppercase()).copied() { Some(v) => v, None => return OptionDataStatus::Missing };
+    let strike_key = to_i64_strike(strike);
+    let type_id = opt_type_to_id(opt_type);
+    let expiry_days = match date_str_to_days(&normalize_date_str(expiry)) { Some(v) => v, None => return OptionDataStatus::Missing };
+    let key = (date_days, sym_id, strike_key, type_id, expiry_days);
+    if cache.untradeable.contains(&key) {
+        return OptionDataStatus::ZeroContracts;
+    }
+    if let Some(px) = cache.options.get(&key).copied() {
+        return OptionDataStatus::Tradeable(px);
+    }
+    // Moved-expiry fallback — mirrors lookup_option_price. NSE sometimes lists
+    // a contract under the original (pre-holiday) expiry label (e.g. 29-Jun-2023)
+    // but the schedule resolves to the settlement day (28-Jun-2023). Try
+    // +1..+3 days when the exact expiry misses and entry is before expiry.
+    if date_days < expiry_days {
+        for offset in 1i32..=3 {
+            let alt_expiry = expiry_days + offset;
+            let alt_key = (date_days, sym_id, strike_key, type_id, alt_expiry);
+            if cache.untradeable.contains(&alt_key) {
+                return OptionDataStatus::ZeroContracts;
+            }
+            if let Some(px) = cache.options.get(&alt_key).copied() {
+                return OptionDataStatus::Tradeable(px);
+            }
+        }
+    }
+    OptionDataStatus::Missing
+}
+
+/// Backwards-compatible tradeable lookup: returns Some(price) only when the
+/// strike has real (non-stale) data.  Used by Python callers that just want
+/// a boolean tradeable check.
+pub(crate) fn lookup_option_price_tradeable(date: &str, index: &str, strike: f64, opt_type: &str, expiry: &str) -> Option<f64> {
+    match lookup_option_status(date, index, strike, opt_type, expiry) {
+        OptionDataStatus::Tradeable(px) => Some(px),
+        _ => None,
+    }
+}
+
 pub(crate) fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type: &str, expiry: &str) -> Option<f64> {
     let cache = CACHE.read().ok()?;
     let cache = cache.as_ref()?;
@@ -264,7 +335,28 @@ pub(crate) fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type
     let strike_key = to_i64_strike(strike);
     let type_id = opt_type_to_id(opt_type);
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
-    cache.options.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+    if let Some(px) = cache.options.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied() {
+        return Some(px);
+    }
+    // Moved-expiry fallback.  NSE sometimes lists a contract under one expiry
+    // label (e.g. Thu 29-Jun-2023 — the original weekly) but settles it on an
+    // earlier day (Wed 28-Jun-2023, because Thu 29-Jun was Bakri Eid holiday).
+    // The engine's get_expiry_dates returns the SETTLEMENT day (28-Jun), but
+    // historical chain data is keyed by the ORIGINAL expiry (29-Jun).  When the
+    // direct lookup misses AND the entry date is strictly before the requested
+    // expiry, try +1..+3 days forward — the live contract was almost certainly
+    // listed under the original (slightly later) weekday expiry.
+    // Settlement-day pricing (date == expiry) is unaffected: it uses whatever
+    // expiry the data is keyed by, which IS the moved-settlement label.
+    if date_days < expiry_days {
+        for offset in 1i32..=3 {
+            let alt_expiry = expiry_days + offset;
+            if let Some(px) = cache.options.get(&(date_days, sym_id, strike_key, type_id, alt_expiry)).copied() {
+                return Some(px);
+            }
+        }
+    }
+    None
 }
 
 /// Day HIGH for one option contract on one date. None if absent from cache
@@ -444,6 +536,11 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
         let idx_high = schema.index_of("High").ok();
         let idx_low = schema.index_of("Low").ok();
         let idx_open = schema.index_of("Open").ok();
+        // Contracts is optional — older feathers don't include it.  When present,
+        // the strike-shift validator uses it to skip stale-price records.
+        let idx_contracts = schema.index_of("Contracts").ok();
+        // SettledPrice is optional — MAE/MFE falls back to this when High==Low==0.
+        let idx_settled = schema.index_of("SettledPrice").ok();
 
         // Downcast columns once outside the row loop — critical for performance.
         // Accept both Utf8 (StringArray) and LargeUtf8 (LargeStringArray) — Polars writes large_string.
@@ -456,6 +553,16 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
         let high_arr = idx_high.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
         let low_arr = idx_low.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
         let open_arr = idx_open.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
+        let settled_arr = idx_settled.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>());
+        // Contracts can be stored as Int64 or Float64 depending on the writer.
+        // Try Int64 first (preferred), fall back to Float64 (Polars sometimes
+        // promotes ints when mixed with nulls).
+        let contracts_i64 = idx_contracts.and_then(|i| batch.column(i).as_any().downcast_ref::<arrow_array::Int64Array>());
+        let contracts_f64 = if contracts_i64.is_none() {
+            idx_contracts.and_then(|i| batch.column(i).as_any().downcast_ref::<Float64Array>())
+        } else {
+            None
+        };
         if high_arr.is_some() {
             cache.options_high.reserve(batch.num_rows());
         }
@@ -508,6 +615,29 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
             if let Some(o) = open_arr {
                 if !o.is_null(row) {
                     cache.options_open.insert(key, o.value(row));
+                }
+            }
+            if let Some(s) = settled_arr {
+                if !s.is_null(row) {
+                    let sv = s.value(row);
+                    if sv > 0.0 {
+                        cache.options_settled.insert(key, sv);
+                    }
+                }
+            }
+            // Mark this (date, sym, strike, type, expiry) as untradeable if the
+            // row has Contracts=0 (zero turnover — close is a stale carry-over).
+            // Strike-shift validator uses this to skip the strike.
+            let contracts_val: Option<i64> = if let Some(arr) = contracts_i64 {
+                if arr.is_null(row) { None } else { Some(arr.value(row)) }
+            } else if let Some(arr) = contracts_f64 {
+                if arr.is_null(row) { None } else { Some(arr.value(row) as i64) }
+            } else {
+                None
+            };
+            if let Some(c) = contracts_val {
+                if c <= 0 {
+                    cache.untradeable.insert(key);
                 }
             }
             cache.strikes
@@ -616,6 +746,26 @@ fn get_option_price(date: String, index: String, strike: f64, opt_type: String, 
     lookup_option_price(&date, &index, strike, &opt_type, &expiry)
 }
 
+/// Tradeable variant: returns None for zero-turnover (stale) records.
+/// Used by the Python cascade-reentry strike validator.
+#[pyfunction]
+fn get_option_price_tradeable(date: String, index: String, strike: f64, opt_type: String, expiry: String) -> Option<f64> {
+    lookup_option_price_tradeable(&date, &index, strike, &opt_type, &expiry)
+}
+
+/// Three-way data status as a string: "tradeable", "zero_contracts", or "missing".
+/// Used by the Python strike-shift validator to differentiate "no record at all"
+/// (don't shift) from "stale-price record" (do shift).
+#[pyfunction]
+fn get_option_status(date: String, index: String, strike: f64, opt_type: String, expiry: String) -> &'static str {
+    match lookup_option_status(&date, &index, strike, &opt_type, &expiry) {
+        OptionDataStatus::Tradeable(px) if px > 0.0 => "tradeable",
+        OptionDataStatus::Tradeable(_) => "missing",
+        OptionDataStatus::ZeroContracts => "zero_contracts",
+        OptionDataStatus::Missing => "missing",
+    }
+}
+
 #[pyfunction]
 fn get_spot_price(date: String, index: String) -> Option<f64> {
     lookup_spot_price(&date, &index)
@@ -641,6 +791,61 @@ fn get_strikes_for_date(
     let sym_id = match cache.symbol_ids.get(&index.trim().to_uppercase()) { Some(&id) => id, None => return Vec::new() };
     let type_id = opt_type_to_id(&opt_type);
     cache.strikes.get(&(date_days, sym_id, expiry_days, type_id)).cloned().unwrap_or_default()
+}
+
+/// Return (max_high, min_low) for one option leg over a date range using the
+/// in-memory MarketCache. O(days-in-range) per call — avoids DB/disk for MAE/MFE.
+#[pyfunction]
+fn get_ohlc_range(
+    from_date: String,
+    to_date: String,
+    index: String,
+    strike: f64,
+    opt_type: String,
+    expiry: String,
+) -> Option<(f64, f64)> {
+    let cache = CACHE.read().ok()?;
+    let cache = cache.as_ref()?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let type_id = opt_type_to_id(&opt_type);
+    let expiry_days = date_str_to_days(&normalize_date_str(&expiry))?;
+    let from_days = date_str_to_days(&normalize_date_str(&from_date))?;
+    let to_days = date_str_to_days(&normalize_date_str(&to_date))?;
+    let strike_key = to_i64_strike(strike);
+
+    let mut max_high: Option<f64> = None;
+    let mut min_low: Option<f64> = None;
+    for d in from_days..=to_days {
+        let key = (d, sym_id, strike_key, type_id, expiry_days);
+        let h_raw = cache.options_high.get(&key).copied();
+        let l_raw = cache.options_low.get(&key).copied();
+        let settled = cache.options_settled.get(&key).copied().filter(|&v| v > 0.0);
+        // Per-VALUE SettledPrice substitution:
+        //   - high > 0  → use high as-is (pre-existing behavior, untouched)
+        //   - high == 0 → substitute settled_price for high (if available)
+        //   - same rule applied independently to low
+        // Asymmetric case (high>0, low=0) keeps the real high and replaces
+        // only the zero low — matches the user's "where there is zero, take
+        // settled there only" rule.
+        let h_eff = match h_raw {
+            Some(h) if h > 0.0 => Some(h),
+            _ => settled,
+        };
+        let l_eff = match l_raw {
+            Some(l) if l > 0.0 => Some(l),
+            _ => settled,
+        };
+        if let Some(h) = h_eff {
+            max_high = Some(max_high.map_or(h, |prev: f64| prev.max(h)));
+        }
+        if let Some(l) = l_eff {
+            min_low = Some(min_low.map_or(l, |prev: f64| prev.min(l)));
+        }
+    }
+    match (max_high, min_low) {
+        (Some(h), Some(l)) => Some((h, l)),
+        _ => None,
+    }
 }
 
 fn py_any_to_string_opt(obj: Option<&PyAny>) -> Option<String> {
@@ -1158,6 +1363,8 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clear_cache, m)?)?;
     m.add_function(wrap_pyfunction!(is_loaded, m)?)?;
     m.add_function(wrap_pyfunction!(get_option_price, m)?)?;
+    m.add_function(wrap_pyfunction!(get_option_price_tradeable, m)?)?;
+    m.add_function(wrap_pyfunction!(get_option_status, m)?)?;
     m.add_function(wrap_pyfunction!(get_spot_price, m)?)?;
     m.add_function(wrap_pyfunction!(get_strikes_for_date, m)?)?;
     m.add_function(wrap_pyfunction!(check_leg_stop_loss_target, m)?)?;
@@ -1168,5 +1375,6 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simulate::simulate_trades_batch, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::resolve_trade_specs, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
     Ok(())
 }

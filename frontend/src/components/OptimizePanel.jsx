@@ -52,6 +52,14 @@ export default function OptimizePanel({
   basePayload,
   nLegs,
   onJobQueued,
+  // Lifted state — owned by StrategyBuilder so settings survive panel close/reopen
+  checked, setChecked,
+  savedValues, setSavedValues,
+  method, setMethod,
+  sampleN, setSampleN,
+  algorithm, setAlgorithm,
+  objective, setObjective,
+  parallelism, setParallelism,
 }) {
   const allParams = useMemo(() => expandSchemaForLegs(nLegs || 1), [nLegs]);
   const grouped = useMemo(() => {
@@ -63,21 +71,18 @@ export default function OptimizePanel({
     return Array.from(m.entries());
   }, [allParams]);
 
-  // checked paths
-  const [checked, setChecked] = useState({});
-  // saved spec values per path — persists even when a param is unchecked
-  const [savedValues, setSavedValues] = useState({});
-
-  const [method, setMethod] = useState(DEFAULT_METHOD);
-  const [sampleN, setSampleN] = useState(200);
-  const [algorithm, setAlgorithm] = useState('cma-es');
-  const [objective, setObjective] = useState(DEFAULT_OBJECTIVE);
   const [objectives, setObjectives] = useState([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
   const [preview, setPreview] = useState(null);
   const [cpuInfo, setCpuInfo] = useState({ cpu_count: 8, default_parallelism: 4 });
-  const [parallelism, setParallelism] = useState(null);
+  // Strike-shift override: defaults to whatever StrategyBuilder put in
+  // basePayload.strike_shift_max_steps. User can override per optimization run.
+  const [strikeShiftOverride, setStrikeShiftOverride] = useState(
+    typeof basePayload?.strike_shift_max_steps === 'number'
+      ? basePayload.strike_shift_max_steps
+      : 1
+  );
 
   useEffect(() => {
     if (!isOpen) return;
@@ -153,12 +158,20 @@ export default function OptimizePanel({
     setSavedValues((sv) => ({ ...sv, [path]: { ...sv[path], values: arr } }));
   }
 
+  // Merge the strike-shift override into basePayload so it's applied per run.
+  function basePayloadWithOverrides() {
+    return {
+      ...(basePayload || {}),
+      strike_shift_max_steps: Number(strikeShiftOverride) || 0,
+    };
+  }
+
   async function launch() {
     setSubmitting(true);
     setError(null);
     try {
       const body = {
-        base_payload: basePayload,
+        base_payload: basePayloadWithOverrides(),
         param_specs: specsToPayload(selectedList),
         method,
         sample_n: method === 'exhaustive' ? null : Number(sampleN) || 0,
@@ -177,11 +190,22 @@ export default function OptimizePanel({
       }
       const data = await res.json();
       if (onJobQueued) {
+        const objLabel = (objectives.find((o) => o.name === objective) || {}).label || objective;
         onJobQueued({
           jobId: data.job_id,
           totalCombos: data.total_combos,
           objective: data.objective,
           method: data.method,
+          runConfig: {
+            paramSpecs: selectedList,
+            method,
+            methodLabel: { exhaustive: 'Exhaustive', random: `Random (N=${sampleN})`, smart: `Smart · ${algorithm}` }[method] || method,
+            sampleN: method !== 'exhaustive' ? Number(sampleN) : null,
+            algorithm: method === 'smart' ? algorithm : null,
+            objective,
+            objectiveLabel: objLabel,
+            totalCombos: data.total_combos,
+          },
         });
       }
       onClose && onClose();
@@ -196,7 +220,7 @@ export default function OptimizePanel({
     setError(null);
     try {
       const body = {
-        base_payload: basePayload,
+        base_payload: basePayloadWithOverrides(),
         param_specs: specsToPayload(selectedList),
         method,
         sample_n: method === 'exhaustive' ? null : Number(sampleN) || 0,
@@ -471,6 +495,10 @@ export default function OptimizePanel({
                 More workers = faster, but each one loads market data so heavy on RAM.
               </div>
             </Section>
+
+            {/* Strike Shift on Missing Contract section removed — engine
+                now always walks TOWARD ATM on zero-turnover strikes and the
+                tradesheet shows the shift reason in its own column. */}
 
             <Section title="Ranking Objective">
               <select

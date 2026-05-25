@@ -1166,10 +1166,28 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
     else:
         if parquet_path.exists():
             age = time.time() - os.path.getmtime(parquet_path)
-            if age < 86400:
+            # Historical option data doesn't change — 30-day TTL avoids a 113s
+            # full DB reload every 24 hours on an HDD-backed PostgreSQL.
+            parquet_ttl = int(os.environ.get("PARQUET_CACHE_TTL_SECONDS", str(30 * 86400)))
+            if age < parquet_ttl:
                 try:
                     start_cache = time.perf_counter()
                     _bulk_options_df = pl.read_parquet(parquet_path)
+                    # Invalidate Parquet caches built before Contracts column was
+                    # added — the strike-shift validator needs it to detect zero-
+                    # turnover strikes. Re-fetching from Postgres is the only way
+                    # to populate it.
+                    if (_bulk_options_df is not None
+                            and not _bulk_options_df.is_empty()
+                            and ("Contracts" not in _bulk_options_df.columns
+                                 or "SettledPrice" not in _bulk_options_df.columns)):
+                        logger.info("[BULK] Parquet cache missing Contracts/SettledPrice column — invalidating to force fresh DB load")
+                        try:
+                            parquet_path.unlink()
+                        except Exception:
+                            pass
+                        _bulk_options_df = None
+                        raise RuntimeError("parquet cache invalidated: missing Contracts/SettledPrice")
                     _full_range_loaded = True
                     _full_range_symbol = symbol_upper
                     _bulk_loaded_key = cache_key

@@ -16,7 +16,9 @@
 #   frontend         :  200M
 #   intraday-api     :  512M
 #   ─────────────────────────────
-#   Total hard limit : 11,462M
+#   worker-optimize  : 4096M  (profile-gated; replaces 3200M — see comment below)
+#   ─────────────────────────────
+#   Total hard limit : 11,462M (default stack; +4096M when optimize profile active)
 #   OS + kernel      : ~1,500M
 #   Headroom/cache   : ~3,600M  ← HDD needs large OS page cache
 #   ─────────────────────────────
@@ -43,6 +45,12 @@ x-backend-env: &backend-env
   DB_POOL_RECYCLE: "3600"
   # Cap in-process bulk_load so backend+worker never OOM on 16GB HDD server
   BULK_LOAD_MAX_MEMORY_MB: "1500"
+  # Max Rust AHashMap cache size (feather_MB × 5 estimate). Raised to 3000 because
+  # OHLC columns (added for MAE/MFE) grew the feather from ~275 MB to ~575 MB;
+  # 575×5=2875 MB exceeds the old 2500 MB cap, causing the Rust cache to be
+  # skipped and an 8.4M-row Python fallback dict build that never finishes.
+  # Actual peak usage is ~2770 MB (within the 3500 MB Docker worker limit).
+  RUST_CACHE_MAX_MEMORY_MB: "3000"
   # NIFTY bulk loads are narrow (date/expiry/type/strike/close), so avoid
   # splitting normal 6-7 year backtests into repeated DB+engine passes.
   BULK_LOAD_CHUNK_YEARS: "10"
@@ -303,8 +311,16 @@ services:
     # Profile-gated: not started by `docker compose up`. Bring up with:
     #   docker compose --profile optimize up -d worker-optimize
     # Shares the same image as worker-backtests; runs an exclusive 'optimize' queue
-    # so long parameter sweeps don't block normal backtests. Resident bulk
-    # cache benefits from concurrency=1 (sweep iterates inside one task).
+    # so long parameter sweeps don't block normal backtests.
+    #
+    # concurrency=3: 3 simultaneous optimize jobs (one per user).
+    # Memory math per job with P=2 (fork start method, CoW AHashMap sharing):
+    #   - Coordinator: ~700MB (Rust cache 1680MB loaded then kept for CoW fork)
+    #   - 2 fork workers: inherit AHashMap via CoW (shared pages, ~0 extra RAM)
+    #     + Python working memory ~300MB each = ~600MB total
+    #   - Per-job total: ~1300MB
+    #   - 3 concurrent jobs: 3 × 1300MB = 3.9GB  →  within 4096M
+    #   NOTE: old forkserver path rebuilt 1680MB AHashMap per child → OOM.
     profiles: ["optimize"]
     image: algotest-backend-app:latest
     container_name: algotest-worker-optimize
@@ -312,7 +328,7 @@ services:
     command: >
       celery -A worker.celery worker
       --queues=optimize
-      --concurrency=1
+      --concurrency=3
       -l info
       --max-memory-per-child=2800000
       --without-gossip
@@ -322,19 +338,28 @@ services:
       <<: *backend-env
       BACKTEST_WORKERS: "1"
       OPTIMIZE_MAX_COMBOS: "100000"
-      # Sequential mode. Python-multiprocessing parallelism for this
-      # workload is blocked by an interaction between Celery's billiard
-      # process model and the Rust feather cache's process-global state:
-      # fork inherits a partially-locked Rust RwLock; spawn/forkserver
-      # hit billiard's AuthenticationString pickle guard; billiard.Pool
-      # gets past that but children still stall after [FAST_LOOKUP]
-      # Cleared, likely on Postgres connection pool contention.
-      #
-      # The right fix is Phase 2b — port run_algotest_backtest to Rust
-      # and run combos in-process with rayon (no GIL, no fork, no DB
-      # round-trips per combo). Until then sequential is the safe path.
-      OPTIMIZE_PARALLELISM: "1"
-      FAST_LOOKUP_RANGE_FILTER: "1"
+      # P=2: 2 billiard fork workers per job. Children inherit the parent's
+      # Rust AHashMap via CoW (1680MB shared, not duplicated). Safe with
+      # concurrency=3 — total RSS stays within 4096M.
+      # FAST_LOOKUP_RANGE_FILTER=0: always use full feather (575MB on disk)
+      # instead of a range-specific feather that may not exist → avoids 2-3 min
+      # DB fallback. Full feather loads in ~6s cold / <1s warm from page cache.
+      OPTIMIZE_PARALLELISM: "2"
+      OPTIMIZE_SKIP_MAE_MFE: "0"
+      OPTIMIZE_SKIP_TRADESHEETS: "0"
+      FAST_LOOKUP_RANGE_FILTER: "0"
+      # Fork-safe threading for the optimizer worker.
+      # POLARS_MAX_THREADS=1: keep Polars single-threaded in the parent so
+      # its global rayon pool has ≤1 thread before forking — Polars ops in
+      # children degrade gracefully to sequential rather than deadlocking.
+      # RUST_SIM_THREADS=4: thread count for the process-local rayon pools
+      # (SIM_POOL in simulate.rs, OPTIM_POOL in optimizer.rs). These pools
+      # are Lazy<ThreadPool> singletons that are NOT initialized in the parent
+      # — each forked child creates its own fresh pool on first use, so there
+      # are no dead inherited threads. RAYON_NUM_THREADS is intentionally
+      # unset; the global rayon pool is never used by the engine.
+      POLARS_MAX_THREADS: "1"
+      RUST_SIM_THREADS: "4"
     user: "0:0"
     volumes: *backend-volumes
     depends_on:
@@ -351,12 +376,13 @@ services:
     deploy:
       resources:
         limits:
-          # Profile-gated, so it does NOT count against the 16 GB total budget
-          # at the top of this file when running the default stack. When the
-          # optimize profile is active, expect the user to be running fewer
-          # other workloads (e.g. not concurrent intraday backtests).
-          memory: 3200M
-          cpus: "4.0"
+          # 4096M: 3 concurrent jobs × ~800MB each = 2.4GB + 1.6GB headroom.
+          # Feather mmap is shared (OS page cache) so memory does NOT multiply
+          # with each additional concurrent job.
+          # 8 CPUs: 3 jobs × 2 forkserver workers = 6 active Python processes;
+          # 8 gives headroom for Celery coordinators + Rust rayon threads.
+          memory: 4096M
+          cpus: "8.0"
         reservations:
           memory: 256M
     networks:

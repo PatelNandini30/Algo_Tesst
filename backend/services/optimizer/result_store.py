@@ -122,6 +122,32 @@ def update_progress(
     r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
 
 
+def increment_done(job_id: str) -> None:
+    """Atomically increment the running done counter in Redis.
+
+    Called once per completed combo from any worker. The INCR is atomic;
+    the meta update is best-effort (acceptable race for progress display).
+    """
+    r = _redis()
+    if r is None:
+        return
+    counter_key = f"optim:{job_id}:done_counter"
+    cnt = r.incr(counter_key)
+    r.expire(counter_key, OPTIM_TTL)
+    raw = r.get(_meta_key(job_id))
+    if not raw:
+        return
+    meta = json.loads(raw)
+    meta["done"] = int(cnt)
+    meta["phase"] = "running"
+    started = meta.get("started_at") or time.time()
+    elapsed = max(time.time() - started, 0.001)
+    rate = cnt / elapsed if cnt > 0 else 0
+    remaining = max(int(meta.get("total", cnt)) - cnt, 0)
+    meta["eta_seconds"] = int(remaining / rate) if rate > 0 else None
+    r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
+
+
 def append_result(job_id: str, row: Dict[str, Any]) -> None:
     r = _redis()
     if r is None:
@@ -149,7 +175,42 @@ def get_meta(job_id: str) -> Optional[Dict[str, Any]]:
     if r is None:
         return None
     raw = r.get(_meta_key(job_id))
-    return json.loads(raw) if raw else None
+    if not raw:
+        return None
+    meta = json.loads(raw)
+    # Overlay atomic running counter when job is still in progress.
+    if meta.get("status") == "running":
+        cnt_raw = r.get(f"optim:{job_id}:done_counter")
+        if cnt_raw is not None:
+            meta["done"] = int(cnt_raw)
+    return meta
+
+
+def _combo_fingerprint(row: Dict[str, Any]) -> str:
+    """Stable hash of the result row's combo_label + summary PnL.
+
+    Deduplication key: two rows are duplicates when they have the same
+    combo_label (same human-readable strategy) AND identical total_pnl
+    (same engine outcome).  Using both fields ensures:
+      - Parameters swept with no engine effect (e.g. strike_type in
+        pct_of_atm mode) are collapsed — same label, same result.
+      - Different parameter values that happen to share a legacy label
+        due to abs() rounding are NOT collapsed — same label, different result.
+    """
+    label = row.get("combo_label") or str(row.get("combo_id"))
+    pnl = row.get("summary", {}).get("total_pnl", None)
+    return f"{label}|{pnl}"
+
+
+def _dedupe_by_label(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        key = _combo_fingerprint(row)
+        if key not in seen:
+            seen.add(key)
+            out.append(row)
+    return out
 
 
 def get_results(
@@ -159,12 +220,14 @@ def get_results(
     limit: int = 100,
     sort_key: Optional[str] = None,
     descending: bool = True,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
+    """Return {"rows": [...], "total": <unique_count>} for the results page."""
     r = _redis()
     if r is None:
-        return []
+        return {"rows": [], "total": 0}
     raw = r.lrange(_results_key(job_id), 0, -1)
-    rows = [json.loads(x) for x in raw]
+    rows = _dedupe_by_label([json.loads(x) for x in raw])
+    total = len(rows)
     if sort_key:
         def _k(row):
             try:
@@ -173,7 +236,7 @@ def get_results(
                 return 0.0
 
         rows.sort(key=_k, reverse=descending)
-    return rows[offset : offset + limit]
+    return {"rows": rows[offset : offset + limit], "total": total}
 
 
 def get_all_results(job_id: str) -> List[Dict[str, Any]]:
@@ -181,7 +244,7 @@ def get_all_results(job_id: str) -> List[Dict[str, Any]]:
     if r is None:
         return []
     raw = r.lrange(_results_key(job_id), 0, -1)
-    return [json.loads(x) for x in raw]
+    return _dedupe_by_label([json.loads(x) for x in raw])
 
 
 def get_combo_by_id(job_id: str, combo_id: int) -> Optional[Dict[str, Any]]:
@@ -292,6 +355,57 @@ def write_summary_csv(job_id: str, rows: List[Dict[str, Any]]) -> None:
         df.to_csv(os.path.join(dirpath, "summary.csv"), index=False)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] summary CSV write failed: %s", exc)
+
+
+def write_run_config(
+    job_id: str,
+    method: str,
+    objective: str,
+    param_specs: list,
+    base_payload: dict,
+    *,
+    sample_n: int | None = None,
+    algorithm: str | None = None,
+    total_combos: int | None = None,
+) -> None:
+    """Write run_config.csv to the job's trades directory."""
+    try:
+        import csv
+        dirpath = get_trades_dir(job_id)
+        os.makedirs(dirpath, exist_ok=True)
+        path = os.path.join(dirpath, "run_config.csv")
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            # Run-level metadata block
+            w.writerow(["# Run Configuration"])
+            w.writerow(["Method", method])
+            w.writerow(["Objective", objective])
+            w.writerow(["Total Combinations", total_combos or ""])
+            if sample_n is not None:
+                w.writerow(["Sample N", sample_n])
+            if algorithm:
+                w.writerow(["Algorithm", algorithm])
+            from_date = base_payload.get("from_date") or base_payload.get("date_from", "")
+            to_date = base_payload.get("to_date") or base_payload.get("date_to", "")
+            w.writerow(["From Date", from_date])
+            w.writerow(["To Date", to_date])
+            w.writerow(["Symbol", base_payload.get("symbol", "")])
+            w.writerow([])
+            # Parameter sweep specs
+            w.writerow(["# Parameter Specs"])
+            w.writerow(["Parameter", "Min", "Max", "Step", "Values", "Type"])
+            for spec in param_specs:
+                ptype = spec.get("type", "range")
+                w.writerow([
+                    spec.get("path", spec.get("label", "")),
+                    spec.get("min", ""),
+                    spec.get("max", ""),
+                    spec.get("step", ""),
+                    "|".join(str(v) for v in spec.get("values", [])) if spec.get("values") else "",
+                    ptype,
+                ])
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] run_config write failed: %s", exc)
 
 
 def delete_job_trades(job_id: str) -> None:

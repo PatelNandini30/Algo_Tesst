@@ -248,11 +248,22 @@ def _compute_spot_adjustment_trigger(
     watch_fall = direction in ("fall", "both")
     if not watch_rise and not watch_fall:
         return None
+    from datetime import date as _date
     for d in trading_days:
         if d <= entry_date:
             continue
         if d > scheduled_exit:
             break
+        # Skip weekend special sessions (e.g. NSE Budget Sunday 01-Feb-2026 has spot
+        # data but options chains don't exist — pricing path silently drops the
+        # trade if a spot-adj trigger lands on Sat/Sun, leaving a gap in cascades).
+        # ISO dates are YYYY-MM-DD; compute weekday directly without pandas.
+        try:
+            y, m, dd = d.split("-")
+            if _date(int(y), int(m), int(dd)).weekday() >= 5:  # Sat=5, Sun=6
+                continue
+        except Exception:
+            pass
         spot = spot_by_date.get(d)
         if spot is None:
             continue
@@ -570,6 +581,66 @@ def _pick_by_premium(
     return min(chain, key=_key)
 
 
+def _validate_or_shift_strike_python(
+    strike: float,
+    atm: float,
+    interval: float,
+    is_call: bool,
+    entry_date: Optional[str],
+    expiry: Optional[str],
+    index: Optional[str],
+    opt_type: str,
+    max_shifts: int,
+) -> Optional[float]:
+    """Python mirror of Rust validate_or_shift_strike.  Walks TOWARD ATM when
+    the requested strike has zero turnover, capped at the distance to ATM
+    (i.e. never walks past ATM).  Returns the first tradeable strike or None
+    when even ATM is untradeable.  `max_shifts` is ignored and retained only
+    for API compatibility — the cap is always distance-to-ATM."""
+    if not (entry_date and expiry and index):
+        return strike  # Can't validate without market context — trust the picker.
+    try:
+        import algotest_native  # type: ignore
+    except ImportError:
+        return strike
+    def _status(s: float) -> str:
+        """Returns 'tradeable' | 'zero_contracts' | 'missing'."""
+        fn = getattr(algotest_native, "get_option_status", None)
+        if fn is None:
+            try:
+                px = algotest_native.get_option_price(entry_date, index, s, opt_type, expiry)
+                return "tradeable" if (px is not None and px > 0) else "missing"
+            except Exception:
+                return "missing"
+        try:
+            return fn(entry_date, index, s, opt_type, expiry) or "missing"
+        except Exception:
+            return "missing"
+
+    st = _status(strike)
+    if st == "tradeable":
+        return strike
+    if st == "missing":
+        return None
+    # st == "zero_contracts" → walk TOWARD ATM (more liquid strikes).
+    if strike > atm + 1e-6:
+        direction = -1.0  # above ATM → walk down toward ATM
+    elif strike < atm - 1e-6:
+        direction = 1.0   # below ATM → walk up toward ATM
+    else:
+        # Already at ATM with zero turnover — nowhere to walk.
+        return None
+    dist = int(round(abs(strike - atm) / interval))
+    max_walk = max(dist, 1)
+    for step in range(1, max_walk + 1):
+        cand = strike + direction * step * interval
+        if cand <= 0:
+            break
+        if _status(cand) == "tradeable":
+            return cand
+    return None
+
+
 def _compute_strike_for_leg_python(
     leg: Dict[str, Any],
     entry_spot: float,
@@ -578,6 +649,8 @@ def _compute_strike_for_leg_python(
     entry_date: Optional[str] = None,
     expiry: Optional[str] = None,
     index: Optional[str] = None,
+    strike_shift_max: int = 1,
+    out_info: Optional[Dict[str, Any]] = None,
 ) -> Optional[float]:
     """
     Python mirror of simulate.rs::compute_strike_for_leg.
@@ -588,6 +661,9 @@ def _compute_strike_for_leg_python(
     provided (uses algotest_native.get_strikes_for_date / get_option_price).
     Returns None when premium lookup is needed but params are absent, or when
     the feather has no data for the given date/expiry.
+
+    If `out_info` is provided, it is populated with 'requested_strike' (the
+    strike before zero-turnover shift) so the tradesheet can show the reason.
     """
     sel = leg.get("strike_selection") or {}
     if not isinstance(sel, dict):
@@ -597,6 +673,15 @@ def _compute_strike_for_leg_python(
     is_ce = opt_type in ("CE", "CALL", "C")
     atm = round(entry_spot / interval) * interval
 
+    def _validate(s: Optional[float]) -> Optional[float]:
+        if s is None:
+            return None
+        if out_info is not None:
+            out_info["requested_strike"] = float(s)
+        return _validate_or_shift_strike_python(
+            s, atm, interval, is_ce, entry_date, expiry, index, opt_type, strike_shift_max,
+        )
+
     if sel_type in ("strike_type", "") or sel_type.startswith(("atm", "itm", "otm")):
         # Compact form: {type: "ATM"} | {type: "ITM1"} | …
         if sel_type not in ("strike_type", ""):
@@ -604,21 +689,21 @@ def _compute_strike_for_leg_python(
         else:
             strike_type = str(sel.get("strike_type") or "ATM").upper().strip()
         if strike_type == "ATM":
-            return atm
+            return _validate(atm)
         if strike_type.startswith("ITM"):
             n_str = strike_type[3:].strip()
             try:
                 n = int(n_str) if n_str else 1
             except ValueError:
                 return None
-            return atm - n * interval if is_ce else atm + n * interval
+            return _validate(atm - n * interval if is_ce else atm + n * interval)
         if strike_type.startswith("OTM"):
             n_str = strike_type[3:].strip()
             try:
                 n = int(n_str) if n_str else 1
             except ValueError:
                 return None
-            return atm + n * interval if is_ce else atm - n * interval
+            return _validate(atm + n * interval if is_ce else atm - n * interval)
         return None
 
     if sel_type == "pct_of_atm":
@@ -626,10 +711,26 @@ def _compute_strike_for_leg_python(
             value = float(sel.get("value") or 0.0)
         except (TypeError, ValueError):
             return None
-        direction = str(sel.get("direction") or "+").strip()
-        shift = entry_spot * value / 100.0
-        raw = entry_spot - shift if direction == "-" else entry_spot + shift
-        return round(raw / interval) * interval
+        # Default direction is empty (sign convention), NOT "OTM".  When the
+        # optimizer sweeps `value` across negative territory the user expects
+        # signed-offset behavior: negative value = below spot (ITM for CE,
+        # OTM for PE), positive value = above spot (OTM for CE, ITM for PE).
+        # An "OTM" default would discard the sign and always place strikes
+        # above spot for CE, making the negative half of the param range
+        # collapse onto the positive half.
+        direction = str(sel.get("direction") or "").strip()
+        direction_up = direction.upper()
+        if direction_up in ("OTM", "ITM", "ATM"):
+            if direction_up == "ATM" or value == 0.0:
+                raw = entry_spot
+            else:
+                shift = entry_spot * abs(value) / 100.0
+                above_spot = (direction_up == "OTM" and is_ce) or (direction_up == "ITM" and not is_ce)
+                raw = entry_spot + shift if above_spot else entry_spot - shift
+        else:
+            shift = entry_spot * value / 100.0
+            raw = entry_spot - shift if direction == "-" else entry_spot + shift
+        return _validate(round(raw / interval) * interval)
 
     # Premium-based modes — need the Rust feather for option chain lookup.
     if not (entry_date and expiry and index):
@@ -802,9 +903,11 @@ def _build_fixed_entry_specs(
             for leg_idx, leg in enumerate(legs_src):
                 if not isinstance(leg, dict):
                     return None
+                _shift_info: Dict[str, Any] = {}
                 strike = _compute_strike_for_leg_python(
                     leg, entry_spot, interval,
                     entry_date=current_entry, expiry=target_expiry, index=index_str,
+                    out_info=_shift_info,
                 )
                 if strike is None:
                     return None  # Strike not resolvable — caller falls back to Python
@@ -816,6 +919,8 @@ def _build_fixed_entry_specs(
                     "exit_date": exit_date,
                     "expiry": target_expiry,
                     "strike": float(strike),
+                    "requested_strike": float(_shift_info.get("requested_strike") or strike),
+                    "strike_interval": float(interval),
                     "option_type": str(leg.get("option_type") or "CE").upper(),
                     "position": str(leg.get("position") or "SELL").upper(),
                     "lots": int(leg.get("lots") or 1),
@@ -951,9 +1056,11 @@ def _build_next_expiry_specs(
 
         for leg_idx, (leg, is_next) in enumerate(zip(legs_src, leg_is_next)):
             per_leg_expiry = next_exp if is_next else cur_exp
+            _shift_info: Dict[str, Any] = {}
             strike = _compute_strike_for_leg_python(
                 leg, entry_spot, interval,
                 entry_date=entry_date, expiry=per_leg_expiry, index=index_str,
+                out_info=_shift_info,
             )
             if strike is None:
                 return None  # Strike unresolvable — caller falls back to Python engine
@@ -965,6 +1072,8 @@ def _build_next_expiry_specs(
                 "exit_date": exit_date,
                 "expiry": per_leg_expiry,
                 "strike": float(strike),
+                "requested_strike": float(_shift_info.get("requested_strike") or strike),
+                "strike_interval": float(interval),
                 "option_type": str(leg.get("option_type") or "CE").upper(),
                 "position": str(leg.get("position") or "SELL").upper(),
                 "lots": int(leg.get("lots") or 1),
@@ -1086,15 +1195,19 @@ def _apply_min_days_filter(
             leg_idx = int(s.get("leg_id", 1)) - 1
             leg = legs_src[leg_idx] if 0 <= leg_idx < len(legs_src) else {}
             spec_expiry = _normalize_iso(s.get("expiry"))
+            _shift_info: Dict[str, Any] = {}
             new_strike = _compute_strike_for_leg_python(
                 leg, new_spot, interval,
                 entry_date=new_entry, expiry=spec_expiry, index=index_str,
+                out_info=_shift_info,
             )
             if new_strike is None:
                 return None  # Strike not resolvable — Python fallback
             s = dict(s)
             s["entry_date"] = new_entry
             s["strike"] = float(new_strike)
+            s["requested_strike"] = float(_shift_info.get("requested_strike") or new_strike)
+            s["strike_interval"] = float(interval)
         result.append(s)
     return result
 
@@ -1276,6 +1389,10 @@ def _apply_fixed_rollover_strike(
         if key in strike_overrides:
             s = dict(s)
             s["strike"] = strike_overrides[key]
+            # rollover_strike_mode='fixed' is a user-chosen behavior (reuse
+            # first-cycle strike). Sync requested_strike so this carry-over
+            # doesn't get reported as a zero-turnover shift.
+            s["requested_strike"] = strike_overrides[key]
         result.append(s)
     return result
 
@@ -1342,6 +1459,25 @@ def priced_to_tradesheet_records(
         qty = int(row.get("lots") or 1) * int(row.get("lot_size") or lot_size or 1)
         # FUTURES: Strike = '' (matches Python engine convention); options: float.
         strike_val = "" if is_fut else float(row.get("strike") or 0.0)
+        # Strike Shift Reason — populated only when the engine shifted the
+        # requested strike toward ATM because the original contract had zero
+        # turnover on entry day. Empty when no shift was applied.
+        _shift_reason = ""
+        try:
+            _req = row.get("requested_strike")
+            if _req is not None and not is_fut and strike_val != "":
+                _req_f = float(_req)
+                _act_f = float(strike_val)
+                if abs(_req_f - _act_f) > 1e-6:
+                    _intvl = float(row.get("strike_interval") or 50.0) or 50.0
+                    _steps = max(1, int(round(abs(_act_f - _req_f) / _intvl)))
+                    _shift_reason = (
+                        f"{int(_req_f) if _req_f.is_integer() else _req_f}→"
+                        f"{int(_act_f) if _act_f.is_integer() else _act_f} "
+                        f"(zero turnover, {_steps} step{'s' if _steps != 1 else ''})"
+                    )
+        except (TypeError, ValueError):
+            pass
         out.append({
             "Trade": str(row.get("trade_id") or ""),
             "Leg": int(row.get("leg_id") or 1),
@@ -1375,6 +1511,7 @@ def priced_to_tradesheet_records(
             "Net P&L": net_pnl,
             "% P&L": pct_pnl,
             "Exit Reason": str(row.get("exit_reason") or "EXPIRY"),
+            "Strike Shift Reason": _shift_reason,
             "ReEntryIndex": "",
             "ReEntryTrigger": "",
             "ReEntryMode": "",
@@ -1488,6 +1625,11 @@ def _apply_buffer_strike_to_specs(
 
         new_spec = dict(spec)
         new_spec["strike"] = float(snapped)
+        # Buffer is a user-configured offset, NOT a zero-turnover shift.
+        # Sync requested_strike with the buffered strike so the Strike Shift
+        # Reason column only reports forced toward-ATM shifts, never the
+        # deliberate buffer offset the user enabled.
+        new_spec["requested_strike"] = float(snapped)
         result.append(new_spec)
     return result
 
@@ -1632,12 +1774,48 @@ def run_rust_engine_pipeline(
 
     else:
         # Step 1 (DTE, default): Rust builds trade specs.
+        # For rollover strategies, extend expiry_dates by one extra cycle so
+        # the last rollover window is not silently dropped. The last expiry in
+        # range is typically a 0-day trade (entry==exit); the subsequent window
+        # (entry=last_expiry, exit=next_cycle) needs the extra cycle present.
+        # Mirrors the Python engine's look-ahead behaviour.
+        _rollover_lookahead = (
+            bool(payload.get("rollover_toggle", False))
+            and str(payload.get("expiry_type") or "").upper() in ("WEEKLY", "MONTHLY")
+        )
+        _expiry_dates_for_specs = (
+            _fetch_one_extra_expiry(expiry_dates, payload)
+            if _rollover_lookahead
+            else expiry_dates
+        )
         specs = algotest_native.resolve_trade_specs(
-            payload, expiry_dates, trading_days, int(lot_size), spot_by_date
+            payload, _expiry_dates_for_specs, trading_days, int(lot_size), spot_by_date
         )
         if not specs:
             # Rust path rejected payload — feature outside supported slices.
             return None
+        # Clip specs whose exit exceeds to_date to the last trading day ≤ to_date.
+        # This mirrors the Python engine which uses to_date as the effective exit
+        # ceiling for the last rollover window.
+        if _rollover_lookahead:
+            _to_date_str = str(payload.get("to_date") or payload.get("date_to") or "")
+            if _to_date_str:
+                _clipped: List[Dict[str, Any]] = []
+                for _s in specs:
+                    _entry_iso = _normalize_iso(_s.get("entry_date", ""))
+                    _exit_iso = _normalize_iso(_s.get("exit_date", ""))
+                    if _entry_iso > _to_date_str:
+                        continue
+                    if _exit_iso > _to_date_str:
+                        _last_td = _last_trading_day_on_or_before(_to_date_str, trading_days)
+                        if _last_td is None or _last_td <= _entry_iso:
+                            continue
+                        _s = dict(_s)
+                        _s["exit_date"] = _last_td
+                    _clipped.append(_s)
+                specs = _clipped
+                if not specs:
+                    return None
 
         # Slice 7b: Buffer strike.
         if payload.get("buffer_strike_enabled"):
@@ -2115,9 +2293,11 @@ def run_rust_engine_pipeline(
                     lazy_spot = spot_by_date.get(current_trig)
                     if not lazy_spot:
                         break
+                    _shift_info: Dict[str, Any] = {}
                     lazy_strike = _compute_strike_for_leg_python(
                         lazy_leg_config, float(lazy_spot), strike_interval,
                         entry_date=current_trig, expiry=lazy_expiry, index=index_str,
+                        out_info=_shift_info,
                     )
                     if lazy_strike is None:
                         return None  # Strike unresolvable — Python fallback
@@ -2129,6 +2309,8 @@ def run_rust_engine_pipeline(
                         "exit_date": cycle_exit,
                         "expiry": lazy_expiry,
                         "strike": lazy_strike,
+                        "requested_strike": float(_shift_info.get("requested_strike") or lazy_strike),
+                        "strike_interval": float(strike_interval),
                         "option_type": lazy_opt_type,
                         "position": lazy_position,
                         "lots": lazy_lots,
@@ -2181,9 +2363,11 @@ def run_rust_engine_pipeline(
                 spot = spot_by_date.get(current_trig)
                 if spot is None:
                     break
+                _shift_info: Dict[str, Any] = {}
                 new_strike = _compute_strike_for_leg_python(
                     leg_src, float(spot), strike_interval,
                     entry_date=current_trig, expiry=parent_expiry, index=index_str,
+                    out_info=_shift_info,
                 )
                 if new_strike is None:
                     return None  # Strike not resolvable — fall back to Python
@@ -2197,6 +2381,8 @@ def run_rust_engine_pipeline(
                     "exit_date": cycle_exit,
                     "expiry": parent_expiry,
                     "strike": new_strike,
+                    "requested_strike": float(_shift_info.get("requested_strike") or new_strike),
+                    "strike_interval": float(strike_interval),
                     "option_type": leg["option_type"],
                     "position": base_position,
                     "lots": leg["lots"],
@@ -2251,6 +2437,168 @@ def run_rust_engine_pipeline(
                 # loop. Otherwise stop.
                 current_trig = re_exit
                 current_reason = re_reason
+
+    # Slice 7b: Spot-adjustment bridge trades (rollover).
+    # When spot adj exits a trade early AND rollover_toggle=True, insert bridge
+    # spec(s) from trigger_date to original scheduled exit so the cycle stays
+    # fully covered. Each bridge is itself checked for cascading spot adj (up to
+    # 8 levels). Mirrors generic_algotest_engine.py:4144-4191.
+    #
+    # Bridge specs piggyback on the parent trade_id (same as Slice 6 re-entries)
+    # so they survive the overlap filter exactly when the parent does.
+    _rollover_toggle = bool(payload.get("rollover_toggle", False))
+    # Bridges only apply in filter_entry_mode='fixed': Python's re-anchor logic
+    # (_prev_actual_exit) only runs when _seg_expiries is populated, which only
+    # happens in fixed mode. In DTE mode, spot adj truncates the current trade
+    # and the next trade starts at its originally scheduled entry — no bridge.
+    if spot_adj_enabled and _rollover_toggle and spot_adj_overrides and filter_entry_mode == "fixed":
+        for _bt_id, _bt_trigger in list(spot_adj_overrides.items()):
+            _bt_legs = sorted(by_trade.get(_bt_id, []), key=lambda r: r["leg_id"])
+            if not _bt_legs:
+                continue
+            _bt_orig_exit = _normalize_iso(_bt_legs[0]["exit_date"])
+            if _bt_trigger >= _bt_orig_exit:
+                continue  # No gap between trigger and scheduled exit — skip
+
+            _bt_cur_entry = _bt_trigger
+            _bt_cycle_exit = _bt_orig_exit
+            _bt_depth = 0
+
+            while _bt_depth < 8 and _bt_cur_entry < _bt_cycle_exit:
+                _bt_depth += 1
+                _bt_spot = spot_by_date.get(_bt_cur_entry)
+                if _bt_spot is None:
+                    break
+
+                # Cascading spot adj trigger for this bridge window.
+                _bt_casc_trig = _compute_spot_adjustment_trigger(
+                    _bt_cur_entry,
+                    float(_bt_spot),
+                    _bt_cycle_exit,
+                    spot_adj_direction,
+                    spot_adj_pct,
+                    spot_adj_units,
+                    trading_days,
+                    spot_by_date,
+                )
+                _bt_this_exit = (
+                    _bt_casc_trig
+                    if (_bt_casc_trig and _bt_casc_trig < _bt_cycle_exit)
+                    else _bt_cycle_exit
+                )
+                _bt_all_ok = True
+
+                for _btl in _bt_legs:
+                    _btl_src = (
+                        legs_src[_btl["leg_id"] - 1]
+                        if 0 <= _btl["leg_id"] - 1 < len(legs_src)
+                        else {}
+                    )
+                    if not _supports_reentry_strike(_btl_src):
+                        return None  # Can't re-resolve strike — Python fallback
+
+                    _btl_si = float(
+                        _btl_src.get("strike_interval")
+                        or _STRIKE_INTERVALS.get(index_str, 50.0)
+                    )
+                    _btl_shift_info: Dict[str, Any] = {}
+                    _btl_strike = _compute_strike_for_leg_python(
+                        _btl_src,
+                        float(_bt_spot),
+                        _btl_si,
+                        entry_date=_bt_cur_entry,
+                        expiry=_normalize_iso(_btl["expiry"]),
+                        index=index_str,
+                        out_info=_btl_shift_info,
+                    )
+                    if _btl_strike is None:
+                        return None  # Strike unresolvable — Python fallback
+
+                    _btl_spec = {
+                        "trade_id": _bt_id,
+                        "leg_id": _btl["leg_id"],
+                        "index": _btl["index"],
+                        "entry_date": _bt_cur_entry,
+                        "exit_date": _bt_this_exit,
+                        "expiry": _normalize_iso(_btl["expiry"]),
+                        "strike": _btl_strike,
+                        "requested_strike": float(_btl_shift_info.get("requested_strike") or _btl_strike),
+                        "strike_interval": float(_btl_si),
+                        "option_type": _btl["option_type"],
+                        "position": _btl["position"],
+                        "lots": _btl["lots"],
+                        "lot_size": _btl["lot_size"],
+                        "slippage_pct": _btl["slippage_pct"],
+                    }
+                    # Inline price for SL check (needs entry_price).
+                    try:
+                        _btl_priced = algotest_native.simulate_trades_batch([_btl_spec])
+                    except Exception as _btl_exc:
+                        logger.warning("[ENGINE_RUST] bridge simulate failed: %s", _btl_exc)
+                        _bt_all_ok = False
+                        break
+                    if not _btl_priced:
+                        _bt_all_ok = False
+                        break
+
+                    _btl_row = _btl_priced[0]
+                    _btl_entry_spot = float(_btl_row.get("entry_spot") or _bt_spot)
+                    _btl_sl_cfg = _build_leg_config_for_sl(_btl_row, _btl_src)
+
+                    try:
+                        _btl_sl_res = algotest_native.check_leg_stop_loss_target(
+                            _bt_cur_entry,
+                            _bt_this_exit,
+                            _normalize_iso(_btl["expiry"]),
+                            _btl_entry_spot,
+                            [_btl_sl_cfg],
+                            index_str,
+                            trading_calendar,
+                            str(square_off_mode or "partial"),
+                            slippage,
+                        )
+                    except Exception as _btl_sl_exc:
+                        logger.warning("[ENGINE_RUST] bridge SL check failed: %s", _btl_sl_exc)
+                        _btl_sl_res = None
+
+                    _btl_final_exit = _bt_this_exit
+                    _btl_reason = (
+                        "SPOT_ADJ"
+                        if (_bt_casc_trig and _bt_casc_trig < _bt_cycle_exit)
+                        else "EXPIRY"
+                    )
+                    if isinstance(_btl_sl_res, list) and _btl_sl_res:
+                        _btl_r0 = _btl_sl_res[0]
+                        if isinstance(_btl_r0, dict) and _btl_r0.get("triggered"):
+                            _btl_sl_exit = _normalize_iso(
+                                _btl_r0.get("exit_date") or _bt_this_exit
+                            )
+                            if _btl_sl_exit < _btl_final_exit:
+                                _btl_final_exit = _btl_sl_exit
+                                _btl_reason = (
+                                    (_btl_r0.get("exit_reason") or "").upper() or "SL"
+                                )
+
+                    # Overall SL clamp — bridge shares the same trade_id.
+                    _bt_overall = overall_overrides.get(_bt_id)
+                    if _bt_overall is not None and _btl_final_exit >= _bt_overall:
+                        _btl_final_exit = _bt_overall
+                        _btl_reason = overall_reasons.get(_bt_id, "OVERALL_SL")
+
+                    _btl_spec["exit_date"] = _btl_final_exit
+                    _btl_spec["_entry_date_key"] = str(_bt_cur_entry)
+                    reentry_specs.append(_btl_spec)
+                    reentry_reason_map[
+                        (int(_bt_id), int(_btl["leg_id"]), str(_bt_cur_entry))
+                    ] = _btl_reason
+
+                if not _bt_all_ok:
+                    break
+
+                if _bt_casc_trig and _bt_casc_trig < _bt_cycle_exit:
+                    _bt_cur_entry = _bt_casc_trig  # Loop for next cascade bridge
+                else:
+                    break  # Bridge chain complete
 
     # Step 4: build a NEW spec list with adjusted exit_dates for triggered legs.
     # Then apply Python-engine overlap prevention before re-pricing.
@@ -2312,6 +2660,13 @@ def run_rust_engine_pipeline(
                 "exit_date": final_exit,
                 "expiry": leg["expiry"],
                 "strike": leg["strike"],
+                # Carry through the zero-turnover-shift metadata so the final
+                # re-priced row still shows "Strike Shift Reason". Without
+                # these two fields, every trade that goes through any
+                # adjustment path (SL/Target/Overall/SpotAdj) loses its
+                # requested_strike and the tradesheet column comes up blank.
+                "requested_strike": leg.get("requested_strike", leg["strike"]),
+                "strike_interval": leg.get("strike_interval") or _STRIKE_INTERVALS.get(leg.get("index") or "", 50.0),
                 "option_type": leg["option_type"],
                 "position": leg["position"],
                 "lots": leg["lots"],
@@ -2319,6 +2674,162 @@ def run_rust_engine_pipeline(
                 "slippage_pct": leg["slippage_pct"],
             })
         trade_scheduled_exit[trade_id] = latest_scheduled
+
+    # Slice 7a-reentry: When rollover is on and spot adj fired before the original
+    # expiry, synthesise a fresh mini-trade for the residual window
+    # [trigger_date, orig_expiry] so the gap between the spot-adj exit and the
+    # next pre-scheduled entry is filled.  Mirrors the DTE-mode correction added
+    # to generic_algotest_engine.py:[SPOT_ADJ_ROLLOVER_DTE].
+    _sa_reentry_specs: List[Dict[str, Any]] = []
+    _sa_reentry_by_new_tid: Dict[int, int] = {}  # new_tid → orig_tid (for overlap filter)
+    _sa_reentry_reasons: Dict[Tuple[int, int, str], str] = {}
+
+    # Slice 7a-reentry only applies to DTE mode. For filter_entry_mode='fixed' the
+    # bridge (Slice 7b above) already fills the [trigger_date, orig_expiry] gap under
+    # the same trade_id. Running both would create duplicate re-entry rows and
+    # double-count P&L for every spot-adj trade in fixed-entry strategies.
+    #
+    # Cascade fires whenever a trade spans an expiry window — i.e. its scheduled
+    # exit_date < expiry, OR its window simply covers multiple trading days. This
+    # is true for:
+    #   - rollover_toggle=True + WEEKLY/MONTHLY            (classic rollover)
+    #   - NEXT_WEEKLY / NEXT_MONTHLY                       (per-leg next-expiry)
+    #   - T-0/T-0 WEEKLY/MONTHLY                           (engine treats this as
+    #                                                       "sell next contract on
+    #                                                       this expiry day" even
+    #                                                       without the toggle)
+    # Old gate required rollover_toggle=True which silently dropped the cascade
+    # for the T-0/T-0 case → tradesheets missed the [trigger, expiry] mini-trade.
+    _sa_rollover_toggle = bool(payload.get("rollover_toggle"))
+    _sa_expiry_type     = str(payload.get("expiry_type") or "").upper()
+    _sa_entry_dte       = int(payload.get("entry_dte") or 0)
+    _sa_exit_dte        = int(payload.get("exit_dte") or 0)
+    _sa_cascade_active = (
+        # Classic rollover
+        (_sa_rollover_toggle and _sa_expiry_type in ("WEEKLY", "MONTHLY"))
+        # Per-leg next-expiry strategies (engine spans expiry implicitly)
+        or _sa_expiry_type in ("NEXT_WEEKLY", "NEXT_MONTHLY", "WEEKLY_T1", "MONTHLY_T1")
+        # T-0/T-0 WEEKLY/MONTHLY: trade window naturally spans 1 expiry cycle.
+        # Engine builds trade.exit_date on the NEXT expiry while expiry stays the
+        # current one — same residual-window logic applies when spot adj fires.
+        or (_sa_entry_dte == 0 and _sa_exit_dte == 0 and _sa_expiry_type in ("WEEKLY", "MONTHLY"))
+    )
+    if spot_adj_overrides and _sa_cascade_active and filter_entry_mode != "fixed":
+        if True:  # legacy indentation
+            _sa_index = str(payload.get("symbol") or payload.get("index") or "NIFTY").upper()
+            _sa_interval = _STRIKE_INTERVALS.get(_sa_index, 50.0)
+            _sa_new_tid = max(list(by_trade.keys()) + [0]) + 1
+
+            for orig_tid in sorted(spot_adj_overrides.keys()):
+                trigger_date = spot_adj_overrides[orig_tid]  # ISO string
+                orig_legs = by_trade.get(orig_tid)
+                if not orig_legs:
+                    continue
+                orig_legs_s = sorted(orig_legs, key=lambda r: r["leg_id"])
+                orig_expiry = _normalize_iso(orig_legs_s[0].get("expiry") or "")
+                if not orig_expiry or trigger_date >= orig_expiry:
+                    continue  # no residual window
+
+                # For T-n strategies (exit_dte > 0) the original scheduled exit
+                # is T-n days before expiry, not expiry itself.  Use that as the
+                # cascade boundary so mini-specs also exit at T-n (not at expiry).
+                # For T-0 orig_exit_date == orig_expiry so there's no difference.
+                orig_exit_date = _normalize_iso(orig_legs_s[0].get("exit_date") or "")
+                if not orig_exit_date or orig_exit_date >= orig_expiry:
+                    orig_exit_date = orig_expiry
+
+                # Guard: trigger must be before the scheduled exit too
+                if trigger_date >= orig_exit_date:
+                    continue
+
+                # Cascade spot-adj within [trigger_date, orig_exit_date] — mirrors
+                # the DTE rollover logic in generic_algotest_engine.py where each
+                # re-entry trade goes through spot-adj check again on its own slot.
+                _sa_cur_entry = trigger_date
+                _sa_cur_exit  = orig_exit_date
+                _sa_depth = 0
+
+                while _sa_depth < 8 and _sa_cur_entry < _sa_cur_exit:
+                    _sa_depth += 1
+                    _sa_spot = float(spot_by_date.get(_sa_cur_entry) or 0.0)
+                    if not _sa_spot:
+                        break
+
+                    # Check for a further spot-adj trigger inside this window.
+                    _sa_casc = _compute_spot_adjustment_trigger(
+                        _sa_cur_entry,
+                        _sa_spot,
+                        _sa_cur_exit,
+                        spot_adj_direction,
+                        spot_adj_pct,
+                        spot_adj_units,
+                        trading_days,
+                        spot_by_date,
+                    )
+                    _sa_this_exit = (
+                        _sa_casc if (_sa_casc and _sa_casc < _sa_cur_exit)
+                        else _sa_cur_exit
+                    )
+
+                    mini_specs: List[Dict[str, Any]] = []
+                    for _sa_leg in orig_legs_s:
+                        _sa_lidx = int(_sa_leg.get("leg_id") or 1) - 1
+                        _sa_leg_src = legs_src[_sa_lidx] if _sa_lidx < len(legs_src) else {}
+                        # Per-leg strike_interval override (e.g. user sets 100 for NIFTY).
+                        # Without this, mini-trades default to the index step and re-entry
+                        # strikes snap to 50 even when the leg was configured for 100.
+                        _sa_leg_sel = (_sa_leg_src or {}).get("strike_selection") or {}
+                        _sa_leg_interval_raw = (
+                            (_sa_leg_src or {}).get("strike_interval")
+                            or (_sa_leg_src or {}).get("strike_gap")
+                            or (_sa_leg_sel.get("strike_interval") if isinstance(_sa_leg_sel, dict) else None)
+                            or (_sa_leg_sel.get("strike_gap") if isinstance(_sa_leg_sel, dict) else None)
+                        )
+                        try:
+                            _sa_leg_interval = float(_sa_leg_interval_raw) if _sa_leg_interval_raw else _sa_interval
+                        except (TypeError, ValueError):
+                            _sa_leg_interval = _sa_interval
+                        if _sa_leg_interval not in (50.0, 100.0, 25.0):
+                            _sa_leg_interval = _sa_interval
+                        _sa_strike_info: Dict[str, Any] = {}
+                        _sa_strike = _compute_strike_for_leg_python(
+                            _sa_leg_src, _sa_spot, _sa_leg_interval,
+                            entry_date=_sa_cur_entry, expiry=orig_expiry, index=_sa_index,
+                            out_info=_sa_strike_info,
+                        ) or float(_sa_leg.get("strike") or 0.0)
+                        if not _sa_strike:
+                            continue
+                        _sa_lid = int(_sa_leg.get("leg_id") or 1)
+                        mini_specs.append({
+                            "trade_id":     _sa_new_tid,
+                            "leg_id":       _sa_lid,
+                            "index":        _sa_leg.get("index") or _sa_index,
+                            "entry_date":   _sa_cur_entry,
+                            "exit_date":    _sa_this_exit,
+                            "expiry":       orig_expiry,
+                            "strike":       _sa_strike,
+                            "requested_strike": float(_sa_strike_info.get("requested_strike") or _sa_strike),
+                            "strike_interval": float(_sa_leg_interval),
+                            "option_type":  _sa_leg.get("option_type") or "CE",
+                            "position":     _sa_leg.get("position") or "SELL",
+                            "lots":         int(_sa_leg.get("lots") or 1),
+                            "lot_size":     int(_sa_leg.get("lot_size") or lot_size),
+                            "slippage_pct": float(_sa_leg.get("slippage_pct") or 0.0),
+                        })
+                        _sa_reason = (
+                            "SPOT_ADJ" if (_sa_casc and _sa_casc < _sa_cur_exit) else "EXPIRY"
+                        )
+                        _sa_reentry_reasons[(_sa_new_tid, _sa_lid, _sa_cur_entry)] = _sa_reason
+
+                    if mini_specs:
+                        _sa_reentry_specs.extend(mini_specs)
+                        _sa_reentry_by_new_tid[_sa_new_tid] = orig_tid
+                        _sa_new_tid += 1
+
+                    if _sa_casc and _sa_casc < _sa_cur_exit:
+                        _sa_cur_entry = _sa_casc  # advance to cascade trigger for next mini-trade
+                    else:
+                        break
 
     # Step 5: Overlap prevention — mirrors engines/generic_algotest_engine.py:3680
     # If a trade's scheduled entry_date is on-or-before the previous trade's
@@ -2349,6 +2860,12 @@ def run_rust_engine_pipeline(
     # Slice 6: re-entry specs piggyback on the parent trade_id, so they survive
     # the overlap filter exactly when the parent does.
     adjusted_specs.extend(s for s in reentry_specs if s["trade_id"] in kept_trades)
+    # Slice 7a-reentry: spot-adj mini-trades survive when their source trade was kept.
+    adjusted_specs.extend(
+        s for s in _sa_reentry_specs
+        if _sa_reentry_by_new_tid.get(s["trade_id"]) in kept_trades
+    )
+    adjusted_reason_by_date.update(_sa_reentry_reasons)
     if not adjusted_specs:
         return []
 
@@ -2394,4 +2911,41 @@ def run_rust_engine_pipeline(
             # net_pnl is in PREMIUM POINTS, matching simulate_trades_batch (no qty multiply).
             per_leg_pnl_points = (entry_px - adjusted_exit) if position == "SELL" else (adjusted_exit - entry_px)
             row["net_pnl"] = round(float(per_leg_pnl_points), 4)
+
+    # Settlement-price fix for same-day expiry trades (T-0 or intraday-expiry).
+    # The Rust feather has one LTP per (symbol, expiry, strike, type, date). When
+    # entry_date == exit_date == expiry_date the lookup returns the SAME record for
+    # both legs → entry_price == exit_price → net_pnl = 0.
+    # NSE settles expired options at intrinsic value: max(0, spot-strike) for CE,
+    # max(0, strike-spot) for PE. Apply that here so P&L is correct.
+    # The condition is intentionally narrow: all three must match so we never
+    # touch legs that exit mid-life (entry_date == exit_date but expiry is later)
+    # or normal held trades (entry_date != exit_date).
+    for row in final_priced:
+        exit_d = _normalize_iso(row.get("exit_date") or "")
+        entry_d = _normalize_iso(row.get("entry_date") or "")
+        expiry_d = _normalize_iso(row.get("expiry") or "")
+        if not (exit_d and entry_d == exit_d == expiry_d):
+            continue
+        opt_type = str(row.get("option_type") or "").upper()
+        if opt_type not in ("CE", "PE"):
+            continue
+        exit_spot = float(row.get("exit_spot") or 0.0)
+        strike = float(row.get("strike") or 0.0)
+        if exit_spot <= 0 or strike <= 0:
+            continue
+        settlement = (
+            max(0.0, exit_spot - strike) if opt_type == "CE"
+            else max(0.0, strike - exit_spot)
+        )
+        settlement = round(settlement, 2)
+        position = str(row.get("position") or "SELL").upper()
+        entry_px = float(row.get("entry_price") or 0.0)
+        net_pnl = round(
+            entry_px - settlement if position == "SELL" else settlement - entry_px, 4
+        )
+        row["exit_price"] = settlement
+        row["raw_exit_price"] = settlement
+        row["net_pnl"] = net_pnl
+
     return final_priced

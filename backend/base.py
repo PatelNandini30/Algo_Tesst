@@ -567,6 +567,24 @@ def load_ohlc_for_leg_range(symbol, from_date, to_date, expiry, option_type, str
     Single indexed query — O(1) per leg vs O(days) bhavcopy queries.
     Falls back to Arrow feather when the DB returns None (e.g. missing strike/expiry).
     """
+    # Fast path: Rust in-memory cache avoids disk/DB round-trips entirely.
+    # This prevents 60+ PostgreSQL queries (one per leg) during MAE/MFE computation.
+    if _rust_lookup_active:
+        try:
+            import algotest_native as _nat
+            if _nat.is_loaded():
+                result = _nat.get_ohlc_range(
+                    str(from_date), str(to_date),
+                    str(symbol).upper(),
+                    float(strike),
+                    str(option_type).upper(),
+                    str(expiry),
+                )
+                if result is not None:
+                    return result
+        except Exception:
+            pass
+        return _get_ohlc_range_from_feather(symbol, from_date, to_date, expiry, option_type, strike)
     if _use_postgres():
         try:
             result = _repo.get_ohlc_for_option_range(
@@ -581,9 +599,6 @@ def load_ohlc_for_leg_range(symbol, from_date, to_date, expiry, option_type, str
                 return result
         except Exception:
             pass
-    # DB returned None or is unavailable — try feather before the slow per-day fallback.
-    if _rust_lookup_active:
-        return _get_ohlc_range_from_feather(symbol, from_date, to_date, expiry, option_type, strike)
     return None
 
 
@@ -986,7 +1001,10 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     initial_capital = float(initial_entry_spot) if pd.notna(initial_entry_spot) else 0.0
     final_capital = initial_capital + total_pnl
     if initial_capital > 0 and final_capital > 0:
-        cagr = round(100.0 * ((final_capital / initial_capital) ** (1.0 / n_years) - 1), 2)
+        cagr_raw = 100.0 * ((final_capital / initial_capital) ** (1.0 / n_years) - 1)
+        # Cap at ±99999% — prevents astronomical blow-up when n_years is tiny
+        # (e.g. date-parse error collapses range to 0.01 years → 2^100 overflow).
+        cagr = round(max(-99999.0, min(99999.0, cagr_raw)), 2)
     else:
         cagr = round(-100.0, 2)
 
@@ -1014,8 +1032,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         mdd_start_date = peak_date.strftime('%Y-%m-%d')
         mdd_end_date   = trough_date.strftime('%Y-%m-%d')
 
-    car_mdd = round(cagr / abs(max_dd_pct), 2) if max_dd_pct != 0 else 0
-    recovery_factor = round(total_pnl / abs(max_dd_pts), 2) if max_dd_pts != 0 else 0
+    car_mdd = round(min(99999.0, cagr / abs(max_dd_pct)), 2) if max_dd_pct != 0 else 0
+    recovery_factor = round(min(99999.0, total_pnl / abs(max_dd_pts)), 2) if max_dd_pts != 0 else 0
 
     if 'Spot P&L' in df.columns:
         spot_series_safe = pd.to_numeric(_adf['Spot P&L'].replace('', np.nan), errors='coerce')
@@ -3482,7 +3500,33 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                 _range_opt = _range_dir / "options.feather"
                 _range_spt = _range_dir / "spot.feather"
                 if _range_opt.exists() and _range_spt.exists():
-                    if _try_feather_shortcut(_range_ck, _range_opt, _range_spt):
+                    # Guard: verify the spot feather's actual max date covers to_date.
+                    # The feather key encodes the requested range but the *content* may
+                    # be stale — written before a subsequent DB import extended the data.
+                    # A stale spot feather truncates the trading calendar, causing wrong
+                    # DTE calculations and silently dropping trades via deduplication.
+                    # The full-feather path (step 2) already has this check; apply it
+                    # here too before trusting the range-specific feather.
+                    _range_spot_valid = False
+                    try:
+                        _rsp = pl.scan_ipc(str(_range_spt)).select(["Date"]).collect()
+                        _rsp_max = str(_rsp["Date"].max())[:10]
+                        _range_spot_valid = (_rsp_max >= to_date)
+                        if not _range_spot_valid:
+                            logger.warning(
+                                "[BULK] Range feather %s stale: spot max=%s < to_date=%s — deleting",
+                                _range_ck, _rsp_max, to_date,
+                            )
+                            try:
+                                _range_opt.unlink(missing_ok=True)
+                                _range_spt.unlink(missing_ok=True)
+                                _range_dir.rmdir()
+                            except Exception:
+                                pass
+                    except Exception as _rce:
+                        logger.debug("[BULK] Range feather spot-date check failed: %s", _rce)
+                        _range_spot_valid = True  # optimistically try if unreadable
+                    if _range_spot_valid and _try_feather_shortcut(_range_ck, _range_opt, _range_spt):
                         return {
                             "options_rows": 0,
                             "spot_rows": len(_spot_lookup_table),
@@ -3500,6 +3544,10 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                     _spt_feather = _feather_dir / "spot.feather"
                     if _opt_feather.exists() and _spt_feather.exists():
                         _feather_covers = False
+                        _fmin = _fmax = None
+                        # Read spot max once — reused for both the coverage extension
+                        # and the staleness check below to avoid reading the file twice.
+                        _spt_max_full = None
                         try:
                             _fdf_full = pl.scan_ipc(_opt_feather).select(["Date"]).collect()
                             _fmin = str(_fdf_full["Date"].min())[:10]
@@ -3512,6 +3560,44 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                                 )
                         except Exception as _fe:
                             logger.debug("[BULK] Feather range check failed: %s", _fe)
+                        # Read spot feather max once for both coverage and staleness checks.
+                        if _fmin is not None:
+                            try:
+                                _sdf_full = pl.scan_ipc(_spt_feather).select(["Date"]).collect()
+                                _spt_max_full = str(_sdf_full["Date"].max())[:10]
+                            except Exception as _sfe:
+                                logger.debug("[BULK] Full feather spot-date read failed: %s", _sfe)
+                        # Extension: feather may not reach to_date because DB spot data
+                        # is behind Parquet options data. If the feather is internally
+                        # consistent (spot_max == options_max in the feather pair), it
+                        # contains the best available data — any dates beyond _fmax have
+                        # no spot so produce no trades regardless. Accept it.
+                        if not _feather_covers and _fmin is not None and _fmin <= from_date and _spt_max_full is not None:
+                            if _spt_max_full >= _fmax:
+                                _feather_covers = True
+                                logger.info(
+                                    "[BULK] Feather (%s→%s) is spot-bounded (spot=%s); accepting for to_date=%s",
+                                    _fmin, _fmax, _spt_max_full, to_date,
+                                )
+                        # Staleness check: if spot feather is BEHIND the options feather
+                        # in the same pair, the pair was written inconsistently (options
+                        # came from a wider Parquet while spot came from a narrower DB
+                        # export). Delete and let a DB reload rebuild a consistent pair.
+                        # Compare against _fmax (options max), NOT to_date — to_date can
+                        # exceed DB spot max permanently, which would cause an infinite
+                        # delete-rebuild cycle.
+                        if _feather_covers and _spt_max_full is not None:
+                            if _spt_max_full < _fmax:
+                                logger.warning(
+                                    "[BULK] Full feather spot stale: spot max=%s < options max=%s — deleting both feathers",
+                                    _spt_max_full, _fmax,
+                                )
+                                try:
+                                    _opt_feather.unlink(missing_ok=True)
+                                    _spt_feather.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                _feather_covers = False
                         if _feather_covers and _try_feather_shortcut(_rust_ck, _opt_feather, _spt_feather, _fmin, _fmax):
                             return {
                                 "options_rows": 0,
