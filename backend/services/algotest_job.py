@@ -287,12 +287,18 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     Activation: set ENGINE_BACKEND=rust. Default unset / 'python' uses the
     Python engine.
 
-    Known gaps vs Python (set ENGINE_BACKEND=python if these matter for you):
-      * Exit Reason is always 'Expiry' regardless of SL/Target/Spot-Adj firing
-      * ReEntryIndex/Trigger/Mode tags missing (re-entry rows still produced)
-      * Buffer strike / futures / lazy legs / rollover / no_rollover /
-        filter_entry_mode='fixed'|'min_days' → orchestrator returns None →
-        falls back to Python.
+    Status: Rust engine is fully parity-shipped with Python for the supported
+    strategy surface (verified by tests/test_engine_rust_pipeline.py).  Supported:
+    all strike modes, per-leg SL/Target/TrailSL, SL-with-Buffer, overall SL/Target,
+    re-entry (RE_ASAP, RE_ASAP_REV, LAZY_LEG, RE_MOMENTUM, RE_MOMENTUM_REV),
+    spot adjustment, buffer strike, STR/filter gating in all filter_entry_modes
+    ('dte'/'fixed'/'min_days'), rollover + no_rollover, NEXT_WEEKLY/NEXT_MONTHLY,
+    FUTURES (incl. SL/Target/TrailSL/re-entry), and FUTURES + NEXT_WEEKLY mixed.
+
+    Only edge cases that still return None and fall back to Python: data-missing
+    runtime failures (strike unresolvable, spot data missing for re-anchor),
+    custom strike_selection.type values not in the supported set, and re-entry
+    modes outside the 5 supported modes above.
     """
     from base import compute_analytics, build_pivot, get_spot_price_from_db, get_trading_calendar
     from engines.generic_algotest_engine import get_lot_size
@@ -463,15 +469,17 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
             "Peak": r.get("Peak"),
             "DD": r.get("DD"),
             "%DD": r.get("%DD"),
+            "Spot P&L": r.get("Spot P&L"),
         }
         for _, r in aggregated.iterrows()
     }
     parent_leg_seen = set()
-    cum, peak, dd, pdd = [], [], [], []
+    cum, peak, dd, pdd, spot_pl = [], [], [], [], []
     for _, row in trades_df.iterrows():
         tid = str(row["Trade"])
         if tid in parent_leg_seen:
             cum.append(None); peak.append(None); dd.append(None); pdd.append(None)
+            spot_pl.append(None)
             continue
         parent_leg_seen.add(tid)
         v = trade_to_cum.get(tid, {})
@@ -479,10 +487,15 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
         peak.append(v.get("Peak"))
         dd.append(v.get("DD"))
         pdd.append(v.get("%DD"))
+        spot_pl.append(v.get("Spot P&L"))
     trades_df["Cumulative"] = cum
     trades_df["Peak"] = peak
     trades_df["DD"] = dd
     trades_df["%DD"] = pdd
+    # Spot P&L is a trade-level quantity. Write only on the parent (first-leg)
+    # row to match Net P&L convention; per-leg sums then give the trade total
+    # without double-counting.
+    trades_df["Spot P&L"] = spot_pl
 
     # Sort by Entry Date so cascade mini-trades (which have NEW higher
     # trade_ids appended at the end by engine_rust._sa_reentry_specs) appear
@@ -698,7 +711,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             bulk_clear_options()
                         except Exception:
                             pass
-                        engine_summary = result_summary
+                        # Keep engine_summary from run_algotest_backtest (computed from
+                        # per-trade data) — result_summary from per-leg trades_agg
+                        # double-counts Net P&L for multi-leg strategies.
                         engine_pivot = result_pivot
                         logger.info("[JOB_PERF] first analytics %.2fs", time.perf_counter() - stage_t)
                     except Exception as e:
@@ -784,23 +799,45 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             trades_df[col], dayfirst=True, errors='coerce'
                         )
 
-                # Skip aggregation - trades are already properly indexed
-                # The _reindex_trades call above ensures unique Trade IDs
                 trades_aggregated = trades_df
 
                 if 'Net P&L' in trades_aggregated.columns:
                     logger.debug("[DEBUG] Net P&L sample=%s", trades_aggregated['Net P&L'].head().tolist())
 
-                trades_aggregated, result_summary = compute_analytics(trades_aggregated)
+                # Pass trade-level (first-leg) data to compute_analytics and
+                # build_pivot.  The Python engine writes Net P&L = TRADE_TOTAL on
+                # the first-leg row and per-leg partial on Leg 2+.  Both functions
+                # use Net P&L directly (compute_analytics sums by Trade groupby;
+                # build_pivot cumsum-s the column) — feeding them per-leg data
+                # double-counts: Leg1(total) + Leg2(partial) != correct trade P&L.
+                # Extracting first-leg rows gives one row per trade with the correct
+                # combined P&L.  For single-leg strategies every row is a first-leg
+                # row so the mask is a no-op and behaviour is identical to before.
+                if 'Trade' in trades_aggregated.columns:
+                    _leg_sort_pre = ['Entry Date']
+                    if 'Leg' in trades_aggregated.columns:
+                        _leg_sort_pre.append('Leg')
+                    trades_aggregated = trades_aggregated.sort_values(
+                        _leg_sort_pre, kind='stable'
+                    ).reset_index(drop=True)
+                    _fm_pre = trades_aggregated.groupby('Trade', sort=False).cumcount() == 0
+                    _analytics_df = trades_aggregated[_fm_pre].copy()
+                else:
+                    _analytics_df = trades_aggregated.copy()
+
+                _, result_summary = compute_analytics(_analytics_df)
                 logger.debug("[DEBUG] Result summary=%s", result_summary)
-                result_pivot = build_pivot(trades_aggregated, "Exit Date")
+                result_pivot = build_pivot(_analytics_df, "Exit Date")
 
                 # Recompute cumulative/peak/DD/%DD from scratch using first-leg rows.
                 # Each chunk's engine call resets cumulative to 100, so we must
                 # recompute globally across the combined dataset.
                 # First-leg rows carry the total trade P&L (not per-leg partial),
                 # so the compound formula gives the correct global series.
-                _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+                # 'Spot P&L' is a trade-level quantity (same Entry/Exit Spot on
+                # every leg of a trade) and is also kept first-leg-only here so
+                # downstream column sums match the trade-level total.
+                _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD', 'Spot P&L']
                 if ('Trade' in trades_aggregated.columns
                         and 'Net P&L' in trades_aggregated.columns
                         and 'Entry Spot' in trades_aggregated.columns

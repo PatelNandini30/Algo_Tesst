@@ -636,6 +636,94 @@ _register(
 )
 
 
+# FUTURES with per-leg SL — verifies _scan_futures_sl_target fires correctly.
+# Aggressive 0.5% SL on a short FUTURES SELL so it fires during the window.
+_register(
+    "futures_with_sl",
+    {
+        **_base(),
+        "legs": [
+            {
+                "segment": "FUTURES",
+                "option_type": "FUT",
+                "position": "SELL",
+                "lots": 1,
+                "expiry": "CURRENT_MONTH",
+                "fut_exit_mode": "ON_EXPIRY",
+                "stopLoss": {"mode": "PERCENT", "value": 0.5},
+            }
+        ],
+    },
+)
+
+# FUTURES with TrailSL.
+_register(
+    "futures_with_trail_sl",
+    {
+        **_base(),
+        "legs": [
+            {
+                "segment": "FUTURES",
+                "option_type": "FUT",
+                "position": "SELL",
+                "lots": 1,
+                "expiry": "CURRENT_MONTH",
+                "fut_exit_mode": "ON_EXPIRY",
+                "trailSL": {"trigger": 0.3, "move": 0.2, "mode": "PERCENT"},
+            }
+        ],
+    },
+)
+
+# Mixed FUTURES + NEXT_WEEKLY option leg.
+# Leg 1 is a monthly FUTURES SELL; Leg 2 is a NEXT_WEEKLY CE SELL.
+_register(
+    "futures_next_weekly_mix",
+    {
+        **_base(),
+        "legs": [
+            {
+                "segment": "FUTURES",
+                "option_type": "FUT",
+                "position": "SELL",
+                "lots": 1,
+                "expiry": "CURRENT_MONTH",
+                "fut_exit_mode": "ON_EXPIRY",
+            },
+            {
+                "segment": "OPTIONS",
+                "option_type": "CE",
+                "position": "SELL",
+                "lots": 1,
+                "expiry": "NEXT_WEEKLY",
+                "strike_interval": 50,
+                "strike_selection": {"type": "strike_type", "strike_type": "ATM"},
+            },
+        ],
+    },
+)
+
+# FUTURES with re-entry on SL (RE_ASAP mode).
+_register(
+    "futures_with_reentry_sl",
+    {
+        **_base(),
+        "legs": [
+            {
+                "segment": "FUTURES",
+                "option_type": "FUT",
+                "position": "SELL",
+                "lots": 1,
+                "expiry": "CURRENT_MONTH",
+                "fut_exit_mode": "ON_EXPIRY",
+                "stopLoss": {"mode": "PERCENT", "value": 0.5},
+                "reEntryOnSL": {"mode": "RE_ASAP", "count": 1},
+            }
+        ],
+    },
+)
+
+
 def list_names() -> List[str]:
     return sorted(ARCHETYPES.keys())
 

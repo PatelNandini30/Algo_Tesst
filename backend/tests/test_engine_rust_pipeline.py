@@ -102,6 +102,13 @@ SLICE_4_ARCHETYPES = (
     "rollover_fixed_strike",
     # FUTURES — single-leg monthly futures SELL, no SL/Target
     "single_leg_futures_monthly",
+    # Gap 1: FUTURES + per-leg SL / TrailSL (uses _scan_futures_sl_target)
+    "futures_with_sl",
+    "futures_with_trail_sl",
+    # Gap 2: FUTURES + re-entry on SL
+    "futures_with_reentry_sl",
+    # Gap 3: FUTURES + NEXT_WEEKLY mixed strategies
+    "futures_next_weekly_mix",
 )
 
 

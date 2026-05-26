@@ -219,6 +219,34 @@ def _resolve_atm_strike(spot: float, strike_interval: float) -> float:
     return round(spot / strike_interval) * strike_interval
 
 
+def _spot_adj_reason_tag(
+    spot_adj_direction: str,
+    entry_spot: float,
+    trigger_spot: Optional[float],
+    spot_adj_pct: float,
+    spot_adj_units: str,
+) -> str:
+    """SPOT_ADJ_RISE vs SPOT_ADJ_FALL — never returns the plain 'SPOT_ADJ' tag.
+
+    For one-directional configs the answer is fixed. For 'both' we compare the
+    trigger-day spot against the rise threshold; if data is missing we fall
+    back to the move direction (trig vs entry), and finally to RISE.
+    """
+    d = (spot_adj_direction or "").lower()
+    if d == "rise":
+        return "SPOT_ADJ_RISE"
+    if d == "fall":
+        return "SPOT_ADJ_FALL"
+    # "both" — figure it out from the actual spot movement.
+    if trigger_spot is None or entry_spot <= 0:
+        return "SPOT_ADJ_RISE"
+    if (spot_adj_units or "").lower() == "points":
+        rise_tgt = entry_spot + spot_adj_pct
+    else:
+        rise_tgt = entry_spot * (1.0 + spot_adj_pct / 100.0)
+    return "SPOT_ADJ_RISE" if trigger_spot >= rise_tgt else "SPOT_ADJ_FALL"
+
+
 def _compute_spot_adjustment_trigger(
     entry_date: str,
     entry_spot: float,
@@ -402,6 +430,96 @@ def _futures_get_exit_date(anchor: str, exit_mode: str, n_days: int, sorted_td: 
     return anchor
 
 
+def _scan_futures_sl_target(
+    entry_date: str,
+    entry_price_raw: float,
+    position: str,
+    leg_src: Dict[str, Any],
+    sorted_td: List[str],
+    scheduled_exit: str,
+    index: str,
+    fut_expiry: str,
+    slippage: float,
+) -> Tuple[str, Optional[float], str]:
+    """
+    Scan daily futures prices entry+1 -> scheduled_exit for SL/Target/TrailSL.
+
+    Returns (actual_exit_date, exit_price_raw_or_None, exit_reason).
+    exit_price_raw is None when nothing fires - caller keeps original price.
+    Mirrors check_leg_stop_loss_target logic from generic_algotest_engine.py.
+    """
+    from base import get_future_price_from_db
+
+    sl = (leg_src.get("stopLoss") or {}) if isinstance(leg_src.get("stopLoss"), dict) else {}
+    tp = (leg_src.get("targetProfit") or {}) if isinstance(leg_src.get("targetProfit"), dict) else {}
+    trail = (leg_src.get("trailSL") or {}) if isinstance(leg_src.get("trailSL"), dict) else {}
+
+    sl_val = _maybe_float(sl.get("value"))
+    sl_type = _norm_mode(sl.get("mode"))
+    tp_val = _maybe_float(tp.get("value"))
+    tp_type = _norm_mode(tp.get("mode"))
+    trail_trig = _maybe_float(trail.get("trigger") or trail.get("x"))
+    trail_move_v = _maybe_float(trail.get("move") or trail.get("y"))
+    trail_mode = _norm_mode(trail.get("mode"))
+    trail_enabled = bool(trail_trig and trail_move_v and trail_trig > 0 and trail_move_v > 0)
+
+    has_sl = sl_val is not None and sl_val > 0
+    has_tp = tp_val is not None and tp_val > 0
+    if not has_sl and not has_tp and not trail_enabled:
+        return (scheduled_exit, None, "EXPIRY")
+
+    trail_armed = False
+    trail_best: Optional[float] = None
+
+    def _metric(current: float, mode: str) -> float:
+        """Directional P&L in pct or points, positive = favourable."""
+        if mode == "pct":
+            base = entry_price_raw or 1.0
+            raw = (current - entry_price_raw) / base * 100.0
+        else:
+            raw = current - entry_price_raw
+        return raw if position == "BUY" else -raw
+
+    for day in sorted_td:
+        if day <= entry_date:
+            continue
+        if day > scheduled_exit:
+            break
+        try:
+            current = get_future_price_from_db(day, index, expiry=fut_expiry)
+        except Exception:
+            current = None
+        if current is None or current <= 0:
+            continue
+
+        pnl_pct = _metric(current, "pct")
+        pnl_pts = _metric(current, "points")
+
+        if trail_enabled:
+            trail_metric = pnl_pct if trail_mode == "pct" else pnl_pts
+            if not trail_armed:
+                if trail_metric >= trail_trig:
+                    trail_armed = True
+                    trail_best = trail_metric
+            else:
+                if trail_metric > trail_best:
+                    trail_best = trail_metric
+                if trail_best - trail_metric >= trail_move_v:
+                    return (day, current, "TRAIL_SL")
+
+        if has_sl:
+            adverse = pnl_pct if sl_type == "pct" else pnl_pts
+            if adverse <= -sl_val:
+                return (day, current, "SL")
+
+        if has_tp:
+            favourable = pnl_pct if tp_type == "pct" else pnl_pts
+            if favourable >= tp_val:
+                return (day, current, "TARGET")
+
+    return (scheduled_exit, None, "EXPIRY")
+
+
 def _build_futures_specs(
     payload: Dict[str, Any],
     expiry_dates: List[str],
@@ -475,15 +593,6 @@ def _build_futures_specs(
             if str(leg.get("segment") or "OPTION").upper() not in ("FUTURE", "FUTURES"):
                 continue
 
-            # SL / Target / Trail on futures not yet supported → Python fallback.
-            for risk_key in ("stopLoss", "targetProfit", "trailSL"):
-                v = leg.get(risk_key) or {}
-                if isinstance(v, dict) and _maybe_float(v.get("value")):
-                    return None
-            # Re-entry on futures not yet supported.
-            if leg.get("reEntryOnSL") or leg.get("reEntryOnTarget"):
-                return None
-
             position = str(leg.get("position") or "SELL").upper()
             lots = int(leg.get("lots") or 1)
 
@@ -514,6 +623,19 @@ def _build_futures_specs(
                 continue
             if exit_price_raw is None:
                 exit_price_raw = entry_price_raw
+
+            # Save scheduled exit BEFORE the SL scan — re-entry (Task 3) uses it as cap.
+            _orig_sched_exit = fut_exit_date
+
+            # SL / Target / TrailSL scan for FUTURES leg.
+            _scan_exit_date, _scan_exit_raw, _actual_exit_reason = _scan_futures_sl_target(
+                entry_date, float(entry_price_raw), position, leg, sorted_td,
+                _orig_sched_exit, index, fut_expiry or "", slippage,
+            )
+            if _scan_exit_raw is not None:
+                fut_exit_date = _scan_exit_date
+                exit_price_raw = _scan_exit_raw
+                exit_spot = spot_by_date.get(fut_exit_date, exit_spot)
 
             # Slippage — mirrors _apply_slippage in generic_algotest_engine.py
             if slippage > 0:
@@ -551,8 +673,109 @@ def _build_futures_specs(
                 "net_pnl": net_pnl,
                 "entry_spot": float(entry_spot),
                 "exit_spot": float(exit_spot),
-                "exit_reason": "EXPIRY",
+                "exit_reason": _actual_exit_reason,
             })
+
+            # Re-entry loop for FUTURES legs (mirrors options re-entry orchestration).
+            _re_on_sl = leg.get("reEntryOnSL") if isinstance(leg.get("reEntryOnSL"), dict) else None
+            _re_on_tgt = leg.get("reEntryOnTarget") if isinstance(leg.get("reEntryOnTarget"), dict) else None
+            _sl_budget = int((_re_on_sl or {}).get("count") or 0)
+            _tgt_budget = int((_re_on_tgt or {}).get("count") or 0)
+            _re_mode = str(
+                ((_re_on_sl or _re_on_tgt or {}).get("mode") or "RE_ASAP")
+            ).upper()
+
+            if (_re_on_sl or _re_on_tgt) and (_sl_budget > 0 or _tgt_budget > 0):
+                _sl_used_re = 0
+                _tgt_used_re = 0
+                _cur_exit = fut_exit_date           # tracks re-entry's start date (post-scan actual exit)
+                _cur_reason = _actual_exit_reason   # reason that may trigger re-entry
+                _sched_exit = _orig_sched_exit      # original scheduled exit cap — re-entry cannot exceed
+
+                while True:
+                    if _cur_reason in ("SL", "TRAIL_SL") and _re_on_sl and _sl_used_re < _sl_budget:
+                        _sl_used_re += 1
+                        _re_trigger = "SL"
+                    elif _cur_reason == "TARGET" and _re_on_tgt and _tgt_used_re < _tgt_budget:
+                        _tgt_used_re += 1
+                        _re_trigger = "TARGET"
+                    else:
+                        break
+
+                    _re_entry_date = next(
+                        (d for d in sorted_td if d > _cur_exit and d < _sched_exit),
+                        None,
+                    )
+                    if not _re_entry_date:
+                        break
+
+                    _re_idx = _sl_used_re + _tgt_used_re
+
+                    try:
+                        _re_ep_raw, _re_xp_raw, _re_expiry = resolve_futures_pnl_with_rollover(
+                            entry_date=_re_entry_date,
+                            exit_date=_sched_exit,
+                            index=index,
+                            position=position,
+                            preference=fut_pref,
+                        )
+                    except Exception:
+                        break
+                    if _re_ep_raw is None:
+                        break
+                    if _re_xp_raw is None:
+                        _re_xp_raw = _re_ep_raw
+
+                    _re_scan_date, _re_scan_raw, _re_reason = _scan_futures_sl_target(
+                        _re_entry_date, float(_re_ep_raw), position, leg, sorted_td,
+                        _sched_exit, index, _re_expiry or fut_expiry or "", slippage,
+                    )
+                    if _re_scan_raw is not None:
+                        _re_xp_raw = _re_scan_raw
+                        _re_exit_date = _re_scan_date
+                    else:
+                        _re_exit_date = _sched_exit
+                        _re_reason = "EXPIRY"
+
+                    if slippage > 0:
+                        _re_ep = round(max(float(_re_ep_raw) * _entry_fac, 0.0), 2)
+                        _re_xp = round(max(float(_re_xp_raw) * _exit_fac, 0.0), 2)
+                    else:
+                        _re_ep = round(float(_re_ep_raw), 2)
+                        _re_xp = round(float(_re_xp_raw), 2)
+
+                    _re_pnl = round(
+                        (_re_ep - _re_xp) if position == "SELL" else (_re_xp - _re_ep), 4
+                    )
+
+                    out.append({
+                        "trade_id": trade_id,
+                        "leg_id": leg_id,
+                        "index": index,
+                        "entry_date": _re_entry_date,
+                        "exit_date": _re_exit_date,
+                        "expiry": _re_expiry or fut_expiry or "",
+                        "strike": 0.0,
+                        "option_type": "FUT",
+                        "position": position,
+                        "lots": lots,
+                        "lot_size": lot_size,
+                        "slippage_pct": slippage,
+                        "entry_price": _re_ep,
+                        "exit_price": _re_xp,
+                        "raw_entry_price": round(float(_re_ep_raw), 4),
+                        "raw_exit_price": round(float(_re_xp_raw), 4),
+                        "net_pnl": _re_pnl,
+                        "entry_spot": float(spot_by_date.get(_re_entry_date, 0.0)),
+                        "exit_spot": float(spot_by_date.get(_re_exit_date, 0.0)),
+                        "exit_reason": _re_reason,
+                        "_reentry_index": _re_idx,
+                        "_reentry_trigger": _re_trigger,
+                        "_reentry_mode": _re_mode,
+                    })
+
+                    _cur_exit = _re_exit_date
+                    _cur_reason = _re_reason
 
     return out
 
@@ -903,9 +1126,17 @@ def _build_fixed_entry_specs(
             for leg_idx, leg in enumerate(legs_src):
                 if not isinstance(leg, dict):
                     return None
+                # Honour per-leg strike_interval override (user picks 100 for
+                # NIFTY in the leg form). Without this, every fixed-mode trade
+                # snaps to the index default (50 for NIFTY).
+                _leg_iv_raw = leg.get("strike_interval")
+                try:
+                    leg_interval = float(_leg_iv_raw) if _leg_iv_raw else interval
+                except (TypeError, ValueError):
+                    leg_interval = interval
                 _shift_info: Dict[str, Any] = {}
                 strike = _compute_strike_for_leg_python(
-                    leg, entry_spot, interval,
+                    leg, entry_spot, leg_interval,
                     entry_date=current_entry, expiry=target_expiry, index=index_str,
                     out_info=_shift_info,
                 )
@@ -920,7 +1151,7 @@ def _build_fixed_entry_specs(
                     "expiry": target_expiry,
                     "strike": float(strike),
                     "requested_strike": float(_shift_info.get("requested_strike") or strike),
-                    "strike_interval": float(interval),
+                    "strike_interval": float(leg_interval),
                     "option_type": str(leg.get("option_type") or "CE").upper(),
                     "position": str(leg.get("position") or "SELL").upper(),
                     "lots": int(leg.get("lots") or 1),
@@ -1056,9 +1287,17 @@ def _build_next_expiry_specs(
 
         for leg_idx, (leg, is_next) in enumerate(zip(legs_src, leg_is_next)):
             per_leg_expiry = next_exp if is_next else cur_exp
+            # Honour per-leg strike_interval override (e.g. user picks 100 for
+            # NIFTY). Without this, DTE-mode trades collapse to the index
+            # default and the per-leg setting is ignored.
+            _leg_iv_raw = leg.get("strike_interval")
+            try:
+                leg_interval = float(_leg_iv_raw) if _leg_iv_raw else interval
+            except (TypeError, ValueError):
+                leg_interval = interval
             _shift_info: Dict[str, Any] = {}
             strike = _compute_strike_for_leg_python(
-                leg, entry_spot, interval,
+                leg, entry_spot, leg_interval,
                 entry_date=entry_date, expiry=per_leg_expiry, index=index_str,
                 out_info=_shift_info,
             )
@@ -1073,7 +1312,7 @@ def _build_next_expiry_specs(
                 "expiry": per_leg_expiry,
                 "strike": float(strike),
                 "requested_strike": float(_shift_info.get("requested_strike") or strike),
-                "strike_interval": float(interval),
+                "strike_interval": float(leg_interval),
                 "option_type": str(leg.get("option_type") or "CE").upper(),
                 "position": str(leg.get("position") or "SELL").upper(),
                 "lots": int(leg.get("lots") or 1),
@@ -1439,7 +1678,12 @@ def priced_to_tradesheet_records(
         position = (row.get("position") or "SELL").upper()
         entry_spot = float(row.get("entry_spot") or 0.0)
         exit_spot = float(row.get("exit_spot") or 0.0)
-        spot_pnl = round(exit_spot - entry_spot, 2)
+        # Spot P&L is a trade-level quantity: write it only on the first-leg
+        # row (leg_id == 1) and leave subsequent leg rows blank, mirroring the
+        # Net P&L convention.  Per-row summing then yields the trade total
+        # without double-counting for multi-leg strategies.
+        _leg_id_val = int(row.get("leg_id") or 1)
+        spot_pnl = round(exit_spot - entry_spot, 2) if _leg_id_val == 1 else ""
         net_pnl = float(row.get("net_pnl") or 0.0)
         # CE/PE P&L are PER-LEG values. The simulate.rs post-process puts the
         # trade total in the parent row's `net_pnl`, so we cannot read per-leg
@@ -1512,9 +1756,9 @@ def priced_to_tradesheet_records(
             "% P&L": pct_pnl,
             "Exit Reason": str(row.get("exit_reason") or "EXPIRY"),
             "Strike Shift Reason": _shift_reason,
-            "ReEntryIndex": "",
-            "ReEntryTrigger": "",
-            "ReEntryMode": "",
+            "ReEntryIndex": row.get("_reentry_index") or "",
+            "ReEntryTrigger": str(row.get("_reentry_trigger") or ""),
+            "ReEntryMode": str(row.get("_reentry_mode") or ""),
             "Is Lazy Leg": False,
             "Lazy Leg Name": "",
             "Lazy Entry Date": "",
@@ -1634,6 +1878,128 @@ def _apply_buffer_strike_to_specs(
     return result
 
 
+def _build_mixed_futures_next_weekly(
+    payload: Dict[str, Any],
+    expiry_dates: List[str],
+    trading_days: List[str],
+    lot_size: int,
+    spot_by_date: Dict[str, float],
+    segments: Optional[List[Tuple[str, str]]],
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Handle strategies that mix FUTURES legs with NEXT_WEEKLY/NEXT_MONTHLY option legs.
+
+    Python convention for mixed mode:
+      * FUT pricing uses the FUT's OWN DTE schedule (entry_dte/exit_dte applied
+        to the current weekly expiry — same as _build_futures_specs would produce).
+      * The row's reported exit_date field uses the TRADE-level exit
+        (option's NEXT_WEEKLY exit), not the FUT's own exit.
+      * The first leg of each trade gets the trade-total net_pnl.
+
+    Returns None on any failure so caller falls back to Python.
+    """
+    try:
+        import algotest_native  # type: ignore
+    except ImportError:
+        return None
+
+    legs_src = payload.get("legs") or []
+
+    fut_legs_with_pos = [
+        (orig_idx, leg) for orig_idx, leg in enumerate(legs_src, start=1)
+        if isinstance(leg, dict)
+        and str(leg.get("segment") or "OPTION").upper() in ("FUTURE", "FUTURES")
+    ]
+    opt_legs_with_pos = [
+        (orig_idx, leg) for orig_idx, leg in enumerate(legs_src, start=1)
+        if isinstance(leg, dict)
+        and str(leg.get("segment") or "OPTION").upper() not in ("FUTURE", "FUTURES")
+    ]
+    if not fut_legs_with_pos or not opt_legs_with_pos:
+        return None  # Mixed mode requires both leg types.
+
+    # Build option specs — drives the trade-level exit_date.
+    _ext_expiry_dates = _fetch_one_extra_expiry(expiry_dates, payload)
+    opt_payload = {**payload, "legs": [l for _, l in opt_legs_with_pos]}
+    opt_specs = _build_next_expiry_specs(
+        opt_payload, _ext_expiry_dates, trading_days, spot_by_date, int(lot_size)
+    )
+    if opt_specs is None:
+        return None
+    if not opt_specs:
+        return []
+
+    if not algotest_native.is_loaded():
+        return None
+    priced_opts = list(algotest_native.simulate_trades_batch(opt_specs))
+
+    # Remap option leg_ids from opt_legs (1-based) to their original positions.
+    _opt_leg_id_remap = {new_idx: orig_idx for new_idx, (orig_idx, _) in enumerate(opt_legs_with_pos, start=1)}
+    for row in priced_opts:
+        if row.get("leg_id") in _opt_leg_id_remap:
+            row["leg_id"] = _opt_leg_id_remap[row["leg_id"]]
+
+    # Build FUT rows using FUT's OWN DTE schedule via _build_futures_specs.
+    # _build_futures_specs already skips non-FUTURES legs by segment check, so
+    # we can pass the full payload — only FUT legs will produce rows.
+    fut_rows = _build_futures_specs(
+        payload, expiry_dates, trading_days, spot_by_date, lot_size, segments
+    )
+    if fut_rows is None:
+        return None  # FUT path rejected (unsupported config)
+
+    # Relabel each FUT row's exit_date to the trade-level exit_date from options.
+    # Match FUT rows to option specs by entry_date (same trade period).
+    from collections import defaultdict
+    opt_exit_by_entry: Dict[str, str] = {}  # entry_date -> max(exit_date) across option legs
+    for spec in opt_specs:
+        e = spec["entry_date"]
+        x = spec["exit_date"]
+        if e not in opt_exit_by_entry or x > opt_exit_by_entry[e]:
+            opt_exit_by_entry[e] = x
+
+    for row in fut_rows:
+        trade_exit = opt_exit_by_entry.get(row["entry_date"])
+        if trade_exit and trade_exit > row["exit_date"]:
+            # Don't change actual pricing — just the reported exit_date label.
+            row["exit_date"] = trade_exit
+            # exit_spot is the spot on the labeled exit date.
+            row["exit_spot"] = float(spot_by_date.get(trade_exit, row.get("exit_spot") or 0.0))
+
+    # Re-assign trade_ids so FUT row and option row of the same period share one tid.
+    # Match by entry_date.
+    entry_to_tid: Dict[str, int] = {}
+    next_tid = 1
+    # Walk through unique entry_dates in chronological order.
+    all_entries = sorted({r["entry_date"] for r in (list(priced_opts) + list(fut_rows))})
+    for e in all_entries:
+        entry_to_tid[e] = next_tid
+        next_tid += 1
+    for row in priced_opts:
+        row["trade_id"] = entry_to_tid[row["entry_date"]]
+    for row in fut_rows:
+        row["trade_id"] = entry_to_tid[row["entry_date"]]
+
+    combined = list(priced_opts) + fut_rows
+
+    # Multi-leg P&L convention: the FIRST leg (lowest leg_id) of each trade
+    # carries the TRADE-TOTAL net_pnl; other legs carry per-leg net_pnl.
+    # simulate.rs already does this for options-only trades; for mixed we must
+    # replicate it after merging the FUT rows in.
+    from collections import defaultdict as _dd
+    _by_tid: Dict[int, List[Dict]] = _dd(list)
+    for _r in combined:
+        _by_tid[int(_r.get("trade_id") or 0)].append(_r)
+    for _tid, _rows in _by_tid.items():
+        if len(_rows) <= 1:
+            continue  # Single-leg trade — net_pnl already per-leg = trade total
+        _trade_total = round(sum(float(_r.get("net_pnl") or 0.0) for _r in _rows), 4)
+        _first = min(_rows, key=lambda _r: int(_r.get("leg_id") or 1))
+        _first["net_pnl"] = _trade_total
+
+    return combined if combined else None
+
+
 def run_rust_engine_pipeline(
     payload: Dict[str, Any],
     *,
@@ -1702,9 +2068,16 @@ def run_rust_engine_pipeline(
         # FUTURES legs are priced via base.resolve_futures_pnl_with_rollover
         # (Python DB lookup), not the Rust feather.  Build and return complete
         # priced rows directly — bypass simulate_trades_batch and SL/re-entry.
-        # FUTURES + NEXT_WEEKLY mixed strategies fall back to Python for now.
         if _has_next_leg:
-            return None
+            # Mixed FUTURES + NEXT_WEEKLY: build each type separately, merge by period.
+            try:
+                _mixed = _build_mixed_futures_next_weekly(
+                    payload, expiry_dates, trading_days, lot_size, spot_by_date, segments,
+                )
+            except Exception as _exc:
+                logger.warning("[ENGINE_RUST] mixed FUTURES+NEXT_WEEKLY failed: %s", _exc)
+                _mixed = None
+            return _mixed  # None → caller falls back to Python engine
         fut_rows = _build_futures_specs(
             payload, expiry_dates, trading_days, spot_by_date, int(lot_size), segments,
         )
@@ -1854,7 +2227,7 @@ def run_rust_engine_pipeline(
     # ── Slice 6b: no_rollover post-processing ───────────────────────────────
     # Keep only the first trade per segment (or globally when no filter).
     # Mirrors generic_algotest_engine.py:4054-4072.
-    if payload.get("no_rollover"):
+    if payload.get("no_rollover") and filter_entry_mode != "fixed":
         specs = _apply_no_rollover(specs, payload, trading_days, segments)
 
     # ── Slice 9b: rollover_strike_mode='fixed' ───────────────────────────────
@@ -1973,21 +2346,13 @@ def run_rust_engine_pipeline(
             )
             if trig:
                 spot_adj_overrides[trade_id] = trig
-                if spot_adj_direction == "rise":
-                    spot_adj_reasons[trade_id] = "SPOT_ADJ_RISE"
-                elif spot_adj_direction == "fall":
-                    spot_adj_reasons[trade_id] = "SPOT_ADJ_FALL"
-                else:
-                    # "both" — determine which threshold was crossed on the trigger day
-                    trig_spot = spot_by_date.get(trig)
-                    if trig_spot is not None:
-                        if spot_adj_units == "points":
-                            rise_tgt = entry_spot + spot_adj_pct
-                        else:
-                            rise_tgt = entry_spot * (1.0 + spot_adj_pct / 100.0)
-                        spot_adj_reasons[trade_id] = "SPOT_ADJ_RISE" if trig_spot >= rise_tgt else "SPOT_ADJ_FALL"
-                    else:
-                        spot_adj_reasons[trade_id] = "SPOT_ADJ"
+                spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
+                    spot_adj_direction,
+                    entry_spot,
+                    spot_by_date.get(trig),
+                    spot_adj_pct,
+                    spot_adj_units,
+                )
 
     # Slice 5: Overall SL / Target detection.
     # Engine flow (engines/generic_algotest_engine.py:4553-4594):
@@ -2143,6 +2508,7 @@ def run_rust_engine_pipeline(
     # the Python engine — never produce wrong numbers.
     reentry_specs: List[Dict[str, Any]] = []
     reentry_reason_map: Dict[Tuple[int, int, str], str] = {}  # (trade_id, leg_id, entry_date) → reason
+    reentry_meta_map: Dict[Tuple[int, int, str], Tuple[int, str, str]] = {}  # → (index, trigger, mode)
     index_str = str(payload.get("index") or "NIFTY").upper()
     for trade_id, legs in by_trade.items():
         legs.sort(key=lambda r: r["leg_id"])
@@ -2356,6 +2722,11 @@ def run_rust_engine_pipeline(
                     lazy_spec["_entry_date_key"] = str(current_trig)
                     reentry_specs.append(lazy_spec)
                     reentry_reason_map[(int(leg["trade_id"]), int(lazy_spec["leg_id"]), str(current_trig))] = lazy_reason or "EXPIRY"
+                    reentry_meta_map[(int(leg["trade_id"]), int(lazy_spec["leg_id"]), str(current_trig))] = (
+                        sl_used + tgt_used,
+                        "SL" if current_reason in _SL_REASONS else "TARGET",
+                        re_mode,
+                    )
                     break  # Lazy leg doesn't cascade in the outer re-entry loop
 
                 # ── RE_ASAP / RE_ASAP_REV branch ─────────────────────────────
@@ -2432,6 +2803,11 @@ def run_rust_engine_pipeline(
                 re_spec["_entry_date_key"] = str(current_trig)
                 reentry_specs.append(re_spec)
                 reentry_reason_map[(int(leg["trade_id"]), int(leg["leg_id"]), str(current_trig))] = re_reason or "EXPIRY"
+                reentry_meta_map[(int(leg["trade_id"]), int(leg["leg_id"]), str(current_trig))] = (
+                    sl_used + tgt_used,
+                    "SL" if current_reason in _SL_REASONS else "TARGET",
+                    re_mode,
+                )
 
                 # Cascade: if this re-entry also SL'd/TP'd AND budget remains,
                 # loop. Otherwise stop.
@@ -2444,14 +2820,21 @@ def run_rust_engine_pipeline(
     # fully covered. Each bridge is itself checked for cascading spot adj (up to
     # 8 levels). Mirrors generic_algotest_engine.py:4144-4191.
     #
-    # Bridge specs piggyback on the parent trade_id (same as Slice 6 re-entries)
-    # so they survive the overlap filter exactly when the parent does.
+    # Bridge specs mint a NEW trade_id per cascade cycle so each cycle renders
+    # as its own row block in the tradesheet (Cumulative/Peak/DD live per-Trade
+    # in the frontend; reusing the parent id squashed multi-cascade trades into
+    # one block with all chain values on a single row). Survival through the
+    # overlap filter still uses the parent id via _bt_bridge_by_new_tid.
+    # Mirrors Slice 7a-reentry behavior in DTE mode (~line 3082).
     _rollover_toggle = bool(payload.get("rollover_toggle", False))
+    _bt_bridge_specs: List[Dict[str, Any]] = []
+    _bt_bridge_by_new_tid: Dict[int, int] = {}  # new_tid → parent_tid (for overlap filter)
     # Bridges only apply in filter_entry_mode='fixed': Python's re-anchor logic
     # (_prev_actual_exit) only runs when _seg_expiries is populated, which only
     # happens in fixed mode. In DTE mode, spot adj truncates the current trade
     # and the next trade starts at its originally scheduled entry — no bridge.
     if spot_adj_enabled and _rollover_toggle and spot_adj_overrides and filter_entry_mode == "fixed":
+        _bt_new_tid = max(list(by_trade.keys()) + [0]) + 1
         for _bt_id, _bt_trigger in list(spot_adj_overrides.items()):
             _bt_legs = sorted(by_trade.get(_bt_id, []), key=lambda r: r["leg_id"])
             if not _bt_legs:
@@ -2469,6 +2852,11 @@ def run_rust_engine_pipeline(
                 _bt_spot = spot_by_date.get(_bt_cur_entry)
                 if _bt_spot is None:
                     break
+
+                # Fresh trade_id for this cascade cycle (shared across legs in
+                # this cycle). Lets the tradesheet render each cycle as its own
+                # row block with its own Cumulative/Peak/DD entry.
+                _bt_cycle_tid = _bt_new_tid
 
                 # Cascading spot adj trigger for this bridge window.
                 _bt_casc_trig = _compute_spot_adjustment_trigger(
@@ -2515,7 +2903,7 @@ def run_rust_engine_pipeline(
                         return None  # Strike unresolvable — Python fallback
 
                     _btl_spec = {
-                        "trade_id": _bt_id,
+                        "trade_id": _bt_cycle_tid,
                         "leg_id": _btl["leg_id"],
                         "index": _btl["index"],
                         "entry_date": _bt_cur_entry,
@@ -2563,7 +2951,13 @@ def run_rust_engine_pipeline(
 
                     _btl_final_exit = _bt_this_exit
                     _btl_reason = (
-                        "SPOT_ADJ"
+                        _spot_adj_reason_tag(
+                            spot_adj_direction,
+                            _bt_spot,
+                            spot_by_date.get(_bt_casc_trig),
+                            spot_adj_pct,
+                            spot_adj_units,
+                        )
                         if (_bt_casc_trig and _bt_casc_trig < _bt_cycle_exit)
                         else "EXPIRY"
                     )
@@ -2587,13 +2981,17 @@ def run_rust_engine_pipeline(
 
                     _btl_spec["exit_date"] = _btl_final_exit
                     _btl_spec["_entry_date_key"] = str(_bt_cur_entry)
-                    reentry_specs.append(_btl_spec)
+                    _bt_bridge_specs.append(_btl_spec)
                     reentry_reason_map[
-                        (int(_bt_id), int(_btl["leg_id"]), str(_bt_cur_entry))
+                        (int(_bt_cycle_tid), int(_btl["leg_id"]), str(_bt_cur_entry))
                     ] = _btl_reason
 
                 if not _bt_all_ok:
                     break
+
+                # Cycle complete — record parent mapping + advance the id counter.
+                _bt_bridge_by_new_tid[_bt_cycle_tid] = _bt_id
+                _bt_new_tid += 1
 
                 if _bt_casc_trig and _bt_casc_trig < _bt_cycle_exit:
                     _bt_cur_entry = _bt_casc_trig  # Loop for next cascade bridge
@@ -2647,7 +3045,7 @@ def run_rust_engine_pipeline(
             spot_adj_clamp = spot_adj_overrides.get(trade_id)
             if spot_adj_clamp and final_exit >= spot_adj_clamp:
                 final_exit = spot_adj_clamp
-                reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ")
+                reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
             adjusted_reason_by_date[(int(leg["trade_id"]), int(leg["leg_id"]), str(leg["entry_date"]))] = reason
             sched_exit = leg["exit_date"]
             if sched_exit > latest_scheduled:
@@ -2817,7 +3215,15 @@ def run_rust_engine_pipeline(
                             "slippage_pct": float(_sa_leg.get("slippage_pct") or 0.0),
                         })
                         _sa_reason = (
-                            "SPOT_ADJ" if (_sa_casc and _sa_casc < _sa_cur_exit) else "EXPIRY"
+                            _spot_adj_reason_tag(
+                                spot_adj_direction,
+                                _sa_spot,
+                                spot_by_date.get(_sa_casc),
+                                spot_adj_pct,
+                                spot_adj_units,
+                            )
+                            if (_sa_casc and _sa_casc < _sa_cur_exit)
+                            else "EXPIRY"
                         )
                         _sa_reentry_reasons[(_sa_new_tid, _sa_lid, _sa_cur_entry)] = _sa_reason
 
@@ -2860,6 +3266,11 @@ def run_rust_engine_pipeline(
     # Slice 6: re-entry specs piggyback on the parent trade_id, so they survive
     # the overlap filter exactly when the parent does.
     adjusted_specs.extend(s for s in reentry_specs if s["trade_id"] in kept_trades)
+    # Slice 7b bridges: new trade_ids per cycle, survive when their parent did.
+    adjusted_specs.extend(
+        s for s in _bt_bridge_specs
+        if _bt_bridge_by_new_tid.get(s["trade_id"]) in kept_trades
+    )
     # Slice 7a-reentry: spot-adj mini-trades survive when their source trade was kept.
     adjusted_specs.extend(
         s for s in _sa_reentry_specs
@@ -2881,6 +3292,16 @@ def run_rust_engine_pipeline(
             or adjusted_reason_by_date.get(key)
             or "EXPIRY"
         )
+
+    # Inject re-entry metadata so priced_to_tradesheet_records can populate
+    # ReEntryIndex / ReEntryTrigger / ReEntryMode columns.
+    for row in final_priced:
+        key = (int(row.get("trade_id") or 0), int(row.get("leg_id") or 1), str(row.get("entry_date") or ""))
+        meta = reentry_meta_map.get(key)
+        if meta:
+            row["_reentry_index"] = meta[0]
+            row["_reentry_trigger"] = meta[1]
+            row["_reentry_mode"] = meta[2]
 
     # SL-with-Buffer post-process: when a leg's final exit date matches the
     # buffer trigger date, swap the close-based exit price for the buffer

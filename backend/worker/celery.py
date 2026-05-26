@@ -29,7 +29,11 @@ celery_app.conf.update(
     task_soft_time_limit=1500,  # 25 minutes soft limit
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=200,   # recycle workers less frequently now that memory is bounded
-    worker_max_memory_per_child=2800000,  # keep native cache resident; CLI uses same value
+    # Raised from 2800000 → 5000000 on 2026-05-25: the feather grew to 706 MB
+    # (FUTURES port), the Rust cache expanded to ~3.5 GB, and the prior 2.8 GB
+    # cap was killing optimize tasks mid-flight at ~3 GB RSS during cache load.
+    # CLI --max-memory-per-child must match (currently 5000000 on all workers).
+    worker_max_memory_per_child=5000000,
     broker_connection_retry_on_startup=True,
     broker_connection_retry=True,
     broker_connection_max_retries=3,

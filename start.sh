@@ -164,6 +164,28 @@ for port in 5432 6379 8000 3000; do
     fi
 done
 
+# Build the frontend bundle on the host BEFORE docker compose builds the
+# image.  The frontend Dockerfile only COPYs ./frontend/dist (npm install
+# OOM-crashes inside the container on this 16GB HDD host — see the comment
+# at the top of frontend/Dockerfile).  Running `npm run build` here keeps
+# source changes in frontend/src/ flowing through to the deployed bundle.
+echo ""
+echo "[1.7/5] Building frontend bundle (vite)..."
+if command -v npm >/dev/null 2>&1; then
+    if [ ! -d "frontend/node_modules" ]; then
+        echo "  Installing frontend dependencies (one-time)..."
+        (cd frontend && npm install --no-audit --no-fund) || {
+            echo "  WARNING: npm install failed — bundle may be stale"
+        }
+    fi
+    (cd frontend && npm run build) || {
+        echo "  WARNING: npm run build failed — using existing frontend/dist"
+    }
+else
+    echo "  WARNING: npm not found on host — skipping frontend build"
+    echo "  (Docker image will use whatever is already in frontend/dist)"
+fi
+
 # Build and start services
 echo ""
 echo "[2/5] Building and starting Docker services..."

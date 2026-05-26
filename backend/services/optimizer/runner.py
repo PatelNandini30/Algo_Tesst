@@ -322,6 +322,53 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
                     "[OPTIM] preloaded OHLC feather into memory: %d rows in %.2fs",
                     len(ctx["rust_context"]["ohlc_df"]), time.perf_counter() - _t1,
                 )
+                # Also build a memory-tight pandas version of OHLC for parallel
+                # workers to inherit via CoW fork. Without this, each child
+                # re-reads the 706 MB feather from HDD (~108s with 2 children
+                # contending). With CoW inheritance the children pay 0s.
+                # Pandas dtypes are picked to minimize CoW-private growth:
+                # datetime64[ms], category, float32, int32 strike_r.
+                try:
+                    import pyarrow as _pa_p
+                    import pyarrow.ipc as _pa_ipc_p
+                    import pyarrow.compute as _pc_p
+                    _t2 = time.perf_counter()
+                    _needed_p = ["Symbol", "Date", "ExpiryDate", "StrikePrice",
+                                 "OptionType", "High", "Low"]
+                    _reader_p = _pa_ipc_p.open_file(str(_fpath))
+                    _avail_p = set(_reader_p.schema.names)
+                    _sel_p = [c for c in _needed_p if c in _avail_p]
+                    _tbl_p = _reader_p.read_all().select(_sel_p)
+                    if "OptionType" in _avail_p:
+                        _opt_mask_p = _pc_p.is_in(
+                            _tbl_p.column("OptionType"),
+                            value_set=_pa_p.array(["CE", "PE"]),
+                        )
+                        _tbl_p = _tbl_p.filter(_opt_mask_p)
+                    if "Date" in _avail_p:
+                        _date_mask_p = _pc_p.and_(
+                            _pc_p.greater_equal(_tbl_p.column("Date"), _pa_p.scalar(_ohlc_from)),
+                            _pc_p.less_equal(_tbl_p.column("Date"), _pa_p.scalar(_ohlc_to)),
+                        )
+                        _tbl_p = _tbl_p.filter(_date_mask_p)
+                    _ohlc_pd_p = _tbl_p.to_pandas(date_as_object=False)
+                    for _col_p in ("Symbol", "OptionType"):
+                        if _col_p in _ohlc_pd_p.columns and _ohlc_pd_p[_col_p].dtype == object:
+                            _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("category")
+                    for _col_p in ("High", "Low"):
+                        if _col_p in _ohlc_pd_p.columns:
+                            _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("float32")
+                    if "StrikePrice" in _ohlc_pd_p.columns:
+                        _ohlc_pd_p["strike_r"] = _ohlc_pd_p["StrikePrice"].round(0).astype("int32")
+                        _ohlc_pd_p = _ohlc_pd_p.drop(columns=["StrikePrice"])
+                    ctx["rust_context"]["ohlc_df_pandas"] = _ohlc_pd_p
+                    _mem_mb_p = _ohlc_pd_p.memory_usage(deep=True).sum() / (1024 * 1024)
+                    logger.info(
+                        "[OPTIM] preloaded OHLC pandas (for CoW-fork children): %d rows, %.1f MB in %.2fs",
+                        len(_ohlc_pd_p), _mem_mb_p, time.perf_counter() - _t2,
+                    )
+                except Exception as _pexc:
+                    logger.warning("[OPTIM] OHLC pandas preload skipped: %s — workers will reload", _pexc)
         except Exception as _exc:
             logger.warning("[OPTIM] OHLC feather preload skipped: %s", _exc)
 
@@ -562,77 +609,115 @@ def _compute_mae_mfe_batch(
     for r in valid_rows:
         unique_combos[(r["expiry_str"], r["opt_type"], r["strike"])] = None
 
-    try:
-        lookup_rows = []
-        for (exp_str, opt, strike) in unique_combos:
-            exp_dt = _pd3.Timestamp(exp_str).date()
-            lookup_rows.append({
-                "ExpiryDate": exp_dt,
-                "OptionType": opt,
-                "strike_r": int(round(strike)),
-            })
-        lookup_df = pl.DataFrame(
-            lookup_rows,
-            schema={"ExpiryDate": pl.Date, "OptionType": pl.Utf8, "strike_r": pl.Int32},
-        )
+    _ctx = _RUST_CONTEXT
+    # Fork-safe path: parallel workers pre-load the OHLC feather via pyarrow
+    # (no Polars), since pl.read_ipc and any rayon-using Polars op deadlocks on
+    # the dead inherited Rayon worker after fork. When ohlc_df_pandas is set we
+    # bypass Polars entirely and do filter + join in pandas.
+    if _ctx is not None and "ohlc_df_pandas" in _ctx:
+        try:
+            _full_pd = _ctx["ohlc_df_pandas"]
+            # Date columns are datetime64[ns]; convert from_dt/to_dt to Timestamp
+            # for vectorised comparison (orders of magnitude faster than object cmp).
+            _from_ts = _pd3.Timestamp(from_dt)
+            _to_ts = _pd3.Timestamp(to_dt)
+            _mask = (
+                (_full_pd["Symbol"] == sym_upper)
+                & (_full_pd["Date"] >= _from_ts)
+                & (_full_pd["Date"] <= _to_ts)
+            )
+            _cols = ["ExpiryDate", "OptionType", "strike_r", "Date", "High", "Low"]
+            ohlc_pd = _full_pd.loc[_mask, _cols].copy()
+            ohlc_pd["date_str"] = ohlc_pd["Date"].dt.strftime("%Y-%m-%d")
+            ohlc_pd["expiry_str"] = ohlc_pd["ExpiryDate"].dt.strftime("%Y-%m-%d")
+            # OptionType is Categorical — cast to str for tuple comparison & MultiIndex.
+            if str(ohlc_pd["OptionType"].dtype) == "category":
+                ohlc_pd["OptionType"] = ohlc_pd["OptionType"].astype(str)
+            needed = {(r["expiry_str"], r["opt_type"], int(round(r["strike"]))) for r in valid_rows}
+            ohlc_pd = ohlc_pd[
+                [(e, t, s) in needed for e, t, s in zip(
+                    ohlc_pd["expiry_str"], ohlc_pd["OptionType"], ohlc_pd["strike_r"]
+                )]
+            ]
+            if ohlc_pd.empty:
+                return df
+            ohlc_idx = ohlc_pd.set_index(
+                ["expiry_str", "OptionType", "strike_r", "date_str"]
+            )[["High", "Low"]]
+        except Exception as exc:
+            logger.debug("[OPTIM] MAE/MFE pandas fast-path failed: %s", exc)
+            return df
+    else:
+        try:
+            lookup_rows = []
+            for (exp_str, opt, strike) in unique_combos:
+                exp_dt = _pd3.Timestamp(exp_str).date()
+                lookup_rows.append({
+                    "ExpiryDate": exp_dt,
+                    "OptionType": opt,
+                    "strike_r": int(round(strike)),
+                })
+            lookup_df = pl.DataFrame(
+                lookup_rows,
+                schema={"ExpiryDate": pl.Date, "OptionType": pl.Utf8, "strike_r": pl.Int32},
+            )
 
-        date_filter = (
-            (pl.col("Symbol") == sym_upper)
-            & (pl.col("Date") >= from_dt)
-            & (pl.col("Date") <= to_dt)
-        )
-        _sel = ["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"]
+            date_filter = (
+                (pl.col("Symbol") == sym_upper)
+                & (pl.col("Date") >= from_dt)
+                & (pl.col("Date") <= to_dt)
+            )
+            _sel = ["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"]
 
-        # Use the preloaded in-memory DataFrame when available (avoids HDD scan).
-        _ctx = _RUST_CONTEXT
-        if _ctx is not None and "ohlc_df" not in _ctx:
-            try:
-                _days_sorted = sorted(_ctx.get("trading_days") or [])
-                if _days_sorted:
-                    import pandas as _pd_lz
-                    _lz_from = _pd_lz.Timestamp(_days_sorted[0]).date()
-                    _lz_to = _pd_lz.Timestamp(_days_sorted[-1]).date()
-                    _ctx["ohlc_df"] = pl.read_ipc(str(feather)).filter(
-                        (pl.col("Date") >= _lz_from) & (pl.col("Date") <= _lz_to)
-                    )
-                else:
-                    _ctx["ohlc_df"] = pl.read_ipc(str(feather))
-                logger.info("[OPTIM] lazily loaded OHLC feather: %d rows", len(_ctx["ohlc_df"]))
-            except Exception as _le:
-                logger.warning("[OPTIM] lazy feather load failed: %s", _le)
+            # Use the preloaded in-memory DataFrame when available (avoids HDD scan).
+            if _ctx is not None and "ohlc_df" not in _ctx:
+                try:
+                    _days_sorted = sorted(_ctx.get("trading_days") or [])
+                    if _days_sorted:
+                        import pandas as _pd_lz
+                        _lz_from = _pd_lz.Timestamp(_days_sorted[0]).date()
+                        _lz_to = _pd_lz.Timestamp(_days_sorted[-1]).date()
+                        _ctx["ohlc_df"] = pl.read_ipc(str(feather)).filter(
+                            (pl.col("Date") >= _lz_from) & (pl.col("Date") <= _lz_to)
+                        )
+                    else:
+                        _ctx["ohlc_df"] = pl.read_ipc(str(feather))
+                    logger.info("[OPTIM] lazily loaded OHLC feather: %d rows", len(_ctx["ohlc_df"]))
+                except Exception as _le:
+                    logger.warning("[OPTIM] lazy feather load failed: %s", _le)
 
-        if _ctx and "ohlc_df" in _ctx:
-            date_filtered = _ctx["ohlc_df"].filter(date_filter).select(_sel)
-        else:
-            date_filtered = pl.scan_ipc(str(feather)).filter(date_filter).select(_sel).collect()
+            if _ctx and "ohlc_df" in _ctx:
+                date_filtered = _ctx["ohlc_df"].filter(date_filter).select(_sel)
+            else:
+                date_filtered = pl.scan_ipc(str(feather)).filter(date_filter).select(_sel).collect()
 
-        # Round strike to int for the join key (matches strike_r in lookup_df)
-        date_filtered = date_filtered.with_columns(
-            (pl.col("StrikePrice").round(0).cast(pl.Int32)).alias("strike_r")
-        )
-        ohlc_raw = (
-            date_filtered
-            .join(lookup_df, on=["ExpiryDate", "OptionType", "strike_r"], how="inner")
-            .select(_sel)
-        )
-    except Exception as exc:
-        logger.debug("[OPTIM] MAE/MFE feather join failed: %s", exc)
-        return df
+            # Round strike to int for the join key (matches strike_r in lookup_df)
+            date_filtered = date_filtered.with_columns(
+                (pl.col("StrikePrice").round(0).cast(pl.Int32)).alias("strike_r")
+            )
+            ohlc_raw = (
+                date_filtered
+                .join(lookup_df, on=["ExpiryDate", "OptionType", "strike_r"], how="inner")
+                .select(_sel)
+            )
+        except Exception as exc:
+            logger.debug("[OPTIM] MAE/MFE feather join failed: %s", exc)
+            return df
 
-    if ohlc_raw.is_empty():
-        return df
+        if ohlc_raw.is_empty():
+            return df
 
-    # Convert to pandas MultiIndex for fast per-day lookup
-    try:
-        import pandas as _pd4
-        ohlc_pd = ohlc_raw.to_pandas()
-        ohlc_pd["date_str"] = _pd4.to_datetime(ohlc_pd["Date"]).dt.strftime("%Y-%m-%d")
-        ohlc_pd["expiry_str"] = _pd4.to_datetime(ohlc_pd["ExpiryDate"]).dt.strftime("%Y-%m-%d")
-        ohlc_pd["strike_r"] = ohlc_pd["StrikePrice"].round(0).astype(int)
-        ohlc_idx = ohlc_pd.set_index(["expiry_str", "OptionType", "strike_r", "date_str"])[["High", "Low"]]
-    except Exception as exc:
-        logger.debug("[OPTIM] MAE/MFE ohlc index build failed: %s", exc)
-        return df
+        # Convert to pandas MultiIndex for fast per-day lookup
+        try:
+            import pandas as _pd4
+            ohlc_pd = ohlc_raw.to_pandas()
+            ohlc_pd["date_str"] = _pd4.to_datetime(ohlc_pd["Date"]).dt.strftime("%Y-%m-%d")
+            ohlc_pd["expiry_str"] = _pd4.to_datetime(ohlc_pd["ExpiryDate"]).dt.strftime("%Y-%m-%d")
+            ohlc_pd["strike_r"] = ohlc_pd["StrikePrice"].round(0).astype(int)
+            ohlc_idx = ohlc_pd.set_index(["expiry_str", "OptionType", "strike_r", "date_str"])[["High", "Low"]]
+        except Exception as exc:
+            logger.debug("[OPTIM] MAE/MFE ohlc index build failed: %s", exc)
+            return df
 
     df = df.copy()
     mae_vals = list(df["MAE"]) if "MAE" in df.columns else [0.0] * len(df)
@@ -913,20 +998,24 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
                 "%DD":        r.get("%DD"),
                 "Net P&L":    r.get("Net P&L"),
                 "% P&L":      r.get("% P&L"),
+                "Spot P&L":   r.get("Spot P&L"),
             }
             for _, r in aggregated.iterrows()
         }
-        # Net P&L and % P&L (combined totals) shown on first leg only — null on
-        # subsequent legs — so summing the column gives per-trade counts, not
-        # inflated double-counts. Cumulative/Peak/DD/%DD follow the same rule.
+        # Net P&L, % P&L, and Spot P&L (trade-level totals) shown on first leg
+        # only — null on subsequent legs — so summing the column gives per-trade
+        # counts, not inflated double-counts. Cumulative/Peak/DD/%DD follow the
+        # same rule.
         parent_seen: set = set()
-        c_vals, pk_vals, dd_vals, pdd_vals, net_vals, pct_vals = [], [], [], [], [], []
+        c_vals, pk_vals, dd_vals, pdd_vals = [], [], [], []
+        net_vals, pct_vals, spot_vals = [], [], []
         for _, row in df.iterrows():
             tid = str(row["Trade"])
             if tid in parent_seen:
                 c_vals.append(None); pk_vals.append(None)
                 dd_vals.append(None); pdd_vals.append(None)
                 net_vals.append(None); pct_vals.append(None)
+                spot_vals.append(None)
                 continue
             parent_seen.add(tid)
             v = trade_to_analytics.get(tid, {})
@@ -936,12 +1025,14 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             pdd_vals.append(v.get("%DD"))
             net_vals.append(v.get("Net P&L"))
             pct_vals.append(v.get("% P&L"))
+            spot_vals.append(v.get("Spot P&L"))
         df["Cumulative"] = c_vals
         df["Peak"]       = pk_vals
         df["DD"]         = dd_vals
         df["%DD"]        = pdd_vals
         df["Net P&L"]    = net_vals
         df["% P&L"]      = pct_vals
+        df["Spot P&L"]   = spot_vals
 
         # MAE/MFE and Live DD: skip during batch optimizer runs (OPTIMIZE_SKIP_MAE_MFE=1).
         # Saves ~1.5s/combo by skipping the per-combo Polars feather scan.
@@ -1134,11 +1225,21 @@ def run_optimization(
             for c in combos:
                 c.pop("__optim_callback__", None)
 
-            # Strip ohlc_df before pickling for workers — it's 275 MB and would
-            # be serialized once per worker process. Workers lazy-load from the
-            # mmap'd feather instead (OS page-cache shared, effectively zero cost).
+            # Install the FULL context (with ohlc_df_pandas) into the parent's
+            # _RUST_CONTEXT BEFORE forking — children inherit it via CoW fork
+            # at zero cost. Without this set_rust_context() call, _RUST_CONTEXT
+            # in the parent is None at fork time, so children can't inherit
+            # the pandas OHLC and fall back to the per-child pyarrow load
+            # (~32s on HDD with 2 children contending).
+            set_rust_context(prebuilt_rust_context)
+
+            # Strip ohlc_df and ohlc_df_pandas before pickling for workers.
+            # ohlc_df (Polars) would deadlock in forked children (Rayon).
+            # ohlc_df_pandas (pandas) is ~16-111 MB and shouldn't be pickled
+            # through the pool pipe — children pick it up via CoW fork
+            # inheritance from the set_rust_context call above instead.
             _worker_ctx = {k: v for k, v in (prebuilt_rust_context or {}).items()
-                           if k != "ohlc_df"}
+                           if k not in ("ohlc_df", "ohlc_df_pandas")}
             agg = run_parallel(
                 job_id=job_id,
                 base_payload=base_payload,

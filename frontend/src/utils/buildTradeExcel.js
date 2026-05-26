@@ -419,13 +419,11 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       } else if (key === 'Index') {
         val = _tidToIndexNo[k] ?? parseInt(trade.Trade || trade.trade || 1, 10);
       } else if (key === 'Spot P&L %') {
-        let spotPnl = trade['Spot P&L'];
-        if (toNumber(spotPnl) == null) {
-          const entrySpot = toNumber(trade['Entry Spot']);
-          const exitSpot  = toNumber(trade['Exit Spot']);
-          spotPnl = (entrySpot != null && exitSpot != null) ? exitSpot - entrySpot : null;
-        }
-        val = pctOfBase(spotPnl, trade['Entry Spot']);
+        // Spot P&L is a trade-level quantity written only on Leg 1.  Leave
+        // Spot P&L % blank on Leg 2+ rows (matches Net P&L convention) so
+        // column SUM(W) yields the trade-level total without double-counting.
+        const spotPnl = trade['Spot P&L'];
+        val = (toNumber(spotPnl) == null) ? '' : pctOfBase(spotPnl, trade['Entry Spot']);
       } else if (key === 'CE P&L %') {
         val = pctOfBase(trade['CE P&L'], trade['Entry Spot']);
       } else if (key === 'PE P&L %') {
@@ -597,7 +595,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const _lossRateJS   = _totalCntJS > 0 ? (_lossCntJS / _totalCntJS) * 100 : 0;
   const _avgNetJS     = _totalCntJS > 0 ? (_sumNetJS  / _totalCntJS) : 0;
   const _expectancyJS = _avgLossPctJS !== 0
-    ? (((_winRateJS / 100) * _avgWinPctJS - (_lossRateJS / 100) * Math.abs(_avgLossPctJS)) / Math.abs(_avgLossPctJS))
+    ? ((_winRateJS / 100) * _avgWinPctJS / Math.abs(_avgLossPctJS) - (1 - _winRateJS / 100))
     : 0;
   const _yearsJS = (_minEntryMs != null && _maxExitMs != null)
     ? (_maxExitMs - _minEntryMs) / (365.25 * 86400000) : 0;
@@ -750,8 +748,12 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
 
   kv('Avg Profit per Trade', `${_avgNetJS >= 0 ? '+' : ''}${_avgNetJS.toFixed(2)}`, row, 'A', true,
     _avgNetJS >= 0 ? C.greenTx : C.redTx);
-  kv('Expectancy Ratio', _expectancyJS.toFixed(4), row++, 'D', true,
+  // Expectancy Ratio: store the raw float so downstream Excel formulas see
+  // full precision; numFmt renders 2 decimals in the cell display.
+  const _expRow_bte = row++;
+  kv('Expectancy Ratio', _expectancyJS, _expRow_bte, 'D', true,
     _expectancyJS >= 0 ? C.greenTx : C.redTx);
+  ws2.getCell(`E${_expRow_bte}`).numFmt = '0.00';
 
   kv('Max Profit (Single Trade)', _fmtCurrency(_maxNetJS), row, 'A', false, C.greenTx);
   kv('Max Loss (Single Trade)',   _fmtCurrency(_minNetJS), row++, 'D', false, C.redTx);
@@ -811,7 +813,15 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     ws2.getRow(row).height = 18;
   };
 
-  _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS * 100); row++;
+  // Use backend summary for Spot P&L sum and Spot P&L % (single source of truth).
+  // After the engine fix that writes Spot P&L only on first-leg rows the local
+  // sums equal the backend, but reading from `summary.*` keeps all three
+  // download paths (ResultsPanel, buildTradeExcel, excel_builder) consistent.
+  const _spotSumSummary = (typeof summary?.spot_change === 'number' && Number.isFinite(summary.spot_change))
+    ? summary.spot_change : _spotSumGatedJS;
+  const _spotPctSummary = (typeof summary?.spot_change_pct === 'number' && Number.isFinite(summary.spot_change_pct))
+    ? summary.spot_change_pct : (_spotPctJS * 100);
+  _addTypeRow('Spot P&L', _spotSumSummary, _spotPctSummary); row++;
   if (hasCalls)            { _addTypeRow('CE P&L',      _ceSumJS,               _cePctJS * 100);              row++; }
   if (hasPuts)             { _addTypeRow('PE P&L',       _peSumJS,               _pePctJS * 100);              row++; }
   if (hasFutures)          { _addTypeRow('FUT P&L',      _futSumJS,              null);                        row++; }

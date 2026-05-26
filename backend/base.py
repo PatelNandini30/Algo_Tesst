@@ -1038,17 +1038,34 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if 'Spot P&L' in df.columns:
         spot_series_safe = pd.to_numeric(_adf['Spot P&L'].replace('', np.nan), errors='coerce')
         spot_chg = round(spot_series_safe.sum(skipna=True), 2)
+        # Sum of per-trade Spot P&L % (each trade's % = Spot P&L / Entry Spot,
+        # multiplied by 100 to display as percent). Matches the research-team
+        # convention used in Summary cell C13 / "ROI vs Spot" computations.
+        if 'Entry Spot' in _adf.columns:
+            es_safe = pd.to_numeric(_adf['Entry Spot'].replace('', np.nan), errors='coerce').replace(0, np.nan)
+            spot_pct_per_trade = (spot_series_safe / es_safe) * 100.0
+            spot_chg_pct = round(float(spot_pct_per_trade.sum(skipna=True)), 4)
+        else:
+            spot_chg_pct = 0.0
     else:
         spot_chg = 0
+        spot_chg_pct = 0.0
 
     wins_pct_series = net_pnl_pct_series[_adf[trade_pnl_col] > 0]
     losses_pct_series = net_pnl_pct_series[_adf[trade_pnl_col] < 0]
     avg_win_pct = float(wins_pct_series.mean()) if len(wins_pct_series) > 0 else 0.0
     avg_loss_pct = float(losses_pct_series.mean()) if len(losses_pct_series) > 0 else 0.0
     w_decimal = win_pct / 100.0
-    l_decimal = loss_pct / 100.0
+    # Research-team formula (Summary cell L7):
+    #   ((Win × AvgWin%) − ((1 − Win) × |AvgLoss%|)) / |AvgLoss%|
+    # which simplifies to (AvgWin% / |AvgLoss%|) × Win − (1 − Win).
+    # Use (1 − Win) — the complement — instead of the raw loss_pct so
+    # breakeven trades (Net P&L = 0) don't shift the result downward.
     if avg_loss_pct != 0:
-        expectancy = round((avg_win_pct / abs(avg_loss_pct)) * w_decimal - l_decimal, 4)
+        # Keep full precision in the stored value so downstream Excel formulas
+        # see every digit; only the *display* gets rounded to 2 decimals
+        # (frontend formatter + Excel numFmt). Per user request.
+        expectancy = (avg_win_pct / abs(avg_loss_pct)) * w_decimal - (1.0 - w_decimal)
     else:
         expectancy = 0.0
 
@@ -1091,6 +1108,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         "max_win_streak":        max_win_streak,
         "max_loss_streak":       max_loss_streak,
         "spot_change":           spot_chg,
+        "spot_change_pct":       spot_chg_pct,
         "cagr_spot":             cagr_spot,
     }
 

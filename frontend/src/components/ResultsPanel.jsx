@@ -1458,13 +1458,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         else if (key==='Trade') val=_tidToIndexNo[k] ?? parseInt(trade.Trade||trade.trade||1,10);
         else if (key==='Exit Date') val=getVisibleExitDate(trade);
         else if (key==='Spot P&L %') {
-          let spotPnl = trade['Spot P&L'];
-          if (toNumber(spotPnl) == null) {
-            const entrySpot = toNumber(trade['Entry Spot']);
-            const exitSpot = toNumber(trade['Exit Spot']);
-            spotPnl = entrySpot != null && exitSpot != null ? exitSpot - entrySpot : null;
-          }
-          val = pctOfBase(spotPnl, trade['Entry Spot']);
+          // Spot P&L is a trade-level quantity written only on Leg 1 rows.
+          // Leave Spot P&L % blank on Leg 2+ (matches Net P&L convention) so
+          // column sums give the trade-level total without double-counting.
+          const spotPnl = trade['Spot P&L'];
+          val = (toNumber(spotPnl) == null) ? '' : pctOfBase(spotPnl, trade['Entry Spot']);
         }
         else if (key==='CE P&L %') val=pctOfBase(trade['CE P&L'], trade['Entry Spot']);
         else if (key==='PE P&L %') val=pctOfBase(trade['PE P&L'], trade['Entry Spot']);
@@ -1700,8 +1698,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     kv('Avg Profit per Trade', `${_avgNetJS>=0?'+':''}${_avgNetJS.toFixed(2)}`, row, 'A', true,
        _avgNetJS>=0?C.greenTx:C.redTx);
-    kv('Expectancy Ratio', _expectancyJS.toFixed(4), row++, 'D', true,
+    // Store the raw float so Excel formulas referencing it get full precision;
+    // numFmt '0.00' renders the cell to 2 decimals for display.
+    const _expRow_rp = row++;
+    kv('Expectancy Ratio', _expectancyJS, _expRow_rp, 'D', true,
        _expectancyJS>=0?C.greenTx:C.redTx);
+    ws2.getCell(`E${_expRow_rp}`).numFmt = '0.00';
 
     kv('Max Profit (Single Trade)', _fmtCurrency(_maxNetJS), row, 'A', false, C.greenTx);
     kv('Max Loss (Single Trade)',   _fmtCurrency(_minNetJS), row++, 'D', false, C.redTx);
@@ -1780,8 +1782,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       _roiVal.alignment = centerAlign;
       _roiVal.border = thinBorder(C.border);
 
-      // Rows
-      _addTypeRow('Spot P&L', _spotSumGatedJS, _spotPctJS * 100); row++;
+      // Rows — use backend summary for Spot P&L (single source of truth across
+      // the regular-backtest, optimizer-combo, and optimizer-ZIP downloads).
+      const _spotSumSummary = (typeof summary?.spot_change === 'number' && Number.isFinite(summary.spot_change))
+        ? summary.spot_change : _spotSumGatedJS;
+      const _spotPctSummary = (typeof summary?.spot_change_pct === 'number' && Number.isFinite(summary.spot_change_pct))
+        ? summary.spot_change_pct : (_spotPctJS * 100);
+      _addTypeRow('Spot P&L', _spotSumSummary, _spotPctSummary); row++;
       if (hasCalls) { _addTypeRow('CE P&L', _ceSumJS, _cePctJS * 100); row++; }
       if (hasPuts)  { _addTypeRow('PE P&L', _peSumJS, _pePctJS * 100); row++; }
       if (hasFutures) { _addTypeRow('FUT P&L', _futSumJS, null); row++; }

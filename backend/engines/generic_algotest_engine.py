@@ -3408,7 +3408,8 @@ def run_algotest_backtest(params):
     logger.info(
         "[MODE PROBE] filter_entry_mode=%r fixed_entry_mode=%s str_enabled=%s filter_enabled=%s rollover_toggle=%s min_days_to_expiry=%s exit_dte=%s spot_adj_enabled=%s spot_adj_pct=%s spot_adj_dir=%s",
         filter_entry_mode, fixed_entry_mode, str_enabled, filter_enabled,
-        rollover_toggle, params.get('rollover_min_days_to_expiry'),
+        rollover_toggle,
+        params.get('rollover_min_days_to_expiry'),
         params.get('exit_dte', 0), params.get('spot_adjustment_enabled', False),
         params.get('spot_adjustment_pct', 1.0), params.get('spot_adjustment_direction', 'rise'),
     )
@@ -4021,6 +4022,52 @@ def run_algotest_backtest(params):
                 # ── Rollover same-day chain (re-entries) ─────────────────────
                 if _rec_rollover and _dte_last_exit is not None:
                     entry_ts = _dte_last_exit
+                    # If the chain re-entry lands ON or AFTER the current rec's
+                    # expiry day, the rec's contract has already expired (or
+                    # expires same day) — selling it now would write a zero-day
+                    # contract at near-zero premium.  Route the leg to the
+                    # next-expiry contract instead (mirrors FIXED-mode line
+                    # 3905 advance-target-on-T-0/T-0 logic).  Example:
+                    #   Trade N expires Jan 6 (Tue weekly expiry).
+                    #   Chain entry for Trade N+1 = Jan 6.
+                    #   rec.expiry_date = Jan 6 → would re-sell same contract.
+                    #   Force next_expiry (Jan 13) so the new trade has real
+                    #   time to expiry, and re-anchor exit_date to (next_exp -
+                    #   exit_dte) so the 0-day-trade guard at line 4067 doesn't
+                    #   skip the slot.
+                    _rec_exp_ts = pd.Timestamp(rec.get('expiry_date'))
+                    _rec_next_exp = rec.get('next_expiry')
+                    if (pd.notna(_rec_exp_ts)
+                            and entry_ts >= _rec_exp_ts
+                            and _rec_next_exp is not None):
+                        _next_exp_ts = pd.Timestamp(_rec_next_exp)
+                        # Re-anchor exit to (next_exp - exit_dte) trading days
+                        _new_exit_ts = None
+                        try:
+                            _idx_next_exp = int(np.searchsorted(
+                                trading_calendar_arr,
+                                _next_exp_ts.normalize().to_numpy(),
+                                side='right')) - 1
+                            _idx_new_exit = _idx_next_exp - max(0, int(exit_dte))
+                            if _idx_new_exit >= 0:
+                                _new_exit_ts = pd.Timestamp(
+                                    trading_calendar_arr[_idx_new_exit]
+                                )
+                        except Exception:
+                            _new_exit_ts = None
+                        _rec_patch = {'_force_next_expiry': True}
+                        if _new_exit_ts is not None and _new_exit_ts > entry_ts:
+                            _rec_patch['exit_date'] = _new_exit_ts
+                        rec = {**rec, **_rec_patch}
+                        _log(
+                            f"[DTE CHAIN] entry {entry_ts.date()} "
+                            f"≥ rec expiry {_rec_exp_ts.date()} "
+                            f"→ forcing next expiry "
+                            f"{_next_exp_ts.date()}"
+                            + (f", exit re-anchored {_new_exit_ts.date()}"
+                               if _new_exit_ts is not None and _new_exit_ts > entry_ts
+                               else "")
+                        )
 
                 # ── First trade in DTE + rollover when entry==exit ───────────
                 # T-N/T-N rollover schedules have entry==exit (e.g. T-0/T-0 → both = current_exp).
@@ -4638,6 +4685,37 @@ def run_algotest_backtest(params):
                             leg_options_expiry = pd.Timestamp(_sched_current_exp)
                         _log(f"      [LEG EXPIRY DEBUG] leg.expiry={_leg_expiry_raw} | _is_leg_next={_is_leg_next}")
                         _log(f"      [LEG EXPIRY DEBUG] _sched_current_exp={_sched_current_exp} | _sched_next_exp={_sched_next_exp}")
+
+                        # ── Hard safety: never trade an expired/expiring-same-day contract ──
+                        # Defense in depth for chain re-entry / synthetic segment-end slots
+                        # where entry_date lands ON or AFTER the resolved leg_options_expiry —
+                        # e.g., a previous trade exits at Tue Jan 6 weekly expiry, and the
+                        # synthetic continuation slot wants to re-enter on Jan 6 with the
+                        # Jan 6 contract (which has already settled).  Bump to the next
+                        # available expiry: prefer `_sched_next_exp` (set on the trade entry
+                        # even when it's beyond the backtest to_date), then fall back to
+                        # the next row in expiry_df.  Both can be unset, so we guard each.
+                        _entry_norm_ts = pd.Timestamp(entry_date).normalize()
+                        if _entry_norm_ts >= leg_options_expiry.normalize():
+                            _bumped = None
+                            # Primary: schedule's stored next_expiry (survives to_date filtering)
+                            if _sched_next_exp is not None:
+                                _next_ts = pd.Timestamp(_sched_next_exp).normalize()
+                                if _next_ts > _entry_norm_ts:
+                                    _bumped = _next_ts
+                            # Fallback: scan expiry_df for the first expiry after entry
+                            if _bumped is None:
+                                _candidates = expiry_df[expiry_df['Current Expiry'] > _entry_norm_ts]
+                                if not _candidates.empty:
+                                    _bumped = pd.Timestamp(_candidates.iloc[0]['Current Expiry'])
+                            if _bumped is not None:
+                                _log(
+                                    f"      [LEG EXPIRY SAFETY] entry "
+                                    f"{_entry_norm_ts.date()} ≥ resolved expiry "
+                                    f"{leg_options_expiry.date()} — bumping to "
+                                    f"{_bumped.date()}"
+                                )
+                                leg_options_expiry = _bumped
                         _log(f"      [LEG EXPIRY DEBUG] → resolved leg_options_expiry={leg_options_expiry.strftime('%Y-%m-%d')}")
 
                         # Min-days-to-expiry rollover: if trading days from entry to resolved expiry
@@ -5162,11 +5240,29 @@ def run_algotest_backtest(params):
                 # Trigger: entry_idx >= _seg_original_count means we are on the
                 # last original slot or beyond (synthetic). Works for T-0, T-1,
                 # T-2 … T-N regardless of whether the slot is clamped or not.
-                if rollover_toggle and _seg_expiries and entry_idx >= _seg_original_count:
+                if rollover_toggle and not no_rollover and _seg_expiries and entry_idx >= _seg_original_count:
                     _seg_end_ts = pd.Timestamp(segment['end'])
                     _last_in_seg = _last_trading_day_on_or_before(trading_calendar, _seg_end_ts)
                     if (_last_in_seg is not None
                             and pd.Timestamp(_last_in_seg) > _prev_actual_exit):
+                        # If the synthetic continuation enters on/after the parent
+                        # trade's expiry day (e.g., Trade N exits at Tue Jan 6 weekly
+                        # expiry → synthetic re-entry on Jan 6 itself), the parent's
+                        # contract has already settled. Force next-expiry so the new
+                        # slot writes a real contract instead of a same-day-expiring
+                        # one with ~₹0.40 premium.
+                        _synth_parent_exp = pd.Timestamp(trade_entry.get('current_expiry') or trade_entry['expiry_date'])
+                        _synth_next_exp   = trade_entry.get('next_expiry')
+                        _synth_force_next = trade_entry.get('_force_next_expiry', False)
+                        if (pd.Timestamp(_prev_actual_exit).normalize() >= _synth_parent_exp.normalize()
+                                and _synth_next_exp is not None
+                                and pd.Timestamp(_synth_next_exp).normalize() > _synth_parent_exp.normalize()):
+                            _synth_force_next = True
+                            _log(
+                                f"  [SYNTH CONT] entry {pd.Timestamp(_prev_actual_exit).date()} "
+                                f"≥ parent expiry {_synth_parent_exp.date()} "
+                                f"→ forcing next expiry {pd.Timestamp(_synth_next_exp).date()}"
+                            )
                         seg_scope['entries'].append({
                             'segment':            segment,
                             'entry_date':         _prev_actual_exit,
@@ -5174,7 +5270,7 @@ def run_algotest_backtest(params):
                             'expiry_date':        trade_entry['expiry_date'],
                             'current_expiry':     trade_entry.get('current_expiry', trade_entry['expiry_date']),
                             'next_expiry':        trade_entry.get('next_expiry', trade_entry['expiry_date']),
-                            '_force_next_expiry': trade_entry.get('_force_next_expiry', False),
+                            '_force_next_expiry': _synth_force_next,
                             '_rollover_mode':     trade_entry.get('_rollover_mode', False),
                             'clamped_exit':       True,
                             '_is_synthetic':      True,
@@ -5493,8 +5589,12 @@ def run_algotest_backtest(params):
                     'buffer_strike_offset': buffer_strike_offset,
                     'Entry Spot':     row_entry_spot if row_entry_spot is not None else np.nan,
                     'Exit Spot':      leg_exit_spot if leg_exit_spot is not None else np.nan,
+                    # Spot P&L is a trade-level quantity (same Entry/Exit Spot
+                    # for every leg of a trade). Write it only on the first-leg
+                    # row to match the Net P&L convention; downstream sums then
+                    # naturally yield the trade-level total without double-counting.
                     'Spot P&L':       (round(leg_exit_spot - row_entry_spot, 2)
-                                      if show_spot_cols and leg_exit_spot is not None and row_entry_spot is not None
+                                      if is_first_leg and show_spot_cols and leg_exit_spot is not None and row_entry_spot is not None
                                       else np.nan),
                     'Expiry':         (
                         leg.get('futures_expiry')
@@ -5601,9 +5701,10 @@ def run_algotest_backtest(params):
                         'buffer_strike_offset': re_leg.get('buffer_strike_offset'),
                         'Entry Spot':     re_entry_spot if re_entry_spot is not None else np.nan,
                         'Exit Spot':      re_exit_spot if re_exit_spot is not None else np.nan,
-                        'Spot P&L':       (round(float(re_exit_spot) - float(re_entry_spot), 2)
-                                          if re_entry_spot is not None and re_exit_spot is not None
-                                          else np.nan),
+                        # Re-entry rows are always non-first-leg (they're
+                        # appended after the original legs of the same trade),
+                        # so Spot P&L stays blank to avoid double-counting.
+                        'Spot P&L':       np.nan,
                         'Expiry':         (
                             re_leg.get('futures_expiry')
                             if re_is_futures

@@ -16,13 +16,22 @@
 #   frontend         :  200M
 #   intraday-api     :  512M
 #   ─────────────────────────────
-#   worker-optimize  : 4096M  (profile-gated; replaces 3200M — see comment below)
+#   worker-optimize  : 6144M  (profile-gated; raised from 4096M on 2026-05-25
+#                              because the feather grew to 706 MB → Rust cache
+#                              needs ~3.5 GB; old 4 GB limit pushed swap)
 #   ─────────────────────────────
-#   Total hard limit : 11,462M (default stack; +4096M when optimize profile active)
+#   Total hard limit : 11,462M (default stack; +6144M when optimize profile active)
 #   OS + kernel      : ~1,500M
-#   Headroom/cache   : ~3,600M  ← HDD needs large OS page cache
+#   Headroom/cache   : ~1,400M  ← tightened on optimize-active runs (HDD swap risk
+#                                 if optimize + worker-backtests run at full RSS)
 #   ─────────────────────────────
-#   Grand total      : ~16,000M  ✓ fits with buffer
+#   Grand total      : ~17,600M with optimize active — overcommits 16 GB host by
+#                       ~1.6 GB. Acceptable because (a) only one optimize job at
+#                       a time in practice (concurrency=3 but solo-user setup),
+#                       (b) worker-backtests typically idle during optimize runs,
+#                       (c) Rust cache mmap pages are reclaimable under pressure.
+#                       If both workers run hot together, expect HDD swap; pause
+#                       backtests during long optims.
 #
 # HDD-specific Postgres tuning:
 #   - random_page_cost=4.0   (HDD random I/O is 4x more expensive than seq)
@@ -45,12 +54,12 @@ x-backend-env: &backend-env
   DB_POOL_RECYCLE: "3600"
   # Cap in-process bulk_load so backend+worker never OOM on 16GB HDD server
   BULK_LOAD_MAX_MEMORY_MB: "1500"
-  # Max Rust AHashMap cache size (feather_MB × 5 estimate). Raised to 3000 because
-  # OHLC columns (added for MAE/MFE) grew the feather from ~275 MB to ~575 MB;
-  # 575×5=2875 MB exceeds the old 2500 MB cap, causing the Rust cache to be
-  # skipped and an 8.4M-row Python fallback dict build that never finishes.
-  # Actual peak usage is ~2770 MB (within the 3500 MB Docker worker limit).
-  RUST_CACHE_MAX_MEMORY_MB: "3000"
+  # Max Rust AHashMap cache size (feather_MB × 5 estimate). Raised to 4000 on
+  # 2026-05-25 because the FUTURES port grew the feather from ~575 MB → 706 MB;
+  # 706×5=3530 MB exceeds the old 3000 MB cap, causing the Rust cache to be
+  # skipped → Python/Polars fallback → 7 GB host swap and stuck optimize jobs.
+  # Pair with worker-optimize mem_limit raised to 6144M (see budget header).
+  RUST_CACHE_MAX_MEMORY_MB: "4000"
   # NIFTY bulk loads are narrow (date/expiry/type/strike/close), so avoid
   # splitting normal 6-7 year backtests into repeated DB+engine passes.
   BULK_LOAD_CHUNK_YEARS: "10"
@@ -236,7 +245,7 @@ services:
       --queues=backtests
       --concurrency=1
       -l info
-      --max-memory-per-child=3200000
+      --max-memory-per-child=5000000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -276,7 +285,7 @@ services:
       --queues=backtests_fast
       --concurrency=1
       -l info
-      --max-memory-per-child=3200000
+      --max-memory-per-child=5000000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -330,7 +339,7 @@ services:
       --queues=optimize
       --concurrency=3
       -l info
-      --max-memory-per-child=2800000
+      --max-memory-per-child=5000000
       --without-gossip
       --without-mingle
       --without-heartbeat
@@ -345,7 +354,14 @@ services:
       # instead of a range-specific feather that may not exist → avoids 2-3 min
       # DB fallback. Full feather loads in ~6s cold / <1s warm from page cache.
       OPTIMIZE_PARALLELISM: "2"
-      OPTIMIZE_SKIP_MAE_MFE: "0"
+      # SKIP_MAE_MFE=1 on 2026-05-25: with the feather expanded to 706 MB and
+      # date ranges up to 7 years, per-combo MAE/MFE computation hits 30s+ on
+      # the 3.89M-row pandas DataFrame (Python-bound strftime). Combos are now
+      # ~200ms each via Rust, total ~30s for 252 combos. MAE/MFE is computed
+      # on-demand when the user downloads a single combo tradesheet (cached
+      # to disk after first compute) — see routers/optimize.py
+      # download_combo_tradesheet.
+      OPTIMIZE_SKIP_MAE_MFE: "1"
       OPTIMIZE_SKIP_TRADESHEETS: "0"
       FAST_LOOKUP_RANGE_FILTER: "0"
       # Fork-safe threading for the optimizer worker.
@@ -376,12 +392,18 @@ services:
     deploy:
       resources:
         limits:
-          # 4096M: 3 concurrent jobs × ~800MB each = 2.4GB + 1.6GB headroom.
+          # 6144M (raised from 4096M on 2026-05-25): the 706 MB feather expands
+          # to ~3.5 GB Rust AHashMap; Polars OHLC preload adds ~700 MB in the
+          # parent (CoW-inherited); pyarrow MAE/MFE preload adds ~250 MB per
+          # forked child (private, not shared). Per-job budget:
+          #   3.5 GB Rust cache + 0.7 GB Polars OHLC + 2×0.25 GB pandas OHLC
+          #   + 0.5 GB Python/Celery overhead = ~5.2 GB → 6 GB w/ headroom.
           # Feather mmap is shared (OS page cache) so memory does NOT multiply
-          # with each additional concurrent job.
-          # 8 CPUs: 3 jobs × 2 forkserver workers = 6 active Python processes;
-          # 8 gives headroom for Celery coordinators + Rust rayon threads.
-          memory: 4096M
+          # with each additional concurrent job — but the AHashMap and pyarrow
+          # DataFrame are per-process and DO duplicate. Keep concurrency=1 in
+          # practice (set OPTIMIZE_PARALLELISM, not Celery concurrency) when
+          # running multiple sweeps.
+          memory: 6144M
           cpus: "8.0"
         reservations:
           memory: 256M

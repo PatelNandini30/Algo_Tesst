@@ -207,6 +207,134 @@ async def get_optimize_results(
     }
 
 
+# ── On-demand MAE/MFE compute for individual tradesheet downloads ────────────
+# Optim runs skip MAE/MFE per combo (OPTIMIZE_SKIP_MAE_MFE=1) for speed.
+# When a user downloads a single combo's tradesheet we compute MAE/MFE here
+# and cache it back to the CSV so the second download is instant.
+
+_ohlc_pandas_cache: Dict[str, "tuple[Any, List[str]]"] = {}
+_ohlc_pandas_lock = threading.Lock()
+
+
+def _get_ohlc_pandas_for_index(index_str: str):
+    """
+    Lazy-load OHLC feather into a pandas DataFrame (cached per-process).
+    Returns (ohlc_pd, trading_days). Same dtypes as the worker's preload:
+    datetime64[ms] dates, category strings, float32 prices, int32 strike_r.
+    """
+    key = index_str.upper()
+    with _ohlc_pandas_lock:
+        if key in _ohlc_pandas_cache:
+            return _ohlc_pandas_cache[key]
+        import pyarrow as _pa
+        import pyarrow.ipc as _pa_ipc
+        import pyarrow.compute as _pc
+        import pandas as _pd
+        from services import rust_fast_path as _rfp
+        _pa.set_cpu_count(1)
+        _pa.set_io_thread_count(1)
+        feather = _rfp._cache_root() / f"arrow-v2:bulk:{key}:full" / "options.feather"
+        if not feather.exists():
+            raise FileNotFoundError(f"OHLC feather missing: {feather}")
+        _t0 = time.time()
+        needed = ["Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType", "High", "Low"]
+        reader = _pa_ipc.open_file(str(feather))
+        avail = set(reader.schema.names)
+        sel = [c for c in needed if c in avail]
+        tbl = reader.read_all().select(sel)
+        if "OptionType" in avail:
+            mask = _pc.is_in(tbl.column("OptionType"), value_set=_pa.array(["CE", "PE"]))
+            tbl = tbl.filter(mask)
+        ohlc_pd = tbl.to_pandas(date_as_object=False)
+        for c in ("Symbol", "OptionType"):
+            if c in ohlc_pd.columns and ohlc_pd[c].dtype == object:
+                ohlc_pd[c] = ohlc_pd[c].astype("category")
+        for c in ("High", "Low"):
+            if c in ohlc_pd.columns:
+                ohlc_pd[c] = ohlc_pd[c].astype("float32")
+        if "StrikePrice" in ohlc_pd.columns:
+            ohlc_pd["strike_r"] = ohlc_pd["StrikePrice"].round(0).astype("int32")
+            ohlc_pd = ohlc_pd.drop(columns=["StrikePrice"])
+        trading_days = sorted({d.strftime("%Y-%m-%d")
+                               for d in _pd.to_datetime(ohlc_pd["Date"]).dt.date.unique()})
+        logger.info(
+            "[OPTIM_DL] OHLC pandas cached for %s: %d rows, %d trading days in %.2fs",
+            key, len(ohlc_pd), len(trading_days), time.time() - _t0,
+        )
+        _ohlc_pandas_cache[key] = (ohlc_pd, trading_days)
+        return _ohlc_pandas_cache[key]
+
+
+def _enrich_tradesheet_with_mae_mfe(csv_path: str, index_str: str) -> bool:
+    """
+    Read the combo tradesheet CSV, compute MAE/MFE and Lowest NAV per trade,
+    write back to disk. Returns True if enrichment was applied.
+
+    Idempotent: skips if MAE/MFE columns already populated (non-zero sum).
+    """
+    import pandas as _pd
+    try:
+        trades_df = _pd.read_csv(csv_path, dtype=str)
+    except Exception as exc:
+        logger.warning("[OPTIM_DL] CSV read failed for %s: %s", csv_path, exc)
+        return False
+    if trades_df.empty or "MAE" not in trades_df.columns or "MFE" not in trades_df.columns:
+        return False
+    # Skip if already enriched (any non-zero MAE/MFE means populated)
+    mae_num = _pd.to_numeric(trades_df["MAE"], errors="coerce").fillna(0.0)
+    mfe_num = _pd.to_numeric(trades_df["MFE"], errors="coerce").fillna(0.0)
+    if (mae_num.abs().sum() + mfe_num.abs().sum()) > 0.0001:
+        return False  # already has values, no need to recompute
+    try:
+        ohlc_pd, trading_days = _get_ohlc_pandas_for_index(index_str)
+    except Exception as exc:
+        logger.warning("[OPTIM_DL] OHLC load failed: %s", exc)
+        return False
+
+    # _compute_mae_mfe_batch reads from runner._RUST_CONTEXT["ohlc_df_pandas"].
+    # Install the cached pandas DataFrame and trading_days so it uses our path.
+    from services.optimizer import runner as _r
+    from services.optimizer.runner import _compute_mae_mfe_batch, _compute_live_dd_from_mae
+    _prev_ctx = _r._RUST_CONTEXT
+    _r._RUST_CONTEXT = {"ohlc_df_pandas": ohlc_pd, "trading_days": trading_days}
+    try:
+        # CSV dates are DD-MM-YYYY (per algotest_job tradesheet format).
+        # Convert back to datetime for the compute, restore string format on save.
+        for col in ("Entry Date", "Exit Date"):
+            if col in trades_df.columns:
+                trades_df[col] = _pd.to_datetime(trades_df[col], format="%d-%m-%Y", errors="coerce")
+        # Numeric columns the compute reads
+        for col in ("Strike", "Entry Price", "Entry Spot", "Exit Price", "Exit Spot",
+                    "Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+            if col in trades_df.columns:
+                trades_df[col] = _pd.to_numeric(trades_df[col], errors="coerce")
+        trades_df = _compute_mae_mfe_batch(trades_df, index_str.upper(), trading_days)
+
+        # Lowest NAV needs an aggregated DataFrame (one row per trade with Cumulative).
+        # Build it from parent rows (first occurrence of each Trade id).
+        if "Trade" in trades_df.columns:
+            parent_rows = trades_df.drop_duplicates(subset=["Trade"], keep="first")
+            aggregated = parent_rows[["Trade"]].copy()
+            for col in ("Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                if col in parent_rows.columns:
+                    aggregated[col] = parent_rows[col].values
+            trades_df = _compute_live_dd_from_mae(trades_df, aggregated)
+
+        # Restore date format for CSV
+        for col in ("Entry Date", "Exit Date"):
+            if col in trades_df.columns:
+                trades_df[col] = trades_df[col].dt.strftime("%d-%m-%Y")
+
+        trades_df.to_csv(csv_path, index=False)
+        logger.info("[OPTIM_DL] enriched MAE/MFE for %s", os.path.basename(csv_path))
+        return True
+    except Exception as exc:
+        logger.warning("[OPTIM_DL] MAE/MFE enrich failed for %s: %s", csv_path, exc)
+        return False
+    finally:
+        _r._RUST_CONTEXT = _prev_ctx
+
+
 # ── Background ZIP builder ───────────────────────────────────────────────────
 # Building 100+ XLSX tradesheets takes minutes — far longer than a browser HTTP
 # timeout (~60s).  The endpoint kicks off a background build, returns 202 with
@@ -427,6 +555,19 @@ async def download_combo_tradesheet(job_id: str, combo_id: int):
         raise HTTPException(status_code=400, detail="Invalid combo label")
     if not os.path.isfile(csv_path):
         raise HTTPException(status_code=404, detail="Tradesheet file not found on disk")
+
+    # On-demand MAE/MFE compute (cached to disk after first download).
+    # Worker skips MAE/MFE during the optim run (OPTIMIZE_SKIP_MAE_MFE=1) so
+    # combos finish in ~200ms each. The full MAE/MFE compute happens here
+    # only for combos the user actually downloads — ~5s first time, instant
+    # on subsequent downloads since we cache by writing back to the CSV.
+    try:
+        _index_str = (meta.get("base_payload", {}) or {}).get("index") or "NIFTY"
+        await asyncio.get_event_loop().run_in_executor(
+            None, _enrich_tradesheet_with_mae_mfe, csv_path, _index_str
+        )
+    except Exception as _exc:
+        logger.warning("[OPTIM_DL] enrich step skipped for combo %d: %s", combo_id, _exc)
 
     filename = f"combo_{combo_id}_{combo_label_safe[:60]}.csv"
 

@@ -111,6 +111,17 @@ def _worker_entrypoint(
 
         obj = resolve_objective(objective_name)
 
+        # Preserve fork-inherited ohlc_df_pandas across set_rust_context().
+        # Parent built it in _prepare_market_data; child inherited it via CoW
+        # (zero I/O). set_rust_context() below replaces _RUST_CONTEXT with the
+        # pickled context that was stripped of ohlc_df_pandas (to avoid
+        # pickling 111 MB through the pool pipe). We re-attach the inherited
+        # one after — same physical pages, no copy.
+        from services.optimizer import runner as _runner_mod
+        _inherited_ohlc_pandas = None
+        if _runner_mod._RUST_CONTEXT is not None:
+            _inherited_ohlc_pandas = _runner_mod._RUST_CONTEXT.get("ohlc_df_pandas")
+
         if prebuilt_feather_root:
             # With fork, the parent's Rust AHashMap is inherited via CoW —
             # check if it's already live before doing any disk I/O.
@@ -140,6 +151,113 @@ def _worker_entrypoint(
             lean = _payload_is_rust_compatible(base_payload)
             meta = _prepare_market_data(base_payload, lean=lean)
             set_rust_context(meta.get("rust_context"))
+
+        # Re-attach the CoW-inherited pandas OHLC (free, same physical pages).
+        if _inherited_ohlc_pandas is not None and _runner_mod._RUST_CONTEXT is not None:
+            _runner_mod._RUST_CONTEXT["ohlc_df_pandas"] = _inherited_ohlc_pandas
+            logger.info(
+                "[OPTIM_PARALLEL] OHLC pandas inherited via fork — skipping reload (%d rows)",
+                len(_inherited_ohlc_pandas),
+            )
+
+        # Polars' Rayon pool was initialized in the parent (via pl.read_ipc during
+        # feather preload). After fork the pool thread is dead — any subsequent
+        # Polars op that schedules on Rayon (pl.read_ipc, .filter, .join on
+        # multi-row data, etc.) deadlocks on futex_do_wait.
+        #
+        # Workaround: load the OHLC feather via pyarrow (no Rayon) into a pandas
+        # DataFrame and hand it to runner via _RUST_CONTEXT["ohlc_df_pandas"].
+        # _compute_mae_mfe_batch detects this key and runs the join in pandas,
+        # bypassing Polars entirely in the child. Result: MAE/MFE in tradesheets
+        # matches the regular backtest engine exactly.
+        try:
+            import pyarrow as _pa
+            import pyarrow.ipc as _pa_ipc
+            import pyarrow.compute as _pc
+            # Single-thread pyarrow in forked children — the inherited Arrow
+            # thread pool is dead post-fork, same root cause as Polars/Rayon.
+            try:
+                _pa.set_cpu_count(1)
+                _pa.set_io_thread_count(1)
+            except Exception:
+                pass
+            from services import rust_fast_path as _rfp_w
+            from services.optimizer import runner as _runner_mod
+            _rctx = _runner_mod._RUST_CONTEXT
+            if _rctx is not None and "ohlc_df_pandas" not in _rctx:
+                _sym_upper = str(
+                    base_payload.get("index") or base_payload.get("symbol") or "NIFTY"
+                ).upper()
+                _feather_path = (
+                    _rfp_w._cache_root()
+                    / f"arrow-v2:bulk:{_sym_upper}:full"
+                    / "options.feather"
+                )
+                if _feather_path.exists():
+                    _t0 = time.perf_counter()
+                    # Only the columns _compute_mae_mfe_batch needs — skips
+                    # Open/Close/Volume and any other heavy fields in the feather.
+                    _needed = ["Symbol", "Date", "ExpiryDate", "StrikePrice",
+                               "OptionType", "High", "Low"]
+                    _reader = _pa_ipc.open_file(str(_feather_path))
+                    _avail = set(_reader.schema.names)
+                    _sel = [c for c in _needed if c in _avail]
+                    _pa_table = _reader.read_all().select(_sel)
+                    # Filter to the run's date range in pyarrow (low-memory) BEFORE
+                    # converting to pandas — avoids materializing rows we'll discard.
+                    _days_sorted = sorted(_rctx.get("trading_days") or [])
+                    import pandas as _pd_w
+                    if _days_sorted and "Date" in _avail:
+                        _from_dt = _pd_w.Timestamp(_days_sorted[0]).date()
+                        _to_dt = _pd_w.Timestamp(_days_sorted[-1]).date()
+                        _mask = _pc.and_(
+                            _pc.greater_equal(_pa_table.column("Date"), _pa.scalar(_from_dt)),
+                            _pc.less_equal(_pa_table.column("Date"), _pa.scalar(_to_dt)),
+                        )
+                        _pa_table = _pa_table.filter(_mask)
+                    # Drop FUTIDX/spot rows in pyarrow before to_pandas — they have
+                    # null StrikePrice/OptionType and would break the int32 strike_r cast.
+                    # MAE/MFE only needs option (CE/PE) rows.
+                    if "OptionType" in _avail:
+                        _opt_mask = _pc.is_in(
+                            _pa_table.column("OptionType"),
+                            value_set=_pa.array(["CE", "PE"]),
+                        )
+                        _pa_table = _pa_table.filter(_opt_mask)
+                    # Convert with date_as_object=False → datetime64[ns] (8 B/row vs ~32 B object).
+                    # Categorical + float32 casts happen below to cut memory further.
+                    _ohlc_pd = _pa_table.to_pandas(date_as_object=False)
+                    # Cast string columns to category (low-cardinality: NIFTY, CE/PE).
+                    for _col in ("Symbol", "OptionType"):
+                        if _col in _ohlc_pd.columns and _ohlc_pd[_col].dtype == object:
+                            _ohlc_pd[_col] = _ohlc_pd[_col].astype("category")
+                    # Cast prices to float32 — halves their memory vs float64,
+                    # and MAE/MFE math doesn't need float64 precision.
+                    for _col in ("High", "Low"):
+                        if _col in _ohlc_pd.columns:
+                            _ohlc_pd[_col] = _ohlc_pd[_col].astype("float32")
+                    # Pre-compute strike_r once, drop StrikePrice — saves another ~15 MB.
+                    if "StrikePrice" in _ohlc_pd.columns:
+                        _ohlc_pd["strike_r"] = _ohlc_pd["StrikePrice"].round(0).astype("int32")
+                        _ohlc_pd = _ohlc_pd.drop(columns=["StrikePrice"])
+                    _rctx["ohlc_df_pandas"] = _ohlc_pd
+                    _mem_mb = _ohlc_pd.memory_usage(deep=True).sum() / (1024 * 1024)
+                    logger.info(
+                        "[OPTIM_PARALLEL] OHLC pyarrow-loaded: %d rows, %.1f MB in %.2fs (fork-safe MAE/MFE)",
+                        len(_ohlc_pd), _mem_mb, time.perf_counter() - _t0,
+                    )
+                else:
+                    logger.warning(
+                        "[OPTIM_PARALLEL] OHLC feather not found at %s — MAE/MFE will be 0",
+                        _feather_path,
+                    )
+                    os.environ["OPTIMIZE_SKIP_MAE_MFE"] = "1"
+        except Exception as _ohlc_err:
+            logger.warning(
+                "[OPTIM_PARALLEL] OHLC pyarrow load failed: %s — MAE/MFE will be 0",
+                _ohlc_err,
+            )
+            os.environ["OPTIMIZE_SKIP_MAE_MFE"] = "1"
 
         # Signal that this worker has started processing combos.
         try:
