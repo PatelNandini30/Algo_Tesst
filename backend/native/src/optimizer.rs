@@ -80,12 +80,21 @@ struct ComboMetrics {
     actual_live_dd_max: f64,
     actual_live_dd_avg: f64,
     car_mdd_live: f64,
+    positive_outlier_1: f64,
+    negative_outlier_1: f64,
     outlier_dd_1: f64,
     outlier_dd_1_avg: f64,
+    positive_outlier_2: f64,
+    negative_outlier_2: f64,
     outlier_dd_2: f64,
     outlier_dd_2_avg: f64,
+    positive_outlier_3: f64,
+    negative_outlier_3: f64,
     outlier_dd_3: f64,
     outlier_dd_3_avg: f64,
+    ce_pe_pnl_pct_without_top_1_outliers: f64,
+    ce_pe_pnl_pct_without_top_2_outliers: f64,
+    ce_pe_pnl_pct_without_top_3_outliers: f64,
     ce_pnl_pct_no_outlier_1: f64,
     ce_pnl_pct_no_outlier_2: f64,
     ce_pnl_pct_no_outlier_3: f64,
@@ -118,39 +127,49 @@ fn first_nonzero(slice: &[f64]) -> Option<f64> {
     slice.iter().copied().find(|v| !v.is_nan() && *v != 0.0)
 }
 
-/// Recompute Live DD after dropping the top-N trades by |net_pnl_pct|.
-fn live_dd_after_dropping(pct: &[f64], drop_n: usize) -> (f64, f64) {
-    if pct.is_empty() || drop_n == 0 {
-        return (0.0, 0.0);
+fn outlier_block(pct: &[f64], live_dd: &[f64], n: usize) -> (f64, f64, f64, f64, f64) {
+    if pct.is_empty() || n == 0 {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
     }
     let mut indexed: Vec<(usize, f64)> = pct
         .iter()
         .copied()
         .enumerate()
-        .map(|(i, v)| (i, v.abs()))
         .collect();
     indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let drop_set: AHashMap<usize, ()> =
-        indexed.iter().take(drop_n).map(|(i, _)| (*i, ())).collect();
 
-    let mut cum = 100.0_f64;
-    let mut peak = 100.0_f64;
-    let mut lows: Vec<f64> = Vec::with_capacity(pct.len());
-    for (i, v) in pct.iter().enumerate() {
-        if drop_set.contains_key(&i) {
+    let pos_sum: f64 = indexed.iter().take(n).map(|(_, v)| *v).sum();
+    let start = indexed.len().saturating_sub(n);
+    let neg_sum: f64 = indexed.iter().skip(start).map(|(_, v)| *v).sum();
+    let total_sum: f64 = pct.iter().copied().sum();
+
+    let drop_set: AHashMap<usize, ()> = indexed
+        .iter()
+        .take(n)
+        .chain(indexed.iter().skip(start))
+        .map(|(i, _)| (*i, ()))
+        .collect();
+
+    let mut kept: Vec<f64> = Vec::with_capacity(live_dd.len());
+    for (i, v) in live_dd.iter().copied().enumerate() {
+        if drop_set.contains_key(&i) || !v.is_finite() {
             continue;
         }
-        cum *= 1.0 + v / 100.0;
-        if cum > peak {
-            peak = cum;
-        }
-        lows.push(cum - peak);
+        kept.push(v);
     }
-    if lows.is_empty() {
-        return (0.0, 0.0);
-    }
-    let min = lows.iter().copied().fold(f64::INFINITY, f64::min);
-    (round4(min), round4(mean(&lows)))
+    let dd_min = if kept.is_empty() {
+        0.0
+    } else {
+        kept.iter().copied().fold(f64::INFINITY, f64::min)
+    };
+    let dd_avg = mean(&kept);
+    (
+        round4(pos_sum),
+        round4(neg_sum),
+        round4(dd_min),
+        round4(dd_avg),
+        round4(total_sum - pos_sum - neg_sum),
+    )
 }
 
 /// Top-N largest leg P&L values are stripped from the sum.
@@ -189,9 +208,9 @@ fn compute_metrics_for_batch(batch: &TradeBatch) -> ComboMetrics {
         .min(0.0);
     let live_avg = mean(&live_pairs);
 
-    let (d1, d1a) = live_dd_after_dropping(&batch.net_pnl_pct, 1);
-    let (d2, d2a) = live_dd_after_dropping(&batch.net_pnl_pct, 2);
-    let (d3, d3a) = live_dd_after_dropping(&batch.net_pnl_pct, 3);
+    let (p1, n1, d1, d1a, c1) = outlier_block(&batch.net_pnl_pct, &live_pairs, 1);
+    let (p2, n2, d2, d2a, c2) = outlier_block(&batch.net_pnl_pct, &live_pairs, 2);
+    let (p3, n3, d3, d3a, c3) = outlier_block(&batch.net_pnl_pct, &live_pairs, 3);
 
     let roi_vs_spot = if batch.spot_change != 0.0 {
         round4(sum(&batch.net_pnl) / batch.spot_change)
@@ -215,12 +234,21 @@ fn compute_metrics_for_batch(batch: &TradeBatch) -> ComboMetrics {
         actual_live_dd_max: round4(if live_max.is_finite() { live_max } else { 0.0 }),
         actual_live_dd_avg: round4(live_avg),
         car_mdd_live,
+        positive_outlier_1: p1,
+        negative_outlier_1: n1,
         outlier_dd_1: d1,
         outlier_dd_1_avg: d1a,
+        positive_outlier_2: p2,
+        negative_outlier_2: n2,
         outlier_dd_2: d2,
         outlier_dd_2_avg: d2a,
+        positive_outlier_3: p3,
+        negative_outlier_3: n3,
         outlier_dd_3: d3,
         outlier_dd_3_avg: d3a,
+        ce_pe_pnl_pct_without_top_1_outliers: c1,
+        ce_pe_pnl_pct_without_top_2_outliers: c2,
+        ce_pe_pnl_pct_without_top_3_outliers: c3,
         ce_pnl_pct_no_outlier_1: leg_pct_no_outliers(&batch.call_pnl, denom, 1),
         ce_pnl_pct_no_outlier_2: leg_pct_no_outliers(&batch.call_pnl, denom, 2),
         ce_pnl_pct_no_outlier_3: leg_pct_no_outliers(&batch.call_pnl, denom, 3),
@@ -276,12 +304,30 @@ fn metrics_to_dict(py: Python<'_>, m: &ComboMetrics) -> PyResult<PyObject> {
     d.set_item("actual_live_dd_max", m.actual_live_dd_max)?;
     d.set_item("actual_live_dd_avg", m.actual_live_dd_avg)?;
     d.set_item("car_mdd_live", m.car_mdd_live)?;
+    d.set_item("positive_outlier_1", m.positive_outlier_1)?;
+    d.set_item("negative_outlier_1", m.negative_outlier_1)?;
     d.set_item("outlier_dd_1", m.outlier_dd_1)?;
     d.set_item("outlier_dd_1_avg", m.outlier_dd_1_avg)?;
+    d.set_item("positive_outlier_2", m.positive_outlier_2)?;
+    d.set_item("negative_outlier_2", m.negative_outlier_2)?;
     d.set_item("outlier_dd_2", m.outlier_dd_2)?;
     d.set_item("outlier_dd_2_avg", m.outlier_dd_2_avg)?;
+    d.set_item("positive_outlier_3", m.positive_outlier_3)?;
+    d.set_item("negative_outlier_3", m.negative_outlier_3)?;
     d.set_item("outlier_dd_3", m.outlier_dd_3)?;
     d.set_item("outlier_dd_3_avg", m.outlier_dd_3_avg)?;
+    d.set_item(
+        "ce_pe_pnl_pct_without_top_1_outliers",
+        m.ce_pe_pnl_pct_without_top_1_outliers,
+    )?;
+    d.set_item(
+        "ce_pe_pnl_pct_without_top_2_outliers",
+        m.ce_pe_pnl_pct_without_top_2_outliers,
+    )?;
+    d.set_item(
+        "ce_pe_pnl_pct_without_top_3_outliers",
+        m.ce_pe_pnl_pct_without_top_3_outliers,
+    )?;
     d.set_item("ce_pnl_pct_no_outlier_1", m.ce_pnl_pct_no_outlier_1)?;
     d.set_item("ce_pnl_pct_no_outlier_2", m.ce_pnl_pct_no_outlier_2)?;
     d.set_item("ce_pnl_pct_no_outlier_3", m.ce_pnl_pct_no_outlier_3)?;

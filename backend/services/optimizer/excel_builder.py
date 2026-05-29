@@ -623,6 +623,7 @@ def _write_summary_sheet(
     win_rate      = (win_cnt  / total_cnt * 100) if total_cnt > 0 else 0.0
     loss_rate     = (loss_cnt / total_cnt * 100) if total_cnt > 0 else 0.0
     avg_net       = (sum_net  / total_cnt)       if total_cnt > 0 else 0.0
+    avg_pct       = (sum_pct  / total_cnt)       if total_cnt > 0 else 0.0
     if avg_loss_pct != 0:
         expectancy = (
             ((win_rate / 100) * avg_win_pct - (loss_rate / 100) * abs(avg_loss_pct))
@@ -651,7 +652,8 @@ def _write_summary_sheet(
         ce_sum              if has_calls else
         fut_sum             if has_futures else sum_net
     )
-    roi_pct = (opt_sum / spot_sum_gated * 100) if spot_sum_gated != 0 else 0.0
+    _scp = _to_num(S.get("spot_change_pct")) or (spot_pct * 100) or 0.0
+    roi_pct = sum_pct / abs(_scp) if _scp != 0 else 0.0
 
     # Live DD outlier analysis — iterate trades chronologically (same order as
     # the cleaned rows / Live DD pass above) so cascade trades are placed in
@@ -747,6 +749,8 @@ def _write_summary_sheet(
     sign = "+" if avg_net >= 0 else ""
     _kv("Avg Profit per Trade",  f"{sign}{avg_net:.2f}", r, "A", True, _GREEN_TX if avg_net >= 0 else _RED_TX)
     _kv("Expectancy Ratio",      f"{expectancy:.4f}",    r, "D", True, _GREEN_TX if expectancy >= 0 else _RED_TX); r += 1
+    sign_pct = "+" if avg_pct >= 0 else ""
+    _kv("Net P/L Avg %",  f"{sign_pct}{avg_pct:.4f}%", r, "A", False, _GREEN_TX if avg_pct >= 0 else _RED_TX); r += 1
 
     _kv("Max Profit (Single Trade)", _fmt_cur(max_net), r, "A", False, _GREEN_TX)
     _kv("Max Loss (Single Trade)",   _fmt_cur(min_net), r, "D", False, _RED_TX); r += 1
@@ -960,6 +964,187 @@ def _write_summary_sheet(
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def compute_xlsx_summary_metrics(
+    trades_df: pd.DataFrame,
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Return a dict of every summary stat that _write_summary_sheet computes from
+    the trades, using identical formulas.  Called by the optimizer after
+    MAE/MFE enrichment so the master summary CSV matches each combo XLSX exactly.
+    """
+    S = summary or {}
+    if trades_df is None or (hasattr(trades_df, "empty") and trades_df.empty):
+        rows: List[Dict] = []
+    else:
+        rows = trades_df.where(trades_df.notna(), None).to_dict("records")
+
+    tm, _ = _aggregate_trades(rows)
+
+    sum_pct = 0.0; sum_pos_pct = 0.0; sum_neg_pct = 0.0
+    win_cnt = 0;   loss_cnt = 0;      total_cnt = 0
+    sum_net = 0.0
+    final_cum = 100.0; spot_cum = 100.0
+    min_entry_ms = None; max_exit_ms = None
+    spot_sum_gated = 0.0
+    ce_sum = 0.0; pe_sum = 0.0; fut_sum = 0.0
+    ce_pct_sum = 0.0; pe_pct_sum = 0.0; spot_pct_sum = 0.0
+
+    def _parse_date_ms(v):
+        d = _parse_date(v)
+        return d.timestamp() * 1000 if d else None
+
+    for t in rows:
+        ce = _to_num(t.get("CE P&L")) or _to_num(t.get("Call P&L"))
+        pe = _to_num(t.get("PE P&L")) or _to_num(t.get("Put P&L"))
+        fu = _to_num(t.get("FUT P&L"))
+        ce_sum  += ce if ce is not None else 0
+        pe_sum  += pe if pe is not None else 0
+        fut_sum += fu if fu is not None else 0
+        es = _to_num(t.get("Entry Spot"))
+        cep = _to_num(t.get("CE P&L %"))
+        if cep is None and ce is not None and es and es != 0:
+            cep = ce / es
+        ce_pct_sum += cep if cep is not None else 0
+        pep = _to_num(t.get("PE P&L %"))
+        if pep is None and pe is not None and es and es != 0:
+            pep = pe / es
+        pe_pct_sum += pep if pep is not None else 0
+        spp = _to_num(t.get("Spot P&L %"))
+        sp = _to_num(t.get("Spot P&L"))
+        if spp is None and sp is not None and es and es != 0:
+            spp = sp / es
+        spot_pct_sum += spp if spp is not None else 0
+
+    for t in rows:
+        p = _to_num(t.get("% P&L")); n = _to_num(t.get("Net P&L"))
+        if p is not None and math.isfinite(p):
+            sum_pct += p; total_cnt += 1
+            if p > 0:   sum_pos_pct += p; win_cnt  += 1
+            elif p < 0: sum_neg_pct += p; loss_cnt += 1
+        if n is not None and math.isfinite(n):
+            sum_net += n
+            sp = _to_num(t.get("Spot P&L"))
+            if sp is not None: spot_sum_gated += sp
+        cum = _to_num(t.get("Cumulative"))
+        if cum is not None and math.isfinite(cum): final_cum = cum
+        es = _to_num(t.get("Entry Spot")); xs = _to_num(t.get("Exit Spot"))
+        if n is not None and math.isfinite(n) and es and xs and es > 0:
+            spot_cum *= (xs / es)
+        ed = _parse_date_ms(t.get("Entry Date"))
+        xd = _parse_date_ms(t.get("Exit Date"))
+        if ed and (min_entry_ms is None or ed < min_entry_ms): min_entry_ms = ed
+        if xd and (max_exit_ms  is None or xd > max_exit_ms):  max_exit_ms  = xd
+
+    avg_win_pct  = (sum_pos_pct / win_cnt)  if win_cnt  > 0 else 0.0
+    avg_loss_pct = (sum_neg_pct / loss_cnt) if loss_cnt > 0 else 0.0
+    avg_pct      = (sum_pct / total_cnt)    if total_cnt > 0 else 0.0
+
+    years = (
+        (max_exit_ms - min_entry_ms) / (365.25 * 86400 * 1000)
+        if (min_entry_ms is not None and max_exit_ms is not None) else 0.0
+    )
+    opt_cagr  = (math.pow(final_cum / 100, 1 / years) - 1) * 100 if years > 0 and final_cum > 0 else 0.0
+    spot_cagr = (math.pow(spot_cum  / 100, 1 / years) - 1) * 100 if years > 0 and spot_cum  > 0 else 0.0
+
+    max_dd_pct = _to_num(S.get("max_dd_pct")) or 0.0
+    car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
+
+    opt_sum = (
+        (ce_sum + pe_sum) if (ce_sum != 0 or pe_sum != 0)
+        else (fut_sum if fut_sum != 0 else sum_net)
+    )
+    _scp = _to_num(S.get("spot_change_pct")) or (spot_pct_sum * 100) or 0.0
+    roi_pct = sum_pct / abs(_scp) if _scp != 0 else 0.0
+
+    trade_pairs: List[Dict] = []
+    _seen2: set = set()
+    _chron_keys: List[str] = []
+    for _cr in rows:
+        _k = str(_cr.get("Trade") or _cr.get("trade") or 1)
+        if _k not in _seen2 and _k in tm:
+            _seen2.add(_k); _chron_keys.append(_k)
+    for _k in tm.keys():
+        if _k not in _seen2:
+            _seen2.add(_k); _chron_keys.append(_k)
+    for k in _chron_keys:
+        t2 = tm[k]
+        pct_v = t2.get("pct")
+        pct_v = pct_v if isinstance(pct_v, float) and math.isfinite(pct_v) else None
+        ldd_v = t2.get("actualLDD")
+        ldd_v = ldd_v if isinstance(ldd_v, float) and math.isfinite(ldd_v) else None
+        if pct_v is not None:
+            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "idx": len(trade_pairs)})
+
+    n_trades = len(trade_pairs)
+    by_pct_desc = sorted(trade_pairs, key=lambda x: -x["pct"])
+
+    _p1 = by_pct_desc[0]["pct"]  if n_trades > 0 else 0.0
+    _p2 = _p1 + by_pct_desc[1]["pct"] if n_trades > 1 else _p1
+    _p3 = _p2 + by_pct_desc[2]["pct"] if n_trades > 2 else _p2
+    _n1 = by_pct_desc[n_trades - 1]["pct"] if n_trades > 0 else 0.0
+    _n2 = _n1 + by_pct_desc[n_trades - 2]["pct"] if n_trades > 1 else _n1
+    _n3 = _n2 + by_pct_desc[n_trades - 3]["pct"] if n_trades > 2 else _n2
+    total_pct_s = sum(p["pct"] for p in trade_pairs)
+    pct_no_o1 = total_pct_s - _p1 - _n1
+    pct_no_o2 = total_pct_s - _p2 - _n2
+    pct_no_o3 = total_pct_s - _p3 - _n3
+
+    def _ldd_exc(exc_top: int, exc_bot: int):
+        exc_idx = {
+            *[p["idx"] for p in by_pct_desc[:exc_top]],
+            *[p["idx"] for p in by_pct_desc[max(0, n_trades - exc_bot):]],
+        }
+        filt = [p["ldd"] for p in trade_pairs if p["idx"] not in exc_idx and p["ldd"] is not None]
+        if not filt: return (0.0, 0.0)
+        return (round(min(filt), 4), round(sum(filt) / len(filt), 4))
+
+    all_ldds = [p["ldd"] for p in trade_pairs if p["ldd"] is not None]
+    live_dd_min  = round(min(all_ldds), 4)                if all_ldds else 0.0
+    live_dd_avg  = round(sum(all_ldds) / len(all_ldds), 4) if all_ldds else 0.0
+    ldd_no_o1    = _ldd_exc(1, 1)
+    ldd_no_o2    = _ldd_exc(2, 2)
+    ldd_no_o3    = _ldd_exc(3, 3)
+    car_mdd_live = (opt_cagr / 100) / abs(live_dd_min) if live_dd_min != 0 else 0.0
+
+    _spot_chg     = _to_num(S.get("spot_change"))     or round(spot_sum_gated, 2)
+    _spot_chg_pct = _to_num(S.get("spot_change_pct")) or round(spot_pct_sum * 100, 4)
+
+    return {
+        "cagr_options":                          round(opt_cagr, 2),
+        "cagr_spot":                             round(spot_cagr, 2),
+        "car_mdd":                               round(car_mdd, 4),
+        "roi_vs_spot":                           round(roi_pct, 4),
+        "avg_profit_per_trade_pct":              round(avg_pct, 4),
+        "avg_win_pct":                           round(avg_win_pct, 4),
+        "avg_loss_pct":                          round(avg_loss_pct, 4),
+        "ce_pnl_total":                          round(ce_sum, 2),
+        "ce_pnl_pct":                            round(ce_pct_sum * 100, 4),
+        "pe_pnl_total":                          round(pe_sum, 2),
+        "pe_pnl_pct":                            round(pe_pct_sum * 100, 4),
+        "long_spot_pnl":                         _spot_chg,
+        "long_spot_pnl_pct":                     _spot_chg_pct,
+        "actual_live_dd_max":                    live_dd_min,
+        "actual_live_dd_avg":                    live_dd_avg,
+        "car_mdd_live":                          round(car_mdd_live, 4),
+        "positive_outlier_1":                    round(_p1, 4),
+        "negative_outlier_1":                    round(_n1, 4),
+        "positive_outlier_2":                    round(_p2, 4),
+        "negative_outlier_2":                    round(_n2, 4),
+        "positive_outlier_3":                    round(_p3, 4),
+        "negative_outlier_3":                    round(_n3, 4),
+        "outlier_dd_1":                          ldd_no_o1[0],
+        "outlier_dd_1_avg":                      ldd_no_o1[1],
+        "outlier_dd_2":                          ldd_no_o2[0],
+        "outlier_dd_2_avg":                      ldd_no_o2[1],
+        "outlier_dd_3":                          ldd_no_o3[0],
+        "outlier_dd_3_avg":                      ldd_no_o3[1],
+        "ce_pe_pnl_pct_without_top_1_outliers": round(pct_no_o1, 4),
+        "ce_pe_pnl_pct_without_top_2_outliers": round(pct_no_o2, 4),
+        "ce_pe_pnl_pct_without_top_3_outliers": round(pct_no_o3, 4),
+    }
+
 
 def build_combo_xlsx(
     trades_df: pd.DataFrame,

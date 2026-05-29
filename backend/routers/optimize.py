@@ -404,6 +404,24 @@ def _build_zip_blocking(job_id: str) -> None:
         state["total"] = len(combo_csvs)
         state["done"]  = 0
 
+        # Enrich MAE/MFE on disk before building XLSXs.
+        # OPTIMIZE_SKIP_MAE_MFE=1 leaves zeros in stored CSVs for speed;
+        # we compute them here in this thread (OHLC feather is cached after the
+        # first call so all combos share one load).  The ProcessPoolExecutor
+        # subprocesses below then read already-enriched CSVs.
+        index_str = (base_payload.get("index") or "NIFTY").upper()
+        state["phase"] = "enriching"
+        for i, fname in enumerate(combo_csvs):
+            try:
+                _enrich_tradesheet_with_mae_mfe(
+                    os.path.join(trades_dir, fname), index_str
+                )
+            except Exception as _e:
+                logger.warning("[ZIP] MAE/MFE enrich skipped for %s: %s", fname, _e)
+            state["done"] = i + 1
+        state["done"] = 0
+        state["phase"] = "building"
+
         build_args = []
         for fname in combo_csvs:
             label_safe = fname[:-4]

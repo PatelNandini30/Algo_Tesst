@@ -14,7 +14,10 @@ New metrics produced (matching `Summary_of_Weekly_Non-QTR_CE.xlsx` columns):
   roi_vs_spot
   actual_live_dd_max / actual_live_dd_avg
   car_mdd_live
+  positive_outlier_1 / _2 / _3
+  negative_outlier_1 / _2 / _3
   outlier_dd_1 / outlier_dd_2 / outlier_dd_3  (and their Avg variants)
+  ce_pe_pnl_pct_without_top_1_outliers / _2 / _3
   ce_pnl_pct_no_outlier_1 / _2 / _3
   pe_pnl_pct_no_outlier_1 / _2 / _3
 
@@ -55,43 +58,59 @@ def per_leg_pnl(trades: pd.DataFrame) -> Dict[str, float]:
     CE P&L = sum(Call P&L).  PE P&L = sum(Put P&L).
     Long Spot P&L = sum(Spot P&L) — already a reference column built by engine.
 
-    All `_pct` variants are expressed as percentage of initial spot,
-    consistent with how `total_pnl_pct = total_pnl / initial_spot * 100` is
-    computed elsewhere.
+    All `_pct` variants sum per-row (P&L / Entry Spot * 100), matching the
+    research-team convention used for spot_change_pct in compute_analytics.
     """
-    # Rust path uses "CE P&L"/"PE P&L"; Python engine uses "Call P&L"/"Put P&L".
-    ce_total = _sum_col(trades, "Call P&L", "CE P&L", "call_pnl")
-    pe_total = _sum_col(trades, "Put P&L", "PE P&L", "put_pnl")
-    spot_total = _sum_col(trades, "Spot P&L", "spot_pnl")
+    ce_col = next((c for c in ("Call P&L", "CE P&L", "call_pnl") if c in trades.columns), None)
+    pe_col = next((c for c in ("Put P&L", "PE P&L", "put_pnl") if c in trades.columns), None)
+    spot_col = next((c for c in ("Spot P&L", "spot_pnl") if c in trades.columns), None)
 
-    initial_spot, _ = _safe_first_last_spot(trades)
-    to_pct = (lambda v: round(v / initial_spot * 100, 4)) if initial_spot > 0 else (lambda v: 0.0)
+    def _s(col):
+        if col is None:
+            return pd.Series(0.0, index=trades.index, dtype=float)
+        return pd.to_numeric(trades[col], errors="coerce").fillna(0)
+
+    ce_s = _s(ce_col)
+    pe_s = _s(pe_col)
+    spot_s = _s(spot_col)
+
+    ce_total = float(ce_s.sum())
+    pe_total = float(pe_s.sum())
+    spot_total = float(spot_s.sum())
+
+    if "Entry Spot" in trades.columns:
+        es = pd.to_numeric(trades["Entry Spot"].replace("", np.nan), errors="coerce").replace(0, np.nan)
+        ce_pnl_pct = round(float((ce_s / es).fillna(0).sum() * 100), 4)
+        pe_pnl_pct = round(float((pe_s / es).fillna(0).sum() * 100), 4)
+        long_spot_pnl_pct = round(float((spot_s / es).fillna(0).sum() * 100), 4)
+    else:
+        ce_pnl_pct = 0.0
+        pe_pnl_pct = 0.0
+        long_spot_pnl_pct = 0.0
 
     return {
         "ce_pnl_total": round(ce_total, 2),
-        "ce_pnl_pct": to_pct(ce_total),
+        "ce_pnl_pct": ce_pnl_pct,
         "pe_pnl_total": round(pe_total, 2),
-        "pe_pnl_pct": to_pct(pe_total),
+        "pe_pnl_pct": pe_pnl_pct,
         "long_spot_pnl": round(spot_total, 2),
-        "long_spot_pnl_pct": to_pct(spot_total),
+        "long_spot_pnl_pct": long_spot_pnl_pct,
     }
 
 
 def roi_vs_spot(summary: Dict[str, Any]) -> float:
-    """`total_pnl_pct / spot_change_pct`. Falls back to total_pnl_pct itself if spot_change is zero."""
+    """Net P&L % / |Spot %|. Returns 0 if spot_change_pct is zero."""
     try:
-        spot_change = float(summary.get("spot_change", 0) or 0)
+        spot_change_pct = float(summary.get("spot_change_pct", 0) or 0)
     except (TypeError, ValueError):
-        spot_change = 0.0
+        spot_change_pct = 0.0
     try:
-        total_pnl = float(summary.get("total_pnl", 0) or 0)
+        total_pnl_pct = float(summary.get("total_pnl_pct", 0) or 0)
     except (TypeError, ValueError):
-        total_pnl = 0.0
-    if spot_change == 0:
+        total_pnl_pct = 0.0
+    if spot_change_pct == 0:
         return 0.0
-    # spot_change is in absolute points (matches compute_analytics).
-    # Use total_pnl in the same unit. Ratio of points.
-    return round(total_pnl / spot_change, 4)
+    return round(total_pnl_pct / abs(spot_change_pct), 4)
 
 
 def actual_live_dd(trades: pd.DataFrame) -> Dict[str, float]:
@@ -136,111 +155,126 @@ def car_mdd_live(summary: Dict[str, Any], live_dd_max: float) -> float:
         cagr = float(summary.get("cagr_options", 0) or 0)
     except (TypeError, ValueError):
         cagr = 0.0
-    return round(cagr / abs(live_dd_max), 4)
+    return round((cagr / 100.0) / abs(live_dd_max), 4)
 
 
-def _recompute_live_dd_after_dropping(trades: pd.DataFrame, drop_n: int) -> Dict[str, float]:
+def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
     """
-    Drop the top-`drop_n` outlier trades (by absolute Net P&L %), rebuild the
-    live NAV series, and return the new Actual Live DD.
+    Match the tradesheet Summary outlier block.
 
-    Uses Lowest NAV During Trade (MAE-based) when available — same methodology
-    as actual_live_dd() so the outlier-stripped values are comparable.  Falls
-    back to the booked cumulative approach when MAE data is absent.
-
-    Outlier definition: trades with the largest |% P&L| (or |Net P&L|).
+    Outlier N is cumulative: `+ve Outlier 2` is the sum of the top two
+    positive P&L% trades, and `-ve Outlier 2` is the sum of the bottom two
+    P&L% trades. Stripped Live DD removes both sides for the given N.
     """
-    if trades is None or trades.empty or drop_n <= 0:
-        return {"max": 0.0, "avg": 0.0}
+    out: Dict[str, float] = {}
+    for n in (1, 2, 3):
+        out[f"positive_outlier_{n}"] = 0.0
+        out[f"negative_outlier_{n}"] = 0.0
+        out[f"outlier_dd_{n}"] = 0.0
+        out[f"outlier_dd_{n}_avg"] = 0.0
+        out[f"ce_pe_pnl_pct_without_top_{n}_outliers"] = 0.0
 
-    # Extract one parent row per trade (first row per Trade ID, sorted by Entry Date).
+    if trades is None or trades.empty:
+        return out
+
+    # Extract one parent row per trade, preserving chronological order.
     df_all = trades.copy()
     if "Entry Date" in df_all.columns:
-        df_all = df_all.sort_values("Entry Date", na_position="last")
+        df_all["__entry_sort__"] = pd.to_datetime(
+            df_all["Entry Date"], errors="coerce", dayfirst=True
+        )
+        df_all = df_all.sort_values("__entry_sort__", na_position="last")
     seen: set = set()
     parent_idx = []
     for idx, row in df_all.iterrows():
-        tid = str(row.get("Trade", ""))
+        tid = str(row.get("Trade", row.get("trade", idx)))
         if tid not in seen:
             seen.add(tid)
             parent_idx.append(idx)
     df = df_all.loc[parent_idx].copy()
+    df = df.drop(columns=["__entry_sort__"], errors="ignore")
 
     if df.empty:
-        return {"max": 0.0, "avg": 0.0}
+        return out
 
-    # Rank column for outlier identification.
-    for _rcol in ("% P&L", "Net P&L %", "Net P&L"):
+    for _rcol in ("% P&L", "Net P&L %"):
         if _rcol in df.columns:
-            rank_series = pd.to_numeric(df[_rcol], errors="coerce").fillna(0)
+            pct_series = pd.to_numeric(df[_rcol], errors="coerce")
             break
     else:
-        return {"max": 0.0, "avg": 0.0}
+        return out
 
     df = df.copy()
-    df["__rank__"] = rank_series.abs().values
-    df = df.sort_values("__rank__", ascending=False).iloc[drop_n:].copy()
-    df = df.drop(columns="__rank__")
-    if df.empty:
-        return {"max": 0.0, "avg": 0.0}
+    df["__pct__"] = pct_series.fillna(0).values
 
-    # Re-sort chronologically for correct NAV accumulation.
-    if "Entry Date" in df.columns:
-        df = df.sort_values("Entry Date", na_position="last").reset_index(drop=True)
+    if "Lowest NAV During Trade" in df.columns and "Peak" in df.columns:
+        low = pd.to_numeric(df["Lowest NAV During Trade"], errors="coerce")
+        peak = pd.to_numeric(df["Peak"], errors="coerce")
+        live = low - peak
+    elif "Actual Live DD" in df.columns:
+        live = pd.to_numeric(df["Actual Live DD"], errors="coerce")
+    elif "%DD" in df.columns:
+        live = pd.to_numeric(df["%DD"], errors="coerce")
+    else:
+        live = pd.Series(np.nan, index=df.index)
+    df["__live_dd__"] = live.values
 
-    # Determine P&L% column.
-    pct_col = "% P&L" if "% P&L" in df.columns else ("Net P&L %" if "Net P&L %" in df.columns else None)
+    pairs = [
+        {
+            "pct": float(row["__pct__"]),
+            "ldd": None if pd.isna(row["__live_dd__"]) else float(row["__live_dd__"]),
+            "idx": i,
+        }
+        for i, (_, row) in enumerate(df.iterrows())
+    ]
+    n_trades = len(pairs)
+    if n_trades == 0:
+        return out
 
-    has_lnav = "Lowest NAV During Trade" in df.columns
-    has_cum = "Cumulative" in df.columns
+    by_pct_desc = sorted(pairs, key=lambda p: p["pct"], reverse=True)
+    total_pct_sum = sum(p["pct"] for p in pairs)
 
-    cum_idx = 100.0
-    peak = 100.0
-    live_dd_list = []
+    def _sum_top(count: int) -> float:
+        return sum(p["pct"] for p in by_pct_desc[:count])
 
-    for _, r in df.iterrows():
-        pct = float(pd.to_numeric(r.get(pct_col, 0) if pct_col else 0, errors="coerce") or 0)
+    def _sum_bottom(count: int) -> float:
+        start = max(0, n_trades - count)
+        return sum(p["pct"] for p in by_pct_desc[start:])
 
-        if has_lnav and has_cum:
-            # Derive the Final MAE ratio from the stored Lowest NAV During Trade.
-            # Lowest NAV was stored as prev_cum * (1 + final_mae/100), so
-            # final_mae/100 = lnav / prev_cum - 1, independent of absolute NAV level.
-            lnav_orig = r.get("Lowest NAV During Trade")
-            cum_orig = r.get("Cumulative")
-            if (
-                lnav_orig is not None and not pd.isna(lnav_orig)
-                and cum_orig is not None and not pd.isna(cum_orig)
-            ):
-                denom = 1.0 + pct / 100.0
-                orig_prev_cum = float(cum_orig) / denom if denom != 0 else 100.0
-                if orig_prev_cum > 0:
-                    final_mae_ratio = float(lnav_orig) / orig_prev_cum - 1.0
-                    lowest_nav = cum_idx * (1.0 + final_mae_ratio)
-                else:
-                    lowest_nav = cum_idx * (1.0 + pct / 100.0)
-            else:
-                lowest_nav = cum_idx * (1.0 + pct / 100.0)
-        else:
-            lowest_nav = cum_idx * (1.0 + pct / 100.0)
+    def _ldd_exc_stats(exc_top: int, exc_bot: int) -> Dict[str, float]:
+        exc_idx = {
+            *[p["idx"] for p in by_pct_desc[:exc_top]],
+            *[p["idx"] for p in by_pct_desc[max(0, n_trades - exc_bot):]],
+        }
+        filtered = [
+            p["ldd"]
+            for p in pairs
+            if p["idx"] not in exc_idx and p["ldd"] is not None
+        ]
+        if not filtered:
+            return {"max": 0.0, "avg": 0.0}
+        return {
+            "max": round(float(min(filtered)), 4),
+            "avg": round(float(sum(filtered) / len(filtered)), 4),
+        }
 
-        cum_idx = cum_idx * (1.0 + pct / 100.0)
-        peak = max(peak, cum_idx)
-        live_dd_list.append(lowest_nav - peak)
-
-    if not live_dd_list:
-        return {"max": 0.0, "avg": 0.0}
-    arr = np.array(live_dd_list, dtype=float)
-    return {"max": round(float(arr.min()), 4), "avg": round(float(arr.mean()), 4)}
+    for n in (1, 2, 3):
+        pos = _sum_top(n) if n_trades > 0 else 0.0
+        neg = _sum_bottom(n) if n_trades > 0 else 0.0
+        stats = _ldd_exc_stats(n, n)
+        out[f"positive_outlier_{n}"] = round(float(pos), 4)
+        out[f"negative_outlier_{n}"] = round(float(neg), 4)
+        out[f"outlier_dd_{n}"] = stats["max"]
+        out[f"outlier_dd_{n}_avg"] = stats["avg"]
+        out[f"ce_pe_pnl_pct_without_top_{n}_outliers"] = round(
+            float(total_pct_sum - pos - neg), 4
+        )
+    return out
 
 
 def outlier_stripped_live_dd(trades: pd.DataFrame) -> Dict[str, float]:
-    """Compute Live DD after dropping the top 1, 2, and 3 outliers."""
-    out: Dict[str, float] = {}
-    for n in (1, 2, 3):
-        r = _recompute_live_dd_after_dropping(trades, n)
-        out[f"outlier_dd_{n}"] = r["max"]
-        out[f"outlier_dd_{n}_avg"] = r["avg"]
-    return out
+    """Compute tradesheet-style outlier analysis fields for top 1/2/3."""
+    return _trade_outlier_analysis(trades)
 
 
 def _ce_pe_pct_no_outliers(trades: pd.DataFrame, leg_col: str) -> Dict[str, float]:

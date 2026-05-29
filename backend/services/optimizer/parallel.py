@@ -265,6 +265,10 @@ def _worker_entrypoint(
         except Exception:
             pass
 
+        _from_date = base_payload.get("from_date") or base_payload.get("date_from") or ""
+        _to_date = base_payload.get("to_date") or base_payload.get("date_to") or ""
+        _index_str = str(base_payload.get("index") or base_payload.get("symbol") or "NIFTY").upper()
+
         done = 0
         failures = 0
         for i, combo in enumerate(chunk):
@@ -302,6 +306,17 @@ def _worker_entrypoint(
                 _skip_ts = os.environ.get("OPTIMIZE_SKIP_TRADESHEETS", "0").strip().lower() in ("1", "true", "yes")
                 if not _skip_ts and not trades_df.empty:
                     result_store.write_combo_tradesheet(job_id, combo_label_safe, trades_df)
+                    result_store.write_combo_xlsx(
+                        job_id,
+                        combo_label_safe,
+                        trades_df,
+                        flat_summary,
+                        combo_label=labels["combo_label"],
+                        from_date=_from_date,
+                        to_date=_to_date,
+                        index_str=_index_str,
+                        trading_days=(_runner_mod._RUST_CONTEXT or {}).get("trading_days") or [],
+                    )
                 done += 1
                 logger.info(
                     "[OPTIM] combo %d done | %s | trades=%d pnl=%.0f obj=%.4f | %.0fms",

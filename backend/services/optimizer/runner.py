@@ -296,81 +296,57 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
             "spots": spots,
             "lot_size": lot_size,
         }
-        # Preload OHLC feather into memory once — eliminates ~12 s per-combo disk
-        # scan in _compute_mae_mfe_batch (pl.scan_ipc on HDD is the bottleneck).
+        # Preload OHLC as a compact pandas DataFrame (pyarrow, float32, category).
+        # Used by _compute_mae_mfe_batch for MAE/MFE in both sequential and
+        # parallel paths. Workers inherit it via CoW fork at zero extra memory cost.
+        # Polars ohlc_df is intentionally NOT loaded — for 2019-2026 it adds ~500 MB
+        # persistent + 2 GB transient spike from pl.read_ipc. The pandas path
+        # already exists in _compute_mae_mfe_batch and produces identical results.
         try:
-            import polars as _pl
+            import pyarrow as _pa_p
+            import pyarrow.ipc as _pa_ipc_p
+            import pyarrow.compute as _pc_p
+            import pandas as _pd_dt
             from services import rust_fast_path as _rf
             _fpath = _rf._cache_root() / f"arrow-v2:bulk:{sym_upper}:full" / "options.feather"
             if _fpath.exists():
-                _t1 = time.perf_counter()
-                _full_ohlc = _pl.read_ipc(str(_fpath))
-                # Pre-filter to strategy date range — reduces per-combo filter cost
-                # from ~15 ms (262 MB full df) to ~1 ms (date-range slice).
-                try:
-                    import pandas as _pd_dt
-                    _ohlc_from = _pd_dt.Timestamp(from_date).date()
-                    _ohlc_to = _pd_dt.Timestamp(to_date).date()
-                    ctx["rust_context"]["ohlc_df"] = _full_ohlc.filter(
-                        (_pl.col("Date") >= _ohlc_from) & (_pl.col("Date") <= _ohlc_to)
-                    )
-                    del _full_ohlc
-                except Exception as _fe:
-                    logger.warning("[OPTIM] ohlc_df date-range filter failed (%r→%r): %s", from_date, to_date, _fe)
-                    ctx["rust_context"]["ohlc_df"] = _full_ohlc
+                _t2 = time.perf_counter()
+                _ohlc_from = _pd_dt.Timestamp(from_date).date()
+                _ohlc_to = _pd_dt.Timestamp(to_date).date()
+                _needed_p = ["Symbol", "Date", "ExpiryDate", "StrikePrice",
+                             "OptionType", "High", "Low"]
+                _reader_p = _pa_ipc_p.open_file(str(_fpath))
+                _avail_p = set(_reader_p.schema.names)
+                _sel_p = [c for c in _needed_p if c in _avail_p]
+                _tbl_p = _reader_p.read_all().select(_sel_p)
+                if "OptionType" in _avail_p:
+                    _tbl_p = _tbl_p.filter(_pc_p.is_in(
+                        _tbl_p.column("OptionType"),
+                        value_set=_pa_p.array(["CE", "PE"]),
+                    ))
+                if "Date" in _avail_p:
+                    _tbl_p = _tbl_p.filter(_pc_p.and_(
+                        _pc_p.greater_equal(_tbl_p.column("Date"), _pa_p.scalar(_ohlc_from)),
+                        _pc_p.less_equal(_tbl_p.column("Date"), _pa_p.scalar(_ohlc_to)),
+                    ))
+                _ohlc_pd_p = _tbl_p.to_pandas(date_as_object=False)
+                for _col_p in ("Symbol", "OptionType"):
+                    if _col_p in _ohlc_pd_p.columns and _ohlc_pd_p[_col_p].dtype == object:
+                        _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("category")
+                for _col_p in ("High", "Low"):
+                    if _col_p in _ohlc_pd_p.columns:
+                        _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("float32")
+                if "StrikePrice" in _ohlc_pd_p.columns:
+                    _ohlc_pd_p["strike_r"] = _ohlc_pd_p["StrikePrice"].round(0).astype("int32")
+                    _ohlc_pd_p = _ohlc_pd_p.drop(columns=["StrikePrice"])
+                ctx["rust_context"]["ohlc_df_pandas"] = _ohlc_pd_p
+                _mem_mb_p = _ohlc_pd_p.memory_usage(deep=True).sum() / (1024 * 1024)
                 logger.info(
-                    "[OPTIM] preloaded OHLC feather into memory: %d rows in %.2fs",
-                    len(ctx["rust_context"]["ohlc_df"]), time.perf_counter() - _t1,
+                    "[OPTIM] preloaded OHLC pandas: %d rows, %.1f MB in %.2fs",
+                    len(_ohlc_pd_p), _mem_mb_p, time.perf_counter() - _t2,
                 )
-                # Also build a memory-tight pandas version of OHLC for parallel
-                # workers to inherit via CoW fork. Without this, each child
-                # re-reads the 706 MB feather from HDD (~108s with 2 children
-                # contending). With CoW inheritance the children pay 0s.
-                # Pandas dtypes are picked to minimize CoW-private growth:
-                # datetime64[ms], category, float32, int32 strike_r.
-                try:
-                    import pyarrow as _pa_p
-                    import pyarrow.ipc as _pa_ipc_p
-                    import pyarrow.compute as _pc_p
-                    _t2 = time.perf_counter()
-                    _needed_p = ["Symbol", "Date", "ExpiryDate", "StrikePrice",
-                                 "OptionType", "High", "Low"]
-                    _reader_p = _pa_ipc_p.open_file(str(_fpath))
-                    _avail_p = set(_reader_p.schema.names)
-                    _sel_p = [c for c in _needed_p if c in _avail_p]
-                    _tbl_p = _reader_p.read_all().select(_sel_p)
-                    if "OptionType" in _avail_p:
-                        _opt_mask_p = _pc_p.is_in(
-                            _tbl_p.column("OptionType"),
-                            value_set=_pa_p.array(["CE", "PE"]),
-                        )
-                        _tbl_p = _tbl_p.filter(_opt_mask_p)
-                    if "Date" in _avail_p:
-                        _date_mask_p = _pc_p.and_(
-                            _pc_p.greater_equal(_tbl_p.column("Date"), _pa_p.scalar(_ohlc_from)),
-                            _pc_p.less_equal(_tbl_p.column("Date"), _pa_p.scalar(_ohlc_to)),
-                        )
-                        _tbl_p = _tbl_p.filter(_date_mask_p)
-                    _ohlc_pd_p = _tbl_p.to_pandas(date_as_object=False)
-                    for _col_p in ("Symbol", "OptionType"):
-                        if _col_p in _ohlc_pd_p.columns and _ohlc_pd_p[_col_p].dtype == object:
-                            _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("category")
-                    for _col_p in ("High", "Low"):
-                        if _col_p in _ohlc_pd_p.columns:
-                            _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("float32")
-                    if "StrikePrice" in _ohlc_pd_p.columns:
-                        _ohlc_pd_p["strike_r"] = _ohlc_pd_p["StrikePrice"].round(0).astype("int32")
-                        _ohlc_pd_p = _ohlc_pd_p.drop(columns=["StrikePrice"])
-                    ctx["rust_context"]["ohlc_df_pandas"] = _ohlc_pd_p
-                    _mem_mb_p = _ohlc_pd_p.memory_usage(deep=True).sum() / (1024 * 1024)
-                    logger.info(
-                        "[OPTIM] preloaded OHLC pandas (for CoW-fork children): %d rows, %.1f MB in %.2fs",
-                        len(_ohlc_pd_p), _mem_mb_p, time.perf_counter() - _t2,
-                    )
-                except Exception as _pexc:
-                    logger.warning("[OPTIM] OHLC pandas preload skipped: %s — workers will reload", _pexc)
         except Exception as _exc:
-            logger.warning("[OPTIM] OHLC feather preload skipped: %s", _exc)
+            logger.warning("[OPTIM] OHLC pandas preload skipped: %s", _exc)
 
         logger.info(
             "[OPTIM] rust_context preloaded in %.2fs (days=%d, expiries=%d, spots=%d, source=%s)",
@@ -405,6 +381,239 @@ def _teardown_market_data() -> None:
         bulk_clear_options()
     except Exception:
         pass
+
+
+def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
+    """
+    Enrich combo CSVs with MAE/MFE (OHLC already in _RUST_CONTEXT), build full
+    XLSX tradesheets (Trade Sheet + Summary), and pack everything into a ZIP at
+    the standard cache path.
+
+    Called right before mark_complete while market data is still hot so the
+    first download is instant — no lazy build needed.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    import zipfile as _zf
+    import pandas as _pd
+    from services.optimizer.excel_builder import build_combo_xlsx as _build_xlsx
+
+    zip_dir = os.environ.get("OPTIMIZE_ZIP_DIR", "/data/cache/optim_zips")
+    zip_path = os.path.join(zip_dir, f"{job_id}.v2.zip")
+    if os.path.isfile(zip_path):
+        return
+
+    trades_dir = result_store.get_trades_dir(job_id)
+    if not os.path.isdir(trades_dir):
+        return
+
+    ctx = _RUST_CONTEXT
+    trading_days: List[str] = (ctx or {}).get("trading_days") or []
+    index_str = str(
+        base_payload.get("index") or base_payload.get("symbol") or "NIFTY"
+    ).upper()
+    from_date = base_payload.get("from_date") or base_payload.get("date_from") or ""
+    to_date   = base_payload.get("to_date")   or base_payload.get("date_to")   or ""
+
+    files = sorted(os.listdir(trades_dir))
+    csv_files = [f for f in files if f.endswith(".csv")]
+    root_files = {"summary.csv", "run_config.csv"}
+    combo_files = [f for f in csv_files if f not in root_files]
+
+    if not combo_files:
+        return
+
+    # ── Step 0: Compute corrected metrics (same formulas as XLSX Summary Sheet) ─
+    # Enrich each CSV with MAE/MFE in-memory, then derive every stat via the same
+    # path as excel_builder._write_summary_sheet, and push corrections to Redis +
+    # rewrite summary.csv so the master summary matches each combo XLSX exactly.
+    try:
+        from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _compute_metrics
+        _all_results = result_store.get_all_results(job_id)
+        _result_by_label = {
+            r.get("combo_label_safe", ""): r
+            for r in _all_results if r.get("combo_label_safe")
+        }
+        _corrected: dict = {}
+        for _fname in combo_files:
+            _label_safe = _fname[:-4]
+            _csv_path = os.path.join(trades_dir, _fname)
+            _stored_summary = (_result_by_label.get(_label_safe) or {}).get("summary") or {}
+            try:
+                _df = _pd.read_csv(_csv_path, dtype=str)
+                if _df.empty:
+                    continue
+                # Enrich with MAE/MFE if the CSV still has zeros (fast-exec path)
+                if "MAE" in _df.columns and trading_days:
+                    _mae_s = _pd.to_numeric(_df["MAE"], errors="coerce").fillna(0.0)
+                    _mfe_s = _pd.to_numeric(_df["MFE"], errors="coerce").fillna(0.0)
+                    if (_mae_s.abs().sum() + _mfe_s.abs().sum()) <= 0.0001:
+                        for _col in ("Entry Date", "Exit Date"):
+                            if _col in _df.columns:
+                                _df[_col] = _pd.to_datetime(_df[_col], format="%d-%m-%Y", errors="coerce")
+                        for _col in ("Strike", "Entry Price", "Entry Spot", "Exit Price", "Exit Spot",
+                                     "Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                            if _col in _df.columns:
+                                _df[_col] = _pd.to_numeric(_df[_col], errors="coerce")
+                        _df = _compute_mae_mfe_batch(_df, index_str, trading_days)
+                        if "Trade" in _df.columns:
+                            _pr = _df.drop_duplicates(subset=["Trade"], keep="first")
+                            _agg = _pr[["Trade"]].copy()
+                            for _col in ("Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                                if _col in _pr.columns:
+                                    _agg[_col] = _pr[_col].values
+                            _df = _compute_live_dd_from_mae(_df, _agg)
+                        for _col in ("Entry Date", "Exit Date"):
+                            if _col in _df.columns and hasattr(_df[_col], "dt"):
+                                _df[_col] = _df[_col].dt.strftime("%d-%m-%Y")
+                _corrected[_label_safe] = _compute_metrics(_df, _stored_summary)
+            except Exception as _ce:
+                logger.warning("[OPTIM] Metric correction skipped for %s: %s", _label_safe, _ce)
+
+        if _corrected:
+            result_store.update_result_summaries(job_id, _corrected)
+            result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
+            logger.info("[OPTIM] Corrected summary metrics for %d combos in job %s",
+                        len(_corrected), job_id[:8])
+    except Exception as _step0_exc:
+        logger.warning("[OPTIM] Step 0 metric correction failed for job %s: %s", job_id[:8], _step0_exc)
+
+    # ── Fast path: per-combo XLSX files already written during execution ──────
+    xlsx_files_disk = sorted(f for f in files if f.endswith(".xlsx"))
+    combo_labels_set = {f[:-4] for f in combo_files}
+    xlsx_labels_set = {f[:-5] for f in xlsx_files_disk}
+    if combo_labels_set and combo_labels_set.issubset(xlsx_labels_set):
+        # All combos already have an XLSX on disk (built inline with MAE/MFE
+        # from the in-memory trades_df). Skip Steps 1+2 entirely.
+        os.makedirs(zip_dir, exist_ok=True)
+        tmp_path = zip_path + ".building"
+        try:
+            with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED, compresslevel=3) as zf:
+                for fname in csv_files:
+                    if fname in root_files:
+                        zf.write(os.path.join(trades_dir, fname), fname)
+                for xlsx_fname in xlsx_files_disk:
+                    label_safe = xlsx_fname[:-5]
+                    if label_safe in combo_labels_set:
+                        zf.write(
+                            os.path.join(trades_dir, xlsx_fname),
+                            f"tradesheets/{xlsx_fname}",
+                        )
+                for fname in combo_files:
+                    label_safe = fname[:-4]
+                    if label_safe not in xlsx_labels_set:
+                        fpath = os.path.join(trades_dir, fname)
+                        if os.path.isfile(fpath):
+                            zf.write(fpath, f"tradesheets/{fname}")
+            os.replace(tmp_path, zip_path)
+            logger.info(
+                "[OPTIM] Pre-built ZIP for job %s (fast-path, per-combo XLSX): %d xlsx",
+                job_id[:8], len(xlsx_files_disk),
+            )
+        except Exception as _e:
+            logger.warning("[OPTIM] ZIP fast-path failed for job %s: %s", job_id[:8], _e)
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return
+
+    # ── Step 1: Enrich each combo CSV with MAE/MFE while OHLC is in _RUST_CONTEXT.
+    for fname in combo_files:
+        csv_path = os.path.join(trades_dir, fname)
+        try:
+            df = _pd.read_csv(csv_path, dtype=str)
+            if df.empty or "MAE" not in df.columns:
+                continue
+            mae_s = _pd.to_numeric(df["MAE"], errors="coerce").fillna(0.0)
+            mfe_s = _pd.to_numeric(df["MFE"], errors="coerce").fillna(0.0)
+            if (mae_s.abs().sum() + mfe_s.abs().sum()) > 0.0001:
+                continue  # already enriched
+            for col in ("Entry Date", "Exit Date"):
+                if col in df.columns:
+                    df[col] = _pd.to_datetime(df[col], format="%d-%m-%Y", errors="coerce")
+            for col in ("Strike", "Entry Price", "Entry Spot", "Exit Price", "Exit Spot",
+                        "Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                if col in df.columns:
+                    df[col] = _pd.to_numeric(df[col], errors="coerce")
+            df = _compute_mae_mfe_batch(df, index_str, trading_days)
+            if "Trade" in df.columns:
+                parent_rows = df.drop_duplicates(subset=["Trade"], keep="first")
+                aggregated = parent_rows[["Trade"]].copy()
+                for col in ("Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                    if col in parent_rows.columns:
+                        aggregated[col] = parent_rows[col].values
+                df = _compute_live_dd_from_mae(df, aggregated)
+            for col in ("Entry Date", "Exit Date"):
+                if col in df.columns and hasattr(df[col], "dt"):
+                    df[col] = df[col].dt.strftime("%d-%m-%Y")
+            df.to_csv(csv_path, index=False)
+        except Exception as _e:
+            logger.warning("[OPTIM] MAE/MFE pre-enrich skipped for %s: %s", fname, _e)
+
+    # ── Step 2: Build full XLSX for every combo using enriched CSVs.
+    all_results = result_store.get_all_results(job_id)
+    summary_by_label = {
+        r.get("combo_label_safe", ""): r for r in all_results if r.get("combo_label_safe")
+    }
+
+    def _make_xlsx(fname: str):
+        label_safe = fname[:-4]
+        csv_path = os.path.join(trades_dir, fname)
+        row = summary_by_label.get(label_safe, {})
+        try:
+            df = _pd.read_csv(csv_path, dtype=str)
+            xlsx_bytes = _build_xlsx(
+                df,
+                row.get("summary") or {},
+                combo_label=row.get("combo_label") or label_safe,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            return label_safe, xlsx_bytes, None
+        except Exception as _e:
+            return label_safe, None, str(_e)
+
+    n_workers = min(4, max(1, (os.cpu_count() or 2) - 1))
+    xlsx_results: dict = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as _ex:
+        futs = {_ex.submit(_make_xlsx, f): f for f in combo_files}
+        for fut in _as_completed(futs):
+            ls, xlsx_bytes, err = fut.result()
+            if xlsx_bytes is not None:
+                xlsx_results[ls] = xlsx_bytes
+            else:
+                logger.warning("[OPTIM] XLSX build failed for %s: %s", ls, err)
+
+    # ── Step 3: Pack into ZIP (XLSX primary, CSV fallback for any that failed).
+    os.makedirs(zip_dir, exist_ok=True)
+    tmp_path = zip_path + ".building"
+    try:
+        with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED, compresslevel=3) as zf:
+            for fname in csv_files:
+                if fname in root_files:
+                    zf.write(os.path.join(trades_dir, fname), fname)
+            for label_safe, xlsx_bytes in xlsx_results.items():
+                zf.writestr(f"tradesheets/{label_safe}.xlsx", xlsx_bytes)
+            for fname in combo_files:
+                label_safe = fname[:-4]
+                if label_safe not in xlsx_results:
+                    fpath = os.path.join(trades_dir, fname)
+                    if os.path.isfile(fpath):
+                        zf.write(fpath, f"tradesheets/{fname}")
+        os.replace(tmp_path, zip_path)
+        n_fallback = len(combo_files) - len(xlsx_results)
+        logger.info(
+            "[OPTIM] Pre-built ZIP for job %s: %d xlsx, %d csv fallback",
+            job_id[:8], len(xlsx_results), n_fallback,
+        )
+    except Exception as _e:
+        logger.warning("[OPTIM] ZIP pre-build failed for job %s: %s", job_id[:8], _e)
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _warm_feather_page_cache(feather_root: str) -> None:
@@ -564,9 +773,17 @@ def _compute_mae_mfe_batch(
             continue
         try:
             import pandas as _pd
-            entry_str = _pd.Timestamp(entry_dt).strftime("%Y-%m-%d")
-            exit_str = _pd.Timestamp(exit_dt).strftime("%Y-%m-%d")
-            expiry_str = _pd.Timestamp(expiry_raw).strftime("%Y-%m-%d")
+
+            def _to_iso(v) -> str:
+                # DD-MM-YYYY strings (Python engine output) are misread by
+                # pd.Timestamp as MM-DD-YYYY.  Detect by position of dashes.
+                if isinstance(v, str) and len(v) == 10 and v[2] == "-" and v[5] == "-":
+                    return _pd.to_datetime(v, format="%d-%m-%Y").strftime("%Y-%m-%d")
+                return _pd.Timestamp(v).strftime("%Y-%m-%d")
+
+            entry_str = _to_iso(entry_dt)
+            exit_str = _to_iso(exit_dt)
+            expiry_str = _to_iso(expiry_raw)
         except Exception:
             rows_data.append(None)
             continue
@@ -668,23 +885,6 @@ def _compute_mae_mfe_batch(
                 & (pl.col("Date") <= to_dt)
             )
             _sel = ["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"]
-
-            # Use the preloaded in-memory DataFrame when available (avoids HDD scan).
-            if _ctx is not None and "ohlc_df" not in _ctx:
-                try:
-                    _days_sorted = sorted(_ctx.get("trading_days") or [])
-                    if _days_sorted:
-                        import pandas as _pd_lz
-                        _lz_from = _pd_lz.Timestamp(_days_sorted[0]).date()
-                        _lz_to = _pd_lz.Timestamp(_days_sorted[-1]).date()
-                        _ctx["ohlc_df"] = pl.read_ipc(str(feather)).filter(
-                            (pl.col("Date") >= _lz_from) & (pl.col("Date") <= _lz_to)
-                        )
-                    else:
-                        _ctx["ohlc_df"] = pl.read_ipc(str(feather))
-                    logger.info("[OPTIM] lazily loaded OHLC feather: %d rows", len(_ctx["ohlc_df"]))
-                except Exception as _le:
-                    logger.warning("[OPTIM] lazy feather load failed: %s", _le)
 
             if _ctx and "ohlc_df" in _ctx:
                 date_filtered = _ctx["ohlc_df"].filter(date_filter).select(_sel)
@@ -964,7 +1164,7 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             peak = max(cumulative, peak)
             cum.append(cumulative); pk.append(peak)
             dd.append(cumulative - peak)
-            pdd.append((cumulative - peak) / peak if peak != 0 else 0.0)
+            pdd.append(((cumulative - peak) / peak * 100) if peak != 0 else 0.0)
         aggregated["Cumulative"] = cum
         aggregated["Peak"] = pk
         aggregated["DD"] = dd
@@ -1254,6 +1454,7 @@ def run_optimization(
             )
             spill_path = result_store.maybe_spill_to_parquet(job_id)
             result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
+            _prebuild_csv_zip(job_id, base_payload)
             result_store.update_progress(job_id, done=agg["done"], total=total)
             result_store.mark_complete(job_id)
             logger.info(
@@ -1303,6 +1504,10 @@ def run_optimization(
         seed=seed,
     )
 
+    _seq_from_date = base_payload.get("from_date") or base_payload.get("date_from") or ""
+    _seq_to_date = base_payload.get("to_date") or base_payload.get("date_to") or ""
+    _seq_index_str = str(base_payload.get("index") or base_payload.get("symbol") or "NIFTY").upper()
+
     done = 0
     failures = 0
     try:
@@ -1341,10 +1546,21 @@ def run_optimization(
 
             result_store.append_result(job_id, row)
 
-            # Persist tradesheet CSV for later ZIP download (one per combo)
+            # Persist tradesheet CSV + XLSX for later ZIP download (one per combo)
             if not trades_df.empty:
                 result_store.write_combo_tradesheet(
                     job_id, row["combo_label_safe"], trades_df
+                )
+                result_store.write_combo_xlsx(
+                    job_id,
+                    row["combo_label_safe"],
+                    trades_df,
+                    flat_summary,
+                    combo_label=labels["combo_label"],
+                    from_date=_seq_from_date,
+                    to_date=_seq_to_date,
+                    index_str=_seq_index_str,
+                    trading_days=(_RUST_CONTEXT or {}).get("trading_days") or [],
                 )
 
             if tell is not None:
@@ -1362,6 +1578,7 @@ def run_optimization(
 
         # Write master summary CSV for ZIP download
         result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
+        _prebuild_csv_zip(job_id, base_payload)
 
         result_store.update_progress(job_id, done=done)
         result_store.mark_complete(job_id)

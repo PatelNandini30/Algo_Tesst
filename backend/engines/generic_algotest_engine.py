@@ -1777,7 +1777,8 @@ def _reentry_mode_trigger_date(
 
     position = str(leg_config.get('position', 'SELL') or 'SELL').upper()
     reason_base = str(trigger_reason or '').split('[')[0].strip().upper()
-    is_sl = reason_base in {'STOP_LOSS', 'TRAIL_SL', 'COMPLETE_STOP_LOSS'}
+    is_sl = reason_base in {'STOP_LOSS', 'TRAIL_SL', 'COMPLETE_STOP_LOSS',
+                            'STOP_LOSS_BUFFER', 'STOP_LOSS_BUFFER_GAP'}
     is_tgt = reason_base in {'TARGET', 'COMPLETE_TARGET'}
     if not is_sl and not is_tgt:
         return None
@@ -1874,7 +1875,8 @@ def _execute_per_leg_reentry(
     def _base_reason(reason_str):
         return str(reason_str or '').split('[')[0].strip().upper()
 
-    sl_reasons = {'STOP_LOSS', 'TRAIL_SL', 'COMPLETE_STOP_LOSS'}
+    sl_reasons = {'STOP_LOSS', 'TRAIL_SL', 'COMPLETE_STOP_LOSS',
+                  'STOP_LOSS_BUFFER', 'STOP_LOSS_BUFFER_GAP'}
     tgt_reasons = {'TARGET', 'COMPLETE_TARGET'}
 
     first_reason = _base_reason(original_exit_reason)
@@ -4187,8 +4189,10 @@ def run_algotest_backtest(params):
         # is on. Tracks the previous trade's actual exit so the next trade starts
         # from there instead of the stale pre-computed entry.  Existing code paths
         # are untouched when rollover_toggle is off or no spot adj fires.
-        _prev_actual_exit      = None
-        _prev_expiry           = None  # DTE mode: expiry of trade that triggered spot adj
+        _prev_actual_exit           = None
+        _prev_expiry                = None  # DTE mode: expiry of trade that triggered spot adj
+        _seg_spot_adj_base          = None  # fixed-strike: segment entry spot for adj baseline
+        _seg_fixed_strike_disabled  = False  # True after first spot adj in segment → stop reuse/save
         _seg_expiries          = seg_scope.get('expiries_sorted', [])
         _seg_expiry_recmap     = seg_scope.get('expiry_rec_map', {})
         _seg_original_count    = len(seg_scope['entries'])  # count before any synthetic appends
@@ -4369,10 +4373,29 @@ def run_algotest_backtest(params):
 
                 _log(f"  Entry Spot: {entry_spot}")
 
+                # Save the full-period exit before spot adj may shorten it.
+                # Used by restrike injection to know how far the continuation runs.
+                _original_scheduled_exit = exit_date
+                _has_fixed_strike_legs = spot_adjustment_enabled and any(
+                    str(lc.get('rollover_strike_mode') or 'fresh').lower() == 'fixed'
+                    for lc in legs_config
+                    if str(lc.get('segment', 'OPTIONS')).upper() not in ('FUTURES', 'FUTURE')
+                )
+
                 if spot_adjustment_enabled:
+                    # Fixed-strike legs use the segment's first-entry spot as the
+                    # adj baseline so rollovers don't reset the reference level.
+                    # Only a fired trigger resets it (updated below after fire).
+                    if _has_fixed_strike_legs and _seg_spot_adj_base is None:
+                        _seg_spot_adj_base = entry_spot
+                    _spot_for_adj = (
+                        _seg_spot_adj_base
+                        if _has_fixed_strike_legs and _seg_spot_adj_base is not None
+                        else entry_spot
+                    )
                     adjusted_date, was_adjusted, triggered_direction = apply_spot_adjustment_exit(
                         entry_date=entry_date,
-                        entry_spot=entry_spot,
+                        entry_spot=_spot_for_adj,
                         scheduled_exit_date=exit_date,
                         expiry_date=expiry_date,
                         spot_adjustment_direction=spot_adjustment_direction,
@@ -4400,6 +4423,15 @@ def run_algotest_backtest(params):
                         exit_date = adjusted_ts
                         base_exit_reason = 'SPOT_ADJ_RISE' if triggered_direction == 'RISE' else 'SPOT_ADJ_FALL'
                         _log(f"  Spot adjustment triggered on {adjusted_ts.strftime('%Y-%m-%d')} ({triggered_direction})")
+                        # Reset segment baseline to trigger-day spot so the next
+                        # rollover/restrike measures rise from the new reference.
+                        # Also disable fixed-strike reuse/save for the rest of this
+                        # segment — all subsequent rollovers must resolve fresh ATM.
+                        if _has_fixed_strike_legs:
+                            _seg_fixed_strike_disabled = True
+                            _triggered_spot = get_spot_price_from_db(adjusted_ts.strftime('%Y-%m-%d'), index)
+                            if _triggered_spot is not None:
+                                _seg_spot_adj_base = _triggered_spot
                         # DTE mode: record for residual-window re-entry on next slot.
                         if rollover_toggle and not _seg_expiries:
                             _prev_actual_exit = pd.Timestamp(exit_date)
@@ -4756,7 +4788,7 @@ def run_algotest_backtest(params):
                         }
                         _fs_key = (_seg_label, leg_idx)
                         _rollover_strike_mode = str(leg_config.get('rollover_strike_mode') or 'fresh').lower()
-                        if _rollover_strike_mode == 'fixed' and entry_idx > 1 and _fs_key in _seg_fixed_strikes:
+                        if _rollover_strike_mode == 'fixed' and entry_idx > 1 and _fs_key in _seg_fixed_strikes and not trade_entry.get('_is_restrike'):
                             strike = _seg_fixed_strikes[_fs_key]
                             buffer_offset = 0
                             buffer_ref_price = None
@@ -4770,7 +4802,7 @@ def run_algotest_backtest(params):
                                 strike_interval=strike_interval,
                                 index=index,
                             )
-                            if _rollover_strike_mode == 'fixed' and entry_idx == 1 and strike is not None:
+                            if _rollover_strike_mode == 'fixed' and strike is not None and not _seg_fixed_strike_disabled:
                                 _seg_fixed_strikes[_fs_key] = strike
                                 _log(f"      [FIXED_STRIKE] leg {leg_idx+1}: saved strike={strike} for future rollovers")
 
@@ -5234,13 +5266,50 @@ def run_algotest_backtest(params):
                 trade_record['trade_id'] = f"{trade_id_counter}"
                 all_trades.append(trade_record)
 
+                # SPOT_ADJ RESTRIKE: fixed-strike legs exit on spot adj trigger and
+                # immediately re-enter at a fresh strike from the new spot level.
+                # Injects a synthetic continuation so the remaining window is covered.
+                _was_spot_adj = base_exit_reason in ('SPOT_ADJ_RISE', 'SPOT_ADJ_FALL')
+                if _was_spot_adj and _has_fixed_strike_legs:
+                    # Always clear fixed strikes when spot adj fires — ensures the next
+                    # rollover cycle resolves a fresh strike even when no intra-period
+                    # restrike is possible (e.g. trigger and expiry on the same day).
+                    for _li in range(len(legs_config)):
+                        _seg_fixed_strikes.pop((_seg_label, _li), None)
+                if (
+                    _was_spot_adj
+                    and _has_fixed_strike_legs
+                    and actual_exit_date < pd.Timestamp(_original_scheduled_exit)
+                    and actual_exit_date < pd.Timestamp(expiry_date)
+                ):
+                    _restrike_next_spot = get_spot_price_from_db(actual_exit_date, index)
+                    if _restrike_next_spot is not None:
+                        seg_scope['entries'].append({
+                            'segment':            segment,
+                            'entry_date':         actual_exit_date,
+                            'exit_date':          pd.Timestamp(_original_scheduled_exit),
+                            'expiry_date':        expiry_date,
+                            'current_expiry':     trade_entry.get('current_expiry', expiry_date),
+                            'next_expiry':        trade_entry.get('next_expiry', expiry_date),
+                            '_force_next_expiry': _force_next_expiry,
+                            '_rollover_mode':     _trade_rollover_mode,
+                            'clamped_exit':       False,
+                            '_is_restrike':       True,
+                            '_is_synthetic':      True,
+                        })
+                        _log(
+                            f"  [RESTRIKE] {base_exit_reason}: injecting re-entry "
+                            f"entry_date={actual_exit_date.strftime('%Y-%m-%d')} "
+                            f"exit={pd.Timestamp(_original_scheduled_exit).strftime('%Y-%m-%d')}"
+                        )
+
                 # Segment-end continuation: when the last pre-computed slot (any
                 # T-N exit mode, any expiry type) or a synthetic follow-on exits
                 # before seg_end, inject a synthetic slot to cover the remainder.
                 # Trigger: entry_idx >= _seg_original_count means we are on the
                 # last original slot or beyond (synthetic). Works for T-0, T-1,
                 # T-2 … T-N regardless of whether the slot is clamped or not.
-                if rollover_toggle and not no_rollover and _seg_expiries and entry_idx >= _seg_original_count:
+                if rollover_toggle and not no_rollover and _seg_expiries and entry_idx >= _seg_original_count and not trade_entry.get('_is_restrike', False):
                     _seg_end_ts = pd.Timestamp(segment['end'])
                     _last_in_seg = _last_trading_day_on_or_before(trading_calendar, _seg_end_ts)
                     if (_last_in_seg is not None
@@ -5294,6 +5363,40 @@ def run_algotest_backtest(params):
                             continue
 
                         reentry_cfg = tleg.get('_reentry') or {}
+
+                        # Re-entry Rollover same-day chain (2026-05-27):
+                        # When rollover_toggle is on AND the user did NOT explicitly
+                        # enable Re-entry on SL / Re-entry on Target, synthesize a
+                        # RE_ASAP config so SL/SL_WITH_BUFFER/TARGET exits chain a
+                        # same-day, same-expiry replacement trade — matching how
+                        # natural EXPIRY exits already chain via the rollover
+                        # scheduler. Capped at 10 to avoid runaway loops.
+                        _sl_exit_set = (
+                            'STOP_LOSS', 'TRAIL_SL', 'COMPLETE_STOP_LOSS',
+                            'STOP_LOSS_BUFFER', 'STOP_LOSS_BUFFER_GAP',
+                        )
+                        _tgt_exit_set = ('TARGET', 'COMPLETE_TARGET')
+                        if _trade_rollover_mode and leg_exit_base in (_sl_exit_set + _tgt_exit_set):
+                            _synth_changed = False
+                            if leg_exit_base in _sl_exit_set and not reentry_cfg.get('re_entry_on_sl'):
+                                reentry_cfg = {
+                                    **reentry_cfg,
+                                    're_entry_on_sl': True,
+                                    're_entry_on_sl_count': 10,
+                                    're_entry_on_sl_mode': 'RE_ASAP',
+                                }
+                                _synth_changed = True
+                            elif leg_exit_base in _tgt_exit_set and not reentry_cfg.get('re_entry_on_target'):
+                                reentry_cfg = {
+                                    **reentry_cfg,
+                                    're_entry_on_target': True,
+                                    're_entry_on_target_count': 10,
+                                    're_entry_on_target_mode': 'RE_ASAP',
+                                }
+                                _synth_changed = True
+                            if _synth_changed:
+                                tleg = {**tleg, '_reentry': reentry_cfg}
+
                         if not reentry_cfg.get('re_entry_on_sl') and not reentry_cfg.get('re_entry_on_target'):
                             continue
                         if (
@@ -5323,9 +5426,12 @@ def run_algotest_backtest(params):
                         if not re_legs:
                             continue
 
-                        tleg['re_entries'] = re_legs
-                        tleg['re_entry_pnl'] = sum(float(r.get('pnl', 0) or 0) for r in re_legs)
-                        _reentry_points += tleg['re_entry_pnl']
+                        # Write back to trade_legs[li], not the local tleg which may be
+                        # a new dict created by the synthesis path (_synth_changed=True).
+                        _re_pnl_sum = sum(float(r.get('pnl', 0) or 0) for r in re_legs)
+                        trade_legs[li]['re_entries'] = re_legs
+                        trade_legs[li]['re_entry_pnl'] = _re_pnl_sum
+                        _reentry_points += _re_pnl_sum
                         _reentry_count += len(re_legs)
                         _reentry_applied = True
 

@@ -998,12 +998,9 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     end_date   = pd.to_datetime(_adf[exit_date_col].max(), dayfirst=True)
     n_years    = max((end_date - start_date).days / 365.0, 0.01)
 
-    initial_capital = float(initial_entry_spot) if pd.notna(initial_entry_spot) else 0.0
-    final_capital = initial_capital + total_pnl
-    if initial_capital > 0 and final_capital > 0:
-        cagr_raw = 100.0 * ((final_capital / initial_capital) ** (1.0 / n_years) - 1)
-        # Cap at ±99999% — prevents astronomical blow-up when n_years is tiny
-        # (e.g. date-parse error collapses range to 0.01 years → 2^100 overflow).
+    final_nav = cumulative_series[-1] if cumulative_series else 0.0
+    if final_nav > 0 and n_years > 0:
+        cagr_raw = 100.0 * ((final_nav / 100.0) ** (1.0 / n_years) - 1)
         cagr = round(max(-99999.0, min(99999.0, cagr_raw)), 2)
     else:
         cagr = round(-100.0, 2)
@@ -1032,7 +1029,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         mdd_start_date = peak_date.strftime('%Y-%m-%d')
         mdd_end_date   = trough_date.strftime('%Y-%m-%d')
 
-    car_mdd = round(min(99999.0, cagr / abs(max_dd_pct)), 2) if max_dd_pct != 0 else 0
+    car_mdd = round(min(99999.0, (cagr / 100.0) / abs(max_dd_pct)), 4) if max_dd_pct != 0 else 0
     recovery_factor = round(min(99999.0, total_pnl / abs(max_dd_pts)), 2) if max_dd_pts != 0 else 0
 
     if 'Spot P&L' in df.columns:
@@ -1083,6 +1080,8 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     summary = {
         "total_pnl":             total_pnl,
+        "total_pnl_pct":         round(float(net_pnl_pct_series.fillna(0).sum()), 4),
+        "avg_profit_per_trade_pct": round(float(net_pnl_pct_series.fillna(0).mean()), 4) if count > 0 else 0.0,
         "count":                 count,
         "win_pct":               win_pct,
         "loss_pct":              loss_pct,

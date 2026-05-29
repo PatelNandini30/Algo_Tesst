@@ -299,6 +299,36 @@ def maybe_spill_to_parquet(job_id: str) -> Optional[str]:
         return None
 
 
+def update_result_summaries(
+    job_id: str,
+    corrected_by_label: Dict[str, Any],
+) -> None:
+    """Merge corrected metrics into stored result rows, keyed by combo_label_safe."""
+    r = _redis()
+    if r is None or not corrected_by_label:
+        return
+    try:
+        raw_list = r.lrange(_results_key(job_id), 0, -1)
+        if not raw_list:
+            return
+        updated = []
+        for raw in raw_list:
+            row = json.loads(raw)
+            label = row.get("combo_label_safe", "")
+            if label in corrected_by_label:
+                row["summary"] = {**(row.get("summary") or {}), **corrected_by_label[label]}
+            updated.append(json.dumps(row, default=str))
+        pipe = r.pipeline()
+        pipe.delete(_results_key(job_id))
+        for item in updated:
+            pipe.rpush(_results_key(job_id), item)
+        pipe.expire(_results_key(job_id), OPTIM_TTL)
+        pipe.execute()
+        logger.info("[OPTIM_STORE] Updated summaries for %d combos in job %s", len(corrected_by_label), job_id[:8])
+    except Exception as e:
+        logger.warning("[OPTIM_STORE] update_result_summaries failed: %s", e)
+
+
 def delete_job(job_id: str) -> None:
     r = _redis()
     if r is None:
@@ -332,6 +362,68 @@ def write_combo_tradesheet(
         trades_df.to_csv(path, index=False)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] tradesheet write failed (%s): %s", combo_label_safe, exc)
+
+
+def write_combo_xlsx(
+    job_id: str,
+    combo_label_safe: str,
+    trades_df: Any,
+    summary: Dict[str, Any],
+    combo_label: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    index_str: str = "",
+    trading_days: Optional[List] = None,
+) -> None:
+    """Write a single combo's XLSX tradesheet to disk (called per-combo during execution).
+
+    Always enriches MAE/MFE before building the XLSX regardless of
+    OPTIMIZE_SKIP_MAE_MFE — that flag only controls the ranking metrics,
+    not the download tradesheet.
+    """
+    if trades_df is None:
+        return
+    try:
+        if hasattr(trades_df, "empty") and trades_df.empty:
+            return
+
+        # Enrich MAE/MFE for the download tradesheet.  The optimizer skips this
+        # during combo execution (OPTIMIZE_SKIP_MAE_MFE=1) for speed, so we do
+        # it here using the feather that's already on disk.
+        if index_str and trading_days:
+            try:
+                from services.optimizer.runner import (
+                    _compute_mae_mfe_batch,
+                    _compute_live_dd_from_mae,
+                )
+                import pandas as _pd
+                enriched = _compute_mae_mfe_batch(trades_df, index_str, trading_days)
+                if "Trade" in enriched.columns:
+                    _pr = enriched.drop_duplicates(subset=["Trade"], keep="first")
+                    _agg = _pr[["Trade"]].copy()
+                    for _c in ("Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                        if _c in _pr.columns:
+                            _agg[_c] = _pr[_c].values
+                    enriched = _compute_live_dd_from_mae(enriched, _agg)
+                trades_df = enriched
+            except Exception as _mae_exc:
+                logger.debug("[OPTIM_STORE] MAE/MFE enrich skipped (%s): %s", combo_label_safe, _mae_exc)
+
+        from services.optimizer.excel_builder import build_combo_xlsx
+        xlsx_bytes = build_combo_xlsx(
+            trades_df,
+            summary,
+            combo_label=combo_label,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        dirpath = get_trades_dir(job_id)
+        os.makedirs(dirpath, exist_ok=True)
+        path = os.path.join(dirpath, f"{combo_label_safe}.xlsx")
+        with open(path, "wb") as fh:
+            fh.write(xlsx_bytes)
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] xlsx write failed (%s): %s", combo_label_safe, exc)
 
 
 def write_summary_csv(job_id: str, rows: List[Dict[str, Any]]) -> None:

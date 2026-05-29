@@ -42,7 +42,7 @@ class TestPerLegPnL(unittest.TestCase):
 
 class TestROIVsSpot(unittest.TestCase):
     def test_basic_ratio(self):
-        self.assertAlmostEqual(roi_vs_spot({"total_pnl": 50, "spot_change": 100}), 0.5)
+        self.assertAlmostEqual(roi_vs_spot({"total_pnl": 50, "spot_change": 100}), 50.0)
 
     def test_zero_spot_change(self):
         self.assertEqual(roi_vs_spot({"total_pnl": 50, "spot_change": 0}), 0.0)
@@ -63,29 +63,32 @@ class TestLiveDD(unittest.TestCase):
         self.assertEqual(out["actual_live_dd_avg"], -2.0)
 
     def test_car_mdd_live(self):
-        # cagr / |dd| → positive ratio when both have the conventional signs
-        self.assertAlmostEqual(car_mdd_live({"cagr_options": 12}, -4.0), 3.0)
+        # (cagr/100) / |dd| — dd is in NAV points (e.g. -4.0 = 4 points)
+        self.assertAlmostEqual(car_mdd_live({"cagr_options": 12}, -4.0), 0.03)
         self.assertEqual(car_mdd_live({"cagr_options": 12}, 0.0), 0.0)
 
 
 class TestOutlierStripped(unittest.TestCase):
     def test_drop_top_n_changes_dd(self):
-        # Three positive trades followed by a big losing trade
         df = _trades(
             [
-                {"Net P&L %": 1.0},
-                {"Net P&L %": 1.0},
-                {"Net P&L %": 1.0},
-                {"Net P&L %": -5.0},
-                {"Net P&L %": 0.5},
+                {"Trade": 1, "Entry Date": "01-01-2024", "Net P&L %": 1.0, "Lowest NAV During Trade": 99, "Peak": 100},
+                {"Trade": 2, "Entry Date": "02-01-2024", "Net P&L %": 3.0, "Lowest NAV During Trade": 98, "Peak": 101},
+                {"Trade": 3, "Entry Date": "03-01-2024", "Net P&L %": -2.0, "Lowest NAV During Trade": 96, "Peak": 101},
+                {"Trade": 4, "Entry Date": "04-01-2024", "Net P&L %": 4.0, "Lowest NAV During Trade": 97, "Peak": 102},
+                {"Trade": 5, "Entry Date": "05-01-2024", "Net P&L %": -5.0, "Lowest NAV During Trade": 94, "Peak": 102},
             ]
         )
-        # Without dropping, DD includes the -5% trade.
-        # Drop top-1 outlier (|-5| is largest) → curve stays positive
         out = outlier_stripped_live_dd(df)
-        self.assertIn("outlier_dd_1", out)
-        self.assertIn("outlier_dd_2", out)
-        self.assertIn("outlier_dd_3", out)
+        self.assertEqual(out["positive_outlier_1"], 4.0)
+        self.assertEqual(out["negative_outlier_1"], -5.0)
+        self.assertEqual(out["ce_pe_pnl_pct_without_top_1_outliers"], 2.0)
+        # Remove top +4 and bottom -5, leaving live DDs -1, -3, -5.
+        self.assertEqual(out["outlier_dd_1"], -5.0)
+        self.assertEqual(out["outlier_dd_1_avg"], -3.0)
+        self.assertEqual(out["positive_outlier_2"], 7.0)
+        self.assertEqual(out["negative_outlier_2"], -7.0)
+        self.assertEqual(out["ce_pe_pnl_pct_without_top_2_outliers"], 1.0)
 
 
 class TestLegPctNoOutliers(unittest.TestCase):
@@ -130,9 +133,12 @@ class TestComputeBundle(unittest.TestCase):
             "actual_live_dd_max",
             "actual_live_dd_avg",
             "car_mdd_live",
+            "positive_outlier_1",
+            "negative_outlier_1",
             "outlier_dd_1",
             "outlier_dd_2",
             "outlier_dd_3",
+            "ce_pe_pnl_pct_without_top_1_outliers",
             "ce_pnl_pct_no_outlier_1",
             "pe_pnl_pct_no_outlier_1",
             "cagr_midcap",

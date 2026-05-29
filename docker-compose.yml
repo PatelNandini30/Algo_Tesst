@@ -16,22 +16,18 @@
 #   frontend         :  200M
 #   intraday-api     :  512M
 #   ─────────────────────────────
-#   worker-optimize  : 6144M  (profile-gated; raised from 4096M on 2026-05-25
-#                              because the feather grew to 706 MB → Rust cache
-#                              needs ~3.5 GB; old 4 GB limit pushed swap)
+#   worker-optimize  : 7000M  (profile-gated; updated 2026-05-28: f32 AHashMap
+#                              reduces Rust cache 3.5→2.6 GB; Polars ohlc_df
+#                              dropped (saves 0.5 GB+2 GB spike); P=4 workers
+#                              add 4×400 MB CoW-private = ~4.8 GB total)
 #   ─────────────────────────────
-#   Total hard limit : 11,462M (default stack; +6144M when optimize profile active)
+#   Total hard limit : 11,462M (default stack; +7000M when optimize profile active)
 #   OS + kernel      : ~1,500M
-#   Headroom/cache   : ~1,400M  ← tightened on optimize-active runs (HDD swap risk
-#                                 if optimize + worker-backtests run at full RSS)
+#   Headroom/cache   : ~3,000M  ← comfortable margin; no OOM risk with Chrome open
 #   ─────────────────────────────
-#   Grand total      : ~17,600M with optimize active — overcommits 16 GB host by
-#                       ~1.6 GB. Acceptable because (a) only one optimize job at
-#                       a time in practice (concurrency=3 but solo-user setup),
-#                       (b) worker-backtests typically idle during optimize runs,
-#                       (c) Rust cache mmap pages are reclaimable under pressure.
-#                       If both workers run hot together, expect HDD swap; pause
-#                       backtests during long optims.
+#   Grand total      : ~15,962M with optimize active — fits within 16 GB host.
+#                       Chrome + GNOME (~3 GB) + optimizer (~4.8 GB) + other
+#                       containers (~8 GB) = ~15.8 GB. Safe to use PC normally.
 #
 # HDD-specific Postgres tuning:
 #   - random_page_cost=4.0   (HDD random I/O is 4x more expensive than seq)
@@ -58,7 +54,7 @@ x-backend-env: &backend-env
   # 2026-05-25 because the FUTURES port grew the feather from ~575 MB → 706 MB;
   # 706×5=3530 MB exceeds the old 3000 MB cap, causing the Rust cache to be
   # skipped → Python/Polars fallback → 7 GB host swap and stuck optimize jobs.
-  # Pair with worker-optimize mem_limit raised to 6144M (see budget header).
+  # Pair with worker-optimize mem_limit (see budget header). f32 cache ~2.6 GB.
   RUST_CACHE_MAX_MEMORY_MB: "4000"
   # NIFTY bulk loads are narrow (date/expiry/type/strike/close), so avoid
   # splitting normal 6-7 year backtests into repeated DB+engine passes.
@@ -322,14 +318,16 @@ services:
     # Shares the same image as worker-backtests; runs an exclusive 'optimize' queue
     # so long parameter sweeps don't block normal backtests.
     #
-    # concurrency=3: 3 simultaneous optimize jobs (one per user).
-    # Memory math per job with P=2 (fork start method, CoW AHashMap sharing):
-    #   - Coordinator: ~700MB (Rust cache 1680MB loaded then kept for CoW fork)
-    #   - 2 fork workers: inherit AHashMap via CoW (shared pages, ~0 extra RAM)
-    #     + Python working memory ~300MB each = ~600MB total
-    #   - Per-job total: ~1300MB
-    #   - 3 concurrent jobs: 3 × 1300MB = 3.9GB  →  within 4096M
-    #   NOTE: old forkserver path rebuilt 1680MB AHashMap per child → OOM.
+    # concurrency=1: ONE optimize job at a time.
+    # In-job parallelism via OPTIMIZE_PARALLELISM=4 (billiard fork + CoW sharing).
+    # Memory budget after f32 AHashMap + no Polars ohlc_df (2026-05-28):
+    #   - Rust AHashMap (f32): ~2.6 GB (down from 3.5 GB with f64)
+    #   - pandas ohlc_df_pandas: ~75 MB (CoW-inherited by workers)
+    #   - Python/Celery overhead: ~500 MB
+    #   - 4 workers × ~400 MB private pages: ~1.6 GB
+    #   - Total: ~4.8 GB → fits within 7000M with headroom
+    # Host impact: 4.8 GB optimizer + ~3 GB Chrome/GNOME + ~1 GB OS = ~9 GB
+    # (leaves 7 GB headroom on 16 GB machine — no OOM risk).
     profiles: ["optimize"]
     image: algotest-backend-app:latest
     container_name: algotest-worker-optimize
@@ -337,7 +335,7 @@ services:
     command: >
       celery -A worker.celery worker
       --queues=optimize
-      --concurrency=3
+      --concurrency=1
       -l info
       --max-memory-per-child=5000000
       --without-gossip
@@ -345,23 +343,23 @@ services:
       --without-heartbeat
     environment:
       <<: *backend-env
+      # PYTHONOPTIMIZE=1 (override): the base image sets =2 (strips docstrings)
+      # which breaks the `cma` library that nevergrad lazy-imports for
+      # CMA-ES / PSO / GA optimization methods. =1 still strips asserts (same
+      # behavior as today) but keeps docstrings so cma's module-level
+      # `plot.__doc__.split(...)` doesn't crash. Smart-sampler optims would
+      # crash with `'NoneType' object has no attribute 'split'` otherwise.
+      PYTHONOPTIMIZE: "1"
       BACKTEST_WORKERS: "1"
       OPTIMIZE_MAX_COMBOS: "100000"
-      # P=2: 2 billiard fork workers per job. Children inherit the parent's
-      # Rust AHashMap via CoW (1680MB shared, not duplicated). Safe with
-      # concurrency=3 — total RSS stays within 4096M.
-      # FAST_LOOKUP_RANGE_FILTER=0: always use full feather (575MB on disk)
-      # instead of a range-specific feather that may not exist → avoids 2-3 min
-      # DB fallback. Full feather loads in ~6s cold / <1s warm from page cache.
-      OPTIMIZE_PARALLELISM: "2"
-      # SKIP_MAE_MFE=1 on 2026-05-25: with the feather expanded to 706 MB and
-      # date ranges up to 7 years, per-combo MAE/MFE computation hits 30s+ on
-      # the 3.89M-row pandas DataFrame (Python-bound strftime). Combos are now
-      # ~200ms each via Rust, total ~30s for 252 combos. MAE/MFE is computed
-      # on-demand when the user downloads a single combo tradesheet (cached
-      # to disk after first compute) — see routers/optimize.py
-      # download_combo_tradesheet.
-      OPTIMIZE_SKIP_MAE_MFE: "1"
+      # P=4: 4 billiard fork workers share the Rust AHashMap via CoW.
+      # Each worker adds ~400 MB private pages. Safe after f32 memory fix.
+      OPTIMIZE_PARALLELISM: "4"
+      # Keep MAE/MFE enabled so optimizer master-summary "Actual Live DD"
+      # matches the downloaded tradesheet Summary sheet. If disabled, optimizer
+      # summary falls back to booked DD/%DD while tradesheet downloads are
+      # enriched later, causing the two summaries to disagree.
+      OPTIMIZE_SKIP_MAE_MFE: "0"
       OPTIMIZE_SKIP_TRADESHEETS: "0"
       FAST_LOOKUP_RANGE_FILTER: "0"
       # Fork-safe threading for the optimizer worker.
@@ -392,19 +390,11 @@ services:
     deploy:
       resources:
         limits:
-          # 6144M (raised from 4096M on 2026-05-25): the 706 MB feather expands
-          # to ~3.5 GB Rust AHashMap; Polars OHLC preload adds ~700 MB in the
-          # parent (CoW-inherited); pyarrow MAE/MFE preload adds ~250 MB per
-          # forked child (private, not shared). Per-job budget:
-          #   3.5 GB Rust cache + 0.7 GB Polars OHLC + 2×0.25 GB pandas OHLC
-          #   + 0.5 GB Python/Celery overhead = ~5.2 GB → 6 GB w/ headroom.
-          # Feather mmap is shared (OS page cache) so memory does NOT multiply
-          # with each additional concurrent job — but the AHashMap and pyarrow
-          # DataFrame are per-process and DO duplicate. Keep concurrency=1 in
-          # practice (set OPTIMIZE_PARALLELISM, not Celery concurrency) when
-          # running multiple sweeps.
-          memory: 6144M
-          cpus: "8.0"
+          # 7000M: f32 AHashMap (~2.6 GB) + pandas OHLC (75 MB CoW) +
+          # Python/Celery (500 MB) + 4 workers × 400 MB private = ~4.8 GB.
+          # 7000M gives ~2.2 GB headroom for spikes. Updated 2026-05-28.
+          memory: 7000M
+          cpus: "6.0"
         reservations:
           memory: 256M
     networks:

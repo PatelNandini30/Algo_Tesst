@@ -1665,8 +1665,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const _winRateJS    = _totalCntJS > 0 ? (_winCntJS  / _totalCntJS) * 100 : 0;
     const _lossRateJS   = _totalCntJS > 0 ? (_lossCntJS / _totalCntJS) * 100 : 0;
     const _avgNetJS     = _totalCntJS > 0 ? (_sumNetJS  / _totalCntJS) : 0;
-    // Use backend-computed expectancy (research-verified, same as sidebar display)
-    const _expectancyJS = typeof summary?.expectancy === 'number' ? summary.expectancy : 0;
+    const _expectancyJS = _avgLossPctJS !== 0
+      ? ((_winRateJS / 100) * _avgWinPctJS / Math.abs(_avgLossPctJS) - (1 - _winRateJS / 100))
+      : 0;
     const _yearsJS = (_minEntryMs != null && _maxExitMs != null)
       ? (_maxExitMs - _minEntryMs) / (365.25 * 86400000)
       : 0;
@@ -1701,6 +1702,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     // Store the raw float so Excel formulas referencing it get full precision;
     // numFmt '0.00' renders the cell to 2 decimals for display.
     const _expRow_rp = row++;
+    const _avgPctJS = _totalCntJS > 0 ? (_sumPctJS / _totalCntJS) : 0;
+    kv('Net P/L Avg %', `${_avgPctJS>=0?'+':''}${_avgPctJS.toFixed(4)}%`, row++, 'A', false,
+       _avgPctJS>=0?C.greenTx:C.redTx);
     kv('Expectancy Ratio', _expectancyJS, _expRow_rp, 'D', true,
        _expectancyJS>=0?C.greenTx:C.redTx);
     ws2.getCell(`E${_expRow_rp}`).numFmt = '0.00';
@@ -1767,10 +1771,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         ws2.getRow(row).height = 18;
       };
 
-      // Determine numerator for ROI: CE+PE if both, else single side, else FUT, else Net
-      const _optionsSumJS = (hasCalls && hasPuts) ? (_ceSumJS + _peSumJS)
-        : (hasPuts ? _peSumJS : (hasCalls ? _ceSumJS : (hasFutures ? _futSumJS : _sumNetJS)));
-      const _roiPctJS = _spotSumGatedJS !== 0 ? (_optionsSumJS / _spotSumGatedJS) * 100 : 0;
+      // ROI vs Spot = Net P&L % / |Spot %|
+      const _netPctForRoi = (typeof summary?.total_pnl_pct === 'number' && Number.isFinite(summary.total_pnl_pct))
+        ? summary.total_pnl_pct : _sumPctJS;
+      const _spotPctForRoi = (typeof summary?.spot_change_pct === 'number' && Number.isFinite(summary.spot_change_pct))
+        ? summary.spot_change_pct : 0;
+      const _roiPctJS = Math.abs(_spotPctForRoi) > 0 ? _netPctForRoi / Math.abs(_spotPctForRoi) : 0;
 
       // ROI value in D-E of the first data row (Spot P&L row)
       const _spotRow = row;

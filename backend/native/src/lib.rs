@@ -28,16 +28,17 @@ use pyo3::wrap_pyfunction;
 // For 4.3M rows: ~172MB vs ~650MB — eliminates memory-pressure swapping on HDD boxes.
 struct MarketCache {
     // (date_days, symbol_id, strike_i64, opttype_id, expiry_days) → close
-    options: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    // f32 values: Indian options priced to ₹0.05; f32 gives 7 sig-digits — no precision loss.
+    options: AHashMap<(i32, u16, i64, u8, i32), f32>,
     // Same key → day HIGH price. Used by SL-with-Buffer slice 4b.
-    options_high: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    options_high: AHashMap<(i32, u16, i64, u8, i32), f32>,
     // Same key → day LOW price. Used by SL-with-Buffer slice 4b.
-    options_low: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    options_low: AHashMap<(i32, u16, i64, u8, i32), f32>,
     // Same key → day OPEN price. Used by SL-with-Buffer gap detection.
-    options_open: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    options_open: AHashMap<(i32, u16, i64, u8, i32), f32>,
     // Same key → day SETTLED price. Used as MAE/MFE high/low fallback when
     // High and Low are both 0 (no intraday trades but settlement published).
-    options_settled: AHashMap<(i32, u16, i64, u8, i32), f64>,
+    options_settled: AHashMap<(i32, u16, i64, u8, i32), f32>,
     // (date_days, symbol_id) → spot_close
     spot: AHashMap<(i32, u16), f64>,
     // (date_days, symbol_id, expiry_days, opttype_id) → sorted [(strike, close)]
@@ -296,7 +297,7 @@ pub(crate) fn lookup_option_status(date: &str, index: &str, strike: f64, opt_typ
         return OptionDataStatus::ZeroContracts;
     }
     if let Some(px) = cache.options.get(&key).copied() {
-        return OptionDataStatus::Tradeable(px);
+        return OptionDataStatus::Tradeable(px as f64);
     }
     // Moved-expiry fallback — mirrors lookup_option_price. NSE sometimes lists
     // a contract under the original (pre-holiday) expiry label (e.g. 29-Jun-2023)
@@ -310,7 +311,7 @@ pub(crate) fn lookup_option_status(date: &str, index: &str, strike: f64, opt_typ
                 return OptionDataStatus::ZeroContracts;
             }
             if let Some(px) = cache.options.get(&alt_key).copied() {
-                return OptionDataStatus::Tradeable(px);
+                return OptionDataStatus::Tradeable(px as f64);
             }
         }
     }
@@ -336,7 +337,7 @@ pub(crate) fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type
     let type_id = opt_type_to_id(opt_type);
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
     if let Some(px) = cache.options.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied() {
-        return Some(px);
+        return Some(px as f64);
     }
     // Moved-expiry fallback.  NSE sometimes lists a contract under one expiry
     // label (e.g. Thu 29-Jun-2023 — the original weekly) but settles it on an
@@ -352,7 +353,7 @@ pub(crate) fn lookup_option_price(date: &str, index: &str, strike: f64, opt_type
         for offset in 1i32..=3 {
             let alt_expiry = expiry_days + offset;
             if let Some(px) = cache.options.get(&(date_days, sym_id, strike_key, type_id, alt_expiry)).copied() {
-                return Some(px);
+                return Some(px as f64);
             }
         }
     }
@@ -375,7 +376,7 @@ pub(crate) fn lookup_option_high(
     let strike_key = to_i64_strike(strike);
     let type_id = opt_type_to_id(opt_type);
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
-    cache.options_high.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+    cache.options_high.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied().map(|v| v as f64)
 }
 
 /// Day LOW for one option contract on one date. None if absent.
@@ -393,7 +394,7 @@ pub(crate) fn lookup_option_low(
     let strike_key = to_i64_strike(strike);
     let type_id = opt_type_to_id(opt_type);
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
-    cache.options_low.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+    cache.options_low.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied().map(|v| v as f64)
 }
 
 /// Day OPEN for one option contract on one date. None if absent. Used by
@@ -412,7 +413,7 @@ pub(crate) fn lookup_option_open(
     let strike_key = to_i64_strike(strike);
     let type_id = opt_type_to_id(opt_type);
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
-    cache.options_open.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied()
+    cache.options_open.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied().map(|v| v as f64)
 }
 
 /// Return the full strike chain for one (date, index, expiry, opt_type) as
@@ -601,27 +602,27 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
             let strike_key = to_i64_strike(strike_v);
             let key = (date_days, sym_id, strike_key, type_id, expiry_days);
 
-            cache.options.insert(key, close_v);
+            cache.options.insert(key, close_v as f32);
             if let Some(h) = high_arr {
                 if !h.is_null(row) {
-                    cache.options_high.insert(key, h.value(row));
+                    cache.options_high.insert(key, h.value(row) as f32);
                 }
             }
             if let Some(l) = low_arr {
                 if !l.is_null(row) {
-                    cache.options_low.insert(key, l.value(row));
+                    cache.options_low.insert(key, l.value(row) as f32);
                 }
             }
             if let Some(o) = open_arr {
                 if !o.is_null(row) {
-                    cache.options_open.insert(key, o.value(row));
+                    cache.options_open.insert(key, o.value(row) as f32);
                 }
             }
             if let Some(s) = settled_arr {
                 if !s.is_null(row) {
                     let sv = s.value(row);
                     if sv > 0.0 {
-                        cache.options_settled.insert(key, sv);
+                        cache.options_settled.insert(key, sv as f32);
                     }
                 }
             }
@@ -817,9 +818,9 @@ fn get_ohlc_range(
     let mut min_low: Option<f64> = None;
     for d in from_days..=to_days {
         let key = (d, sym_id, strike_key, type_id, expiry_days);
-        let h_raw = cache.options_high.get(&key).copied();
-        let l_raw = cache.options_low.get(&key).copied();
-        let settled = cache.options_settled.get(&key).copied().filter(|&v| v > 0.0);
+        let h_raw = cache.options_high.get(&key).copied().map(|v| v as f64);
+        let l_raw = cache.options_low.get(&key).copied().map(|v| v as f64);
+        let settled = cache.options_settled.get(&key).copied().map(|v| v as f64).filter(|&v| v > 0.0);
         // Per-VALUE SettledPrice substitution:
         //   - high > 0  → use high as-is (pre-existing behavior, untouched)
         //   - high == 0 → substitute settled_price for high (if available)

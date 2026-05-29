@@ -210,7 +210,7 @@ def _build_leg_dict_for_overall(spec: Dict[str, Any], expiry_date: str) -> Dict[
     }
 
 
-_SL_REASONS = {"STOP_LOSS", "TRAIL_SL", "COMPLETE_STOP_LOSS"}
+_SL_REASONS = {"STOP_LOSS", "TRAIL_SL", "COMPLETE_STOP_LOSS", "STOP_LOSS_BUFFER", "STOP_LOSS_BUFFER_GAP", "SL_WITH_BUFFER"}
 _TGT_REASONS = {"TARGET", "COMPLETE_TARGET"}
 
 
@@ -1123,6 +1123,8 @@ def _build_fixed_entry_specs(
             if not entry_spot:
                 break
 
+            _trade_specs: List[Dict[str, Any]] = []
+            _trade_resolved = True
             for leg_idx, leg in enumerate(legs_src):
                 if not isinstance(leg, dict):
                     return None
@@ -1141,8 +1143,15 @@ def _build_fixed_entry_specs(
                     out_info=_shift_info,
                 )
                 if strike is None:
-                    return None  # Strike not resolvable — caller falls back to Python
-                all_specs.append({
+                    # Strike unresolvable on this date — e.g. the requested strike
+                    # is a stale/zero-turnover contract with no inward strike to
+                    # shift to (NSE didn't trade it that day), or it was never
+                    # listed. Skip ONLY this trade and keep building the chain,
+                    # rather than aborting the whole backtest to Python. Mirrors the
+                    # Python engine, which drops an unpriceable trade and continues.
+                    _trade_resolved = False
+                    break
+                _trade_specs.append({
                     "trade_id": trade_id,
                     "leg_id": leg_idx + 1,
                     "index": index_str,
@@ -1159,7 +1168,13 @@ def _build_fixed_entry_specs(
                     "slippage_pct": slippage,
                 })
 
-            trade_id += 1
+            # Emit the trade only if every leg resolved; otherwise drop just this
+            # trade. Either way advance the same-day chain so the rest of the
+            # schedule keeps the same entry/exit dates (the schedule is built
+            # independent of strike resolution, exactly like the Python engine).
+            if _trade_resolved:
+                all_specs.extend(_trade_specs)
+                trade_id += 1
 
             if clamped or no_rollover_flag or not rollover_toggle:
                 break
@@ -2234,6 +2249,12 @@ def run_rust_engine_pipeline(
     # Reuse first rollover cycle's (already-buffered) strike for subsequent cycles.
     # Must run AFTER buffer-strike and segment gating, BEFORE simulate_trades_batch.
     # Mirrors generic_algotest_engine.py:4601-4618.
+    # Save natural (post-buffer, pre-fixed-strike) strikes so we can restore them
+    # for rollover trades that follow a spot-adj trigger in the same segment.
+    _natural_spec_strikes: Dict[Tuple[int, int], float] = {
+        (int(s.get("trade_id", 0)), int(s.get("leg_id", 1))): float(s.get("strike") or 0)
+        for s in specs
+    }
     if any(
         isinstance(leg, dict) and str(leg.get("rollover_strike_mode") or "fresh").lower() == "fixed"
         for leg in (payload.get("legs") or [])
@@ -2277,6 +2298,8 @@ def run_rust_engine_pipeline(
     if not any_risk and not has_overall_top and not has_spot_adj:
         # No risk controls → priced output is the final answer.
         return list(priced)
+
+    # Re-entry Rollover same-day chain: handled in Slice 6 via synthesis below.
 
     # Slice 4b: SL-with-Buffer pre-pass. Walk each priced spec and let Rust
     # detect a gap-triggered SL-with-Buffer exit. If triggered, the override
@@ -2323,6 +2346,58 @@ def run_rust_engine_pipeline(
     if spot_adj_enabled and spot_adj_pct > 0 and spot_adj_units == "percent":
         spot_adj_pct = max(0.25, min(5.0, spot_adj_pct))
 
+    # Fixed-strike legs: compute per-trade spot adj baseline using the segment's
+    # first-entry spot so rollovers don't reset the reference level.
+    # Mirrors the Python engine _seg_spot_adj_base logic.
+    _has_fixed_strike_opt_legs_sa = any(
+        isinstance(leg, dict)
+        and str(leg.get("rollover_strike_mode") or "fresh").lower() == "fixed"
+        for leg in legs_src
+        if str(leg.get("segment", "OPTIONS")).upper() not in ("FUTURES", "FUTURE")
+    )
+    _trade_adj_baseline: Dict[int, float] = {}
+    if spot_adj_enabled and spot_adj_pct > 0 and _has_fixed_strike_opt_legs_sa:
+        _eff_segs_sa: List[Tuple[str, str]]
+        if original_segments is not None:
+            _eff_segs_sa = original_segments
+        else:
+            _from_sa = str(payload.get("from_date") or payload.get("date_from") or "")
+            _to_sa = str(payload.get("to_date") or payload.get("date_to") or "")
+            _eff_segs_sa = [(_from_sa, _to_sa)] if _from_sa and _to_sa else []
+        _tid_entry_iso_sa: Dict[int, str] = {
+            tid: _normalize_iso(legs[0]["entry_date"])
+            for tid, legs in by_trade.items()
+            if legs
+        }
+        for _seg_s_sa, _seg_e_sa in _eff_segs_sa:
+            _seg_tids_sa = sorted(
+                [t for t, e in _tid_entry_iso_sa.items() if e and _seg_s_sa <= e <= _seg_e_sa],
+                key=lambda t: _tid_entry_iso_sa[t],
+            )
+            _seg_base_sa: Optional[float] = None
+            for _tid_sa in _seg_tids_sa:
+                _tid_iso_sa = _tid_entry_iso_sa[_tid_sa]
+                _tid_own_sa = float(
+                    by_trade[_tid_sa][0].get("entry_spot")
+                    or spot_by_date.get(_tid_iso_sa)
+                    or 0.0
+                )
+                if _seg_base_sa is None or _seg_base_sa <= 0:
+                    _seg_base_sa = _tid_own_sa
+                _trade_adj_baseline[_tid_sa] = _seg_base_sa
+                # If adj fires with this baseline, next trade measures from trigger spot
+                _sched_sa = _normalize_iso(by_trade[_tid_sa][0].get("exit_date", ""))
+                if _sched_sa and _seg_base_sa > 0:
+                    _trig_sa = _compute_spot_adjustment_trigger(
+                        _tid_iso_sa, _seg_base_sa, _sched_sa,
+                        spot_adj_direction, spot_adj_pct, spot_adj_units,
+                        trading_days, spot_by_date,
+                    )
+                    if _trig_sa:
+                        _new_base_sa = spot_by_date.get(_trig_sa)
+                        if _new_base_sa and _new_base_sa > 0:
+                            _seg_base_sa = _new_base_sa
+
     spot_adj_overrides: Dict[int, str] = {}
     spot_adj_reasons: Dict[int, str] = {}
     if spot_adj_enabled and spot_adj_pct > 0:
@@ -2330,7 +2405,11 @@ def run_rust_engine_pipeline(
             legs.sort(key=lambda r: r["leg_id"])
             first = legs[0]
             entry_iso = _normalize_iso(first["entry_date"])
-            entry_spot = float(first.get("entry_spot") or spot_by_date.get(entry_iso) or 0.0)
+            entry_spot = (
+                _trade_adj_baseline[trade_id]
+                if trade_id in _trade_adj_baseline
+                else float(first.get("entry_spot") or spot_by_date.get(entry_iso) or 0.0)
+            )
             scheduled_exit = _normalize_iso(first["exit_date"])
             if entry_spot <= 0 or not scheduled_exit:
                 continue
@@ -2509,6 +2588,11 @@ def run_rust_engine_pipeline(
     reentry_specs: List[Dict[str, Any]] = []
     reentry_reason_map: Dict[Tuple[int, int, str], str] = {}  # (trade_id, leg_id, entry_date) → reason
     reentry_meta_map: Dict[Tuple[int, int, str], Tuple[int, str, str]] = {}  # → (index, trigger, mode)
+    # Each re-entry gets a unique trade_id so it appears as a separate trade row
+    # (with its own Cumulative/Peak/DD) rather than a sub-row of the parent.
+    # Mirrors the bridge-trade pattern (_bt_bridge_by_new_tid).
+    _reentry_new_tid = max(by_trade.keys()) + 1 if by_trade else 1
+    _reentry_by_new_tid: Dict[int, int] = {}  # new_tid → parent_tid (for overlap filter)
     index_str = str(payload.get("index") or "NIFTY").upper()
     for trade_id, legs in by_trade.items():
         legs.sort(key=lambda r: r["leg_id"])
@@ -2518,6 +2602,22 @@ def run_rust_engine_pipeline(
             leg_src = legs_src[leg["leg_id"] - 1] if 0 <= leg["leg_id"] - 1 < len(legs_src) else {}
             sl_cfg = leg_src.get("reEntryOnSL") if isinstance(leg_src.get("reEntryOnSL"), dict) else None
             tgt_cfg = leg_src.get("reEntryOnTarget") if isinstance(leg_src.get("reEntryOnTarget"), dict) else None
+            # Rollover same-day chain synthesis (mirrors generic_algotest_engine.py:5367-5398).
+            # When rollover_toggle is on and a leg has risk but no explicit re-entry config,
+            # synthesize RE_ASAP count=10 based on what actually fired — same as Python engine.
+            if not sl_cfg and not tgt_cfg and bool(payload.get("rollover_toggle")) and _has_risk(leg_src):
+                _leg_result = leg_results[i] if i < len(leg_results) else {}
+                _trig = str(_leg_result.get("exit_reason") or "").split("[")[0].strip().upper()
+                _slb_synth_key = (int(leg["trade_id"]), int(leg["leg_id"]))
+                # slWithBuffer-only legs: check_leg_stop_loss_target returns EXPIRY (it
+                # doesn't know about SLB). If SLB pre-pass fired, override the reason.
+                if _trig not in _SL_REASONS and _trig not in _TGT_REASONS:
+                    if slb_overrides.get(_slb_synth_key):
+                        _trig = "SL_WITH_BUFFER"
+                if _trig in _SL_REASONS:
+                    sl_cfg = {"mode": "RE_ASAP", "count": 10}
+                elif _trig in _TGT_REASONS:
+                    tgt_cfg = {"mode": "RE_ASAP", "count": 10}
             if not sl_cfg and not tgt_cfg:
                 continue
             # RE_ASAP, RE_ASAP_REV, LAZY_LEG, RE_MOMENTUM supported. Anything else → fall back.
@@ -2530,12 +2630,31 @@ def run_rust_engine_pipeline(
             if not _supports_reentry_strike(leg_src):
                 return None
             result = leg_results[i] if i < len(leg_results) else {}
-            if not result.get("triggered"):
-                continue
+            _slb_key = (int(leg["trade_id"]), int(leg["leg_id"]))
+            _slb_override = slb_overrides.get(_slb_key)
+
+            # Determine trigger date and reason. Priority (matches adjusted_specs
+            # construction ~line 3173): SLB fires before regular SL → use SLB.
+            _per_leg_exit = _normalize_iso(result.get("exit_date")) if result.get("triggered") else None
+            _per_leg_reason = (result.get("exit_reason") or "").upper() if result.get("triggered") else ""
+
+            if _slb_override is not None:
+                _slb_date = _slb_override[0]
+                # Use SLB when: no regular SL fired, or SLB fires before regular SL.
+                if _per_leg_exit is None or _slb_date < _per_leg_exit or _per_leg_reason not in _SL_REASONS:
+                    trig_date = _slb_date
+                    _init_reason = "SL_WITH_BUFFER"
+                else:
+                    trig_date = _per_leg_exit
+                    _init_reason = _per_leg_reason
+            elif _per_leg_exit and _per_leg_reason in _SL_REASONS | _TGT_REASONS:
+                trig_date = _per_leg_exit
+                _init_reason = _per_leg_reason
+            else:
+                continue  # No SL/Target/SLB triggered — nothing to chain.
+
             # If overall SL fires BEFORE the per-leg trigger, the leg is already
-            # closed by overall — no re-entry. Python mirrors this implicitly via
-            # _apply_overall_sl_to_per_leg.
-            trig_date = _normalize_iso(result.get("exit_date"))
+            # closed by overall — no re-entry.
             if not trig_date:
                 continue
             if overall_date is not None and overall_date <= trig_date:
@@ -2551,7 +2670,7 @@ def run_rust_engine_pipeline(
             sl_used = 0
             tgt_used = 0
             current_trig = trig_date
-            current_reason = (result.get("exit_reason") or "").upper()
+            current_reason = _init_reason
             strike_interval = float(
                 leg_src.get("strike_interval")
                 or _STRIKE_INTERVALS.get(index_str, 50.0)
@@ -2666,10 +2785,12 @@ def run_rust_engine_pipeline(
                         out_info=_shift_info,
                     )
                     if lazy_strike is None:
-                        return None  # Strike unresolvable — Python fallback
+                        break  # Strike unresolvable — skip this lazy leg re-entry
+                    _lazy_new_tid = _reentry_new_tid; _reentry_new_tid += 1
+                    _reentry_by_new_tid[_lazy_new_tid] = int(leg["trade_id"])
                     lazy_spec = {
-                        "trade_id": leg["trade_id"],
-                        "leg_id": 9000 + sl_used + tgt_used,
+                        "trade_id": _lazy_new_tid,
+                        "leg_id": 1,
                         "index": index_str,
                         "entry_date": current_trig,
                         "exit_date": cycle_exit,
@@ -2721,8 +2842,8 @@ def run_rust_engine_pipeline(
                     lazy_spec["exit_date"] = lazy_exit
                     lazy_spec["_entry_date_key"] = str(current_trig)
                     reentry_specs.append(lazy_spec)
-                    reentry_reason_map[(int(leg["trade_id"]), int(lazy_spec["leg_id"]), str(current_trig))] = lazy_reason or "EXPIRY"
-                    reentry_meta_map[(int(leg["trade_id"]), int(lazy_spec["leg_id"]), str(current_trig))] = (
+                    reentry_reason_map[(_lazy_new_tid, 1, str(current_trig))] = lazy_reason or "EXPIRY"
+                    reentry_meta_map[(_lazy_new_tid, 1, str(current_trig))] = (
                         sl_used + tgt_used,
                         "SL" if current_reason in _SL_REASONS else "TARGET",
                         re_mode,
@@ -2741,12 +2862,16 @@ def run_rust_engine_pipeline(
                     out_info=_shift_info,
                 )
                 if new_strike is None:
-                    return None  # Strike not resolvable — fall back to Python
+                    break  # Strike not resolvable — skip this re-entry chain
 
                 # Build a single-leg spec for the re-entry and price its entry.
+                # New unique trade_id so this appears as a separate trade row
+                # with its own Cumulative/Peak/DD, not a sub-row of the parent.
+                _re_new_tid = _reentry_new_tid; _reentry_new_tid += 1
+                _reentry_by_new_tid[_re_new_tid] = int(leg["trade_id"])
                 re_spec = {
-                    "trade_id": leg["trade_id"],
-                    "leg_id": leg["leg_id"],
+                    "trade_id": _re_new_tid,
+                    "leg_id": 1,
                     "index": leg["index"],
                     "entry_date": current_trig,
                     "exit_date": cycle_exit,
@@ -2802,8 +2927,8 @@ def run_rust_engine_pipeline(
                 re_spec["exit_date"] = re_exit
                 re_spec["_entry_date_key"] = str(current_trig)
                 reentry_specs.append(re_spec)
-                reentry_reason_map[(int(leg["trade_id"]), int(leg["leg_id"]), str(current_trig))] = re_reason or "EXPIRY"
-                reentry_meta_map[(int(leg["trade_id"]), int(leg["leg_id"]), str(current_trig))] = (
+                reentry_reason_map[(_re_new_tid, 1, str(current_trig))] = re_reason or "EXPIRY"
+                reentry_meta_map[(_re_new_tid, 1, str(current_trig))] = (
                     sl_used + tgt_used,
                     "SL" if current_reason in _SL_REASONS else "TARGET",
                     re_mode,
@@ -2829,11 +2954,22 @@ def run_rust_engine_pipeline(
     _rollover_toggle = bool(payload.get("rollover_toggle", False))
     _bt_bridge_specs: List[Dict[str, Any]] = []
     _bt_bridge_by_new_tid: Dict[int, int] = {}  # new_tid → parent_tid (for overlap filter)
-    # Bridges only apply in filter_entry_mode='fixed': Python's re-anchor logic
-    # (_prev_actual_exit) only runs when _seg_expiries is populated, which only
-    # happens in fixed mode. In DTE mode, spot adj truncates the current trade
-    # and the next trade starts at its originally scheduled entry — no bridge.
-    if spot_adj_enabled and _rollover_toggle and spot_adj_overrides and filter_entry_mode == "fixed":
+    # Bridges apply in two cases:
+    #   1. rollover + filter_entry_mode='fixed': original bridge behaviour (fills the
+    #      gap so the cycle window stays fully covered after a spot-adj exit).
+    #   2. Any leg has rollover_strike_mode='fixed': restrike — exit at trigger price,
+    #      re-enter immediately with a fresh strike from the new spot level, continue
+    #      to the original scheduled exit. Works for no-rollover and DTE-rollover too.
+    #      Mirrors the Python change in generic_algotest_engine.py (SPOT_ADJ RESTRIKE).
+    _has_fixed_strike_opt_legs = any(
+        isinstance(leg, dict)
+        and str(leg.get("rollover_strike_mode") or "fresh").lower() == "fixed"
+        for leg in legs_src
+        if str(leg.get("segment", "OPTIONS")).upper() not in ("FUTURES", "FUTURE")
+    )
+    if spot_adj_enabled and spot_adj_overrides and (
+        (_rollover_toggle and filter_entry_mode == "fixed") or _has_fixed_strike_opt_legs
+    ):
         _bt_new_tid = max(list(by_trade.keys()) + [0]) + 1
         for _bt_id, _bt_trigger in list(spot_adj_overrides.items()):
             _bt_legs = sorted(by_trade.get(_bt_id, []), key=lambda r: r["leg_id"])
@@ -2997,6 +3133,48 @@ def run_rust_engine_pipeline(
                     _bt_cur_entry = _bt_casc_trig  # Loop for next cascade bridge
                 else:
                     break  # Bridge chain complete
+
+    # Fixed-strike restrike propagation: when spot adj fires for a fixed-strike leg,
+    # subsequent rollover trades in the same segment must resolve fresh ATM strikes
+    # rather than reusing the pre-adj fixed one. Mirrors the Python engine's
+    # _seg_fixed_strike_disabled flag / _seg_fixed_strikes clearing logic.
+    # Updating by_trade here (before adjusted_specs assembly) means the final
+    # simulate_trades_batch picks up the corrected strikes automatically.
+    # Works for both filter/STR mode (original_segments set) and plain DTE mode
+    # (original_segments None — treat full date range as one segment).
+    if _has_fixed_strike_opt_legs and spot_adj_overrides:
+        _reprice_segs: Optional[List[Tuple[str, str]]]
+        if original_segments is not None:
+            _reprice_segs = original_segments
+        else:
+            _rp_from = str(payload.get("from_date") or payload.get("date_from") or "")
+            _rp_to = str(payload.get("to_date") or payload.get("date_to") or "")
+            _reprice_segs = [(_rp_from, _rp_to)] if _rp_from and _rp_to else None
+        if _reprice_segs:
+            _orig_tid_entry_map: Dict[int, str] = {
+                _tid: _normalize_iso(_tlegs[0]["entry_date"])
+                for _tid, _tlegs in by_trade.items()
+                if _tlegs
+            }
+            _reprice_tids: Set[int] = set()
+            for _seg_s, _seg_e in _reprice_segs:
+                _seg_sorted = sorted(
+                    [t for t, e in _orig_tid_entry_map.items() if _seg_s <= e <= _seg_e],
+                    key=lambda t: _orig_tid_entry_map[t],
+                )
+                _found_adj = False
+                for _tid in _seg_sorted:
+                    if _found_adj:
+                        _reprice_tids.add(_tid)
+                    elif _tid in spot_adj_overrides:
+                        _found_adj = True
+            for _rtid in _reprice_tids:
+                for _row in by_trade.get(_rtid, []):
+                    _lid = int(_row["leg_id"])
+                    _nat = _natural_spec_strikes.get((_rtid, _lid))
+                    if _nat and abs(_nat - float(_row.get("strike") or 0)) > 0.01:
+                        _row["strike"] = _nat
+                        _row["requested_strike"] = _nat
 
     # Step 4: build a NEW spec list with adjusted exit_dates for triggered legs.
     # Then apply Python-engine overlap prevention before re-pricing.
@@ -3263,9 +3441,11 @@ def run_rust_engine_pipeline(
 
     # Filter adjusted_specs to only kept trades.
     adjusted_specs = [s for s in adjusted_specs if s["trade_id"] in kept_trades]
-    # Slice 6: re-entry specs piggyback on the parent trade_id, so they survive
-    # the overlap filter exactly when the parent does.
-    adjusted_specs.extend(s for s in reentry_specs if s["trade_id"] in kept_trades)
+    # Slice 6: re-entry specs have unique trade_ids; survive when their parent trade did.
+    adjusted_specs.extend(
+        s for s in reentry_specs
+        if _reentry_by_new_tid.get(s["trade_id"]) in kept_trades
+    )
     # Slice 7b bridges: new trade_ids per cycle, survive when their parent did.
     adjusted_specs.extend(
         s for s in _bt_bridge_specs
