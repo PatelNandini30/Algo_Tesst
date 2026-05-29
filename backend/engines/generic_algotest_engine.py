@@ -3532,6 +3532,31 @@ def run_algotest_backtest(params):
         else:  # MONTHLY, NEXT_MONTHLY, MONTHLY_T1
             expiry_df = get_expiry_dates(index, 'monthly', from_date, to_date)
 
+    # Rollover lookahead: append one extra expiry beyond to_date so the last
+    # rollover window (entry = last_expiry, exit clamped to segment/to_date end)
+    # is generated. Without this, the last cycle is silently dropped because
+    # expiry_df has no Next Expiry row for the final entry.
+    if _rollover_mode and expiry_df is not None and not expiry_df.empty:
+        try:
+            _col = 'Current Expiry' if 'Current Expiry' in expiry_df.columns else expiry_df.columns[0]
+            _last_exp = pd.to_datetime(expiry_df[_col]).max()
+            _lookahead_to = (_last_exp + pd.Timedelta(days=40)).strftime('%Y-%m-%d')
+            _extra_df = get_expiry_dates(
+                index,
+                'weekly' if _etype in ('WEEKLY', 'NEXT_WEEKLY', 'WEEKLY_T1') else 'monthly',
+                _last_exp.strftime('%Y-%m-%d'),
+                _lookahead_to,
+            )
+            if _extra_df is not None and not _extra_df.empty:
+                _ecol = 'Current Expiry' if 'Current Expiry' in _extra_df.columns else _extra_df.columns[0]
+                _extra_dates = pd.to_datetime(_extra_df[_ecol]).sort_values()
+                _extra_next = _extra_dates[_extra_dates > _last_exp]
+                if not _extra_next.empty:
+                    _new_row = pd.DataFrame({_col: [_extra_next.iloc[0]]})
+                    expiry_df = pd.concat([expiry_df, _new_row], ignore_index=True)
+        except Exception:
+            pass
+
     # ========== STEP 4: INITIALIZE RESULTS ==========
     all_trades = []
     trade_id_counter = 0
@@ -4192,7 +4217,6 @@ def run_algotest_backtest(params):
         _prev_actual_exit           = None
         _prev_expiry                = None  # DTE mode: expiry of trade that triggered spot adj
         _seg_spot_adj_base          = None  # fixed-strike: segment entry spot for adj baseline
-        _seg_fixed_strike_disabled  = False  # True after first spot adj in segment → stop reuse/save
         _seg_expiries          = seg_scope.get('expiries_sorted', [])
         _seg_expiry_recmap     = seg_scope.get('expiry_rec_map', {})
         _seg_original_count    = len(seg_scope['entries'])  # count before any synthetic appends
@@ -4425,10 +4449,10 @@ def run_algotest_backtest(params):
                         _log(f"  Spot adjustment triggered on {adjusted_ts.strftime('%Y-%m-%d')} ({triggered_direction})")
                         # Reset segment baseline to trigger-day spot so the next
                         # rollover/restrike measures rise from the new reference.
-                        # Also disable fixed-strike reuse/save for the rest of this
-                        # segment — all subsequent rollovers must resolve fresh ATM.
+                        # Fixed-strike legs RE-ANCHOR here: the restrike re-entry
+                        # resolves a fresh ATM and saves it as the new fixed strike,
+                        # which subsequent EXPIRY rollovers then carry (reuse).
                         if _has_fixed_strike_legs:
-                            _seg_fixed_strike_disabled = True
                             _triggered_spot = get_spot_price_from_db(adjusted_ts.strftime('%Y-%m-%d'), index)
                             if _triggered_spot is not None:
                                 _seg_spot_adj_base = _triggered_spot
@@ -4802,7 +4826,7 @@ def run_algotest_backtest(params):
                                 strike_interval=strike_interval,
                                 index=index,
                             )
-                            if _rollover_strike_mode == 'fixed' and strike is not None and not _seg_fixed_strike_disabled:
+                            if _rollover_strike_mode == 'fixed' and strike is not None:
                                 _seg_fixed_strikes[_fs_key] = strike
                                 _log(f"      [FIXED_STRIKE] leg {leg_idx+1}: saved strike={strike} for future rollovers")
 

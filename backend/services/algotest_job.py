@@ -304,7 +304,27 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     from engines.generic_algotest_engine import get_lot_size
     from services.engine_rust import run_rust_engine_pipeline, priced_to_tradesheet_records
 
-    _trading_cal_df = get_trading_calendar(effective_from, effective_to)
+    # When filter segments extend beyond effective_to, load data through the
+    # latest segment end so the last rollover window can be priced correctly.
+    # Without this, trading_days / expiries / spots stop at effective_to and
+    # the rollover clipping has no valid last-trading-day to clamp to.
+    _data_to = effective_to
+    try:
+        _custom_segs = payload.get("filter_segments") or []
+        if _custom_segs and isinstance(_custom_segs, list):
+            _seg_ends = [
+                pd.Timestamp(s["end"]).strftime("%Y-%m-%d")
+                for s in _custom_segs
+                if isinstance(s, dict) and s.get("end")
+            ]
+            if _seg_ends:
+                _max_seg_end = max(_seg_ends)
+                if _max_seg_end > _data_to:
+                    _data_to = _max_seg_end
+    except Exception:
+        pass
+
+    _trading_cal_df = get_trading_calendar(effective_from, _data_to)
     days = pd.to_datetime(
         _trading_cal_df["date"]
     ).sort_values().dt.strftime("%Y-%m-%d").tolist()
@@ -315,7 +335,7 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
         index,
         payload.get("expiry_type", "weekly"),
         effective_from,
-        effective_to,
+        _data_to,
     )
     if expiries_df is None or expiries_df.empty:
         return (None, None, None)
@@ -629,149 +649,48 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             if engine_pivot is None:
                 engine_pivot = {"headers": [], "rows": []}
         else:
-            from_dt = pd.to_datetime(effective_from)
-            to_dt = pd.to_datetime(effective_to)
-            span_years = (to_dt - from_dt).days / 365.25
-            if span_years <= _BULK_LOAD_CHUNK_YEARS:
-                stage_t = time.perf_counter()
-                bulk_load_options(index, effective_from, effective_to)
-                logger.info("[JOB_PERF] bulk_load_options %.2fs", time.perf_counter() - stage_t)
-                # Always build fast lookup if Rust is already loaded (feather shortcut
-                # makes this free — 0 ms), OR if the span exceeds the threshold.
-                # Skipping it when Rust is active but span < threshold leaves all
-                # option price lookups falling back to raw DB queries.
-                _rust_active = False
+            # Unified Rust engine path — all durations, no Python fallback.
+            # Feather covers 2019-2026 (~275 MB, already in memory) so no
+            # chunking is needed regardless of date range.
+            stage_t = time.perf_counter()
+            bulk_load_options(index, effective_from, effective_to)
+            logger.info("[JOB_PERF] bulk_load_options %.2fs", time.perf_counter() - stage_t)
+            stage_t = time.perf_counter()
+            _build_fast_lookup_from_bulk(index, effective_from, effective_to)
+            logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)
+            stage_t = time.perf_counter()
+            trades_df, engine_summary, engine_pivot = _try_rust_engine(
+                payload, index, effective_from, effective_to
+            )
+            logger.info("[JOB_PERF] run_algotest_backtest %.2fs", time.perf_counter() - stage_t)
+            all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
+            if engine_summary is None:
+                engine_summary = {}
+            if engine_pivot is None:
+                engine_pivot = {"headers": [], "rows": []}
+            if all_trades:
                 try:
-                    from services import rust_fast_path as _rf
-                    _rust_active = _rf.is_available() and _rf._loaded_cache_key is not None
-                except Exception:
-                    pass
-                # When ENGINE_BACKEND=rust, always build/reload the Rust feather cache.
-                # If the feather was deleted (staleness check) the DB-load path has the
-                # data in memory; build_fast_lookup rebuilds the feather from that data.
-                _rust_engine_mode = os.environ.get("ENGINE_BACKEND", "python").lower() == "rust"
-                if _rust_active or _rust_engine_mode or _should_build_fast_lookup(payload, effective_from, effective_to):
                     stage_t = time.perf_counter()
-                    _build_fast_lookup_from_bulk(index, effective_from, effective_to)
-                    logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)
-                logger.debug("[DEBUG] Calling run_algotest_backtest from=%s to=%s", effective_from, effective_to)
-                stage_t = time.perf_counter()
-                # Slice 11: ENGINE_BACKEND=rust runs the Phase 2b orchestrator
-                # for supported strategies (slices 1-8a) and falls back to the
-                # Python engine for anything else. Unset / 'python' uses the
-                # Python engine unconditionally (default for production).
-                trades_df = engine_summary = engine_pivot = None
-                if os.environ.get("ENGINE_BACKEND", "python").lower() == "rust":
-                    try:
-                        trades_df, engine_summary, engine_pivot = _try_rust_engine(
-                            payload, index, effective_from, effective_to
-                        )
-                    except Exception as exc:
-                        logger.warning("[ENGINE_RUST] failed (%s) — falling back to Python", exc)
-                        trades_df = None
-                    if trades_df is None:
-                        logger.info("[ENGINE_RUST] orchestrator rejected payload — Python engine")
-                if trades_df is None:
-                    trades_df, engine_summary, engine_pivot = run_algotest_backtest(payload)
-                logger.info("[JOB_PERF] run_algotest_backtest %.2fs", time.perf_counter() - stage_t)
-                logger.debug("[DEBUG] Backtest returned type=%s len=%s empty=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None', trades_df.empty if trades_df is not None else 'N/A')
-                stage_t = time.perf_counter()
-                all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
-                logger.info("[JOB_PERF] trades_df_to_records %.2fs rows=%s", time.perf_counter() - stage_t, len(all_trades))
-                logger.debug("[DEBUG] Single chunk trades_df=%s len=%s", type(trades_df), len(trades_df) if trades_df is not None else 'None')
-                logger.debug("[DEBUG] all_trades from single chunk=%s", len(all_trades))
-                if engine_summary is None:
-                    engine_summary = {}
-                if engine_pivot is None:
-                    engine_pivot = {"headers": [], "rows": []}
-                
-                # Compute analytics for single chunk to add Cumulative/Peak/DD/%DD
-                if all_trades and len(all_trades) > 0:
-                    try:
-                        stage_t = time.perf_counter()
-                        from base import compute_analytics, build_pivot
-                        trades_agg = pd.DataFrame(all_trades)
-                        for col in ['Entry Date', 'Exit Date']:
-                            if col in trades_agg.columns:
-                                trades_agg[col] = pd.to_datetime(trades_agg[col], dayfirst=True, errors='coerce')
-
-                        # Preserve engine-computed cumulative series before compute_analytics overwrites them
-                        _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
-                        _saved_agg = {col: trades_agg[col].copy() for col in _cum_cols if col in trades_agg.columns}
-
-                        trades_agg, result_summary = compute_analytics(trades_agg)
-                        result_pivot = build_pivot(trades_agg, "Exit Date")
-
-                        # Restore correct additive-from-100 series
-                        for col, saved in _saved_agg.items():
-                            trades_agg[col] = saved
-
-                        all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
-                        try:
-                            bulk_clear_options()
-                        except Exception:
-                            pass
-                        # Keep engine_summary from run_algotest_backtest (computed from
-                        # per-trade data) — result_summary from per-leg trades_agg
-                        # double-counts Net P&L for multi-leg strategies.
-                        engine_pivot = result_pivot
-                        logger.info("[JOB_PERF] first analytics %.2fs", time.perf_counter() - stage_t)
-                    except Exception as e:
-                        logger.warning("[WARN] compute_analytics for single chunk failed: %s", e)
-            else:
-                all_chunk_trades = []
-                engine_summary = None
-                engine_pivot = None
-                _trade_id_offset = 0  # cumulative offset so Trade IDs never collide across chunks
-                for chunk_from, chunk_to in _date_chunks(effective_from, effective_to, _BULK_LOAD_CHUNK_YEARS):
-                    try:
-                        bulk_load_options(index, chunk_from, chunk_to)
-                        chunk_payload = dict(payload)
-                        chunk_payload['from_date'] = chunk_from
-                        chunk_payload['to_date'] = chunk_to
-                        if _should_build_fast_lookup(chunk_payload, chunk_from, chunk_to):
-                            _build_fast_lookup_from_bulk(index, chunk_from, chunk_to)
-                        c_df, c_summary, c_pivot = run_algotest_backtest(chunk_payload)
-                        chunk_count = len(c_df) if c_df is not None and not c_df.empty else 0
-                        logger.debug("[DEBUG] chunk %s -> %s c_df type=%s count=%s", chunk_from, chunk_to, type(c_df), chunk_count)
-                        if c_df is not None and not c_df.empty:
-                            logger.debug("[DEBUG] c_df columns=%s", list(c_df.columns)[:5])
-                            logger.debug("[DEBUG] c_df first row=%s", c_df.iloc[0].to_dict() if len(c_df) > 0 else 'empty')
-                        if chunk_count > 0:
-                            chunk_records = c_df.to_dict('records')
-                            # Offset Trade IDs so they never collide with previous chunks
-                            chunk_max_id = 0
-                            for row in chunk_records:
-                                orig = int(str(row.get('Trade', 0) or 0))
-                                row['Trade'] = orig + _trade_id_offset
-                                if orig > chunk_max_id:
-                                    chunk_max_id = orig
-                            _trade_id_offset += chunk_max_id
-                            all_chunk_trades.extend(chunk_records)
-                            if c_summary:
-                                engine_summary = c_summary
-                            if c_pivot:
-                                engine_pivot = c_pivot
-                        expiry_type_used = chunk_payload.get('expiry_type', 'WEEKLY')
-                        logger.info("[CHUNK] %s -> %s: %s trades (expiry_type=%s)", chunk_from, chunk_to, chunk_count, expiry_type_used)
-                    except Exception as chunk_err:
-                        logger.error("[CHUNK ERROR] %s -> %s: %s", chunk_from, chunk_to, chunk_err)
-                        traceback.print_exc()
-                        continue
-                    finally:
-                        try:
-                            _safe_clear_fast_lookup()
-                        except Exception:
-                            pass
-                        try:
-                            bulk_clear_options()
-                        except Exception:
-                            pass
-                all_trades = all_chunk_trades
-                logger.debug("[DEBUG] Total all_chunk_trades collected=%s", len(all_chunk_trades))
-                if not all_trades:
-                    engine_summary = None
-                    engine_pivot = None
+                    from base import compute_analytics, build_pivot
+                    trades_agg = pd.DataFrame(all_trades)
+                    for col in ['Entry Date', 'Exit Date']:
+                        if col in trades_agg.columns:
+                            trades_agg[col] = pd.to_datetime(trades_agg[col], dayfirst=True, errors='coerce')
+                    _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+                    _saved_agg = {col: trades_agg[col].copy() for col in _cum_cols if col in trades_agg.columns}
+                    trades_agg, result_summary = compute_analytics(trades_agg)
+                    result_pivot = build_pivot(trades_agg, "Exit Date")
+                    for col, saved in _saved_agg.items():
+                        trades_agg[col] = saved
+                    all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
+                    engine_pivot = result_pivot
+                    logger.info("[JOB_PERF] first analytics %.2fs", time.perf_counter() - stage_t)
+                except Exception as e:
+                    logger.warning("[WARN] compute_analytics failed: %s", e)
+            try:
+                bulk_clear_options()
+            except Exception:
+                pass
 
         # Reindex trades so multi-chunk runs produce unique trade numbers
         if all_trades:

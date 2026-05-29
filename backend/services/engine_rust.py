@@ -1118,6 +1118,14 @@ def _build_fixed_entry_specs(
                     break
                 exit_date = last_in_seg
                 clamped = True
+            # Also a filter-end exit when the target expiry lies BEYOND the
+            # segment end: the trade can't reach its expiry inside the segment,
+            # so it exits at the segment boundary. This catches the case where
+            # the expiry is also outside the loaded data range — then exit_date
+            # was already truncated to the last trading day (== last_in_seg) so
+            # the `exit_date > last_in_seg` test above misses it.
+            if target_expiry > last_in_seg:
+                clamped = True
 
             entry_spot = spot_by_date.get(current_entry)
             if not entry_spot:
@@ -1166,6 +1174,9 @@ def _build_fixed_entry_specs(
                     "lots": int(leg.get("lots") or 1),
                     "lot_size": int(lot_size),
                     "slippage_pct": slippage,
+                    # Exit was clamped to the segment/filter end (exit < natural
+                    # expiry exit) → exit reason should be FILTER_END, not EXPIRY.
+                    "_seg_clamped": clamped,
                 })
 
             # Emit the trade only if every leg resolved; otherwise drop just this
@@ -2118,8 +2129,21 @@ def run_rust_engine_pipeline(
 
     elif filter_entry_mode == "fixed":
         # Step 1 (fixed): Python builds schedule then Rust prices each spec.
+        # Rollover lookahead: the last rollover window (entry = last in-range
+        # expiry) needs one expiry BEYOND it to roll into, otherwise the final
+        # same-day chain trade (entry = last expiry, exit clamped to segment end)
+        # is never generated. Same fix the DTE path applies.
+        _fixed_rollover_lookahead = (
+            bool(payload.get("rollover_toggle", False))
+            and str(payload.get("expiry_type") or "").upper() in ("WEEKLY", "MONTHLY")
+        )
+        _fixed_expiry_dates = (
+            _fetch_one_extra_expiry(expiry_dates, payload)
+            if _fixed_rollover_lookahead
+            else expiry_dates
+        )
         specs = _build_fixed_entry_specs(
-            payload, expiry_dates, trading_days, spot_by_date, int(lot_size), segments,
+            payload, _fixed_expiry_dates, trading_days, spot_by_date, int(lot_size), segments,
         )
         if specs is None:
             return None  # Premium-based strike mode — Python engine handles it
@@ -2187,6 +2211,14 @@ def run_rust_engine_pipeline(
         # ceiling for the last rollover window.
         if _rollover_lookahead:
             _to_date_str = str(payload.get("to_date") or payload.get("date_to") or "")
+            # When filter segments extend beyond to_date, use the latest segment
+            # end as the effective ceiling. Without this, the last rollover window
+            # (entry = last expiry = to_date) gets clamped to a zero-duration trade
+            # and dropped before segment gating can extend it to the segment end.
+            if _to_date_str and segments:
+                _max_seg_end = max(end for _, end in segments)
+                if _max_seg_end > _to_date_str:
+                    _to_date_str = _max_seg_end
             if _to_date_str:
                 _clipped: List[Dict[str, Any]] = []
                 for _s in specs:
@@ -2234,6 +2266,14 @@ def run_rust_engine_pipeline(
                         continue
                     s = dict(s)
                     s["exit_date"] = clamped
+                    # Exit clamped to segment/filter end → FILTER_END reason.
+                    s["_seg_clamped"] = True
+                elif _normalize_iso(s.get("expiry", "")) > seg_end:
+                    # Expiry lies beyond the segment end (and may be outside the
+                    # loaded data, so exit_date was already truncated to seg_end).
+                    # Still a filter-end exit, not a natural expiry exit.
+                    s = dict(s)
+                    s["_seg_clamped"] = True
                 filtered.append(s)
             specs = filtered
             if not specs:
@@ -2262,6 +2302,21 @@ def run_rust_engine_pipeline(
         specs = _apply_fixed_rollover_strike(specs, payload, original_segments)
 
     # Step 2: price entries + scheduled exits.
+    # Capture which specs were clamped to a segment/filter end BEFORE pricing
+    # (simulate_trades_batch drops custom keys). Keyed by (trade_id, entry_date)
+    # so the exit-reason step can label these FILTER_END instead of EXPIRY,
+    # matching the Python engine (generic_algotest_engine.py:4385).
+    _seg_clamped_keys: set = {
+        (int(s.get("trade_id", 0)), _normalize_iso(s.get("entry_date", "")))
+        for s in specs if s.get("_seg_clamped")
+    }
+    # STR (super-trend) segments use 'STR_Exit'; plain filters use 'FILTER_END'.
+    _clamp_reason = (
+        "STR_Exit"
+        if str(payload.get("super_trend_config") or "").strip() in ("5x1", "5x2")
+        else "FILTER_END"
+    )
+
     priced = algotest_native.simulate_trades_batch(specs)
     if not priced:
         return []
@@ -2296,7 +2351,13 @@ def run_rust_engine_pipeline(
         (_maybe_float(payload.get("spot_adjustment_pct")) or 0) > 0
     )
     if not any_risk and not has_overall_top and not has_spot_adj:
-        # No risk controls → priced output is the final answer.
+        # No risk controls → priced output is the final answer. Still tag exits
+        # that were clamped to a segment/filter end so they read FILTER_END
+        # (or STR_Exit) instead of defaulting to EXPIRY.
+        if _seg_clamped_keys:
+            for _row in priced:
+                if (int(_row.get("trade_id", 0)), _normalize_iso(_row.get("entry_date", ""))) in _seg_clamped_keys:
+                    _row["exit_reason"] = _clamp_reason
         return list(priced)
 
     # Re-entry Rollover same-day chain: handled in Slice 6 via synthesis below.
@@ -2967,10 +3028,14 @@ def run_rust_engine_pipeline(
         for leg in legs_src
         if str(leg.get("segment", "OPTIONS")).upper() not in ("FUTURES", "FUTURE")
     )
+    # Shared id counter: continue from where the Slice-6 re-entry generator left
+    # off so bridge / spot-adj trades never collide with re-entry trade_ids.
+    # (Defined unconditionally so the spot-adj re-entry block below can chain from
+    # it even when this bridge block doesn't run.)
+    _bt_new_tid = _reentry_new_tid
     if spot_adj_enabled and spot_adj_overrides and (
         (_rollover_toggle and filter_entry_mode == "fixed") or _has_fixed_strike_opt_legs
     ):
-        _bt_new_tid = max(list(by_trade.keys()) + [0]) + 1
         for _bt_id, _bt_trigger in list(spot_adj_overrides.items()):
             _bt_legs = sorted(by_trade.get(_bt_id, []), key=lambda r: r["leg_id"])
             if not _bt_legs:
@@ -3134,47 +3199,73 @@ def run_rust_engine_pipeline(
                 else:
                     break  # Bridge chain complete
 
-    # Fixed-strike restrike propagation: when spot adj fires for a fixed-strike leg,
-    # subsequent rollover trades in the same segment must resolve fresh ATM strikes
-    # rather than reusing the pre-adj fixed one. Mirrors the Python engine's
-    # _seg_fixed_strike_disabled flag / _seg_fixed_strikes clearing logic.
+    # Fixed-strike carry-forward: in fixed-strike mode the strike is LOCKED and
+    # only RE-ANCHORS when a spot-adjustment re-entry fires. A normal EXPIRY
+    # rollover must CARRY the previous (locked) strike — it must NOT resolve its
+    # own fresh ATM. Mirrors the Python engine (generic_algotest_engine.py
+    # _seg_fixed_strikes: reuse on rollover, clear+resave on spot adj).
+    #
+    # Re-anchor points (entry date → fresh-ATM strike per leg):
+    #   (1) every spot-adj re-entry ("bridge") trade — it already holds the
+    #       fresh ATM resolved at its trigger/cascade-trigger entry date, and
+    #   (2) a trade that re-enters on a trigger==scheduled-exit day, where no
+    #       bridge is created — its own natural (pre-fixed) ATM is the re-anchor.
+    # Each original trade then takes the strike of the most-recent re-anchor on
+    # or before its own entry; trades before any trigger keep the first-cycle
+    # (locked) strike already applied by _apply_fixed_rollover_strike.
     # Updating by_trade here (before adjusted_specs assembly) means the final
     # simulate_trades_batch picks up the corrected strikes automatically.
-    # Works for both filter/STR mode (original_segments set) and plain DTE mode
+    # Works for filter/STR mode (original_segments set) and DTE mode
     # (original_segments None — treat full date range as one segment).
     if _has_fixed_strike_opt_legs and spot_adj_overrides:
-        _reprice_segs: Optional[List[Tuple[str, str]]]
+        _cf_segs: Optional[List[Tuple[str, str]]]
         if original_segments is not None:
-            _reprice_segs = original_segments
+            _cf_segs = original_segments
         else:
-            _rp_from = str(payload.get("from_date") or payload.get("date_from") or "")
-            _rp_to = str(payload.get("to_date") or payload.get("date_to") or "")
-            _reprice_segs = [(_rp_from, _rp_to)] if _rp_from and _rp_to else None
-        if _reprice_segs:
-            _orig_tid_entry_map: Dict[int, str] = {
+            _cf_from = str(payload.get("from_date") or payload.get("date_from") or "")
+            _cf_to = str(payload.get("to_date") or payload.get("date_to") or "")
+            _cf_segs = [(_cf_from, _cf_to)] if _cf_from and _cf_to else None
+        if _cf_segs:
+            _cf_tid_entry: Dict[int, str] = {
                 _tid: _normalize_iso(_tlegs[0]["entry_date"])
                 for _tid, _tlegs in by_trade.items()
                 if _tlegs
             }
-            _reprice_tids: Set[int] = set()
-            for _seg_s, _seg_e in _reprice_segs:
-                _seg_sorted = sorted(
-                    [t for t, e in _orig_tid_entry_map.items() if _seg_s <= e <= _seg_e],
-                    key=lambda t: _orig_tid_entry_map[t],
-                )
-                _found_adj = False
-                for _tid in _seg_sorted:
-                    if _found_adj:
-                        _reprice_tids.add(_tid)
-                    elif _tid in spot_adj_overrides:
-                        _found_adj = True
-            for _rtid in _reprice_tids:
-                for _row in by_trade.get(_rtid, []):
-                    _lid = int(_row["leg_id"])
-                    _nat = _natural_spec_strikes.get((_rtid, _lid))
-                    if _nat and abs(_nat - float(_row.get("strike") or 0)) > 0.01:
-                        _row["strike"] = _nat
-                        _row["requested_strike"] = _nat
+            # Re-anchor strikes keyed by entry date → {leg_id: strike}.
+            _anchor_strike: Dict[str, Dict[int, float]] = {}
+            # (1) spot-adj re-entry bridges carry the fresh trigger-day ATM.
+            for _bspec in _bt_bridge_specs:
+                _bdate = _normalize_iso(_bspec.get("_entry_date_key") or _bspec.get("entry_date") or "")
+                if not _bdate:
+                    continue
+                _anchor_strike.setdefault(_bdate, {})[int(_bspec["leg_id"])] = float(_bspec.get("strike") or 0)
+            # (2) trigger==scheduled-exit days have no bridge; the original trade
+            #     entering that day re-anchors with its own natural ATM.
+            _trigger_dates = set(spot_adj_overrides.values())
+            for _tid, _tdate in _cf_tid_entry.items():
+                if _tdate in _trigger_dates:
+                    for _trow in by_trade.get(_tid, []):
+                        _tlid = int(_trow["leg_id"])
+                        _tnat = _natural_spec_strikes.get((_tid, _tlid))
+                        if _tnat:
+                            _anchor_strike.setdefault(_tdate, {}).setdefault(_tlid, _tnat)
+            _anchor_dates_sorted = sorted(_anchor_strike.keys())
+            # Reprice each original trade to the most-recent re-anchor ≤ its entry.
+            for _cf_s, _cf_e in _cf_segs:
+                _seg_tids = [t for t, e in _cf_tid_entry.items() if _cf_s <= e <= _cf_e]
+                _seg_anchors = [d for d in _anchor_dates_sorted if _cf_s <= d <= _cf_e]
+                for _ctid in _seg_tids:
+                    _centry = _cf_tid_entry[_ctid]
+                    _applicable = [d for d in _seg_anchors if d <= _centry]
+                    if not _applicable:
+                        continue  # before any re-anchor → keep locked first-cycle strike
+                    _anchor = _applicable[-1]
+                    for _crow in by_trade.get(_ctid, []):
+                        _clid = int(_crow["leg_id"])
+                        _cstrike = _anchor_strike[_anchor].get(_clid)
+                        if _cstrike and abs(_cstrike - float(_crow.get("strike") or 0)) > 0.01:
+                            _crow["strike"] = _cstrike
+                            _crow["requested_strike"] = _cstrike
 
     # Step 4: build a NEW spec list with adjusted exit_dates for triggered legs.
     # Then apply Python-engine overlap prevention before re-pricing.
@@ -3201,7 +3292,12 @@ def run_rust_engine_pipeline(
                 lr = leg_results_for_reason[i] if i < len(leg_results_for_reason) else {}
                 reason = str(lr.get("exit_reason") or "SL").upper() or "SL"
             else:
-                reason = "EXPIRY"
+                # Default to EXPIRY, unless this trade's exit was clamped to a
+                # segment/filter end — then it's a FILTER_END (or STR_Exit) exit.
+                if (int(leg["trade_id"]), _normalize_iso(leg["entry_date"])) in _seg_clamped_keys:
+                    reason = _clamp_reason
+                else:
+                    reason = "EXPIRY"
             # Slice 4b: SL-with-Buffer. The engine's exit_price_override IS
             # honored now (_recalc_leg_pnl is skipped when it's set). We stash
             # the override here keyed by (trade_id, leg_id, date) so the
@@ -3294,7 +3390,9 @@ def run_rust_engine_pipeline(
         if True:  # legacy indentation
             _sa_index = str(payload.get("symbol") or payload.get("index") or "NIFTY").upper()
             _sa_interval = _STRIKE_INTERVALS.get(_sa_index, 50.0)
-            _sa_new_tid = max(list(by_trade.keys()) + [0]) + 1
+            # Continue the shared id counter (re-entry → bridge → spot-adj) so
+            # spot-adj mini-trades never collide with re-entry / bridge trade_ids.
+            _sa_new_tid = _bt_new_tid
 
             for orig_tid in sorted(spot_adj_overrides.keys()):
                 trigger_date = spot_adj_overrides[orig_tid]  # ISO string
