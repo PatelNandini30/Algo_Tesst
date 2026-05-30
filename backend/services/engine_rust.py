@@ -2980,6 +2980,34 @@ def run_rust_engine_pipeline(
                         re_exit = _normalize_iso(r0.get("exit_date") or cycle_exit)
                         re_reason = (r0.get("exit_reason") or "").upper()
 
+                # SL-with-Buffer also applies to the re-entry leg. The regular
+                # check above (check_leg_stop_loss_target) is buffer-blind, so an
+                # SLB-only re-entry would otherwise ride to EXPIRY and the cascade
+                # would stop after one re-entry. Run the same buffer-aware pre-pass
+                # the parent uses and apply the parent's SLB-vs-SL priority
+                # (mirrors ~line 2702): SLB wins when no regular SL fired or it
+                # fires first.
+                if isinstance(leg_src.get("slWithBuffer"), dict) and _maybe_float(
+                    (leg_src.get("slWithBuffer") or {}).get("value")
+                ):
+                    try:
+                        _re_slb_res = algotest_native.apply_sl_with_buffer_batch(
+                            [priced_re_row], [leg_src], list(trading_days)
+                        )
+                    except Exception as exc:
+                        logger.warning("[ENGINE_RUST] re-entry SLB check failed: %s", exc)
+                        _re_slb_res = None
+                    if _re_slb_res and _re_slb_res[0] is not None:
+                        _re_slb_date = _normalize_iso(_re_slb_res[0][0])
+                        _re_slb_price = float(_re_slb_res[0][1])
+                        if re_reason not in _SL_REASONS or _re_slb_date < re_exit:
+                            re_exit = _re_slb_date
+                            re_reason = "SL_WITH_BUFFER"
+                            # Register so the price/display fix-up (~line 3589)
+                            # swaps in the buffered exit price for this re-entry
+                            # row too, exactly as it does for the parent.
+                            slb_overrides[(_re_new_tid, 1)] = (_re_slb_date, _re_slb_price)
+
                 # If overall SL fires before the re-entry's own exit, clamp.
                 if overall_date is not None and re_exit >= overall_date:
                     re_exit = overall_date
