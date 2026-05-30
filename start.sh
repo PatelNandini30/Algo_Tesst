@@ -28,6 +28,21 @@ fi
 # Navigate to project directory
 cd "$(dirname "$0")"
 
+# ── Optional optimizer profile ───────────────────────────────────────────────
+# `./start.sh --optimize` also brings up the profile-gated worker-optimize
+# container (7000M mem_limit). Omitted by default to protect the 16 GB budget.
+COMPOSE_PROFILE_ARGS=""
+START_OPTIMIZE=false
+for arg in "$@"; do
+    case "$arg" in
+        --optimize) START_OPTIMIZE=true; COMPOSE_PROFILE_ARGS="--profile optimize" ;;
+    esac
+done
+if [ "$START_OPTIMIZE" = "true" ]; then
+    echo ""
+    echo "[OPT] Optimizer profile enabled — worker-optimize will be started."
+fi
+
 # ── Rust wheel (compiled once, outside Docker, cached in named volumes) ──────
 # Rust is compiled by the maturin Docker image and the .whl is saved to
 # backend/prebuilt/. Docker never compiles Rust — it just copies the wheel.
@@ -122,6 +137,10 @@ done
 if [ "$ALL_HEALTHY" = "true" ]; then
     echo ""
     echo "All containers are healthy! Skipping restart."
+    if [ "$START_OPTIMIZE" = "true" ]; then
+        echo "Ensuring optimizer container is up..."
+        docker compose --profile optimize up -d worker-optimize
+    fi
     echo "To force restart, run: docker compose down && docker compose up -d"
     exit 0
 fi
@@ -189,7 +208,7 @@ fi
 # Build and start services
 echo ""
 echo "[2/5] Building and starting Docker services..."
-docker compose up -d --build
+docker compose $COMPOSE_PROFILE_ARGS up -d --build
 
 if [ $? -ne 0 ]; then
     echo ""
@@ -221,4 +240,7 @@ LOG_SERVICES=(
   postgres
   redis
 )
-docker compose logs -f "${LOG_SERVICES[@]}"
+if [ "$START_OPTIMIZE" = "true" ]; then
+  LOG_SERVICES+=(worker-optimize)
+fi
+docker compose $COMPOSE_PROFILE_ARGS logs -f "${LOG_SERVICES[@]}"
