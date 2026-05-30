@@ -8,8 +8,8 @@
  *   nLegs         — count of legs in the current strategy
  *   onJobQueued   — ({ jobId, totalCombos, objective }) callback after enqueue
  */
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { X, Play, AlertCircle, Loader2, Beaker } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { X, Play, AlertCircle, Loader2, Beaker, Check } from 'lucide-react';
 import {
   expandSchemaForLegs,
 } from '../utils/strategyParamSchema';
@@ -400,8 +400,9 @@ export default function OptimizePanel({
                       )}
                       {(isChecked || savedValues[p.path]) && spec.kind === 'enum' && (
                         <div style={{ marginTop: 6, marginLeft: 24 }}>
-                          <EnumInput
-                            values={spec.values || []}
+                          <EnumChips
+                            options={p.values || spec.values || []}
+                            selected={spec.values || []}
                             onChange={(arr) => {
                               setSavedValues((sv) => ({ ...sv, [p.path]: { ...sv[p.path], values: arr } }));
                             }}
@@ -723,33 +724,109 @@ function RangeNum({ label, value, onChange }) {
   );
 }
 
-function EnumInput({ values, onChange }) {
-  const [raw, setRaw] = useState((values || []).join(', '));
-  const valuesKey = (values || []).join(',');
-  const prevKey = useRef(valuesKey);
-  if (prevKey.current !== valuesKey) {
-    prevKey.current = valuesKey;
-    setRaw((values || []).join(', '));
-  }
+/**
+ * EnumChips — click-to-toggle selector for an enum parameter.
+ *
+ * Shows every available value as a checkbox chip (pre-selected by default),
+ * so the user just clicks to drop the values they don't want instead of
+ * typing or editing a comma-separated string. Selection order follows the
+ * canonical `options` order regardless of click order.
+ *
+ *   options  — full list of allowed values (from the param schema)
+ *   selected — currently-included subset
+ *   onChange — (nextSelectedArray) => void
+ */
+function EnumChips({ options, selected, onChange }) {
+  const opts = options && options.length ? options : selected || [];
+  const selSet = new Set(selected || []);
+  const allOn = opts.length > 0 && opts.every((o) => selSet.has(o));
+  const noneOn = (selected || []).length === 0;
+
+  const toggle = (opt) => {
+    const next = new Set(selSet);
+    if (next.has(opt)) next.delete(opt);
+    else next.add(opt);
+    // Keep canonical option order, not click order.
+    onChange(opts.filter((o) => next.has(o)));
+  };
+
+  const linkStyle = (disabled) => ({
+    background: 'transparent',
+    border: 0,
+    padding: 0,
+    fontSize: 10,
+    letterSpacing: '0.04em',
+    textTransform: 'uppercase',
+    fontFamily: 'IBM Plex Mono, monospace',
+    color: disabled ? 'var(--text-muted, #9ca3af)' : 'var(--accent, #2563eb)',
+    opacity: disabled ? 0.45 : 1,
+    cursor: disabled ? 'default' : 'pointer',
+  });
+
   return (
-    <input
-      type="text"
-      value={raw}
-      onChange={(e) => {
-        setRaw(e.target.value);
-        const arr = e.target.value.split(',').map((x) => x.trim()).filter(Boolean);
-        onChange(arr);
-      }}
-      placeholder="comma-separated values"
-      style={{
-        width: '100%',
-        fontSize: 11,
-        padding: '4px 6px',
-        background: 'var(--bg-input, #fff)',
-        color: 'var(--text-primary, #111)',
-        border: '1px solid var(--border-strong, #d1d5db)',
-        borderRadius: 4,
-      }}
-    />
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <button type="button" onClick={() => onChange([...opts])} disabled={allOn} style={linkStyle(allOn)}>
+          All
+        </button>
+        <span style={{ fontSize: 10, opacity: 0.3 }}>·</span>
+        <button type="button" onClick={() => onChange([])} disabled={noneOn} style={linkStyle(noneOn)}>
+          None
+        </button>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {opts.map((opt) => {
+          const on = selSet.has(opt);
+          return (
+            <button
+              key={opt}
+              type="button"
+              onClick={() => toggle(opt)}
+              aria-pressed={on}
+              title={on ? `Remove ${opt}` : `Add ${opt}`}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '3px 9px 3px 7px',
+                fontSize: 11,
+                lineHeight: 1.4,
+                borderRadius: 6,
+                cursor: 'pointer',
+                fontFamily: 'IBM Plex Mono, monospace',
+                color: on ? 'var(--text-primary, #111)' : 'var(--text-muted, #9ca3af)',
+                border: on
+                  ? '1px solid var(--accent, #2563eb)'
+                  : '1px solid var(--border-strong, #d1d5db)',
+                background: on
+                  ? 'color-mix(in srgb, var(--accent, #2563eb) 14%, transparent)'
+                  : 'transparent',
+                transition: 'background 120ms ease, border-color 120ms ease, color 120ms ease',
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: 13,
+                  height: 13,
+                  borderRadius: 3,
+                  color: '#fff',
+                  border: on
+                    ? '1px solid var(--accent, #2563eb)'
+                    : '1px solid var(--border-strong, #d1d5db)',
+                  background: on ? 'var(--accent, #2563eb)' : 'transparent',
+                }}
+              >
+                {on ? <Check size={10} strokeWidth={3} /> : null}
+              </span>
+              {opt}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
