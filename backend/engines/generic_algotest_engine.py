@@ -3907,6 +3907,14 @@ def run_algotest_backtest(params):
                     _target_idx += 1
                     target_expiry = expiries_sorted[_target_idx]
 
+                # No-rollover min-DTE: same expiry-skip for the single trade per segment
+                if (no_rollover
+                        and no_rollover_min_days > 0
+                        and days_to_target <= no_rollover_min_days
+                        and _target_idx + 1 < len(expiries_sorted)):
+                    _target_idx += 1
+                    target_expiry = expiries_sorted[_target_idx]
+
                 target_rec = expiry_rec_map[target_expiry]
 
                 # Compute exit = target_expiry - exit_dte trading days
@@ -3988,7 +3996,7 @@ def run_algotest_backtest(params):
                 if clamped_exit:
                     break  # No more trades after the segment-end clamp
                 if no_rollover:
-                    break  # Single trade per segment (near-expiry extension applied post-loop)
+                    break  # Single trade per segment
                 if not rollover_toggle:
                     break  # No chaining when re-entry rollover is off
 

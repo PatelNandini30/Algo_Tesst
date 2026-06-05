@@ -1549,6 +1549,59 @@ _bhav_by_date_from: str = None
 _bhav_by_date_to: str = None
 # True when Rust Arrow IPC cache is active — Python partition can be skipped
 _rust_lookup_active: bool = False
+# Last-seen services.backtest_cache data_version token + throttle timestamp. When
+# the token changes (a market-data import bumped it) the in-memory lookup below is
+# dropped so the next load rebuilds from the freshly-imported DB. See
+# _invalidate_stale_bulk_lookup and the check at the top of bulk_load_options.
+_bulk_data_version = None
+_bulk_dv_checked_at: float = 0.0
+
+
+def _invalidate_stale_bulk_lookup(sym_upper: str) -> None:
+    """Drop in-memory + on-disk lookup state for ``sym_upper`` so the next load
+    rebuilds from the (freshly imported) DB. Triggered only when the Redis
+    data_version token changes (services.backtest_cache.bump_data_version)."""
+    global _bulk_loaded, _bulk_date_range, _bhav_by_date_symbol
+    global _bhav_by_date_from, _bhav_by_date_to, _rust_lookup_active
+    _bulk_loaded = False
+    _bulk_date_range = None
+    _bhav_by_date_symbol = None
+    _bhav_by_date_from = None
+    _bhav_by_date_to = None
+    _rust_lookup_active = False
+    for _tbl in (_bulk_bhav_by_date, _option_lookup_cache, _spot_lookup_table):
+        try:
+            _tbl.clear()
+        except Exception:
+            pass
+    try:
+        _feather_ohlc_loaded_symbols.discard(sym_upper)
+    except Exception:
+        pass
+    try:
+        import algotest_native
+        algotest_native.clear_cache()
+    except Exception:
+        pass
+    # On-disk feathers for this symbol (the worker runs as root → deletable). The
+    # next load finds no covering feather and rebuilds from the DB, overwriting it.
+    try:
+        import shutil
+        from services import rust_fast_path as _rf
+        _root = _rf._cache_root()
+        for _d in list(_root.glob(f"arrow-v2:bulk:{sym_upper}:*")):
+            shutil.rmtree(_d, ignore_errors=True)
+    except Exception as _e:
+        logger.debug("[BULK] feather cleanup skipped: %s", _e)
+    try:
+        from services.data_loader import PARQUET_CACHE_DIR
+        for _p in list(PARQUET_CACHE_DIR.glob("*.parquet")):
+            try:
+                _p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
 # Set of symbols for which the feather has already been read into
 # _bulk_bhav_by_date (lazy OHLC fallback for SL-with-Buffer / MAE-MFE when
 # the Rust fast-path skipped the partition step).
@@ -3438,10 +3491,33 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     global _option_lookup_table, _future_lookup_table, _spot_lookup_table
     global _bhav_by_date_symbol, _bhav_by_date_from, _bhav_by_date_to
     global _rust_lookup_active
+    global _bulk_data_version, _bulk_dv_checked_at
 
     sym_upper = symbol.upper()
     requested_from = pd.to_datetime(from_date)
     requested_to = pd.to_datetime(to_date)
+
+    # Auto-invalidate after a market-data import. services.backtest_cache bumps a
+    # Redis token on import; when it changes we drop the stale lookup so the load
+    # below rebuilds from the freshly-imported DB. Throttled (>=5s) so optimization
+    # combos don't hammer Redis; a None token (Redis down) is ignored, leaving
+    # behaviour unchanged when the token can't be read.
+    try:
+        _now = time.time()
+        if _now - _bulk_dv_checked_at >= 5.0:
+            _bulk_dv_checked_at = _now
+            from services.backtest_cache import get_data_version as _get_dv
+            _cur_dv = _get_dv()
+            if _cur_dv is not None:
+                if _bulk_data_version is not None and _bulk_data_version != _cur_dv:
+                    logger.info(
+                        "[BULK] data_version %s->%s — invalidating stale lookup for %s",
+                        _bulk_data_version, _cur_dv, sym_upper,
+                    )
+                    _invalidate_stale_bulk_lookup(sym_upper)
+                _bulk_data_version = _cur_dv
+    except Exception:
+        pass
 
     # Fast early return: either Python partition or Rust already covers this range.
     if ((_bulk_bhav_by_date or _rust_lookup_active)

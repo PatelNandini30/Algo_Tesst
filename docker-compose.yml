@@ -1,41 +1,62 @@
 # ============================================================
-# Tuned for: HP 280 Pro G6 Microtower
-#   CPU  : Intel i5-10500  (6C/12T, 3.1–4.5 GHz)
-#   RAM  : 16 GB DDR4-3200 (2×8 GB)
-#   DISK : 1 TB TOSHIBA DT01ACA1  ← spinning HDD, NOT SSD
-#   OS   : Ubuntu (Linux)
-#   Swap : 11 GB (also on HDD — DO NOT LET ANYTHING TOUCH IT)
+# Tuned for: Dell Pro Tower QCT1250  (migrated from HP 280 Pro G6 in 2026-06)
+#   CPU  : Intel Core i5-14500  (14C/20T, 20 logical CPUs)
+#   RAM  : 16 GB DDR5  (≈14.8 GiB usable) — FIXED, no upgrade planned.
+#          Board has 2 DDR5 UDIMM slots / max 64 GB, but the user is staying at
+#          16 GB, so the budget below MUST live within ~14.8 GiB RAM + swap.
+#   DISK : KIOXIA 512 GB NVMe SSD  ← SSD now, NOT a spinning HDD.
+#   OS   : Ubuntu 26.04 (Linux 7.0)
+#   Swap : 24 GB on the NVMe SSD  ← safe to use as overflow (SSD, ~100x faster
+#          than the old HDD). This swap is the cushion that absorbs the
+#          intentional overcommit below; it is NOT off-limits like the old HDD swap.
 #
-# Memory budget (hard limits must never trigger swap):
-#   postgres         : 3500M  (shared_buffers 512MB — safe for HDD)
-#   redis            :  700M
-#   backend          : 2500M
-#   worker-backtests : 3500M
-#   worker-uploads   :  500M
-#   cron-warmup      :   50M
-#   frontend         :  200M
-#   intraday-api     :  512M
-#   ─────────────────────────────
-#   worker-optimize  : 7000M  (profile-gated; updated 2026-05-28: f32 AHashMap
-#                              reduces Rust cache 3.5→2.6 GB; Polars ohlc_df
-#                              dropped (saves 0.5 GB+2 GB spike); P=4 workers
-#                              add 4×400 MB CoW-private = ~4.8 GB total)
-#   ─────────────────────────────
-#   Total hard limit : 11,462M (default stack; +7000M when optimize profile active)
-#   OS + kernel      : ~1,500M
-#   Headroom/cache   : ~3,000M  ← comfortable margin; no OOM risk with Chrome open
-#   ─────────────────────────────
-#   Grand total      : ~15,962M with optimize active — fits within 16 GB host.
-#                       Chrome + GNOME (~3 GB) + optimizer (~4.8 GB) + other
-#                       containers (~8 GB) = ~15.8 GB. Safe to use PC normally.
+# *** MEMORY REALITY ON THIS 16 GB BOX — READ BEFORE CHANGING LIMITS ***
+#   The hard limits below SUM TO ~21,962M (default stack) and therefore
+#   intentionally OVERCOMMIT the 14.8 GiB of RAM. This is only safe because:
+#     (a) the two 5 GB backtest workers each hold ~3.9 GB just for their own
+#         Rust/Arrow NIFTY cache (much of it mmap'd, cheap to page from SSD), and
+#         a solo user rarely runs a heavy job on BOTH at the same instant; and
+#     (b) the 24 GB SSD swap absorbs any spillover cheaply.
+#   The old HDD machine froze (swap thrash) when this overcommit hit; on the new
+#   NVMe SSD the same pressure degrades gracefully instead of rebooting the PC.
 #
-# HDD-specific Postgres tuning:
-#   - random_page_cost=4.0   (HDD random I/O is 4x more expensive than seq)
-#   - effective_io_concurrency=2  (NOT 100 — HDD can't do parallel I/O)
-#   - shared_buffers=512MB   (keep more in Postgres cache to avoid disk reads)
-#   - effective_cache_size=2GB  (realistic for 16GB with HDD)
-#   - work_mem=32MB          (low — 6 parallel workers × 32MB = 192MB max)
-#   - max_parallel_workers=2  (HDD bottleneck means more workers = slower)
+#   *** NO-OOM ENFORCEMENT (added 2026-06): a memory ADMISSION GATE now bounds
+#   the combined memory of concurrently *active* heavy jobs to HEAVY_MEMORY_BUDGET_MB
+#   (7000M). A job that doesn't fit WAITS (status "queued") instead of overcommitting.
+#   So the per-container limits above are ceilings, but the gate is what actually
+#   keeps the live working set within RAM. The old "RULE: don't run optimize + two
+#   backtests" is now ENFORCED by the gate, not left to the user. Idle warm caches
+#   page to SSD swap and don't count against the active budget.
+#   FAST_LOOKUP_MODE=rust is on: lookups are Rust-only (no Python dict fallback);
+#   the gate + swap are the memory backstop for the uncapped native cache load.
+#   See services/memory_gate.py. Retune via HEAVY_* env vars; revert with
+#   HEAVY_MEMORY_GATE=0 and FAST_LOOKUP_MODE=auto.
+#
+# Per-container hard limits (default stack):
+#   postgres                       : 3500M
+#   redis                          :  700M
+#   backend                        : 2500M
+#   worker-backtests               : 5000M  (own ~3.9 GB Rust cache)
+#   worker-backtests-fast          : 5000M  (own ~3.9 GB Rust cache)
+#   worker-backtests-intraday      : 2500M
+#   worker-backtests-intraday-slow : 1500M
+#   worker-uploads                 :  500M
+#   intraday-api                   :  512M
+#   frontend                       :  200M
+#   cron-warmup                    :   50M
+#   ───────────────────────────────────────
+#   Sum (default stack)            : 21,962M   (+6144M when worker-optimize active)
+#   Host RAM                       : ~15,160M (14.8 GiB)
+#   → overcommit ~6.8 GB, backed by 24 GB SSD swap. Keep ONE heavy backtest hot
+#     at a time. If the intraday workers (2500M+1500M=4 GB) are unused, scale them
+#     to 0 to reclaim that RAM.
+#
+# SSD-specific Postgres tuning (was HDD-tuned before the 2026-06 migration):
+#   - random_page_cost=1.1   (NVMe random reads are ~as cheap as sequential)
+#   - effective_io_concurrency=200  (SSD does deep parallel I/O; the HDD could not)
+#   - shared_buffers=512MB / effective_cache_size=2GB  (kept modest — only 16 GB RAM)
+#   - work_mem=32MB, max_parallel_workers=2  (kept low to protect the RAM budget,
+#     not because of disk — CPU now has 20 threads to spare)
 # ============================================================
 
 x-backend-env: &backend-env
@@ -68,11 +89,27 @@ x-backend-env: &backend-env
   # Persist hot caches across container recreates.
   PARQUET_CACHE_DIR: /data/cache/parquet
   ALGO_RUST_CACHE_DIR: /data/cache/arrow
-  # Avoid expensive native-cache setup for short expiry-only runs.
-  FAST_LOOKUP_MODE: auto
+  # FAST_LOOKUP_MODE=rust: strict Rust-only lookups. The native cache is ALWAYS
+  # built and NEVER falls back to the Python dict — a missing/unbuildable native
+  # cache raises a clear error instead of silently running the slow path. Memory
+  # safety comes from the admission gate below + SSD swap, not from skipping to
+  # Python. Set back to 'auto' to restore Rust-preferred + Python fallback.
+  FAST_LOOKUP_MODE: rust
   FAST_LOOKUP_MIN_YEARS: "2.0"
   FAST_LOOKUP_RANGE_FILTER: "0"
   FAST_LOOKUP_NATIVE_SCANS: "1"
+  # ── Memory admission gate (no-OOM) ──────────────────────────────────────────
+  # Bounds the combined memory of concurrently *active* heavy jobs so they can
+  # never overcommit RAM. A job that doesn't fit waits (status shows "queued")
+  # until a running job releases its slot. Idle warm caches page to SSD swap and
+  # don't count. Pure orchestration — see services/memory_gate.py (no math touched).
+  HEAVY_MEMORY_GATE: "1"
+  HEAVY_MEMORY_BUDGET_MB: "7000"          # ~one heavy job + a light intraday
+  HEAVY_COST_BACKTEST_MB: "5000"
+  HEAVY_COST_OPTIMIZE_MB: "6000"
+  HEAVY_COST_INTRADAY_MB: "2000"
+  HEAVY_GATE_WAIT_MAX_SECONDS: "600"      # then proceed anyway (SSD swap backstop)
+  HEAVY_RESERVATION_TTL_SECONDS: "2400"   # auto-reclaim a crashed/cancelled slot
   # Route small ranges to a separate worker so they do not wait behind a long run.
   BACKTEST_FAST_QUEUE_MAX_DAYS: "550"
   # API warm-cache waits for the Celery worker cache, not only backend memory.
@@ -114,8 +151,8 @@ services:
       -c effective_cache_size=2GB
       -c work_mem=32MB
       -c maintenance_work_mem=256MB
-      -c random_page_cost=4.0
-      -c effective_io_concurrency=2
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
       -c max_worker_processes=2
       -c max_parallel_workers_per_gather=1
       -c max_parallel_workers=2
@@ -319,15 +356,15 @@ services:
     # so long parameter sweeps don't block normal backtests.
     #
     # concurrency=1: ONE optimize job at a time.
-    # In-job parallelism via OPTIMIZE_PARALLELISM=4 (billiard fork + CoW sharing).
+    # In-job parallelism via OPTIMIZE_PARALLELISM=6 (billiard fork + CoW sharing).
     # Memory budget after f32 AHashMap + no Polars ohlc_df (2026-05-28):
     #   - Rust AHashMap (f32): ~2.6 GB (down from 3.5 GB with f64)
     #   - pandas ohlc_df_pandas: ~75 MB (CoW-inherited by workers)
     #   - Python/Celery overhead: ~500 MB
-    #   - 4 workers × ~400 MB private pages: ~1.6 GB
-    #   - Total: ~4.8 GB → fits within 7000M with headroom
-    # Host impact: 4.8 GB optimizer + ~3 GB Chrome/GNOME + ~1 GB OS = ~9 GB
-    # (leaves 7 GB headroom on 16 GB machine — no OOM risk).
+    #   - 6 workers × ~400 MB private pages: ~2.4 GB
+    #   - Total: ~5.6 GB → fits within 7000M with ~1.4 GB headroom
+    # Host impact: 5.6 GB optimizer + ~3 GB Chrome/GNOME + ~1 GB OS = ~10 GB
+    # (leaves 5 GB headroom on 16 GB machine — no OOM risk).
     profiles: ["optimize"]
     image: algotest-backend-app:latest
     container_name: algotest-worker-optimize
@@ -352,9 +389,9 @@ services:
       PYTHONOPTIMIZE: "1"
       BACKTEST_WORKERS: "1"
       OPTIMIZE_MAX_COMBOS: "100000"
-      # P=4: 4 billiard fork workers share the Rust AHashMap via CoW.
+      # P=6: 6 billiard fork workers share the Rust AHashMap via CoW.
       # Each worker adds ~400 MB private pages. Safe after f32 memory fix.
-      OPTIMIZE_PARALLELISM: "4"
+      OPTIMIZE_PARALLELISM: "6"
       # Keep MAE/MFE enabled so optimizer master-summary "Actual Live DD"
       # matches the downloaded tradesheet Summary sheet. If disabled, optimizer
       # summary falls back to booked DD/%DD while tradesheet downloads are
@@ -391,8 +428,8 @@ services:
       resources:
         limits:
           # 7000M: f32 AHashMap (~2.6 GB) + pandas OHLC (75 MB CoW) +
-          # Python/Celery (500 MB) + 4 workers × 400 MB private = ~4.8 GB.
-          # 7000M gives ~2.2 GB headroom for spikes. Updated 2026-05-28.
+          # Python/Celery (500 MB) + 6 workers × 400 MB private = ~5.6 GB.
+          # 7000M gives ~1.4 GB headroom for spikes. Updated 2026-06-03.
           memory: 7000M
           cpus: "6.0"
         reservations:

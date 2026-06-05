@@ -459,17 +459,17 @@ const createDefaultLazyLeg = (index = 1) => ({
   premium_min: 0,
   premium_max: 0,
   target_enabled: false,
-  target_mode: 'POINTS',
+  target_mode: 'PERCENT',
   target_value: 0,
   stop_loss_enabled: false,
-  stop_loss_mode: 'POINTS',
+  stop_loss_mode: 'PERCENT',
   stop_loss_value: 0,
   sl_buffer_enabled: false,
-  sl_buffer_mode: 'POINTS',
+  sl_buffer_mode: 'PERCENT',
   sl_buffer_value: null,
   sl_buffer_pct: null,
   trail_sl_enabled: false,
-  trail_sl_mode: 'POINTS',
+  trail_sl_mode: 'PERCENT',
   trail_sl_trigger: 0,
   trail_sl_move: 0,
   re_entry_target_enabled: false,
@@ -875,6 +875,7 @@ const [slippagePct, setSlippagePct] = useState(0);
     enabled: false,
     configId: '5x1',
     configLabel: 'STR 5,1',
+    filterName: 'STR 5,1',
     summary: null,
     segments: [],
     entryMode: 'dte',
@@ -1387,10 +1388,10 @@ const [slippagePct, setSlippagePct] = useState(0);
     setLegs(prev => [...prev, {
       id: Date.now(),
       ...normalizedDraft,
-      target_enabled: false, target_mode: 'POINTS', target_value: 0,
-      stop_loss_enabled: false, stop_loss_mode: 'POINTS', stop_loss_value: 0,
-      sl_buffer_enabled: false, sl_buffer_mode: 'POINTS', sl_buffer_value: null, sl_buffer_pct: null,
-      trail_sl_enabled: false, trail_sl_mode: 'POINTS', trail_sl_trigger: 0, trail_sl_move: 0,
+      target_enabled: false, target_mode: 'PERCENT', target_value: 0,
+      stop_loss_enabled: false, stop_loss_mode: 'PERCENT', stop_loss_value: 0,
+      sl_buffer_enabled: false, sl_buffer_mode: 'PERCENT', sl_buffer_value: null, sl_buffer_pct: null,
+      trail_sl_enabled: false, trail_sl_mode: 'PERCENT', trail_sl_trigger: 0, trail_sl_move: 0,
       re_entry_target_enabled: false, re_entry_target_mode: 'RE_ASAP', re_entry_target_count: 1,
       re_entry_sl_enabled: false, re_entry_sl_mode: 'RE_ASAP', re_entry_sl_count: 1,
       lazy_leg_sl_id: null,
@@ -2070,8 +2071,8 @@ const [slippagePct, setSlippagePct] = useState(0);
       square_off_time: intradaySquareOffTime,
       legs: optLegs.map(l => {
         const optType = l.option_type === 'call' ? 'CE' : 'PE';
-        const slMode = (l.stop_loss_mode || 'POINTS').includes('PERCENT') ? 'percent' : 'points';
-        const tgtMode = (l.target_mode || 'POINTS').includes('PERCENT') ? 'percent' : 'points';
+        const slMode = (l.stop_loss_mode || 'PERCENT').includes('PERCENT') ? 'percent' : 'points';
+        const tgtMode = (l.target_mode || 'PERCENT').includes('PERCENT') ? 'percent' : 'points';
         return {
           opt_type: optType,
           action: l.position === 'sell' ? 'SELL' : 'BUY',
@@ -2149,9 +2150,9 @@ const [slippagePct, setSlippagePct] = useState(0);
       <header className="app-header px-6 py-3">
         <div className="max-w-screen-2xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="logo-mark"><span>SL</span></div>
+            <div className="logo-mark"><span>SQ</span></div>
             <div className="flex flex-col leading-none">
-              <span className="app-name">StrategyLab</span>
+              <span className="app-name">ShellQuant</span>
               <span className="app-tagline mt-0.5">Options Backtester</span>
             </div>
           </div>
@@ -3498,7 +3499,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                             {ll.target_enabled && (
                               <>
-                                <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                <select value={ll.target_mode || 'PERCENT'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="PERCENT">Percent (%)</option>
                                 </select>
@@ -3511,7 +3512,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                             {ll.stop_loss_enabled && (
                               <>
-                                <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                <select value={ll.stop_loss_mode || 'PERCENT'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="PERCENT">Percent (%)</option>
                                 </select>
@@ -3524,7 +3525,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">SL with Buffer</span>
                             {ll.sl_buffer_enabled && (
                               <>
-                                <select value={ll.sl_buffer_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'sl_buffer_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                <select value={ll.sl_buffer_mode || 'PERCENT'} onChange={e => updateLazyLeg(ll.id, 'sl_buffer_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                                   <option value="POINTS">Points (Pts)</option>
                                   <option value="PERCENT">Percent (%)</option>
                                 </select>
@@ -3693,7 +3694,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Target Profit</span>
                         {ll.target_enabled && (
                           <>
-                            <select value={ll.target_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                            <select value={ll.target_mode || 'PERCENT'} onChange={e => updateLazyLeg(ll.id, 'target_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS">Points (Pts)</option>
                               <option value="PERCENT">Percent (%)</option>
                             </select>
@@ -3706,7 +3707,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Stop Loss</span>
                         {ll.stop_loss_enabled && (
                           <>
-                            <select value={ll.stop_loss_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                            <select value={ll.stop_loss_mode || 'PERCENT'} onChange={e => updateLazyLeg(ll.id, 'stop_loss_mode', e.target.value)} className="h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS">Points (Pts)</option>
                               <option value="PERCENT">Percent (%)</option>
                             </select>
@@ -3719,7 +3720,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <span className="text-xs font-medium text-secondary whitespace-nowrap">Trail SL</span>
                         {ll.trail_sl_enabled && (
                           <>
-                            <select value={ll.trail_sl_mode || 'POINTS'} onChange={e => updateLazyLeg(ll.id, 'trail_sl_mode', e.target.value)} className="w-16 h-7 px-1 border border-default rounded text-xs bg-surface">
+                            <select value={ll.trail_sl_mode || 'PERCENT'} onChange={e => updateLazyLeg(ll.id, 'trail_sl_mode', e.target.value)} className="w-16 h-7 px-1 border border-default rounded text-xs bg-surface">
                               <option value="POINTS">Points</option>
                               <option value="PERCENT">Percent</option>
                             </select>
@@ -3996,6 +3997,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             algorithm={optimAlgorithm} setAlgorithm={setOptimAlgorithm}
             objective={optimObjective} setObjective={setOptimObjective}
             parallelism={optimParallelism} setParallelism={setOptimParallelism}
+            filterName={strFilter.enabled ? strFilter.filterName : null}
             onJobQueued={(info) => {
               setOptimJob(info);
               setOptimPanelOpen(false);

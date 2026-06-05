@@ -774,6 +774,14 @@ const buildExcelFileName = (config) => {
       const exp = (leg.expiry || '').toUpperCase().replace('_', '');
       if (exp) parts.push(exp);
     }
+    const fmtVal = v => Number.isInteger(v) ? String(v) : parseFloat(Number(v).toFixed(2)).toString();
+    if (leg.sl_buffer_enabled && leg.sl_buffer_value > 0 && leg.sl_buffer_pct > 0) {
+      const modeSuffix = (leg.sl_buffer_mode || 'POINTS').includes('PERCENT') ? '%' : 'PTS';
+      parts.push(`SL_${fmtVal(leg.sl_buffer_value)}${modeSuffix}_Buffer_${fmtVal(leg.sl_buffer_pct)}%`);
+    } else if (leg.stop_loss_enabled && leg.stop_loss_value > 0) {
+      const modeSuffix = (leg.stop_loss_mode || 'POINTS').includes('PERCENT') ? '%' : 'PTS';
+      parts.push(`SL_${fmtVal(leg.stop_loss_value)}${modeSuffix}`);
+    }
   });
 
   const entry = config.entryDaysBefore != null ? `T${config.entryDaysBefore}` : null;
@@ -986,15 +994,23 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       });
     }
 
-    result.sort((a, b) => {
-      if (a.tradeNumber !== b.tradeNumber) {
-        return a.tradeNumber - b.tradeNumber;
+    // Parse dd-mm-yyyy or dd/mm/yyyy into a comparable timestamp.
+    const parseDateMs = (dateStr) => {
+      if (!dateStr) return 0;
+      const parts = dateStr.split(/[-\/]/);
+      if (parts.length === 3) {
+        const [d, m, y] = parts;
+        return new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10)).getTime();
       }
-      const dateA = a.entryDate || '';
-      const dateB = b.entryDate || '';
-      if (dateA < dateB) return -1;
-      if (dateA > dateB) return 1;
-      return 0;
+      return new Date(dateStr).getTime() || 0;
+    };
+
+    result.sort((a, b) => {
+      const tA = parseDateMs(a.entryDate);
+      const tB = parseDateMs(b.entryDate);
+      if (tA !== tB) return tA - tB;
+      // Tie-break by trade number so legs of same-day trades stay stable.
+      return a.tradeNumber - b.tradeNumber;
     });
     return result;
   }, [tradesWithFormattedDates]);
@@ -1028,7 +1044,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       }
       return {
         index: index + 1,
-        date: group.exitDate || `Trade ${index + 1}`,
+        date: group.entryDate || group.exitDate || `Trade ${index + 1}`,
         cumulative: cum,
         pnl: group.totalPnl ?? 0,
       };
@@ -1063,7 +1079,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       // pct_dd from backend is a percentage (e.g. -0.31), never multiply by 100 here.
       return {
         index: index + 1,
-        date: group.exitDate || `Trade ${index + 1}`,
+        date: group.entryDate || group.exitDate || `Trade ${index + 1}`,
         drawdown: (dd !== null && dd !== undefined) ? dd : null,
       };
     });
@@ -1096,6 +1112,25 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const lo = ddMin >= 0 ? -1 : Math.floor(ddMin * 1.15 * 10) / 10;
     return [lo, 0.5];
   }, [drawdownData]);
+
+  // Yearly x-axis ticks: pick the first data point in each calendar year.
+  // Used by both equity and drawdown charts so tick positions are consistent.
+  const yearlyTicks = useMemo(() => {
+    if (!equityData.length) return [];
+    const getYear = (dateStr) => {
+      if (!dateStr) return null;
+      const parts = dateStr.split(/[-\/]/);
+      if (parts.length === 3) return parseInt(parts[2], 10);
+      return null;
+    };
+    const seen = new Set();
+    const ticks = [];
+    equityData.forEach(d => {
+      const yr = getYear(d.date);
+      if (yr && !seen.has(yr)) { seen.add(yr); ticks.push(d.date); }
+    });
+    return ticks;
+  }, [equityData]);
 
   // Calculate stats
   const stats = useMemo(() => {
@@ -1275,53 +1310,49 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const isBuyLeg  = (row) => String(row?.['B/S'] || '').toUpperCase() === 'BUY';
     const isSellLeg = (row) => String(row?.['B/S'] || '').toUpperCase() === 'SELL';
 
+    // Bearish leg: profits when market falls  → CE SELL, PE BUY or FUT SELL
+    // Bullish leg: profits when market rises  → CE BUY,  PE SELL or FUT BUY
+    const isBearishLeg = (row) => {
+      const t  = String(row?.['Type'] || '').toUpperCase();
+      const bs = String(row?.['B/S']  || '').toUpperCase();
+      return ((t === 'CE' || t === 'CALL') && bs === 'SELL') ||
+             ((t === 'PE' || t === 'PUT')  && bs === 'BUY')  ||
+             (t === 'FUT' && bs === 'SELL');
+    };
+    const isBullishLeg = (row) => {
+      const t  = String(row?.['Type'] || '').toUpperCase();
+      const bs = String(row?.['B/S']  || '').toUpperCase();
+      return ((t === 'CE' || t === 'CALL') && bs === 'BUY')  ||
+             ((t === 'PE' || t === 'PUT')  && bs === 'SELL') ||
+             (t === 'FUT' && bs === 'BUY');
+    };
+
+    // Every leg (option or future) is classified by market direction:
+    //   Bullish (CE BUY / PE SELL / FUT BUY)  — adverse when market falls, favorable when rises.
+    //   Bearish (CE SELL / PE BUY / FUT SELL) — adverse when market rises, favorable when falls.
+    // Unified rule (single-leg, multi-leg, options and futures alike):
+    //   Net MAE 1 = sum(bullish MAE) + sum(bearish MFE)
+    //   Net MAE 2 = sum(bullish MFE) + sum(bearish MAE)
+    //   Final MAE = min(Net MAE 1, Net MAE 2)
     const calcTradeMae = (legs) => {
-      const futureLegs = legs.filter(isFutureRow);
-      const optionLegs = legs.filter(isOptionRow);
-      if (optionLegs.length === 0) return null;
+      const dirLegs = legs.filter(r => isOptionRow(r) || isFutureRow(r));
+      if (dirLegs.length === 0) return null;
 
-      const optionMae = sumRequired(optionLegs, 'MAE');
-      const optionMfe = sumRequired(optionLegs, 'MFE');
-      if ([optionMae, optionMfe].some(v => v == null)) return null;
+      const allMae = sumRequired(dirLegs, 'MAE');
+      const allMfe = sumRequired(dirLegs, 'MFE');
+      if ([allMae, allMfe].some(v => v == null)) return null;
 
-      if (futureLegs.length > 0) {
-        const futureMfe = sumRequired(futureLegs, 'MFE');
-        const futureMae = sumRequired(futureLegs, 'MAE');
-        if ([futureMfe, futureMae].some(v => v == null)) return null;
+      const bullishLegs = dirLegs.filter(isBullishLeg);
+      const bearishLegs = dirLegs.filter(isBearishLeg);
 
-        const netMae1 = futureMfe + optionMae;
-        const netMae2 = optionMfe + futureMae;
-        return {
-          netMae1: roundMae(netMae1),
-          netMae2: roundMae(netMae2),
-          finalMae: roundMae(Math.min(netMae1, netMae2)),
-        };
-      }
+      const bullishMae = sumRequired(bullishLegs, 'MAE');
+      const bullishMfe = sumRequired(bullishLegs, 'MFE');
+      const bearishMae = sumRequired(bearishLegs, 'MAE');
+      const bearishMfe = sumRequired(bearishLegs, 'MFE');
+      if ([bullishMae, bullishMfe, bearishMae, bearishMfe].some(v => v == null)) return null;
 
-      // Options-only trade with at least one BUY and at least one SELL option leg:
-      // pair the SELL-side MAE with the BUY-side MFE (and vice versa) to model
-      // the two legs as directionally hedging each other. (Per user spec.)
-      const buyOptionLegs  = optionLegs.filter(isBuyLeg);
-      const sellOptionLegs = optionLegs.filter(isSellLeg);
-      if (buyOptionLegs.length > 0 && sellOptionLegs.length > 0) {
-        const buyMae  = sumRequired(buyOptionLegs,  'MAE');
-        const buyMfe  = sumRequired(buyOptionLegs,  'MFE');
-        const sellMae = sumRequired(sellOptionLegs, 'MAE');
-        const sellMfe = sumRequired(sellOptionLegs, 'MFE');
-        if ([buyMae, buyMfe, sellMae, sellMfe].some(v => v == null)) return null;
-
-        const netMae1 = sellMae + buyMfe;
-        const netMae2 = sellMfe + buyMae;
-        return {
-          netMae1: roundMae(netMae1),
-          netMae2: roundMae(netMae2),
-          finalMae: roundMae(Math.min(netMae1, netMae2)),
-        };
-      }
-
-      // All option legs same side (all BUY or all SELL) — naive sum.
-      const netMae1 = optionMae;
-      const netMae2 = optionMfe;
+      const netMae1 = bullishMae + bearishMfe;
+      const netMae2 = bullishMfe + bearishMae;
       return {
         netMae1: roundMae(netMae1),
         netMae2: roundMae(netMae2),
@@ -2113,11 +2144,16 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     // Build per-trade (% P&L, Actual Live DD) pairs — one entry per unique trade
     const _tradePairs = [];
-    Object.keys(tm).sort((a, b) => parseInt(a, 10) - parseInt(b, 10)).forEach(k => {
+    const _seenChron = new Set();
+    sortedTrades.forEach(tRow => {
+      const k = String(tRow.Trade || tRow.trade || 1);
+      if (_seenChron.has(k) || !tm[k]) return;
+      _seenChron.add(k);
       const t = tm[k];
       const pct = (typeof t.pct === 'number' && Number.isFinite(t.pct)) ? t.pct : null;
       const ldd = (typeof t.actualLiveDD === 'number' && Number.isFinite(t.actualLiveDD)) ? t.actualLiveDD : null;
-      if (pct !== null) _tradePairs.push({ pct, ldd, idx: _tradePairs.length });
+      const mae = (typeof t.finalMae === 'number' && Number.isFinite(t.finalMae)) ? t.finalMae : null;
+      if (pct !== null) _tradePairs.push({ pct, ldd, mae, idx: _tradePairs.length });
     });
     const _nTrades = _tradePairs.length;
     const _byPctDesc = [..._tradePairs].sort((a, b) => b.pct - a.pct);
@@ -2141,9 +2177,29 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         ..._byPctDesc.slice(0, excTop).map(p => p.idx),
         ..._byPctDesc.slice(Math.max(0, _nTrades - excBot)).map(p => p.idx),
       ]);
-      const filtered = _tradePairs.filter(p => !excIdx.has(p.idx) && p.ldd !== null);
+      const filtered = _tradePairs.filter(p => !excIdx.has(p.idx));
       if (filtered.length === 0) return { min: 0, avg: 0 };
-      const ldds = filtered.map(p => p.ldd);
+      let cumulative = 100;
+      let peak = 100;
+      let prevCum = 100;
+      let firstTradeDone = false;
+      const ldds = [];
+      filtered.forEach(p => {
+        cumulative *= (1 + p.pct / 100);
+        peak = Math.max(peak, cumulative);
+        if (p.mae !== null && peak !== 0) {
+          const lowestNav = (!firstTradeDone)
+            ? Math.round(cumulative * 100) / 100
+            : Math.round(prevCum * (1 + p.mae / 100) * 100) / 100;
+          const actualLiveDD = Math.round((lowestNav / peak - 1) * 10000) / 100;
+          ldds.push(actualLiveDD);
+          firstTradeDone = true;
+        } else {
+          firstTradeDone = true;
+        }
+        prevCum = cumulative;
+      });
+      if (ldds.length === 0) return { min: 0, avg: 0 };
       return {
         min: +Math.min(...ldds).toFixed(2),
         avg: +(ldds.reduce((s, v) => s + v, 0) / ldds.length).toFixed(2),
@@ -2250,6 +2306,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       );
     }
     return null;
+  };
+
+  const formatYearOnly = (dateStr) => {
+    if (!dateStr) return '';
+    const parts = dateStr.split(/[-\/]/);
+    if (parts.length === 3) return parts[2];
+    return dateStr;
   };
 
   const formatDateShort = (dateStr) => {
@@ -2391,11 +2454,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   <XAxis
                     dataKey="date"
                     stroke="var(--border-default)"
-                    tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
+                    tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
                     tickLine={false}
-                    tickFormatter={formatDateShort}
-                    interval="preserveStartEnd"
-                    minTickGap={50}
+                    ticks={yearlyTicks}
+                    tickFormatter={formatYearOnly}
                   />
                   <YAxis
                     stroke="var(--border-default)"
@@ -2432,11 +2494,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                   <XAxis
                     dataKey="date"
                     stroke="var(--border-default)"
-                    tick={{ fontSize: 10, fill: 'var(--text-secondary)' }}
+                    tick={{ fontSize: 11, fill: 'var(--text-secondary)' }}
                     tickLine={false}
-                    tickFormatter={formatDateShort}
-                    interval="preserveStartEnd"
-                    minTickGap={50}
+                    ticks={yearlyTicks}
+                    tickFormatter={formatYearOnly}
                   />
                   <YAxis
                     stroke="var(--border-default)"

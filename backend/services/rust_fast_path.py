@@ -113,6 +113,16 @@ def _cache_key_for_df(options_df, spot_df, cache_key: Optional[str]) -> str:
     return f"{_cache_version()}:rust-{digest}"
 
 
+def _safe_cast_date_expr(col_name: str, dtype):
+    """Return a Polars expression that casts a column to pl.Date regardless of source dtype."""
+    import polars as pl
+    # String columns may contain datetime representations like "2021-11-11 00:00:00.000000000"
+    # which cast(pl.Date) rejects. Slice the ISO-date prefix and parse instead.
+    if dtype in (pl.Utf8, pl.String):
+        return pl.col(col_name).str.slice(0, 10).str.to_date(strict=False)
+    return pl.col(col_name).cast(pl.Date)
+
+
 def _write_feather(df, path: Path, columns: List[str]) -> None:
     if df is None or df.is_empty():
         return
@@ -120,14 +130,14 @@ def _write_feather(df, path: Path, columns: List[str]) -> None:
         return
     try:
         import polars as pl
-        # Cast Datetime columns to pl.Date (Arrow Date32) — Rust code only handles Date32
+        # Cast Datetime/string columns to pl.Date (Arrow Date32) — Rust code only handles Date32
         date_cols = [
             c for c in columns
             if c in df.columns and df[c].dtype != pl.Date
             and (c == "Date" or c.endswith("Date"))
         ]
         if date_cols:
-            df = df.with_columns([pl.col(c).cast(pl.Date) for c in date_cols])
+            df = df.with_columns([_safe_cast_date_expr(c, df[c].dtype) for c in date_cols])
         available = [c for c in columns if c in df.columns]
         if set(columns) - set(available):
             logger.warning(
@@ -167,7 +177,7 @@ def _fix_feather_date_format(path: Path) -> bool:
         ]
         if not date_cols:
             return True
-        df = df.with_columns([pl.col(c).cast(pl.Date) for c in date_cols])
+        df = df.with_columns([_safe_cast_date_expr(c, df[c].dtype) for c in date_cols])
         if feather is not None and pa is not None:
             feather.write_feather(df.to_arrow(), tmp, compression="uncompressed")
             os.replace(tmp, path)
@@ -370,12 +380,23 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                 if _oom_risk
                 else f"exceeds RUST_CACHE_MAX_MEMORY_MB={_hard_cap_mb} MB"
             )
-            logger.warning(
-                "[RUST_FAST] Skipping cache load — feather %.0f MB × 5 ≈ %.0f MB: %s. "
-                "Set RUST_CACHE_MAX_MEMORY_MB=0 to uncap or reduce feather size.",
-                _feather_bytes / (1024 ** 2), _estimated_mb, reason,
-            )
-            return False
+            # Strict Rust-only mode: do NOT skip to Python — the memory-gate
+            # (services/memory_gate.py) already ensures only one heavy job is active,
+            # and the SSD swap is the backstop, so load anyway rather than degrade.
+            _strict_rust = os.environ.get("FAST_LOOKUP_MODE", "auto").strip().lower() == "rust"
+            if _strict_rust:
+                logger.warning(
+                    "[RUST_FAST] FAST_LOOKUP_MODE=rust — loading despite memory guard "
+                    "(feather %.0f MB × 5 ≈ %.0f MB: %s). Admission gate + swap are the backstop.",
+                    _feather_bytes / (1024 ** 2), _estimated_mb, reason,
+                )
+            else:
+                logger.warning(
+                    "[RUST_FAST] Skipping cache load — feather %.0f MB × 5 ≈ %.0f MB: %s. "
+                    "Set RUST_CACHE_MAX_MEMORY_MB=0 to uncap or reduce feather size.",
+                    _feather_bytes / (1024 ** 2), _estimated_mb, reason,
+                )
+                return False
         native.load_cache(str(options_path), str(spot_path))
         _loaded_cache_key = key
         _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))

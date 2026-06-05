@@ -933,6 +933,45 @@ def _ensure_schema_wide(engine, cols_cache: Dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cache invalidation after a market-data import
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _invalidate_caches_after_import() -> None:
+    """Refresh ALL backtest caches after a market-data import so re-runs reflect
+    the new data immediately:
+      1. bump the Redis data-version token  → invalidates the result-cache key and
+         signals running workers to drop their in-memory lookup (see base.py);
+      2. delete the on-disk Parquet + Arrow feather caches → they rebuild from the
+         freshly-imported DB (covers stale/truncated feathers the spot-date guard
+         can miss, e.g. an internal hole like a special trading session).
+    Each step is best-effort; a failure (e.g. root-owned cache files when run as a
+    non-root user) never aborts the import."""
+    import shutil
+    try:
+        from services.backtest_cache import bump_data_version
+        bump_data_version()
+    except Exception as e:
+        logger.warning("data_version bump failed: %s", e)
+    try:
+        from services.data_loader import PARQUET_CACHE_DIR
+        for p in Path(PARQUET_CACHE_DIR).glob("*.parquet"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("parquet cache clear skipped: %s", e)
+    try:
+        from services import rust_fast_path as _rf
+        root = _rf._cache_root()
+        for d in list(root.glob("arrow-v2:bulk:*")):
+            shutil.rmtree(d, ignore_errors=True)
+        logger.info("[CACHE] Cleared on-disk feather/parquet after data import")
+    except Exception as e:
+        logger.debug("arrow cache clear skipped: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Migrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1164,6 +1203,15 @@ class Migrator:
         finally:
             if not self.dry_run:
                 self._tracker_finish(tid, result)
+
+        # Auto-invalidate backtest caches when market data actually changed, so
+        # re-runs reflect the new data immediately. CACHE_VERSION only tracks
+        # engine CODE, not DATA — this covers the gap. Every import path (CLI
+        # main, load_data_task, migrate_csv_task) funnels through here.
+        if (not self.dry_run and table in ("option_data", "spot_data")
+                and ((result.get("rows_inserted") or 0)
+                     + (result.get("rows_updated") or 0)) > 0):
+            _invalidate_caches_after_import()
         return result
 
     # ── option_data ───────────────────────────────────────────────────────

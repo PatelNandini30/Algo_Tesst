@@ -89,6 +89,67 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 CACHE_TTL_SECONDS = int(os.getenv("BACKTEST_CACHE_TTL", "86400"))  # 24 hours
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Data-version token
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHE_VERSION above invalidates results when the engine CODE changes — but it
+# is blind to DATA changes (a new trading day, a corrected price, a re-import).
+# This token, bumped on every market-data import, is folded into the cache key
+# so a data change forces a fresh calculation. The same token is read by the
+# in-memory bulk loader (base.bulk_load_options) so long-running workers drop
+# their stale lookup too. Bumped from migrate_data.Migrator on import.
+# ─────────────────────────────────────────────────────────────────────────────
+DATA_VERSION_KEY = os.getenv("BACKTEST_DATA_VERSION_KEY", "algotest:data_version")
+_dv_client_singleton = None
+
+
+def _dv_client():
+    """Lazily-built, reused Redis client for the data-version token."""
+    global _dv_client_singleton
+    if _dv_client_singleton is not None:
+        return _dv_client_singleton
+    try:
+        c = redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, password=REDIS_PASSWORD,
+            decode_responses=True, socket_connect_timeout=2, socket_timeout=2,
+        )
+        c.ping()
+        _dv_client_singleton = c
+        return c
+    except Exception:
+        return None
+
+
+def get_data_version(client=None) -> Optional[str]:
+    """Current data-version token. ``'0'`` when the key is unset; ``None`` when
+    Redis is unreachable (callers MUST treat None as 'unknown' and NOT
+    invalidate, so a Redis outage never changes calculation behaviour)."""
+    try:
+        c = client if client is not None else _dv_client()
+        if c is None:
+            return None
+        v = c.get(DATA_VERSION_KEY)
+        return str(v) if v is not None else "0"
+    except Exception:
+        return None
+
+
+def bump_data_version() -> Optional[str]:
+    """Atomically advance the data-version token. Call after ANY market-data
+    import so every cache layer serves fresh results. Safe no-op if Redis down."""
+    try:
+        c = _dv_client()
+        if c is None:
+            logger.warning("[REDIS] data_version bump skipped (Redis unavailable)")
+            return None
+        v = c.incr(DATA_VERSION_KEY)
+        logger.info("[REDIS] data_version -> %s (backtest caches invalidated)", v)
+        return str(v)
+    except Exception as e:
+        logger.warning("[REDIS] data_version bump failed: %s", e)
+        return None
+
+
 class BacktestCache:
     """
     Redis-based cache for backtest results.
@@ -203,10 +264,16 @@ class BacktestCache:
         from_date_norm = normalize_date(from_date)
         to_date_norm = normalize_date(to_date)
 
+        # Fold the data-version token into the key so a market-data import (which
+        # bumps the token) forces a fresh calculation even though the engine CODE
+        # — and thus CACHE_VERSION — is unchanged.
+        data_ver = get_data_version(self._redis) or "0"
+
         key_payload = {
             'symbol': symbol.upper() if symbol else '',
             'from_date': from_date_norm,
             'to_date': to_date_norm,
+            'data_version': data_ver,
             'config': strategy_config or {}
         }
 

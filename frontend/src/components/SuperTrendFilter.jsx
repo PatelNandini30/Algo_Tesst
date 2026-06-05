@@ -167,10 +167,15 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const prevFilterChangeRef = useRef(null);
   useEffect(() => {
     const payloadSegments = selected === 'custom' ? customSegmentsPayload : null;
+    const filterName = selected === 'custom'
+      ? (csvFileName.replace(/\.[^.]+$/, '') || '')
+      : selectedOption.label;
+
     const filterState = {
       enabled,
       configId: selected,
       configLabel: selectedOption.label,
+      filterName,
       summary: enabled ? summaryPayload : null,
       segments: payloadSegments,
       entryMode,
@@ -185,14 +190,15 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
       prevState.segments       !== filterState.segments       ||
       prevState.entryMode      !== filterState.entryMode      ||
       prevState.lateEntry      !== filterState.lateEntry      ||
-      prevState.minDaysToEntry !== filterState.minDaysToEntry;
+      prevState.minDaysToEntry !== filterState.minDaysToEntry ||
+      prevState.filterName     !== filterState.filterName;
 
     prevFilterChangeRef.current = filterState;
 
     if (!stateChanged) return;
 
     onFilterChange?.(filterState);
-  }, [enabled, selected, selectedOption.label, summaryPayload, customSegmentsPayload, entryMode, lateEntry, minDaysToEntry, onFilterChange]);
+  }, [enabled, selected, selectedOption.label, csvFileName, summaryPayload, customSegmentsPayload, entryMode, lateEntry, minDaysToEntry, onFilterChange]);
 
   const previewRows = useMemo(() => {
     if (!enabled) return [];

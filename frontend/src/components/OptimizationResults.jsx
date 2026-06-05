@@ -259,9 +259,12 @@ export default function OptimizationResults({
         const r = await fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`);
         if (r.status === 200) {
           const blob = await r.blob();
+          const filename =
+            r.headers.get('x-filename') ||
+            `optimize_${jobId.slice(0, 8)}_tradesheets.zip`;
           const a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
-          a.download = `optimize_${jobId.slice(0, 8)}_tradesheets.zip`;
+          a.download = filename;
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);

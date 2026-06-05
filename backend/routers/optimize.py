@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import zipfile
@@ -143,6 +144,7 @@ async def enqueue_optimization(request: Dict[str, Any]):
         "algorithm": algorithm,
         "seed": seed,
         "parallelism": parallelism,
+        "zip_naming": request.get("zip_naming") or None,
     }
     task = run_optimize_job.apply_async(args=[spec], queue="optimize")
     return {
@@ -342,7 +344,13 @@ def _enrich_tradesheet_with_mae_mfe(csv_path: str, index_str: str) -> bool:
 # downloads stream from disk instantly.
 
 _ZIP_CACHE_DIR = "/data/cache/optim_zips"
-_ZIP_BUILDER_VERSION = "v2"
+_ZIP_BUILDER_VERSION = "v6"
+
+_UNSAFE_ZIP_RE = re.compile(r'[/\\:*?"<>|]')
+
+def _safe_zip_name(name: str) -> str:
+    """Sanitize a user-provided name for use in ZIP folder/filename paths."""
+    return _UNSAFE_ZIP_RE.sub('_', str(name or '').strip())
 _zip_build_state: Dict[str, Dict[str, Any]] = {}
 _zip_build_lock = threading.Lock()
 
@@ -393,6 +401,16 @@ def _build_zip_blocking(job_id: str) -> None:
         base_payload = meta.get("base_payload") or {}
         from_date = base_payload.get("from_date") or base_payload.get("date_from") or ""
         to_date   = base_payload.get("to_date")   or base_payload.get("date_to")   or ""
+
+        # Named folder structure when a filter was active during the run.
+        zip_naming = meta.get("zip_naming") or {}
+        if zip_naming:
+            _l1 = _safe_zip_name(zip_naming.get("level1", "")) or "tradesheets"
+            _l2 = _safe_zip_name(zip_naming.get("level2", ""))
+            _l3 = _safe_zip_name(zip_naming.get("level3", ""))
+            tradesheets_root = "/".join(p for p in [_l1, _l2, _l3] if p)
+        else:
+            tradesheets_root = "tradesheets"
 
         files = sorted(os.listdir(trades_dir))
         csv_files = [f for f in files if f.endswith(".csv")]
@@ -445,12 +463,26 @@ def _build_zip_blocking(job_id: str) -> None:
         # starving the host (Granian + 2 worker containers also need CPU).
         max_workers = min(6, max(2, (os.cpu_count() or 4) - 1))
 
+        # When a job swept spot_adjustment_enabled (both true and false), route
+        # each combo into Adjustment/ or No_Adjustment/ subfolders inside the zip.
+        # Use filenames directly — Redis results may be deduplicated (multiple
+        # identical NoAdjustment runs collapse to one row), so label_safe from
+        # the filename is the only reliable source.
+        _has_no_adj = any("NoAdjustment" in f for f in combo_csvs)
+        _has_adj    = any("NoAdjustment" not in f for f in combo_csvs)
+        _use_adj_folders = _has_no_adj and _has_adj
+
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
             # Root CSVs first — these are tiny and don't need parallel build.
             for fname in root_csvs:
                 zf.write(os.path.join(trades_dir, fname), fname)
 
             if build_args:
+                # Track no-adjustment labels already written (strip numeric prefix)
+                # so that identical no-adj runs with different swept pct values
+                # are deduplicated to one file per unique strategy.
+                _no_adj_seen: set = set()
+
                 with ProcessPoolExecutor(max_workers=max_workers) as pool:
                     futures = {pool.submit(_build_one_xlsx, a): a[1] for a in build_args}
                     for fut in as_completed(futures):
@@ -459,14 +491,25 @@ def _build_zip_blocking(job_id: str) -> None:
                             ls, xlsx_bytes, err = fut.result()
                         except Exception as exc:
                             xlsx_bytes, err = None, str(exc)
+                        if _use_adj_folders:
+                            _subfolder = "No_Adjustment" if "NoAdjustment" in label_safe else "Adjustment"
+                            if _subfolder == "No_Adjustment":
+                                _base = label_safe.split("_", 1)[1] if "_" in label_safe else label_safe
+                                if _base in _no_adj_seen:
+                                    state["done"] += 1
+                                    continue
+                                _no_adj_seen.add(_base)
+                            arc_base = f"{tradesheets_root}/{_subfolder}/{label_safe}"
+                        else:
+                            arc_base = f"{tradesheets_root}/{label_safe}"
                         if xlsx_bytes is not None:
-                            zf.writestr(f"tradesheets/{label_safe}.xlsx", xlsx_bytes)
+                            zf.writestr(f"{arc_base}.xlsx", xlsx_bytes)
                         else:
                             logger.warning("[ZIP] XLSX failed for %s: %s — using CSV",
                                            label_safe, err)
                             csv_path = os.path.join(trades_dir, f"{label_safe}.csv")
                             if os.path.isfile(csv_path):
-                                zf.write(csv_path, f"tradesheets/{label_safe}.csv")
+                                zf.write(csv_path, f"{arc_base}.csv")
                         state["done"] += 1
 
         os.replace(tmp_path, out_path)
@@ -494,11 +537,15 @@ async def download_tradesheets_zip(job_id: str):
     # The presence of the file itself is proof the job ran to completion.
     cache_path = _zip_cache_path(job_id)
     if os.path.isfile(cache_path):
-        filename = f"optimize_{job_id[:8]}_tradesheets.zip"
+        _meta_for_name = result_store.get_meta(job_id) or {}
+        _zip_naming = _meta_for_name.get("zip_naming") or {}
+        _level1 = _safe_zip_name(_zip_naming.get("level1", "")) if _zip_naming else ""
+        filename = f"{_level1}.zip" if _level1 else f"optimize_{job_id[:8]}_tradesheets.zip"
         return FileResponse(
             cache_path,
             media_type="application/zip",
             filename=filename,
+            headers={"X-Filename": filename},
         )
 
     meta = result_store.get_meta(job_id)
@@ -611,6 +658,13 @@ async def cancel_optimize_job(job_id: str):
         celery_app.control.revoke(job_id, terminate=True)
     except Exception as exc:
         logger.warning("Could not revoke %s: %s", job_id, exc)
+    # Free the memory-gate reservation immediately so a queued job can start
+    # (the TTL would also reclaim it, but cancellation should free it at once).
+    try:
+        from services import memory_gate
+        memory_gate.release(job_id)
+    except Exception as exc:
+        logger.debug("memory_gate release on cancel failed: %s", exc)
     result_store.delete_job(job_id)
     result_store.delete_job_trades(job_id)
     return {"status": "deleted", "job_id": job_id}

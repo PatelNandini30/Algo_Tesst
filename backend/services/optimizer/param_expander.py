@@ -168,7 +168,7 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
     new_payload = apply_combo(payload, combo)
 
     spot_adj_implied = any(k in _SPOT_ADJ_KEYS for k in combo)
-    if spot_adj_implied:
+    if spot_adj_implied and "spot_adjustment_enabled" not in combo:
         new_payload["spot_adjustment_enabled"] = True
 
     for path in combo:

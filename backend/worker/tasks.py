@@ -53,6 +53,18 @@ def run_backtest_task(self, params: dict):
 @celery_app.task(bind=True)
 def run_algotest_job(self, params: dict):
     """Execute AlgoTest backtest via shared service."""
+    # Admission gate: wait for a memory slot before the engine runs so concurrent
+    # heavy jobs cannot overcommit RAM (no-OOM). Pure gating — the backtest math
+    # below is unchanged. See services/memory_gate.py.
+    from services import memory_gate
+    rid = self.request.id or ""
+    memory_gate.acquire(
+        rid,
+        memory_gate.cost_for("backtest"),
+        on_wait=lambda: self.update_state(
+            state='PROCESSING', meta={'status': 'queued: waiting for memory budget'}
+        ),
+    )
     try:
         self.update_state(state='PROCESSING', meta={'status': 'Running AlgoTest backtest'})
         from services.algotest_job import execute_algotest_job
@@ -63,6 +75,8 @@ def run_algotest_job(self, params: dict):
             'status': 'error',
             'message': str(e)
         })
+    finally:
+        memory_gate.release(rid)
 
 
 @celery_app.task(bind=True)
@@ -74,6 +88,17 @@ def run_optimize_job(self, spec: dict):
             base_payload, param_specs, method, sample_n, objective,
             algorithm, seed
     """
+    # Admission gate (no-OOM): reserve the optimize memory budget before the
+    # sweep starts; if busy the job waits (queued) instead of overcommitting RAM.
+    from services import memory_gate
+    rid = self.request.id or ""
+    memory_gate.acquire(
+        rid,
+        memory_gate.cost_for("optimize"),
+        on_wait=lambda: self.update_state(
+            state='PROCESSING', meta={'status': 'queued: waiting for memory budget'}
+        ),
+    )
     try:
         from services.optimizer.runner import run_optimization
         self.update_state(state='PROCESSING', meta={'status': 'Starting optimization'})
@@ -87,10 +112,28 @@ def run_optimize_job(self, spec: dict):
             algorithm=spec.get('algorithm'),
             seed=spec.get('seed'),
             parallelism=spec.get('parallelism'),
+            zip_naming=spec.get('zip_naming'),
         )
+        # Pre-build the tradesheets ZIP and wait for it to finish so the
+        # user gets an instant download instead of a progress bar.
+        try:
+            import time as _time
+            import requests as _req
+            _url = f'http://backend:8000/api/optimize/jobs/{self.request.id}/tradesheets.zip'
+            _req.get(_url, timeout=10)          # trigger the build (returns 202)
+            _deadline = _time.time() + 20 * 60  # wait up to 20 minutes
+            while _time.time() < _deadline:
+                _time.sleep(3)
+                _r = _req.get(_url, timeout=10)
+                if _r.status_code == 200:
+                    break                       # ZIP is ready
+        except Exception:
+            pass  # Non-critical — ZIP will still build on-demand if this fails
         return _sanitize_result(result)
     except Exception as e:
         return _sanitize_result({'status': 'error', 'message': str(e)})
+    finally:
+        memory_gate.release(rid)
 
 
 @celery_app.task(bind=True)

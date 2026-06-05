@@ -314,7 +314,7 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
                 _ohlc_from = _pd_dt.Timestamp(from_date).date()
                 _ohlc_to = _pd_dt.Timestamp(to_date).date()
                 _needed_p = ["Symbol", "Date", "ExpiryDate", "StrikePrice",
-                             "OptionType", "High", "Low"]
+                             "OptionType", "High", "Low", "SettledPrice"]
                 _reader_p = _pa_ipc_p.open_file(str(_fpath))
                 _avail_p = set(_reader_p.schema.names)
                 _sel_p = [c for c in _needed_p if c in _avail_p]
@@ -333,7 +333,7 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
                 for _col_p in ("Symbol", "OptionType"):
                     if _col_p in _ohlc_pd_p.columns and _ohlc_pd_p[_col_p].dtype == object:
                         _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("category")
-                for _col_p in ("High", "Low"):
+                for _col_p in ("High", "Low", "SettledPrice"):
                     if _col_p in _ohlc_pd_p.columns:
                         _ohlc_pd_p[_col_p] = _ohlc_pd_p[_col_p].astype("float32")
                 if "StrikePrice" in _ohlc_pd_p.columns:
@@ -662,10 +662,45 @@ def set_rust_context(ctx: Optional[Dict[str, Any]]) -> None:
     _RUST_CONTEXT = ctx
 
 
+def _is_bearish_leg(leg_type: str, leg_bs: str) -> bool:
+    """CE SELL, PE BUY or FUT SELL — profits when market falls."""
+    t  = leg_type.upper()
+    bs = leg_bs.upper()
+    return (
+        (t in ("CE", "CALL") and bs == "SELL")
+        or (t in ("PE", "PUT") and bs == "BUY")
+        or (t == "FUT" and bs == "SELL")
+    )
+
+
+def _is_bullish_leg(leg_type: str, leg_bs: str) -> bool:
+    """CE BUY, PE SELL or FUT BUY — profits when market rises."""
+    t  = leg_type.upper()
+    bs = leg_bs.upper()
+    return (
+        (t in ("CE", "CALL") and bs == "BUY")
+        or (t in ("PE", "PUT") and bs == "SELL")
+        or (t == "FUT" and bs == "BUY")
+    )
+
+
 def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame") -> Optional[float]:
     """
     Compute finalMae for a group of trade legs.
     Mirrors buildTradeExcel.js calcTradeMae function exactly.
+
+    Every leg (option or future) is classified by market direction:
+      Bullish (CE BUY / PE SELL / FUT BUY):  adverse when market falls, favorable when rises.
+      Bearish (CE SELL / PE BUY / FUT SELL): adverse when market rises, favorable when falls.
+
+    Unified rule (single-leg, multi-leg, options and futures alike):
+      Net MAE 1 = sum(bullish MAE) + sum(bearish MFE)
+      Net MAE 2 = sum(bullish MFE) + sum(bearish MAE)
+      Final MAE = min(Net MAE 1, Net MAE 2)
+
+    When every leg shares one direction this collapses to "all MAE" vs
+    "all MFE"; mixed directions cross automatically.
+
     Returns None when MAE/MFE are all zero (not yet computed).
     """
     def _sum(legs: "pd.DataFrame", col: str) -> Optional[float]:
@@ -674,43 +709,48 @@ def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame") -> Optional[float]:
             return None
         return float(vals.sum())
 
-    opt_types = {"CE", "PE", "CALL", "PUT"}
-    opt_legs = trade_legs[trade_legs["Type"].str.upper().isin(opt_types)]
-    fut_legs = trade_legs[trade_legs["Type"].str.upper() == "FUT"]
-    if opt_legs.empty:
+    dir_types = {"CE", "PE", "CALL", "PUT", "FUT"}
+    dir_legs = trade_legs[trade_legs["Type"].str.upper().isin(dir_types)]
+    if dir_legs.empty:
         return None
 
-    opt_mae = _sum(opt_legs, "MAE")
-    opt_mfe = _sum(opt_legs, "MFE")
-    if opt_mae is None or opt_mfe is None:
+    all_mae = _sum(dir_legs, "MAE")
+    all_mfe = _sum(dir_legs, "MFE")
+    if all_mae is None or all_mfe is None:
         return None
-    if opt_mae == 0.0 and opt_mfe == 0.0:
+    if all_mae == 0.0 and all_mfe == 0.0:
         return None  # MAE/MFE columns not yet computed
 
-    if not fut_legs.empty:
-        fut_mae = _sum(fut_legs, "MAE")
-        fut_mfe = _sum(fut_legs, "MFE")
-        if fut_mae is None or fut_mfe is None:
-            return None
-        net_mae1 = fut_mfe + opt_mae
-        net_mae2 = opt_mfe + fut_mae
-    else:
-        buy_legs = opt_legs[opt_legs["B/S"].str.upper() == "BUY"]
-        sell_legs = opt_legs[opt_legs["B/S"].str.upper() == "SELL"]
-        if not buy_legs.empty and not sell_legs.empty:
-            buy_mae = _sum(buy_legs, "MAE")
-            buy_mfe = _sum(buy_legs, "MFE")
-            sell_mae = _sum(sell_legs, "MAE")
-            sell_mfe = _sum(sell_legs, "MFE")
-            if any(v is None for v in (buy_mae, buy_mfe, sell_mae, sell_mfe)):
-                return None
-            net_mae1 = sell_mae + buy_mfe  # type: ignore[operator]
-            net_mae2 = sell_mfe + buy_mae  # type: ignore[operator]
-        else:
-            net_mae1 = opt_mae
-            net_mae2 = opt_mfe
+    bullish_mask = dir_legs.apply(
+        lambda r: _is_bullish_leg(str(r["Type"]), str(r["B/S"])), axis=1
+    )
+    bearish_mask = dir_legs.apply(
+        lambda r: _is_bearish_leg(str(r["Type"]), str(r["B/S"])), axis=1
+    )
+    bullish_mae = _sum(dir_legs[bullish_mask], "MAE")
+    bullish_mfe = _sum(dir_legs[bullish_mask], "MFE")
+    bearish_mae = _sum(dir_legs[bearish_mask], "MAE")
+    bearish_mfe = _sum(dir_legs[bearish_mask], "MFE")
+    if any(v is None for v in (bullish_mae, bullish_mfe, bearish_mae, bearish_mfe)):
+        return None
 
+    net_mae1 = bullish_mae + bearish_mfe  # type: ignore[operator]
+    net_mae2 = bullish_mfe + bearish_mae  # type: ignore[operator]
     return round(min(net_mae1, net_mae2) * 10000) / 10000
+
+
+def _expiry_cands_str(expiry_str: str) -> List[str]:
+    """Return [exact, +1day, -1day] ISO strings — mirrors engine._expiry_candidates."""
+    try:
+        import pandas as _pd
+        ts = _pd.Timestamp(expiry_str)
+        return [
+            ts.strftime("%Y-%m-%d"),
+            (ts + _pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            (ts - _pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        ]
+    except Exception:
+        return [expiry_str]
 
 
 def _compute_mae_mfe_batch(
@@ -844,13 +884,19 @@ def _compute_mae_mfe_batch(
                 & (_full_pd["Date"] <= _to_ts)
             )
             _cols = ["ExpiryDate", "OptionType", "strike_r", "Date", "High", "Low"]
+            if "SettledPrice" in _full_pd.columns:
+                _cols = _cols + ["SettledPrice"]
             ohlc_pd = _full_pd.loc[_mask, _cols].copy()
             ohlc_pd["date_str"] = ohlc_pd["Date"].dt.strftime("%Y-%m-%d")
             ohlc_pd["expiry_str"] = ohlc_pd["ExpiryDate"].dt.strftime("%Y-%m-%d")
             # OptionType is Categorical — cast to str for tuple comparison & MultiIndex.
             if str(ohlc_pd["OptionType"].dtype) == "category":
                 ohlc_pd["OptionType"] = ohlc_pd["OptionType"].astype(str)
-            needed = {(r["expiry_str"], r["opt_type"], int(round(r["strike"]))) for r in valid_rows}
+            needed = {
+                (cand, r["opt_type"], int(round(r["strike"])))
+                for r in valid_rows
+                for cand in _expiry_cands_str(r["expiry_str"])
+            }
             ohlc_pd = ohlc_pd[
                 [(e, t, s) in needed for e, t, s in zip(
                     ohlc_pd["expiry_str"], ohlc_pd["OptionType"], ohlc_pd["strike_r"]
@@ -858,22 +904,28 @@ def _compute_mae_mfe_batch(
             ]
             if ohlc_pd.empty:
                 return df
+            _val_cols = ["High", "Low"] + (["SettledPrice"] if "SettledPrice" in ohlc_pd.columns else [])
             ohlc_idx = ohlc_pd.set_index(
                 ["expiry_str", "OptionType", "strike_r", "date_str"]
-            )[["High", "Low"]]
+            )[_val_cols]
         except Exception as exc:
             logger.debug("[OPTIM] MAE/MFE pandas fast-path failed: %s", exc)
             return df
     else:
         try:
             lookup_rows = []
+            seen_lookup: set = set()
             for (exp_str, opt, strike) in unique_combos:
-                exp_dt = _pd3.Timestamp(exp_str).date()
-                lookup_rows.append({
-                    "ExpiryDate": exp_dt,
-                    "OptionType": opt,
-                    "strike_r": int(round(strike)),
-                })
+                for cand_str in _expiry_cands_str(exp_str):
+                    key = (cand_str, opt, int(round(strike)))
+                    if key in seen_lookup:
+                        continue
+                    seen_lookup.add(key)
+                    lookup_rows.append({
+                        "ExpiryDate": _pd3.Timestamp(cand_str).date(),
+                        "OptionType": opt,
+                        "strike_r": int(round(strike)),
+                    })
             lookup_df = pl.DataFrame(
                 lookup_rows,
                 schema={"ExpiryDate": pl.Date, "OptionType": pl.Utf8, "strike_r": pl.Int32},
@@ -885,10 +937,19 @@ def _compute_mae_mfe_batch(
                 & (pl.col("Date") <= to_dt)
             )
             _sel = ["ExpiryDate", "OptionType", "StrikePrice", "Date", "High", "Low"]
-
+            # Include SettledPrice when the source carries it — enables the
+            # backtest's zero-high/low → settled-price substitution below.
             if _ctx and "ohlc_df" in _ctx:
+                if "SettledPrice" in _ctx["ohlc_df"].columns:
+                    _sel = _sel + ["SettledPrice"]
                 date_filtered = _ctx["ohlc_df"].filter(date_filter).select(_sel)
             else:
+                try:
+                    _feather_has_settled = "SettledPrice" in pl.read_ipc_schema(str(feather))
+                except Exception:
+                    _feather_has_settled = False
+                if _feather_has_settled:
+                    _sel = _sel + ["SettledPrice"]
                 date_filtered = pl.scan_ipc(str(feather)).filter(date_filter).select(_sel).collect()
 
             # Round strike to int for the join key (matches strike_r in lookup_df)
@@ -914,7 +975,8 @@ def _compute_mae_mfe_batch(
             ohlc_pd["date_str"] = _pd4.to_datetime(ohlc_pd["Date"]).dt.strftime("%Y-%m-%d")
             ohlc_pd["expiry_str"] = _pd4.to_datetime(ohlc_pd["ExpiryDate"]).dt.strftime("%Y-%m-%d")
             ohlc_pd["strike_r"] = ohlc_pd["StrikePrice"].round(0).astype(int)
-            ohlc_idx = ohlc_pd.set_index(["expiry_str", "OptionType", "strike_r", "date_str"])[["High", "Low"]]
+            _val_cols = ["High", "Low"] + (["SettledPrice"] if "SettledPrice" in ohlc_pd.columns else [])
+            ohlc_idx = ohlc_pd.set_index(["expiry_str", "OptionType", "strike_r", "date_str"])[_val_cols]
         except Exception as exc:
             logger.debug("[OPTIM] MAE/MFE ohlc index build failed: %s", exc)
             return df
@@ -922,6 +984,11 @@ def _compute_mae_mfe_batch(
     df = df.copy()
     mae_vals = list(df["MAE"]) if "MAE" in df.columns else [0.0] * len(df)
     mfe_vals = list(df["MFE"]) if "MFE" in df.columns else [0.0] * len(df)
+
+    # Whether the per-day lookup carries SettledPrice. When present we apply the
+    # backtest's zero-high/low → settled-price substitution (mirrors get_ohlc_range
+    # in backend/native/src/lib.rs) so optim MAE/MFE match the backtest tradesheet.
+    _has_settled = "SettledPrice" in getattr(ohlc_idx, "columns", [])
 
     for r in valid_rows:
         pos = r["pos"]
@@ -939,18 +1006,43 @@ def _compute_mae_mfe_batch(
         hi = bisect.bisect_right(td_sorted, win_end)
         window_days = td_sorted[lo:hi]
 
+        exp_cands = _expiry_cands_str(exp)
         highs: List[float] = []
         lows: List[float] = []
         for d in window_days:
-            try:
-                row_ohlc = ohlc_idx.loc[(exp, opt, strike_r, d)]
-                # loc returns Series (single match) or DataFrame (rare duplicates)
-                if isinstance(row_ohlc, pd.DataFrame):
-                    row_ohlc = row_ohlc.iloc[0]
-                highs.append(float(row_ohlc["High"]))
-                lows.append(float(row_ohlc["Low"]))
-            except (KeyError, IndexError, TypeError):
-                pass
+            for cand_exp in exp_cands:
+                try:
+                    row_ohlc = ohlc_idx.loc[(cand_exp, opt, strike_r, d)]
+                    # loc returns Series (single match) or DataFrame (rare duplicates)
+                    if isinstance(row_ohlc, pd.DataFrame):
+                        row_ohlc = row_ohlc.iloc[0]
+                    _high = float(row_ohlc["High"])
+                    _low = float(row_ohlc["Low"])
+                    # Per-value SettledPrice substitution — mirrors the backtest's
+                    # get_ohlc_range (backend/native/src/lib.rs): when High/Low is 0
+                    # (illiquid / expiry day with no intraday trades) fall back to
+                    # that day's settled price, applied independently to High and Low.
+                    # A zero with no usable settled price contributes nothing, exactly
+                    # as the Rust path leaves max_high/min_low unchanged for that day.
+                    _settled = None
+                    if _has_settled:
+                        try:
+                            _sv = float(row_ohlc["SettledPrice"])
+                            if _sv > 0.0:
+                                _settled = _sv
+                        except (KeyError, TypeError, ValueError):
+                            _settled = None
+                    if _high > 0.0:
+                        highs.append(_high)
+                    elif _settled is not None:
+                        highs.append(_settled)
+                    if _low > 0.0:
+                        lows.append(_low)
+                    elif _settled is not None:
+                        lows.append(_settled)
+                    break
+                except (KeyError, IndexError, TypeError):
+                    continue
 
         if not highs or not lows:
             continue
@@ -1337,6 +1429,7 @@ def run_optimization(
     seed: Optional[int] = None,
     progress_every: int = 1,
     parallelism: Optional[int] = None,
+    zip_naming: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Top-level entry point invoked by the Celery task.
@@ -1356,7 +1449,7 @@ def run_optimization(
         total=total,
         method=method,
         objective=obj.name,
-        extra={"sample_n": sample_n, "algorithm": algorithm},
+        extra={"sample_n": sample_n, "algorithm": algorithm, "zip_naming": zip_naming},
     )
 
     result_store.write_run_config(

@@ -78,7 +78,11 @@ export const OPTIM_PARAM_GROUPS = [
       {
         path: 'legs[I].strike_selection.strike_type',
         label: 'Strike type (enum)',
-        ...ENUM(['ATM', 'ITM1', 'ITM2', 'ITM3', 'OTM1', 'OTM2', 'OTM3']),
+        ...ENUM([
+          'ATM',
+          'ITM1', 'ITM2', 'ITM3', 'ITM4', 'ITM5', 'ITM6', 'ITM7', 'ITM8', 'ITM9', 'ITM10',
+          'OTM1', 'OTM2', 'OTM3', 'OTM4', 'OTM5', 'OTM6', 'OTM7', 'OTM8', 'OTM9', 'OTM10',
+        ]),
       },
       {
         path: 'legs[I].expiry',
@@ -152,6 +156,12 @@ export const OPTIM_PARAM_GROUPS = [
         path: 'spot_adjustment_direction',
         label: 'Spot Adjustment direction',
         ...ENUM(['rise', 'fall', 'both']),
+      },
+      {
+        path: 'spot_adjustment_enabled',
+        label: 'No Adjustment',
+        ...ENUM([false, true]),
+        valueLabels: { false: 'No Adj', true: 'With Adj' },
       },
     ],
   },

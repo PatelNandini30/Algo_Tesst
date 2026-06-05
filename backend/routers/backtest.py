@@ -762,3 +762,20 @@ async def get_algotest_job_status(job_id: str):
             error = str(info)
         return {"status": "failed", "error": error}
     return {"status": state.lower(), "meta": info}
+
+
+@router.delete("/algotest/jobs/{job_id}")
+async def cancel_algotest_job(job_id: str):
+    """Cancel a queued/running AlgoTest backtest: revoke the Celery task and free
+    its memory-gate reservation immediately so a queued job can start at once
+    (the reservation TTL would also reclaim it, but cancel should free it now)."""
+    try:
+        celery_app.control.revoke(job_id, terminate=True)
+    except Exception as exc:
+        logger.warning("Could not revoke backtest %s: %s", job_id, exc)
+    try:
+        from services import memory_gate
+        memory_gate.release(job_id)
+    except Exception as exc:
+        logger.debug("memory_gate release on cancel failed: %s", exc)
+    return {"status": "cancelled", "job_id": job_id}

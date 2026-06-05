@@ -17,6 +17,71 @@ import {
 const DEFAULT_METHOD = 'exhaustive';
 const DEFAULT_OBJECTIVE = 'total_pnl';
 
+function _getSLType(legs, selectedList) {
+  // Check base payload legs
+  for (const leg of (legs || [])) if (leg.trailSL) return 'trail';
+  for (const leg of (legs || [])) if (leg.slWithBuffer?.value) return 'buffer';
+  for (const leg of (legs || [])) if (leg.stopLoss?.value) return 'sl';
+  // Fallback: check if SL params are being swept (base may not have SL pre-set)
+  const paths = (selectedList || []).map(s => s.path);
+  if (paths.some(p => p.includes('trailSL'))) return 'trail';
+  if (paths.some(p => p.includes('slWithBuffer'))) return 'buffer';
+  if (paths.some(p => p.includes('stopLoss'))) return 'sl';
+  return null;
+}
+
+function _getRolloverStrikeMode(legs) {
+  for (const leg of (legs || [])) {
+    if ((leg.segment || 'options') === 'options') return leg.rollover_strike_mode || 'fresh';
+  }
+  return 'fresh';
+}
+
+function buildZipNaming(basePayload, filterName, selectedList = []) {
+  if (!filterName) return null;
+  const legs = basePayload.legs || [];
+  const sweepsAdjustment = selectedList.some(s => s.path === 'spot_adjustment_enabled');
+
+  // Leg descriptions — CE first, then PE
+  const order = ['CE', 'PE'];
+  const legDesc = (leg) => {
+    const t = (leg.option_type || '').toUpperCase();
+    const p = (leg.position || '').toLowerCase();
+    return `${t} ${(p === 'sell' || p === 'short') ? 'Sell' : 'Buy'}`;
+  };
+  const legsStr = order
+    .flatMap(t => legs.filter(l => (l.option_type || '').toUpperCase() === t).map(legDesc))
+    .join(' ');
+
+  const slType = _getSLType(legs, selectedList);
+  const slLevel2 = { trail: 'Trail SL', buffer: 'SL With Buffer', sl: 'SL' }[slType] || null;
+  const slLevel3 = { trail: 'With Trail SL', buffer: 'With SL Buffer', sl: 'With SL' }[slType] || null;
+
+  const adjEnabled = Boolean(basePayload.spot_adjustment_enabled);
+  const adjLevel2 = adjEnabled ? 'With Adj' : 'No Adj';
+  const adjLevel3 = adjEnabled ? 'Adjustment' : 'No Adjustment';
+
+  const hasRollover   = Boolean(basePayload.rollover_toggle);
+  const hasNoRollover = Boolean(basePayload.no_rollover);
+  const rolloverPart  = hasRollover ? 'Rollover' : hasNoRollover ? 'No Rollover' : null;
+  const strikePart    = (hasRollover || hasNoRollover)
+    ? (_getRolloverStrikeMode(legs) === 'fixed' ? 'Fixed' : 'Fresh')
+    : null;
+
+  const entryDte = Number(basePayload.entry_dte || 0);
+  const exitDte  = Number(basePayload.exit_dte  || 0);
+  const dteLevel2 = `T-${entryDte} to T-${exitDte}`;
+  const dteLevel3 = `T-${entryDte} to T-${exitDte}`;
+
+  const level2 = [slLevel2, sweepsAdjustment ? null : adjLevel2, rolloverPart, strikePart, dteLevel2].filter(Boolean).join(' ');
+  const level3Parts = ['Tradesheet of', legsStr, `In ${filterName}`];
+  if (!sweepsAdjustment) level3Parts.push(adjLevel3);
+  if (slLevel3) level3Parts.push(slLevel3);
+  level3Parts.push(dteLevel3);
+
+  return { level1: filterName, level2, level3: level3Parts.join(' ') };
+}
+
 function combosForSpec(spec) {
   if (spec.kind === 'enum') return (spec.values || []).length;
   const { min, max, step } = spec;
@@ -60,6 +125,7 @@ export default function OptimizePanel({
   algorithm, setAlgorithm,
   objective, setObjective,
   parallelism, setParallelism,
+  filterName,
 }) {
   const allParams = useMemo(() => expandSchemaForLegs(nLegs || 1), [nLegs]);
   const grouped = useMemo(() => {
@@ -170,14 +236,16 @@ export default function OptimizePanel({
     setSubmitting(true);
     setError(null);
     try {
+      const _baseForNaming = basePayloadWithOverrides();
       const body = {
-        base_payload: basePayloadWithOverrides(),
+        base_payload: _baseForNaming,
         param_specs: specsToPayload(selectedList),
         method,
         sample_n: method === 'exhaustive' ? null : Number(sampleN) || 0,
         objective,
         algorithm: method === 'smart' ? algorithm : null,
         parallelism: parallelism || cpuInfo.default_parallelism,
+        zip_naming: buildZipNaming(_baseForNaming, filterName, selectedList),
       };
       const res = await fetch('/api/optimize/jobs', {
         method: 'POST',
@@ -403,6 +471,7 @@ export default function OptimizePanel({
                           <EnumChips
                             options={p.values || spec.values || []}
                             selected={spec.values || []}
+                            valueLabels={p.valueLabels}
                             onChange={(arr) => {
                               setSavedValues((sv) => ({ ...sv, [p.path]: { ...sv[p.path], values: arr } }));
                             }}
@@ -736,7 +805,7 @@ function RangeNum({ label, value, onChange }) {
  *   selected — currently-included subset
  *   onChange — (nextSelectedArray) => void
  */
-function EnumChips({ options, selected, onChange }) {
+function EnumChips({ options, selected, onChange, valueLabels }) {
   const opts = options && options.length ? options : selected || [];
   const selSet = new Set(selected || []);
   const allOn = opts.length > 0 && opts.every((o) => selSet.has(o));
@@ -783,7 +852,7 @@ function EnumChips({ options, selected, onChange }) {
               type="button"
               onClick={() => toggle(opt)}
               aria-pressed={on}
-              title={on ? `Remove ${opt}` : `Add ${opt}`}
+              title={on ? `Remove ${valueLabels && valueLabels[opt] != null ? valueLabels[opt] : String(opt)}` : `Add ${valueLabels && valueLabels[opt] != null ? valueLabels[opt] : String(opt)}`}
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -822,7 +891,7 @@ function EnumChips({ options, selected, onChange }) {
               >
                 {on ? <Check size={10} strokeWidth={3} /> : null}
               </span>
-              {opt}
+              {valueLabels && valueLabels[opt] != null ? valueLabels[opt] : String(opt)}
             </button>
           );
         })}

@@ -12,6 +12,7 @@ IMPORTANT: No calculation logic is changed. Only HOW data is fetched.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Optional, Dict, Tuple
 
@@ -70,6 +71,16 @@ def build_fast_lookup(options_df, spot_df, cache_key_override: Optional[str] = N
             return
     except Exception as exc:
         logger.debug("[FAST_LOOKUP] Rust cache build skipped: %s", exc)
+
+    # Strict Rust-only mode (FAST_LOOKUP_MODE=rust): refuse the Python dict
+    # fallback so a backtest never silently runs the slow path. A genuine native
+    # extension / feather problem surfaces immediately as a clear error instead.
+    if os.environ.get("FAST_LOOKUP_MODE", "auto").strip().lower() == "rust":
+        raise RuntimeError(
+            "FAST_LOOKUP_MODE=rust but the native lookup cache could not be built "
+            "(Rust extension unavailable or feather missing/unbuildable). "
+            "Refusing Python fallback — fix the native cache or unset FAST_LOOKUP_MODE=rust."
+        )
 
     # Fallback path only for environments without the native extension.
     n_opt = 0

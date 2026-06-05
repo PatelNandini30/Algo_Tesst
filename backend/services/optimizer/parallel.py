@@ -198,7 +198,7 @@ def _worker_entrypoint(
                     # Only the columns _compute_mae_mfe_batch needs — skips
                     # Open/Close/Volume and any other heavy fields in the feather.
                     _needed = ["Symbol", "Date", "ExpiryDate", "StrikePrice",
-                               "OptionType", "High", "Low"]
+                               "OptionType", "High", "Low", "SettledPrice"]
                     _reader = _pa_ipc.open_file(str(_feather_path))
                     _avail = set(_reader.schema.names)
                     _sel = [c for c in _needed if c in _avail]
@@ -233,7 +233,7 @@ def _worker_entrypoint(
                             _ohlc_pd[_col] = _ohlc_pd[_col].astype("category")
                     # Cast prices to float32 — halves their memory vs float64,
                     # and MAE/MFE math doesn't need float64 precision.
-                    for _col in ("High", "Low"):
+                    for _col in ("High", "Low", "SettledPrice"):
                         if _col in _ohlc_pd.columns:
                             _ohlc_pd[_col] = _ohlc_pd[_col].astype("float32")
                     # Pre-compute strike_r once, drop StrikePrice — saves another ~15 MB.
@@ -378,8 +378,41 @@ def run_parallel(
 
     ctx = get_context("fork")
 
+    # Dispose the SQLAlchemy pool BEFORE forking so children don't inherit a
+    # connection that is mid-read (causes psycopg2 "D without T" errors when a
+    # child hits load_expiry via the Python fallback path). Disposing in the
+    # parent before fork is safe — the pool lazily reopens connections as needed.
+    # Do NOT call dispose() inside _worker_entrypoint (the child) — the pool
+    # lock may be held by a dead parent thread, causing a futex deadlock.
+    try:
+        from database import get_engine as _get_db_engine
+        _get_db_engine().dispose()
+    except Exception:
+        pass
+
     t0 = time.perf_counter()
     pool = ctx.Pool(processes=parallelism)
+
+    # When Celery revokes this task it sends SIGTERM to this process.
+    # The billiard fork children are in a separate process group and do NOT
+    # receive that signal — they keep running their full combo chunk.
+    # Install a SIGTERM handler that calls pool.terminate() so all children
+    # are killed immediately when the task is cancelled.
+    import signal as _signal
+    _pool_ref = [pool]
+
+    def _on_terminate(signum, frame):
+        try:
+            _pool_ref[0].terminate()
+        except Exception:
+            pass
+        raise SystemExit(0)
+
+    try:
+        _old_sigterm = _signal.signal(_signal.SIGTERM, _on_terminate)
+    except (OSError, ValueError):
+        _old_sigterm = None  # not the main thread — signal() not allowed
+
     try:
         offset = 1
         async_results = []
@@ -407,10 +440,17 @@ def run_parallel(
                 except Exception:
                     pass
         pool.join()
-    except Exception:
+    except BaseException:
         pool.terminate()
         pool.join()
         raise
+    finally:
+        _pool_ref[0] = None
+        if _old_sigterm is not None:
+            try:
+                _signal.signal(_signal.SIGTERM, _old_sigterm)
+            except (OSError, ValueError):
+                pass
     logger.info(
         "[OPTIM_PARALLEL] %d combos in %.2fs across %d workers",
         total_done,

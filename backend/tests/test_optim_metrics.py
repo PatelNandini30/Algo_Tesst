@@ -69,26 +69,25 @@ class TestLiveDD(unittest.TestCase):
 
 
 class TestOutlierStripped(unittest.TestCase):
-    def test_drop_top_n_changes_dd(self):
+    def test_rebuilds_path_after_outlier_removal(self):
         df = _trades(
             [
-                {"Trade": 1, "Entry Date": "01-01-2024", "Net P&L %": 1.0, "Lowest NAV During Trade": 99, "Peak": 100},
-                {"Trade": 2, "Entry Date": "02-01-2024", "Net P&L %": 3.0, "Lowest NAV During Trade": 98, "Peak": 101},
-                {"Trade": 3, "Entry Date": "03-01-2024", "Net P&L %": -2.0, "Lowest NAV During Trade": 96, "Peak": 101},
-                {"Trade": 4, "Entry Date": "04-01-2024", "Net P&L %": 4.0, "Lowest NAV During Trade": 97, "Peak": 102},
-                {"Trade": 5, "Entry Date": "05-01-2024", "Net P&L %": -5.0, "Lowest NAV During Trade": 94, "Peak": 102},
+                {"Trade": 1, "Entry Date": "01-01-2024", "Net P&L %": -24.94, "Final MAE": -5.40},
+                {"Trade": 2, "Entry Date": "02-01-2024", "Net P&L %": -0.32,  "Final MAE": -28.50},
+                {"Trade": 3, "Entry Date": "03-01-2024", "Net P&L %": 18.38,   "Final MAE": -15.70},
+                {"Trade": 4, "Entry Date": "04-01-2024", "Net P&L %": -12.80,  "Final MAE": -26.89},
+                {"Trade": 5, "Entry Date": "05-01-2024", "Net P&L %": -8.74,   "Final MAE": -2.10},
             ]
         )
         out = outlier_stripped_live_dd(df)
-        self.assertEqual(out["positive_outlier_1"], 4.0)
-        self.assertEqual(out["negative_outlier_1"], -5.0)
-        self.assertEqual(out["ce_pe_pnl_pct_without_top_1_outliers"], 2.0)
-        # Remove top +4 and bottom -5, leaving live DDs -1, -3, -5.
-        self.assertEqual(out["outlier_dd_1"], -5.0)
-        self.assertEqual(out["outlier_dd_1_avg"], -3.0)
-        self.assertEqual(out["positive_outlier_2"], 7.0)
-        self.assertEqual(out["negative_outlier_2"], -7.0)
-        self.assertEqual(out["ce_pe_pnl_pct_without_top_2_outliers"], 1.0)
+        self.assertEqual(out["positive_outlier_1"], 18.38)
+        self.assertEqual(out["negative_outlier_1"], -24.94)
+        self.assertEqual(out["outlier_dd_1"], -27.12)
+        self.assertEqual(out["outlier_dd_1_avg"], -14.11)
+        self.assertEqual(out["outlier_dd_2"], -8.74)
+        self.assertEqual(out["outlier_dd_2_avg"], -8.74)
+        self.assertEqual(out["outlier_dd_3"], 0.0)
+        self.assertEqual(out["outlier_dd_3_avg"], 0.0)
 
 
 class TestLegPctNoOutliers(unittest.TestCase):

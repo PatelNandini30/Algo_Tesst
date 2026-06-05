@@ -247,7 +247,8 @@ def _strategy_needs_native_scan(payload: Dict[str, Any]) -> bool:
 def _should_build_fast_lookup(payload: Dict[str, Any], from_date: str, to_date: str) -> bool:
     if _FAST_LOOKUP_MODE in ("0", "off", "false", "no"):
         return False
-    if _FAST_LOOKUP_MODE in ("1", "on", "true", "yes", "always"):
+    # "rust" = strict Rust-only: always build the native cache (no Python dict).
+    if _FAST_LOOKUP_MODE in ("1", "on", "true", "yes", "always", "rust"):
         return True
     if _strategy_needs_native_scan(payload):
         return True

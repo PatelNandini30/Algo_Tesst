@@ -164,7 +164,8 @@ def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
 
     Outlier N is cumulative: `+ve Outlier 2` is the sum of the top two
     positive P&L% trades, and `-ve Outlier 2` is the sum of the bottom two
-    P&L% trades. Stripped Live DD removes both sides for the given N.
+    P&L% trades. Stripped Live DD removes both sides for the given N, then
+    rebuilds the remaining trade path before measuring Live DD.
     """
     out: Dict[str, float] = {}
     for n in (1, 2, 3):
@@ -206,6 +207,10 @@ def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
 
     df = df.copy()
     df["__pct__"] = pct_series.fillna(0).values
+    if "Final MAE" in df.columns:
+        mae_series = pd.to_numeric(df["Final MAE"], errors="coerce")
+    else:
+        mae_series = pd.Series(np.nan, index=df.index)
 
     if "Lowest NAV During Trade" in df.columns and "Peak" in df.columns:
         low = pd.to_numeric(df["Lowest NAV During Trade"], errors="coerce")
@@ -222,6 +227,7 @@ def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
     pairs = [
         {
             "pct": float(row["__pct__"]),
+            "mae": None if pd.isna(mae_series.iloc[i]) else float(mae_series.iloc[i]),
             "ldd": None if pd.isna(row["__live_dd__"]) else float(row["__live_dd__"]),
             "idx": i,
         }
@@ -246,16 +252,35 @@ def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
             *[p["idx"] for p in by_pct_desc[:exc_top]],
             *[p["idx"] for p in by_pct_desc[max(0, n_trades - exc_bot):]],
         }
-        filtered = [
-            p["ldd"]
-            for p in pairs
-            if p["idx"] not in exc_idx and p["ldd"] is not None
-        ]
+        filtered = [p for p in pairs if p["idx"] not in exc_idx]
         if not filtered:
             return {"max": 0.0, "avg": 0.0}
+        cumulative = 100.0
+        peak = 100.0
+        prev_cum = 100.0
+        first_done = False
+        rebuilt_ldds = []
+        for p in filtered:
+            pct = p["pct"]
+            cumulative *= (1.0 + pct / 100.0)
+            peak = max(peak, cumulative)
+            mae = p["mae"]
+            if mae is not None and peak != 0:
+                if not first_done:
+                    lowest_nav = round(cumulative * 100) / 100
+                else:
+                    lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
+                actual_ldd = round((lowest_nav / peak - 1) * 10000) / 100
+                rebuilt_ldds.append(actual_ldd)
+                first_done = True
+            else:
+                first_done = True
+            prev_cum = cumulative
+        if not rebuilt_ldds:
+            return {"max": 0.0, "avg": 0.0}
         return {
-            "max": round(float(min(filtered)), 4),
-            "avg": round(float(sum(filtered) / len(filtered)), 4),
+            "max": round(float(min(rebuilt_ldds)), 4),
+            "avg": round(float(sum(rebuilt_ldds) / len(rebuilt_ldds)), 4),
         }
 
     for n in (1, 2, 3):
@@ -421,6 +446,7 @@ def compute_optim_metrics_batch_rust(
         # still Python because it needs date math.
         for i, (df, summary) in enumerate(tradesheets_and_summaries):
             results[i]["cagr_midcap"] = cagr_midcap_for_period(df, None, None)
+            results[i].update(outlier_stripped_live_dd(df))
         return list(results)
     except Exception:
         # Fall back to the per-sheet Python pipeline.

@@ -103,6 +103,23 @@ const isOptionRow = (row) => ['CE', 'CALL', 'PE', 'PUT'].includes(String(row?.['
 const isBuyLeg   = (row) => String(row?.['B/S'] || '').toUpperCase() === 'BUY';
 const isSellLeg  = (row) => String(row?.['B/S'] || '').toUpperCase() === 'SELL';
 
+// Bearish leg: profits when market falls  → CE SELL, PE BUY or FUT SELL
+// Bullish leg: profits when market rises  → CE BUY,  PE SELL or FUT BUY
+const isBearishLeg = (row) => {
+  const t  = String(row?.['Type'] || '').toUpperCase();
+  const bs = String(row?.['B/S']  || '').toUpperCase();
+  return ((t === 'CE' || t === 'CALL') && bs === 'SELL') ||
+         ((t === 'PE' || t === 'PUT')  && bs === 'BUY')  ||
+         (t === 'FUT' && bs === 'SELL');
+};
+const isBullishLeg = (row) => {
+  const t  = String(row?.['Type'] || '').toUpperCase();
+  const bs = String(row?.['B/S']  || '').toUpperCase();
+  return ((t === 'CE' || t === 'CALL') && bs === 'BUY')  ||
+         ((t === 'PE' || t === 'PUT')  && bs === 'SELL') ||
+         (t === 'FUT' && bs === 'BUY');
+};
+
 const sumRequired = (rows, key) => {
   let total = 0;
   for (const row of rows) {
@@ -115,44 +132,40 @@ const sumRequired = (rows, key) => {
 
 const roundMae = (value) => Math.round(value * 10000) / 10000;
 
-/** Compute Net MAE 1, Net MAE 2, Final MAE for a group of legs. */
+/** Compute Net MAE 1, Net MAE 2, Final MAE for a group of legs.
+ *
+ * Every leg (option or future) is classified by market direction:
+ *   Bullish (CE BUY / PE SELL / FUT BUY)  — adverse when market falls, favorable when rises.
+ *   Bearish (CE SELL / PE BUY / FUT SELL) — adverse when market rises, favorable when falls.
+ *
+ * Unified rule (single-leg, multi-leg, options and futures alike):
+ *   Net MAE 1 = sum(bullish MAE) + sum(bearish MFE)
+ *   Net MAE 2 = sum(bullish MFE) + sum(bearish MAE)
+ *   Final MAE = min(Net MAE 1, Net MAE 2)
+ *
+ * When every leg shares one direction this collapses to "all MAE" vs
+ * "all MFE"; mixed directions cross automatically.
+ */
 const calcTradeMae = (legs) => {
-  const futureLegs = legs.filter(isFutureRow);
-  const optionLegs = legs.filter(isOptionRow);
-  if (optionLegs.length === 0) return null;
+  const dirLegs = legs.filter(r => isOptionRow(r) || isFutureRow(r));
+  if (dirLegs.length === 0) return null;
 
-  const optionMae = sumRequired(optionLegs, 'MAE');
-  const optionMfe = sumRequired(optionLegs, 'MFE');
-  if ([optionMae, optionMfe].some(v => v == null)) return null;
+  const allMae = sumRequired(dirLegs, 'MAE');
+  const allMfe = sumRequired(dirLegs, 'MFE');
+  if ([allMae, allMfe].some(v => v == null)) return null;
 
-  if (futureLegs.length > 0) {
-    const futureMfe = sumRequired(futureLegs, 'MFE');
-    const futureMae = sumRequired(futureLegs, 'MAE');
-    if ([futureMfe, futureMae].some(v => v == null)) return null;
-    const netMae1 = futureMfe + optionMae;
-    const netMae2 = optionMfe + futureMae;
-    return { netMae1: roundMae(netMae1), netMae2: roundMae(netMae2), finalMae: roundMae(Math.min(netMae1, netMae2)) };
-  }
+  const bullishLegs = dirLegs.filter(isBullishLeg);
+  const bearishLegs = dirLegs.filter(isBearishLeg);
 
-  const buyOptionLegs  = optionLegs.filter(isBuyLeg);
-  const sellOptionLegs = optionLegs.filter(isSellLeg);
-  if (buyOptionLegs.length > 0 && sellOptionLegs.length > 0) {
-    const buyMae  = sumRequired(buyOptionLegs,  'MAE');
-    const buyMfe  = sumRequired(buyOptionLegs,  'MFE');
-    const sellMae = sumRequired(sellOptionLegs, 'MAE');
-    const sellMfe = sumRequired(sellOptionLegs, 'MFE');
-    if ([buyMae, buyMfe, sellMae, sellMfe].some(v => v == null)) return null;
-    const netMae1 = sellMae + buyMfe;
-    const netMae2 = sellMfe + buyMae;
-    return { netMae1: roundMae(netMae1), netMae2: roundMae(netMae2), finalMae: roundMae(Math.min(netMae1, netMae2)) };
-  }
+  const bullishMae = sumRequired(bullishLegs, 'MAE');
+  const bullishMfe = sumRequired(bullishLegs, 'MFE');
+  const bearishMae = sumRequired(bearishLegs, 'MAE');
+  const bearishMfe = sumRequired(bearishLegs, 'MFE');
+  if ([bullishMae, bullishMfe, bearishMae, bearishMfe].some(v => v == null)) return null;
 
-  // All option legs same side (all BUY or all SELL) — naive sum
-  return {
-    netMae1:  roundMae(optionMae),
-    netMae2:  roundMae(optionMfe),
-    finalMae: roundMae(Math.min(optionMae, optionMfe)),
-  };
+  const netMae1 = bullishMae + bearishMfe;
+  const netMae2 = bullishMfe + bearishMae;
+  return { netMae1: roundMae(netMae1), netMae2: roundMae(netMae2), finalMae: roundMae(Math.min(netMae1, netMae2)) };
 };
 
 const getReEntryType = (trade) => {
@@ -633,7 +646,8 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     const t = tm[k];
     const pct = (typeof t.pct === 'number' && Number.isFinite(t.pct)) ? t.pct : null;
     const ldd = (typeof t.actualLiveDD === 'number' && Number.isFinite(t.actualLiveDD)) ? t.actualLiveDD : null;
-    if (pct !== null) _tradePairsDD.push({ pct, ldd, idx: _tradePairsDD.length });
+    const mae = (typeof t.finalMae === 'number' && Number.isFinite(t.finalMae)) ? t.finalMae : null;
+    if (pct !== null) _tradePairsDD.push({ pct, ldd, mae, idx: _tradePairsDD.length });
   });
   const _nTrades    = _tradePairsDD.length;
   const _byPctDesc  = [..._tradePairsDD].sort((a, b) => b.pct - a.pct);
@@ -654,9 +668,29 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       ..._byPctDesc.slice(0, excTop).map(p => p.idx),
       ..._byPctDesc.slice(Math.max(0, _nTrades - excBot)).map(p => p.idx),
     ]);
-    const filtered = _tradePairsDD.filter(p => !excIdx.has(p.idx) && p.ldd !== null);
+    const filtered = _tradePairsDD.filter(p => !excIdx.has(p.idx));
     if (filtered.length === 0) return { min: 0, avg: 0 };
-    const ldds = filtered.map(p => p.ldd);
+    let cumulative = 100;
+    let peak = 100;
+    let prevCum = 100;
+    let firstTradeDone = false;
+    const ldds = [];
+    filtered.forEach(p => {
+      cumulative *= (1 + p.pct / 100);
+      peak = Math.max(peak, cumulative);
+      if (p.mae !== null && peak !== 0) {
+        const lowestNav = (!firstTradeDone)
+          ? Math.round(cumulative * 100) / 100
+          : Math.round(prevCum * (1 + p.mae / 100) * 100) / 100;
+        const actualLiveDD = Math.round((lowestNav / peak - 1) * 10000) / 100;
+        ldds.push(actualLiveDD);
+        firstTradeDone = true;
+      } else {
+        firstTradeDone = true;
+      }
+      prevCum = cumulative;
+    });
+    if (ldds.length === 0) return { min: 0, avg: 0 };
     return { min: +Math.min(...ldds).toFixed(2), avg: +(ldds.reduce((s, v) => s + v, 0) / ldds.length).toFixed(2) };
   };
   const _allLDDs        = _tradePairsDD.filter(p => p.ldd !== null).map(p => p.ldd);

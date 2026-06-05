@@ -168,6 +168,31 @@ def _position_label(leg: Optional[Dict[str, Any]]) -> str:
     return pos.capitalize() if pos else ""
 
 
+def _sl_label(leg: Optional[Dict[str, Any]]) -> str:
+    """Return SL suffix for a leg, e.g. 'SL_50%' or 'SL_50PTS_Buffer_10%'."""
+    if not leg:
+        return ""
+    sl_buf = leg.get("slWithBuffer") or {}
+    if sl_buf:
+        val = sl_buf.get("value")
+        buf_pct = sl_buf.get("buffer_pct")
+        if val and buf_pct:
+            mode = (sl_buf.get("mode") or "PERCENT").upper()
+            suffix = "%" if "PERCENT" in mode else "PTS"
+            val_str = f"{float(val):g}"
+            buf_str = f"{float(buf_pct):g}"
+            return f"SL_{val_str}{suffix}_Buffer_{buf_str}%"
+    sl = leg.get("stopLoss") or {}
+    if sl:
+        val = sl.get("value")
+        if val:
+            mode = (sl.get("mode") or "PERCENT").upper()
+            suffix = "%" if "PERCENT" in mode else "PTS"
+            val_str = f"{float(val):g}"
+            return f"SL_{val_str}{suffix}"
+    return ""
+
+
 def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     """
     Inspect a (combo-applied) payload and return the master-summary columns
@@ -187,6 +212,8 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     put_strike = _strike_label(pe_leg.get("strike_selection") if pe_leg else None, "PE")
     call_pos = _position_label(ce_leg)
     put_pos = _position_label(pe_leg)
+    ce_sl = _sl_label(ce_leg)
+    pe_sl = _sl_label(pe_leg)
     spot_adj = _spot_adjustment_label(payload)
     expiry = _expiry_label(payload)
     shift = _shift_label(payload)
@@ -196,11 +223,15 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         seg = f"CE_{call_strike}"
         if call_pos:
             seg += f"_{call_pos}"
+        if ce_sl:
+            seg += f"_{ce_sl}"
         parts.append(seg)
     if pe_leg is not None:
         seg = f"PE_{put_strike}"
         if put_pos:
             seg += f"_{put_pos}"
+        if pe_sl:
+            seg += f"_{pe_sl}"
         parts.append(seg)
     parts.append(spot_adj)
     parts.append(f"{expiry}_Expiry")

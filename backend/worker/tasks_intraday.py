@@ -51,11 +51,19 @@ def ingest_intraday_csv(self, symbol: str, csv_path: str, format_hint: str = "cl
 )
 def execute_intraday_backtest(self, config: dict) -> bytes:
     """Run intraday backtest and return Arrow IPC bytes."""
-    from services.intraday_engine import run_intraday_backtest
-    symbol = config.get("symbol", "?")
-    date_from = config.get("date_from", "?")
-    date_to = config.get("date_to", "?")
-    logger.info("[intraday] start symbol=%s range=%s..%s", symbol, date_from, date_to)
-    result = run_intraday_backtest(config)
-    logger.info("[intraday] done symbol=%s bytes=%d", symbol, len(result))
-    return result
+    # Admission gate (no-OOM): reserve intraday memory before running so it can
+    # share the budget with a backtest but not pile on top of two heavy jobs.
+    from services import memory_gate
+    rid = self.request.id or ""
+    memory_gate.acquire(rid, memory_gate.cost_for("intraday"))
+    try:
+        from services.intraday_engine import run_intraday_backtest
+        symbol = config.get("symbol", "?")
+        date_from = config.get("date_from", "?")
+        date_to = config.get("date_to", "?")
+        logger.info("[intraday] start symbol=%s range=%s..%s", symbol, date_from, date_to)
+        result = run_intraday_backtest(config)
+        logger.info("[intraday] done symbol=%s bytes=%d", symbol, len(result))
+        return result
+    finally:
+        memory_gate.release(rid)

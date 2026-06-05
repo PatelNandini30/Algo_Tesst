@@ -141,11 +141,45 @@ def _get_reentry_type(row: Dict) -> str:
     return "Re-Entry" if row.get("ReEntryIndex") else ""
 
 
+def _is_bearish_leg(leg: Dict) -> bool:
+    """CE SELL, PE BUY or FUT SELL — profits when market falls."""
+    t  = str(leg.get("Type") or "").upper()
+    bs = str(leg.get("B/S")  or "").upper()
+    return (
+        (t in ("CE", "CALL") and bs == "SELL")
+        or (t in ("PE", "PUT") and bs == "BUY")
+        or (t == "FUT" and bs == "SELL")
+    )
+
+
+def _is_bullish_leg(leg: Dict) -> bool:
+    """CE BUY, PE SELL or FUT BUY — profits when market rises."""
+    t  = str(leg.get("Type") or "").upper()
+    bs = str(leg.get("B/S")  or "").upper()
+    return (
+        (t in ("CE", "CALL") and bs == "BUY")
+        or (t in ("PE", "PUT") and bs == "SELL")
+        or (t == "FUT" and bs == "BUY")
+    )
+
+
 def _calc_trade_mae(legs: List[Dict]):
-    """Replicate calcTradeMae from JS."""
-    option_legs  = [l for l in legs if str(l.get("Type") or "").upper() in ("CE", "CALL", "PE", "PUT")]
-    future_legs  = [l for l in legs if str(l.get("Type") or "").upper() == "FUT"]
-    if not option_legs:
+    """Replicate calcTradeMae from JS.
+
+    Every leg (option or future) is classified by market direction:
+      Bullish (CE BUY / PE SELL / FUT BUY):  adverse when market falls, favorable when rises.
+      Bearish (CE SELL / PE BUY / FUT SELL): adverse when market rises, favorable when falls.
+
+    Unified rule (single-leg, multi-leg, options and futures alike):
+      nm1 = sum(bullish MAE) + sum(bearish MFE)
+      nm2 = sum(bullish MFE) + sum(bearish MAE)
+      final = min(nm1, nm2)
+    """
+    dir_legs = [
+        l for l in legs
+        if str(l.get("Type") or "").upper() in ("CE", "CALL", "PE", "PUT", "FUT")
+    ]
+    if not dir_legs:
         return None
 
     def _sum_field(rows, key):
@@ -157,34 +191,20 @@ def _calc_trade_mae(legs: List[Dict]):
             total += v
         return total
 
-    opt_mae = _sum_field(option_legs, "MAE")
-    opt_mfe = _sum_field(option_legs, "MFE")
-    if opt_mae is None or opt_mfe is None:
-        return None
-
     def _rnd(v):
         return round(v * 10000) / 10000
 
-    if future_legs:
-        fut_mfe = _sum_field(future_legs, "MFE")
-        fut_mae = _sum_field(future_legs, "MAE")
-        if fut_mfe is None or fut_mae is None:
-            return None
-        nm1 = fut_mfe + opt_mae
-        nm2 = opt_mfe + fut_mae
-        return (_rnd(nm1), _rnd(nm2), _rnd(min(nm1, nm2)))
+    bullish_legs = [l for l in dir_legs if _is_bullish_leg(l)]
+    bearish_legs = [l for l in dir_legs if _is_bearish_leg(l)]
 
-    buy_legs  = [l for l in option_legs if str(l.get("B/S") or "").upper() == "BUY"]
-    sell_legs = [l for l in option_legs if str(l.get("B/S") or "").upper() == "SELL"]
-    if buy_legs and sell_legs:
-        bm = _sum_field(buy_legs,  "MAE"); bf = _sum_field(buy_legs,  "MFE")
-        sm = _sum_field(sell_legs, "MAE"); sf = _sum_field(sell_legs, "MFE")
-        if None in (bm, bf, sm, sf):
-            return None
-        nm1 = sm + bf; nm2 = sf + bm
-        return (_rnd(nm1), _rnd(nm2), _rnd(min(nm1, nm2)))
+    bull_mae = _sum_field(bullish_legs, "MAE"); bull_mfe = _sum_field(bullish_legs, "MFE")
+    bear_mae = _sum_field(bearish_legs, "MAE"); bear_mfe = _sum_field(bearish_legs, "MFE")
+    if None in (bull_mae, bull_mfe, bear_mae, bear_mfe):
+        return None
 
-    return (_rnd(opt_mae), _rnd(opt_mfe), _rnd(min(opt_mae, opt_mfe)))
+    nm1 = bull_mae + bear_mfe
+    nm2 = bull_mfe + bear_mae
+    return (_rnd(nm1), _rnd(nm2), _rnd(min(nm1, nm2)))
 
 
 def _build_key_order(rows: List[Dict]) -> List[str]:
@@ -675,8 +695,9 @@ def _write_summary_sheet(
         t2 = tm[k]
         pct_v = t2.get("pct");    pct_v = pct_v if isinstance(pct_v, float) and math.isfinite(pct_v) else None
         ldd_v = t2.get("actualLDD"); ldd_v = ldd_v if isinstance(ldd_v, float) and math.isfinite(ldd_v) else None
+        mae_v = t2.get("finalMae"); mae_v = mae_v if isinstance(mae_v, float) and math.isfinite(mae_v) else None
         if pct_v is not None:
-            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "idx": len(trade_pairs)})
+            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "mae": mae_v, "idx": len(trade_pairs)})
 
     n_trades  = len(trade_pairs)
     by_pct_desc = sorted(trade_pairs, key=lambda x: -x["pct"])
@@ -697,10 +718,32 @@ def _write_summary_sheet(
             *[p["idx"] for p in by_pct_desc[:exc_top]],
             *[p["idx"] for p in by_pct_desc[max(0, n_trades - exc_bot):]],
         }
-        filtered = [p for p in trade_pairs if p["idx"] not in exc_idx and p["ldd"] is not None]
+        filtered = [p for p in trade_pairs if p["idx"] not in exc_idx]
         if not filtered:
             return (0.0, 0.0)
-        ldds = [p["ldd"] for p in filtered]
+        cumulative = 100.0
+        peak = 100.0
+        prev_cum = 100.0
+        first_done = False
+        ldds = []
+        for p in filtered:
+            pct = p["pct"]
+            cumulative *= (1.0 + pct / 100.0)
+            peak = max(peak, cumulative)
+            mae = p["mae"]
+            if mae is not None and peak != 0:
+                if not first_done and cumulative is not None:
+                    lowest_nav = round(cumulative * 100) / 100
+                else:
+                    lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
+                actual_ldd = round((lowest_nav / peak - 1) * 10000) / 100
+                ldds.append(actual_ldd)
+                first_done = True
+            else:
+                first_done = True
+            prev_cum = cumulative
+        if not ldds:
+            return (0.0, 0.0)
         return (round(min(ldds), 2), round(sum(ldds) / len(ldds), 2))
 
     all_ldds   = [p["ldd"] for p in trade_pairs if p["ldd"] is not None]
@@ -1074,8 +1117,10 @@ def compute_xlsx_summary_metrics(
         pct_v = pct_v if isinstance(pct_v, float) and math.isfinite(pct_v) else None
         ldd_v = t2.get("actualLDD")
         ldd_v = ldd_v if isinstance(ldd_v, float) and math.isfinite(ldd_v) else None
+        mae_v = t2.get("finalMae")
+        mae_v = mae_v if isinstance(mae_v, float) and math.isfinite(mae_v) else None
         if pct_v is not None:
-            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "idx": len(trade_pairs)})
+            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "mae": mae_v, "idx": len(trade_pairs)})
 
     n_trades = len(trade_pairs)
     by_pct_desc = sorted(trade_pairs, key=lambda x: -x["pct"])
@@ -1096,9 +1141,33 @@ def compute_xlsx_summary_metrics(
             *[p["idx"] for p in by_pct_desc[:exc_top]],
             *[p["idx"] for p in by_pct_desc[max(0, n_trades - exc_bot):]],
         }
-        filt = [p["ldd"] for p in trade_pairs if p["idx"] not in exc_idx and p["ldd"] is not None]
-        if not filt: return (0.0, 0.0)
-        return (round(min(filt), 4), round(sum(filt) / len(filt), 4))
+        filtered = [p for p in trade_pairs if p["idx"] not in exc_idx]
+        if not filtered:
+            return (0.0, 0.0)
+        cumulative = 100.0
+        peak = 100.0
+        prev_cum = 100.0
+        first_done = False
+        ldds = []
+        for p in filtered:
+            pct = p["pct"]
+            cumulative *= (1.0 + pct / 100.0)
+            peak = max(peak, cumulative)
+            mae = p["mae"]
+            if mae is not None and peak != 0:
+                if not first_done:
+                    lowest_nav = round(cumulative * 100) / 100
+                else:
+                    lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
+                actual_ldd = round((lowest_nav / peak - 1) * 10000) / 100
+                ldds.append(actual_ldd)
+                first_done = True
+            else:
+                first_done = True
+            prev_cum = cumulative
+        if not ldds:
+            return (0.0, 0.0)
+        return (round(min(ldds), 4), round(sum(ldds) / len(ldds), 4))
 
     all_ldds = [p["ldd"] for p in trade_pairs if p["ldd"] is not None]
     live_dd_min  = round(min(all_ldds), 4)                if all_ldds else 0.0
