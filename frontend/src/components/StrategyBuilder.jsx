@@ -720,7 +720,7 @@ const LazyLegModal = ({
 const StrategyBuilder = () => {
   const [isDark, setIsDark] = useState(() => {
     const saved = localStorage.getItem('sl-theme');
-    return saved ? saved === 'dark' : false;
+    return saved ? saved === 'dark' : true;
   });
 
   useEffect(() => {
