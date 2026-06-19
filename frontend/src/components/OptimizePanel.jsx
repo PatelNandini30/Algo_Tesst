@@ -40,7 +40,11 @@ function _getRolloverStrikeMode(legs) {
 function buildZipNaming(basePayload, filterName, selectedList = []) {
   if (!filterName) return null;
   const legs = basePayload.legs || [];
-  const sweepsAdjustment = selectedList.some(s => s.path === 'spot_adjustment_enabled');
+  // True when ANY spot-adjustment parameter is being swept — enabled toggle,
+  // pct, direction or units. (Previously only checked `_enabled`, so sweeping
+  // spot_adjustment_pct/direction still labelled the folder "No Adjustment"
+  // even though every combo applies a Rise/Fall adjustment.)
+  const sweepsAdjustment = selectedList.some(s => String(s.path || '').startsWith('spot_adjustment'));
 
   // Leg descriptions — CE first, then PE
   const order = ['CE', 'PE'];
@@ -127,7 +131,13 @@ export default function OptimizePanel({
   parallelism, setParallelism,
   filterName,
 }) {
-  const allParams = useMemo(() => expandSchemaForLegs(nLegs || 1), [nLegs]);
+  // Midcap params (Global — Midcap Spot Adjustment) only appear when the
+  // strategy actually has a Midcap leg.
+  const _hasMidcapLeg = Array.isArray(basePayload?.midcap_legs) && basePayload.midcap_legs.length > 0;
+  const allParams = useMemo(
+    () => expandSchemaForLegs(nLegs || 1).filter(p => !p.midcapOnly || _hasMidcapLeg),
+    [nLegs, _hasMidcapLeg],
+  );
   const grouped = useMemo(() => {
     const m = new Map();
     for (const p of allParams) {

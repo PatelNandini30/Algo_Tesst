@@ -318,22 +318,18 @@ def _compute_spot_adjustment_trigger(
     watch_fall = direction in ("fall", "both")
     if not watch_rise and not watch_fall:
         return None
-    from datetime import date as _date
     for d in trading_days:
         if d <= entry_date:
             continue
         if d > scheduled_exit:
             break
-        # Skip weekend special sessions (e.g. NSE Budget Sunday 01-Feb-2026 has spot
-        # data but options chains don't exist — pricing path silently drops the
-        # trade if a spot-adj trigger lands on Sat/Sun, leaving a gap in cascades).
-        # ISO dates are YYYY-MM-DD; compute weekday directly without pandas.
-        try:
-            y, m, dd = d.split("-")
-            if _date(int(y), int(m), int(dd)).weekday() >= 5:  # Sat=5, Sun=6
-                continue
-        except Exception:
-            pass
+        # NOTE: do NOT skip weekends here. NSE runs special weekend sessions
+        # (Diwali Muhurat, occasional Saturday sessions) where the index genuinely
+        # trades and can breach the spot-adj threshold — the research-team reference
+        # exits on those session dates. Days that are not real sessions are already
+        # excluded: this loop iterates `trading_days` (built from loaded data) and the
+        # `spot is None` guard below drops any date lacking a close, so a weekday skip
+        # would only discard legitimate special sessions and report the next weekday.
         spot = spot_by_date.get(d)
         if spot is None:
             continue
@@ -383,11 +379,25 @@ def _load_filter_segments(payload: Dict[str, Any]) -> Optional[List[Tuple[str, s
         logger.warning("[ENGINE_RUST] filter segment load failed: %s", exc)
         return None
 
+    def _seg_iso(v) -> str:
+        # Normalize a segment boundary to ISO YYYY-MM-DD. Already-ISO / datetime
+        # values parse directly (no warning); only ambiguous slash/dash dates fall
+        # back to dayfirst=True so DD/MM/YYYY (e.g. "10/05/2019" = 10-May) is never
+        # misread as MM/DD (5-Oct). Keeps this loader consistent with
+        # parse_filter_csv (base.py), which already parses uploads day-first.
+        text = str(v).strip()
+        # Try unambiguous year-first formats first (no warning, no flip), then
+        # fall back to dayfirst=True for genuine DD/MM-style inputs.
+        for _fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+            try:
+                return pd.to_datetime(text, format=_fmt).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                continue
+        return pd.to_datetime(text, dayfirst=True).strftime("%Y-%m-%d")
+
     for s in raw or []:
         try:
-            start = pd.Timestamp(s["start"]).strftime("%Y-%m-%d")
-            end = pd.Timestamp(s["end"]).strftime("%Y-%m-%d")
-            segs.append((start, end))
+            segs.append((_seg_iso(s["start"]), _seg_iso(s["end"])))
         except Exception:
             continue
     segs.sort()
@@ -893,7 +903,21 @@ def _validate_or_shift_strike_python(
     elif strike < atm - 1e-6:
         direction = 1.0   # below ATM → walk up toward ATM
     else:
-        # Already at ATM with zero turnover — nowhere to walk.
+        # ATM strike itself has zero turnover. Instead of skipping the trade,
+        # walk OUTWARD in the OTM direction (CALL: up, PUT: down) to the first
+        # strike WITH turnover. Stop at the chain edge (missing) or a safety cap.
+        otm_dir = 1.0 if is_call else -1.0
+        step = 1
+        while step <= 500:
+            cand = strike + otm_dir * step * interval
+            if cand <= 0:
+                break
+            cand_st = _status(cand)
+            if cand_st == "tradeable":
+                return cand
+            if cand_st == "missing":
+                break
+            step += 1
         return None
     dist = int(round(abs(strike - atm) / interval))
     max_walk = max(dist, 1)
@@ -1186,6 +1210,20 @@ def _build_fixed_entry_specs(
             for leg_idx, leg in enumerate(legs_src):
                 if not isinstance(leg, dict):
                     return None
+                # NEXT_WEEKLY / NEXT_MONTHLY legs trade the contract ONE expiry
+                # beyond the exit anchor (target_expiry); all other legs trade
+                # target_expiry itself. Same contract shift as the DTE next-weekly
+                # path, applied here so Fixed Entry works for next-weekly. If the
+                # shifted contract isn't available (end of expiry list), skip just
+                # this trade and keep chaining.
+                _leg_is_next = str(leg.get("expiry") or "").upper() in _NEXT_EXPIRY_TYPES
+                if _leg_is_next:
+                    if target_idx + 1 >= len(sorted_expiries):
+                        _trade_resolved = False
+                        break
+                    leg_expiry = sorted_expiries[target_idx + 1]
+                else:
+                    leg_expiry = target_expiry
                 # Honour per-leg strike_interval override (user picks 100 for
                 # NIFTY in the leg form). Without this, every fixed-mode trade
                 # snaps to the index default (50 for NIFTY).
@@ -1197,7 +1235,7 @@ def _build_fixed_entry_specs(
                 _shift_info: Dict[str, Any] = {}
                 strike = _compute_strike_for_leg_python(
                     leg, entry_spot, leg_interval,
-                    entry_date=current_entry, expiry=target_expiry, index=index_str,
+                    entry_date=current_entry, expiry=leg_expiry, index=index_str,
                     out_info=_shift_info,
                 )
                 if strike is None:
@@ -1215,7 +1253,7 @@ def _build_fixed_entry_specs(
                     "index": index_str,
                     "entry_date": current_entry,
                     "exit_date": exit_date,
-                    "expiry": target_expiry,
+                    "expiry": leg_expiry,
                     "strike": float(strike),
                     "requested_strike": float(_shift_info.get("requested_strike") or strike),
                     "strike_interval": float(leg_interval),
@@ -1246,14 +1284,17 @@ def _build_fixed_entry_specs(
     return all_specs
 
 
-def _fetch_one_extra_expiry(expiry_dates: List[str], payload: Dict[str, Any]) -> List[str]:
+def _fetch_one_extra_expiry(
+    expiry_dates: List[str], payload: Dict[str, Any], count: int = 1
+) -> List[str]:
     """
-    Return expiry_dates extended by one extra cycle beyond the last date.
+    Return expiry_dates extended by `count` extra cycles beyond the last date.
 
-    For NEXT_WEEKLY / NEXT_MONTHLY strategies the last schedule cycle needs a
-    `next_exp` that may lie outside the backtest range. The Python engine gets
-    this from get_expiry_dates() which queries the DB. We do the same but for
-    just one row so the overhead is negligible.
+    For NEXT_WEEKLY / NEXT_MONTHLY strategies the last schedule cycle needs
+    expiries that may lie outside the backtest range. The Python engine gets
+    these from get_expiry_dates() which queries the DB. We do the same but for
+    just a couple of rows so the overhead is negligible. `count=2` is used by
+    the next-weekly path, which anchors exit to Ek+1 and trades the Ek+2 contract.
     """
     if not expiry_dates:
         return expiry_dates
@@ -1270,19 +1311,19 @@ def _fetch_one_extra_expiry(expiry_dates: List[str], payload: Dict[str, Any]) ->
         index = str(payload.get("index") or "NIFTY").upper()
         # Search two months ahead to be safe (one weekly = 7 days).
         import datetime as _dt
+        _n = max(1, int(count))
         last_dt = _dt.date.fromisoformat(last_exp)
-        lookahead = (last_dt + _dt.timedelta(days=40)).isoformat()
+        lookahead = (last_dt + _dt.timedelta(days=40 * _n)).isoformat()
         extra_df = get_expiry_dates(index, freq, last_exp, lookahead)
         if extra_df is not None and not extra_df.empty:
             col = "Current Expiry" if "Current Expiry" in extra_df.columns else extra_df.columns[0]
             candidates = sorted(
                 pd.to_datetime(extra_df[col]).dt.strftime("%Y-%m-%d").unique().tolist()
             )
-            # Add the first expiry strictly after last_exp.
-            for c in candidates:
-                if c > last_exp:
-                    combined = sorted(set(expiry_dates) | {c})
-                    return combined
+            # Add the first `count` expiries strictly after last_exp.
+            extra = [c for c in candidates if c > last_exp][:_n]
+            if extra:
+                return sorted(set(expiry_dates) | set(extra))
     except Exception:
         pass
     return expiry_dates
@@ -1309,8 +1350,13 @@ def _build_next_expiry_specs(
     Returns None if any strike is unresolvable (Python fallback required).
     Returns [] if no trades are generated.
     """
-    entry_dte = int(payload.get("entry_dte") or 1)
-    exit_dte = int(payload.get("exit_dte") or 0)
+    # NOTE: use an explicit None check, not `or 1` — entry_dte=0 is a valid
+    # value (enter ON the expiry day) and `0 or 1` would wrongly coerce it to 1,
+    # shifting every entry one trading day early and breaking the contiguous roll.
+    _edte = payload.get("entry_dte")
+    entry_dte = int(_edte) if _edte not in (None, "") else 1
+    _xdte = payload.get("exit_dte")
+    exit_dte = int(_xdte) if _xdte not in (None, "") else 0
     legs_src = [leg for leg in (payload.get("legs") or []) if isinstance(leg, dict)]
     index_str = str(payload.get("index") or "NIFTY").upper()
     interval = _STRIKE_INTERVALS.get(index_str, 50.0)
@@ -1336,22 +1382,27 @@ def _build_next_expiry_specs(
     trade_id = 1
 
     for i, cur_exp in enumerate(sorted_expiries):
-        if i + 1 < n_exp:
-            next_exp = sorted_expiries[i + 1]
-        else:
-            # No next expiry in range — skip if all legs need it.
-            # For mixed strategies fall back to cur_exp (matches Python engine behaviour
-            # where next_exp=None causes the trade to be skipped via _all_legs_next guard).
-            if _all_legs_next:
+        # NEXT_WEEKLY semantics — like WEEKLY, one contract further out:
+        #   • entry anchors to cur_exp (Ek)             → Ek   - entry_dte td
+        #   • exit  anchors to the NEXT expiry (Ek+1)   → Ek+1 - exit_dte  td
+        #   • the traded NEXT_* contract is Ek+2 — at exit it still has ~1 week
+        #     of life. (entry 4-Apr / exit 11-Apr → 18-Apr contract.)
+        # Non-next ("mixed") legs keep trading cur_exp and anchor exit to cur_exp.
+        next_exp     = sorted_expiries[i + 1] if i + 1 < n_exp else None  # exit anchor (Ek+1)
+        contract_exp = sorted_expiries[i + 2] if i + 2 < n_exp else None  # NEXT_* contract (Ek+2)
+
+        if _all_legs_next:
+            # Both the exit anchor (Ek+1) and the traded contract (Ek+2) must exist.
+            if next_exp is None or contract_exp is None:
                 continue
-            next_exp = cur_exp
+            exit_anchor = next_exp
+        else:
+            exit_anchor = cur_exp
 
         entry_date = _trading_day_n_before(cur_exp, entry_dte, td_sorted)
         if entry_date is None:
             continue
 
-        # Exit anchors to next_exp when all legs trade the next contract.
-        exit_anchor = next_exp if _all_legs_next else cur_exp
         exit_date = _trading_day_n_before(exit_anchor, exit_dte, td_sorted)
         if exit_date is None:
             continue
@@ -1363,8 +1414,19 @@ def _build_next_expiry_specs(
         if not entry_spot:
             continue
 
+        # Resolve every leg first; only commit the trade if all legs resolve.
+        # A NEXT_* leg with no Ek+2 contract available (end of range) skips the
+        # WHOLE cycle rather than emitting a partial trade.
+        _trade_specs: List[Dict[str, Any]] = []
+        _skip_trade = False
         for leg_idx, (leg, is_next) in enumerate(zip(legs_src, leg_is_next)):
-            per_leg_expiry = next_exp if is_next else cur_exp
+            if is_next:
+                if contract_exp is None:
+                    _skip_trade = True
+                    break
+                per_leg_expiry = contract_exp
+            else:
+                per_leg_expiry = cur_exp
             # Honour per-leg strike_interval override (e.g. user picks 100 for
             # NIFTY). Without this, DTE-mode trades collapse to the index
             # default and the per-leg setting is ignored.
@@ -1380,8 +1442,14 @@ def _build_next_expiry_specs(
                 out_info=_shift_info,
             )
             if strike is None:
-                return None  # Strike unresolvable — caller falls back to Python engine
-            all_specs.append({
+                # Unresolvable strike for THIS cycle — most commonly the Ek+2
+                # contract lies past the loaded data at the end of the range, or
+                # a thin/zero-volume expiry. Skip just this trade (mirrors WEEKLY:
+                # never zero the entire run on one bad strike). Premium-based modes
+                # that need data params still resolve normally when present.
+                _skip_trade = True
+                break
+            _trade_specs.append({
                 "trade_id": trade_id,
                 "leg_id": leg_idx + 1,
                 "index": index_str,
@@ -1398,6 +1466,9 @@ def _build_next_expiry_specs(
                 "slippage_pct": slippage,
             })
 
+        if _skip_trade or not _trade_specs:
+            continue
+        all_specs.extend(_trade_specs)
         trade_id += 1
 
     return all_specs
@@ -1996,8 +2067,9 @@ def _build_mixed_futures_next_weekly(
     if not fut_legs_with_pos or not opt_legs_with_pos:
         return None  # Mixed mode requires both leg types.
 
-    # Build option specs — drives the trade-level exit_date.
-    _ext_expiry_dates = _fetch_one_extra_expiry(expiry_dates, payload)
+    # Build option specs — drives the trade-level exit_date. Two extra cycles so
+    # the next-weekly option leg can resolve its Ek+2 contract at end of range.
+    _ext_expiry_dates = _fetch_one_extra_expiry(expiry_dates, payload, count=2)
     opt_payload = {**payload, "legs": [l for _, l in opt_legs_with_pos]}
     opt_specs = _build_next_expiry_specs(
         opt_payload, _ext_expiry_dates, trading_days, spot_by_date, int(lot_size)
@@ -2076,6 +2148,26 @@ def _build_mixed_futures_next_weekly(
         _first["net_pnl"] = _trade_total
 
     return combined if combined else None
+
+
+# Per-process cache of the Midcap index close-lookup, keyed by symbol. Loaded
+# once (Rust INDEX_OHLC or DB) and reused across combos so the optimizer doesn't
+# re-load the series for every combo.
+_MIDCAP_SA_LOOKUP_CACHE: Dict[str, Any] = {}
+
+
+def _get_midcap_sa_lookup(symbol: str):
+    lk = _MIDCAP_SA_LOOKUP_CACHE.get(symbol)
+    if lk is None:
+        from services.midcap_overlay import MidcapCloseLookup
+        lk = MidcapCloseLookup(symbol)
+        # Force the one-time series load now so subsequent .close() are O(1).
+        try:
+            lk.close("2000-01-01")
+        except Exception:
+            pass
+        _MIDCAP_SA_LOOKUP_CACHE[symbol] = lk
+    return lk
 
 
 def run_rust_engine_pipeline(
@@ -2167,11 +2259,30 @@ def run_rust_engine_pipeline(
             return None  # SL/Target/re-entry on futures — Python handles it
         return fut_rows  # already priced; skip simulate_trades_batch entirely
 
+    elif _has_next_leg and filter_entry_mode == "fixed":
+        # NEXT_WEEKLY / NEXT_MONTHLY + Fixed Entry: pin the first entry of each
+        # segment to the segment start and chain like WEEKLY fixed entry, but
+        # trade the next-weekly contract (one expiry beyond the exit anchor).
+        # _build_fixed_entry_specs is per-leg next-weekly-aware; one extra expiry
+        # so the last cycle's shifted contract resolves. Its own per-segment
+        # gating/clamping applies, so suppress the downstream gate (segments=None).
+        _fx_expiry_dates = _fetch_one_extra_expiry(expiry_dates, payload, count=1)
+        specs = _build_fixed_entry_specs(
+            payload, _fx_expiry_dates, trading_days, spot_by_date, int(lot_size), segments,
+        )
+        if specs is None:
+            return None  # Premium-based strike mode — Python engine handles it
+        if not specs:
+            return []
+        if payload.get("buffer_strike_enabled"):
+            specs = _apply_buffer_strike_to_specs(specs, payload)
+        segments = None
+
     elif _has_next_leg:
         # Per-leg NEXT_WEEKLY / NEXT_MONTHLY: Python builds per-leg-expiry specs.
-        # Extend expiry list by one extra cycle so the last cycle can resolve its
-        # next_exp contract (Python engine gets this from an internal DB call).
-        _ext_expiry_dates = _fetch_one_extra_expiry(expiry_dates, payload)
+        # Extend expiry list by TWO extra cycles so the last cycle can resolve
+        # both its exit anchor (Ek+1) and its traded contract (Ek+2).
+        _ext_expiry_dates = _fetch_one_extra_expiry(expiry_dates, payload, count=2)
         specs = _build_next_expiry_specs(
             payload, _ext_expiry_dates, trading_days, spot_by_date, int(lot_size),
         )
@@ -2181,7 +2292,44 @@ def run_rust_engine_pipeline(
             return []
         if payload.get("buffer_strike_enabled"):
             specs = _apply_buffer_strike_to_specs(specs, payload)
-        segments = None  # No further STR gating needed
+        # STR / filter date-range gating — SAME rule as the WEEKLY (DTE) path so
+        # NEXT_WEEKLY behaves exactly like WEEKLY under a filter: the ENTRY must
+        # fall inside a filter segment, and an exit running past the segment end
+        # is CLAMPED to the last trading day in the segment (labelled FILTER_END
+        # / STR_Exit downstream via _seg_clamped). Unlike the DTE gate we do NOT
+        # treat expiry>seg_end as a filter-end — the next-weekly contract (Ek+2)
+        # naturally lies a week past the scheduled exit (Ek+1), which is a normal
+        # exit, not a filter truncation. Leaving `segments` non-None is inert
+        # downstream (only original_segments is read past this point).
+        if segments is not None:
+            if not segments:
+                return []
+
+            def _seg_for_next(entry_iso: str) -> Optional[Tuple[str, str]]:
+                for s_start, s_end in segments:
+                    if s_start <= entry_iso <= s_end:
+                        return (s_start, s_end)
+                return None
+
+            _gated: List[Dict[str, Any]] = []
+            for s in specs:
+                entry_iso = _normalize_iso(s["entry_date"])
+                seg = _seg_for_next(entry_iso)
+                if seg is None:
+                    continue
+                _, seg_end = seg
+                exit_iso = _normalize_iso(s["exit_date"])
+                if exit_iso > seg_end:
+                    clamped = _last_trading_day_on_or_before(seg_end, trading_days)
+                    if clamped is None or clamped <= entry_iso:
+                        continue
+                    s = dict(s)
+                    s["exit_date"] = clamped
+                    s["_seg_clamped"] = True
+                _gated.append(s)
+            specs = _gated
+            if not specs:
+                return []
 
     elif filter_entry_mode == "fixed":
         # Step 1 (fixed): Python builds schedule then Rust prices each spec.
@@ -2288,6 +2436,25 @@ def run_rust_engine_pipeline(
                             continue
                         _s = dict(_s)
                         _s["exit_date"] = _last_td
+                        # This trade did NOT reach its natural expiry — it was cut
+                        # short at the window/range ceiling (the filter's last
+                        # segment end, or the requested to_date). Tag it so the
+                        # exit reason reads FILTER_END (combined with any
+                        # co-occurring reason) instead of falsely reading EXPIRY.
+                        # Calc-neutral: a range-clipped trade is the final trade
+                        # of the run, so it has no successor for the FILTER_END
+                        # patch/Live-DD reset to act on.
+                        _s["_seg_clamped"] = True
+                    elif _normalize_iso(_s.get("expiry", "")) > _to_date_str:
+                        # Exit was ALREADY truncated to the last available trading
+                        # day by resolve_trade_specs (so the exit>ceiling test
+                        # above misses it), but the contract's expiry lies beyond
+                        # the range ceiling — i.e. the trade was cut short by the
+                        # window/range, not by reaching expiry. Mirrors the filter
+                        # gating's `elif expiry > seg_end` so range-end and
+                        # filter-end behave identically. → FILTER_END.
+                        _s = dict(_s)
+                        _s["_seg_clamped"] = True
                     _clipped.append(_s)
                 specs = _clipped
                 if not specs:
@@ -2362,8 +2529,12 @@ def run_rust_engine_pipeline(
     # (simulate_trades_batch drops custom keys). Keyed by (trade_id, entry_date)
     # so the exit-reason step can label these FILTER_END instead of EXPIRY,
     # matching the Python engine (generic_algotest_engine.py:4385).
+    # Keyed by (entry_date, expiry) — NOT trade_id — so the marker survives the
+    # spot-adjustment / re-entry trade-id renumbering that happens further down.
+    # With trade_id in the key, a clamped boundary trade whose id is renumbered
+    # by spot-adj synthesis would miss this lookup and fall back to EXPIRY.
     _seg_clamped_keys: set = {
-        (int(s.get("trade_id", 0)), _normalize_iso(s.get("entry_date", "")))
+        (_normalize_iso(s.get("entry_date", "")), _normalize_iso(s.get("expiry", "")))
         for s in specs if s.get("_seg_clamped")
     }
     # STR (super-trend) segments use 'STR_Exit'; plain filters use 'FILTER_END'.
@@ -2406,13 +2577,19 @@ def run_rust_engine_pipeline(
     has_spot_adj = bool(payload.get("spot_adjustment_enabled")) and (
         (_maybe_float(payload.get("spot_adjustment_pct")) or 0) > 0
     )
-    if not any_risk and not has_overall_top and not has_spot_adj:
+    # Midcap cross-index spot adjustment also needs the risk/re-entry pass below,
+    # so it must NOT take the no-risk-controls early return.
+    _mc_sa_cfg_early = payload.get("midcap_spot_adjustment") or {}
+    has_midcap_spot_adj = bool(_mc_sa_cfg_early.get("enabled")) and (
+        (_maybe_float(_mc_sa_cfg_early.get("pct")) or 0) > 0
+    )
+    if not any_risk and not has_overall_top and not has_spot_adj and not has_midcap_spot_adj:
         # No risk controls → priced output is the final answer. Still tag exits
         # that were clamped to a segment/filter end so they read FILTER_END
         # (or STR_Exit) instead of defaulting to EXPIRY.
         if _seg_clamped_keys:
             for _row in priced:
-                if (int(_row.get("trade_id", 0)), _normalize_iso(_row.get("entry_date", ""))) in _seg_clamped_keys:
+                if (_normalize_iso(_row.get("entry_date", "")), _normalize_iso(_row.get("expiry", ""))) in _seg_clamped_keys:
                     _row["exit_reason"] = _clamp_reason
         return list(priced)
 
@@ -2462,6 +2639,43 @@ def run_rust_engine_pipeline(
     # Mirror Python's clamp: pct in [0.25, 5.0] when enabled.
     if spot_adj_enabled and spot_adj_pct > 0 and spot_adj_units == "percent":
         spot_adj_pct = max(0.25, min(5.0, spot_adj_pct))
+
+    # ── Midcap cross-index spot adjustment (additive; gated on its own config) ──
+    # Same exit-trigger + same-day re-entry logic as the NIFTY spot adjustment,
+    # but the breach is measured on the NIFTYMIDCAP100 index. Earliest breach
+    # (NIFTY vs Midcap) wins. Strikes/re-entry are unchanged (still NIFTY). When
+    # midcap_spot_adjustment is absent/disabled NOTHING below runs — the NIFTY
+    # path stays byte-identical.
+    _mc_sa = payload.get("midcap_spot_adjustment") or {}
+    midcap_adj_enabled = bool(_mc_sa.get("enabled"))
+    midcap_adj_pct = _maybe_float(_mc_sa.get("pct")) or 0.0
+    midcap_adj_direction = str(_mc_sa.get("direction") or "rise").lower()
+    if midcap_adj_direction not in ("rise", "fall", "both"):
+        midcap_adj_direction = "rise"
+    midcap_adj_units = str(_mc_sa.get("units") or "percent").lower()
+    if midcap_adj_units not in ("percent", "points"):
+        midcap_adj_units = "percent"
+    if midcap_adj_enabled and midcap_adj_pct > 0 and midcap_adj_units == "percent":
+        midcap_adj_pct = max(0.25, min(5.0, midcap_adj_pct))
+    _mc_legs_pl = payload.get("midcap_legs") or []
+    midcap_sa_symbol = (
+        (_mc_legs_pl[0].get("symbol") if (_mc_legs_pl and isinstance(_mc_legs_pl[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    midcap_spot_by_date: Dict[str, float] = {}
+    if midcap_adj_enabled and midcap_adj_pct > 0 and trading_days:
+        try:
+            _mc_lk = _get_midcap_sa_lookup(midcap_sa_symbol)
+            for _d in trading_days:
+                _c = _mc_lk.close(_d)
+                if _c is not None:
+                    midcap_spot_by_date[_d] = float(_c)
+        except Exception as _mc_exc:
+            logger.warning("[ENGINE_RUST] midcap spot-adj data load failed (%s) — disabling midcap trigger", _mc_exc)
+            midcap_adj_enabled = False
+        if not midcap_spot_by_date:
+            midcap_adj_enabled = False
+    _midcap_active = bool(midcap_adj_enabled and midcap_adj_pct > 0 and midcap_spot_by_date)
 
     # Fixed-strike legs: compute per-trade spot adj baseline using the segment's
     # first-entry spot so rollovers don't reset the reference level.
@@ -2517,37 +2731,58 @@ def run_rust_engine_pipeline(
 
     spot_adj_overrides: Dict[int, str] = {}
     spot_adj_reasons: Dict[int, str] = {}
-    if spot_adj_enabled and spot_adj_pct > 0:
+    _nifty_active = bool(spot_adj_enabled and spot_adj_pct > 0)
+    if _nifty_active or _midcap_active:
         for trade_id, legs in by_trade.items():
             legs.sort(key=lambda r: r["leg_id"])
             first = legs[0]
             entry_iso = _normalize_iso(first["entry_date"])
-            entry_spot = (
-                _trade_adj_baseline[trade_id]
-                if trade_id in _trade_adj_baseline
-                else float(first.get("entry_spot") or spot_by_date.get(entry_iso) or 0.0)
-            )
             scheduled_exit = _normalize_iso(first["exit_date"])
-            if entry_spot <= 0 or not scheduled_exit:
+            if not scheduled_exit:
                 continue
-            trig = _compute_spot_adjustment_trigger(
-                entry_iso,
-                entry_spot,
-                scheduled_exit,
-                spot_adj_direction,
-                spot_adj_pct,
-                spot_adj_units,
-                trading_days,
-                spot_by_date,
-            )
-            if trig:
-                spot_adj_overrides[trade_id] = trig
+
+            # NIFTY-index breach (unchanged path).
+            nifty_trig = None
+            entry_spot = 0.0
+            if _nifty_active:
+                entry_spot = (
+                    _trade_adj_baseline[trade_id]
+                    if trade_id in _trade_adj_baseline
+                    else float(first.get("entry_spot") or spot_by_date.get(entry_iso) or 0.0)
+                )
+                if entry_spot > 0:
+                    nifty_trig = _compute_spot_adjustment_trigger(
+                        entry_iso, entry_spot, scheduled_exit,
+                        spot_adj_direction, spot_adj_pct, spot_adj_units,
+                        trading_days, spot_by_date,
+                    )
+
+            # Midcap-index breach (additive — measured on NIFTYMIDCAP100, but it
+            # truncates the SAME trade so the existing re-entry chain re-enters
+            # the NIFTY leg the same day with a fresh strike).
+            midcap_trig = None
+            if _midcap_active:
+                mc_entry_spot = midcap_spot_by_date.get(entry_iso) or 0.0
+                if mc_entry_spot > 0:
+                    midcap_trig = _compute_spot_adjustment_trigger(
+                        entry_iso, mc_entry_spot, scheduled_exit,
+                        midcap_adj_direction, midcap_adj_pct, midcap_adj_units,
+                        trading_days, midcap_spot_by_date,
+                    )
+
+            # Earliest breach wins.
+            if nifty_trig and (not midcap_trig or nifty_trig <= midcap_trig):
+                spot_adj_overrides[trade_id] = nifty_trig
                 spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
-                    spot_adj_direction,
-                    entry_spot,
-                    spot_by_date.get(trig),
-                    spot_adj_pct,
-                    spot_adj_units,
+                    spot_adj_direction, entry_spot, spot_by_date.get(nifty_trig),
+                    spot_adj_pct, spot_adj_units,
+                )
+            elif midcap_trig:
+                spot_adj_overrides[trade_id] = midcap_trig
+                _mc_e = midcap_spot_by_date.get(entry_iso) or 0.0
+                _mc_t = midcap_spot_by_date.get(midcap_trig) or 0.0
+                spot_adj_reasons[trade_id] = (
+                    "MIDCAP_SPOT_ADJ_RISE" if _mc_t >= _mc_e else "MIDCAP_SPOT_ADJ_FALL"
                 )
 
     # Slice 5: Overall SL / Target detection.
@@ -2717,7 +2952,7 @@ def run_rust_engine_pipeline(
         and _maybe_float((leg.get("slWithBuffer") or {}).get("value"))
         for leg in legs_src
     )
-    if _fix4_fixed_legs and _fix4_has_slb and spot_adj_enabled and spot_adj_overrides:
+    if _fix4_fixed_legs and _fix4_has_slb and (spot_adj_enabled or _midcap_active) and spot_adj_overrides:
         # (1) anchor strikes per re-anchor date — mirrors the bridge cascade strike
         #     resolution + the natural-ATM fallback in the carry-forward below.
         _fix4_anchor: Dict[str, Dict[int, float]] = {}
@@ -2736,11 +2971,16 @@ def run_rust_engine_pipeline(
                 _f_spot = spot_by_date.get(_f_cur)
                 if _f_spot is None:
                     break
-                _f_casc = _compute_spot_adjustment_trigger(
-                    _f_cur, float(_f_spot), _f_orig_exit,
-                    spot_adj_direction, spot_adj_pct, spot_adj_units,
-                    trading_days, spot_by_date,
-                )
+                # Guard on _nifty_active (see bridge note): a default spot_adjustment_pct
+                # in the payload would otherwise fire a spurious NIFTY re-anchor on a
+                # Midcap-only run.
+                _f_casc = None
+                if _nifty_active:
+                    _f_casc = _compute_spot_adjustment_trigger(
+                        _f_cur, float(_f_spot), _f_orig_exit,
+                        spot_adj_direction, spot_adj_pct, spot_adj_units,
+                        trading_days, spot_by_date,
+                    )
                 for _f_leg in _f_legs:
                     _f_src = (
                         legs_src[_f_leg["leg_id"] - 1]
@@ -3269,7 +3509,7 @@ def run_rust_engine_pipeline(
     # (Defined unconditionally so the spot-adj re-entry block below can chain from
     # it even when this bridge block doesn't run.)
     _bt_new_tid = _reentry_new_tid
-    if spot_adj_enabled and spot_adj_overrides and (
+    if (spot_adj_enabled or _midcap_active) and spot_adj_overrides and (
         (_rollover_toggle and filter_entry_mode == "fixed") or _has_fixed_strike_opt_legs
     ):
         for _bt_id, _bt_trigger in list(spot_adj_overrides.items()):
@@ -3296,16 +3536,46 @@ def run_rust_engine_pipeline(
                 _bt_cycle_tid = _bt_new_tid
 
                 # Cascading spot adj trigger for this bridge window.
-                _bt_casc_trig = _compute_spot_adjustment_trigger(
-                    _bt_cur_entry,
-                    float(_bt_spot),
-                    _bt_cycle_exit,
-                    spot_adj_direction,
-                    spot_adj_pct,
-                    spot_adj_units,
-                    trading_days,
-                    spot_by_date,
-                )
+                # Guard on _nifty_active: when NIFTY spot adjustment is disabled the
+                # payload still carries a default spot_adjustment_pct (e.g. 1.0), so an
+                # unconditional scan would fire a spurious NIFTY trigger on a Midcap-only
+                # run. Mirrors the initial loop and the DTE/cascade block.
+                _bt_casc_trig = None
+                if _nifty_active:
+                    _bt_casc_trig = _compute_spot_adjustment_trigger(
+                        _bt_cur_entry,
+                        float(_bt_spot),
+                        _bt_cycle_exit,
+                        spot_adj_direction,
+                        spot_adj_pct,
+                        spot_adj_units,
+                        trading_days,
+                        spot_by_date,
+                    )
+                # Re-base + re-scan the Midcap index on THIS cycle too (mirrors the
+                # DTE/cascade path above). Without this, fixed-strike bridge
+                # re-entries silently skipped Midcap spot adjustment — only the
+                # original trade was ever checked. Earliest of NIFTY / Midcap wins
+                # (tie → NIFTY, since we only override on a strictly earlier date).
+                _bt_casc_is_midcap = False
+                if _midcap_active:
+                    _bt_mc_entry = midcap_spot_by_date.get(_bt_cur_entry) or 0.0
+                    if _bt_mc_entry > 0:
+                        _bt_mc_casc = _compute_spot_adjustment_trigger(
+                            _bt_cur_entry,
+                            _bt_mc_entry,
+                            _bt_cycle_exit,
+                            midcap_adj_direction,
+                            midcap_adj_pct,
+                            midcap_adj_units,
+                            trading_days,
+                            midcap_spot_by_date,
+                        )
+                        if _bt_mc_casc and (
+                            not _bt_casc_trig or _bt_mc_casc < _bt_casc_trig
+                        ):
+                            _bt_casc_trig = _bt_mc_casc
+                            _bt_casc_is_midcap = True
                 _bt_this_exit = (
                     _bt_casc_trig
                     if (_bt_casc_trig and _bt_casc_trig < _bt_cycle_exit)
@@ -3392,17 +3662,24 @@ def run_rust_engine_pipeline(
                         _btl_sl_res = None
 
                     _btl_final_exit = _bt_this_exit
-                    _btl_reason = (
-                        _spot_adj_reason_tag(
-                            spot_adj_direction,
-                            _bt_spot,
-                            spot_by_date.get(_bt_casc_trig),
-                            spot_adj_pct,
-                            spot_adj_units,
-                        )
-                        if (_bt_casc_trig and _bt_casc_trig < _bt_cycle_exit)
-                        else "EXPIRY"
-                    )
+                    if _bt_casc_trig and _bt_casc_trig < _bt_cycle_exit:
+                        if _bt_casc_is_midcap:
+                            _bt_mc_e2 = midcap_spot_by_date.get(_bt_cur_entry) or 0.0
+                            _bt_mc_t2 = midcap_spot_by_date.get(_bt_casc_trig) or 0.0
+                            _btl_reason = (
+                                "MIDCAP_SPOT_ADJ_RISE" if _bt_mc_t2 >= _bt_mc_e2
+                                else "MIDCAP_SPOT_ADJ_FALL"
+                            )
+                        else:
+                            _btl_reason = _spot_adj_reason_tag(
+                                spot_adj_direction,
+                                _bt_spot,
+                                spot_by_date.get(_bt_casc_trig),
+                                spot_adj_pct,
+                                spot_adj_units,
+                            )
+                    else:
+                        _btl_reason = "EXPIRY"
                     if isinstance(_btl_sl_res, list) and _btl_sl_res:
                         _btl_r0 = _btl_sl_res[0]
                         if isinstance(_btl_r0, dict) and _btl_r0.get("triggered"):
@@ -3613,17 +3890,27 @@ def run_rust_engine_pipeline(
         for i, leg in enumerate(legs):
             override = leg_overrides[i]
             final_exit = override or leg["exit_date"]
-            # Determine exit reason (cascades in same order as final_exit)
+            # Determine exit reason (cascades in same order as final_exit).
+            # We also accumulate every candidate (exit_date, reason) so that when
+            # more than one exit condition resolves to the SAME final exit date
+            # (e.g. a filter-end clamp AND a spot adjustment on the same day),
+            # the tradesheet "Exit Reason" shows ALL of them joined by '+'
+            # (e.g. "FILTER_END+SPOT_ADJ_RISE") instead of only the
+            # highest-priority one. EXPIRY is included too when the trade reached
+            # its scheduled exit on that same day (e.g. "EXPIRY+SPOT_ADJ_RISE");
+            # it only stands alone when nothing else co-occurs.
+            _reason_cands: List[Tuple[Any, str]] = []  # (exit_date, reason) in display order
             if override:
                 lr = leg_results_for_reason[i] if i < len(leg_results_for_reason) else {}
                 reason = str(lr.get("exit_reason") or "SL").upper() or "SL"
             else:
                 # Default to EXPIRY, unless this trade's exit was clamped to a
                 # segment/filter end — then it's a FILTER_END (or STR_Exit) exit.
-                if (int(leg["trade_id"]), _normalize_iso(leg["entry_date"])) in _seg_clamped_keys:
+                if (_normalize_iso(leg["entry_date"]), _normalize_iso(leg.get("expiry", ""))) in _seg_clamped_keys:
                     reason = _clamp_reason
                 else:
                     reason = "EXPIRY"
+            _reason_cands.append((final_exit, reason))
             # Slice 4b: SL-with-Buffer. The engine's exit_price_override IS
             # honored now (_recalc_leg_pnl is skipped when it's set). We stash
             # the override here keyed by (trade_id, leg_id, date) so the
@@ -3634,18 +3921,49 @@ def run_rust_engine_pipeline(
                 if not override or slb_date < override:
                     final_exit = slb_date
                     reason = "SL_WITH_BUFFER"
+                    _reason_cands.append((slb_date, "SL_WITH_BUFFER"))
             # Slice 5: Overall SL/Target. Matches _apply_overall_sl_to_per_leg —
             # overall trigger overrides leg whose current exit_date is on or
             # after the overall trigger date. Earlier per-leg exits win.
             if overall_date is not None and final_exit >= overall_date:
                 final_exit = overall_date
                 reason = overall_reasons.get(trade_id, "OVERALL_SL")
+                _reason_cands.append((overall_date, reason))
             # Slice 7a: Spot adjustment exit always clamps the final exit when
             # the SL/Overall date is later than the spot-adj trigger.
             spot_adj_clamp = spot_adj_overrides.get(trade_id)
             if spot_adj_clamp and final_exit >= spot_adj_clamp:
                 final_exit = spot_adj_clamp
                 reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
+                _reason_cands.append((spot_adj_clamp, reason))
+            # `reason` now holds the OLD single (highest-priority) label — the
+            # value this column used to carry. Combine all reasons whose
+            # effective date matches the resolved final_exit, in display order,
+            # de-duplicated. EXPIRY is kept so a trade that reached its scheduled
+            # exit shows it even when another reason co-occurs on the same day.
+            _old_primary = reason
+            _fx_norm = _normalize_iso(str(final_exit))
+            _at_final = [
+                r for (d, r) in _reason_cands
+                if r and _normalize_iso(str(d)) == _fx_norm
+            ]
+            _combined = "+".join(dict.fromkeys(_at_final)) or "EXPIRY"
+            # CALCULATION-NEUTRALITY GUARD. Downstream metrics key off the EXACT
+            # reason string (the SL adverse-cap set; the FILTER_END patch /
+            # Live-DD reset). Those checks are intentionally left untouched while
+            # the software is being verified. If the OLD single label would have
+            # matched one of those exact-keyed calculations but the combined
+            # label no longer would, keep the OLD single label so no numeric
+            # output changes. (FILTER_END is only ever the primary when it is the
+            # sole reason, so that clause is a belt-and-braces no-op.)
+            _EXACT_KEYED_REASONS = {
+                "FILTER_END",
+                "STOP_LOSS", "SL_WITH_BUFFER", "SL_WITH_BUFFER_GAP",
+                "STOP_LOSS_BUFFER", "STOP_LOSS_BUFFER_GAP",
+            }
+            if _combined != _old_primary and _old_primary in _EXACT_KEYED_REASONS:
+                _combined = _old_primary
+            reason = _combined
             adjusted_reason_by_date[(int(leg["trade_id"]), int(leg["leg_id"]), str(leg["entry_date"]))] = reason
             sched_exit = leg["exit_date"]
             if sched_exit > latest_scheduled:
@@ -3714,6 +4032,16 @@ def run_rust_engine_pipeline(
         # Engine builds trade.exit_date on the NEXT expiry while expiry stays the
         # current one — same residual-window logic applies when spot adj fires.
         or (_sa_entry_dte == 0 and _sa_exit_dte == 0 and _sa_expiry_type in ("WEEKLY", "MONTHLY"))
+        # Non-rollover intra-cycle T-n (Entry T-m / Exit T-n, m>n>=0): one base
+        # trade per expiry whose scheduled exit is T-n before expiry. A spot-adj
+        # breach mid-cycle must still exit + re-enter same day and ride to the
+        # T-n scheduled exit (exactly like weekly), instead of stopping at the
+        # breach and leaving a gap to the next cycle. The residual window is
+        # [trigger, scheduled_exit] and is bounded by the per-trade exit_date
+        # read below, so this never extends past T-n. Fixed-entry is handled by
+        # the bridge (Slice 7b) and stays excluded via the filter_entry_mode
+        # guard on the `if` immediately below.
+        or _sa_expiry_type in ("WEEKLY", "MONTHLY")
     )
     if spot_adj_overrides and _sa_cascade_active and filter_entry_mode != "fixed":
         if True:  # legacy indentation
@@ -3758,17 +4086,45 @@ def run_rust_engine_pipeline(
                     if not _sa_spot:
                         break
 
-                    # Check for a further spot-adj trigger inside this window.
-                    _sa_casc = _compute_spot_adjustment_trigger(
-                        _sa_cur_entry,
-                        _sa_spot,
-                        _sa_cur_exit,
-                        spot_adj_direction,
-                        spot_adj_pct,
-                        spot_adj_units,
-                        trading_days,
-                        spot_by_date,
-                    )
+                    # Check for a further NIFTY spot-adj trigger inside this
+                    # window — only when NIFTY SA is actually enabled.
+                    _sa_casc = None
+                    if _nifty_active:
+                        _sa_casc = _compute_spot_adjustment_trigger(
+                            _sa_cur_entry,
+                            _sa_spot,
+                            _sa_cur_exit,
+                            spot_adj_direction,
+                            spot_adj_pct,
+                            spot_adj_units,
+                            trading_days,
+                            spot_by_date,
+                        )
+                    # Check for a further Midcap spot-adj trigger — only when
+                    # Midcap SA is active. Earliest of NIFTY/Midcap wins.
+                    _mc_casc = None
+                    _mc_casc_is_midcap = False
+                    if _midcap_active:
+                        _mc_entry_c = midcap_spot_by_date.get(_sa_cur_entry) or 0.0
+                        if _mc_entry_c > 0:
+                            _mc_casc = _compute_spot_adjustment_trigger(
+                                _sa_cur_entry,
+                                _mc_entry_c,
+                                _sa_cur_exit,
+                                midcap_adj_direction,
+                                midcap_adj_pct,
+                                midcap_adj_units,
+                                trading_days,
+                                midcap_spot_by_date,
+                            )
+                    # Earliest sub-trigger wins; track which source it came from.
+                    if _sa_casc and _mc_casc:
+                        if _mc_casc < _sa_casc:
+                            _sa_casc = _mc_casc
+                            _mc_casc_is_midcap = True
+                    elif _mc_casc:
+                        _sa_casc = _mc_casc
+                        _mc_casc_is_midcap = True
                     _sa_this_exit = (
                         _sa_casc if (_sa_casc and _sa_casc < _sa_cur_exit)
                         else _sa_cur_exit
@@ -3819,17 +4175,24 @@ def run_rust_engine_pipeline(
                             "lot_size":     int(_sa_leg.get("lot_size") or lot_size),
                             "slippage_pct": float(_sa_leg.get("slippage_pct") or 0.0),
                         })
-                        _sa_reason = (
-                            _spot_adj_reason_tag(
-                                spot_adj_direction,
-                                _sa_spot,
-                                spot_by_date.get(_sa_casc),
-                                spot_adj_pct,
-                                spot_adj_units,
-                            )
-                            if (_sa_casc and _sa_casc < _sa_cur_exit)
-                            else "EXPIRY"
-                        )
+                        if _sa_casc and _sa_casc < _sa_cur_exit:
+                            if _mc_casc_is_midcap:
+                                _mc_e2 = midcap_spot_by_date.get(_sa_cur_entry) or 0.0
+                                _mc_t2 = midcap_spot_by_date.get(_sa_casc) or 0.0
+                                _sa_reason = (
+                                    "MIDCAP_SPOT_ADJ_RISE" if _mc_t2 >= _mc_e2
+                                    else "MIDCAP_SPOT_ADJ_FALL"
+                                )
+                            else:
+                                _sa_reason = _spot_adj_reason_tag(
+                                    spot_adj_direction,
+                                    _sa_spot,
+                                    spot_by_date.get(_sa_casc),
+                                    spot_adj_pct,
+                                    spot_adj_units,
+                                )
+                        else:
+                            _sa_reason = "EXPIRY"
                         _sa_reentry_reasons[(_sa_new_tid, _sa_lid, _sa_cur_entry)] = _sa_reason
 
                     if mini_specs:
@@ -4025,5 +4388,25 @@ def run_rust_engine_pipeline(
         row["exit_price"] = settlement
         row["raw_exit_price"] = settlement
         row["net_pnl"] = net_pnl
+
+    # Final FILTER_END guarantee. A trade clamped to a filter/segment end must
+    # read FILTER_END (combined with any co-occurring reason) no matter which
+    # path assigned its reason. The spot-adjustment / bridge re-entry synthesis
+    # renumbers trade ids and writes reasons via reentry_reason_map, which
+    # bypasses the per-leg cascade lookup — so without this pass a clamped
+    # boundary trade in a spot-adj run silently falls back to EXPIRY. Keyed by
+    # (entry_date, expiry) so it survives the renumbering. Display-only: it
+    # prepends FILTER_END and drops the neutral EXPIRY token; it never changes
+    # exit dates, prices, or P&L.
+    if _seg_clamped_keys:
+        for row in final_priced:
+            k = (_normalize_iso(row.get("entry_date", "")), _normalize_iso(row.get("expiry", "")))
+            if k not in _seg_clamped_keys:
+                continue
+            _parts = [
+                p for p in str(row.get("exit_reason") or "").upper().split("+")
+                if p and p != "EXPIRY" and p != _clamp_reason
+            ]
+            row["exit_reason"] = "+".join([_clamp_reason] + _parts)
 
     return final_priced

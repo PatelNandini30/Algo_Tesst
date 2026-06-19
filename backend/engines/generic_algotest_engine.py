@@ -529,7 +529,45 @@ def _calculate_mae_mfe_from_extremes(entry_price, position, entry_spot, max_high
     return round(mae * 100, 4), round(mfe * 100, 4)
 
 
-def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, position, entry_spot, trading_calendar_df, trade=None):
+# Exit reasons that represent a realised stop-out (plain SL + SL-with-buffer).
+# For these — and ONLY these — the adverse excursion cannot be worse than the
+# stop fill price: any print past the stop happened after the position was
+# already flat, so counting it would overstate MAE. Target / Expiry / Spot-Adj
+# exits are NOT in this set and keep the raw window extremes.
+_SL_CAP_REASONS = {
+    "STOP_LOSS",
+    "SL_WITH_BUFFER",
+    "SL_WITH_BUFFER_GAP",
+    "STOP_LOSS_BUFFER",
+    "STOP_LOSS_BUFFER_GAP",
+}
+
+
+def _cap_adverse_extreme_for_sl(max_high, min_low, position, exit_reason, exit_price):
+    """Clamp the ADVERSE extreme to the realised stop price on SL / SL-with-buffer
+    exits. SELL → cap the High; BUY → floor the Low. The favourable extreme (which
+    drives MFE) is never touched. Non-SL exits, or a missing/invalid stop price,
+    return the extremes unchanged so all other behaviour is byte-for-byte the same.
+    """
+    reason = str(exit_reason or "").upper().strip()
+    if reason not in _SL_CAP_REASONS:
+        return max_high, min_low
+    stop = _safe_float(exit_price)
+    if stop is None or stop <= 0:
+        return max_high, min_low
+    pos = str(position or "").upper().strip()
+    if pos == "SELL":
+        hi = _safe_float(max_high)
+        if hi is not None:
+            return min(hi, stop), min_low
+    else:
+        lo = _safe_float(min_low)
+        if lo is not None:
+            return max_high, max(lo, stop)
+    return max_high, min_low
+
+
+def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, position, entry_spot, trading_calendar_df, trade=None, exit_reason=None, exit_price=None):
     if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() in ("0", "false", "no", "off"):
         return None, None
 
@@ -576,12 +614,15 @@ def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, posit
                 strike=strike,
             )
             if result is not None:
+                _hi, _lo = _cap_adverse_extreme_for_sl(
+                    result[0], result[1], position, exit_reason, exit_price
+                )
                 return _calculate_mae_mfe_from_extremes(
                     entry_price=entry_price,
                     position=position,
                     entry_spot=entry_spot,
-                    max_high=result[0],
-                    min_low=result[1],
+                    max_high=_hi,
+                    min_low=_lo,
                 )
 
     # Fallback: per-day loop (futures or when range query returns nothing).
@@ -607,12 +648,15 @@ def _calculate_leg_mae_mfe(index, entry_date, exit_date, leg, entry_price, posit
     if not highs or not lows:
         return None, None
 
+    _hi, _lo = _cap_adverse_extreme_for_sl(
+        max(highs), min(lows), position, exit_reason, exit_price
+    )
     return _calculate_mae_mfe_from_extremes(
         entry_price=entry_price,
         position=position,
         entry_spot=entry_spot,
-        max_high=max(highs),
-        min_low=min(lows),
+        max_high=_hi,
+        min_low=_lo,
     )
 
 
@@ -5676,6 +5720,8 @@ def run_algotest_backtest(params):
                     entry_spot=row_entry_spot,
                     trading_calendar_df=trading_calendar,
                     trade=trade,
+                    exit_reason=leg_exit_reason,
+                    exit_price=exit_price,
                 )
 
                 segment_meta = trade.get('segment') or {}
@@ -5814,6 +5860,8 @@ def run_algotest_backtest(params):
                         entry_spot=re_entry_spot,
                         trading_calendar_df=trading_calendar,
                         trade=trade,
+                        exit_reason=re_leg.get('exit_reason', 'EXPIRY'),
+                        exit_price=re_exit_price,
                     )
 
                     re_row = {

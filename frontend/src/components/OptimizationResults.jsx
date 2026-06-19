@@ -70,6 +70,7 @@ export default function OptimizationResults({
   totalCombos,
   objective: defaultObjective,
   runConfig,
+  midcapConfig,
   onClose,
   onApplyCombo,
 }) {
@@ -84,6 +85,8 @@ export default function OptimizationResults({
   const [configExpanded, setConfigExpanded] = useState(false);
   const [zipDownloading, setZipDownloading] = useState(false);
   const [zipProgress, setZipProgress] = useState(null);
+  const [showDdMenu, setShowDdMenu] = useState(false);
+  const [ddMode, setDdMode] = useState('overall');
   const pollRef = useRef(null);
 
   const fetchAll = useCallback(async () => {
@@ -133,6 +136,16 @@ export default function OptimizationResults({
   const total = meta?.total ?? totalCombos ?? 0;
   const progressPct = total > 0 ? Math.round((done / total) * 100) : 0;
   const status = meta?.status || jobStatus || 'queued';
+
+  // Pre-build the ZIP silently as soon as the job succeeds so it's ready
+  // when the user clicks download instead of making them wait then.
+  const zipPrebuiltRef = useRef(false);
+  useEffect(() => {
+    if (status === 'success' && rows.length > 0 && jobId && !zipPrebuiltRef.current) {
+      zipPrebuiltRef.current = true;
+      fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`).catch(() => {});
+    }
+  }, [status, rows.length, jobId]);
   const eta = meta?.eta_seconds;
   const phase = meta?.phase || 'running';
 
@@ -161,14 +174,16 @@ export default function OptimizationResults({
     let hasCE = false;
     let hasPE = false;
     let hasSpot = false;
+    let hasMidcap = false;
     for (const r of rows) {
       const s = r.summary || {};
       if (!hasCE && s.ce_pnl_total != null && Math.abs(Number(s.ce_pnl_total)) > 0.01) hasCE = true;
       if (!hasPE && s.pe_pnl_total != null && Math.abs(Number(s.pe_pnl_total)) > 0.01) hasPE = true;
       if (!hasSpot && s.long_spot_pnl != null && Math.abs(Number(s.long_spot_pnl)) > 0.01) hasSpot = true;
-      if (hasCE && hasPE && hasSpot) break;
+      if (!hasMidcap && s.has_midcap) hasMidcap = true;
+      if (hasCE && hasPE && hasSpot && hasMidcap) break;
     }
-    return { hasCE, hasPE, hasSpot };
+    return { hasCE, hasPE, hasSpot, hasMidcap, notMidcap: !hasMidcap };
   }, [rows]);
 
   // Filter MASTER_SUMMARY_COLUMNS based on which leg types are actually present.
@@ -246,7 +261,7 @@ export default function OptimizationResults({
     document.body.removeChild(a);
   }
 
-  async function downloadTradesheets() {
+  async function downloadTradesheets(patchwise = false) {
     if (zipDownloading) return;
     setZipDownloading(true);
     setZipProgress({ done: 0, total: 0, elapsed: 0 });
@@ -255,8 +270,11 @@ export default function OptimizationResults({
       // still building (poll progress).
       const start = Date.now();
       const maxWaitMs = 20 * 60 * 1000;  // 20 min hard cap
+      const zipUrl = patchwise
+        ? `/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
+        : `/api/optimize/jobs/${jobId}/tradesheets.zip`;
       while (true) {
-        const r = await fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`);
+        const r = await fetch(zipUrl);
         if (r.status === 200) {
           const blob = await r.blob();
           const filename =
@@ -358,10 +376,60 @@ export default function OptimizationResults({
       const summary     = matchingRow?.summary || {};
       const comboLabel  = matchingRow?.combo_label || `Combo ${comboId}`;
 
+      // Midcap cross-index overlay — compute via the SAME native engine the
+      // backtest uses (/api/midcap-overlay), so the single-combo Excel matches
+      // the backtest + the ZIP. Only when this run had a Midcap leg.
+      let midcapData = null;
+      // Midcap config: prefer the job meta (server source of truth — survives
+      // page reloads / works even if this panel was opened fresh), fall back to
+      // the launch-time prop.
+      const _bpMc = meta?.base_payload?.midcap_legs;
+      const _mcLegs = (Array.isArray(_bpMc) && _bpMc.length) ? _bpMc : midcapConfig?.midcap_legs;
+      const _mcSA = (Array.isArray(_bpMc) && _bpMc.length)
+        ? (meta?.base_payload?.midcap_spot_adjustment || null)
+        : (midcapConfig?.midcap_spot_adjustment || null);
+      if (Array.isArray(_mcLegs) && _mcLegs.length) {
+        try {
+          // Project per-leg rows → one row per trade for the overlay.
+          const _grp = {};
+          for (const t of parsedTrades) {
+            const k = String(t.Trade || t.trade || 1);
+            (_grp[k] = _grp[k] || []).push(t);
+          }
+          const _num = (v) => { const n = parseFloat(String(v ?? '').replace(/[,%₹\s]/g, '')); return Number.isFinite(n) ? n : null; };
+          const _proj = Object.entries(_grp).map(([k, legs]) => {
+            const main = legs.find(l => !l['ReEntryIndex'] && !l['ReEntryTrigger'] && !l['ReEntryMode']) || legs[0];
+            let net = _num(main['Net P&L']);
+            if (net == null) net = legs.reduce((s, l) => s + (_num(l['CE P&L']) || 0) + (_num(l['PE P&L']) || 0) + (_num(l['FUT P&L']) || 0), 0);
+            let pct = _num(main['% P&L']);
+            if (pct == null) { const es = _num(main['Entry Spot']) || 0; pct = es ? (net / es) * 100 : 0; }
+            return { trade_id: k, entry_date: main['Entry Date'], exit_date: main['Exit Date'], nifty_pnl: net, nifty_pnl_pct: pct };
+          });
+          const _resp = await fetch('/api/midcap-overlay', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            // Engine already applied the Midcap spot-adjustment (exit + re-entry);
+            // the overlay just prices the Midcap leg over each trade window. Pass null.
+            body: JSON.stringify({ rows: _proj, midcap_legs: _mcLegs, midcap_spot_adjustment: null, symbol: 'NIFTYMIDCAP100' }),
+          });
+          if (_resp.ok) {
+            const _r = await _resp.json();
+            if (_r?.available) {
+              const byTrade = {};
+              for (const rr of (_r.results || [])) { if (rr?.available) byTrade[String(rr.trade_id)] = rr; }
+              midcapData = { available: true, byTrade, summary: _r.summary || null, legs: _mcLegs };
+            }
+          }
+        } catch (_e) { /* non-fatal — fall back to NIFTY-only sheet */ }
+      }
+
       const blob = await buildTradeExcel(parsedTrades, summary, {
         comboLabel,
         runConfig,
         comboValues: matchingRow?.combo || {},
+        midcap: midcapData,
+        filterName: meta?.zip_naming?.level1 || '',
+        patchwise: ddMode === 'patchwise',
+        filterSegments: meta?.base_payload?.filter_segments || null,
       });
 
       // Derive filename from Content-Disposition or fallback
@@ -487,36 +555,59 @@ export default function OptimizationResults({
             >
               <Download size={12} /> Export XLSX
             </button>
-            <button
-              onClick={downloadTradesheets}
-              disabled={status !== 'success' || rows.length === 0 || zipDownloading}
-              style={{
-                padding: '6px 12px',
-                fontSize: 11,
-                border: '1px solid var(--border-strong, #d1d5db)',
-                borderRadius: 6,
-                background: 'transparent',
-                cursor: (status !== 'success' || rows.length === 0 || zipDownloading) ? 'not-allowed' : 'pointer',
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                opacity: (status !== 'success' || rows.length === 0) ? 0.4 : 1,
-              }}
-              title={
-                status !== 'success'
-                  ? 'Available after run completes'
-                  : zipDownloading
-                    ? 'ZIP is being built…'
-                    : 'Download all tradesheets as ZIP'
-              }
-            >
-              <Download size={12} />
-              {zipDownloading
-                ? (zipProgress && zipProgress.total > 0
-                    ? `Building ZIP… ${zipProgress.done}/${zipProgress.total} (${Math.round(zipProgress.elapsed)}s)`
-                    : `Building ZIP…${zipProgress ? ` ${Math.round(zipProgress.elapsed)}s` : ''}`)
-                : 'Download Tradesheets ZIP'}
-            </button>
+            <div style={{ position: 'relative' }}>
+              <button
+                onClick={() => setShowDdMenu(v => !v)}
+                disabled={status !== 'success' || rows.length === 0 || zipDownloading}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: 11,
+                  border: '1px solid var(--border-strong, #d1d5db)',
+                  borderRadius: 6,
+                  background: 'transparent',
+                  cursor: (status !== 'success' || rows.length === 0 || zipDownloading) ? 'not-allowed' : 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  opacity: (status !== 'success' || rows.length === 0) ? 0.4 : 1,
+                }}
+                title={
+                  status !== 'success'
+                    ? 'Available after run completes'
+                    : zipDownloading
+                      ? 'ZIP is being built…'
+                      : 'Download all tradesheets as ZIP'
+                }
+              >
+                <Download size={12} />
+                {zipDownloading
+                  ? (zipProgress && zipProgress.total > 0
+                      ? `Building ZIP… ${zipProgress.done}/${zipProgress.total} (${Math.round(zipProgress.elapsed)}s)`
+                      : `Building ZIP…${zipProgress ? ` ${Math.round(zipProgress.elapsed)}s` : ''}`)
+                  : `Download Tradesheets ZIP ▾`}
+              </button>
+              {showDdMenu && (
+                <div style={{
+                  position: 'absolute', right: 0, top: '100%', marginTop: 4,
+                  zIndex: 50, borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.18)',
+                  overflow: 'hidden', background: 'var(--bg-card)', border: '1px solid var(--border)',
+                  minWidth: 200,
+                }}>
+                  <button
+                    style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', border: 'none', cursor: 'pointer', display: 'block' }}
+                    onClick={() => { setShowDdMenu(false); setDdMode('overall'); downloadTradesheets(false); }}
+                  >
+                    Overall System DD
+                  </button>
+                  <button
+                    style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', borderTop: '1px solid var(--border)', cursor: 'pointer', display: 'block' }}
+                    onClick={() => { setShowDdMenu(false); setDdMode('patchwise'); downloadTradesheets(true); }}
+                  >
+                    Patchwise DD
+                  </button>
+                </div>
+              )}
+            </div>
             {status === 'running' && (
               <button
                 onClick={cancelJob}

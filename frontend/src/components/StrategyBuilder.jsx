@@ -764,6 +764,10 @@ const StrategyBuilder = () => {
     () => legs.some(l => l.segment === 'futures'),
     [legs]
   );
+  const hasMidcapLeg = useMemo(
+    () => legs.some(l => l.segment === 'midcap100'),
+    [legs]
+  );
   const indexConfig = useMemo(() => getIndexConfig(instrument), [instrument]);
   const expiryBasisOptions = useMemo(
     () => indexConfig.expiryBases.map(value => ({
@@ -776,13 +780,17 @@ const StrategyBuilder = () => {
   const defaultOptionExpiry = indexConfig.defaultOptionExpiry;
   const unsupportedIndexMessage = `${instrument} backtest data is not available. Import option quotes and expiry calendar before running this index.`;
 
-  const normalizeLegForSelectedIndex = useCallback((leg) => ({
-    ...leg,
-    expiry: normalizeExpiryForIndex(leg.expiry, instrument, leg.segment),
-    strike_interval: normalizeStrikeInterval(leg.strike_interval),
-    re_entry_target_mode: normalizeReEntryMode(leg.re_entry_target_mode),
-    re_entry_sl_mode: normalizeReEntryMode(leg.re_entry_sl_mode),
-  }), [instrument]);
+  const normalizeLegForSelectedIndex = useCallback((leg) => (
+    // Midcap100 overlay legs have no expiry/strike of their own — pass through
+    // untouched so index changes don't rewrite them.
+    leg.segment === 'midcap100' ? { ...leg } : {
+      ...leg,
+      expiry: normalizeExpiryForIndex(leg.expiry, instrument, leg.segment),
+      strike_interval: normalizeStrikeInterval(leg.strike_interval),
+      re_entry_target_mode: normalizeReEntryMode(leg.re_entry_target_mode),
+      re_entry_sl_mode: normalizeReEntryMode(leg.re_entry_sl_mode),
+    }
+  ), [instrument]);
 
   const selectInstrument = useCallback((symbol) => {
     const nextConfig = getIndexConfig(symbol);
@@ -805,6 +813,12 @@ const StrategyBuilder = () => {
   const [spotAdjustmentValue, setSpotAdjustmentValue] = useState(1.0);
   const [spotAdjustmentUnits, setSpotAdjustmentUnits] = useState('percent');
   const [spotAdjustmentShowInfo, setSpotAdjustmentShowInfo] = useState(true);
+  // Per-index spot adjustment for the Midcap100 overlay leg (applied by the
+  // overlay, not the engine). Shown as a second checkbox when a Midcap leg exists.
+  const [midcapSpotAdjEnabled, setMidcapSpotAdjEnabled] = useState(false);
+  const [midcapSpotAdjDirection, setMidcapSpotAdjDirection] = useState('rise');
+  const [midcapSpotAdjValue, setMidcapSpotAdjValue] = useState(1.0);
+  const [midcapSpotAdjUnits, setMidcapSpotAdjUnits] = useState('percent');
   const [bufferStrikeEnabled, setBufferStrikeEnabled] = useState(false);
   const [bufferStrikeValue, setBufferStrikeValue] = useState(0.5);
   const [bufferStrikeUnit, setBufferStrikeUnit] = useState('percent');
@@ -844,6 +858,9 @@ const [slippagePct, setSlippagePct] = useState(0);
     atm_straddle_prem_pct: 0,
     straddle_multiplier: 0.5,
     straddle_direction: '+',
+    // Midcap100 cross-index overlay leg (segment === 'midcap100'):
+    midcap_mode: 'hypothetical',     // 'spot' | 'hypothetical'
+    cost_pct_per_month: 0.5,         // carry cost for hypothetical mode
   });
 
   useEffect(() => {
@@ -1024,6 +1041,106 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
   }, []);
 
+  // ── Midcap cross-index overlay (additive) ─────────────────────────────────
+  // After the NIFTY backtest completes, price the Midcap100 overlay leg(s) for
+  // each trade cycle and attach the result as `payload.midcap`. No-op when no
+  // Midcap leg is configured (so the existing flow is untouched).
+  const _midcapNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+
+  const buildMidcapConfig = useCallback(() => {
+    const midcap_legs = legs
+      .filter(l => l.segment === 'midcap100')
+      .map(l => ({
+        midcap_mode: (l.midcap_mode || 'hypothetical').toLowerCase(),
+        cost_pct_per_month: Number(l.cost_pct_per_month) || 0,
+        position: (l.position || 'buy').toUpperCase(),
+        lots: l.lot || 1,
+        symbol: 'NIFTYMIDCAP100',
+      }));
+    const midcap_spot_adjustment = (midcap_legs.length && midcapSpotAdjEnabled)
+      ? {
+          enabled: true,
+          direction: midcapSpotAdjDirection,
+          pct: clampSpotAdjustmentValue(midcapSpotAdjValue),
+          units: midcapSpotAdjUnits,
+        }
+      : null;
+    return { midcap_legs, midcap_spot_adjustment };
+  }, [legs, midcapSpotAdjEnabled, midcapSpotAdjDirection, midcapSpotAdjValue, midcapSpotAdjUnits, clampSpotAdjustmentValue]);
+
+  const projectTradesForOverlay = useCallback((trades) => {
+    // One projected row per Trade id (matching the Excel export's grouping):
+    // sum the NIFTY-leg P&L across all of that trade's rows (legs + re-entries),
+    // span = earliest Entry Date → latest Exit Date. trade_id is String(Trade)
+    // so it lines up with the export's per-trade map.
+    const cmp = (d) => {
+      const s = String(d || '').trim();
+      let m = s.match(/^(\d{2})-(\d{2})-(\d{4})/);
+      if (m) return `${m[3]}${m[2]}${m[1]}`;
+      m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) return `${m[1]}${m[2]}${m[3]}`;
+      return s;
+    };
+    const byKey = new Map();
+    for (const t of trades || []) {
+      const tid = t['Trade'] ?? t.trade;
+      if (tid === undefined || tid === null || tid === '') continue;
+      const key = String(tid);
+      const entry = t['Entry Date'] ?? t.entry_date;
+      const exit = t['Exit Date'] ?? t['Leg Exit Date'] ?? t.exit_date;
+      if (!entry || !exit) continue;
+      const pnl = _midcapNum(t['Net P&L'] ?? t.net_pnl);
+      const pct = _midcapNum(t['% P&L'] ?? t.pnl_pct);
+      if (!byKey.has(key)) {
+        byKey.set(key, { trade_id: key, entry_date: entry, exit_date: exit, nifty_pnl: 0, nifty_pnl_pct: 0 });
+      }
+      const agg = byKey.get(key);
+      if (cmp(entry) < cmp(agg.entry_date)) agg.entry_date = entry;
+      if (cmp(exit) > cmp(agg.exit_date)) agg.exit_date = exit;
+      if (pnl != null) agg.nifty_pnl += pnl;
+      if (pct != null) agg.nifty_pnl_pct += pct;
+    }
+    return [...byKey.values()];
+  }, []);
+
+  const applyMidcapOverlay = useCallback(async (payload) => {
+    const { midcap_legs, midcap_spot_adjustment } = buildMidcapConfig();
+    if (!midcap_legs.length || !Array.isArray(payload?.trades) || !payload.trades.length) {
+      return payload;
+    }
+    const rows = projectTradesForOverlay(payload.trades);
+    if (!rows.length) return payload;
+    try {
+      const res = await fetch('/api/midcap-overlay', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // The engine already applies the Midcap spot-adjustment (truncates the
+        // trade + re-enters), so the overlay must NOT re-apply it — it just
+        // prices the Midcap leg over each trade's window. Pass null.
+        body: JSON.stringify({ rows, midcap_legs, midcap_spot_adjustment: null, symbol: 'NIFTYMIDCAP100' }),
+      });
+      if (!res.ok) return payload;
+      const data = await res.json();
+      const byTrade = {};
+      for (const r of (data.results || [])) {
+        if (r && r.trade_id != null) byTrade[String(r.trade_id)] = r;
+      }
+      return {
+        ...payload,
+        midcap: {
+          available: Boolean(data.available),
+          summary: data.summary || {},
+          byTrade,
+          spot_adjustment: midcap_spot_adjustment,
+          legs: midcap_legs,
+        },
+      };
+    } catch (e) {
+      console.warn('[midcap-overlay] failed', e);
+      return payload;
+    }
+  }, [buildMidcapConfig, projectTradesForOverlay]);
+
   useEffect(() => {
     return () => stopJobPolling();
   }, [stopJobPolling]);
@@ -1056,6 +1173,14 @@ const [slippagePct, setSlippagePct] = useState(0);
           setSlippagePct(payload?.meta?.slippage_pct ?? 0);
           setChargesEnabled(payload?.meta?.charges_enabled ?? false);
           setResults(payload);
+          // Midcap overlay (additive): enrich with the cross-index leg if present.
+          applyMidcapOverlay(payload).then(enriched => {
+            if (enriched && enriched.midcap) {
+              setRawResults(enriched);
+              setDisplayResults(enriched);
+              setResults(enriched);
+            }
+          });
           if (strFilter.enabled && Array.isArray(payload?.trades) && payload.trades.length === 0) {
             setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
           } else {
@@ -1101,7 +1226,7 @@ const [slippagePct, setSlippagePct] = useState(0);
     };
 
     jobPollRef.current = setTimeout(fetchStatus, 0);
-  }, [stopJobPolling, strFilter.configLabel, strFilter.enabled]);
+  }, [stopJobPolling, strFilter.configLabel, strFilter.enabled, applyMidcapOverlay]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
@@ -1313,18 +1438,24 @@ const [slippagePct, setSlippagePct] = useState(0);
         return false;
       }
     }
+    // Only options legs carry a real weekly/monthly expiry. Futures and Midcap100
+    // legs do not (Midcap follows the NIFTY trade's dates), so exclude them here.
     if (expiryBasis === 'monthly') {
-      const weeklyLegs = legs.filter(l => l.segment !== 'futures' && ['weekly', 'next_weekly'].includes(l.expiry));
+      const weeklyLegs = legs
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => l.segment === 'options' && ['weekly', 'next_weekly'].includes(l.expiry));
       if (weeklyLegs.length > 0) {
-        const legNumbers = weeklyLegs.map((_, i) => i + 1).join(', ');
+        const legNumbers = weeklyLegs.map(({ i }) => i + 1).join(', ');
         showValidationError(`Monthly expiry basis selected — Leg(s) ${legNumbers} have weekly expiry. Change leg expiry to Monthly or Next Monthly.`);
         return false;
       }
     }
     if (expiryBasis === 'weekly') {
-      const monthlyLegs = legs.filter(l => l.segment !== 'futures' && ['monthly', 'next_monthly'].includes(l.expiry));
+      const monthlyLegs = legs
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => l.segment === 'options' && ['monthly', 'next_monthly'].includes(l.expiry));
       if (monthlyLegs.length > 0) {
-        const legNumbers = monthlyLegs.map((_, i) => i + 1).join(', ');
+        const legNumbers = monthlyLegs.map(({ i }) => i + 1).join(', ');
         showValidationError(`Weekly expiry basis selected — Leg(s) ${legNumbers} have monthly expiry. Change leg expiry to Weekly or Next Weekly.`);
         return false;
       }
@@ -1373,14 +1504,15 @@ const [slippagePct, setSlippagePct] = useState(0);
           charges_enabled: chargesEnabled,
         },
       };
-      setDisplayResults(nextResults);
-      setResults(nextResults);
+      const enriched = await applyMidcapOverlay(nextResults);
+      setDisplayResults(enriched);
+      setResults(enriched);
     } catch (err) {
       setError(err.message || 'Recalculate failed');
     } finally {
       setIsRecalculating(false);
     }
-  }, [rawResults, slippagePct, chargesEnabled]);
+  }, [rawResults, slippagePct, chargesEnabled, applyMidcapOverlay]);
 
   const addLegFromDraft = () => {
     if (legs.length >= 12) return;
@@ -1722,6 +1854,12 @@ const [slippagePct, setSlippagePct] = useState(0);
           fut_with_spot_adj: l.fut_with_spot_adj !== false,
         });
       }
+      if (segmentType === 'midcap100') {
+        // Cross-index overlay leg — routed OUT of the engine `legs` array below.
+        leg.midcap_mode = (l.midcap_mode || 'hypothetical').toLowerCase();
+        leg.cost_pct_per_month = Number(l.cost_pct_per_month) || 0;
+        leg.symbol = 'NIFTYMIDCAP100';
+      }
 
       // Target Profit - only send if enabled AND value is set
       if (l.target_enabled && l.target_value != null && l.target_value > 0) {
@@ -1796,10 +1934,15 @@ const [slippagePct, setSlippagePct] = useState(0);
       return leg;
     });
 
+    // Split Midcap overlay legs out of the engine legs — the NIFTY engine
+    // never sees them; they are priced afterward by the /midcap-overlay endpoint.
+    const engineLegs = legsPayload.filter(l => String(l.segment || '').toUpperCase() !== 'MIDCAP100');
+    const midcapLegs = legsPayload.filter(l => String(l.segment || '').toUpperCase() === 'MIDCAP100');
+
     const allFuturesNextMonthly = (
-      legsPayload.length > 0 &&
-      legsPayload.every(l => String(l.segment || '').toUpperCase() === 'FUTURES') &&
-      legsPayload.some(l => String(l.expiry || '').toLowerCase() === 'next_monthly')
+      engineLegs.length > 0 &&
+      engineLegs.every(l => String(l.segment || '').toUpperCase() === 'FUTURES') &&
+      engineLegs.some(l => String(l.expiry || '').toLowerCase() === 'next_monthly')
     );
     const effectiveExpiryType = allFuturesNextMonthly ? 'NEXT_MONTHLY' : expiryBasis.toUpperCase();
 
@@ -1832,7 +1975,17 @@ const [slippagePct, setSlippagePct] = useState(0);
       buffer_position_below: Boolean(bufferPositionBelow),
       slippage_pct: Math.max(0, Number(slippagePct) || 0),
       charges_enabled: chargesEnabled,
-      legs: legsPayload,
+      legs: engineLegs,
+      // Midcap cross-index overlay (additive; ignored by the engine).
+      midcap_legs: midcapLegs.length ? midcapLegs : null,
+      midcap_spot_adjustment: (midcapLegs.length && midcapSpotAdjEnabled)
+        ? {
+            enabled: true,
+            direction: midcapSpotAdjDirection,
+            pct: clampSpotAdjustmentValue(midcapSpotAdjValue),
+            units: midcapSpotAdjUnits,
+          }
+        : null,
       // Overall SL/TGT - send flat structure with correct field names expected by backend
       overall_sl_type: overallSLEnabled ? overallSLType : null,
       overall_sl_value: overallSLEnabled ? (overallSLValue === '' ? 0 : overallSLValue) : null,
@@ -2436,9 +2589,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
-                        Spot Adjustment
+                        Spot Adjustment{hasMidcapLeg ? ' · NIFTY' : ''}
                       </span>
-                      <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach." />
+                      <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach. With a Midcap100 leg present, this applies to NIFTY; use the Midcap100 toggle below for that leg — if both are set, whichever breaches first exits." />
                     </div>
                     <Toggle
                       enabled={spotAdjustmentEnabled}
@@ -2517,6 +2670,88 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <p className="text-[11px] text-muted leading-relaxed bg-hover rounded-lg px-3 py-2">
                           {spotAdjustmentHelperText}
                         </p>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Per-index: Midcap100 spot adjustment (applied by the overlay) */}
+                  {hasMidcapLeg && (
+                    <div className="pt-3 mt-1 border-t border-subtle space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-semibold uppercase tracking-wide text-secondary">
+                          Midcap100
+                        </span>
+                        <Toggle
+                          enabled={midcapSpotAdjEnabled}
+                          onToggle={(val) => setMidcapSpotAdjEnabled(prev => val !== undefined ? Boolean(val) : !prev)}
+                          size="sm"
+                        />
+                      </div>
+                      {midcapSpotAdjEnabled && (
+                        <div className="space-y-4 pt-1">
+                          <div className="space-y-1">
+                            <p className="text-xs font-semibold text-muted uppercase tracking-wide">Direction</p>
+                            <div className="flex gap-2">
+                              {[
+                                { value: 'rise', label: '↑ Rise' },
+                                { value: 'fall', label: '↓ Fall' },
+                                { value: 'both', label: '↕ Both' },
+                              ].map(opt => (
+                                <button
+                                  key={opt.value}
+                                  type="button"
+                                  onClick={() => setMidcapSpotAdjDirection(opt.value)}
+                                  className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                    midcapSpotAdjDirection === opt.value
+                                      ? 'bg-accent text-white border-accent'
+                                      : 'border-default text-secondary hover:bg-hover'
+                                  }`}
+                                >
+                                  {opt.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-xs font-semibold text-muted uppercase tracking-wide">Threshold</p>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                min={0.25}
+                                max={midcapSpotAdjUnits === 'percent' ? 20 : 10000}
+                                step={midcapSpotAdjUnits === 'percent' ? 0.25 : 50}
+                                value={midcapSpotAdjValue}
+                                onChange={e => {
+                                  const v = e.target.value;
+                                  if (v === '') { setMidcapSpotAdjValue(''); return; }
+                                  const n = Number(v);
+                                  setMidcapSpotAdjValue(Number.isNaN(n) ? '' : n);
+                                }}
+                                onBlur={() => setMidcapSpotAdjValue(prev => clampSpotAdjustmentValue(prev))}
+                                className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
+                              />
+                              <div className="flex gap-1">
+                                {['percent', 'points'].map(u => (
+                                  <button
+                                    key={u}
+                                    type="button"
+                                    onClick={() => {
+                                      setMidcapSpotAdjUnits(u);
+                                      setMidcapSpotAdjValue(u === 'percent' ? 1.0 : 200);
+                                    }}
+                                    className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                      midcapSpotAdjUnits === u
+                                        ? 'bg-accent text-white border-accent'
+                                        : 'border-default text-secondary hover:bg-hover'
+                                    }`}
+                                  >
+                                    {u === 'percent' ? '% Pct' : 'Pts'}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
                       )}
                     </div>
                   )}
@@ -2775,12 +3010,14 @@ const [slippagePct, setSlippagePct] = useState(0);
                 <div>
                   <label className="field-label">Select segments</label>
                   <SegBtn
-                    options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }]}
+                    options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }, { value: 'midcap100', label: 'Midcap100' }]}
                     value={draftLeg.segment}
                     onChange={v => setDraftLeg(prev => ({
                       ...prev,
                       segment: v,
-                      expiry: normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, instrument, v),
+                      expiry: v === 'midcap100'
+                        ? prev.expiry
+                        : normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, instrument, v),
                     }))}
                   />
                 </div>
@@ -2816,17 +3053,42 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
-                {/* Expiry */}
-                <div>
-                  <label className="field-label">Expiry</label>
-                  <select value={draftLeg.expiry}
-                    onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
-                    className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-36">
-                    {(draftLeg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </div>
+                {/* Expiry — hidden for Midcap100 (follows the NIFTY trade's dates) */}
+                {draftLeg.segment !== 'midcap100' && (
+                  <div>
+                    <label className="field-label">Expiry</label>
+                    <select value={draftLeg.expiry}
+                      onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
+                      className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-36">
+                      {(draftLeg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {/* Midcap100 pricing mode */}
+                {draftLeg.segment === 'midcap100' && (
+                  <>
+                    <div>
+                      <label className="field-label">Pricing</label>
+                      <SegBtn
+                        options={[{ value: 'spot', label: 'Spot' }, { value: 'hypothetical', label: 'Hypothetical' }]}
+                        value={draftLeg.midcap_mode}
+                        onChange={v => setDraftLeg(prev => ({ ...prev, midcap_mode: v }))}
+                      />
+                    </div>
+                    {draftLeg.midcap_mode === 'hypothetical' && (
+                      <div>
+                        <label className="field-label">Cost % / month</label>
+                        <input type="number" min={0} step="0.05" value={draftLeg.cost_pct_per_month}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, cost_pct_per_month: Math.max(0, parseFloat(e.target.value) || 0) }))}
+                          className="w-20 h-8 px-2 border border-default rounded text-xs text-center bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40"
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
 
                 {/* Strike Criteria */}
                 {draftLeg.segment === 'options' && (
@@ -3019,10 +3281,12 @@ const [slippagePct, setSlippagePct] = useState(0);
                           <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '0.04em' }}>
                             {leg.segment === 'options'
                               ? `${leg.position === 'sell' ? 'SELL' : 'BUY'} ${leg.option_type === 'call' ? 'CALL' : 'PUT'}`
-                              : 'FUTURE'}
+                              : leg.segment === 'midcap100'
+                                ? `${leg.position === 'sell' ? 'SELL' : 'BUY'} MIDCAP100`
+                                : 'FUTURE'}
                           </span>
                           <span style={{ color: 'var(--text-muted)', fontSize: '0.65rem' }}>·</span>
-                          <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.68rem', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{leg.expiry}</span>
+                          <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.68rem', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{leg.segment === 'midcap100' ? leg.midcap_mode : leg.expiry}</span>
                         </div>
                         <div className="flex items-center gap-3">
                           <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.65rem', fontWeight: 700, color: 'var(--accent)' }}>{leg.lot * getLotSize(instrument, startDate)} units</span>
@@ -3046,7 +3310,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                           <div>
                             <label className="field-label">Segment</label>
                             <SegBtn size="sm"
-                              options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
+                              options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }, { value: 'midcap100', label: 'Midcap100' }]}
                               value={leg.segment}
                               onChange={v => {
                                 updateLeg(leg.id, 'segment', v);
@@ -3083,15 +3347,36 @@ const [slippagePct, setSlippagePct] = useState(0);
                                 value={leg.option_type} onChange={v => updateLeg(leg.id, 'option_type', v)} />
                             </div>
                           )}
-                          <div>
-                            <label className="field-label">Expiry</label>
-                            <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
-                              className="h-7 px-2 border border-default rounded text-xs bg-surface w-28">
-                              {(leg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
-                                <option key={opt.value} value={opt.value}>{opt.label}</option>
-                              ))}
-                            </select>
-                          </div>
+                          {leg.segment !== 'midcap100' && (
+                            <div>
+                              <label className="field-label">Expiry</label>
+                              <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
+                                className="h-7 px-2 border border-default rounded text-xs bg-surface w-28">
+                                {(leg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
+                                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                ))}
+                              </select>
+                            </div>
+                          )}
+                          {leg.segment === 'midcap100' && (
+                            <>
+                              <div>
+                                <label className="field-label">Pricing</label>
+                                <SegBtn size="sm"
+                                  options={[{ value: 'spot', label: 'Spot' }, { value: 'hypothetical', label: 'Hypothetical' }]}
+                                  value={leg.midcap_mode || 'hypothetical'}
+                                  onChange={v => updateLeg(leg.id, 'midcap_mode', v)} />
+                              </div>
+                              {(leg.midcap_mode || 'hypothetical') === 'hypothetical' && (
+                                <div>
+                                  <label className="field-label">Cost % / month</label>
+                                  <input type="number" min={0} step="0.05" value={leg.cost_pct_per_month ?? 0.5}
+                                    onChange={e => updateLeg(leg.id, 'cost_pct_per_month', Math.max(0, parseFloat(e.target.value) || 0))}
+                                    className="w-20 h-7 px-2 border border-default rounded text-xs text-center bg-surface" />
+                                </div>
+                              )}
+                            </>
+                          )}
                           {leg.segment === 'options' && (
                             <>
                               <div>
@@ -3864,6 +4149,7 @@ const [slippagePct, setSlippagePct] = useState(0);
               }}
               showCloseButton={false}
               filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
+              filterSegments={strFilter.enabled ? strFilter.segments : null}
               showStrSegment={strFilter.enabled}
               strategyConfig={{
                 instrument,
@@ -3874,6 +4160,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                 spotAdjustmentDirection,
                 spotAdjustmentValue: normalizedSpotAdjustmentValue,
                 spotAdjustmentUnits,
+                // Midcap cross-index spot adjustment (for the filename).
+                midcapSpotAdjustmentEnabled: midcapSpotAdjEnabled && legs.some(l => l.segment === 'midcap100'),
+                midcapSpotAdjustmentDirection: midcapSpotAdjDirection,
+                midcapSpotAdjustmentValue: clampSpotAdjustmentValue(midcapSpotAdjValue),
+                midcapSpotAdjustmentUnits: midcapSpotAdjUnits,
               }}
             />
             <div className="flex flex-wrap items-center gap-4 px-4 py-3 bg-surface border border-default border-t-0 rounded-b-xl">
@@ -3989,7 +4280,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             isOpen={optimPanelOpen}
             onClose={() => setOptimPanelOpen(false)}
             basePayload={buildPayload()}
-            nLegs={legs.length}
+            nLegs={legs.filter(l => String(l.segment || '').toLowerCase() !== 'midcap100').length}
             checked={optimChecked} setChecked={setOptimChecked}
             savedValues={optimSavedValues} setSavedValues={setOptimSavedValues}
             method={optimMethod} setMethod={setOptimMethod}
@@ -3999,7 +4290,9 @@ const [slippagePct, setSlippagePct] = useState(0);
             parallelism={optimParallelism} setParallelism={setOptimParallelism}
             filterName={strFilter.enabled ? strFilter.filterName : null}
             onJobQueued={(info) => {
-              setOptimJob(info);
+              // Capture the Midcap overlay config at launch so per-combo
+              // downloads can apply the same overlay as the backtest.
+              setOptimJob({ ...info, midcapConfig: buildMidcapConfig() });
               setOptimPanelOpen(false);
             }}
           />
@@ -4010,6 +4303,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             totalCombos={optimJob.totalCombos}
             objective={optimJob.objective}
             runConfig={optimJob.runConfig}
+            midcapConfig={optimJob.midcapConfig}
             onClose={() => setOptimJob(null)}
             onApplyCombo={(combo) => {
               // Best-effort: surface the combo as a JSON note in the status

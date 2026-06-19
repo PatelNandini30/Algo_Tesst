@@ -164,12 +164,31 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
        engine (PCT_OF_ATM branch) and Rust engine (StrikeSel::PctOfAtm) use
        the value.  The schema labels this param "Strike offset (pct_of_atm
        value)" — switching the leg to pct_of_atm mode is intentional.
+
+    3. When any `midcap_spot_adjustment.*` key is in the combo, ensure
+       midcap_spot_adjustment is a dict with enabled=True (the engine ignores it
+       otherwise), and seed it BEFORE apply_combo so nested _set_by_path works
+       even when the base payload had it null/disabled.
     """
+    midcap_sa_implied = any(str(k).startswith("midcap_spot_adjustment") for k in combo)
+    if midcap_sa_implied and not isinstance((payload or {}).get("midcap_spot_adjustment"), dict):
+        # Seed the nested dict on a copy so apply_combo's _set_by_path can target it.
+        payload = copy.deepcopy(payload)
+        payload["midcap_spot_adjustment"] = {"enabled": True, "units": "percent"}
+
     new_payload = apply_combo(payload, combo)
 
     spot_adj_implied = any(k in _SPOT_ADJ_KEYS for k in combo)
     if spot_adj_implied and "spot_adjustment_enabled" not in combo:
         new_payload["spot_adjustment_enabled"] = True
+
+    if midcap_sa_implied:
+        msa = new_payload.get("midcap_spot_adjustment")
+        if not isinstance(msa, dict):
+            msa = {}
+            new_payload["midcap_spot_adjustment"] = msa
+        msa["enabled"] = True
+        msa.setdefault("units", "percent")
 
     for path in combo:
         m = _STRIKE_VALUE_RE.match(path)

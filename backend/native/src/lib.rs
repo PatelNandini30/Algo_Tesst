@@ -72,6 +72,32 @@ impl Default for MarketCache {
 
 static CACHE: Lazy<RwLock<Option<MarketCache>>> = Lazy::new(|| RwLock::new(None));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Index OHLC cache — ADDITIVE, fully independent of MarketCache above.
+// Holds daily OHLC for cash indices used as cross-index overlay legs
+// (e.g. NIFTYMIDCAP100). Tiny + static (~6k rows/symbol); loaded lazily per
+// symbol by the Midcap overlay. Never touches the options/spot MarketCache, so
+// it does not affect the existing backtest path or its memory budget.
+// ─────────────────────────────────────────────────────────────────────────────
+struct IndexOhlcCache {
+    // (date_days, symbol_id) → (open, high, low, close)
+    ohlc: AHashMap<(i32, u16), (f64, f64, f64, f64)>,
+    symbol_ids: AHashMap<String, u16>,
+    symbol_names: Vec<String>,
+}
+
+impl Default for IndexOhlcCache {
+    fn default() -> Self {
+        IndexOhlcCache {
+            ohlc: AHashMap::new(),
+            symbol_ids: AHashMap::new(),
+            symbol_names: Vec::new(),
+        }
+    }
+}
+
+static INDEX_OHLC: Lazy<RwLock<Option<IndexOhlcCache>>> = Lazy::new(|| RwLock::new(None));
+
 pub(crate) fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
@@ -730,6 +756,368 @@ fn load_cache(options_path: String, spot_path: String) -> PyResult<()> {
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Index OHLC — ADDITIVE feather store/lookup (Midcap overlay). Independent of
+// the options/spot MarketCache above.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Build an index-OHLC cache from feather batches. Columns: Date, Close, and
+// optional Symbol/Open/High/Low. Symbol-less feathers store under u16::MAX.
+fn build_index_ohlc_from_batches(batches: Vec<arrow_array::RecordBatch>) -> IndexOhlcCache {
+    let mut cache = IndexOhlcCache::default();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    cache.ohlc.reserve(total + 16);
+
+    for batch in &batches {
+        let schema = batch.schema();
+        let (Some(idx_date), Some(idx_close)) =
+            (schema.index_of("Date").ok(), schema.index_of("Close").ok()) else { continue };
+        let date_col = batch.column(idx_date).clone();
+        let close_col = batch.column(idx_close).clone();
+        let open_col = schema.index_of("Open").ok().map(|i| batch.column(i).clone());
+        let high_col = schema.index_of("High").ok().map(|i| batch.column(i).clone());
+        let low_col = schema.index_of("Low").ok().map(|i| batch.column(i).clone());
+        let sym_col = schema.index_of("Symbol").ok().map(|i| batch.column(i).clone());
+
+        for row in 0..batch.num_rows() {
+            let date_s = match to_iso_date_from_array(&date_col, row) { Some(v) => v, None => continue };
+            let date_days = match date_str_to_days(&date_s) { Some(v) => v, None => continue };
+            let close_v = match to_f64_from_array(&close_col, row) { Some(v) => v, None => continue };
+            let open_v = open_col.as_ref().and_then(|c| to_f64_from_array(c, row)).unwrap_or(close_v);
+            let high_v = high_col.as_ref().and_then(|c| to_f64_from_array(c, row)).unwrap_or(close_v);
+            let low_v = low_col.as_ref().and_then(|c| to_f64_from_array(c, row)).unwrap_or(close_v);
+
+            let sym_id = match sym_col.as_ref() {
+                Some(sc) if !sc.is_null(row) => match AnyStrArray::from_col(sc.as_ref()) {
+                    Some(sa) => {
+                        let raw = sa.value(row).trim();
+                        if raw.is_empty() {
+                            u16::MAX
+                        } else {
+                            intern_symbol(&mut cache.symbol_ids, &mut cache.symbol_names, &raw.to_uppercase())
+                        }
+                    }
+                    None => u16::MAX,
+                },
+                _ => u16::MAX,
+            };
+
+            cache.ohlc.insert((date_days, sym_id), (open_v, high_v, low_v, close_v));
+        }
+    }
+    cache
+}
+
+fn lookup_index_ohlc(date: &str, symbol: &str) -> Option<(f64, f64, f64, f64)> {
+    let guard = INDEX_OHLC.read().ok()?;
+    let cache = guard.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_upper = symbol.trim().to_uppercase();
+    if let Some(&sym_id) = cache.symbol_ids.get(&sym_upper) {
+        if let Some(v) = cache.ohlc.get(&(date_days, sym_id)).copied() {
+            return Some(v);
+        }
+    }
+    cache.ohlc.get(&(date_days, u16::MAX)).copied()
+}
+
+/// Load (and MERGE) a per-symbol index-OHLC feather into the global cache.
+/// Merging lets multiple indices coexist; reloading the same symbol upserts.
+#[pyfunction]
+fn load_index_ohlc(path: String) -> PyResult<()> {
+    let batches = load_table_from_path(&path)?;
+    let new_cache = build_index_ohlc_from_batches(batches);
+    let mut guard = INDEX_OHLC.write().unwrap();
+    match guard.as_mut() {
+        Some(existing) => {
+            for ((date_days, new_sym_id), ohlc) in new_cache.ohlc.iter() {
+                let sym_id = match new_cache.symbol_names.get(*new_sym_id as usize) {
+                    Some(name) if !name.is_empty() => {
+                        intern_symbol(&mut existing.symbol_ids, &mut existing.symbol_names, name)
+                    }
+                    _ => u16::MAX,
+                };
+                existing.ohlc.insert((*date_days, sym_id), *ohlc);
+            }
+        }
+        None => {
+            *guard = Some(new_cache);
+        }
+    }
+    Ok(())
+}
+
+#[pyfunction]
+fn clear_index_ohlc() {
+    if let Ok(mut guard) = INDEX_OHLC.write() {
+        *guard = None;
+    }
+}
+
+#[pyfunction]
+fn index_ohlc_is_loaded() -> bool {
+    INDEX_OHLC.read().ok().and_then(|g| g.as_ref().map(|_| true)).unwrap_or(false)
+}
+
+#[pyfunction]
+fn get_index_ohlc_close(date: String, symbol: String) -> Option<f64> {
+    lookup_index_ohlc(&date, &symbol).map(|(_, _, _, c)| c)
+}
+
+#[pyfunction]
+fn get_index_ohlc(date: String, symbol: String) -> Option<(f64, f64, f64, f64)> {
+    lookup_index_ohlc(&date, &symbol)
+}
+
+// ── Midcap overlay math (Rust port of services/midcap_overlay.compute_midcap_legs) ──
+// Kept byte-for-byte equivalent to the Python reference so the two engines agree.
+fn _mc_round(x: f64, dp: i32) -> f64 {
+    let f = 10f64.powi(dp);
+    (x * f).round() / f
+}
+
+fn _mc_parse_date(s: &str) -> Option<NaiveDate> {
+    let s = s.trim();
+    let s = s.split(|c| c == 'T' || c == ' ').next().unwrap_or(s);
+    for fmt in &["%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y"] {
+        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+fn _mc_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
+    match v.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+fn _mc_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
+}
+
+// (date_days, sym) → (o,h,l,c) with the same named-then-sentinel fallback as lookup_index_ohlc.
+fn _mc_ohlc(cache: &IndexOhlcCache, sym_id: Option<u16>, dd: i32) -> Option<(f64, f64, f64, f64)> {
+    if let Some(sid) = sym_id {
+        if let Some(v) = cache.ohlc.get(&(dd, sid)) {
+            return Some(*v);
+        }
+    }
+    cache.ohlc.get(&(dd, u16::MAX)).copied()
+}
+
+/// Compute Midcap overlay legs entirely in Rust. Inputs/outputs are JSON strings
+/// (rows, midcap_legs, spot_adjustment) so this mirrors the Python contract exactly.
+#[pyfunction]
+fn compute_midcap_legs(
+    rows_json: String,
+    legs_json: String,
+    spot_adj_json: String,
+    symbol: String,
+) -> PyResult<String> {
+    use serde_json::{json, Value};
+    let rows: Vec<Value> = serde_json::from_str(&rows_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("rows json: {e}")))?;
+    let legs: Vec<Value> = serde_json::from_str(&legs_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("legs json: {e}")))?;
+    let sa: Value = serde_json::from_str(&spot_adj_json).unwrap_or(Value::Null);
+
+    let sym_upper = symbol.trim().to_uppercase();
+    let guard = INDEX_OHLC
+        .read()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("index_ohlc lock poisoned"))?;
+    let cache = guard
+        .as_ref()
+        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("index_ohlc not loaded"))?;
+    let sym_id = cache.symbol_ids.get(&sym_upper).copied();
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+
+    let sa_enabled = sa.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+    let sa_dir = sa.get("direction").and_then(|x| x.as_str()).unwrap_or("rise").to_lowercase();
+    let sa_units = sa.get("units").and_then(|x| x.as_str()).unwrap_or("percent").to_lowercase();
+    let sa_pct = _mc_f64(&sa, "pct").unwrap_or(0.0);
+
+    let mut results: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut any_priced = false;
+    let (mut sum_leg, mut sum_leg_pct, mut sum_comb, mut sum_comb_pct) = (0f64, 0f64, 0f64, 0f64);
+    let mut priced_rows = 0i64;
+
+    for row in &rows {
+        let trade_id = row.get("trade_id").cloned().unwrap_or(Value::Null);
+        let reentry = row.get("reentry_index").cloned().unwrap_or(Value::Null);
+        let entry = _mc_str(row, "entry_date").and_then(_mc_parse_date);
+        let exit_ = _mc_str(row, "exit_date").and_then(_mc_parse_date);
+        let nifty_pnl = _mc_f64(row, "nifty_pnl").unwrap_or(0.0);
+        let nifty_pnl_pct = _mc_f64(row, "nifty_pnl_pct").unwrap_or(0.0);
+
+        let (entry, exit_) = match (entry, exit_) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                results.push(json!({"trade_id": trade_id, "reentry_index": reentry, "available": false}));
+                continue;
+            }
+        };
+        let entry_days = (entry - epoch).num_days() as i32;
+        let sched_exit_days = (exit_ - epoch).num_days() as i32;
+        let spot_entry = _mc_ohlc(cache, sym_id, entry_days).map(|t| t.3);
+
+        let mut midcap_exit_days = sched_exit_days;
+        if sa_enabled && sa_pct > 0.0 {
+            if let Some(se) = spot_entry {
+                let watch_rise = sa_dir == "rise" || sa_dir == "both";
+                let watch_fall = sa_dir == "fall" || sa_dir == "both";
+                let (rise_t, fall_t) = if sa_units == "points" {
+                    (se + sa_pct, se - sa_pct)
+                } else {
+                    (se * (1.0 + sa_pct / 100.0), se * (1.0 - sa_pct / 100.0))
+                };
+                let mut dd = entry_days + 1; // (entry, sched_exit]
+                while dd <= sched_exit_days {
+                    if let Some(c) = _mc_ohlc(cache, sym_id, dd).map(|t| t.3) {
+                        if (watch_rise && c >= rise_t) || (watch_fall && c <= fall_t) {
+                            if dd < midcap_exit_days {
+                                midcap_exit_days = dd;
+                            }
+                            break;
+                        }
+                    }
+                    dd += 1;
+                }
+            }
+        }
+        let spot_exit = _mc_ohlc(cache, sym_id, midcap_exit_days).map(|t| t.3);
+
+        let (se, sx) = match (spot_entry, spot_exit) {
+            (Some(a), Some(b)) if a != 0.0 => (a, b),
+            _ => {
+                let mut o = json!({"trade_id": trade_id, "reentry_index": reentry, "available": false});
+                o["Midcap Entry Spot"] = spot_entry.map(|v| json!(v)).unwrap_or(Value::Null);
+                o["Midcap Exit Spot"] = spot_exit.map(|v| json!(v)).unwrap_or(Value::Null);
+                results.push(o);
+                continue;
+            }
+        };
+
+        let no_of_days = midcap_exit_days - entry_days;
+        let raw_spot_pnl = sx - se;
+
+        let mut leg_pnl_total = 0f64;
+        let mut leg_pnl_pct_total = 0f64;
+        let mut rollover_pct_repr = 0f64;
+        let mut total_mae = 0f64;
+        let mut total_mfe = 0f64;
+
+        for leg in &legs {
+            let position = _mc_str(leg, "position").unwrap_or("buy").to_uppercase();
+            let mode = leg
+                .get("midcap_mode")
+                .and_then(|x| x.as_str())
+                .or_else(|| leg.get("mode").and_then(|x| x.as_str()))
+                .unwrap_or("spot")
+                .to_lowercase();
+            let cost = if mode == "hypothetical" { _mc_f64(leg, "cost_pct_per_month").unwrap_or(0.0) } else { 0.0 };
+            let roll = cost / 100.0 * (no_of_days as f64) / 30.0;
+            let sp = if position == "SELL" { -raw_spot_pnl } else { raw_spot_pnl };
+            let sp_pct = sp / se;
+            // Cost%/month carry sign by position: BUY subtracts the cost (-), SELL
+            // adds it (+) for leg P&L. MAE/MFE always uses added carry.
+            let csign = if position == "SELL" { 1.0 } else { -1.0 };
+            let (pnl, pnl_pct);
+            if mode == "hypothetical" {
+                pnl = sp + csign * roll * se;
+                pnl_pct = sp_pct + csign * roll;
+                rollover_pct_repr = csign * roll * 100.0;
+            } else {
+                pnl = sp;
+                pnl_pct = sp_pct;
+            }
+            leg_pnl_total += pnl;
+            leg_pnl_pct_total += pnl_pct;
+
+            // MAE/MFE — reproduces the reference workbook EXACTLY:
+            //   f_entry = se * (1 + full carry)            [Hypo close on the entry day]
+            //   scan trading days in (entry, exit] — ENTRY-DAY BAR EXCLUDED —
+            //   carry-adjusted (Hypo) High/Low for hypothetical, raw for spot;
+            //   both reference point and denominator are f_entry (workbook DI6/DM2-1):
+            //     BUY :  MFE=(max/f_entry-1)*100  MAE=(min/f_entry-1)*100
+            //     SELL:  MFE=(1-min/f_entry)*100  MAE=(1-max/f_entry)*100
+            // For Midcap MAE/MFE we always ADD carry to the synthetic path
+            // (long future is entered at a premium), regardless of position —
+            // matches midcap_overlay._leg_mae_mfe. Position only flips which
+            // direction is adverse/favorable below. csign stays for leg P&L only.
+            let f_entry = se * (1.0 + roll);
+            let mut max_fh: Option<f64> = None;
+            let mut min_fl: Option<f64> = None;
+            for dd in (entry_days + 1)..=midcap_exit_days {
+                if let Some((_, h, l, _)) = _mc_ohlc(cache, sym_id, dd) {
+                    let cr = cost / 100.0 * ((midcap_exit_days - dd) as f64) / 30.0;
+                    let fh = h * (1.0 + cr);
+                    let fl = l * (1.0 + cr);
+                    max_fh = Some(max_fh.map_or(fh, |m: f64| m.max(fh)));
+                    min_fl = Some(min_fl.map_or(fl, |m: f64| m.min(fl)));
+                }
+            }
+            let (mae_pct, mfe_pct) = match (max_fh, min_fl) {
+                (Some(mx), Some(mn)) if f_entry != 0.0 => {
+                    if position == "SELL" {
+                        (_mc_round((1.0 - mx / f_entry) * 100.0, 4), _mc_round((1.0 - mn / f_entry) * 100.0, 4))
+                    } else {
+                        (_mc_round((mn / f_entry - 1.0) * 100.0, 4), _mc_round((mx / f_entry - 1.0) * 100.0, 4))
+                    }
+                }
+                _ => (0.0, 0.0),
+            };
+            total_mae += mae_pct;
+            total_mfe += mfe_pct;
+        }
+
+        let combined_net = nifty_pnl + leg_pnl_total;
+        let combined_net_pct = nifty_pnl_pct + leg_pnl_pct_total * 100.0;
+        let exit_str = (epoch + Duration::days(midcap_exit_days as i64)).format("%d-%m-%Y").to_string();
+
+        results.push(json!({
+            "trade_id": trade_id,
+            "reentry_index": reentry,
+            "available": true,
+            "Midcap Entry Spot": _mc_round(se, 4),
+            "Midcap Exit Spot": _mc_round(sx, 4),
+            "Midcap Spot P&L": _mc_round(raw_spot_pnl, 4),
+            "Midcap Spot P&L %": _mc_round(raw_spot_pnl / se * 100.0, 4),
+            "Midcap No Of Days": no_of_days,
+            "Midcap Rollover Cost %": _mc_round(rollover_pct_repr, 6),
+            "Midcap Exit Date": exit_str,
+            "Midcap Leg P&L": _mc_round(leg_pnl_total, 4),
+            "Midcap Leg P&L %": _mc_round(leg_pnl_pct_total * 100.0, 4),
+            "Combined Net P&L": _mc_round(combined_net, 4),
+            "Combined Net P&L %": _mc_round(combined_net_pct, 4),
+            "Midcap MAE": _mc_round(total_mae, 4),
+            "Midcap MFE": _mc_round(total_mfe, 4),
+        }));
+        any_priced = true;
+        priced_rows += 1;
+        sum_leg += leg_pnl_total;
+        sum_leg_pct += leg_pnl_pct_total * 100.0;
+        sum_comb += combined_net;
+        sum_comb_pct += combined_net_pct;
+    }
+
+    let out = json!({
+        "results": results,
+        "summary": {
+            "midcap_leg_pnl_sum": _mc_round(sum_leg, 4),
+            "midcap_leg_pnl_pct_sum": _mc_round(sum_leg_pct, 4),
+            "combined_pnl_sum": _mc_round(sum_comb, 4),
+            "combined_pnl_pct_sum": _mc_round(sum_comb_pct, 4),
+            "priced_rows": priced_rows,
+            "symbol": sym_upper,
+        },
+        "available": any_priced,
+    });
+    Ok(out.to_string())
+}
+
 #[pyfunction]
 fn clear_cache() {
     if let Ok(mut guard) = CACHE.write() {
@@ -1377,5 +1765,12 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simulate::resolve_trade_specs, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
     m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
+    // Index OHLC (additive — Midcap overlay)
+    m.add_function(wrap_pyfunction!(load_index_ohlc, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_index_ohlc, m)?)?;
+    m.add_function(wrap_pyfunction!(index_ohlc_is_loaded, m)?)?;
+    m.add_function(wrap_pyfunction!(get_index_ohlc_close, m)?)?;
+    m.add_function(wrap_pyfunction!(get_index_ohlc, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_midcap_legs, m)?)?;
     Ok(())
 }

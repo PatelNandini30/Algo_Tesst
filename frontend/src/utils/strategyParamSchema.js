@@ -166,6 +166,27 @@ export const OPTIM_PARAM_GROUPS = [
     ],
   },
   {
+    // Cross-index Midcap spot adjustment — only shown when a Midcap leg is in
+    // the strategy (filtered in OptimizePanel via midcapOnly). Sweeps the
+    // NIFTYMIDCAP100 breach threshold + direction, like the NIFTY one.
+    group: 'Global — Midcap Spot Adjustment',
+    forLeg: false,
+    midcapOnly: true,
+    items: [
+      {
+        path: 'midcap_spot_adjustment.pct',
+        label: 'Midcap Spot Adjustment %',
+        unit: '%',
+        ...RANGE(0.5, 5, 0.5),
+      },
+      {
+        path: 'midcap_spot_adjustment.direction',
+        label: 'Midcap Spot Adjustment direction',
+        ...ENUM(['rise', 'fall', 'both']),
+      },
+    ],
+  },
+  {
     group: 'Global — Buffer Strike',
     forLeg: false,
     items: [
@@ -190,7 +211,7 @@ export function expandSchemaForLegs(nLegs) {
   for (const grp of OPTIM_PARAM_GROUPS) {
     if (!grp.forLeg) {
       for (const item of grp.items) {
-        out.push({ ...item, group: grp.group });
+        out.push({ ...item, group: grp.group, midcapOnly: Boolean(grp.midcapOnly) });
       }
       continue;
     }
@@ -238,6 +259,8 @@ export const MASTER_SUMMARY_COLUMNS = [
   { key: 'max_dd_pct',              label: 'DD',               dup: true },
   { key: 'actual_live_dd_max',      label: 'Actual Live DD' },
   { key: 'actual_live_dd_avg',      label: 'Avg Actual Live DD' },
+  { key: 'avg_final_mae',           label: 'Avg Combined Final MAE', conditional: 'hasMidcap' },
+  { key: 'avg_final_mae',           label: 'Avg Final MAE',          conditional: 'notMidcap', dup: true },
   { key: 'car_mdd_live',            label: 'CAR/MDD Live' },
   { key: 'positive_outlier_1',      label: '+ve Outlier 1' },
   { key: 'negative_outlier_1',      label: '-ve Outlier 1' },
@@ -260,4 +283,10 @@ export const MASTER_SUMMARY_COLUMNS = [
   { key: 'pe_pnl_pct',              label: 'PE P&L %',         conditional: 'hasPE' },
   { key: 'long_spot_pnl',           label: 'Long Spot P&L',    conditional: 'hasSpot' },
   { key: 'long_spot_pnl_pct',       label: 'Long Spot P&L %',  conditional: 'hasSpot' },
+  // Midcap cross-index overlay (shown only when a combo has Midcap data; the
+  // headline metrics above are already COMBINED in that case).
+  { key: 'midcap_leg_pnl_sum',      label: 'Midcap Leg P&L',         conditional: 'hasMidcap' },
+  { key: 'midcap_leg_pnl_pct_sum',  label: 'Midcap Leg P&L %',       conditional: 'hasMidcap' },
+  { key: 'combined_pnl_sum',        label: 'Combined Net P&L',       conditional: 'hasMidcap' },
+  { key: 'combined_pnl_pct_sum',    label: 'Combined Net P&L %',     conditional: 'hasMidcap' },
 ];

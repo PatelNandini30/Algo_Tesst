@@ -14,6 +14,10 @@ cleaned_csvs/
 *.docx~
 node_modules/
 backend/native/target/
+# Compiled native extension — built by start.sh into a wheel (backend/prebuilt)
+# and installed into site-packages. Never commit the .so: a tracked copy in
+# backend/ shadows the wheel via the bind-mount and pins an old Rust build.
+backend/algotest_native*.so
 frontend/dist/
 .claude/
 nifty_data/

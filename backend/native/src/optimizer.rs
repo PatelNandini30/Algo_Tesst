@@ -195,12 +195,23 @@ fn compute_metrics_for_batch(batch: &TradeBatch) -> ComboMetrics {
 
     let to_pct = |v: f64| if denom > 0.0 { round4(v / denom * 100.0) } else { 0.0 };
 
-    let live_pairs: Vec<f64> = batch
-        .lowest_nav
-        .iter()
-        .zip(batch.peak.iter())
-        .map(|(low, pk)| low - pk)
-        .collect();
+    // Research-verified Live DD: each trade's intra-trade low is measured against
+    // the PREVIOUS trade's peak (AX = AW - AV_prev), not its own peak — a trade
+    // that closes at a new high is still measured against the peak it went into.
+    // prev_peak is seeded at 100 for the first trade. Non-parent rows carry
+    // lowest_nav = 0 and peak = 0 in the payload (only parent/first-leg rows hold
+    // the per-trade values), so they contribute 0 — mirroring the Python
+    // parent-row mask in `metrics.actual_live_dd`.
+    let mut prev_peak = 100.0_f64;
+    let mut live_pairs: Vec<f64> = Vec::with_capacity(batch.lowest_nav.len());
+    for (&low, &pk) in batch.lowest_nav.iter().zip(batch.peak.iter()) {
+        if pk == 0.0 {
+            live_pairs.push(0.0);
+        } else {
+            live_pairs.push(low - prev_peak);
+            prev_peak = pk;
+        }
+    }
     let live_max = live_pairs
         .iter()
         .copied()

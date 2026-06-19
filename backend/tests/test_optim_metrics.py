@@ -49,18 +49,21 @@ class TestROIVsSpot(unittest.TestCase):
 
 
 class TestLiveDD(unittest.TestCase):
-    def test_uses_lowest_nav_minus_peak(self):
+    def test_uses_lowest_nav_minus_prev_peak(self):
+        # Research-verified rule: Live DD is measured against the PREVIOUS trade's
+        # peak (AX = AW - AV_prev), not the trade's own peak. The first trade's
+        # prior peak is seeded at 100.
         df = _trades(
             [
-                {"Lowest NAV During Trade": 100, "Peak": 100},
-                {"Lowest NAV During Trade": 98, "Peak": 101},  # live = -3
-                {"Lowest NAV During Trade": 99, "Peak": 102},  # live = -3
+                {"Lowest NAV During Trade": 100, "Peak": 100},  # live = 100-100 = 0
+                {"Lowest NAV During Trade": 98, "Peak": 101},   # live = 98-100  = -2
+                {"Lowest NAV During Trade": 99, "Peak": 102},   # live = 99-101  = -2
             ]
         )
         out = actual_live_dd(df)
-        self.assertEqual(out["actual_live_dd_max"], -3.0)
-        # Avg = (0 + -3 + -3) / 3 = -2
-        self.assertEqual(out["actual_live_dd_avg"], -2.0)
+        self.assertEqual(out["actual_live_dd_max"], -2.0)
+        # Avg = (0 + -2 + -2) / 3 = -1.3333
+        self.assertEqual(out["actual_live_dd_avg"], -1.3333)
 
     def test_car_mdd_live(self):
         # (cagr/100) / |dd| — dd is in NAV points (e.g. -4.0 = 4 points)
@@ -80,12 +83,18 @@ class TestOutlierStripped(unittest.TestCase):
             ]
         )
         out = outlier_stripped_live_dd(df)
+        # Revised research rule: each stripped trade (incl. the first) anchors its
+        # low to prev_cum*(1+FinalMAE%) and measures Live DD against the PREVIOUS
+        # trade's peak. Strip top1+bot1 → remaining T2,T4,T5:
+        #   T2: 100*(1-.2850)=71.50 vs prevPk 100 → -28.50
+        #   T4: 99.68*(1-.2689)=72.87 vs prevPk 100 → -27.13
+        #   T5: 86.92*(1-.0210)=85.09 vs prevPk 100 → -14.91
         self.assertEqual(out["positive_outlier_1"], 18.38)
         self.assertEqual(out["negative_outlier_1"], -24.94)
-        self.assertEqual(out["outlier_dd_1"], -27.12)
-        self.assertEqual(out["outlier_dd_1_avg"], -14.11)
-        self.assertEqual(out["outlier_dd_2"], -8.74)
-        self.assertEqual(out["outlier_dd_2_avg"], -8.74)
+        self.assertEqual(out["outlier_dd_1"], -28.5)
+        self.assertEqual(out["outlier_dd_1_avg"], -23.5067)
+        self.assertEqual(out["outlier_dd_2"], -2.1)
+        self.assertEqual(out["outlier_dd_2_avg"], -2.1)
         self.assertEqual(out["outlier_dd_3"], 0.0)
         self.assertEqual(out["outlier_dd_3_avg"], 0.0)
 

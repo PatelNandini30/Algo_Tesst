@@ -113,6 +113,20 @@ else
 fi
 # ────────────────────────────────────────────────────────────────────────────
 
+# ── Ensure the freshly-built Rust wheel (in site-packages) is what loads ──────
+# A stray top-level algotest_native*.so in backend/ shadows the wheel through the
+# bind-mount (/app is on sys.path before site-packages), which silently pins an
+# OLD build even after a rebuild. Since we run Rust-only (FAST_LOOKUP_MODE=rust),
+# clear them so the just-built wheel is always the one imported.
+echo ""
+echo "[RUST] Clearing stray native .so shadows in backend/ ..."
+if ls backend/algotest_native*.so >/dev/null 2>&1; then
+    rm -f backend/algotest_native*.so && echo "  cleared stray .so (wheel will be used)"
+else
+    echo "  none found — wheel already authoritative"
+fi
+# ────────────────────────────────────────────────────────────────────────────
+
 # Check if containers are already healthy
 echo ""
 echo "[0/5] Checking existing containers..."

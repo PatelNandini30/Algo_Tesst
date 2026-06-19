@@ -1,7 +1,7 @@
 {
   "name": "with_sl_and_target",
-  "captured_at": "2026-05-12T07:19:35.893194Z",
-  "engine_runtime_seconds": 0.072,
+  "captured_at": "2026-06-05T11:04:48.347235Z",
+  "engine_runtime_seconds": 0.031,
   "payload": {
     "index": "NIFTY",
     "from_date": "2024-01-01",
@@ -346,7 +346,7 @@
       "FUT Exit Price": "",
       "Net P&L": 35.35000000000001,
       "% P&L": 0.1619,
-      "Exit Reason": "EXPIRY",
+      "Exit Reason": "Expiry",
       "ReEntryIndex": "",
       "ReEntryTrigger": "",
       "ReEntryMode": "",
@@ -639,6 +639,8 @@
   ],
   "summary": {
     "total_pnl": 111.45,
+    "total_pnl_pct": 0.5257,
+    "avg_profit_per_trade_pct": 0.0404,
     "count": 13,
     "win_pct": 61.54,
     "loss_pct": 38.46,
@@ -647,7 +649,7 @@
     "max_win": 118.55,
     "max_loss": -122.9,
     "avg_profit_per_trade": 8.57,
-    "expectancy": 0.0963,
+    "expectancy": 0.09627317343501646,
     "avg_win_pct": 0.3283,
     "avg_loss_pct": -0.4201,
     "reward_to_risk": 0.78,
@@ -659,11 +661,12 @@
     "mdd_start_date": "2024-03-07",
     "mdd_end_date": "2024-03-28",
     "mdd_trade_number": 13,
-    "car_mdd": 1.8,
+    "car_mdd": 0.018,
     "recovery_factor": 87.76,
     "max_win_streak": 6,
     "max_loss_streak": 3,
     "spot_change": 527.2,
+    "spot_change_pct": 2.3864,
     "cagr_spot": 17.19
   },
   "pivot": {

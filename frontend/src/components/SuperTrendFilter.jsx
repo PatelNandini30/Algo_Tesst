@@ -423,7 +423,8 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
             {selected === 'custom' && (
               <div className="text-[11px] text-muted space-y-1">
                 <p>CSV requires exactly two columns: start/start_date/startdt/from/from_date or entry/entry_date/entrydt, plus the matching end/exit column.</p>
-                <p>Supported formats: DD-MM-YYYY, YYYY-MM-DD, MM/DD/YYYY, DD/MM/YYYY, YYYY/MM/DD, DD-Mon-YYYY, YYYYMMDD.</p>
+                <p>Supported formats: DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD, YYYY/MM/DD, DD-Mon-YYYY, YYYYMMDD.</p>
+                <p>Dates are read <strong>day-first</strong>: an ambiguous date like 10/05/2019 is 10-May-2019, not 5-Oct-2019. Use YYYY-MM-DD to be unambiguous.</p>
               </div>
             )}
           </div>

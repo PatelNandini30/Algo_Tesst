@@ -428,6 +428,14 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
     # rewrite summary.csv so the master summary matches each combo XLSX exactly.
     try:
         from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _compute_metrics
+        # Midcap overlay config (additive). When present, the master summary
+        # metrics are computed on the COMBINED P&L via the same native engine.
+        _mc_legs = base_payload.get("midcap_legs") or None
+        _mc_sa   = base_payload.get("midcap_spot_adjustment") or None
+        _mc_sym  = (
+            (_mc_legs[0].get("symbol") if (_mc_legs and isinstance(_mc_legs[0], dict)) else None)
+            or "NIFTYMIDCAP100"
+        )
         _all_results = result_store.get_all_results(job_id)
         _result_by_label = {
             r.get("combo_label_safe", ""): r
@@ -465,7 +473,10 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
                         for _col in ("Entry Date", "Exit Date"):
                             if _col in _df.columns and hasattr(_df[_col], "dt"):
                                 _df[_col] = _df[_col].dt.strftime("%d-%m-%Y")
-                _corrected[_label_safe] = _compute_metrics(_df, _stored_summary)
+                _corrected[_label_safe] = _compute_metrics(
+                    _df, _stored_summary,
+                    midcap_legs=_mc_legs, midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
+                )
             except Exception as _ce:
                 logger.warning("[OPTIM] Metric correction skipped for %s: %s", _label_safe, _ce)
 
@@ -753,6 +764,17 @@ def _expiry_cands_str(expiry_str: str) -> List[str]:
         return [expiry_str]
 
 
+# Exit reasons that get the SL/SL-with-buffer adverse-side cap (mirrors
+# _SL_CAP_REASONS in engines/generic_algotest_engine.py — keep in sync).
+_SL_CAP_REASONS = {
+    "STOP_LOSS",
+    "SL_WITH_BUFFER",
+    "SL_WITH_BUFFER_GAP",
+    "STOP_LOSS_BUFFER",
+    "STOP_LOSS_BUFFER_GAP",
+}
+
+
 def _compute_mae_mfe_batch(
     df: "pd.DataFrame",
     index_str: str,
@@ -835,10 +857,16 @@ def _compute_mae_mfe_batch(
         if win_start > exit_str:
             rows_data.append(None)
             continue
+        _exit_reason = str(row.get("Exit Reason") or "").upper().strip()
+        try:
+            _exit_price = float(row.get("Exit Price"))
+        except (TypeError, ValueError):
+            _exit_price = None
         rows_data.append({
             "pos": pos, "opt_type": opt_type, "strike": strike,
             "expiry_str": expiry_str, "win_start": win_start, "win_end": exit_str,
             "entry_price": entry_price, "position": position, "entry_spot": entry_spot,
+            "exit_reason": _exit_reason, "exit_price": _exit_price,
         })
 
     valid_rows = [r for r in rows_data if r is not None]
@@ -1050,6 +1078,16 @@ def _compute_mae_mfe_batch(
         max_high = max(highs)
         min_low = min(lows)
 
+        # SL / SL-with-buffer adverse-side cap (mirrors _cap_adverse_extreme_for_sl
+        # in generic_algotest_engine.py): on a realised stop-out the adverse extreme
+        # cannot be worse than the stop fill. SELL caps the High; BUY floors the Low.
+        # MFE side untouched; non-SL exits keep the raw window extremes.
+        if r["exit_reason"] in _SL_CAP_REASONS and r["exit_price"] is not None and r["exit_price"] > 0:
+            if position == "SELL":
+                max_high = min(max_high, r["exit_price"])
+            else:
+                min_low = max(min_low, r["exit_price"])
+
         # Same formula as _calculate_mae_mfe_from_extremes in generic_algotest_engine.py
         if position == "SELL":
             mae = (entry_price - max_high) / entry_spot
@@ -1073,10 +1111,12 @@ def _compute_live_dd_from_mae(
     """
     Add 'Lowest NAV During Trade' column to df using Final MAE per trade.
 
-    Formula (mirrors buildTradeExcel.js lines 253-272):
+    Formula (mirrors buildTradeExcel.js):
         finalMae = min(netMae1, netMae2)  — from _calc_final_mae_for_trade
         lowestNav = prevCum * (1 + finalMae/100)
-        (prevCum = Cumulative of the prior trade, starting at 100.0)
+        (prevCum = Cumulative of the prior trade, starting at 100.0;
+         the FIRST trade therefore uses prevCum = 100.0 too — revised
+         research-verified rule, AW = AU_prev * (1 + AM%) for all trades)
 
     Only parent rows (first occurrence of each trade) carry the value;
     secondary leg rows get None — matching Python engine convention.
@@ -1090,8 +1130,8 @@ def _compute_live_dd_from_mae(
     trade_lowest_nav: Dict[str, Optional[float]] = {}
 
     # Process trades in the same sorted order used by cumulative computation.
-    # Excel formula: AS2 = AN2 (first trade lowestNav = its own cumulative)
-    #                AS_n = AN_(n-1) * (1 + AR_n/100) for all subsequent trades
+    # Revised research-verified rule: every trade (incl. the first, where
+    # prev_cum = 100.0) anchors the low to AS_n = AN_(n-1) * (1 + AR_n/100).
     for _, agg_row in aggregated.iterrows():
         tid = str(agg_row.get("Trade") or "")
         if not tid:
@@ -1100,10 +1140,7 @@ def _compute_live_dd_from_mae(
         final_mae = _calc_final_mae_for_trade(trade_legs) if not trade_legs.empty else None
         cum = agg_row.get("Cumulative")
         if final_mae is not None:
-            if first_trade and cum is not None:
-                trade_lowest_nav[tid] = round(float(cum) * 100) / 100
-            else:
-                trade_lowest_nav[tid] = round(prev_cum * (1.0 + float(final_mae) / 100.0) * 100) / 100
+            trade_lowest_nav[tid] = round(prev_cum * (1.0 + float(final_mae) / 100.0) * 100) / 100
         else:
             trade_lowest_nav[tid] = None
         first_trade = False
@@ -1449,7 +1486,11 @@ def run_optimization(
         total=total,
         method=method,
         objective=obj.name,
-        extra={"sample_n": sample_n, "algorithm": algorithm, "zip_naming": zip_naming},
+        # Persist base_payload so the on-demand ZIP builder (which reads from the
+        # job meta) gets the date range AND the Midcap overlay config. Without
+        # this, meta.base_payload was empty → ZIP combos had no Midcap columns.
+        extra={"sample_n": sample_n, "algorithm": algorithm, "zip_naming": zip_naming,
+               "base_payload": base_payload},
     )
 
     result_store.write_run_config(

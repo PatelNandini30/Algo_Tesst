@@ -10,6 +10,7 @@ from worker.tasks import run_algotest_job, warm_backtest_cache_task
 from worker.celery import celery_app
 import sys
 import os
+import threading
 import pandas as pd
 import numpy as np
 import traceback
@@ -726,6 +727,62 @@ async def recalculate_slippage(request: dict):
         'pivot': result_pivot,
         'meta': {'slippage_pct': slippage_pct, 'charges_enabled': charges_enabled},
     }
+
+
+# ── Midcap cross-index overlay (additive; never runs the engine) ──────────────
+# Bound concurrency so a burst of overlay requests can't spike memory. Each call
+# is O(rows) over a small projection + a sub-MB index lookup, so a small cap is
+# plenty. Lives in the API process; loads only the tiny INDEX_OHLC cache.
+_MIDCAP_OVERLAY_SEM = threading.Semaphore(
+    int(os.getenv("MIDCAP_OVERLAY_MAX_CONCURRENCY", "4") or "4")
+)
+
+
+@router.post("/midcap-overlay")
+def midcap_overlay(request: dict):
+    """Price Midcap100 overlay leg(s) on a finished NIFTY backtest.
+
+    Body: {
+      rows: [{trade_id, reentry_index?, entry_date, exit_date, nifty_pnl, nifty_pnl_pct}],
+      midcap_legs: [{midcap_mode, cost_pct_per_month, position, lots, symbol}],
+      midcap_spot_adjustment: {enabled, direction, pct, units} | null,
+      symbol?: str
+    }
+    Returns {results: [...], summary: {...}, available: bool}.
+    """
+    rows = request.get('rows') or []
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=400, detail="rows must be a list")
+    midcap_legs = request.get('midcap_legs') or []
+    if not isinstance(midcap_legs, list) or not midcap_legs:
+        raise HTTPException(status_code=400, detail="No midcap_legs provided")
+    midcap_sa = request.get('midcap_spot_adjustment') or None
+    symbol = request.get('symbol') or (midcap_legs[0].get('symbol') if midcap_legs else None) or 'NIFTYMIDCAP100'
+
+    if not _MIDCAP_OVERLAY_SEM.acquire(timeout=30):
+        raise HTTPException(status_code=503, detail="midcap overlay busy, retry shortly")
+    try:
+        from services import index_ohlc_store, rust_fast_path
+        # Rust-only: the Midcap math runs exclusively in the native engine.
+        # No Python fallback — if the native path is unavailable we surface an
+        # error so it's fixed (rebuilt), never silently computed in Python.
+        index_ohlc_store.ensure_index_ohlc_loaded(symbol)
+        if not (rust_fast_path.index_ohlc_is_loaded() and rust_fast_path.compute_midcap_legs_available()):
+            raise HTTPException(
+                status_code=503,
+                detail="Rust native midcap engine unavailable (Rust-only mode) — rebuild the native extension.",
+            )
+        result = rust_fast_path.compute_midcap_legs(rows, midcap_legs, midcap_sa, symbol)
+        if result is None:
+            raise HTTPException(status_code=500, detail="Rust midcap computation failed.")
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.exception("midcap-overlay failed")
+        raise HTTPException(status_code=500, detail=f"midcap overlay error: {exc}")
+    finally:
+        _MIDCAP_OVERLAY_SEM.release()
 
 
 @router.get("/algotest/jobs/{job_id}")

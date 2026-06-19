@@ -395,6 +395,8 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
                     position=rec.get("B/S", "SELL"),
                     entry_spot=rec.get("Entry Spot"),
                     trading_calendar_df=_trading_cal_df,
+                    exit_reason=rec.get("Exit Reason"),
+                    exit_price=rec.get("Exit Price"),
                 )
                 if mae_val is not None:
                     rec["MAE"] = mae_val
@@ -943,12 +945,23 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         logger.debug("[DEBUG] result_summary types=%s", [(k, type(v)) for k, v in result_summary.items()])
         
         stage_t = time.perf_counter()
+        # Resolved filter segment windows for the Patch-wise sheet. Works for BOTH
+        # uploaded-CSV (payload.filter_segments) and named filters (resolved on the
+        # backend). The frontend patch-wise export resets the equity at each segment
+        # START, so it must see the actual windows regardless of filter type.
+        try:
+            from services.engine_rust import _load_filter_segments as _lfs
+            _resolved_segs = _lfs(payload) or []
+            _meta_filter_segments = [{"start": s, "end": e} for (s, e) in _resolved_segs]
+        except Exception:
+            _meta_filter_segments = payload.get("filter_segments") or []
         result_payload = {
             'status': 'success',
             'trades': _make_json_safe(all_trades),
             'summary': _make_json_safe(result_summary),
             'pivot': _make_json_safe(result_pivot),
             'meta': _make_json_safe({
+                'filter_segments': _meta_filter_segments,
                 'slippage_pct': payload.get('slippage_pct', 0),
                 'index': payload.get('index', 'NIFTY'),
                 'from_date': payload.get('from_date'),

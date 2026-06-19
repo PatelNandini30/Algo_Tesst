@@ -344,7 +344,7 @@ def _enrich_tradesheet_with_mae_mfe(csv_path: str, index_str: str) -> bool:
 # downloads stream from disk instantly.
 
 _ZIP_CACHE_DIR = "/data/cache/optim_zips"
-_ZIP_BUILDER_VERSION = "v6"
+_ZIP_BUILDER_VERSION = "v10"  # v10: fix module-level _date_ms NameError (was CSV-fallback in v9); v9: summary adds Avg (Combined) Final MAE row
 
 _UNSAFE_ZIP_RE = re.compile(r'[/\\:*?"<>|]')
 
@@ -355,18 +355,20 @@ _zip_build_state: Dict[str, Dict[str, Any]] = {}
 _zip_build_lock = threading.Lock()
 
 
-def _zip_cache_path(job_id: str) -> str:
+def _zip_cache_path(job_id: str, patchwise: bool = False) -> str:
     os.makedirs(_ZIP_CACHE_DIR, exist_ok=True)
-    return os.path.join(_ZIP_CACHE_DIR, f"{job_id}.{_ZIP_BUILDER_VERSION}.zip")
+    ver = f"{_ZIP_BUILDER_VERSION}-pw" if patchwise else _ZIP_BUILDER_VERSION
+    return os.path.join(_ZIP_CACHE_DIR, f"{job_id}.{ver}.zip")
 
 
 def _build_one_xlsx(args: tuple) -> tuple:
     """Worker function for ProcessPoolExecutor.
 
-    Returns (label_safe, xlsx_bytes) or (label_safe, None) on failure.
+    Returns (label_safe, xlsx_bytes, None) or (label_safe, None, err_str) on failure.
     Top-level so it's picklable.
     """
-    fpath, label_safe, combo_summary, combo_label, from_date, to_date = args
+    (fpath, label_safe, combo_summary, combo_label, from_date, to_date,
+     midcap_legs, midcap_sa, midcap_sym, filter_name, patchwise, filter_segments) = args
     try:
         import pandas as _pd
         from services.optimizer.excel_builder import build_combo_xlsx as _build
@@ -375,13 +377,19 @@ def _build_one_xlsx(args: tuple) -> tuple:
             trades_df, combo_summary,
             combo_label=combo_label,
             from_date=from_date, to_date=to_date,
+            midcap_legs=midcap_legs,
+            midcap_spot_adjustment=midcap_sa,
+            midcap_symbol=midcap_sym,
+            filter_name=filter_name,
+            patchwise=patchwise,
+            filter_segments=filter_segments,
         )
         return (label_safe, xlsx_bytes, None)
     except Exception as exc:
         return (label_safe, None, str(exc))
 
 
-def _build_zip_blocking(job_id: str) -> None:
+def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
     """Build the ZIP file on disk.  Updates progress state as it goes."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import pandas as pd
@@ -440,6 +448,21 @@ def _build_zip_blocking(job_id: str) -> None:
         state["done"] = 0
         state["phase"] = "building"
 
+        # Midcap cross-index overlay config (from the run's base payload). When
+        # present, each combo XLSX gets the same Midcap/Combined columns + summary
+        # as the verified backtest, computed via the same native engine.
+        _midcap_legs = base_payload.get("midcap_legs") or None
+        _midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
+        _midcap_sym  = (
+            (_midcap_legs[0].get("symbol") if (_midcap_legs and isinstance(_midcap_legs[0], dict)) else None)
+            or "NIFTYMIDCAP100"
+        )
+
+        _filter_name = (zip_naming.get("level1") or "") if zip_naming else ""
+        # Filter segment windows (from the run's base payload) — patch-wise sheet
+        # resets the equity at each segment START instead of guessing via gaps.
+        _filter_segments = base_payload.get("filter_segments") or None
+
         build_args = []
         for fname in combo_csvs:
             label_safe = fname[:-4]
@@ -450,11 +473,15 @@ def _build_zip_blocking(job_id: str) -> None:
                 row.get("summary") or {},
                 row.get("combo_label") or label_safe,
                 from_date, to_date,
+                _midcap_legs, _midcap_sa, _midcap_sym,
+                _filter_name,
+                patchwise,
+                _filter_segments,
             ))
 
         # Write directly to disk — atomic move at end so partial files never
         # appear cached.
-        out_path = _zip_cache_path(job_id)
+        out_path = _zip_cache_path(job_id, patchwise)
         tmp_path = out_path + ".building"
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -462,6 +489,18 @@ def _build_zip_blocking(job_id: str) -> None:
         # Tune workers: 4-6 is a sweet spot for CPU-bound XLSX builds without
         # starving the host (Granian + 2 worker containers also need CPU).
         max_workers = min(6, max(2, (os.cpu_count() or 4) - 1))
+
+        # Fork-safety: SQLAlchemy's connection pool is not fork-safe. Forked
+        # subprocesses inherit the parent's open TCP connections and corrupt them
+        # (PGRES_TUPLES_OK errors). Disposing connections in each child immediately
+        # after fork forces them to open fresh connections. The parent pool is
+        # completely unaffected — initializer only runs in child processes.
+        def _child_init():
+            try:
+                from database import get_engine as _ge
+                _ge().dispose()
+            except Exception:
+                pass
 
         # When a job swept spot_adjustment_enabled (both true and false), route
         # each combo into Adjustment/ or No_Adjustment/ subfolders inside the zip.
@@ -483,7 +522,7 @@ def _build_zip_blocking(job_id: str) -> None:
                 # are deduplicated to one file per unique strategy.
                 _no_adj_seen: set = set()
 
-                with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                with ProcessPoolExecutor(max_workers=max_workers, initializer=_child_init) as pool:
                     futures = {pool.submit(_build_one_xlsx, a): a[1] for a in build_args}
                     for fut in as_completed(futures):
                         label_safe = futures[fut]
@@ -524,23 +563,26 @@ def _build_zip_blocking(job_id: str) -> None:
 
 
 @router.get("/optimize/jobs/{job_id}/tradesheets.zip")
-async def download_tradesheets_zip(job_id: str):
+async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(False)):
     """
     Returns the tradesheets ZIP, building it on first request.
 
       • 200 + ZIP file       — when the ZIP is ready on disk
       • 202 + progress JSON  — while a background build is in progress
       • 4xx                  — job not found / not complete / no trades
+
+    Pass ?patchwise=true to get a ZIP where the combined chain resets to 100
+    at each FILTER_END boundary (separate on-disk cache from the default build).
     """
     # Disk-cache shortcut: if the ZIP already exists, serve it directly even
     # when Redis meta has expired (TTL) or been wiped (e.g., compose down).
-    # The presence of the file itself is proof the job ran to completion.
-    cache_path = _zip_cache_path(job_id)
+    cache_path = _zip_cache_path(job_id, patchwise)
     if os.path.isfile(cache_path):
         _meta_for_name = result_store.get_meta(job_id) or {}
         _zip_naming = _meta_for_name.get("zip_naming") or {}
         _level1 = _safe_zip_name(_zip_naming.get("level1", "")) if _zip_naming else ""
-        filename = f"{_level1}.zip" if _level1 else f"optimize_{job_id[:8]}_tradesheets.zip"
+        _pw_suffix = "_patchwise" if patchwise else ""
+        filename = f"{_level1}{_pw_suffix}.zip" if _level1 else f"optimize_{job_id[:8]}_tradesheets{_pw_suffix}.zip"
         return FileResponse(
             cache_path,
             media_type="application/zip",
@@ -564,9 +606,10 @@ async def download_tradesheets_zip(job_id: str):
             detail="No tradesheets found. The job may have produced 0 trades.",
         )
 
-    # Kick off / report background build
+    # Separate state key for patchwise so both modes can build concurrently
+    state_key = f"{job_id}:pw" if patchwise else job_id
     with _zip_build_lock:
-        state = _zip_build_state.get(job_id)
+        state = _zip_build_state.get(state_key)
         if state is None or state.get("status") in ("error",):
             state = {
                 "status": "building",
@@ -575,9 +618,9 @@ async def download_tradesheets_zip(job_id: str):
                 "started_at": time.time(),
                 "error": None,
             }
-            _zip_build_state[job_id] = state
+            _zip_build_state[state_key] = state
             thread = threading.Thread(
-                target=_build_zip_blocking, args=(job_id,), daemon=True,
+                target=_build_zip_blocking, args=(job_id, patchwise), daemon=True,
             )
             thread.start()
 

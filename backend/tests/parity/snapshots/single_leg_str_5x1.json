@@ -1,7 +1,7 @@
 {
   "name": "single_leg_str_5x1",
-  "captured_at": "2026-05-13T04:31:27.453144Z",
-  "engine_runtime_seconds": 74.956,
+  "captured_at": "2026-06-05T11:04:48.210291Z",
+  "engine_runtime_seconds": 0.048,
   "payload": {
     "index": "NIFTY",
     "from_date": "2024-01-01",
@@ -264,6 +264,8 @@
   ],
   "summary": {
     "total_pnl": 31.0,
+    "total_pnl_pct": 0.1479,
+    "avg_profit_per_trade_pct": 0.0296,
     "count": 5,
     "win_pct": 60.0,
     "loss_pct": 40.0,
@@ -272,7 +274,7 @@
     "max_win": 118.55,
     "max_loss": -122.9,
     "avg_profit_per_trade": 6.2,
-    "expectancy": 0.0603,
+    "expectancy": 0.06028725725532036,
     "avg_win_pct": 0.3763,
     "avg_loss_pct": -0.4905,
     "reward_to_risk": 0.76,
@@ -284,11 +286,12 @@
     "mdd_start_date": "2024-02-08",
     "mdd_end_date": "2024-03-28",
     "mdd_trade_number": 5,
-    "car_mdd": 1.24,
+    "car_mdd": 0.0124,
     "recovery_factor": 41.33,
     "max_win_streak": 2,
     "max_loss_streak": 1,
     "spot_change": 144.35,
+    "spot_change_pct": 0.6426,
     "cagr_spot": 19.1
   },
   "pivot": {

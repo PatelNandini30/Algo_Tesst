@@ -130,7 +130,14 @@ def actual_live_dd(trades: pd.DataFrame) -> Dict[str, float]:
     if "Lowest NAV During Trade" in trades.columns and "Peak" in trades.columns:
         low = pd.to_numeric(trades["Lowest NAV During Trade"], errors="coerce")
         peak = pd.to_numeric(trades["Peak"], errors="coerce")
-        live = (low - peak).fillna(0)
+        # Live DD is measured against the PREVIOUS trade's peak (research rule
+        # AX = AW / AV_prev - 1), not this trade's own peak — a trade that closes
+        # at a new high is still measured against the peak going into it. Work on
+        # parent rows (those carrying a Lowest NAV) in order; seed the first
+        # trade's prior peak at 100.0.
+        _mask = low.notna()
+        _prev_peak = peak[_mask].shift(1).fillna(100.0)
+        live = (low[_mask] - _prev_peak).reindex(trades.index).fillna(0)
     elif "Actual Live DD" in trades.columns:
         live = pd.to_numeric(trades["Actual Live DD"], errors="coerce").fillna(0)
     elif "%DD" in trades.columns:
@@ -258,19 +265,21 @@ def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
         cumulative = 100.0
         peak = 100.0
         prev_cum = 100.0
+        prev_peak = 100.0
         first_done = False
         rebuilt_ldds = []
         for p in filtered:
             pct = p["pct"]
+            prev_peak = peak
             cumulative *= (1.0 + pct / 100.0)
             peak = max(peak, cumulative)
             mae = p["mae"]
-            if mae is not None and peak != 0:
-                if not first_done:
-                    lowest_nav = round(cumulative * 100) / 100
-                else:
-                    lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
-                actual_ldd = round((lowest_nav / peak - 1) * 10000) / 100
+            if mae is not None and prev_peak != 0:
+                # Revised rule: every trade (incl. first, prev_cum = 100) anchors
+                # the low to prev_cum * (1 + FinalMAE%); Live DD divides by the
+                # PREVIOUS trade's peak (AV_prev), not this trade's peak.
+                lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
+                actual_ldd = round((lowest_nav / prev_peak - 1) * 10000) / 100
                 rebuilt_ldds.append(actual_ldd)
                 first_done = True
             else:

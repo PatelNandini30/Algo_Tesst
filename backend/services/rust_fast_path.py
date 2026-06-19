@@ -525,6 +525,99 @@ def get_spot_price(date, index: str) -> Optional[float]:
         return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Index OHLC — ADDITIVE wrappers for the Midcap cross-index overlay.
+# These hit a separate native INDEX_OHLC cache that is independent of the
+# options/spot MarketCache; they never build or touch the heavy backtest cache.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def index_ohlc_available() -> bool:
+    """True if the native extension exposes the index-OHLC functions."""
+    native = _load_native()
+    return native is not None and hasattr(native, "load_index_ohlc")
+
+
+def load_index_ohlc(path) -> bool:
+    """Load (merge) a per-symbol index-OHLC feather into the native cache."""
+    native = _load_native()
+    if native is None or not hasattr(native, "load_index_ohlc"):
+        return False
+    try:
+        native.load_index_ohlc(str(path))
+        return True
+    except Exception as exc:
+        logger.warning("[RUST_FAST] load_index_ohlc failed for %s: %s", path, exc)
+        return False
+
+
+def index_ohlc_is_loaded() -> bool:
+    native = _load_native()
+    if native is None or not hasattr(native, "index_ohlc_is_loaded"):
+        return False
+    try:
+        return bool(native.index_ohlc_is_loaded())
+    except Exception:
+        return False
+
+
+def clear_index_ohlc() -> None:
+    native = _load_native()
+    if native is None or not hasattr(native, "clear_index_ohlc"):
+        return
+    try:
+        native.clear_index_ohlc()
+    except Exception as exc:
+        logger.debug("[RUST_FAST] clear_index_ohlc failed: %s", exc)
+
+
+def get_index_ohlc_close(symbol: str, date) -> Optional[float]:
+    native = _load_native()
+    if native is None or not hasattr(native, "get_index_ohlc_close"):
+        return None
+    try:
+        return native.get_index_ohlc_close(_to_date_str(date), str(symbol).upper())
+    except Exception as exc:
+        logger.debug("[RUST_FAST] get_index_ohlc_close failed: %s", exc)
+        return None
+
+
+def get_index_ohlc(symbol: str, date):
+    """Return (open, high, low, close) tuple or None."""
+    native = _load_native()
+    if native is None or not hasattr(native, "get_index_ohlc"):
+        return None
+    try:
+        return native.get_index_ohlc(_to_date_str(date), str(symbol).upper())
+    except Exception as exc:
+        logger.debug("[RUST_FAST] get_index_ohlc failed: %s", exc)
+        return None
+
+
+def compute_midcap_legs_available() -> bool:
+    native = _load_native()
+    return native is not None and hasattr(native, "compute_midcap_legs")
+
+
+def compute_midcap_legs(rows, midcap_legs, spot_adjustment, symbol):
+    """Rust-native Midcap overlay math (parity with services.midcap_overlay).
+    Returns the parsed result dict, or None if the native path is unavailable."""
+    import json
+    native = _load_native()
+    if native is None or not hasattr(native, "compute_midcap_legs"):
+        return None
+    try:
+        out = native.compute_midcap_legs(
+            json.dumps(rows),
+            json.dumps(midcap_legs or []),
+            json.dumps(spot_adjustment or {}),
+            str(symbol).upper(),
+        )
+        return json.loads(out)
+    except Exception as exc:
+        logger.warning("[RUST_FAST] compute_midcap_legs failed: %s", exc)
+        return None
+
+
 def get_strikes_for_date(date, index: str, expiry: str, opt_type: str) -> List[tuple]:
     native = _load_native()
     if native is None:

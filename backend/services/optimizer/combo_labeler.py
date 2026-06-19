@@ -118,6 +118,13 @@ def _expiry_label(payload: Dict[str, Any]) -> str:
         for leg in legs
         if isinstance(leg, dict)
     }
+    # Prefer a per-leg NEXT_WEEKLY / NEXT_MONTHLY expiry so the ZIP filename
+    # matches the backtest (which labels off the leg expiry, not the global
+    # expiry_window — which stays "weekly"/"monthly" for next-* strategies).
+    if any(e in ("next_weekly", "weekly_t1") for e in leg_expiries):
+        return "Next_Weekly"
+    if any(e in ("next_monthly", "monthly_t1") for e in leg_expiries):
+        return "Next_Monthly"
     window = (payload.get("expiry_window") or "").lower()
     candidate = window or (next(iter(leg_expiries)) if leg_expiries else "")
     candidate = candidate.replace("_expiry", "")
@@ -193,6 +200,44 @@ def _sl_label(leg: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def _midcap_label(payload: Dict[str, Any]) -> str:
+    """Midcap cross-index overlay segment for the combo label, matching the
+    backtest filename: e.g. "BUY_MIDCAP100_Hypothetical_Future" / "..._Spot".
+    Empty when no Midcap leg is present (non-Midcap combos unchanged)."""
+    legs = payload.get("midcap_legs") or []
+    segs = []
+    for l in legs:
+        if not isinstance(l, dict):
+            continue
+        pos = str(l.get("position") or "BUY").upper()
+        mode = str(l.get("midcap_mode") or l.get("mode") or "hypothetical").lower()
+        sym = str(l.get("symbol") or "NIFTYMIDCAP100").upper().replace("NIFTY", "") or "MIDCAP100"
+        mode_lbl = "Hypothetical_Future" if mode == "hypothetical" else "Spot"
+        segs.append(f"{pos}_{sym}_{mode_lbl}")
+    return "_".join(segs)
+
+
+def _midcap_spot_adjustment_label(payload: Dict[str, Any]) -> str:
+    """Midcap cross-index spot adjustment label, e.g. 'MidcapRiseBy1%'. Empty
+    when the Midcap spot adjustment is disabled (non-Midcap combos unchanged)."""
+    mc = payload.get("midcap_spot_adjustment") or {}
+    if not mc.get("enabled"):
+        return ""
+    direction = str(mc.get("direction") or "").lower()
+    try:
+        pct = float(mc.get("pct") or mc.get("value") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    pct_str = f"{pct:g}%"
+    if direction in ("up", "rise", "rises"):
+        return f"MidcapRiseBy{pct_str}"
+    if direction in ("down", "fall", "falls"):
+        return f"MidcapFallsBy{pct_str}"
+    if direction in ("both", "either", "any"):
+        return f"MidcapRisesOrFallsBy{pct_str}"
+    return f"MidcapAdjust{pct_str}"
+
+
 def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     """
     Inspect a (combo-applied) payload and return the master-summary columns
@@ -233,6 +278,14 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         if pe_sl:
             seg += f"_{pe_sl}"
         parts.append(seg)
+    # Midcap cross-index overlay leg(s) — appended after the option legs, like
+    # the backtest filename (only present when a Midcap leg ran).
+    midcap_seg = _midcap_label(payload)
+    if midcap_seg:
+        parts.append(midcap_seg)
+    midcap_adj_seg = _midcap_spot_adjustment_label(payload)
+    if midcap_adj_seg:
+        parts.append(midcap_adj_seg)
     parts.append(spot_adj)
     parts.append(f"{expiry}_Expiry")
     parts.append(shift)

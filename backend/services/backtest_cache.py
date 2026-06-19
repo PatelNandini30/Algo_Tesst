@@ -61,6 +61,8 @@ def _compute_engine_version() -> str:
         os.path.join(root, 'services', 'fast_lookup.py'),
         os.path.join(root, 'services', 'algotest_job.py'),
         os.path.join(root, 'services', 'engine_rust.py'),
+        os.path.join(root, 'services', 'midcap_overlay.py'),
+        os.path.join(root, 'native', 'src', 'lib.rs'),
     ]
     try:
         hasher = hashlib.md5()
