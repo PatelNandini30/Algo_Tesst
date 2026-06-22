@@ -21,3 +21,4 @@ backend/algotest_native*.so
 frontend/dist/
 .claude/
 nifty_data/
+git-credential-manager/
