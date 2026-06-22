@@ -39,6 +39,8 @@ export default {
         
         // Accent/Brand
         accent: 'var(--accent)',
+        'accent-2': 'var(--accent-2)',
+        'accent-3': 'var(--accent-3)',
         'accent-dim': 'var(--accent-dim)',
         'accent-bg': 'var(--accent-bg)',
         'accent-hover': 'var(--accent-hover)',
@@ -51,9 +53,11 @@ export default {
       boxShadow: {
         'card':        '0 2px 12px rgba(0,0,0,0.35)',
         'card-hover':  '0 4px 24px rgba(0,0,0,0.5)',
-        'glow-amber':  '0 0 20px rgba(232,160,48,0.3)',
-        'glow-profit': '0 0 16px rgba(34,212,122,0.25)',
-        'glow-loss':   '0 0 16px rgba(245,86,110,0.25)',
+        'glow-amber':  '0 0 20px rgba(56,126,209,0.32)',
+        'glow-accent': '0 0 20px rgba(56,126,209,0.32)',
+        'glow-cyan':   '0 0 20px rgba(46,204,113,0.28)',
+        'glow-profit': '0 0 16px rgba(46,204,113,0.25)',
+        'glow-loss':   '0 0 16px rgba(255,87,99,0.25)',
         'inner-glow':  'inset 0 1px 0 rgba(255,255,255,0.04)',
       },
       animation: {

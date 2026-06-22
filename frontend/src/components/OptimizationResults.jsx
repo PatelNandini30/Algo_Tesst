@@ -777,7 +777,7 @@ export default function OptimizationResults({
                       onClick={() => c.key !== 'sr_no' && toggleSort(c.key)}
                       style={{
                         padding: '8px 6px',
-                        textAlign: 'left',
+                        textAlign: c.key === 'sr_no' ? 'center' : 'right',
                         borderBottom: '1px solid var(--border-strong, #e5e7eb)',
                         cursor: c.key === 'sr_no' ? 'default' : 'pointer',
                         whiteSpace: 'nowrap',
@@ -915,6 +915,7 @@ export default function OptimizationResults({
                             padding: '6px 6px',
                             borderBottom: '1px solid var(--border, #f1f5f9)',
                             whiteSpace: 'nowrap',
+                            textAlign: c.key === 'sr_no' ? 'center' : 'right',
                           }}
                         >
                           {formatCell(v)}

@@ -488,7 +488,7 @@ fn validate_or_shift_strike(
     strike: f64,
     atm: f64,
     interval: f64,
-    _is_call: bool,
+    is_call: bool,
     entry_date: &str,
     expiry: &str,
     index: &str,
@@ -521,7 +521,23 @@ fn validate_or_shift_strike(
     } else if strike < atm - 1e-6 {
         1.0  // requested is below ATM → walk UP toward ATM
     } else {
-        // Already at ATM and zero-turnover — nowhere to walk; give up.
+        // ATM strike itself is zero-turnover. Walk OUTWARD in the OTM direction
+        // (CALL: up, PUT: down) to the first strike WITH turnover, instead of
+        // skipping. Stop at the chain edge (Missing) or a safety cap.
+        let otm_dir: f64 = if is_call { 1.0 } else { -1.0 };
+        let mut step = 1i32;
+        while step <= 500 {
+            let candidate = strike + otm_dir * (step as f64) * interval;
+            if candidate <= 0.0 {
+                break;
+            }
+            match crate::lookup_option_status(entry_date, index, candidate, opt_type, expiry) {
+                OptionDataStatus::Tradeable(px) if px > 0.0 => return Some((candidate, step)),
+                OptionDataStatus::Missing => break,
+                _ => {}
+            }
+            step += 1;
+        }
         return None;
     };
     // Cap at distance to ATM (inclusive) — never walk past ATM.

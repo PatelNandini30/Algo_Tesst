@@ -1,0 +1,340 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><title>STRYK · UX Permutations Playbook</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+:root{
+  --base:#1b2537; --surface:#222e44; --elevated:#2a3852; --line:#324056; --line2:#3f5070;
+  --tp:#eaf1fa; --ts:#9fb0c8; --tm:#5d6e88;
+  --blue:#387ed1; --green:#2ecc71; --b2:#5a9ee0; --loss:#ff5763;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+@page{size:1280px 900px;margin:0;}
+html,body{background:var(--base);color:var(--tp);font-family:'Outfit',sans-serif;-webkit-font-smoothing:antialiased;}
+.mono{font-family:'IBM Plex Mono',monospace;}
+.disp{font-family:'Space Grotesk',sans-serif;}
+.page{width:1280px;height:900px;position:relative;overflow:hidden;page-break-after:always;padding:54px 64px;
+  background:
+   linear-gradient(rgba(56,126,209,.035) 1px,transparent 1px) 0 0/40px 40px,
+   linear-gradient(90deg,rgba(56,126,209,.035) 1px,transparent 1px) 0 0/40px 40px,
+   radial-gradient(ellipse 80% 60% at 90% -10%, rgba(56,126,209,.10),transparent 55%),
+   radial-gradient(ellipse 70% 55% at 5% 110%, rgba(46,204,113,.07),transparent 55%),
+   var(--base);}
+.page:last-child{page-break-after:auto;}
+/* title block (engineering drawing) */
+.tb{position:absolute;right:64px;bottom:40px;display:flex;border:1px solid var(--line2);border-radius:6px;overflow:hidden;}
+.tb div{padding:6px 12px;border-right:1px solid var(--line2);font-family:'IBM Plex Mono';font-size:.56rem;color:var(--ts);letter-spacing:.06em;}
+.tb div:last-child{border-right:none;color:var(--blue);}
+.tb b{color:var(--tp);}
+.eyebrow{font-family:'IBM Plex Mono';font-size:.62rem;letter-spacing:.32em;text-transform:uppercase;color:var(--blue);}
+.pg-no{position:absolute;top:54px;right:64px;font-family:'IBM Plex Mono';font-size:.6rem;color:var(--tm);letter-spacing:.2em;}
+h1{font-family:'Space Grotesk';font-weight:700;letter-spacing:-.01em;}
+h2{font-family:'Space Grotesk';font-weight:700;font-size:2rem;letter-spacing:-.01em;margin-bottom:4px;}
+.lead{color:var(--ts);font-size:.95rem;font-weight:300;max-width:880px;line-height:1.5;}
+.brand{display:flex;align-items:center;gap:14px;}
+.bolt{width:46px;height:46px;filter:drop-shadow(0 0 10px rgba(56,126,209,.6));}
+.wm{font-family:'Space Grotesk';font-weight:700;font-size:1.7rem;letter-spacing:.18em;
+  background:linear-gradient(90deg,#5a9ee0,#387ed1 50%,#2ecc71);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.divider{height:1px;background:linear-gradient(90deg,var(--blue),transparent);margin:18px 0 22px;}
+/* cards */
+.grid{display:grid;gap:16px;}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:18px 20px;}
+.card h3{font-family:'Space Grotesk';font-size:.95rem;font-weight:600;margin-bottom:8px;color:var(--tp);display:flex;align-items:center;gap:8px;}
+.card p{font-size:.78rem;color:var(--ts);line-height:1.5;}
+.tag{font-family:'IBM Plex Mono';font-size:.56rem;padding:2px 7px;border-radius:4px;letter-spacing:.04em;border:1px solid;}
+.tag.b{color:var(--blue);border-color:rgba(56,126,209,.4);background:rgba(56,126,209,.1);}
+.tag.g{color:var(--green);border-color:rgba(46,204,113,.4);background:rgba(46,204,113,.1);}
+/* schematic wireframe */
+.screen{border:1px solid var(--line2);border-radius:10px;background:rgba(13,18,28,.4);padding:10px;display:grid;gap:8px;height:430px;}
+.zone{border:1px dashed var(--line2);border-radius:7px;display:flex;flex-direction:column;gap:5px;padding:9px 11px;color:var(--tm);position:relative;min-height:0;}
+.zone .zl{font-family:'IBM Plex Mono';font-size:.56rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ts);}
+.zone .zd{font-size:.66rem;color:var(--tm);line-height:1.35;}
+.zone.act{border-style:solid;border-color:var(--blue);background:rgba(56,126,209,.09);box-shadow:0 0 16px rgba(56,126,209,.12) inset;}
+.zone.act .zl{color:var(--b2);}
+.zone.go{border-style:solid;border-color:var(--green);background:rgba(46,204,113,.1);}
+.zone.go .zl{color:var(--green);}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:auto;}
+.chip{font-family:'IBM Plex Mono';font-size:.52rem;color:var(--ts);border:1px solid var(--line2);border-radius:4px;padding:2px 6px;}
+.barbtns{display:flex;gap:5px;}
+.mini{height:7px;border-radius:3px;background:var(--line2);}
+.specrow{display:flex;gap:0;margin-top:14px;border:1px solid var(--line);border-radius:9px;overflow:hidden;}
+.specrow div{flex:1;padding:10px 12px;border-right:1px solid var(--line);}
+.specrow div:last-child{border-right:none;}
+.specrow .k{font-family:'IBM Plex Mono';font-size:.52rem;letter-spacing:.06em;text-transform:uppercase;color:var(--tm);margin-bottom:4px;}
+.specrow .v{font-size:.74rem;color:var(--tp);font-weight:500;}
+.bestfor{margin-top:12px;font-size:.8rem;color:var(--ts);}
+.bestfor b{color:var(--green);}
+.note{margin-top:8px;font-size:.72rem;color:var(--tm);font-style:italic;border-left:2px solid var(--blue);padding-left:10px;}
+/* matrix */
+.matrix{width:100%;border-collapse:collapse;margin-top:6px;}
+.matrix th{font-family:'IBM Plex Mono';font-size:.58rem;letter-spacing:.06em;text-transform:uppercase;color:var(--tm);text-align:left;padding:8px 10px;border-bottom:1px solid var(--line2);}
+.matrix td{padding:9px 10px;border-bottom:1px solid var(--line);font-size:.74rem;color:var(--ts);vertical-align:top;}
+.matrix td b{color:var(--tp);font-family:'Space Grotesk';font-weight:600;}
+.matrix .ax{color:var(--blue);font-family:'IBM Plex Mono';font-size:.66rem;}
+.opt{display:inline-block;font-family:'IBM Plex Mono';font-size:.6rem;color:var(--ts);border:1px solid var(--line2);border-radius:4px;padding:2px 6px;margin:2px 4px 2px 0;}
+.featgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;}
+.feat{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:11px 13px;}
+.feat .fl{font-family:'Space Grotesk';font-size:.78rem;font-weight:600;color:var(--tp);margin-bottom:6px;}
+.feat ul{list-style:none;}
+.feat li{font-size:.64rem;color:var(--ts);padding:2px 0 2px 11px;position:relative;line-height:1.3;}
+.feat li::before{content:'';position:absolute;left:0;top:8px;width:4px;height:4px;border-radius:1px;background:var(--blue);}
+.big{font-family:'Space Grotesk';font-weight:700;color:var(--blue);}
+</style></head><body>
+
+<!-- SVG bolt def -->
+<svg width="0" height="0" style="position:absolute"><symbol id="bolt" viewBox="0 0 48 48">
+ <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#5a9ee0"/><stop offset="55%" stop-color="#387ed1"/><stop offset="100%" stop-color="#2ecc71"/></linearGradient></defs>
+ <path d="M24 4 L40 13 L40 35 L24 44 L8 35 L8 13 Z" fill="none" stroke="url(#bg)" stroke-width="2" stroke-linejoin="round" opacity=".45"/>
+ <path d="M27 9 L15 26 L22.5 26 L20 39 L33 21 L25 21 Z" fill="url(#bg)" stroke="url(#bg)" stroke-width="1.4" stroke-linejoin="round"/>
+</symbol></svg>
+
+<!-- PAGE 1 — COVER -->
+<section class="page">
+ <div class="pg-no">01 / 11</div>
+ <div class="brand" style="margin-top:40px;"><svg class="bolt"><use href="#bolt"/></svg><span class="wm">STRYK</span></div>
+ <div class="eyebrow" style="margin-top:60px;">UX Permutations · Layout Playbook</div>
+ <h1 style="font-size:4.4rem;line-height:1.02;margin-top:14px;max-width:980px;">Same features.<br/>Seven ways to <span style="color:var(--blue)">arrange</span> them.</h1>
+ <p class="lead" style="margin-top:24px;">Every STRYK capability stays. This document treats the interface as a combinatorial system — five UX axes, a handful of coherent layouts — researched against how the world's top quant desks and options platforms structure dense trading tools. Pick a direction; nothing in the engine changes.</p>
+ <div style="display:flex;gap:40px;margin-top:46px;">
+  <div><div class="big" style="font-size:2.6rem;">5</div><div class="mono" style="font-size:.6rem;color:var(--tm);letter-spacing:.14em;text-transform:uppercase;margin-top:2px;">UX axes</div></div>
+  <div><div class="big" style="font-size:2.6rem;color:var(--green)">2,000</div><div class="mono" style="font-size:.6rem;color:var(--tm);letter-spacing:.14em;text-transform:uppercase;margin-top:2px;">theoretical combos</div></div>
+  <div><div class="big" style="font-size:2.6rem;">7</div><div class="mono" style="font-size:.6rem;color:var(--tm);letter-spacing:.14em;text-transform:uppercase;margin-top:2px;">coherent layouts</div></div>
+  <div><div class="big" style="font-size:2.6rem;color:var(--green)">0</div><div class="mono" style="font-size:.6rem;color:var(--tm);letter-spacing:.14em;text-transform:uppercase;margin-top:2px;">features removed</div></div>
+ </div>
+ <div class="tb"><div>STRYK</div><div>UX-PERM</div><div>MIDNIGHT TEAL</div><div><b>REV</b> 2026.06</div></div>
+</section>
+
+<!-- PAGE 2 — RESEARCH -->
+<section class="page">
+ <div class="pg-no">02 / 11</div>
+ <div class="eyebrow">Field Research</div>
+ <h2>How the best desks present complexity</h2>
+ <p class="lead">Surveyed elite quant firms, retail options platforms, and 2025–26 fintech dashboard practice.</p>
+ <div class="divider"></div>
+ <div class="grid" style="grid-template-columns:1fr 1fr 1fr;">
+  <div class="card"><h3><span class="tag b">FIRMS</span> Quant houses</h3><p><b style="color:var(--tp)">Jane Street, Two Sigma, Optiver.</b> Restrained palette + a single strategic accent (Jane Street's red hexagons, Optiver's orange). Card-based modular grids, sans-serif clarity, a geometric signature motif. Intellectual rigor — not cold minimalism.</p></div>
+  <div class="card"><h3><span class="tag g">PLATFORMS</span> Options tools</h3><p><b style="color:var(--tp)">Opstra</b> = dense pro terminal, max tools per screen. <b style="color:var(--tp)">Sensibull</b> = clean drag-and-drop, beginner-first. <b style="color:var(--tp)">TradingView</b> = powerful charts + robust backtesting. Two valid poles: density vs. guidance.</p></div>
+  <div class="card"><h3><span class="tag b">FINTECH</span> Dashboard UX</h3><p>Card grids, top-banner KPIs, side panels for related functions, <b style="color:var(--tp)">progressive disclosure</b>, sticky left-rail actions. The 2026 shift: arrange the UI around the user's <b style="color:var(--tp)">decision workflow</b>, not the tool's internal structure.</p></div>
+ </div>
+ <div class="eyebrow" style="margin-top:26px;">Principles distilled for STRYK</div>
+ <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:12px;">
+  <div class="card"><p><span class="big" style="font-size:1rem;">01</span> &nbsp;<b style="color:var(--tp)">One accent, used with discipline.</b> Blue carries identity & action; green is reserved for profit & confirm. Everything else is structure.</p></div>
+  <div class="card"><p><span class="big" style="font-size:1rem;">02</span> &nbsp;<b style="color:var(--tp)">Let density be a choice, not a default.</b> Offer both a guided path and a terminal-dense path — same features underneath.</p></div>
+  <div class="card"><p><span class="big" style="font-size:1rem;">03</span> &nbsp;<b style="color:var(--tp)">Disclose progressively.</b> Summaries first, depth on demand — advanced toggles, lazy legs, MAE/MFE fold away until needed.</p></div>
+  <div class="card"><p><span class="big" style="font-size:1rem;">04</span> &nbsp;<b style="color:var(--tp)">Results live beside the decision.</b> The faster config→result feels, the more strategies a user tests.</p></div>
+ </div>
+ <div class="tb"><div>STRYK</div><div>UX-PERM</div><div>RESEARCH</div><div><b>02</b></div></div>
+</section>
+
+<!-- PAGE 3 — FEATURE INVENTORY -->
+<section class="page">
+ <div class="pg-no">03 / 11</div>
+ <div class="eyebrow">Inventory · nothing is dropped</div>
+ <h2>The complete STRYK feature set</h2>
+ <p class="lead">Every permutation that follows must surface all of these. Grouped into seven modules.</p>
+ <div class="divider"></div>
+ <div class="featgrid">
+  <div class="feat"><div class="fl">① Instrument</div><ul><li>NIFTY · SENSEX</li><li>MIDCPNIFTY · BANKNIFTY</li><li>weekly / monthly groups</li></ul></div>
+  <div class="feat"><div class="fl">② Configuration</div><ul><li>Underlying: Cash / Futures</li><li>Expiry basis · expires-on</li><li>Entry / Exit days-to-expiry</li><li>Date range</li></ul></div>
+  <div class="feat"><div class="fl">③ Rules & Adjust</div><ul><li>Re-entry rollover</li><li>No-rollover</li><li>Filter · Spot adjustment</li><li>Buffer strike</li></ul></div>
+  <div class="feat"><div class="fl">④ Leg Builder</div><ul><li>Futures / Options / Midcap100</li><li>Buy/Sell · Call/Put</li><li>Strike criteria · gap · type</li><li>Lots · per-leg SL / Target</li><li>Lazy legs</li></ul></div>
+  <div class="feat"><div class="fl">⑤ SuperTrend Filter</div><ul><li>STR enable · presets 5×1/5×2</li><li>Entry / exit rules</li><li>Custom segment upload</li></ul></div>
+  <div class="feat"><div class="fl">⑥ Results</div><ul><li>KPI cards · equity · drawdown</li><li>Monthly returns · trade sheet</li><li>MAE / MFE · exit reasons</li><li>Export XLSX / CSV</li></ul></div>
+  <div class="feat"><div class="fl">⑦ Optimizer</div><ul><li>Param sweep tree</li><li>Method · workers · objective</li><li>Master summary · combined export</li></ul></div>
+  <div class="feat" style="border-color:var(--blue);background:rgba(56,126,209,.06);"><div class="fl" style="color:var(--b2)">✦ Global</div><ul><li>Theme toggle (kept)</li><li>Save strategy</li><li>Run / Optimize actions</li></ul></div>
+ </div>
+ <div class="eyebrow" style="margin-top:24px;">The five UX axes — where arrangement is free</div>
+ <div class="specrow">
+  <div><div class="k">A · Navigation</div><div class="v">rail · tabs · ⌘K · stepper · dock</div></div>
+  <div><div class="k">B · Config shape</div><div class="v">2-col · accordion · drawer · wizard · dense</div></div>
+  <div><div class="k">C · Results</div><div class="v">inline · split · full · tabbed · modal</div></div>
+  <div><div class="k">D · Run action</div><div class="v">footer · rail · FAB · inline</div></div>
+  <div><div class="k">E · Optimizer</div><div class="v">modal · page · drawer · inline</div></div>
+ </div>
+ <p style="margin-top:10px;font-size:.74rem;color:var(--tm);">5 × 5 × 5 × 4 × 4 = <span class="big" style="font-size:.9rem;">2,000</span> theoretical arrangements. Most are incoherent. The next pages curate the <b style="color:var(--green)">7 that hold together</b> — the minimum set worth building.</p>
+ <div class="tb"><div>STRYK</div><div>UX-PERM</div><div>INVENTORY</div><div><b>03</b></div></div>
+</section>
+
+<!-- PAGE 4 — MATRIX -->
+<section class="page">
+ <div class="pg-no">04 / 11</div>
+ <div class="eyebrow">Combination Matrix</div>
+ <h2>The seven coherent layouts</h2>
+ <p class="lead">Each layout is one pick per axis. All keep the full feature set; they differ only in choreography.</p>
+ <div class="divider"></div>
+ <table class="matrix">
+  <thead><tr><th>Layout</th><th class="ax">A · Nav</th><th class="ax">B · Config</th><th class="ax">C · Results</th><th class="ax">D · Run</th><th class="ax">E · Optimizer</th><th>Best for</th></tr></thead>
+  <tbody>
+   <tr><td><b>① Studio</b></td><td>left rail</td><td>two-column</td><td>inline</td><td>sticky footer</td><td>modal</td><td>balanced default</td></tr>
+   <tr><td><b>② Terminal</b></td><td>top tabs</td><td>dense single-screen</td><td>split-pane</td><td>rail CTA</td><td>inline panel</td><td>power users</td></tr>
+   <tr><td><b>③ Cockpit</b></td><td>left rail</td><td>two-column</td><td>persistent split</td><td>rail CTA</td><td>right drawer</td><td>rapid iteration</td></tr>
+   <tr><td><b>④ Flow</b></td><td>stepper</td><td>wizard steps</td><td>full-screen</td><td>inline (end)</td><td>drawer</td><td>newcomers</td></tr>
+   <tr><td><b>⑤ Canvas</b></td><td>minimal chrome</td><td>inspector drawer</td><td>split-pane</td><td>FAB</td><td>drawer</td><td>focus / demo</td></tr>
+   <tr><td><b>⑥ Command</b></td><td>⌘K palette</td><td>accordion</td><td>tabbed</td><td>rail CTA</td><td>dedicated page</td><td>keyboard-first</td></tr>
+   <tr><td><b>⑦ Briefing</b></td><td>top nav</td><td>drawer config</td><td>dashboard</td><td>FAB</td><td>modal</td><td>portfolio view</td></tr>
+  </tbody>
+ </table>
+ <p style="margin-top:16px;font-size:.78rem;color:var(--ts);">Read each row as a recipe. <span class="tag b">Studio</span> is what's live today. <span class="tag g">Cockpit</span> and <span class="tag g">Terminal</span> are the highest-leverage upgrades for serious backtesting. The schematics follow.</p>
+ <div class="tb"><div>STRYK</div><div>UX-PERM</div><div>MATRIX</div><div><b>04</b></div></div>
+</section>
+
+<!-- LAYOUT SCHEMATIC PAGES -->
+<!-- 5: STUDIO -->
+<section class="page">
+ <div class="pg-no">05 / 11</div>
+ <div class="eyebrow">Layout ① · current</div>
+ <h2>Studio</h2>
+ <div class="screen" style="grid-template-columns:120px 1fr;grid-template-rows:34px 1fr 56px;margin-top:14px;">
+  <div class="zone act" style="grid-row:1 / span 3;"><div class="zl">A · Rail</div><div class="zd">Build · Results · Optimize</div><div class="chips"><span class="chip">brand</span><span class="chip">nav</span></div></div>
+  <div class="zone" style="grid-column:2;"><div class="zl">Header · instrument · theme · save</div></div>
+  <div class="zone" style="grid-column:2;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+    <div class="zone act" style="border:none;background:rgba(56,126,209,.08);"><div class="zl">B · Config (col 1)</div><div class="zd">instrument · expiry · rules · adjust</div></div>
+    <div class="zone" style="border-color:var(--line2);"><div class="zl">Leg Builder (col 2)</div><div class="zd">segments · legs · SuperTrend</div><div class="chips"><span class="chip">+ add leg</span></div></div>
+  </div>
+  <div class="zone go" style="grid-column:2;"><div class="zl">D · Sticky footer — Run Backtest · Optimize</div></div>
+ </div>
+ <div class="specrow">
+  <div><div class="k">Nav</div><div class="v">Left rail</div></div><div><div class="k">Config</div><div class="v">Two-column</div></div>
+  <div><div class="k">Results</div><div class="v">Inline below</div></div><div><div class="k">Run</div><div class="v">Sticky footer</div></div><div><div class="k">Optimizer</div><div class="v">Modal</div></div>
+ </div>
+ <div class="bestfor"><b>Best for:</b> a confident, low-risk default. Familiar, scannable, everything one scroll away.</div>
+ <div class="note">Shipped today. The baseline the others are measured against.</div>
+ <div class="tb"><div>STRYK</div><div>STUDIO</div><div>A·rail B·2col</div><div><b>05</b></div></div>
+</section>
+
+<!-- 6: TERMINAL -->
+<section class="page">
+ <div class="pg-no">06 / 11</div>
+ <div class="eyebrow">Layout ② · density</div>
+ <h2>Terminal</h2>
+ <div class="screen" style="grid-template-rows:34px 1fr;margin-top:14px;">
+  <div class="zone"><div class="zl">A · Top tabs — Build / Results / Optimize / Data</div></div>
+  <div class="zone" style="display:grid;grid-template-columns:1.15fr 1fr;gap:8px;border:none;padding:0;">
+    <div class="zone act"><div class="zl">B · Dense single-screen config</div><div class="zd">instrument + expiry + rules + leg builder + SuperTrend, all visible — Opstra-style, zero hunting</div><div class="chips"><span class="chip">collapse groups</span><span class="chip">lazy legs</span></div></div>
+    <div class="zone" style="display:grid;grid-template-rows:auto 1fr;gap:6px;border-color:var(--line2);">
+      <div class="zone go" style="border:none;background:rgba(46,204,113,.1);"><div class="zl">C · Split-pane results — KPIs + equity</div></div>
+      <div class="zone" style="border:none;"><div class="zl">trade sheet · MAE/MFE · export</div><div class="chips"><span class="chip">E · inline optimizer panel</span></div></div>
+    </div>
+  </div>
+ </div>
+ <div class="specrow">
+  <div><div class="k">Nav</div><div class="v">Top tabs</div></div><div><div class="k">Config</div><div class="v">Dense single-screen</div></div>
+  <div><div class="k">Results</div><div class="v">Split-pane (live)</div></div><div><div class="k">Run</div><div class="v">Rail CTA</div></div><div><div class="k">Optimizer</div><div class="v">Inline panel</div></div>
+ </div>
+ <div class="bestfor"><b>Best for:</b> power users who run dozens of backtests an hour and want every control + result on one screen.</div>
+ <div class="note">Mirrors Opstra's "professional terminal" density — maximum tools per screen, minimum navigation.</div>
+ <div class="tb"><div>STRYK</div><div>TERMINAL</div><div>A·tabs C·split</div><div><b>06</b></div></div>
+</section>
+
+<!-- 7: COCKPIT -->
+<section class="page">
+ <div class="pg-no">07 / 11</div>
+ <div class="eyebrow">Layout ③ · recommended</div>
+ <h2>Cockpit</h2>
+ <div class="screen" style="grid-template-columns:120px 1.05fr 1fr;grid-template-rows:34px 1fr;margin-top:14px;">
+  <div class="zone act" style="grid-row:1 / span 2;"><div class="zl">A · Rail</div><div class="zd">nav + Run CTA pinned</div><div class="chips"><span class="chip">D · run here</span></div></div>
+  <div class="zone" style="grid-column:2 / span 2;"><div class="zl">Header · instrument · theme · save</div></div>
+  <div class="zone" style="grid-column:2;"><div class="zl">B · Two-column config</div><div class="zd">config + leg builder + SuperTrend, progressive disclosure on advanced</div></div>
+  <div class="zone go" style="grid-column:3;"><div class="zl">C · Persistent split results</div><div class="zd">KPIs + equity update beside config; tabs for trades / MAE-MFE</div><div class="chips"><span class="chip">E · right drawer optimizer</span><span class="chip">export</span></div></div>
+ </div>
+ <div class="specrow">
+  <div><div class="k">Nav</div><div class="v">Left rail + Run</div></div><div><div class="k">Config</div><div class="v">Two-column</div></div>
+  <div><div class="k">Results</div><div class="v">Persistent split</div></div><div><div class="k">Run</div><div class="v">Rail CTA</div></div><div><div class="k">Optimizer</div><div class="v">Right drawer</div></div>
+ </div>
+ <div class="bestfor"><b>Best for:</b> the fastest config → result loop. <b>My pick</b> — keeps Studio's familiarity but puts results permanently beside the controls.</div>
+ <div class="note">"Results beside the decision." The smallest change with the biggest workflow payoff.</div>
+ <div class="tb"><div>STRYK</div><div>COCKPIT</div><div>C·persistent-split</div><div><b>07</b></div></div>
+</section>
+
+<!-- 8: FLOW -->
+<section class="page">
+ <div class="pg-no">08 / 11</div>
+ <div class="eyebrow">Layout ④ · guided</div>
+ <h2>Flow</h2>
+ <div class="screen" style="grid-template-rows:46px 1fr 56px;margin-top:14px;">
+  <div class="zone act"><div class="zl">A · Stepper — Instrument › Expiry › Legs › Risk › Run</div><div class="chips"><span class="chip">1</span><span class="chip">2</span><span class="chip">3</span><span class="chip">4</span><span class="chip">5</span></div></div>
+  <div class="zone" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;border:none;padding:0;">
+    <div class="zone" style="border-color:var(--line2);align-items:center;justify-content:center;"><div class="zl">B · One wizard step at a time</div><div class="zd" style="text-align:center;">focused panel · big targets · inline help · all advanced options still reachable per step</div></div>
+    <div class="zone" style="border-color:var(--line2);"><div class="zl">live preview / contextual help</div></div>
+  </div>
+  <div class="zone go"><div class="zl">D · Inline "Run Backtest" appears on final step → C · full-screen results</div></div>
+ </div>
+ <div class="specrow">
+  <div><div class="k">Nav</div><div class="v">Stepper</div></div><div><div class="k">Config</div><div class="v">Wizard steps</div></div>
+  <div><div class="k">Results</div><div class="v">Full-screen</div></div><div><div class="k">Run</div><div class="v">Inline (end)</div></div><div><div class="k">Optimizer</div><div class="v">Drawer</div></div>
+ </div>
+ <div class="bestfor"><b>Best for:</b> newcomers and onboarding. Sensibull's beginner clarity — never overwhelming, yet nothing removed.</div>
+ <div class="note">Could ship as an optional "Guided mode" toggle alongside Studio — not a replacement.</div>
+ <div class="tb"><div>STRYK</div><div>FLOW</div><div>A·stepper B·wizard</div><div><b>08</b></div></div>
+</section>
+
+<!-- 9: CANVAS -->
+<section class="page">
+ <div class="pg-no">09 / 11</div>
+ <div class="eyebrow">Layout ⑤ · the risk</div>
+ <h2>Canvas</h2>
+ <div class="screen" style="grid-template-columns:1.4fr 0.9fr;grid-template-rows:34px 1fr;margin-top:14px;">
+  <div class="zone" style="grid-column:1 / span 2;"><div class="zl">A · Minimal chrome — only logo, instrument, ⌘K hint</div></div>
+  <div class="zone go" style="position:relative;"><div class="zl">C · Strategy canvas — legs as draggable cards on a payoff backdrop</div><div class="zd">live equity + payoff diagram as the hero; cards snap into place</div>
+    <div style="position:absolute;right:16px;bottom:14px;width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,var(--blue),var(--green));display:flex;align-items:center;justify-content:center;box-shadow:0 6px 22px rgba(56,126,209,.5);" class="mono">▸</div>
+    <div style="position:absolute;right:74px;bottom:24px;font-family:'IBM Plex Mono';font-size:.5rem;color:var(--tm);">D · FAB run</div>
+  </div>
+  <div class="zone act"><div class="zl">B · Inspector drawer</div><div class="zd">click any leg/zone → full config + rules + SuperTrend slide in; advanced + lazy legs nested</div><div class="chips"><span class="chip">E · optimizer drawer</span></div></div>
+ </div>
+ <div class="specrow">
+  <div><div class="k">Nav</div><div class="v">Minimal chrome</div></div><div><div class="k">Config</div><div class="v">Inspector drawer</div></div>
+  <div><div class="k">Results</div><div class="v">Canvas split</div></div><div><div class="k">Run</div><div class="v">FAB</div></div><div><div class="k">Optimizer</div><div class="v">Drawer</div></div>
+ </div>
+ <div class="bestfor"><b>Best for:</b> screenshots, demos, and a memorable identity. The payoff-diagram-as-hero is the signature moment.</div>
+ <div class="note">The bold bet — most distinctive, highest build effort. Reads least like every other backtester.</div>
+ <div class="tb"><div>STRYK</div><div>CANVAS</div><div>B·inspector C·canvas</div><div><b>09</b></div></div>
+</section>
+
+<!-- 10: COMMAND + BRIEFING -->
+<section class="page">
+ <div class="pg-no">10 / 11</div>
+ <div class="eyebrow">Layouts ⑥ & ⑦</div>
+ <h2 style="font-size:1.7rem;">Command &nbsp;·&nbsp; Briefing</h2>
+ <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:14px;">
+  <div>
+   <div class="screen" style="height:300px;grid-template-rows:40px 1fr;">
+    <div class="zone act"><div class="zl">A · ⌘K command palette</div><div class="zd">"run · optimize · load NIFTY straddle · export…"</div></div>
+    <div class="zone" style="border-color:var(--line2);"><div class="zl">B · Accordion config</div><div class="zd">collapsible sections · C · tabbed results · E · dedicated optimizer page</div></div>
+   </div>
+   <div class="bestfor" style="font-size:.74rem;"><b>⑥ Command —</b> keyboard-first power. Everything reachable in two keystrokes.</div>
+  </div>
+  <div>
+   <div class="screen" style="height:300px;grid-template-columns:1fr 1fr;grid-template-rows:30px 1fr;">
+    <div class="zone" style="grid-column:1 / span 2;"><div class="zl">A · Top nav</div></div>
+    <div class="zone go" style="border:none;background:rgba(46,204,113,.08);"><div class="zl">C · Dashboard landing</div><div class="zd">saved strategies + KPI tiles</div></div>
+    <div class="zone act" style="border-style:solid;"><div class="zl">B · Drawer config</div><div class="zd">"New strategy" → slides in · D · FAB</div></div>
+   </div>
+   <div class="bestfor" style="font-size:.74rem;"><b>⑦ Briefing —</b> portfolio-first. Opens on saved strategies & performance, config on demand.</div>
+  </div>
+ </div>
+ <div class="specrow">
+  <div><div class="k">⑥ Command</div><div class="v">⌘K · accordion · tabbed · page</div></div>
+  <div><div class="k">⑦ Briefing</div><div class="v">top nav · drawer · dashboard · modal</div></div>
+  <div><div class="k">Shared</div><div class="v">full feature set · Midnight Teal · theme toggle</div></div>
+ </div>
+ <div class="note" style="margin-top:14px;">Both layer cleanly on top of Studio's components — adopt incrementally without re-architecting.</div>
+ <div class="tb"><div>STRYK</div><div>CMD · BRIEF</div><div>⑥ ⑦</div><div><b>10</b></div></div>
+</section>
+
+<!-- 11: RECOMMENDATION -->
+<section class="page">
+ <div class="pg-no">11 / 11</div>
+ <div class="eyebrow">Recommendation</div>
+ <h2>The minimum set worth shipping</h2>
+ <p class="lead">You don't need all seven. Three coordinates cover every user without touching the engine.</p>
+ <div class="divider"></div>
+ <div class="grid" style="grid-template-columns:1fr 1fr 1fr;">
+  <div class="card" style="border-color:var(--green);"><h3><span class="tag g">SHIP NEXT</span></h3><h3 class="disp" style="font-size:1.3rem;">③ Cockpit</h3><p>Persistent split-pane results beside the existing two-column config. Biggest workflow gain, smallest rebuild — reuses every current component.</p></div>
+  <div class="card" style="border-color:var(--blue);"><h3><span class="tag b">OPTIONAL MODE</span></h3><h3 class="disp" style="font-size:1.3rem;">④ Flow</h3><p>A "Guided mode" toggle for newcomers. Same fields, walked one step at a time. Lives beside Studio, not instead of it.</p></div>
+  <div class="card"><h3><span class="tag b">POWER TOGGLE</span></h3><h3 class="disp" style="font-size:1.3rem;">② Terminal</h3><p>A "Dense view" for pros — everything on one screen. Add later; Cockpit's split already does most of the work.</p></div>
+ </div>
+ <div class="eyebrow" style="margin-top:28px;">Decision in one line</div>
+ <p style="font-size:1.25rem;font-family:'Space Grotesk';font-weight:500;color:var(--tp);margin-top:10px;max-width:960px;line-height:1.4;">Keep <span style="color:var(--blue)">Studio</span> as the home, add <span style="color:var(--green)">Cockpit's</span> live split-pane, and expose <span style="color:var(--blue)">Flow</span> + <span style="color:var(--blue)">Terminal</span> as view toggles — one set of features, three densities, zero logic changed.</p>
+ <div class="bestfor" style="margin-top:24px;">Tell me which layout (or which axis picks) to prototype, and I'll render a full high-fidelity mockup PDF of just that one — then wire it into the live app.</div>
+ <div class="tb"><div>STRYK</div><div>UX-PERM</div><div>RECOMMEND</div><div><b>11</b></div></div>
+</section>
+
+</body></html>

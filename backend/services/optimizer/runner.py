@@ -8,7 +8,9 @@ Responsibilities
 3. Build the in-process fast_lookup ONCE.
 4. Iterate combinations from the chosen sampler; for each combo:
        a. Apply combo overrides to the base payload.
-       b. Run the existing engine (`run_algotest_backtest`).
+       b. Run the Rust engine ONLY (`run_rust_engine_pipeline` via the rust
+          fast path). No Python fallback — a combo Rust can't handle hard-fails
+          and is recorded as a failure (see `_run_single_backtest`).
        c. Recompute analytics (`compute_analytics`) on the trades.
        d. Layer in the extra optimizer metrics (`compute_optim_metrics`).
        e. Persist combo + flattened summary to result_store.
@@ -1400,58 +1402,30 @@ def _run_single_backtest(payload: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[st
     """
     Run engine + analytics for one combo. Assumes market data already loaded.
 
-    Order of attempts:
-      1. Rust direct fast path (uses pre-computed worker context).
-      2. Python engine fallback (for unsupported features).
+    Rust-only — no Python fallback. Runs the Rust direct fast path (uses the
+    pre-computed worker context). If Rust punts (returns None), this RAISES so
+    the caller records the combo as a failure rather than substituting Python
+    results.
 
-    Returns (trades_df, summary). Empty df + empty summary on failure.
+    Returns (trades_df, summary).
     """
     fast = _run_single_backtest_rust_fast(payload)
     if fast is not None:
         return fast
 
-    # Python fallback — original path. Required when the payload uses a
-    # feature the Rust slices don't yet cover (rollover, futures, lazy legs,
-    # buffer strike, etc.).
-    import copy
-    from engines.generic_algotest_engine import run_algotest_backtest
-
-    py_payload = payload
-
-    # entry_dte=0 with WEEKLY/MONTHLY expiry: Python engine skips these trades
-    # because entry_date == exit_date == expiry_day → 0 P&L.  The only valid
-    # real-world interpretation of T-0 is NEXT_WEEKLY/NEXT_MONTHLY (sell the
-    # *next* contract on the current expiry day, hold until the next expiry).
-    # Patch the payload so the Python engine produces the expected result.
-    #
-    # IMPORTANT: Do NOT apply this patch for filter_entry_mode='fixed'. The Python
-    # engine's fixed-entry while-loop already advances target_expiry when
-    # exit_date==entry_date (T-0/T-0 case), so no patch is needed. Worse, patching
-    # to NEXT_WEEKLY changes _rollover_mode = rollover_toggle and _etype in
-    # ('WEEKLY','MONTHLY') → False, silently dropping all same-day re-entry chains.
-    _entry_dte = int(payload.get("entry_dte") or 0)
-    _expiry = str(payload.get("expiry_type") or "WEEKLY").upper()
-    _filter_mode = str(payload.get("filter_entry_mode") or "dte").lower()
-    if _entry_dte == 0 and _expiry in ("WEEKLY", "MONTHLY") and _filter_mode != "fixed":
-        py_payload = copy.deepcopy(payload)
-        py_payload["expiry_type"] = "NEXT_" + _expiry  # WEEKLY→NEXT_WEEKLY, MONTHLY→NEXT_MONTHLY
-
-    try:
-        df, engine_summary, _engine_pivot = run_algotest_backtest(py_payload)
-    except Exception as exc:
-        logger.warning("[OPTIM] engine failed for combo: %s", exc)
-        return pd.DataFrame(), {}
-
-    if df is None or df.empty:
-        return pd.DataFrame(), engine_summary or {}
-
-    # IMPORTANT: do NOT re-run compute_analytics on the per-leg df. The Python
-    # engine puts the trade-aggregated Net P&L on each trade's parent (lowest
-    # leg_id) row and per-leg P&L on others; summing Net P&L across all rows
-    # double-counts. `engine_summary` is the engine's own per-trade-aggregated
-    # summary (line 5300 of generic_algotest_engine.py runs compute_analytics
-    # on `trades_aggregated`, not the per-leg df) — use that as-is.
-    return df, engine_summary or {}
+    # HARD-FAIL — no Python fallback (Rust-only rule). The Rust fast path
+    # returned None, meaning run_rust_engine_pipeline punted this payload
+    # (unsupported feature: premium-based strikes, bare non-rollover
+    # weekly/monthly T-n, futures with SL/Target/re-entry, unsupported
+    # re-entry / lazy-leg modes, or the Rust extension/cache not loaded).
+    # Running the Python engine here would NOT apply the SCHEDULED_EXIT relabel
+    # and could diverge from the verified Rust numbers, so we refuse. The caller
+    # (sequential loop + parallel worker) catches this per-combo and counts it
+    # as a failure.
+    raise RuntimeError(
+        "Rust engine cannot handle this combo and Python fallback is disabled "
+        "(Rust-only). Unsupported feature, or Rust extension/cache not loaded."
+    )
 
 
 def run_optimization(
@@ -1650,7 +1624,21 @@ def run_optimization(
 
             merged = apply_combo_for_optim(base_payload, combo)
             t_combo = time.perf_counter()
-            trades_df, summary = _run_single_backtest(merged)
+            try:
+                trades_df, summary = _run_single_backtest(merged)
+            except Exception as exc:
+                # Rust-only: a combo Rust can't handle hard-fails (no Python
+                # fallback). Record it as a failure and keep going so the rest of
+                # the optimization still completes — matches the parallel path.
+                failures += 1
+                logger.warning(
+                    "[OPTIM] combo %d failed (Rust-only, no Python fallback): %s",
+                    done + 1, exc,
+                )
+                done += 1
+                if done == 1 or done % progress_every == 0 or done == total:
+                    result_store.update_progress(job_id, done=done)
+                continue
             elapsed_ms = round((time.perf_counter() - t_combo) * 1000.0, 2)
 
             optim_extra = compute_optim_metrics(trades_df, summary)

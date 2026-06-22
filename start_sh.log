@@ -1,0 +1,83 @@
+===== start.sh RUN 2026-06-01 09:39:43 =====
+==============================================
+  AlgoTest - Starting All Services
+==============================================
+
+[RUST] Checking native extension wheel...
+  Native code changed — compiling Rust wheel...
+Unable to find image 'ghcr.io/pyo3/maturin:latest' locally
+latest: Pulling from pyo3/maturin
+4f4fb700ef54: Pulling fs layer
+0591fa9211fb: Pulling fs layer
+0119a0574f5a: Pulling fs layer
+c8676dbfcb85: Pulling fs layer
+6831ec89dea1: Pulling fs layer
+1595fca0dff6: Pulling fs layer
+424619691993: Pulling fs layer
+61b97c8fe380: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+affc27b06191: Pulling fs layer
+841321495573: Pulling fs layer
+b664e819699a: Pulling fs layer
+722735ebcc66: Pulling fs layer
+f1506ecccb7a: Pulling fs layer
+10bc77ba0e36: Pulling fs layer
+5e692e201119: Pulling fs layer
+bd189a497cee: Pulling fs layer
+0bb32422efa7: Pulling fs layer
+c9c763983040: Pulling fs layer
+d6216b62d321: Pulling fs layer
+2b33d71237b4: Pulling fs layer
+790e58f5f46a: Pulling fs layer
+f9e8a1e89189: Pulling fs layer
+ab1629d797a6: Pulling fs layer
+285ff37a0ca5: Pulling fs layer
+e9e32b7bd393: Pulling fs layer
+4f4fb700ef54: Download complete
+fd8facd56efa: Download complete
+0591fa9211fb: Download complete
+424619691993: Download complete
+1595fca0dff6: Download complete
+affc27b06191: Download complete
+b664e819699a: Download complete
+0bb32422efa7: Download complete
+790e58f5f46a: Download complete
+2b33d71237b4: Download complete
+5e692e201119: Download complete
+d6216b62d321: Download complete
+c8676dbfcb85: Download complete
+0119a0574f5a: Download complete
+bd189a497cee: Download complete
+722735ebcc66: Download complete
+6831ec89dea1: Download complete
+285ff37a0ca5: Download complete
+61b97c8fe380: Download complete
+10bc77ba0e36: Download complete
+e9e32b7bd393: Download complete
+f9e8a1e89189: Download complete
+841321495573: Download complete
+c9c763983040: Download complete
+affc27b06191: Pull complete
+b664e819699a: Pull complete
+c9c763983040: Pull complete
+4f4fb700ef54: Pull complete
+1595fca0dff6: Pull complete
+2b33d71237b4: Pull complete
+424619691993: Pull complete
+d6216b62d321: Pull complete
+61b97c8fe380: Pull complete
+0591fa9211fb: Pull complete
+0bb32422efa7: Pull complete
+285ff37a0ca5: Pull complete
+c8676dbfcb85: Pull complete
+bd189a497cee: Pull complete
+6831ec89dea1: Pull complete
+e9e32b7bd393: Pull complete
+790e58f5f46a: Pull complete
+0119a0574f5a: Pull complete
+10bc77ba0e36: Pull complete
+722735ebcc66: Pull complete
+841321495573: Pull complete
+f1506ecccb7a: Download complete
+5e692e201119: Pull complete
+f1506ecccb7a: Pull complete

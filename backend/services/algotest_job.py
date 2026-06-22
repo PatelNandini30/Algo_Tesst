@@ -3,14 +3,13 @@ import logging
 import traceback
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 from sqlalchemy.exc import OperationalError
 
-from engines.generic_algotest_engine import run_algotest_backtest, get_expiry_dates
+from engines.generic_algotest_engine import get_expiry_dates
 from base import bulk_load_options, bulk_clear_options
 from database import reset_engine
 from services.backtest_cache import get_backtest_cache
@@ -542,41 +541,6 @@ def _safe_clear_fast_lookup() -> None:
         pass
 
 
-def _run_backtest_chunk(args: tuple) -> list:
-    """Run backtest for a subset of expiry dates. Must be top-level for pickling."""
-    params, chunk_dates = args
-    from base import bulk_load_options, bulk_clear_options
-    from engines.generic_algotest_engine import run_algotest_backtest
-    
-    index = params.get('index', 'NIFTY')
-    from_date = params.get('from_date')
-    to_date = params.get('to_date')
-    chunk_from = min(chunk_dates) if chunk_dates else from_date
-    chunk_to = max(chunk_dates) if chunk_dates else to_date
-    
-    try:
-        bulk_load_options(index, chunk_from, chunk_to)
-        if _should_build_fast_lookup(params, chunk_from, chunk_to):
-            _build_fast_lookup_from_bulk(index, chunk_from, chunk_to)
-        chunk_params = dict(params)
-        chunk_params['from_date'] = chunk_from
-        chunk_params['to_date'] = chunk_to
-        chunk_params['_expiry_chunk'] = chunk_dates
-        df, _, _ = run_algotest_backtest(chunk_params)
-        return df.to_dict('records') if df is not None and not df.empty else []
-    except Exception:
-        return []
-    finally:
-        try:
-            _safe_clear_fast_lookup()
-        except Exception:
-            pass
-        try:
-            bulk_clear_options()
-        except Exception:
-            pass
-
-
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     job_t0 = time.perf_counter()
     payload = _normalize_request(request)
@@ -613,7 +577,6 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     try:
         effective_from = payload.get('_effective_from', from_date)
         effective_to = payload.get('_effective_to', to_date)
-        n_workers = _get_backtest_worker_count()
         expiry_type = payload.get('expiry_type', 'WEEKLY')
 
         logger.debug("[DATE RANGE] User=%s -> %s Effective=%s -> %s", request.get('from_date') or request.get('date_from'), request.get('to_date') or request.get('date_to'), effective_from, effective_to)
@@ -626,74 +589,48 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
 
         all_trades = []
 
-        if n_workers > 1 and expiry_df is not None and not expiry_df.empty and len(expiry_df) >= n_workers * 2:
-            expiry_dates = expiry_df['Current Expiry'].dt.strftime('%Y-%m-%d').tolist()
-            chunk_size = max(1, len(expiry_dates) // n_workers)
-
-            chunks = []
-            for i in range(n_workers):
-                start = i * chunk_size
-                end = start + chunk_size if i < n_workers - 1 else len(expiry_dates)
-                chunks.append((dict(payload), expiry_dates[start:end]))
-
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                results = list(executor.map(_run_backtest_chunk, chunks))
-                for chunk_trades in results:
-                    if chunk_trades:
-                        all_trades.extend(chunk_trades)
+        # Unified Rust engine path — all durations, Rust ONLY (no Python
+        # fallback, no process-chunking). Feather covers 2019-2026 (~275 MB,
+        # already in memory) so no chunking is needed regardless of date range.
+        stage_t = time.perf_counter()
+        bulk_load_options(index, effective_from, effective_to)
+        logger.info("[JOB_PERF] bulk_load_options %.2fs", time.perf_counter() - stage_t)
+        stage_t = time.perf_counter()
+        _build_fast_lookup_from_bulk(index, effective_from, effective_to)
+        logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)
+        stage_t = time.perf_counter()
+        trades_df, engine_summary, engine_pivot = _try_rust_engine(
+            payload, index, effective_from, effective_to
+        )
+        logger.info("[JOB_PERF] rust_engine %.2fs", time.perf_counter() - stage_t)
+        all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
+        if engine_summary is None:
+            engine_summary = {}
+        if engine_pivot is None:
+            engine_pivot = {"headers": [], "rows": []}
+        if all_trades:
             try:
-                bulk_clear_options()
-            except Exception:
-                pass
-            engine_summary = None
-            engine_pivot = None
-            if engine_summary is None:
-                engine_summary = {}
-            if engine_pivot is None:
-                engine_pivot = {"headers": [], "rows": []}
-        else:
-            # Unified Rust engine path — all durations, no Python fallback.
-            # Feather covers 2019-2026 (~275 MB, already in memory) so no
-            # chunking is needed regardless of date range.
-            stage_t = time.perf_counter()
-            bulk_load_options(index, effective_from, effective_to)
-            logger.info("[JOB_PERF] bulk_load_options %.2fs", time.perf_counter() - stage_t)
-            stage_t = time.perf_counter()
-            _build_fast_lookup_from_bulk(index, effective_from, effective_to)
-            logger.info("[JOB_PERF] fast_lookup %.2fs", time.perf_counter() - stage_t)
-            stage_t = time.perf_counter()
-            trades_df, engine_summary, engine_pivot = _try_rust_engine(
-                payload, index, effective_from, effective_to
-            )
-            logger.info("[JOB_PERF] run_algotest_backtest %.2fs", time.perf_counter() - stage_t)
-            all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
-            if engine_summary is None:
-                engine_summary = {}
-            if engine_pivot is None:
-                engine_pivot = {"headers": [], "rows": []}
-            if all_trades:
-                try:
-                    stage_t = time.perf_counter()
-                    from base import compute_analytics, build_pivot
-                    trades_agg = pd.DataFrame(all_trades)
-                    for col in ['Entry Date', 'Exit Date']:
-                        if col in trades_agg.columns:
-                            trades_agg[col] = pd.to_datetime(trades_agg[col], dayfirst=True, errors='coerce')
-                    _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
-                    _saved_agg = {col: trades_agg[col].copy() for col in _cum_cols if col in trades_agg.columns}
-                    trades_agg, result_summary = compute_analytics(trades_agg)
-                    result_pivot = build_pivot(trades_agg, "Exit Date")
-                    for col, saved in _saved_agg.items():
-                        trades_agg[col] = saved
-                    all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
-                    engine_pivot = result_pivot
-                    logger.info("[JOB_PERF] first analytics %.2fs", time.perf_counter() - stage_t)
-                except Exception as e:
-                    logger.warning("[WARN] compute_analytics failed: %s", e)
-            try:
-                bulk_clear_options()
-            except Exception:
-                pass
+                stage_t = time.perf_counter()
+                from base import compute_analytics, build_pivot
+                trades_agg = pd.DataFrame(all_trades)
+                for col in ['Entry Date', 'Exit Date']:
+                    if col in trades_agg.columns:
+                        trades_agg[col] = pd.to_datetime(trades_agg[col], dayfirst=True, errors='coerce')
+                _cum_cols = ['Cumulative', 'Peak', 'DD', '%DD']
+                _saved_agg = {col: trades_agg[col].copy() for col in _cum_cols if col in trades_agg.columns}
+                trades_agg, result_summary = compute_analytics(trades_agg)
+                result_pivot = build_pivot(trades_agg, "Exit Date")
+                for col, saved in _saved_agg.items():
+                    trades_agg[col] = saved
+                all_trades = _convert_numpy(_format_dates(trades_agg.to_dict('records')))
+                engine_pivot = result_pivot
+                logger.info("[JOB_PERF] first analytics %.2fs", time.perf_counter() - stage_t)
+            except Exception as e:
+                logger.warning("[WARN] compute_analytics failed: %s", e)
+        try:
+            bulk_clear_options()
+        except Exception:
+            pass
 
         # Reindex trades so multi-chunk runs produce unique trade numbers
         if all_trades:

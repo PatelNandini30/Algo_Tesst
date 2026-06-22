@@ -1157,13 +1157,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
   // Calculate stats
   const stats = useMemo(() => {
-    const finalCumulative = groupedTrades.length > 0
-      ? (groupedTrades[groupedTrades.length - 1]?.cumulative ?? 100)
-      : 100;
-    const totalPnLPct = finalCumulative - 100;
+    // Total P&L = arithmetic SUM of each trade's % P&L, to match the tradesheet
+    // "Overall Profit" (Excel _sumPctJS = Σ Net P&L / Entry Spot per trade).
+    // Previously this was the compounded final-cumulative NAV (finalCumulative - 100),
+    // which differed from the tradesheet for any mix of wins/losses.
+    const totalPnLPct = groupedTrades.reduce((sum, g) => {
+      const net = Number(g.totalPnl);
+      return sum + (g.entrySpot > 1000 && Number.isFinite(net) ? (net / g.entrySpot) * 100 : 0);
+    }, 0);
     const totalTrades = groupedTrades.length;
 
-    return {
+    const out = {
       totalPnLPct,
       totalTrades,
       winRate: summary.win_pct || 0,
@@ -1190,7 +1194,85 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       mddTradeNumber: summary.mdd_trade_number || null,
       cagrSpot: summary.cagr_spot || 0,
     };
-  }, [summary, groupedTrades]);
+
+    // ── Midcap: the backend `summary` is NIFTY/base-only, but the tradesheet
+    //    aggregates COMBINED (base + Midcap overlay). Recompute the displayed
+    //    stats on the combined per-trade data so the UI matches the tradesheet
+    //    (default Overall export). Mirrors the Excel formulas exactly. UI-only.
+    if (results?.midcap?.available) {
+      const byTrade = results.midcap.byTrade || {};
+      const mcs = results.midcap.summary || {};
+      const parseD = (s) => {
+        if (typeof s !== 'string' || !s) return null;
+        const p = s.includes('/') ? s.split('/') : s.split('-');
+        if (p.length !== 3) return null;
+        let y, m, d;
+        if (p[0].length === 4) { y = +p[0]; m = +p[1] - 1; d = +p[2]; }
+        else { d = +p[0]; m = +p[1] - 1; y = +p[2]; }
+        const t = Date.UTC(y, m, d);
+        return Number.isFinite(t) ? t : null;
+      };
+      let sumPos = 0, sumNeg = 0, winCnt = 0, lossCnt = 0, cnt = 0;
+      let maxNet = -Infinity, minNet = Infinity;
+      let winRun = 0, lossRun = 0, maxWinStk = 0, maxLossStk = 0;
+      // Combined equity NAV is COMPOUNDED from the per-trade combined % (the tradesheet
+      // computes it the same way: nav *= 1 + cpct/100). It is NOT a field on byTrade,
+      // so we build it here to drive Max DD and CAGR.
+      let nav = 100, peak = 100, worstDD = 0, finalCum = 100;
+      let peakMs = null, worstPeakMs = null, worstTroughMs = null;
+      let minEntry = null, maxExit = null;
+      for (const g of groupedTrades) {
+        const mc = byTrade[g.groupKey];
+        if (!mc) continue;
+        const pct = Number(mc['Combined Net P&L %']);
+        const net = Number(mc['Combined Net P&L']);
+        const eD = parseD(g.entryDate); const xD = parseD(g.exitDate);
+        if (Number.isFinite(pct)) {
+          cnt++;
+          if (pct > 0) { sumPos += pct; winCnt++; winRun++; lossRun = 0; if (winRun > maxWinStk) maxWinStk = winRun; }
+          else if (pct < 0) { sumNeg += pct; lossCnt++; lossRun++; winRun = 0; if (lossRun > maxLossStk) maxLossStk = lossRun; }
+          nav = nav * (1 + pct / 100);
+          finalCum = nav;
+          if (nav >= peak) { peak = nav; peakMs = xD; }
+          else {
+            const dd = peak !== 0 ? (nav / peak - 1) * 100 : 0;
+            if (dd < worstDD) { worstDD = dd; worstPeakMs = peakMs; worstTroughMs = xD; }
+          }
+        }
+        if (Number.isFinite(net)) { if (net > maxNet) maxNet = net; if (net < minNet) minNet = net; }
+        if (eD != null && (minEntry == null || eD < minEntry)) minEntry = eD;
+        if (xD != null && (maxExit == null || xD > maxExit)) maxExit = xD;
+      }
+      const mddDuration = (worstPeakMs != null && worstTroughMs != null)
+        ? Math.round((worstTroughMs - worstPeakMs) / 86400000) : 0;
+      if (!Number.isFinite(maxNet)) maxNet = 0;
+      if (!Number.isFinite(minNet)) minNet = 0;
+      const winRate = cnt > 0 ? (winCnt / cnt) * 100 : 0;
+      const avgWin = winCnt > 0 ? sumPos / winCnt : 0;
+      const avgLoss = lossCnt > 0 ? sumNeg / lossCnt : 0;
+      const years = (minEntry != null && maxExit != null) ? (maxExit - minEntry) / (365.25 * 86400000) : 0;
+      const cagr = years > 0 && finalCum > 0 ? (Math.pow(finalCum / 100, 1 / years) - 1) * 100 : 0;
+      const combinedTotal = Number(mcs.combined_pnl_pct_sum);
+
+      out.totalPnLPct = Number.isFinite(combinedTotal) ? combinedTotal : (sumPos + sumNeg);
+      out.winRate = winRate;
+      out.lossPct = cnt > 0 ? (lossCnt / cnt) * 100 : 0;
+      out.cagr = cagr;
+      out.maxDDPct = worstDD;
+      out.avgWinPct = avgWin;
+      out.avgLossPct = avgLoss;
+      out.maxWin = maxNet;
+      out.maxLoss = minNet;
+      out.expectancy = avgLoss !== 0
+        ? ((winRate / 100) * avgWin / Math.abs(avgLoss) - (1 - winRate / 100))
+        : 0;
+      out.maxWinStreak = maxWinStk;
+      out.maxLossStreak = maxLossStk;
+      out.mddDuration = mddDuration;
+    }
+
+    return out;
+  }, [summary, groupedTrades, results]);
 
 
   // Export Excel — Sheet 1: Trades, Sheet 2: Formatted Summary
@@ -2900,7 +2982,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               ))}
             </div>
           )}
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 p-6" style={{ background: 'var(--bg-base)' }}>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 px-6 pt-2 pb-6" style={{ background: 'var(--bg-elevated)' }}>
             <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">
               <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-1">Total P&L</p>
               <p className={`text-2xl font-bold ${stats.totalPnLPct >= 0 ? 'text-profit' : 'text-loss'}`}>
@@ -3192,8 +3274,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 </div>
                 
                 <div className="border-b border-default pb-2">
-                  <p className="font-bold text-primary mb-0.5">Return/MaxDD</p>
-                  <p className="font-normal text-primary">{stats.recoveryFactor.toFixed(2)}</p>
+                  <p className="font-bold text-primary mb-0.5">CAR/MDD</p>
+                  <p className="font-normal text-primary">{(Math.abs(stats.maxDDPct) > 0 ? (stats.cagr / 100) / Math.abs(stats.maxDDPct) : 0).toFixed(4)}</p>
                 </div>
                 
                 <div className="border-b border-default pb-2">
@@ -3232,10 +3314,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 </div>
               </div>
               <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
+                <table className="min-w-full text-sm stryk-report-table">
                   <thead>
                     <tr className="bg-base border-b-2 border-strong">
-                      <th className="px-3 py-3 text-left text-xs font-bold text-primary">Index</th>
+                      <th className="px-3 py-3 text-center text-xs font-bold text-primary">Index</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Entry Date</th>
                       <th className="px-3 py-3 text-left text-xs font-bold text-primary">Exit Date</th>
                       <th className="px-3 py-3 text-right text-xs font-bold text-primary">Entry Spot</th>
@@ -3292,7 +3374,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
                             return (
                               <tr key={`${group.tradeNumber}-${rowIdx}`} className={`border-b border-default ${rowBg}`}>
-                                <td className="px-3 py-2 text-xs text-primary">{leg['Index'] || group.tradeNumber}</td>
+                                <td className="px-3 py-2 text-xs text-center text-primary">{((currentPage - 1) * itemsPerPage) + groupIdx + 1}</td>
                                 <td className="px-3 py-2 text-xs text-primary">{leg['Entry Date'] || group.entryDate || '-'}</td>
                                 <td className="px-3 py-2 text-xs text-primary">{exitDateValue}</td>
                                 <td className="px-3 py-2 text-xs text-right text-primary">{Number.isFinite(parseFloat(leg['Entry Spot'])) ? parseFloat(leg['Entry Spot']).toFixed(2) : (group.entrySpot || 0).toFixed(2)}</td>
@@ -3358,7 +3440,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                               <tr key={`${group.tradeNumber}-${legIdx}`} className={legIdx % 2 === 0 ? 'border-b border-default' : 'border-b border-default bg-elevated'}>
                                 {isFirstLeg ? (
                                   <>
-                                    <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.legs[0]['Index'] || group.tradeNumber}</td>
+                                    <td className="px-3 py-2 text-xs text-center text-primary" rowSpan={group.legs.length}>{((currentPage - 1) * itemsPerPage) + groupIdx + 1}</td>
                                     <td className="px-3 py-2 text-xs text-primary" rowSpan={group.legs.length}>{group.entryDate || '-'}</td>
                                   </>
                                 ) : null}

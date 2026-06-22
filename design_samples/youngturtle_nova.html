@@ -1,0 +1,280 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><title>Young Turtle — NOVA Design Sample</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+:root{
+  --base:#06070d;--surface:#0d0f1a;--elevated:#151829;--hover:#1c2036;
+  --border:#242a40;--strong:#38415f;
+  --tp:#e7eaf6;--ts:#8b90b5;--tm:#4a4f70;--inv:#06070d;--on:#ffffff;
+  --accent:#7c5cff;--a2:#22d3ee;--a3:#a78bfa;--argb:124,92,255;--a2rgb:34,211,238;
+  --profit:#2ee6a8;--loss:#ff5d7a;--prgb:46,230,168;--lrgb:255,93,122;
+  --sh:0,0,0,0.45;--r:13px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+@page{size:1280px 900px;margin:0;}
+html,body{background:var(--base);color:var(--tp);font-family:'Outfit',system-ui,sans-serif;-webkit-font-smoothing:antialiased;letter-spacing:-.008em;}
+.mono{font-family:'IBM Plex Mono',monospace;}
+.page{width:1280px;height:900px;position:relative;overflow:hidden;page-break-after:always;
+ background:radial-gradient(ellipse 90% 60% at 12% -8%, rgba(var(--argb),.12) 0%, transparent 55%),
+ radial-gradient(ellipse 70% 55% at 92% 110%, rgba(var(--a2rgb),.08) 0%, transparent 55%),var(--base);}
+.page:last-child{page-break-after:auto;}
+/* logo */
+.shell{filter:drop-shadow(0 0 10px rgba(var(--argb),.6));}
+.wordmark{font-weight:800;letter-spacing:.14em;
+ background:linear-gradient(90deg,var(--a3),var(--accent) 50%,var(--a2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.cover{display:flex;flex-direction:column;justify-content:center;padding:0 110px;height:100%;}
+.cover .tag{color:var(--a2);font-size:.86rem;letter-spacing:.34em;text-transform:uppercase;margin:36px 0 6px;}
+.cover h1{font-size:4.6rem;font-weight:800;letter-spacing:.12em;line-height:1;
+ background:linear-gradient(100deg,var(--a3),var(--accent) 50%,var(--a2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.cover .sub{color:var(--tp);font-size:1.3rem;font-weight:300;margin-top:18px;max-width:720px;}
+.cover .sub b{color:var(--a2);font-weight:600;}
+.swatches{display:flex;gap:14px;margin-top:50px;}
+.sw{width:116px;}.sw .chip{height:60px;border-radius:12px;border:1px solid var(--border);box-shadow:0 6px 22px rgba(var(--sh));}
+.sw .nm{font-size:.6rem;color:var(--ts);margin-top:8px;letter-spacing:.04em;text-transform:uppercase;}.sw .hx{font-size:.64rem;color:var(--tm);}
+.specimen{position:absolute;right:90px;bottom:64px;text-align:right;}
+.specimen .big{font-size:3.7rem;font-weight:800;letter-spacing:.02em;}
+.specimen .lbl{color:var(--ts);font-size:.66rem;letter-spacing:.18em;text-transform:uppercase;margin-top:6px;}
+.shell-bg{position:absolute;right:-120px;top:-80px;opacity:.06;}
+/* shell + app */
+.layout{display:grid;grid-template-columns:232px 1fr;height:100%;}
+.side{background:rgba(var(--argb),.04);border-right:1px solid var(--border);padding:18px 14px;display:flex;flex-direction:column;gap:5px;}
+.side .brand{display:flex;align-items:center;gap:11px;padding:4px 6px 20px;}
+.side .brand .wordmark{font-size:.92rem;}
+.nav{display:flex;align-items:center;gap:11px;padding:11px 13px;border-radius:9px;color:var(--ts);font-weight:600;font-size:.85rem;}
+.nav .ic{width:15px;height:15px;border-radius:5px;border:1.8px solid currentColor;opacity:.85;}
+.nav.active{color:#fff;background:linear-gradient(135deg,var(--accent),var(--a2));box-shadow:0 4px 18px rgba(var(--argb),.45);}
+.nav.active .ic{border-color:#fff;background:rgba(255,255,255,.2);}
+.side .foot{margin-top:auto;font-size:.6rem;color:var(--tm);padding:8px;line-height:1.7;}
+.main{display:flex;flex-direction:column;height:100%;overflow:hidden;}
+.topbar{height:60px;border-bottom:1px solid var(--border);background:rgba(var(--argb),.03);backdrop-filter:blur(20px);display:flex;align-items:center;justify-content:space-between;padding:0 26px;}
+.instruments{display:flex;gap:6px;}.ipill{font-weight:700;font-size:.78rem;color:var(--ts);padding:6px 12px;border-radius:7px;}
+.ipill.on{color:var(--a2);background:rgba(var(--a2rgb),.12);box-shadow:inset 0 0 0 1px rgba(var(--a2rgb),.3);}
+.topright{display:flex;align-items:center;gap:14px;font-size:.72rem;color:var(--ts);}
+.tbtn{padding:7px 13px;border:1px solid var(--border);border-radius:8px;color:var(--ts);font-size:.62rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;background:var(--elevated);}
+.content{padding:24px 26px;display:grid;grid-template-columns:1fr 360px;gap:20px;overflow:hidden;}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:0 2px 16px rgba(var(--sh));}
+.sec{font-size:.65rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--ts);border-left:2.5px solid var(--accent);padding-left:9px;margin-bottom:14px;}
+.fl{font-size:.65rem;font-weight:600;color:var(--ts);margin-bottom:5px;display:block;letter-spacing:.02em;}
+.inp{background:var(--base);border:1px solid var(--border);border-radius:8px;height:36px;display:flex;align-items:center;padding:0 11px;font-size:.78rem;color:var(--tp);}
+.inp.focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(var(--argb),.2);}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:13px;}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px;}
+.seg{display:inline-flex;gap:3px;padding:3px;background:var(--elevated);border:1px solid var(--border);border-radius:9px;}
+.seg b{padding:6px 15px;border-radius:6px;font-size:.7rem;font-weight:700;color:var(--ts);}
+.seg b.on{color:#fff;background:linear-gradient(135deg,var(--accent),var(--a2));box-shadow:0 0 14px rgba(var(--argb),.35);}
+.leg{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:14px;margin-bottom:11px;box-shadow:0 2px 14px rgba(var(--sh));}
+.legtop{display:flex;align-items:center;gap:9px;margin-bottom:12px;}
+.badge{width:21px;height:21px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--a2));color:#fff;font-family:'IBM Plex Mono';font-size:.62rem;font-weight:600;display:flex;align-items:center;justify-content:center;box-shadow:0 0 10px rgba(var(--argb),.5);}
+.pill{font-size:.6rem;font-weight:700;padding:3px 9px;border-radius:5px;letter-spacing:.04em;}
+.pill.sell{background:rgba(var(--lrgb),.12);color:var(--loss);border:1px solid rgba(var(--lrgb),.26);}
+.pill.acc{background:rgba(var(--argb),.14);color:var(--a3);border:1px solid rgba(var(--argb),.3);}
+.pill.pe{background:rgba(var(--a2rgb),.12);color:var(--a2);border:1px solid rgba(var(--a2rgb),.3);}
+.runbtn{height:46px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--a2));color:#fff;font-weight:800;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 24px rgba(var(--argb),.4);}
+.optbtn{height:46px;border-radius:10px;border:1px solid var(--strong);color:var(--a3);background:var(--elevated);font-weight:700;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:8px;}
+.dash{padding:24px 26px;overflow:hidden;}
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:20px;}
+.kpi{background:var(--surface);border:1px solid var(--border);border-top:3px solid var(--accent);border-radius:11px;padding:15px 16px;box-shadow:0 2px 14px rgba(var(--sh));}
+.kpi.g{border-top-color:var(--profit);}.kpi.r{border-top-color:var(--loss);}.kpi.c{border-top-color:var(--a2);}
+.kpi .l{font-size:.55rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--tm);margin-bottom:7px;}
+.kpi .v{font-family:'IBM Plex Mono';font-size:1.5rem;font-weight:600;letter-spacing:-.03em;}
+.row{display:grid;grid-template-columns:1fr 420px;gap:18px;}
+.chartcard{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px 20px;box-shadow:0 2px 16px rgba(var(--sh));}
+.ctitle{font-size:.63rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--ts);margin-bottom:14px;}
+table{width:100%;border-collapse:collapse;}
+.tt thead th{font-size:.55rem;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--tm);background:var(--elevated);padding:9px 10px;text-align:left;border-bottom:1px solid var(--border);}
+.tt tbody td{font-family:'IBM Plex Mono';font-size:.7rem;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--tp);}
+.eb{font-family:'IBM Plex Mono';font-size:.54rem;font-weight:600;letter-spacing:.04em;padding:2px 6px;border-radius:4px;border:1px solid;}
+.eb.t{color:var(--profit);border-color:rgba(var(--prgb),.4);background:rgba(var(--prgb),.08);}
+.eb.s{color:var(--loss);border-color:rgba(var(--lrgb),.4);background:rgba(var(--lrgb),.08);}
+.eb.e{color:var(--a2);border-color:rgba(var(--a2rgb),.4);background:rgba(var(--a2rgb),.08);}
+.mq{display:grid;grid-template-columns:repeat(13,1fr);gap:4px;margin-top:4px;}
+.mq div{height:26px;border-radius:4px;font-family:'IBM Plex Mono';font-size:.5rem;display:flex;align-items:center;justify-content:center;color:var(--tp);}
+.modalpage{display:flex;align-items:center;justify-content:center;height:100%;}
+.modal{width:1040px;background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:0 0 0 1px rgba(var(--argb),.1),0 30px 80px rgba(var(--sh));overflow:hidden;}
+.mhead{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
+.mhead h2{font-size:1.15rem;font-weight:800;letter-spacing:-.02em;}
+.mbody{display:grid;grid-template-columns:300px 1fr;}
+.tree{border-right:1px solid var(--border);padding:18px;}
+.tnode{display:flex;align-items:center;gap:9px;padding:8px 6px;font-size:.78rem;color:var(--tp);}
+.chk{width:15px;height:15px;border-radius:4px;border:1.6px solid var(--strong);}
+.chk.on{background:linear-gradient(135deg,var(--accent),var(--a2));border-color:var(--accent);box-shadow:0 0 8px rgba(var(--argb),.5);}
+.sub2{padding-left:22px;color:var(--ts);font-size:.72rem;}
+.optbody{padding:18px 22px;}.h{color:var(--a2);}
+.plan{display:flex;gap:12px;margin:16px 0;}
+.planbox{flex:1;background:var(--elevated);border:1px solid var(--border);border-radius:10px;padding:13px;}
+.planbox .l{font-size:.55rem;letter-spacing:.08em;text-transform:uppercase;color:var(--tm);}
+.planbox .v{font-family:'IBM Plex Mono';font-size:1.2rem;color:var(--a3);margin-top:5px;}
+.caption{position:absolute;top:22px;right:30px;font-size:.6rem;letter-spacing:.22em;text-transform:uppercase;color:var(--tm);}
+.dz{border:1.6px dashed var(--strong);border-radius:12px;padding:30px;text-align:center;color:var(--ts);background:rgba(var(--argb),.04);}
+.dz .big{font-size:1rem;font-weight:700;color:var(--tp);margin-top:10px;}
+.toggle{width:38px;height:21px;border-radius:11px;position:relative;}
+.toggle.on{background:linear-gradient(135deg,var(--accent),var(--a2));box-shadow:0 0 12px rgba(var(--argb),.5);}
+.toggle.off{background:var(--strong);}
+.toggle i{width:17px;height:17px;border-radius:50%;background:#fff;position:absolute;top:2px;}
+.toggle.on i{right:2px;}.toggle.off i{left:2px;}
+.uprow{display:flex;align-items:center;justify-content:space-between;padding:11px 13px;border:1px solid var(--border);border-radius:9px;margin-bottom:9px;background:var(--surface);}
+.dot{width:8px;height:8px;border-radius:50%;}
+</style></head><body>
+
+<!-- shared defs for logo gradient/glow -->
+<svg width="0" height="0" style="position:absolute"><defs>
+ <linearGradient id="ytg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#a78bfa"/><stop offset="50%" stop-color="#7c5cff"/><stop offset="100%" stop-color="#22d3ee"/></linearGradient>
+</defs></svg>
+
+<!-- reusable STRYK lightning-strike logo via symbol -->
+<svg width="0" height="0" style="position:absolute"><symbol id="turtle" viewBox="0 0 48 48">
+ <!-- hex frame for structure -->
+ <path d="M24 4 L40 13 L40 35 L24 44 L8 35 L8 13 Z" fill="none" stroke="url(#ytg)" stroke-width="2" stroke-linejoin="round" opacity="0.45"/>
+ <!-- strike bolt -->
+ <path d="M27 9 L15 26 L22.5 26 L20 39 L33 21 L25 21 Z" fill="url(#ytg)" stroke="url(#ytg)" stroke-width="1.4" stroke-linejoin="round"/>
+</symbol></svg>
+
+<!-- PAGE 1 — COVER -->
+<section class="page"><div class="caption">STRYK · NOVA · 01</div>
+<svg class="shell-bg" width="640" height="640"><use href="#turtle" width="640" height="640"/></svg>
+<div class="cover">
+ <div style="display:flex;align-items:center;gap:20px;">
+  <svg class="shell" width="72" height="72"><use href="#turtle" width="72" height="72"/></svg>
+  <div><div class="wordmark" style="font-size:2.1rem;line-height:1;">STRYK</div>
+   <div style="color:var(--ts);font-size:.74rem;letter-spacing:.28em;text-transform:uppercase;margin-top:5px;">by Young Turtle</div></div></div>
+ <div class="tag">Every Strike, Backtested</div>
+ <h1>STRYK</h1>
+ <div class="sub">An <b>aurora neo-dark</b> options backtesting terminal — precision strikes on every trade. Glowing data, terminal-grade numerics, built for the desk.</div>
+ <div class="swatches">
+  <div class="sw"><div class="chip" style="background:#06070d"></div><div class="nm">Canvas</div><div class="hx mono">#06070D</div></div>
+  <div class="sw"><div class="chip" style="background:#0d0f1a"></div><div class="nm">Surface</div><div class="hx mono">#0D0F1A</div></div>
+  <div class="sw"><div class="chip" style="background:#7c5cff"></div><div class="nm">Violet</div><div class="hx mono">#7C5CFF</div></div>
+  <div class="sw"><div class="chip" style="background:#22d3ee"></div><div class="nm">Cyan</div><div class="hx mono">#22D3EE</div></div>
+  <div class="sw"><div class="chip" style="background:#2ee6a8"></div><div class="nm">Profit</div><div class="hx mono">#2EE6A8</div></div>
+  <div class="sw"><div class="chip" style="background:#ff5d7a"></div><div class="nm">Loss</div><div class="hx mono">#FF5D7A</div></div>
+ </div>
+</div>
+<div class="specimen"><div class="big mono" style="color:var(--a2);">18.42%</div><div class="lbl">IBM Plex Mono · numerics</div>
+ <div class="big" style="font-size:2.1rem;margin-top:20px;">Outfit Aa</div><div class="lbl">Outfit · interface</div></div>
+</section>
+
+<!-- PAGE 2 — STRATEGY BUILDER -->
+<section class="page"><div class="caption">Strategy Builder · 02</div>
+<div class="layout"><aside class="side">
+ <div class="brand"><svg width="30" height="30"><use href="#turtle" width="30" height="30"/></svg><div><div class="wordmark" style="line-height:1;">STRYK</div><div style="color:var(--tm);font-size:.5rem;letter-spacing:.16em;text-transform:uppercase;margin-top:2px;">by Young Turtle</div></div></div>
+ <div class="nav active"><div class="ic"></div>Build</div><div class="nav"><div class="ic"></div>Results</div>
+ <div class="nav"><div class="ic"></div>Optimize</div><div class="nav"><div class="ic"></div>Data</div>
+ <div class="foot">STRYK Terminal<br/>NOVA · aurora neo-dark</div></aside>
+<div class="main"><div class="topbar">
+ <div class="instruments"><div class="ipill on">NIFTY</div><div class="ipill">BANKNIFTY</div><div class="ipill">SENSEX</div><div class="ipill">MIDCPNIFTY</div></div>
+ <div class="topright"><span class="mono" style="color:var(--a2);font-weight:700;">NIFTY · 2 legs</span><div class="tbtn">◐ Dark</div><div class="tbtn">Save</div></div></div>
+<div class="content"><div>
+ <div class="card" style="padding:20px;margin-bottom:18px;"><div class="sec">Strategy Configuration</div>
+  <div class="grid3" style="margin-bottom:14px;"><div><span class="fl">Underlying</span><div class="inp">Cash ▾</div></div>
+   <div><span class="fl">Strategy Type</span><div class="inp">Positional ▾</div></div><div><span class="fl">Expiry Basis</span><div class="inp">Weekly ▾</div></div></div>
+  <div class="grid2"><div><span class="fl">Start Date</span><div class="inp focus">01 / 01 / 2023</div></div><div><span class="fl">End Date</span><div class="inp">19 / 06 / 2026</div></div></div></div>
+ <div class="sec" style="margin-bottom:12px;">Legs</div>
+ <div class="leg"><div class="legtop"><div class="badge">1</div><span class="pill sell">SELL</span><span class="pill acc">CE · ATM</span>
+  <span style="margin-left:auto;color:var(--tm);font-size:.68rem;" class="mono">SL 30% · Tgt 50%</span></div>
+  <div class="grid3"><div><span class="fl">Lots</span><div class="inp">1</div></div><div><span class="fl">Strike</span><div class="inp">ATM</div></div><div><span class="fl">Stop Loss</span><div class="inp">30%</div></div></div></div>
+ <div class="leg"><div class="legtop"><div class="badge">2</div><span class="pill sell">SELL</span><span class="pill pe">PE · ATM</span>
+  <span style="margin-left:auto;color:var(--tm);font-size:.68rem;" class="mono">SL 30% · Tgt 50%</span></div>
+  <div class="grid3"><div><span class="fl">Lots</span><div class="inp">1</div></div><div><span class="fl">Strike</span><div class="inp">ATM</div></div><div><span class="fl">Stop Loss</span><div class="inp">30%</div></div></div></div>
+</div><div>
+ <div class="card" style="padding:18px;margin-bottom:16px;"><div class="sec">Risk &amp; Exits</div>
+  <span class="fl">Square-off</span><div class="seg" style="margin-bottom:14px;"><b class="on">EOD</b><b>Intraday</b></div>
+  <span class="fl">Re-entry</span><div class="seg"><b>Off</b><b class="on">ASAP</b><b>Reverse</b></div>
+  <div style="margin-top:16px;display:flex;justify-content:space-between;align-items:center;"><span class="fl" style="margin:0;">Spot Adjustment</span><div class="toggle on"><i></i></div></div></div>
+ <div class="runbtn">▸ Run Backtest</div><div style="height:12px;"></div><div class="optbtn">⊞ Optimize</div>
+</div></div></div></div></section>
+
+<!-- PAGE 3 — RESULTS DASHBOARD -->
+<section class="page"><div class="caption">Results Dashboard · 03</div>
+<div class="dash"><div style="display:flex;align-items:baseline;gap:14px;margin-bottom:20px;">
+ <div style="font-size:1.5rem;font-weight:800;letter-spacing:-.02em;">Backtest Results</div>
+ <div style="color:var(--ts);font-size:.78rem;">NIFTY Short Straddle · 01 Jan 2023 → 19 Jun 2026 · 412 trades</div>
+ <div style="margin-left:auto;" class="tbtn">⤓ Export XLSX</div></div>
+<div class="kpis">
+ <div class="kpi g"><div class="l">CAGR</div><div class="v" style="color:var(--profit)">18.42%</div></div>
+ <div class="kpi r"><div class="l">Max Drawdown</div><div class="v" style="color:var(--loss)">-9.21%</div></div>
+ <div class="kpi"><div class="l">Win Rate</div><div class="v">61.4%</div></div>
+ <div class="kpi c"><div class="l">Sharpe</div><div class="v" style="color:var(--a2)">1.94</div></div>
+ <div class="kpi g"><div class="l">Total P&amp;L</div><div class="v" style="color:var(--profit)">₹4.82L</div></div>
+ <div class="kpi"><div class="l">Profit Factor</div><div class="v">2.31</div></div></div>
+<div class="row"><div class="chartcard"><div class="ctitle">Equity Curve</div>
+ <svg width="100%" height="220" viewBox="0 0 760 220" preserveAspectRatio="none">
+  <defs><linearGradient id="eq" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#7c5cff" stop-opacity=".45"/><stop offset="100%" stop-color="#7c5cff" stop-opacity="0"/></linearGradient>
+  <linearGradient id="ln" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#7c5cff"/><stop offset="100%" stop-color="#22d3ee"/></linearGradient>
+  <filter id="glow"><feGaussianBlur stdDeviation="3.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+  <line x1="0" y1="55" x2="760" y2="55" stroke="#242a40"/><line x1="0" y1="110" x2="760" y2="110" stroke="#242a40"/><line x1="0" y1="165" x2="760" y2="165" stroke="#242a40"/>
+  <path d="M0,195 L70,178 L140,182 L210,150 L280,158 L350,120 L420,128 L490,86 L560,96 L630,58 L700,40 L760,28 L760,220 L0,220 Z" fill="url(#eq)"/>
+  <path d="M0,195 L70,178 L140,182 L210,150 L280,158 L350,120 L420,128 L490,86 L560,96 L630,58 L700,40 L760,28" fill="none" stroke="url(#ln)" stroke-width="2.6" filter="url(#glow)"/></svg>
+ <div class="ctitle" style="margin-top:18px;">Monthly Returns (%)</div>
+ <div class="mq"><div style="background:rgba(var(--prgb),.14)"></div>
+  <div style="background:rgba(var(--prgb),.4)">3.1</div><div style="background:rgba(var(--lrgb),.3)">-1.2</div>
+  <div style="background:rgba(var(--prgb),.5)">4.2</div><div style="background:rgba(var(--prgb),.25)">1.8</div>
+  <div style="background:rgba(var(--prgb),.55)">5.0</div><div style="background:rgba(var(--lrgb),.4)">-2.1</div>
+  <div style="background:rgba(var(--prgb),.3)">2.2</div><div style="background:rgba(var(--prgb),.45)">3.6</div>
+  <div style="background:rgba(var(--prgb),.2)">1.1</div><div style="background:rgba(var(--lrgb),.25)">-0.8</div>
+  <div style="background:rgba(var(--prgb),.5)">4.4</div><div style="background:linear-gradient(135deg,var(--accent),var(--a2));color:#fff;font-weight:600">YTD</div></div></div>
+<div class="chartcard" style="padding:0;overflow:hidden;"><div class="ctitle" style="padding:18px 18px 12px;">Recent Trades</div>
+ <table class="tt"><thead><tr><th>Date</th><th>Leg</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>Reason</th></tr></thead><tbody>
+  <tr><td>14 Jun</td><td>CE</td><td>182.4</td><td>96.2</td><td style="color:var(--profit)">+86.2</td><td><span class="eb t">TGT</span></td></tr>
+  <tr><td>14 Jun</td><td>PE</td><td>171.0</td><td>118.5</td><td style="color:var(--profit)">+52.5</td><td><span class="eb e">EOD</span></td></tr>
+  <tr><td>07 Jun</td><td>CE</td><td>164.2</td><td>213.5</td><td style="color:var(--loss)">-49.3</td><td><span class="eb s">SL</span></td></tr>
+  <tr><td>07 Jun</td><td>PE</td><td>158.8</td><td>74.1</td><td style="color:var(--profit)">+84.7</td><td><span class="eb t">TGT</span></td></tr>
+  <tr><td>31 May</td><td>CE</td><td>190.5</td><td>142.0</td><td style="color:var(--profit)">+48.5</td><td><span class="eb e">EOD</span></td></tr>
+  <tr><td>31 May</td><td>PE</td><td>176.2</td><td>228.9</td><td style="color:var(--loss)">-52.7</td><td><span class="eb s">SL</span></td></tr>
+  <tr><td>24 May</td><td>CE</td><td>168.0</td><td>88.4</td><td style="color:var(--profit)">+79.6</td><td><span class="eb t">TGT</span></td></tr>
+ </tbody></table></div></div></div></section>
+
+<!-- PAGE 4 — INTRADAY & DATA -->
+<section class="page"><div class="caption">Intraday &amp; Data · 04</div>
+<div class="layout"><aside class="side">
+ <div class="brand"><svg width="30" height="30"><use href="#turtle" width="30" height="30"/></svg><div><div class="wordmark" style="line-height:1;">STRYK</div><div style="color:var(--tm);font-size:.5rem;letter-spacing:.16em;text-transform:uppercase;margin-top:2px;">by Young Turtle</div></div></div>
+ <div class="nav"><div class="ic"></div>Build</div><div class="nav"><div class="ic"></div>Results</div>
+ <div class="nav"><div class="ic"></div>Optimize</div><div class="nav active"><div class="ic"></div>Data</div>
+ <div class="foot">STRYK Terminal<br/>NOVA · aurora neo-dark</div></aside>
+<div class="main"><div class="topbar">
+ <div class="instruments"><div class="ipill on">NIFTY</div><div class="ipill">BANKNIFTY</div><div class="ipill">SENSEX</div><div class="ipill">MIDCPNIFTY</div></div>
+ <div class="topright"><span class="mono" style="color:var(--a2);font-weight:700;">Intraday mode</span><div class="tbtn">◐ Dark</div></div></div>
+<div class="content" style="grid-template-columns:1fr 1fr;">
+ <div>
+  <div class="card" style="padding:20px;margin-bottom:18px;"><div class="sec">Intraday Window</div>
+   <div class="grid2" style="margin-bottom:13px;"><div><span class="fl">Entry Time</span><div class="inp focus">09 : 20</div></div><div><span class="fl">Square-off</span><div class="inp">15 : 15</div></div></div>
+   <div class="grid2"><div><span class="fl">Per-leg Stop Loss</span><div class="inp">30 %</div></div><div><span class="fl">Per-leg Target</span><div class="inp">50 %</div></div></div></div>
+  <div class="card" style="padding:20px;"><div class="sec">SuperTrend Filter</div>
+   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;"><span class="fl" style="margin:0;">Enable STR filter</span><div class="toggle on"><i></i></div></div>
+   <span class="fl">Preset</span><div class="seg" style="margin-bottom:14px;"><b class="on">5×1</b><b>5×2</b><b>Base2</b><b>Custom</b></div>
+   <div class="grid2"><div><span class="fl">Entry Rule</span><div class="inp">STR Bullish ▾</div></div><div><span class="fl">Exit Rule</span><div class="inp">STR Flip ▾</div></div></div></div>
+ </div>
+ <div>
+  <div class="card" style="padding:20px;"><div class="sec">Data Import</div>
+   <div class="dz"><svg width="34" height="34"><use href="#turtle" width="34" height="34"/></svg><div class="big">Drop CSV files here</div>
+    <div style="font-size:.72rem;margin-top:4px;">Option quotes · Spot · Expiry calendar · Holidays</div></div>
+   <div style="margin-top:16px;">
+    <div class="uprow"><div style="display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--profit)"></span><span style="font-size:.78rem;">NIFTY_options_2023-26.csv</span></div><span class="mono" style="color:var(--profit);font-size:.66rem;">76.7M rows ✓</span></div>
+    <div class="uprow"><div style="display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--profit)"></span><span style="font-size:.78rem;">NIFTY_spot.csv</span></div><span class="mono" style="color:var(--profit);font-size:.66rem;">imported ✓</span></div>
+    <div class="uprow"><div style="display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--a2)"></span><span style="font-size:.78rem;">expiry_calendar.csv</span></div><span class="mono" style="color:var(--a2);font-size:.66rem;">parsing…</span></div>
+    <div class="uprow"><div style="display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--tm)"></span><span style="font-size:.78rem;color:var(--ts)">trading_holidays.csv</span></div><span class="mono" style="color:var(--tm);font-size:.66rem;">pending</span></div>
+   </div>
+  </div>
+ </div>
+</div></div></div></section>
+
+<!-- PAGE 5 — OPTIMIZER -->
+<section class="page"><div class="caption">Optimizer · 05</div>
+<div class="modalpage"><div class="modal"><div class="mhead"><h2>Parameter <span class="h">Optimization</span></h2>
+ <div style="display:flex;gap:10px;"><div class="tbtn">Cancel</div><div class="runbtn" style="height:38px;padding:0 20px;">Launch ▸</div></div></div>
+<div class="mbody"><div class="tree"><div style="font-size:.6rem;letter-spacing:.08em;text-transform:uppercase;color:var(--tm);margin-bottom:10px;">Sweep Parameters</div>
+ <div class="tnode"><div class="chk on"></div>Stop Loss %</div><div class="tnode sub2"><div class="chk on"></div>20 · 25 · 30 · 35</div>
+ <div class="tnode"><div class="chk on"></div>Target %</div><div class="tnode sub2"><div class="chk on"></div>40 · 50 · 60</div>
+ <div class="tnode"><div class="chk"></div>Entry Time</div><div class="tnode"><div class="chk on"></div>Strike Offset</div>
+ <div class="tnode sub2"><div class="chk on"></div>ATM · OTM1 · OTM2</div><div class="tnode"><div class="chk"></div>Re-entry Mode</div></div>
+<div class="optbody"><div style="display:flex;gap:18px;"><div style="flex:1"><span class="fl">Search Method</span><div class="seg"><b class="on">Exhaustive</b><b>Random</b><b>Smart</b></div></div>
+ <div style="width:140px"><span class="fl">Workers</span><div class="inp">4 ▾</div></div></div>
+ <div style="margin-top:16px"><span class="fl">Objective</span><div class="inp focus" style="max-width:280px">Maximize Sharpe Ratio ▾</div></div>
+ <div class="plan"><div class="planbox"><div class="l">Grid Size</div><div class="v">36</div></div>
+  <div class="planbox"><div class="l">Est. Runtime</div><div class="v">~7 min</div></div><div class="planbox"><div class="l">Combos / leg</div><div class="v">12</div></div></div>
+ <div style="margin-top:6px;"><div class="ctitle">Master Summary — top combos</div>
+  <table class="tt"><thead><tr><th>#</th><th>SL</th><th>Tgt</th><th>Offset</th><th>CAGR</th><th>Sharpe</th><th>DD</th></tr></thead><tbody>
+   <tr><td style="color:var(--a3)">1</td><td>30</td><td>50</td><td>ATM</td><td style="color:var(--profit)">18.4%</td><td style="color:var(--a2)">1.94</td><td style="color:var(--loss)">-9.2%</td></tr>
+   <tr><td>2</td><td>25</td><td>60</td><td>OTM1</td><td style="color:var(--profit)">17.1%</td><td>1.81</td><td style="color:var(--loss)">-8.4%</td></tr>
+   <tr><td>3</td><td>35</td><td>50</td><td>ATM</td><td style="color:var(--profit)">16.8%</td><td>1.77</td><td style="color:var(--loss)">-11.0%</td></tr>
+   <tr><td>4</td><td>30</td><td>40</td><td>OTM2</td><td style="color:var(--profit)">15.2%</td><td>1.62</td><td style="color:var(--loss)">-7.9%</td></tr>
+  </tbody></table></div></div></div></div></div></section>
+
+</body></html>

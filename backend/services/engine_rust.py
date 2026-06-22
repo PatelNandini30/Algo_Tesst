@@ -1198,8 +1198,20 @@ def _build_fixed_entry_specs(
             # the expiry is also outside the loaded data range — then exit_date
             # was already truncated to the last trading day (== last_in_seg) so
             # the `exit_date > last_in_seg` test above misses it.
+            #
+            # EXCEPTION (rollover): when the cycle reached its natural T-n exit
+            # STRICTLY BEFORE the filter/segment end, it's a real EXPIRY exit,
+            # not a filter-end one. Leaving clamped=False here lets the chain
+            # roll once more so a final stub trade — entered on this T-n exit
+            # date in the NEXT contract and clamped to the filter end — fills
+            # the [T-n exit, filter end] tail. This mirrors weekly, which
+            # already produces that stub via its denser roll. Non-rollover, or
+            # an exit that already lands at/after the filter end (incl. the
+            # expiry-beyond-data truncation above), keep the original filter-end
+            # behaviour untouched.
             if target_expiry > last_in_seg:
-                clamped = True
+                if not (rollover_toggle and not no_rollover_flag and exit_date < last_in_seg):
+                    clamped = True
 
             entry_spot = spot_by_date.get(current_entry)
             if not entry_spot:
@@ -1821,6 +1833,17 @@ def priced_to_tradesheet_records(
     ``pd.DataFrame(records)`` then ``compute_analytics(df)``.
     """
     index_str = str(payload.get("index") or "NIFTY").upper()
+    # T-n scheduled-exit label. When the run exits N>0 trading days before the
+    # contract expiry (exit_dte > 0) the trade rides to its SCHEDULED exit, not
+    # the actual expiry — so the neutral "EXPIRY" reason reads "SCHEDULED_EXIT"
+    # (alone or within a combo, e.g. "SCHEDULED_EXIT+SPOT_ADJ_RISE"). T-0 runs
+    # (exit ON expiry) keep "EXPIRY". This converter is the single point EVERY
+    # engine return path (simple/full/futures) and EVERY output (backtest +
+    # optimizer ZIP/single-combo/master) funnels through, so the relabel applies
+    # uniformly across weekly / next-weekly / monthly / next-monthly. Purely
+    # cosmetic: no exit date, price, or P&L changes; no downstream calc keys off
+    # the "EXPIRY" string (SL-cap / FILTER_END resets use other tokens).
+    _tn_run = int(payload.get("exit_dte") or 0) > 0
     out: List[Dict[str, Any]] = []
     for row in priced:
         opt_type = (row.get("option_type") or "").upper()
@@ -1871,6 +1894,12 @@ def priced_to_tradesheet_records(
                     )
         except (TypeError, ValueError):
             pass
+        _exit_reason = str(row.get("exit_reason") or "EXPIRY")
+        if _tn_run and "EXPIRY" in _exit_reason.upper():
+            _exit_reason = "+".join(
+                "SCHEDULED_EXIT" if p.upper() == "EXPIRY" else p
+                for p in _exit_reason.split("+")
+            )
         out.append({
             "Trade": str(row.get("trade_id") or ""),
             "Leg": int(row.get("leg_id") or 1),
@@ -1903,7 +1932,7 @@ def priced_to_tradesheet_records(
             "FUT Exit Price": exit_px if is_fut else "",
             "Net P&L": net_pnl,
             "% P&L": pct_pnl,
-            "Exit Reason": str(row.get("exit_reason") or "EXPIRY"),
+            "Exit Reason": _exit_reason,
             "Strike Shift Reason": _shift_reason,
             "ReEntryIndex": row.get("_reentry_index") or "",
             "ReEntryTrigger": str(row.get("_reentry_trigger") or ""),
@@ -2966,7 +2995,12 @@ def run_rust_engine_pipeline(
                 continue
             _f_cur = _f_trigger
             _f_depth = 0
-            while _f_depth < 8 and _f_cur < _f_orig_exit:
+            # Cap is a runaway-loop backstop only (was 8). This walk re-anchors
+            # fixed-strike+SLB strikes at each spot-adj trigger; it MUST cover as
+            # many triggers as the bridge cascade (also 250) or tail segments
+            # beyond the 8th would reprice with a stale strike. Real terminator
+            # is `_f_cur < _f_orig_exit`; each step strictly advances.
+            while _f_depth < 250 and _f_cur < _f_orig_exit:
                 _f_depth += 1
                 _f_spot = spot_by_date.get(_f_cur)
                 if _f_spot is None:
@@ -3524,7 +3558,13 @@ def run_rust_engine_pipeline(
             _bt_cycle_exit = _bt_orig_exit
             _bt_depth = 0
 
-            while _bt_depth < 8 and _bt_cur_entry < _bt_cycle_exit:
+            # Cap is a runaway-loop backstop only — far above any real cycle's
+            # trading-day count (a monthly window is ~23 td). The loop really
+            # terminates on `_bt_cur_entry < _bt_cycle_exit`; each step strictly
+            # advances the cursor to a later trigger. The old cap of 8 silently
+            # dropped the tail segments of cycles with >8 spot-adj triggers
+            # (e.g. Oct-2022), leaving a flat gap + premature roll.
+            while _bt_depth < 250 and _bt_cur_entry < _bt_cycle_exit:
                 _bt_depth += 1
                 _bt_spot = spot_by_date.get(_bt_cur_entry)
                 if _bt_spot is None:
@@ -3910,7 +3950,20 @@ def run_rust_engine_pipeline(
                     reason = _clamp_reason
                 else:
                     reason = "EXPIRY"
-            _reason_cands.append((final_exit, reason))
+            # Anchor the base candidate's DATE. A real SL/Target (override with a
+            # non-EXPIRY reason) sits on its own override date. But a *plain*
+            # EXPIRY base — whether from the no-override default OR from an
+            # override whose SL scan found nothing (the Rust SL fn returns
+            # "EXPIRY" at the scan-window END, which Slice 7a above truncates to
+            # the spot-adj trigger) — means only "reached scheduled exit".
+            # Anchoring it at leg["exit_date"] (the TRUE scheduled exit) instead
+            # of the possibly-truncated `final_exit` lets the date-match below
+            # DROP it when an earlier clamp (spot-adj/overall) actually wins — so
+            # a trade that exits early via spot adjustment reads "SPOT_ADJ_RISE",
+            # not a phantom "EXPIRY+SPOT_ADJ_RISE". When spot-adj lands ON the
+            # scheduled exit day the dates match and both are still shown.
+            _base_date = leg["exit_date"] if reason == "EXPIRY" else final_exit
+            _reason_cands.append((_base_date, reason))
             # Slice 4b: SL-with-Buffer. The engine's exit_price_override IS
             # honored now (_recalc_leg_pnl is skipped when it's set). We stash
             # the override here keyed by (trade_id, leg_id, date) so the
@@ -4080,7 +4133,13 @@ def run_rust_engine_pipeline(
                 _sa_cur_exit  = orig_exit_date
                 _sa_depth = 0
 
-                while _sa_depth < 8 and _sa_cur_entry < _sa_cur_exit:
+                # Cap is a runaway-loop backstop only — far above any real
+                # cycle's trading-day count. The loop really terminates on
+                # `_sa_cur_entry < _sa_cur_exit`; each step strictly advances to
+                # a later trigger. The old cap of 8 silently dropped the tail
+                # re-entry segments of cycles with >8 spot-adj triggers (e.g.
+                # Oct-2022 → flat gap 14-Oct→17-Oct + premature roll to Nov).
+                while _sa_depth < 250 and _sa_cur_entry < _sa_cur_exit:
                     _sa_depth += 1
                     _sa_spot = float(spot_by_date.get(_sa_cur_entry) or 0.0)
                     if not _sa_spot:
@@ -4408,5 +4467,23 @@ def run_rust_engine_pipeline(
                 if p and p != "EXPIRY" and p != _clamp_reason
             ]
             row["exit_reason"] = "+".join([_clamp_reason] + _parts)
+
+    # T-n scheduled-exit label. When the run exits N>0 trading days before the
+    # contract expiry (exit_dte > 0), a trade that rides to its scheduled exit
+    # did NOT reach the actual expiry date — so the neutral "EXPIRY" token reads
+    # "SCHEDULED_EXIT" instead (alone, or within a combined reason such as
+    # "SCHEDULED_EXIT+SPOT_ADJ_RISE"). T-0 runs (exit ON expiry) keep "EXPIRY".
+    # Runs LAST, after every calc-relevant check (per-leg cascade, SLB
+    # post-process, FILTER_END pass) has already keyed off the internal "EXPIRY"
+    # token — so this is purely cosmetic: no exit date, price, or P&L changes.
+    if int(payload.get("exit_dte") or 0) > 0:
+        for row in final_priced:
+            _er = str(row.get("exit_reason") or "")
+            if "EXPIRY" not in _er.upper():
+                continue
+            row["exit_reason"] = "+".join(
+                "SCHEDULED_EXIT" if p.upper() == "EXPIRY" else p
+                for p in _er.split("+")
+            )
 
     return final_priced

@@ -1,0 +1,300 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><title>STRYK · Backtesting-First UI</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+:root{
+  --base:#1b2537; --surface:#222e44; --elevated:#2a3852; --hover:#32405e; --input:#161e2e;
+  --line:#324056; --line2:#3f5070;
+  --tp:#eaf1fa; --ts:#9fb0c8; --tm:#5d6e88;
+  --blue:#387ed1; --green:#2ecc71; --b2:#5a9ee0; --loss:#ff5763; --warn:#f5a623;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+@page{size:1280px 900px;margin:0;}
+html,body{background:var(--base);color:var(--tp);font-family:'Outfit',sans-serif;-webkit-font-smoothing:antialiased;letter-spacing:-.008em;}
+.mono{font-family:'IBM Plex Mono',monospace;}
+.disp{font-family:'Space Grotesk',sans-serif;}
+.page{width:1280px;height:900px;position:relative;overflow:hidden;page-break-after:always;
+  background:radial-gradient(ellipse 85% 60% at 90% -10%,rgba(56,126,209,.10),transparent 55%),
+             radial-gradient(ellipse 70% 55% at 5% 110%,rgba(46,204,113,.07),transparent 55%),var(--base);}
+.page:last-child{page-break-after:auto;}
+.cap{position:absolute;top:22px;right:30px;font-family:'IBM Plex Mono';font-size:.6rem;letter-spacing:.2em;text-transform:uppercase;color:var(--tm);}
+.wm{font-family:'Space Grotesk';font-weight:700;letter-spacing:.16em;background:linear-gradient(90deg,#5a9ee0,#387ed1 50%,#2ecc71);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.bolt{filter:drop-shadow(0 0 9px rgba(56,126,209,.6));}
+
+/* app shell */
+.layout{display:grid;grid-template-columns:210px 1fr;height:100%;}
+.side{background:rgba(34,46,68,.55);border-right:1px solid var(--line);padding:18px 13px;display:flex;flex-direction:column;gap:5px;}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 6px 20px;}
+.brand .wm{font-size:1.02rem;}
+.nav{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:9px;color:var(--ts);font-weight:600;font-size:.82rem;}
+.nav .ic{width:15px;height:15px;border-radius:4px;border:1.7px solid currentColor;opacity:.85;}
+.nav.active{color:#fff;background:linear-gradient(135deg,var(--blue),var(--green));box-shadow:0 4px 16px rgba(56,126,209,.4);}
+.nav.active .ic{border-color:#fff;background:rgba(255,255,255,.18);}
+.side .foot{margin-top:auto;font-size:.55rem;color:var(--tm);padding:8px;line-height:1.7;letter-spacing:.04em;}
+.main{display:flex;flex-direction:column;height:100%;overflow:hidden;}
+.top{height:54px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:rgba(27,37,55,.7);}
+.crumb{font-family:'Space Grotesk';font-weight:700;font-size:.92rem;}
+.crumb span{color:var(--tm);font-weight:400;font-family:'Outfit';font-size:.74rem;}
+.tr{display:flex;align-items:center;gap:12px;}
+.tbtn{padding:6px 12px;border:1px solid var(--line);border-radius:7px;color:var(--ts);font-size:.6rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;background:var(--elevated);}
+.ipill{font-weight:700;font-size:.74rem;color:var(--ts);padding:5px 11px;border-radius:6px;}
+.ipill.on{color:var(--blue);background:rgba(56,126,209,.14);box-shadow:inset 0 0 0 1px rgba(56,126,209,.3);}
+
+/* generic */
+.sec{font-size:.63rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--ts);border-left:2.5px solid var(--blue);padding-left:9px;margin-bottom:13px;}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:0 2px 14px rgba(0,0,0,.3);}
+.fl{font-size:.62rem;font-weight:600;color:var(--ts);margin-bottom:5px;display:block;letter-spacing:.02em;}
+.inp{background:var(--input);border:1px solid var(--line);border-radius:7px;height:34px;display:flex;align-items:center;padding:0 10px;font-size:.74rem;color:var(--tp);}
+.inp.f{border-color:var(--blue);box-shadow:0 0 0 3px rgba(56,126,209,.18);}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:11px;}.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;}
+.seg{display:inline-flex;gap:3px;padding:3px;background:var(--elevated);border:1px solid var(--line);border-radius:8px;}
+.seg b{padding:5px 13px;border-radius:5px;font-size:.66rem;font-weight:700;color:var(--ts);}
+.seg b.on{color:#fff;background:linear-gradient(135deg,var(--blue),var(--green));}
+.pill{font-size:.58rem;font-weight:700;padding:3px 8px;border-radius:5px;letter-spacing:.03em;}
+.pill.sell{background:rgba(255,87,99,.12);color:var(--loss);border:1px solid rgba(255,87,99,.26);}
+.pill.b{background:rgba(56,126,209,.14);color:var(--b2);border:1px solid rgba(56,126,209,.3);}
+.pill.pe{background:rgba(255,87,99,.12);color:var(--loss);border:1px solid rgba(255,87,99,.3);}
+.badge{width:19px;height:19px;border-radius:50%;background:linear-gradient(135deg,var(--blue),var(--green));color:#fff;font-family:'IBM Plex Mono';font-size:.58rem;font-weight:600;display:flex;align-items:center;justify-content:center;box-shadow:0 0 8px rgba(56,126,209,.4);}
+.leg{background:var(--input);border:1px solid var(--line);border-radius:9px;padding:11px 12px;margin-bottom:9px;}
+.legtop{display:flex;align-items:center;gap:8px;margin-bottom:9px;}
+.runbtn{height:42px;border-radius:9px;background:linear-gradient(135deg,var(--blue),var(--green));color:#fff;font-weight:800;font-size:.76rem;letter-spacing:.06em;text-transform:uppercase;display:flex;align-items:center;justify-content:center;gap:7px;box-shadow:0 4px 20px rgba(56,126,209,.35);}
+.tag{font-family:'IBM Plex Mono';font-size:.54rem;padding:2px 7px;border-radius:4px;border:1px solid;letter-spacing:.04em;}
+.tag.b{color:var(--b2);border-color:rgba(56,126,209,.4);background:rgba(56,126,209,.1);}
+.tag.g{color:var(--green);border-color:rgba(46,204,113,.4);background:rgba(46,204,113,.1);}
+
+/* analysis summary tiles */
+.atiles{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.atile{background:var(--input);border:1px solid var(--line);border-radius:8px;padding:9px 11px;}
+.atile .l{font-size:.52rem;letter-spacing:.06em;text-transform:uppercase;color:var(--tm);}
+.atile .v{font-family:'IBM Plex Mono';font-size:.92rem;font-weight:600;margin-top:3px;}
+.greeks{display:flex;gap:6px;margin-top:10px;}
+.greek{flex:1;background:var(--input);border:1px solid var(--line);border-radius:7px;padding:7px;text-align:center;}
+.greek .gk{font-family:'IBM Plex Mono';font-size:.6rem;color:var(--tm);}
+.greek .gv{font-family:'IBM Plex Mono';font-size:.72rem;color:var(--tp);margin-top:2px;}
+
+/* chart tabs */
+.ctabs{display:inline-flex;gap:2px;padding:3px;background:var(--elevated);border:1px solid var(--line);border-radius:8px;}
+.ctabs b{padding:5px 12px;border-radius:5px;font-size:.64rem;font-weight:700;color:var(--ts);}
+.ctabs b.on{color:#fff;background:var(--blue);box-shadow:0 0 12px rgba(56,126,209,.3);}
+
+/* KPI strip */
+.kstrip{display:grid;grid-template-columns:repeat(6,1fr);gap:11px;}
+.kpi{background:var(--surface);border:1px solid var(--line);border-top:3px solid var(--blue);border-radius:10px;padding:12px 13px;}
+.kpi.g{border-top-color:var(--green);}.kpi.r{border-top-color:var(--loss);}
+.kpi .l{font-size:.52rem;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--tm);margin-bottom:6px;}
+.kpi .v{font-family:'IBM Plex Mono';font-size:1.25rem;font-weight:600;letter-spacing:-.03em;}
+
+/* table */
+table{width:100%;border-collapse:collapse;}
+.tt thead th{font-size:.54rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tm);background:var(--elevated);padding:8px 9px;text-align:left;border-bottom:1px solid var(--line);}
+.tt tbody td{font-family:'IBM Plex Mono';font-size:.68rem;padding:7px 9px;border-bottom:1px solid var(--line);color:var(--tp);}
+.eb{font-family:'IBM Plex Mono';font-size:.52rem;font-weight:600;padding:2px 5px;border-radius:4px;border:1px solid;}
+.eb.t{color:var(--green);border-color:rgba(46,204,113,.4);background:rgba(46,204,113,.08);}
+.eb.s{color:var(--loss);border-color:rgba(255,87,99,.4);background:rgba(255,87,99,.08);}
+.eb.e{color:var(--b2);border-color:rgba(56,126,209,.4);background:rgba(56,126,209,.08);}
+
+/* cover + brief */
+.eyebrow{font-family:'IBM Plex Mono';font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--blue);}
+.lead{color:var(--ts);font-size:.95rem;font-weight:300;max-width:880px;line-height:1.5;}
+.brief{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;}
+.bc{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px 20px;}
+.bc h3{font-family:'Space Grotesk';font-size:1rem;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:8px;}
+.bc ul{list-style:none;}
+.bc li{font-size:.76rem;color:var(--ts);padding:4px 0 4px 14px;position:relative;line-height:1.4;}
+.bc li::before{content:'→';position:absolute;left:0;color:var(--blue);font-size:.7rem;}
+.callout{position:absolute;background:var(--elevated);border:1px solid var(--blue);border-radius:8px;padding:7px 10px;font-size:.62rem;color:var(--tp);box-shadow:0 6px 20px rgba(0,0,0,.4);max-width:200px;line-height:1.35;}
+.callout b{color:var(--b2);font-family:'IBM Plex Mono';font-size:.55rem;letter-spacing:.04em;}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;}
+</style></head><body>
+
+<svg width="0" height="0" style="position:absolute"><symbol id="bolt" viewBox="0 0 48 48">
+ <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#5a9ee0"/><stop offset="55%" stop-color="#387ed1"/><stop offset="100%" stop-color="#2ecc71"/></linearGradient></defs>
+ <path d="M24 4 L40 13 L40 35 L24 44 L8 35 L8 13 Z" fill="none" stroke="url(#bg)" stroke-width="2" stroke-linejoin="round" opacity=".45"/>
+ <path d="M27 9 L15 26 L22.5 26 L20 39 L33 21 L25 21 Z" fill="url(#bg)" stroke="url(#bg)" stroke-width="1.4" stroke-linejoin="round"/>
+</symbol></svg>
+
+<!-- PAGE 1 — COVER / BRIEF -->
+<section class="page" style="padding:54px 64px;">
+ <div class="cap">Backtesting-First · 01 / 05</div>
+ <div style="display:flex;align-items:center;gap:16px;margin-top:30px;"><svg class="bolt" width="48" height="48"><use href="#bolt"/></svg><span class="wm" style="font-size:1.8rem;">STRYK</span></div>
+ <div class="eyebrow" style="margin-top:46px;">Best-of-Backtesting UI</div>
+ <h1 class="disp" style="font-size:3.8rem;line-height:1.04;margin-top:12px;max-width:1000px;font-weight:700;">Built like a backtester —<br/>not a trading terminal.</h1>
+ <p class="lead" style="margin-top:20px;">Reworked from the patterns that make AlgoTest, Stockmock and QuantMan the cleanest options-backtesting tools in the market — a live payoff &amp; analysis panel, tabbed result charts, and a customizable trade table — rebuilt in STRYK's Midnight Teal identity. Every existing feature stays.</p>
+ <div class="brief" style="margin-top:40px;">
+  <div class="bc"><h3><span class="tag b">ALGOTEST</span></h3><ul>
+    <li>Clean multi-leg builder, no clutter</li>
+    <li><b style="color:var(--tp)">Live payoff diagram</b> beside the legs</li>
+    <li>Analysis: Max P/L · Breakeven · R:R</li>
+    <li>Per-leg <b style="color:var(--tp)">Greeks</b> (Δ Θ Γ V)</li>
+  </ul></div>
+  <div class="bc"><h3><span class="tag g">STOCKMOCK</span></h3><ul>
+    <li><b style="color:var(--tp)">Chart-tab switcher</b>: Payoff · MTM · DD</li>
+    <li>Basket S1/S2/S3 + combined view</li>
+    <li><b style="color:var(--tp)">Addons</b> to customize the table</li>
+    <li>Day-one detailed day-wise results</li>
+  </ul></div>
+  <div class="bc"><h3><span class="tag b">QUANTMAN</span></h3><ul>
+    <li>Friendly, low-clutter strategy entry</li>
+    <li>Strong <b style="color:var(--tp)">optimization</b> workflow</li>
+    <li>Pre-built logic, fast iteration</li>
+    <li>Clear objective-driven sweeps</li>
+  </ul></div>
+ </div>
+ <p style="margin-top:34px;font-size:.78rem;color:var(--tm);">The next three screens show the result: <b style="color:var(--ts)">Build</b> (payoff + analysis), <b style="color:var(--ts)">Results</b> (chart tabs + table), <b style="color:var(--ts)">Optimize</b>. Page 5 maps what came from where.</p>
+</section>
+
+<!-- PAGE 2 — STRATEGY BUILDER with PAYOFF -->
+<section class="page">
+ <div class="cap">Build · 02 / 05</div>
+ <div class="layout"><aside class="side">
+  <div class="brand"><svg class="bolt" width="28" height="28"><use href="#bolt"/></svg><span class="wm">STRYK</span></div>
+  <div class="nav active"><div class="ic"></div>Build</div><div class="nav"><div class="ic"></div>Results</div><div class="nav"><div class="ic"></div>Optimize</div>
+  <div class="foot">STRYK Terminal<br/>Midnight Teal</div></aside>
+ <div class="main"><div class="top"><div class="crumb">Build <span>/ Strategy</span></div>
+   <div class="tr"><div class="ipill on">NIFTY</div><div class="ipill">BANKNIFTY</div><div class="ipill">SENSEX</div><div class="tbtn">◐ Dark</div><div class="tbtn">Save</div></div></div>
+  <div style="padding:18px 22px;display:grid;grid-template-columns:1fr 1fr 1.05fr;gap:16px;height:calc(100% - 54px);">
+    <!-- col1 config -->
+    <div class="card" style="padding:16px;"><div class="sec">Configuration</div>
+     <span class="fl">Underlying</span><div class="seg" style="margin-bottom:11px;"><b class="on">Cash</b><b>Futures</b></div>
+     <span class="fl">Expiry basis</span><div class="seg" style="margin-bottom:11px;"><b class="on">Weekly</b><b>Monthly</b></div>
+     <div class="g2" style="margin-bottom:11px;"><div><span class="fl">Entry DTE</span><div class="inp">2</div></div><div><span class="fl">Exit DTE</span><div class="inp">0</div></div></div>
+     <div class="g2"><div><span class="fl">From</span><div class="inp f">01/01/23</div></div><div><span class="fl">To</span><div class="inp">19/06/26</div></div></div>
+     <div style="margin-top:12px;display:flex;justify-content:space-between;align-items:center;"><span class="fl" style="margin:0;">SuperTrend filter</span><div style="width:34px;height:19px;border-radius:10px;background:linear-gradient(135deg,var(--blue),var(--green));position:relative;"><div style="width:15px;height:15px;border-radius:50%;background:#fff;position:absolute;top:2px;right:2px;"></div></div></div>
+    </div>
+    <!-- col2 legs -->
+    <div class="card" style="padding:16px;overflow:hidden;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:11px;"><div class="sec" style="margin:0;">Legs</div><span class="tag b">+ ADD LEG</span></div>
+     <div class="leg"><div class="legtop"><div class="badge">1</div><span class="pill sell">SELL</span><span class="pill b">CE · ATM</span><span style="margin-left:auto;color:var(--tm);font-size:.6rem;" class="mono">SL30 · T50</span></div>
+       <div class="g3"><div><span class="fl">Lots</span><div class="inp">1</div></div><div><span class="fl">Strike</span><div class="inp">ATM</div></div><div><span class="fl">SL%</span><div class="inp">30</div></div></div></div>
+     <div class="leg"><div class="legtop"><div class="badge">2</div><span class="pill sell">SELL</span><span class="pill pe">PE · ATM</span><span style="margin-left:auto;color:var(--tm);font-size:.6rem;" class="mono">SL30 · T50</span></div>
+       <div class="g3"><div><span class="fl">Lots</span><div class="inp">1</div></div><div><span class="fl">Strike</span><div class="inp">ATM</div></div><div><span class="fl">SL%</span><div class="inp">30</div></div></div></div>
+     <div style="margin-top:6px;font-size:.62rem;color:var(--tm);" class="mono">+ lazy leg · re-entry · spot-adj</div>
+    </div>
+    <!-- col3 PAYOFF + ANALYSIS (AlgoTest pattern) -->
+    <div class="card" style="padding:16px;display:flex;flex-direction:column;"><div class="sec">Payoff &amp; Analysis</div>
+     <svg width="100%" height="150" viewBox="0 0 360 150" style="margin-bottom:12px;">
+       <defs><linearGradient id="pf" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2ecc71" stop-opacity=".35"/><stop offset="100%" stop-color="#2ecc71" stop-opacity="0"/></linearGradient></defs>
+       <line x1="0" y1="58" x2="360" y2="58" stroke="#3f5070" stroke-dasharray="3 3"/>
+       <text x="4" y="52" fill="#5d6e88" font-size="8" font-family="IBM Plex Mono">P&amp;L 0</text>
+       <!-- short straddle inverted V: profit zone middle -->
+       <path d="M0,130 L120,58 L180,30 L240,58 L360,130 L360,150 L0,150 Z" fill="url(#pf)" opacity="0.5"/>
+       <path d="M0,130 L120,58 L180,30 L240,58 L360,130" fill="none" stroke="#2ecc71" stroke-width="2.4"/>
+       <circle cx="120" cy="58" r="3" fill="#387ed1"/><circle cx="240" cy="58" r="3" fill="#387ed1"/>
+       <text x="100" y="74" fill="#5a9ee0" font-size="7.5" font-family="IBM Plex Mono">BE 24180</text>
+       <text x="222" y="74" fill="#5a9ee0" font-size="7.5" font-family="IBM Plex Mono">BE 24620</text>
+     </svg>
+     <div class="atiles">
+       <div class="atile"><div class="l">Max Profit</div><div class="v" style="color:var(--green)">₹16,200</div></div>
+       <div class="atile"><div class="l">Max Loss</div><div class="v" style="color:var(--loss)">Undefined</div></div>
+       <div class="atile"><div class="l">Risk : Reward</div><div class="v">1 : 1.8</div></div>
+       <div class="atile"><div class="l">Prob. of Profit</div><div class="v" style="color:var(--b2)">64%</div></div>
+     </div>
+     <div class="greeks"><div class="greek"><div class="gk">Δ Delta</div><div class="gv">-0.04</div></div><div class="greek"><div class="gk">Θ Theta</div><div class="gv" style="color:var(--green)">+38.2</div></div><div class="greek"><div class="gk">Γ Gamma</div><div class="gv">0.002</div></div><div class="greek"><div class="gk">V Vega</div><div class="gv" style="color:var(--loss)">-44.1</div></div></div>
+     <div class="runbtn" style="margin-top:auto;">▸ Run Backtest</div>
+    </div>
+  </div>
+ </div></div>
+</section>
+
+<!-- PAGE 3 — RESULTS with CHART TABS + TABLE -->
+<section class="page">
+ <div class="cap">Results · 03 / 05</div>
+ <div class="layout"><aside class="side">
+  <div class="brand"><svg class="bolt" width="28" height="28"><use href="#bolt"/></svg><span class="wm">STRYK</span></div>
+  <div class="nav"><div class="ic"></div>Build</div><div class="nav active"><div class="ic"></div>Results</div><div class="nav"><div class="ic"></div>Optimize</div>
+  <div class="foot">STRYK Terminal<br/>Midnight Teal</div></aside>
+ <div class="main"><div class="top"><div class="crumb">Results <span>/ NIFTY Short Straddle · 412 trades</span></div>
+   <div class="tr"><div class="tbtn">⚙ Addons</div><div class="tbtn">⤓ XLSX</div><div class="tbtn">⤓ CSV</div></div></div>
+  <div style="padding:18px 22px;height:calc(100% - 54px);display:flex;flex-direction:column;gap:14px;">
+    <div class="kstrip">
+      <div class="kpi g"><div class="l">Net P&amp;L</div><div class="v" style="color:var(--green)">₹4.82L</div></div>
+      <div class="kpi g"><div class="l">CAGR</div><div class="v" style="color:var(--green)">18.42%</div></div>
+      <div class="kpi r"><div class="l">Max DD</div><div class="v" style="color:var(--loss)">-9.21%</div></div>
+      <div class="kpi"><div class="l">Win Rate</div><div class="v">61.4%</div></div>
+      <div class="kpi"><div class="l">Sharpe</div><div class="v">1.94</div></div>
+      <div class="kpi"><div class="l">Profit Factor</div><div class="v">2.31</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:14px;flex:1;min-height:0;">
+      <div class="card" style="padding:16px;display:flex;flex-direction:column;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <div class="ctabs"><b class="on">Equity</b><b>Payoff</b><b>Drawdown</b><b>Monthly</b><b>Rolling</b></div>
+          <span class="mono" style="font-size:.6rem;color:var(--tm);">Stockmock-style chart tabs</span>
+        </div>
+        <svg width="100%" height="100%" viewBox="0 0 620 300" preserveAspectRatio="none" style="flex:1;">
+          <defs><linearGradient id="eq" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#387ed1" stop-opacity=".4"/><stop offset="100%" stop-color="#387ed1" stop-opacity="0"/></linearGradient>
+          <linearGradient id="ln" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#387ed1"/><stop offset="100%" stop-color="#2ecc71"/></linearGradient></defs>
+          <line x1="0" y1="75" x2="620" y2="75" stroke="#2a3852"/><line x1="0" y1="150" x2="620" y2="150" stroke="#2a3852"/><line x1="0" y1="225" x2="620" y2="225" stroke="#2a3852"/>
+          <path d="M0,265 L60,242 L120,248 L180,205 L240,214 L300,165 L360,176 L420,118 L480,130 L540,78 L600,52 L620,40 L620,300 L0,300 Z" fill="url(#eq)"/>
+          <path d="M0,265 L60,242 L120,248 L180,205 L240,214 L300,165 L360,176 L420,118 L480,130 L540,78 L600,52 L620,40" fill="none" stroke="url(#ln)" stroke-width="2.6"/>
+        </svg>
+      </div>
+      <div class="card" style="padding:0;overflow:hidden;display:flex;flex-direction:column;">
+        <div style="padding:14px 14px 10px;display:flex;justify-content:space-between;align-items:center;"><div class="sec" style="margin:0;border:0;padding:0;">Trade Sheet</div><span class="mono" style="font-size:.56rem;color:var(--tm);">sort · compress P&amp;L</span></div>
+        <table class="tt"><thead><tr><th>Date</th><th>Leg</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>MAE</th><th>Reason</th></tr></thead><tbody>
+          <tr><td>14 Jun</td><td>CE</td><td>182.4</td><td>96.2</td><td style="color:var(--green)">+86</td><td>-12</td><td><span class="eb t">TGT</span></td></tr>
+          <tr><td>14 Jun</td><td>PE</td><td>171.0</td><td>118.5</td><td style="color:var(--green)">+52</td><td>-31</td><td><span class="eb e">EOD</span></td></tr>
+          <tr><td>07 Jun</td><td>CE</td><td>164.2</td><td>213.5</td><td style="color:var(--loss)">-49</td><td>-58</td><td><span class="eb s">SL</span></td></tr>
+          <tr><td>07 Jun</td><td>PE</td><td>158.8</td><td>74.1</td><td style="color:var(--green)">+84</td><td>-9</td><td><span class="eb t">TGT</span></td></tr>
+          <tr><td>31 May</td><td>CE</td><td>190.5</td><td>142.0</td><td style="color:var(--green)">+48</td><td>-22</td><td><span class="eb e">EOD</span></td></tr>
+          <tr><td>31 May</td><td>PE</td><td>176.2</td><td>228.9</td><td style="color:var(--loss)">-52</td><td>-61</td><td><span class="eb s">SL</span></td></tr>
+          <tr><td>24 May</td><td>CE</td><td>168.0</td><td>88.4</td><td style="color:var(--green)">+79</td><td>-14</td><td><span class="eb t">TGT</span></td></tr>
+          <tr><td>24 May</td><td>PE</td><td>159.5</td><td>121.0</td><td style="color:var(--green)">+38</td><td>-27</td><td><span class="eb e">EOD</span></td></tr>
+        </tbody></table>
+      </div>
+    </div>
+  </div>
+ </div></div>
+</section>
+
+<!-- PAGE 4 — OPTIMIZER -->
+<section class="page">
+ <div class="cap">Optimize · 04 / 05</div>
+ <div class="layout"><aside class="side">
+  <div class="brand"><svg class="bolt" width="28" height="28"><use href="#bolt"/></svg><span class="wm">STRYK</span></div>
+  <div class="nav"><div class="ic"></div>Build</div><div class="nav"><div class="ic"></div>Results</div><div class="nav active"><div class="ic"></div>Optimize</div>
+  <div class="foot">STRYK Terminal<br/>Midnight Teal</div></aside>
+ <div class="main"><div class="top"><div class="crumb">Optimize <span>/ Parameter sweep</span></div>
+   <div class="tr"><div class="tbtn">Cancel</div><div class="runbtn" style="height:32px;padding:0 16px;font-size:.66rem;">Launch ▸</div></div></div>
+  <div style="padding:18px 22px;height:calc(100% - 54px);display:grid;grid-template-columns:270px 1fr;gap:16px;">
+    <div class="card" style="padding:16px;"><div class="sec">Sweep Parameters</div>
+      <div style="font-size:.74rem;color:var(--tp);padding:7px 0;display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--green)"></span>Stop Loss % <span class="mono" style="margin-left:auto;color:var(--tm);font-size:.6rem;">20·25·30·35</span></div>
+      <div style="font-size:.74rem;color:var(--tp);padding:7px 0;display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--green)"></span>Target % <span class="mono" style="margin-left:auto;color:var(--tm);font-size:.6rem;">40·50·60</span></div>
+      <div style="font-size:.74rem;color:var(--tp);padding:7px 0;display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--green)"></span>Strike Offset <span class="mono" style="margin-left:auto;color:var(--tm);font-size:.6rem;">ATM·OTM1·OTM2</span></div>
+      <div style="font-size:.74rem;color:var(--tm);padding:7px 0;display:flex;align-items:center;gap:9px;"><span class="dot" style="background:var(--line2)"></span>Entry Time</div>
+      <div style="margin-top:14px;"><span class="fl">Method</span><div class="seg" style="margin-bottom:11px;"><b class="on">Exhaustive</b><b>Smart</b></div>
+        <div class="g2"><div><span class="fl">Workers</span><div class="inp">4</div></div><div><span class="fl">Objective</span><div class="inp f">Sharpe ▾</div></div></div></div>
+    </div>
+    <div class="card" style="padding:16px;display:flex;flex-direction:column;">
+      <div style="display:flex;gap:11px;margin-bottom:14px;">
+        <div class="atile" style="flex:1"><div class="l">Grid size</div><div class="v" style="color:var(--b2)">36</div></div>
+        <div class="atile" style="flex:1"><div class="l">Est. runtime</div><div class="v">~7 min</div></div>
+        <div class="atile" style="flex:1"><div class="l">Tested</div><div class="v" style="color:var(--green)">36 / 36</div></div>
+      </div>
+      <div class="sec">Master Summary — ranked by Sharpe</div>
+      <table class="tt"><thead><tr><th>#</th><th>SL</th><th>Tgt</th><th>Offset</th><th>CAGR</th><th>Sharpe</th><th>Max DD</th><th>Win%</th></tr></thead><tbody>
+        <tr><td style="color:var(--green)">1</td><td>30</td><td>50</td><td>ATM</td><td style="color:var(--green)">18.4%</td><td style="color:var(--b2)">1.94</td><td style="color:var(--loss)">-9.2%</td><td>61</td></tr>
+        <tr><td>2</td><td>25</td><td>60</td><td>OTM1</td><td style="color:var(--green)">17.1%</td><td>1.81</td><td style="color:var(--loss)">-8.4%</td><td>59</td></tr>
+        <tr><td>3</td><td>35</td><td>50</td><td>ATM</td><td style="color:var(--green)">16.8%</td><td>1.77</td><td style="color:var(--loss)">-11.0%</td><td>63</td></tr>
+        <tr><td>4</td><td>30</td><td>40</td><td>OTM2</td><td style="color:var(--green)">15.2%</td><td>1.62</td><td style="color:var(--loss)">-7.9%</td><td>57</td></tr>
+        <tr><td>5</td><td>20</td><td>50</td><td>ATM</td><td style="color:var(--green)">14.6%</td><td>1.55</td><td style="color:var(--loss)">-7.1%</td><td>55</td></tr>
+      </tbody></table>
+    </div>
+  </div>
+ </div></div>
+</section>
+
+<!-- PAGE 5 — WHAT WE BORROWED -->
+<section class="page" style="padding:54px 64px;">
+ <div class="cap">Provenance · 05 / 05</div>
+ <div class="eyebrow">What came from where</div>
+ <h1 class="disp" style="font-size:2.4rem;margin-top:8px;font-weight:700;">The best of three, in one identity</h1>
+ <p class="lead" style="margin-top:10px;">Each borrowed pattern is a proven backtesting convention — adopted, then re-skinned to Midnight Teal. None changes STRYK's engine.</p>
+ <div style="margin-top:28px;display:grid;grid-template-columns:1fr;gap:12px;">
+  <div class="card" style="padding:16px 20px;display:flex;align-items:center;gap:18px;"><span class="tag b" style="min-width:92px;text-align:center;">ALGOTEST</span><div style="font-size:.84rem;color:var(--ts);"><b class="disp" style="color:var(--tp)">Live Payoff &amp; Analysis panel</b> beside the legs — Max Profit / Max Loss / Breakevens / Risk-Reward / Prob-of-Profit, plus per-leg Greeks (Δ Θ Γ V). You see the strategy's shape before you ever run it.</div></div>
+  <div class="card" style="padding:16px 20px;display:flex;align-items:center;gap:18px;"><span class="tag g" style="min-width:92px;text-align:center;">STOCKMOCK</span><div style="font-size:.84rem;color:var(--ts);"><b class="disp" style="color:var(--tp)">Chart-tab switcher + customizable trade table</b> — one chart frame flips between Equity / Payoff / Drawdown / Monthly / Rolling-straddle; an "Addons" menu compresses P&amp;L, sorts by exit, toggles columns.</div></div>
+  <div class="card" style="padding:16px 20px;display:flex;align-items:center;gap:18px;"><span class="tag b" style="min-width:92px;text-align:center;">QUANTMAN</span><div style="font-size:.84rem;color:var(--ts);"><b class="disp" style="color:var(--tp)">Objective-driven optimizer</b> — pick parameters, a method, an objective; a live master-summary table ranks every combo with progress (36 / 36 tested). Fast, legible iteration.</div></div>
+  <div class="card" style="padding:16px 20px;display:flex;align-items:center;gap:18px;border-color:var(--blue);background:rgba(56,126,209,.06);"><span class="tag b" style="min-width:92px;text-align:center;">STRYK</span><div style="font-size:.84rem;color:var(--ts);"><b class="disp" style="color:var(--tp)">The identity that ties it together</b> — Midnight Teal palette, lightning mark, left rail, MAE/MFE &amp; exit-reason badges (your differentiators) carried into every table. Familiar to any AlgoTest user, unmistakably STRYK.</div></div>
+ </div>
+ <p style="margin-top:30px;font-size:.82rem;color:var(--ts);">Want this live? The biggest adds are the <b style="color:var(--green)">Payoff &amp; Analysis panel</b> and the <b style="color:var(--green)">chart-tab results</b>. Tell me to proceed and I'll wire them into the app — presentation only, engine untouched.</p>
+ <p style="margin-top:14px;font-size:.66rem;color:var(--tm);">Sources: algotest.in · docs.algotest.in · stockmock.in · QuantMan review 2026 · AlgoTest platform comparisons.</p>
+</section>
+
+</body></html>

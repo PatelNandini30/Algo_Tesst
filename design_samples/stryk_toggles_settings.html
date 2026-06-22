@@ -1,0 +1,262 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><title>STRYK · Toggles & Settings Options</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+:root{--base:#1b2537;--surface:#222e44;--elevated:#2a3852;--input:#161e2e;--line:#324056;--line2:#3f5070;
+  --tp:#eaf1fa;--ts:#9fb0c8;--tm:#5d6e88;--blue:#387ed1;--green:#2ecc71;--b2:#5a9ee0;--loss:#ff5763;}
+*{box-sizing:border-box;margin:0;padding:0}
+@page{size:1280px 900px;margin:0;}
+html,body{background:var(--base);color:var(--tp);font-family:'Outfit',sans-serif;-webkit-font-smoothing:antialiased;letter-spacing:-.008em;}
+.mono{font-family:'IBM Plex Mono',monospace;}.disp{font-family:'Space Grotesk',sans-serif;}
+.page{width:1280px;height:900px;position:relative;overflow:hidden;page-break-after:always;padding:50px 60px;
+  background:radial-gradient(ellipse 85% 60% at 90% -10%,rgba(56,126,209,.10),transparent 55%),radial-gradient(ellipse 70% 55% at 5% 110%,rgba(46,204,113,.07),transparent 55%),var(--base);}
+.page:last-child{page-break-after:auto;}
+.cap{position:absolute;top:22px;right:30px;font-family:'IBM Plex Mono';font-size:.6rem;letter-spacing:.2em;text-transform:uppercase;color:var(--tm);}
+.wm{font-family:'Space Grotesk';font-weight:700;letter-spacing:.16em;background:linear-gradient(90deg,#5a9ee0,#387ed1 50%,#2ecc71);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}
+.bolt{filter:drop-shadow(0 0 9px rgba(56,126,209,.6));}
+.eyebrow{font-family:'IBM Plex Mono';font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--blue);}
+h1{font-family:'Space Grotesk';font-weight:700;letter-spacing:-.01em;}
+h2{font-family:'Space Grotesk';font-weight:700;font-size:1.9rem;letter-spacing:-.01em;}
+.lead{color:var(--ts);font-size:.92rem;font-weight:300;max-width:900px;line-height:1.5;}
+.divider{height:1px;background:linear-gradient(90deg,var(--blue),transparent);margin:14px 0 18px;}
+.opt{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:16px 18px;display:flex;flex-direction:column;}
+.opt.rec{border-color:var(--green);box-shadow:0 0 0 1px rgba(46,204,113,.25),0 6px 22px rgba(0,0,0,.3);}
+.opt .on{display:flex;align-items:center;gap:8px;margin-bottom:4px;}
+.opt .num{font-family:'IBM Plex Mono';font-size:.62rem;color:var(--b2);border:1px solid rgba(56,126,209,.4);background:rgba(56,126,209,.1);border-radius:4px;padding:1px 6px;}
+.opt h3{font-family:'Space Grotesk';font-size:.98rem;font-weight:600;color:var(--tp);}
+.opt .d{font-size:.7rem;color:var(--ts);line-height:1.4;margin-bottom:11px;}
+.opt .stage{background:var(--input);border:1px solid var(--line);border-radius:9px;padding:14px;flex:1;display:flex;flex-direction:column;justify-content:center;gap:9px;min-height:0;}
+.opt .pc{margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;}
+.pill{font-family:'IBM Plex Mono';font-size:.52rem;padding:2px 7px;border-radius:4px;border:1px solid;letter-spacing:.03em;}
+.pill.g{color:var(--green);border-color:rgba(46,204,113,.4);background:rgba(46,204,113,.08);}
+.pill.r{color:var(--loss);border-color:rgba(255,87,99,.4);background:rgba(255,87,99,.08);}
+.pill.b{color:var(--b2);border-color:rgba(56,126,209,.4);background:rgba(56,126,209,.08);}
+/* live toggle components */
+.row{display:flex;align-items:center;gap:10px;}
+.lbl{font-size:.74rem;color:var(--tp);}.sub{font-size:.6rem;color:var(--tm);}
+.sw{width:38px;height:21px;border-radius:11px;background:var(--line2);position:relative;flex-shrink:0;transition:.2s;}
+.sw.on{background:linear-gradient(135deg,var(--blue),var(--green));box-shadow:0 0 12px rgba(56,126,209,.45);}
+.sw i{position:absolute;top:2px;width:17px;height:17px;border-radius:50%;background:#fff;left:2px;transition:.2s;}
+.sw.on i{left:19px;}
+.seg{display:inline-flex;gap:3px;padding:3px;background:var(--elevated);border:1px solid var(--line);border-radius:8px;}
+.seg b{padding:5px 13px;border-radius:5px;font-size:.66rem;font-weight:700;color:var(--ts);}
+.seg b.on{color:#fff;background:linear-gradient(135deg,var(--blue),var(--green));}
+.chipt{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--elevated);font-size:.72rem;color:var(--ts);}
+.chipt.on{border-color:var(--green);background:rgba(46,204,113,.12);color:var(--tp);}
+.chipt .ck{width:14px;height:14px;border-radius:4px;border:1.6px solid var(--line2);}
+.chipt.on .ck{background:var(--green);border-color:var(--green);}
+.ctile{border:1px solid var(--line);border-radius:9px;padding:11px 12px;background:var(--elevated);display:flex;align-items:center;gap:11px;}
+.ctile.on{border-color:var(--blue);background:rgba(56,126,209,.1);box-shadow:0 0 14px rgba(56,126,209,.14) inset;}
+.iconbtn{width:34px;height:30px;border-radius:7px;border:1px solid var(--line);background:var(--elevated);display:flex;align-items:center;justify-content:center;color:var(--ts);font-size:.8rem;}
+.iconbtn.on{border-color:var(--green);background:rgba(46,204,113,.14);color:var(--green);}
+/* placement wireframes */
+.wf{border:1px solid var(--line2);border-radius:9px;background:rgba(13,18,28,.4);height:160px;display:flex;overflow:hidden;}
+.wf .zl{font-family:'IBM Plex Mono';font-size:.5rem;letter-spacing:.06em;text-transform:uppercase;color:var(--ts);}
+.wf .z{border:1px dashed var(--line2);border-radius:6px;margin:6px;padding:7px 8px;flex:1;color:var(--tm);font-size:.58rem;}
+.wf .z.act{border-style:solid;border-color:var(--blue);background:rgba(56,126,209,.1);color:var(--b2);}
+.wf .z.go{border-style:solid;border-color:var(--green);background:rgba(46,204,113,.1);color:var(--green);}
+.bestfor{margin-top:9px;font-size:.72rem;color:var(--ts);}.bestfor b{color:var(--green);}
+.tb{position:absolute;right:60px;bottom:32px;display:flex;border:1px solid var(--line2);border-radius:6px;overflow:hidden;}
+.tb div{padding:5px 11px;border-right:1px solid var(--line2);font-family:'IBM Plex Mono';font-size:.54rem;color:var(--ts);letter-spacing:.06em;}.tb div:last-child{border:none;color:var(--blue);}
+.invrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;}
+.invchip{font-family:'IBM Plex Mono';font-size:.62rem;color:var(--ts);border:1px solid var(--line);border-radius:6px;padding:5px 10px;background:var(--surface);}
+.invchip b{color:var(--b2);}
+</style></head><body>
+
+<svg width="0" height="0" style="position:absolute"><symbol id="bolt" viewBox="0 0 48 48">
+ <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#5a9ee0"/><stop offset="55%" stop-color="#387ed1"/><stop offset="100%" stop-color="#2ecc71"/></linearGradient></defs>
+ <path d="M24 4 L40 13 L40 35 L24 44 L8 35 L8 13 Z" fill="none" stroke="url(#bg)" stroke-width="2" stroke-linejoin="round" opacity=".45"/>
+ <path d="M27 9 L15 26 L22.5 26 L20 39 L33 21 L25 21 Z" fill="url(#bg)" stroke="url(#bg)" stroke-width="1.4" stroke-linejoin="round"/>
+</symbol></svg>
+
+<!-- PAGE 1 — COVER + INVENTORY -->
+<section class="page">
+ <div class="cap">Toggles &amp; Settings · 01 / 04</div>
+ <div style="display:flex;align-items:center;gap:14px;margin-top:30px;"><svg class="bolt" width="44" height="44"><use href="#bolt"/></svg><span class="wm" style="font-size:1.7rem;">STRYK</span></div>
+ <div class="eyebrow" style="margin-top:46px;">Toggle styles &amp; settings placement</div>
+ <h1 style="font-size:3.3rem;line-height:1.05;margin-top:12px;max-width:980px;">How your switches should<br/>look — and where they live.</h1>
+ <p class="lead" style="margin-top:18px;">Two decisions, separated. <b style="color:var(--tp)">Style</b> = the visual form of each on/off control. <b style="color:var(--tp)">Placement</b> = where the settings sit in the flow. The next pages show six options for each, then a recommendation. Nothing here changes behavior — only how controls are presented.</p>
+ <div class="eyebrow" style="margin-top:34px;color:var(--ts);">The toggles &amp; settings in STRYK today</div>
+ <div class="invrow">
+  <span class="invchip"><b>switch</b> · Re-entry rollover</span>
+  <span class="invchip"><b>switch</b> · No rollover</span>
+  <span class="invchip"><b>switch</b> · Filter</span>
+  <span class="invchip"><b>switch</b> · Spot adjustment</span>
+  <span class="invchip"><b>switch</b> · Buffer strike</span>
+  <span class="invchip"><b>switch</b> · SuperTrend enable</span>
+  <span class="invchip"><b>tri</b> · Re-entry mode (Off/ASAP/Reverse)</span>
+  <span class="invchip"><b>seg</b> · Underlying · Expiry basis</span>
+  <span class="invchip"><b>select</b> · Workers · Objective · DTE</span>
+  <span class="invchip"><b>switch</b> · Theme</span>
+ </div>
+ <p style="margin-top:22px;font-size:.78rem;color:var(--tm);">Most are simple on/off switches in their own bordered rows. The question: which <b style="color:var(--ts)">style</b> reads best, and should they stay inline or move into an <b style="color:var(--ts)">Advanced</b> group / drawer / tab?</p>
+ <div class="tb"><div>STRYK</div><div>TOGGLES</div><div>MIDNIGHT TEAL</div><div>REV 2026.06</div></div>
+</section>
+
+<!-- PAGE 2 — TOGGLE STYLES -->
+<section class="page">
+ <div class="cap">Component Styles · 02 / 04</div>
+ <div class="eyebrow">Part A · the look of one on/off control</div>
+ <h2>Six toggle styles</h2>
+ <div class="divider"></div>
+ <div style="display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr;gap:14px;height:680px;">
+
+  <div class="opt rec"><div class="on"><span class="num">01</span><h3>Switch + caption</h3><span class="pill g">RECOMMENDED</span></div>
+   <div class="d">Pill slider with a label and one-line helper. Today's control, refined.</div>
+   <div class="stage">
+     <div class="row" style="justify-content:space-between"><div><div class="lbl">Spot adjustment</div><div class="sub">Exit + re-enter on ±X% move</div></div><div class="sw on"><i></i></div></div>
+     <div class="row" style="justify-content:space-between"><div><div class="lbl">Buffer strike</div><div class="sub">Off</div></div><div class="sw"><i></i></div></div>
+   </div>
+   <div class="pc"><span class="pill g">scannable</span><span class="pill g">familiar</span><span class="pill b">helper text</span></div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">02</span><h3>Segmented On/Off</h3></div>
+   <div class="d">Explicit ON / OFF buttons — leaves no doubt about state.</div>
+   <div class="stage">
+     <div class="row" style="justify-content:space-between"><div class="lbl">Re-entry rollover</div><div class="seg"><b class="on">On</b><b>Off</b></div></div>
+     <div class="row" style="justify-content:space-between"><div class="lbl">Filter</div><div class="seg"><b>On</b><b class="on">Off</b></div></div>
+   </div>
+   <div class="pc"><span class="pill g">explicit</span><span class="pill r">wider</span></div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">03</span><h3>Checkbox chip</h3></div>
+   <div class="d">Compact chips — great when many toggles sit in one strip.</div>
+   <div class="stage" style="flex-direction:row;flex-wrap:wrap;align-content:center;">
+     <span class="chipt on"><span class="ck"></span>Spot Adj</span><span class="chipt on"><span class="ck"></span>SuperTrend</span><span class="chipt"><span class="ck"></span>Buffer</span><span class="chipt"><span class="ck"></span>Filter</span>
+   </div>
+   <div class="pc"><span class="pill g">space-saving</span><span class="pill b">multi-select feel</span></div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">04</span><h3>Card toggle</h3></div>
+   <div class="d">Whole card is the control — title, description, switch. Premium, roomy.</div>
+   <div class="stage">
+     <div class="ctile on"><div style="flex:1"><div class="lbl">Re-entry rollover</div><div class="sub">Exit anchors next expiry · same-day rollover</div></div><div class="sw on"><i></i></div></div>
+     <div class="ctile"><div style="flex:1"><div class="lbl">No rollover</div><div class="sub">One trade per segment</div></div><div class="sw"><i></i></div></div>
+   </div>
+   <div class="pc"><span class="pill g">self-explaining</span><span class="pill r">tall</span></div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">05</span><h3>Icon button</h3></div>
+   <div class="d">Pressed-state icon buttons in a toolbar — dense, terminal-like.</div>
+   <div class="stage" style="flex-direction:row;align-items:center;justify-content:center;gap:8px;">
+     <div style="text-align:center"><div class="iconbtn on">⟳</div><div class="sub" style="margin-top:4px">Roll</div></div>
+     <div style="text-align:center"><div class="iconbtn on">◧</div><div class="sub" style="margin-top:4px">Spot</div></div>
+     <div style="text-align:center"><div class="iconbtn">⌁</div><div class="sub" style="margin-top:4px">STR</div></div>
+     <div style="text-align:center"><div class="iconbtn">⊕</div><div class="sub" style="margin-top:4px">Buf</div></div>
+   </div>
+   <div class="pc"><span class="pill g">very dense</span><span class="pill r">needs tooltips</span></div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">06</span><h3>Tri-state segment</h3></div>
+   <div class="d">For settings that aren't binary — re-entry mode, etc. Keep for those only.</div>
+   <div class="stage">
+     <div class="row" style="justify-content:space-between"><div class="lbl">Re-entry mode</div><div class="seg"><b>Off</b><b class="on">ASAP</b><b>Reverse</b></div></div>
+     <div class="row" style="justify-content:space-between"><div class="lbl">Underlying</div><div class="seg"><b class="on">Cash</b><b>Futures</b></div></div>
+   </div>
+   <div class="pc"><span class="pill b">multi-value</span><span class="pill g">already in use</span></div>
+  </div>
+
+ </div>
+ <div class="tb"><div>STRYK</div><div>TOGGLES</div><div>STYLES</div><div>02</div></div>
+</section>
+
+<!-- PAGE 3 — PLACEMENT -->
+<section class="page">
+ <div class="cap">Placement · 03 / 04</div>
+ <div class="eyebrow">Part B · where the settings live</div>
+ <h2>Six placement patterns</h2>
+ <div class="divider"></div>
+ <div style="display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr 1fr;gap:14px;height:680px;">
+
+  <div class="opt"><div class="on"><span class="num">01</span><h3>Inline cards</h3></div>
+   <div class="d">Each toggle in its own row, always visible. Today's layout.</div>
+   <div class="wf" style="flex-direction:column;height:auto;flex:1;">
+     <div class="z act">Config fields</div><div class="z act">⟳ Re-entry · ◧ Spot · ⌁ STR …</div><div class="z">Legs →</div>
+   </div>
+   <div class="bestfor"><b>Best for:</b> discoverability. <span class="pill r" style="margin-left:4px;">long scroll</span></div>
+  </div>
+
+  <div class="opt rec"><div class="on"><span class="num">02</span><h3>Advanced accordion</h3><span class="pill g">RECOMMENDED</span></div>
+   <div class="d">Core fields visible; advanced toggles fold into a collapsible "Advanced" group.</div>
+   <div class="wf" style="flex-direction:column;height:auto;flex:1;">
+     <div class="z act">Index · Expiry · Dates</div><div class="z go">▸ Advanced rules &amp; adjustments (6)</div><div class="z" style="opacity:.5">▸ collapsed by default</div>
+   </div>
+   <div class="bestfor"><b>Best for:</b> clean default + power on demand (progressive disclosure).</div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">03</span><h3>Settings drawer</h3></div>
+   <div class="d">A ⚙ button slides in a right panel holding every toggle, grouped.</div>
+   <div class="wf">
+     <div class="z" style="flex:2">Builder</div><div class="z act" style="flex:1">⚙ Settings drawer ◗</div>
+   </div>
+   <div class="bestfor"><b>Best for:</b> keeping the canvas uncluttered; settings one click away.</div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">04</span><h3>Rules tab</h3></div>
+   <div class="d">A dedicated "Rules &amp; Adjustments" tab beside Build, for all toggles.</div>
+   <div class="wf" style="flex-direction:column;height:auto;flex:1;">
+     <div class="z act" style="flex:0">Build · <b style="color:var(--b2)">Rules</b> · SuperTrend</div><div class="z go">All toggles grouped here</div>
+   </div>
+   <div class="bestfor"><b>Best for:</b> heavy rule sets; separates "what" from "how it behaves".</div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">05</span><h3>Chip toolbar</h3></div>
+   <div class="d">All toggles as a single chip-strip above the legs — flip on/off fast.</div>
+   <div class="wf" style="flex-direction:column;height:auto;flex:1;">
+     <div class="z act">[Spot ✓][STR ✓][Roll][Buffer][Filter]</div><div class="z">Legs →</div>
+   </div>
+   <div class="bestfor"><b>Best for:</b> speed &amp; density; pairs with the checkbox-chip style.</div>
+  </div>
+
+  <div class="opt"><div class="on"><span class="num">06</span><h3>Popover groups</h3></div>
+   <div class="d">Gear icon opens a popover with toggles grouped (Rollover · Adjust · Filter).</div>
+   <div class="wf">
+     <div class="z" style="flex:2">Builder</div><div class="z act" style="flex:1">⚙ ▾ popover</div>
+   </div>
+   <div class="bestfor"><b>Best for:</b> minimal chrome; least screen real-estate used.</div>
+  </div>
+
+ </div>
+ <div class="tb"><div>STRYK</div><div>TOGGLES</div><div>PLACEMENT</div><div>03</div></div>
+</section>
+
+<!-- PAGE 4 — RECOMMENDATION -->
+<section class="page">
+ <div class="cap">Recommendation · 04 / 04</div>
+ <div class="eyebrow">The pairing that works</div>
+ <h2>Switch + caption · grouped in an Advanced accordion</h2>
+ <p class="lead" style="margin-top:6px;">Keep the familiar switch (with helper text), but stop them flooding the config: fold the six advanced toggles into a collapsible "Advanced rules &amp; adjustments" group, expanded only when needed.</p>
+ <div class="divider"></div>
+ <div style="display:grid;grid-template-columns:1.1fr 1fr;gap:20px;">
+  <div class="opt" style="border-color:var(--green);">
+    <div class="on"><h3 class="disp" style="font-size:1.1rem;">Live preview</h3></div>
+    <div class="stage" style="gap:11px;">
+      <div class="lbl" style="font-size:.62rem;letter-spacing:.06em;text-transform:uppercase;color:var(--tm)">Configuration</div>
+      <div class="row" style="gap:10px"><div class="chipt" style="flex:1;justify-content:space-between"><span class="lbl">Index · NIFTY</span></div><div class="chipt" style="flex:1;justify-content:space-between"><span class="lbl">Weekly</span></div></div>
+      <div style="border:1px solid var(--green);border-radius:9px;padding:11px 13px;background:rgba(46,204,113,.06);">
+        <div class="row" style="justify-content:space-between"><div class="lbl" style="font-weight:600">▾ Advanced rules &amp; adjustments</div><span class="pill g">2 on</span></div>
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:9px;">
+          <div class="row" style="justify-content:space-between"><div><div class="lbl">Spot adjustment</div><div class="sub">Exit + re-enter on ±X%</div></div><div class="sw on"><i></i></div></div>
+          <div class="row" style="justify-content:space-between"><div><div class="lbl">SuperTrend filter</div><div class="sub">5×1 preset</div></div><div class="sw on"><i></i></div></div>
+          <div class="row" style="justify-content:space-between"><div><div class="lbl">Re-entry rollover</div><div class="sub">Off</div></div><div class="sw"><i></i></div></div>
+          <div class="row" style="justify-content:space-between"><div><div class="lbl">Buffer strike</div><div class="sub">Off</div></div><div class="sw"><i></i></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    <div class="opt"><div class="lbl" style="font-weight:600;margin-bottom:6px;">Why this pairing</div>
+      <div style="font-size:.78rem;color:var(--ts);line-height:1.6;">→ <b style="color:var(--tp)">Switch + caption</b> stays familiar and scannable — no relearning.<br/>→ <b style="color:var(--tp)">Advanced accordion</b> cuts the default scroll by ~60%, surfacing only Index/Expiry/Dates first.<br/>→ A <b style="color:var(--tp)">"2 on" badge</b> shows active rules without expanding.<br/>→ Tri-state segments stay for non-binary settings (re-entry mode, underlying).</div>
+    </div>
+    <div class="opt"><div class="lbl" style="font-weight:600;margin-bottom:6px;">If you want denser instead</div>
+      <div style="font-size:.78rem;color:var(--ts);line-height:1.6;">Pair <b style="color:var(--tp)">checkbox-chips</b> (style 03) with a <b style="color:var(--tp)">chip toolbar</b> (placement 05) — every toggle in one strip above the legs. Best for power users on wide screens.</div>
+    </div>
+    <div class="opt"><div class="lbl" style="font-weight:600;margin-bottom:6px;">Effort</div>
+      <div style="font-size:.78rem;color:var(--ts);line-height:1.5;">Low — wrap existing toggles in a collapsible group. Pure presentation; no behavior change.</div>
+    </div>
+  </div>
+ </div>
+ <div class="bestfor" style="margin-top:22px;"><b>Pick a style number + a placement number</b> (e.g. "01 + 02") and I'll wire it into the live STRYK builder.</div>
+ <div class="tb"><div>STRYK</div><div>TOGGLES</div><div>RECOMMEND</div><div>04</div></div>
+</section>
+
+</body></html>

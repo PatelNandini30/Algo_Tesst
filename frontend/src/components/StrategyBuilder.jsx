@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
@@ -907,6 +907,13 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [results, setResults] = useState(null);
   const [rawResults, setRawResults] = useState(null);
   const [displayResults, setDisplayResults] = useState(null);
+  // STRYK sidebar nav (cosmetic — does not gate any rendering/logic)
+  const [activeView, setActiveView] = useState('build');
+  const resultsRef = useRef(null);
+  // Advanced rules & settings accordion — presentation only; controls stay mounted
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [legwiseOpen, setLegwiseOpen] = useState(false);
+  const [overallOpen, setOverallOpen] = useState(false);
   const [isRecalculating, setIsRecalculating] = useState(false);
   const [validationError, setValidationError] = useState(null);
   const [trailSLWarning, setTrailSLWarning] = useState(null);
@@ -2297,17 +2304,61 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
   }, [legs, loading, startDate, endDate, intradayEntryTime, intradaySquareOffTime, instrument]);
 
+  const strykNav = [
+    { id: 'build', label: 'Build', Icon: LayoutGrid, onClick: () => { setActiveView('build'); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
+    { id: 'results', label: 'Results', Icon: BarChart3, disabled: !displayResults, onClick: () => { if (displayResults) { setActiveView('results'); resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }); } } },
+    { id: 'optimize', label: 'Optimize', Icon: SlidersHorizontal, onClick: () => setOptimPanelOpen(true) },
+  ];
+
   return (
-    <div className="min-h-screen bg-base">
+    <div className="min-h-screen bg-base flex">
+      {/* STRYK Sidebar */}
+      <aside className="stryk-sidebar shrink-0 sticky top-0 h-screen flex flex-col gap-1 px-3 py-4" style={{ width: 220, zIndex: 40 }}>
+        <div className="flex items-center gap-2.5 px-2 pb-4">
+          <div className="logo-mark" style={{ width: 32, height: 32 }}>
+            <svg viewBox="0 0 48 48" aria-label="STRYK">
+              <defs>
+                <linearGradient id="strykLogoSide" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stopColor="#5a9ee0" />
+                  <stop offset="50%" stopColor="#387ed1" />
+                  <stop offset="100%" stopColor="#2ecc71" />
+                </linearGradient>
+              </defs>
+              <path d="M24 4 L40 13 L40 35 L24 44 L8 35 L8 13 Z" fill="none" stroke="url(#strykLogoSide)" strokeWidth="2" strokeLinejoin="round" opacity="0.45" />
+              <path d="M27 9 L15 26 L22.5 26 L20 39 L33 21 L25 21 Z" fill="url(#strykLogoSide)" stroke="url(#strykLogoSide)" strokeWidth="1.4" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <div className="flex flex-col leading-none">
+            <span className="app-name" style={{ fontSize: '1.05rem' }}>STRYK</span>
+          </div>
+        </div>
+        {strykNav.map(({ id, label, Icon, onClick, disabled }) => (
+          <button
+            key={id}
+            type="button"
+            onClick={onClick}
+            disabled={disabled}
+            className={`stryk-nav ${activeView === id ? 'active' : ''}`}
+            style={disabled ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+          >
+            <Icon className="nav-ic" size={16} />
+            {label}
+          </button>
+        ))}
+        <div className="mt-auto px-2" style={{ fontSize: '0.55rem', color: 'var(--text-muted)', lineHeight: 1.7, letterSpacing: '0.04em' }}>
+          STRYK Terminal<br />Midnight Teal
+        </div>
+      </aside>
+
+      {/* Main column */}
+      <div className="flex-1 min-w-0">
       {/* Header */}
       <header className="app-header px-6 py-3">
         <div className="max-w-screen-2xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="logo-mark"><span>SQ</span></div>
-            <div className="flex flex-col leading-none">
-              <span className="app-name">ShellQuant</span>
-              <span className="app-tagline mt-0.5">Options Backtester</span>
-            </div>
+          <div className="flex items-center gap-2.5">
+            <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.92rem', fontWeight: 800, letterSpacing: '-0.01em', color: 'var(--text-primary)', textTransform: 'capitalize' }}>{activeView}</span>
+            <span className="text-muted text-xs">/</span>
+            <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.72rem', color: 'var(--text-secondary)' }}>Options Backtester</span>
           </div>
           <div className="flex items-center gap-4 text-sm">
             <div className="flex items-center gap-2">
@@ -2377,29 +2428,15 @@ const [slippagePct, setSlippagePct] = useState(0);
         <div className="grid grid-cols-12 gap-4">
 
           {/* LEFT COLUMN - Configuration */}
-          <div className="col-span-5 space-y-3">
+          <div className="col-span-5 space-y-4">
             {/* Configuration Card */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
                 <div className="px-4 py-3 border-b border-subtle">
                   <h3 className="section-heading">Configuration</h3>
             </div>
             <div className="p-4 space-y-4">
-                {/* Backtest Mode toggle */}
-                <div>
-                  <label className="field-label">Backtest Mode</label>
-                  <div className="mode-pill">
-                    {[{ v: 'eod', label: 'EOD' }, { v: 'intraday', label: 'Intraday' }].map(({ v, label }) => (
-                      <button
-                        key={v}
-                        type="button"
-                        onClick={() => setBacktestMode(v)}
-                        className={backtestMode === v ? 'active' : ''}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                {/* Backtest Mode selector removed from UI — intraday handled by separate
+                    software. backtestMode stays 'eod' (default); logic left intact. */}
 
                 {/* Intraday-specific timing fields */}
                 {backtestMode === 'intraday' && (
@@ -2489,6 +2526,25 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </div>
                 )}
 
+              </div>
+            </div>
+
+            {/* Advanced Rules & Settings — its own card so it lines up with Legwise / Overall.
+                Presentation only: every control below stays mounted (display toggle),
+                so behavior is identical whether expanded or collapsed. */}
+            <div className="bg-surface rounded-lg border border-default shadow-sm">
+                <button
+                  type="button"
+                  className={`card-acc-header ${advancedOpen ? 'open' : ''}`}
+                  onClick={() => setAdvancedOpen(o => !o)}
+                  aria-expanded={advancedOpen}
+                >
+                  <h3 className="section-heading">{advancedOpen ? '▾' : '▸'} Advanced Rules &amp; Settings</h3>
+                  {[rolloverToggle, noRollover, strFilter.enabled, spotAdjustmentEnabled, bufferStrikeEnabled, chargesEnabled].filter(Boolean).length > 0 && (
+                    <span className="adv-badge">{[rolloverToggle, noRollover, strFilter.enabled, spotAdjustmentEnabled, bufferStrikeEnabled, chargesEnabled].filter(Boolean).length} on</span>
+                  )}
+                </button>
+                <div className="p-4 space-y-4" style={{ display: advancedOpen ? 'block' : 'none' }}>
                 {/* Rollover Toggle — EOD weekly/monthly only */}
                 {backtestMode === 'eod' && ['weekly', 'monthly'].includes(expiryBasis) && (
                   <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
@@ -2908,17 +2964,26 @@ const [slippagePct, setSlippagePct] = useState(0);
                     </div>
                   )}
                 </div>
+                </div>
             </div>
-          </div>
 
-            {/* Legwise Controls Card */}
+            {/* Legwise Controls Card — collapsible (presentation only; control stays mounted) */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
-                <div className="px-4 py-3 border-b border-subtle">
-                  <h3 className="section-heading">Legwise Controls</h3>
-              </div>
-              <div className="p-4 space-y-3">
+                <button
+                  type="button"
+                  className={`card-acc-header ${legwiseOpen ? 'open' : ''}`}
+                  onClick={() => setLegwiseOpen(o => !o)}
+                  aria-expanded={legwiseOpen}
+                >
+                  <h3 className="section-heading">{legwiseOpen ? '▾' : '▸'} Legwise Controls</h3>
+                  <span className="card-acc-chip">{squareOffMode === 'complete' ? 'Complete' : 'Partial'}</span>
+                </button>
+              <div className="p-4 space-y-3" style={{ display: legwiseOpen ? 'block' : 'none' }}>
                 <div className="flex items-center justify-between">
-                  <span className="text-xs text-secondary">Square Off Mode</span>
+                  <div className="flex flex-col">
+                    <span className="text-xs text-secondary">Square Off Mode</span>
+                    <span className="ctrl-caption">Partial exits each leg on its own SL/target; Complete closes all legs together.</span>
+                  </div>
                   <SegBtn
                     options={[{ value: 'partial', label: 'Partial' }, { value: 'complete', label: 'Complete' }]}
                     value={squareOffMode}
@@ -2930,16 +2995,27 @@ const [slippagePct, setSlippagePct] = useState(0);
               </div>
             </div>
 
-            {/* Overall Settings Card */}
+            {/* Overall Settings Card — collapsible (presentation only; controls stay mounted) */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
-                <div className="px-4 py-3 border-b border-subtle">
-                  <h3 className="section-heading">Overall Settings</h3>
-              </div>
-              <div className="p-4 space-y-4">
+                <button
+                  type="button"
+                  className={`card-acc-header ${overallOpen ? 'open' : ''}`}
+                  onClick={() => setOverallOpen(o => !o)}
+                  aria-expanded={overallOpen}
+                >
+                  <h3 className="section-heading">{overallOpen ? '▾' : '▸'} Overall Settings</h3>
+                  {[overallSLEnabled, overallTgtEnabled].filter(Boolean).length > 0 && (
+                    <span className="adv-badge">{[overallSLEnabled, overallTgtEnabled].filter(Boolean).length} on</span>
+                  )}
+                </button>
+              <div className="p-4 space-y-4" style={{ display: overallOpen ? 'block' : 'none' }}>
                 {/* Overall Stop Loss */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-secondary">Overall Stop Loss</span>
+                    <div className="flex flex-col">
+                      <span className="text-xs font-medium text-secondary">Overall Stop Loss</span>
+                      <span className="ctrl-caption">Exit the whole strategy when combined loss hits this limit.</span>
+                    </div>
                     <Toggle enabled={overallSLEnabled} onToggle={(val) => setOverallSLEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                   </div>
                   {overallSLEnabled && (
@@ -2966,7 +3042,10 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {/* Overall Target */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-medium text-secondary">Overall Target</span>
+                    <div className="flex flex-col">
+                      <span className="text-xs font-medium text-secondary">Overall Target</span>
+                      <span className="ctrl-caption">Exit the whole strategy when combined profit hits this target.</span>
+                    </div>
                     <Toggle enabled={overallTgtEnabled} onToggle={(val) => setOverallTgtEnabled(prev => val !== undefined ? Boolean(val) : !prev)} size="sm" />
                   </div>
                   {overallTgtEnabled && (
@@ -2996,7 +3075,7 @@ const [slippagePct, setSlippagePct] = useState(0);
           </div>
 
           {/* RIGHT COLUMN - Leg Builder (AlgoTest style) */}
-          <div className="col-span-7 space-y-3">
+          <div className="col-span-7 space-y-4">
 
             {/* ── Top configurator panel ── */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
@@ -3252,6 +3331,20 @@ const [slippagePct, setSlippagePct] = useState(0);
                 </div>
               </div>
             </div>
+
+            {/* ── Empty state — keeps the right column balanced before any legs exist ── */}
+            {legs.length === 0 && (
+              <div
+                className="bg-surface rounded-lg border border-default shadow-sm flex flex-col items-center justify-center text-center px-6"
+                style={{ minHeight: 260, borderStyle: 'dashed' }}
+              >
+                <span className="leg-index-badge" style={{ width: 42, height: 42, fontSize: '1.1rem', marginBottom: 14 }}>+</span>
+                <div style={{ fontFamily: 'Outfit, sans-serif', fontWeight: 600, fontSize: '0.92rem', color: 'var(--text-secondary)' }}>No legs added yet</div>
+                <div style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: 5, maxWidth: 340, lineHeight: 1.5 }}>
+                  Configure your leg above, then click <strong style={{ color: 'var(--accent-2)' }}>Add Leg</strong>. Added legs appear here — then Run Backtest.
+                </div>
+              </div>
+            )}
 
             {/* ── Added legs list ── */}
             {legs.length > 0 && (
@@ -4134,7 +4227,7 @@ const [slippagePct, setSlippagePct] = useState(0);
 
         {/* Results */}
         {displayResults && (
-          <div className="mt-4">
+          <div className="mt-4" ref={resultsRef}>
             {displayResults?.meta?.str_enabled && (
               <div className="mb-3 text-xs text-accent rounded px-3 py-2 inline-block" style={{ background: 'var(--accent-bg)', border: '1px solid var(--accent)', opacity: 0.9 }}>
                 STR {displayResults?.meta?.str_type}: {displayResults?.meta?.trades_before_str_filter} -&gt; {displayResults?.meta?.trades_after_str_filter}
@@ -4240,7 +4333,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             <button
               onClick={backtestMode === 'intraday' ? runIntradayBacktest : runBacktest}
               disabled={!canRunBacktest}
-              className="run-btn px-10 py-3 rounded-full"
+              className="run-btn px-9 py-3 rounded-xl"
             >
               {loading ? (
                 <>
@@ -4257,7 +4350,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             <button
               onClick={() => setOptimPanelOpen(true)}
               disabled={!canRunBacktest}
-              className="run-btn px-6 py-3 rounded-full"
+              className="run-btn px-7 py-3 rounded-xl"
               style={{
                 background: 'var(--accent-bg, #eff6ff)',
                 color: 'var(--accent, #2563eb)',
@@ -4331,6 +4424,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             totalLazyLegCount={totalLazyLegCount}
           />
         )}
+      </div>
       </div>
     </div>
   );
