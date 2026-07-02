@@ -113,11 +113,52 @@ def _expand_values(spec: Dict[str, Any]) -> List[Any]:
 
 
 def count_combinations(param_specs: Sequence[Dict[str, Any]]) -> int:
-    """Count the total Cartesian product size without materializing it."""
+    """Count the raw Cartesian product size without materializing it.
+
+    NOTE: this is the *raw* product and ignores gated-param collapsing (see
+    `effective_combo_count`). It stays O(1) and is used for the up-front
+    MAX_COMBOS ceiling check (an upper bound is exactly what's wanted there).
+    """
     total = 1
     for spec in param_specs:
         total *= len(_expand_values(spec))
     return total
+
+
+# ── Gated (conditional) parameters ──────────────────────────────────────────
+# When a gate path is swept to a FALSY value, the listed dependent params have
+# no effect on the engine, so keeping them as separate axes would just produce
+# functionally identical combos (e.g. every spot_adjustment_pct × direction
+# pairing while spot adjustment is OFF). We drop the dependents from such combos
+# and then dedupe, so the OFF branch collapses to a single combo per remaining
+# axis while the ON branch keeps its full sweep. This means the optimizer never
+# runs — nor emits ZIP files for — those duplicates.
+_SPOT_ADJ_KEYS = {"spot_adjustment_pct", "spot_adjustment_direction", "spot_adjustment_value"}
+_GATED_PARAMS: Dict[str, frozenset] = {
+    "spot_adjustment_enabled": frozenset(_SPOT_ADJ_KEYS),
+}
+
+
+def _prune_gated_combo(combo: Dict[str, Any]) -> Dict[str, Any]:
+    """Return `combo` with dependent params dropped whenever their gate is
+    present in the combo and falsy. Returns the same object when nothing to
+    prune, else a new dict."""
+    to_drop: set = set()
+    for gate_path, dependents in _GATED_PARAMS.items():
+        if gate_path in combo and not combo[gate_path]:
+            to_drop |= {d for d in dependents if d in combo}
+    if not to_drop:
+        return combo
+    return {k: v for k, v in combo.items() if k not in to_drop}
+
+
+def _combo_identity(combo: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+    """Hashable, order-independent identity of a combo for dedup."""
+    return tuple(sorted(combo.items(), key=lambda kv: kv[0]))
+
+
+def _has_gated(param_specs: Sequence[Dict[str, Any]]) -> bool:
+    return any((spec.get("path") in _GATED_PARAMS) for spec in param_specs)
 
 
 def expand_param_specs(
@@ -127,14 +168,40 @@ def expand_param_specs(
     Yield combos. Each combo is `{path: value}` for every spec.
 
     Order: lexicographic over input spec order. Reproducible.
+
+    When a gated toggle (see `_GATED_PARAMS`) is part of the sweep, combos are
+    pruned + deduped so the disabled branch doesn't emit duplicates. Grids with
+    no gated toggle take the original zero-overhead cartesian path unchanged.
     """
     if not param_specs:
         yield {}
         return
     paths = [spec["path"] for spec in param_specs]
     value_lists = [_expand_values(spec) for spec in param_specs]
+    if not _has_gated(param_specs):
+        for combo_values in product(*value_lists):
+            yield dict(zip(paths, combo_values))
+        return
+    seen: set = set()
     for combo_values in product(*value_lists):
-        yield dict(zip(paths, combo_values))
+        combo = _prune_gated_combo(dict(zip(paths, combo_values)))
+        identity = _combo_identity(combo)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        yield combo
+
+
+def effective_combo_count(param_specs: Sequence[Dict[str, Any]]) -> int:
+    """Number of DISTINCT combos actually run — equals the raw Cartesian
+    product unless a gated toggle is swept, in which case redundant combos are
+    collapsed. Materializes only when a gate is present (bounded by the
+    MAX_COMBOS check on the raw product done by the caller first)."""
+    if not param_specs:
+        return 1
+    if not _has_gated(param_specs):
+        return count_combinations(param_specs)
+    return sum(1 for _ in expand_param_specs(param_specs))
 
 
 def apply_combo(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dict[str, Any]:
@@ -147,7 +214,8 @@ def apply_combo(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dict[str, Any
 
 # Regex to match legs[N].strike_selection.value paths
 _STRIKE_VALUE_RE = re.compile(r"^legs\[(\d+)\]\.strike_selection\.value$")
-_SPOT_ADJ_KEYS = {"spot_adjustment_pct", "spot_adjustment_direction", "spot_adjustment_value"}
+# _SPOT_ADJ_KEYS is defined above (near _GATED_PARAMS) so the gating rule can
+# reference it at module load.
 
 
 def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dict[str, Any]:

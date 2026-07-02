@@ -98,6 +98,32 @@ impl Default for IndexOhlcCache {
 
 static INDEX_OHLC: Lazy<RwLock<Option<IndexOhlcCache>>> = Lazy::new(|| RwLock::new(None));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Futures (FUTIDX) cache — ADDITIVE, fully independent of MarketCache above.
+// Holds daily futures close keyed by (date_days, symbol_id, expiry_days). Used
+// by the multi-index futures-hedge pricing so futures legs price from Rust
+// instead of the slow per-date Python DB path. Never touches the options/spot
+// MarketCache, so the existing backtest path and its memory budget are unchanged.
+// ─────────────────────────────────────────────────────────────────────────────
+struct FuturesCache {
+    // (date_days, symbol_id, expiry_days) → close
+    futures: AHashMap<(i32, u16, i32), f32>,
+    symbol_ids: AHashMap<String, u16>,
+    symbol_names: Vec<String>,
+}
+
+impl Default for FuturesCache {
+    fn default() -> Self {
+        FuturesCache {
+            futures: AHashMap::new(),
+            symbol_ids: AHashMap::new(),
+            symbol_names: Vec::new(),
+        }
+    }
+}
+
+static FUTURES_CACHE: Lazy<RwLock<Option<FuturesCache>>> = Lazy::new(|| RwLock::new(None));
+
 pub(crate) fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
@@ -867,6 +893,109 @@ fn get_index_ohlc_close(date: String, symbol: String) -> Option<f64> {
 #[pyfunction]
 fn get_index_ohlc(date: String, symbol: String) -> Option<(f64, f64, f64, f64)> {
     lookup_index_ohlc(&date, &symbol)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Futures (FUTIDX) — ADDITIVE feather store/lookup. Independent of MarketCache.
+// Feather columns: Date, Symbol, ExpiryDate, Close.
+// ─────────────────────────────────────────────────────────────────────────────
+fn build_futures_from_batches(batches: Vec<arrow_array::RecordBatch>) -> FuturesCache {
+    let mut cache = FuturesCache::default();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    cache.futures.reserve(total + 16);
+
+    for batch in &batches {
+        let schema = batch.schema();
+        let (Some(idx_date), Some(idx_exp), Some(idx_close)) = (
+            schema.index_of("Date").ok(),
+            schema.index_of("ExpiryDate").ok(),
+            schema.index_of("Close").ok(),
+        ) else { continue };
+        let date_col = batch.column(idx_date).clone();
+        let exp_col = batch.column(idx_exp).clone();
+        let close_col = batch.column(idx_close).clone();
+        let sym_col = schema.index_of("Symbol").ok().map(|i| batch.column(i).clone());
+
+        for row in 0..batch.num_rows() {
+            let date_s = match to_iso_date_from_array(&date_col, row) { Some(v) => v, None => continue };
+            let date_days = match date_str_to_days(&date_s) { Some(v) => v, None => continue };
+            let exp_s = match to_iso_date_from_array(&exp_col, row) { Some(v) => v, None => continue };
+            let exp_days = match date_str_to_days(&exp_s) { Some(v) => v, None => continue };
+            let close_v = match to_f64_from_array(&close_col, row) { Some(v) => v, None => continue };
+
+            let sym_id = match sym_col.as_ref() {
+                Some(sc) if !sc.is_null(row) => match AnyStrArray::from_col(sc.as_ref()) {
+                    Some(sa) => {
+                        let raw = sa.value(row).trim();
+                        if raw.is_empty() {
+                            u16::MAX
+                        } else {
+                            intern_symbol(&mut cache.symbol_ids, &mut cache.symbol_names, &raw.to_uppercase())
+                        }
+                    }
+                    None => u16::MAX,
+                },
+                _ => u16::MAX,
+            };
+
+            cache.futures.insert((date_days, sym_id, exp_days), close_v as f32);
+        }
+    }
+    cache
+}
+
+/// Load (and MERGE) a futures feather into the global futures cache. Merging lets
+/// multiple symbols coexist; reloading the same symbol upserts.
+#[pyfunction]
+fn load_futures_cache(path: String) -> PyResult<()> {
+    let batches = load_table_from_path(&path)?;
+    let new_cache = build_futures_from_batches(batches);
+    let mut guard = FUTURES_CACHE.write().unwrap();
+    match guard.as_mut() {
+        Some(existing) => {
+            for ((date_days, new_sym_id, exp_days), close) in new_cache.futures.iter() {
+                let sym_id = match new_cache.symbol_names.get(*new_sym_id as usize) {
+                    Some(name) if !name.is_empty() => {
+                        intern_symbol(&mut existing.symbol_ids, &mut existing.symbol_names, name)
+                    }
+                    _ => u16::MAX,
+                };
+                existing.futures.insert((*date_days, sym_id, *exp_days), *close);
+            }
+        }
+        None => {
+            *guard = Some(new_cache);
+        }
+    }
+    Ok(())
+}
+
+#[pyfunction]
+fn clear_futures_cache() {
+    if let Ok(mut guard) = FUTURES_CACHE.write() {
+        *guard = None;
+    }
+}
+
+#[pyfunction]
+fn futures_is_loaded() -> bool {
+    FUTURES_CACHE.read().ok().and_then(|g| g.as_ref().map(|_| true)).unwrap_or(false)
+}
+
+/// Futures close for (date, symbol, expiry). Returns None if absent.
+#[pyfunction]
+fn get_future_price(date: String, symbol: String, expiry: String) -> Option<f64> {
+    let guard = FUTURES_CACHE.read().ok()?;
+    let cache = guard.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(&date))?;
+    let exp_days = date_str_to_days(&normalize_date_str(&expiry))?;
+    let sym_upper = symbol.trim().to_uppercase();
+    if let Some(&sym_id) = cache.symbol_ids.get(&sym_upper) {
+        if let Some(&v) = cache.futures.get(&(date_days, sym_id, exp_days)) {
+            return Some(v as f64);
+        }
+    }
+    cache.futures.get(&(date_days, u16::MAX, exp_days)).map(|&v| v as f64)
 }
 
 // ── Midcap overlay math (Rust port of services/midcap_overlay.compute_midcap_legs) ──
@@ -1772,5 +1901,10 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_index_ohlc_close, m)?)?;
     m.add_function(wrap_pyfunction!(get_index_ohlc, m)?)?;
     m.add_function(wrap_pyfunction!(compute_midcap_legs, m)?)?;
+    // Futures (FUTIDX) cache (additive — multi-index futures hedge)
+    m.add_function(wrap_pyfunction!(load_futures_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_futures_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(futures_is_loaded, m)?)?;
+    m.add_function(wrap_pyfunction!(get_future_price, m)?)?;
     Ok(())
 }

@@ -11,7 +11,7 @@
 #          intentional overcommit below; it is NOT off-limits like the old HDD swap.
 #
 # *** MEMORY REALITY ON THIS 16 GB BOX — READ BEFORE CHANGING LIMITS ***
-#   The hard limits below SUM TO ~21,962M (default stack) and therefore
+#   The hard limits below SUM TO ~17,400M (default stack) and therefore
 #   intentionally OVERCOMMIT the 14.8 GiB of RAM. This is only safe because:
 #     (a) the two 5 GB backtest workers each hold ~3.9 GB just for their own
 #         Rust/Arrow NIFTY cache (much of it mmap'd, cheap to page from SSD), and
@@ -38,18 +38,20 @@
 #   backend                        : 2500M
 #   worker-backtests               : 5000M  (own ~3.9 GB Rust cache)
 #   worker-backtests-fast          : 5000M  (own ~3.9 GB Rust cache)
-#   worker-backtests-intraday      : 2500M
-#   worker-backtests-intraday-slow : 1500M
 #   worker-uploads                 :  500M
-#   intraday-api                   :  512M
 #   frontend                       :  200M
-#   cron-warmup                    :   50M
 #   ───────────────────────────────────────
-#   Sum (default stack)            : 21,962M   (+6144M when worker-optimize active)
+#   Sum (default stack)            : 17,400M   (+10,000M when worker-optimize active)
 #   Host RAM                       : ~15,160M (14.8 GiB)
-#   → overcommit ~6.8 GB, backed by 24 GB SSD swap. Keep ONE heavy backtest hot
-#     at a time. If the intraday workers (2500M+1500M=4 GB) are unused, scale them
-#     to 0 to reclaim that RAM.
+#   → The default stack overcommits modestly; the optimize worker (profile-gated)
+#     adds 10,000M when running 2 concurrent optimize jobs (concurrency=2, P=3).
+#     This deliberately overcommits 16 GB onto the 24 GB NVMe swap. The memory
+#     ADMISSION GATE (HEAVY_MEMORY_BUDGET_MB=14000) bounds total ACTIVE heavy
+#     work — 2 optims + 1 backtest run together, a 4th heavy job QUEUES — so the
+#     overcommit can never exhaust RAM+swap (no OOM). All workers mmap-SHARE one
+#     copy of the OHLC feather, so real RAM is far below the per-container sums.
+#     (Intraday is a separate product — its workers/api + the intraday-only
+#     cron-warmup were removed, reclaiming ~4.5 GB for this headroom.)
 #
 # SSD-specific Postgres tuning (was HDD-tuned before the 2026-06 migration):
 #   - random_page_cost=1.1   (NVMe random reads are ~as cheap as sequential)
@@ -104,10 +106,14 @@ x-backend-env: &backend-env
   # until a running job releases its slot. Idle warm caches page to SSD swap and
   # don't count. Pure orchestration — see services/memory_gate.py (no math touched).
   HEAVY_MEMORY_GATE: "1"
-  HEAVY_MEMORY_BUDGET_MB: "7000"          # ~one heavy job + a light intraday
+  # Sized for: 2 concurrent optimize jobs (@ ~4500 each, P=3) + 1 backtest (5000)
+  # = 14000, so a backtest never queues behind optims. The gate still QUEUES a
+  # 4th heavy job (no overcommit); 24 GB NVMe swap is the final backstop. Real
+  # RAM is well under 14000 because all workers mmap-SHARE one copy of the OHLC
+  # feather (only the per-job f32 AHashMap ~2.6 GB is duplicated).
+  HEAVY_MEMORY_BUDGET_MB: "14000"
   HEAVY_COST_BACKTEST_MB: "5000"
-  HEAVY_COST_OPTIMIZE_MB: "6000"
-  HEAVY_COST_INTRADAY_MB: "2000"
+  HEAVY_COST_OPTIMIZE_MB: "4500"          # one optimize job at P=3 (was 6000 at P=6)
   HEAVY_GATE_WAIT_MAX_SECONDS: "600"      # then proceed anyway (SSD swap backstop)
   HEAVY_RESERVATION_TTL_SECONDS: "2400"   # auto-reclaim a crashed/cancelled slot
   # Route small ranges to a separate worker so they do not wait behind a long run.
@@ -355,16 +361,20 @@ services:
     # Shares the same image as worker-backtests; runs an exclusive 'optimize' queue
     # so long parameter sweeps don't block normal backtests.
     #
-    # concurrency=1: ONE optimize job at a time.
-    # In-job parallelism via OPTIMIZE_PARALLELISM=6 (billiard fork + CoW sharing).
-    # Memory budget after f32 AHashMap + no Polars ohlc_df (2026-05-28):
-    #   - Rust AHashMap (f32): ~2.6 GB (down from 3.5 GB with f64)
+    # concurrency=2: TWO optimize jobs at a time (results stay isolated per
+    # job_id — separate processes, separate optim:{job_id}:* keys + trade dirs).
+    # In-job parallelism HALVED to OPTIMIZE_PARALLELISM=3 so 2 jobs ≈ the CPU of
+    # one old P=6 job. Per-job memory at P=3 (billiard fork + CoW sharing):
+    #   - Rust AHashMap (f32): ~2.6 GB  (per JOB — duplicated across the 2 jobs)
     #   - pandas ohlc_df_pandas: ~75 MB (CoW-inherited by workers)
     #   - Python/Celery overhead: ~500 MB
-    #   - 6 workers × ~400 MB private pages: ~2.4 GB
-    #   - Total: ~5.6 GB → fits within 7000M with ~1.4 GB headroom
-    # Host impact: 5.6 GB optimizer + ~3 GB Chrome/GNOME + ~1 GB OS = ~10 GB
-    # (leaves 5 GB headroom on 16 GB machine — no OOM risk).
+    #   - 3 workers × ~400 MB private pages: ~1.2 GB
+    #   - Per job ≈ 4.3 GB → 2 jobs ≈ 8.6 GB (OHLC feather is mmap-shared, +~0.5)
+    # mem_limit raised to 10000M to hold both jobs (clean mmap pages reclaim
+    # first under pressure; cgroup won't OOM a job). Host impact when both run:
+    # ~9.5 GB optimizer + backtest (shares the OHLC mmap) + ~3 GB desktop +
+    # the separate intraday server — overcommits 16 GB onto the 24 GB NVMe swap;
+    # the memory gate caps total ACTIVE heavy work so it can never exhaust swap.
     profiles: ["optimize"]
     image: algotest-backend-app:latest
     container_name: algotest-worker-optimize
@@ -372,7 +382,7 @@ services:
     command: >
       celery -A worker.celery worker
       --queues=optimize
-      --concurrency=1
+      --concurrency=2
       -l info
       --max-memory-per-child=5000000
       --without-gossip
@@ -389,9 +399,10 @@ services:
       PYTHONOPTIMIZE: "1"
       BACKTEST_WORKERS: "1"
       OPTIMIZE_MAX_COMBOS: "100000"
-      # P=6: 6 billiard fork workers share the Rust AHashMap via CoW.
-      # Each worker adds ~400 MB private pages. Safe after f32 memory fix.
-      OPTIMIZE_PARALLELISM: "6"
+      # P=3: 3 billiard fork workers share the Rust AHashMap via CoW.
+      # Halved from 6 so 2 concurrent jobs (concurrency=2) use roughly the CPU/RAM
+      # of one old P=6 job. Each worker adds ~400 MB private pages.
+      OPTIMIZE_PARALLELISM: "3"
       # Keep MAE/MFE enabled so optimizer master-summary "Actual Live DD"
       # matches the downloaded tradesheet Summary sheet. If disabled, optimizer
       # summary falls back to booked DD/%DD while tradesheet downloads are
@@ -427,11 +438,13 @@ services:
     deploy:
       resources:
         limits:
-          # 7000M: f32 AHashMap (~2.6 GB) + pandas OHLC (75 MB CoW) +
-          # Python/Celery (500 MB) + 6 workers × 400 MB private = ~5.6 GB.
-          # 7000M gives ~1.4 GB headroom for spikes. Updated 2026-06-03.
-          memory: 7000M
-          cpus: "6.0"
+          # 10000M: holds TWO concurrent optimize jobs at P=3. Each job ≈ 4.3 GB
+          # (f32 AHashMap ~2.6 GB + Python/Celery ~0.5 GB + 3 workers × 0.4 GB),
+          # the OHLC feather is mmap-shared (counted once) → ~8.6 GB + headroom.
+          # Clean mmap pages reclaim under cgroup pressure before any OOM.
+          # cpus 8.0: 2 jobs × 3 billiard workers + parents. Updated 2026-06-24.
+          memory: 10000M
+          cpus: "8.0"
         reservations:
           memory: 256M
     networks:
@@ -452,14 +465,12 @@ services:
       --without-heartbeat
     environment:
       <<: *backend-env
-      INTRADAY_DATA_DIR: /data/intraday
     volumes:
       - ./cleaned_csvs:/data/cleaned_csvs:ro
       - ./expiryData:/data/expiryData:ro
       - ./strikeData:/data/strikeData:ro
       - ./Filter:/data/Filter:ro
       - algo_cache:/data/cache
-      - algo_cache:/data/intraday
     depends_on:
       postgres:
         condition: service_healthy
@@ -471,10 +482,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    labels:
-      ofelia.enabled: "true"
-      ofelia.job-exec.vmtouch-warmup.schedule: "0 30 0 * * *"
-      ofelia.job-exec.vmtouch-warmup.command: "/app/scripts/vmtouch_warmup.sh"
     deploy:
       resources:
         limits:
@@ -482,78 +489,6 @@ services:
           cpus: "0.5"
         reservations:
           memory: 128M
-    networks:
-      - algotest-network
-
-  cron-warmup:
-    image: mcuadros/ofelia:latest
-    restart: unless-stopped
-    command: daemon --docker
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    depends_on:
-      - worker-uploads
-    deploy:
-      resources:
-        limits:
-          memory: 50M
-          cpus: "0.1"
-    networks:
-      - algotest-network
-
-  worker-backtests-intraday:
-    image: algotest-backend-app:latest
-    container_name: algotest-worker-backtests-intraday
-    restart: unless-stopped
-    command: >
-      celery -A worker.celery worker
-      --queues=backtests_intraday
-      --concurrency=3
-      -l info
-      --max-memory-per-child=2200000
-      --without-gossip --without-mingle --without-heartbeat
-    environment: *backend-env
-    volumes: *backend-volumes
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          memory: 2500M
-          cpus: "3.0"
-        reservations:
-          memory: 512M
-    networks:
-      - algotest-network
-
-  worker-backtests-intraday-slow:
-    image: algotest-backend-app:latest
-    container_name: algotest-worker-backtests-intraday-slow
-    restart: unless-stopped
-    command: >
-      celery -A worker.celery worker
-      --queues=backtests_intraday_slow
-      --concurrency=1
-      -l info
-      --max-memory-per-child=1300000
-      --without-gossip --without-mingle --without-heartbeat
-    environment: *backend-env
-    volumes: *backend-volumes
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          memory: 1500M
-          cpus: "1.5"
-        reservations:
-          memory: 256M
     networks:
       - algotest-network
 
@@ -583,41 +518,6 @@ services:
           memory: 64M
     networks:
       - algotest-network
-
-  intraday-api:
-    build:
-      context: ./backend/intraday_server
-      dockerfile: Dockerfile
-      network: host
-      secrets:
-        - ca_bundle
-    ports:
-      - "8001:8001"
-    environment:
-      INTRADAY_DATA_DIR: /data/intraday
-      REDIS_URL: redis://redis:6379/0
-      RUST_LOG: info
-    volumes:
-      - algo_cache:/data
-      - /data/intraday:/data/intraday
-    depends_on:
-      - redis
-    restart: unless-stopped
-    container_name: algotest-intraday-api
-    networks:
-      - algotest-network
-    healthcheck:
-      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/8001; printf \"GET /api/intraday/health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; read -r line <&3; [[ $$line == *\"200 OK\"* ]]'"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-          cpus: "4.0"
-        reservations:
-          memory: 128M
 
 volumes:
   pgdata:

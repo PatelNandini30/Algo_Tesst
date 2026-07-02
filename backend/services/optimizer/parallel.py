@@ -269,6 +269,17 @@ def _worker_entrypoint(
         _to_date = base_payload.get("to_date") or base_payload.get("date_to") or ""
         _index_str = str(base_payload.get("index") or base_payload.get("symbol") or "NIFTY").upper()
 
+        # Midcap cross-index overlay config (from the run's base payload). Passed
+        # into the per-combo XLSX so its Summary mirrors the verified backtest /
+        # master summary (Combined Live DD etc.) instead of NIFTY-only stats.
+        _mc_legs = base_payload.get("midcap_legs") or None
+        _mc_sa = base_payload.get("midcap_spot_adjustment") or None
+        _mc_sym = (
+            (_mc_legs[0].get("symbol") if (_mc_legs and isinstance(_mc_legs[0], dict)) else None)
+            or "NIFTYMIDCAP100"
+        )
+        _filter_segments = base_payload.get("filter_segments") or None
+
         done = 0
         failures = 0
         for i, combo in enumerate(chunk):
@@ -316,6 +327,10 @@ def _worker_entrypoint(
                         to_date=_to_date,
                         index_str=_index_str,
                         trading_days=(_runner_mod._RUST_CONTEXT or {}).get("trading_days") or [],
+                        midcap_legs=_mc_legs,
+                        midcap_spot_adjustment=_mc_sa,
+                        midcap_symbol=_mc_sym,
+                        filter_segments=_filter_segments,
                     )
                 done += 1
                 logger.info(

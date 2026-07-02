@@ -41,7 +41,11 @@ from services.optimizer import result_store
 from services.optimizer.combo_labeler import label_combo, safe_filename
 from services.optimizer.metrics import compute_optim_metrics
 from services.optimizer.objective import resolve_objective
-from services.optimizer.param_expander import apply_combo_for_optim, count_combinations
+from services.optimizer.param_expander import (
+    apply_combo_for_optim,
+    count_combinations,
+    effective_combo_count,
+)
 from services.optimizer.samplers import build_sampler
 
 logger = logging.getLogger(__name__)
@@ -103,7 +107,11 @@ def validate_request(
                 f"Grid has {grid_size} combinations — exceeds cap of {MAX_COMBOS}. "
                 "Narrow your ranges or switch to random / smart sampling."
             )
-        return grid_size
+        # Return the DISTINCT count so progress/total reflect the combos that
+        # actually run. When a gated toggle (e.g. spot_adjustment_enabled) is
+        # swept OFF, its dependent params are collapsed → no duplicate combos
+        # or ZIP files. Equals grid_size when no gated toggle is present.
+        return effective_combo_count(param_specs)
     if method == "random":
         n = int(sample_n or 0)
         if n <= 0:
@@ -385,7 +393,7 @@ def _teardown_market_data() -> None:
         pass
 
 
-def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
+def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) -> None:
     """
     Enrich combo CSVs with MAE/MFE (OHLC already in _RUST_CONTEXT), build full
     XLSX tradesheets (Trade Sheet + Summary), and pack everything into a ZIP at
@@ -399,10 +407,10 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
     import pandas as _pd
     from services.optimizer.excel_builder import build_combo_xlsx as _build_xlsx
 
-    zip_dir = os.environ.get("OPTIMIZE_ZIP_DIR", "/data/cache/optim_zips")
-    zip_path = os.path.join(zip_dir, f"{job_id}.v2.zip")
+    zip_path = result_store.zip_cache_path(job_id, patchwise=patchwise)
     if os.path.isfile(zip_path):
         return
+    zip_dir = os.path.dirname(zip_path)
 
     trades_dir = result_store.get_trades_dir(job_id)
     if not os.path.isdir(trades_dir):
@@ -416,6 +424,18 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
     from_date = base_payload.get("from_date") or base_payload.get("date_from") or ""
     to_date   = base_payload.get("to_date")   or base_payload.get("date_to")   or ""
 
+    # Midcap cross-index overlay config (from the run's base payload). Hoisted to
+    # function scope so BOTH the master-summary correction (Step 0) and the
+    # per-combo XLSX build (Step 2) compute Combined stats the same way — the
+    # per-combo Summary must mirror the verified backtest / master summary.
+    _mc_legs = base_payload.get("midcap_legs") or None
+    _mc_sa   = base_payload.get("midcap_spot_adjustment") or None
+    _mc_sym  = (
+        (_mc_legs[0].get("symbol") if (_mc_legs and isinstance(_mc_legs[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    _filter_segments = base_payload.get("filter_segments") or None
+
     files = sorted(os.listdir(trades_dir))
     csv_files = [f for f in files if f.endswith(".csv")]
     root_files = {"summary.csv", "run_config.csv"}
@@ -424,20 +444,54 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
     if not combo_files:
         return
 
+    # Mirror routers/optimize.py's _build_zip_blocking EXACTLY — this pre-build
+    # writes to the same zip_cache_path, so on-demand downloads that hit an
+    # already-cached file (built here) must have identical structure, or the
+    # download endpoint's folder-split/naming never actually runs for most jobs
+    # (this pre-build fires right after job completion, beating the user's
+    # first download request to the cache).
+    import re as _re
+    _unsafe_zip_re = _re.compile(r'[/\\:*?"<>|]')
+    def _safe_zip_name(name: str) -> str:
+        return _unsafe_zip_re.sub('_', str(name or '').strip())
+
+    _meta_for_naming = result_store.get_meta(job_id) or {}
+    _zip_naming = _meta_for_naming.get("zip_naming") or {}
+    if _zip_naming:
+        _l1 = _safe_zip_name(_zip_naming.get("level1", "")) or "tradesheets"
+        _l2 = _safe_zip_name(_zip_naming.get("level2", ""))
+        _l3 = _safe_zip_name(_zip_naming.get("level3", ""))
+        tradesheets_root = "/".join(p for p in [_l1, _l2, _l3] if p)
+    else:
+        tradesheets_root = "tradesheets"
+
+    _has_no_adj = any("NoAdjustment" in f for f in combo_files)
+    _has_adj    = any("NoAdjustment" not in f for f in combo_files)
+    _use_adj_folders = _has_no_adj and _has_adj
+    _no_adj_seen: set = set()
+
+    def _arc_base(label_safe: str) -> Optional[str]:
+        """Combo's archive path (without extension), or None to skip (deduped
+        No-Adjustment repeat)."""
+        if _use_adj_folders:
+            subfolder = "No_Adjustment" if "NoAdjustment" in label_safe else "Adjustment"
+            if subfolder == "No_Adjustment":
+                base = label_safe.split("_", 1)[1] if "_" in label_safe else label_safe
+                if base in _no_adj_seen:
+                    return None
+                _no_adj_seen.add(base)
+            return f"{tradesheets_root}/{subfolder}/{label_safe}"
+        return f"{tradesheets_root}/{label_safe}"
+
     # ── Step 0: Compute corrected metrics (same formulas as XLSX Summary Sheet) ─
     # Enrich each CSV with MAE/MFE in-memory, then derive every stat via the same
     # path as excel_builder._write_summary_sheet, and push corrections to Redis +
     # rewrite summary.csv so the master summary matches each combo XLSX exactly.
     try:
         from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _compute_metrics
-        # Midcap overlay config (additive). When present, the master summary
-        # metrics are computed on the COMBINED P&L via the same native engine.
-        _mc_legs = base_payload.get("midcap_legs") or None
-        _mc_sa   = base_payload.get("midcap_spot_adjustment") or None
-        _mc_sym  = (
-            (_mc_legs[0].get("symbol") if (_mc_legs and isinstance(_mc_legs[0], dict)) else None)
-            or "NIFTYMIDCAP100"
-        )
+        # Midcap overlay config (_mc_legs/_mc_sa/_mc_sym) is derived once at
+        # function scope above. When present, the master summary metrics are
+        # computed on the COMBINED P&L via the same native engine.
         _all_results = result_store.get_all_results(job_id)
         _result_by_label = {
             r.get("combo_label_safe", ""): r
@@ -507,16 +561,20 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
                 for xlsx_fname in xlsx_files_disk:
                     label_safe = xlsx_fname[:-5]
                     if label_safe in combo_labels_set:
-                        zf.write(
-                            os.path.join(trades_dir, xlsx_fname),
-                            f"tradesheets/{xlsx_fname}",
-                        )
+                        arc_base = _arc_base(label_safe)
+                        if arc_base is not None:
+                            zf.write(
+                                os.path.join(trades_dir, xlsx_fname),
+                                f"{arc_base}.xlsx",
+                            )
                 for fname in combo_files:
                     label_safe = fname[:-4]
                     if label_safe not in xlsx_labels_set:
                         fpath = os.path.join(trades_dir, fname)
                         if os.path.isfile(fpath):
-                            zf.write(fpath, f"tradesheets/{fname}")
+                            arc_base = _arc_base(label_safe)
+                            if arc_base is not None:
+                                zf.write(fpath, f"{arc_base}.csv")
             os.replace(tmp_path, zip_path)
             logger.info(
                 "[OPTIM] Pre-built ZIP for job %s (fast-path, per-combo XLSX): %d xlsx",
@@ -582,6 +640,11 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
                 combo_label=row.get("combo_label") or label_safe,
                 from_date=from_date,
                 to_date=to_date,
+                midcap_legs=_mc_legs,
+                midcap_spot_adjustment=_mc_sa,
+                midcap_symbol=_mc_sym,
+                filter_segments=_filter_segments,
+                patchwise=patchwise,
             )
             return label_safe, xlsx_bytes, None
         except Exception as _e:
@@ -607,13 +670,17 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
                 if fname in root_files:
                     zf.write(os.path.join(trades_dir, fname), fname)
             for label_safe, xlsx_bytes in xlsx_results.items():
-                zf.writestr(f"tradesheets/{label_safe}.xlsx", xlsx_bytes)
+                arc_base = _arc_base(label_safe)
+                if arc_base is not None:
+                    zf.writestr(f"{arc_base}.xlsx", xlsx_bytes)
             for fname in combo_files:
                 label_safe = fname[:-4]
                 if label_safe not in xlsx_results:
                     fpath = os.path.join(trades_dir, fname)
                     if os.path.isfile(fpath):
-                        zf.write(fpath, f"tradesheets/{fname}")
+                        arc_base = _arc_base(label_safe)
+                        if arc_base is not None:
+                            zf.write(fpath, f"{arc_base}.csv")
         os.replace(tmp_path, zip_path)
         n_fallback = len(combo_files) - len(xlsx_results)
         logger.info(
@@ -627,6 +694,157 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict) -> None:
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
+    """
+    Pre-build WOW/MOM XLSX files (overall and patchwise) right after sweep
+    completes so every subsequent download is a fast FileResponse from disk.
+    """
+    import pandas as _pd
+    from openpyxl import Workbook
+    from services.optimizer.excel_builder import build_cleaned_for_combo
+    from services.optimizer.wow_mom import write_merged_wow_mom
+    import re as _re
+
+    meta = result_store.get_meta(job_id)
+    if not meta:
+        return
+
+    trades_dir = result_store.get_trades_dir(job_id)
+    if not os.path.isdir(trades_dir):
+        return
+
+    midcap_legs = base_payload.get("midcap_legs") or None
+    midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
+    midcap_sym  = (
+        (midcap_legs[0].get("symbol") if (midcap_legs and isinstance(midcap_legs[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    filter_segments = base_payload.get("filter_segments") or None
+
+    label_by_safe: dict = {}
+    cols_by_safe: dict = {}
+    for row in result_store.get_all_results(job_id):
+        cls = row.get("combo_label_safe")
+        if cls:
+            label_by_safe[cls] = row.get("combo_label") or cls
+            cols_by_safe[cls] = row.get("combo_columns") or {}
+
+    files = sorted(os.listdir(trades_dir))
+    combo_csvs = [f for f in files if f.endswith(".csv") and f not in ("summary.csv", "run_config.csv")]
+    if not combo_csvs:
+        return
+
+    def _adj_display(raw):
+        s = (raw or "").strip()
+        if not s or s.lower().startswith("noadjust"):
+            return "No Adj"
+        m = _re.match(r"(RiseBy|FallsBy|RisesOrFallsBy)([\d.]+)%?", s)
+        if m:
+            word = {"RiseBy": "Rise", "FallsBy": "Fall", "RisesOrFallsBy": "Rise or Fall"}[m.group(1)]
+            return f"{word} {m.group(2)}%"
+        return s
+
+    def _strike_display(cc):
+        def fmt(lbl, cepe):
+            if not lbl or lbl == "-":
+                return None
+            return f"{cepe} {str(lbl).replace('_', ' ')}"
+        parts = [p for p in (fmt(cc.get("call_strike_label"), "CE"),
+                              fmt(cc.get("put_strike_label"), "PE")) if p]
+        return " ".join(parts) if parts else "Strategy"
+
+    def _read_combos(pw: bool):
+        combos = []
+        for fname in combo_csvs:
+            label_safe = fname[:-4]
+            try:
+                tdf = _pd.read_csv(os.path.join(trades_dir, fname))
+            except Exception as exc:
+                logger.warning("[WOW_MOM pre] read failed %s: %s", fname, exc)
+                continue
+            try:
+                cleaned, has_midcap = build_cleaned_for_combo(
+                    tdf, midcap_legs, midcap_sa, midcap_sym,
+                    patchwise=pw,
+                    filter_segments=filter_segments,
+                )
+            except Exception as exc:
+                logger.warning("[WOW_MOM pre] cleaned build failed %s: %s", fname, exc)
+                continue
+            cc = cols_by_safe.get(label_safe) or {}
+            strike_disp = _strike_display(cc)
+            adj_label   = _adj_display(cc.get("spot_adjustment"))
+            row_key = "|".join([strike_disp, str(cc.get("expiry") or ""), str(cc.get("shifting") or "")])
+            combos.append({
+                "title": f"{strike_disp} | {adj_label}" if cc else label_by_safe.get(label_safe, label_safe),
+                "cleaned": cleaned,
+                "has_midcap": has_midcap,
+                "adj_key": str(cc.get("spot_adjustment") or adj_label),
+                "adj_label": adj_label,
+                "row_key": row_key,
+            })
+        return combos
+
+    for pw in (False, True):
+        cache_path = result_store.wow_mom_cache_path(job_id, pw)
+        if os.path.isfile(cache_path):
+            continue
+        try:
+            combos = _read_combos(pw)
+            wb = Workbook()
+            wb.remove(wb.active)
+            if not write_merged_wow_mom(wb, combos):
+                continue
+            tmp_path = cache_path + ".building"
+            wb.save(tmp_path)
+            os.replace(tmp_path, cache_path)
+            logger.info("[OPTIM] WOW/MOM pre-built for job %s patchwise=%s", job_id[:8], pw)
+        except Exception as exc:
+            logger.warning("[OPTIM] WOW/MOM pre-build failed for job %s patchwise=%s: %s", job_id[:8], pw, exc)
+
+    # Pre-build patchwise summary JSON so /summary?patchwise=true is instant.
+    _summary_cache = result_store.patchwise_summary_cache_path(job_id)
+    if not os.path.isfile(_summary_cache):
+        try:
+            import json as _json
+            from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cmetrics
+            _all_results = result_store.get_all_results(job_id)
+            _trades_dir = result_store.get_trades_dir(job_id)
+            _filter_segs = base_payload.get("filter_segments") or None
+            _midcap_legs = base_payload.get("midcap_legs") or None
+            _midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
+            _midcap_sym  = (
+                (_midcap_legs[0].get("symbol") if (_midcap_legs and isinstance(_midcap_legs[0], dict)) else None)
+                or "NIFTYMIDCAP100"
+            )
+            _pw_rows = []
+            for _r in _all_results:
+                _ls = _r.get("combo_label_safe") or ""
+                _stored = _r.get("summary") or {}
+                _csv = os.path.join(_trades_dir, f"{_ls}.csv")
+                if not _ls or not os.path.isfile(_csv):
+                    _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": _stored})
+                    continue
+                try:
+                    _df = _pd.read_csv(_csv, dtype=str)
+                    _m = _cmetrics(
+                        _df, _stored,
+                        midcap_legs=_midcap_legs, midcap_spot_adjustment=_midcap_sa,
+                        midcap_symbol=_midcap_sym, patchwise=True,
+                        filter_segments=_filter_segs,
+                    )
+                    _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": {**_stored, **_m}})
+                except Exception as _e2:
+                    _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": _stored})
+            _tmp = _summary_cache + ".building"
+            with open(_tmp, "w") as _fh:
+                _json.dump({"rows": _pw_rows}, _fh)
+            os.replace(_tmp, _summary_cache)
+            logger.info("[OPTIM] patchwise summary pre-built for job %s (%d rows)", job_id[:8], len(_pw_rows))
+        except Exception as exc:
+            logger.warning("[OPTIM] patchwise summary pre-build failed for job %s: %s", job_id[:8], exc)
 
 
 def _warm_feather_page_cache(feather_root: str) -> None:
@@ -1432,6 +1650,7 @@ def run_optimization(
     job_id: str,
     *,
     base_payload: Dict[str, Any],
+    client_ip: Optional[str] = None,
     param_specs: Sequence[Dict[str, Any]],
     method: str = "exhaustive",
     sample_n: Optional[int] = None,
@@ -1464,7 +1683,8 @@ def run_optimization(
         # job meta) gets the date range AND the Midcap overlay config. Without
         # this, meta.base_payload was empty → ZIP combos had no Midcap columns.
         extra={"sample_n": sample_n, "algorithm": algorithm, "zip_naming": zip_naming,
-               "base_payload": base_payload},
+               "base_payload": base_payload,
+               "client_ip": client_ip},
     )
 
     result_store.write_run_config(
@@ -1562,7 +1782,9 @@ def run_optimization(
             )
             spill_path = result_store.maybe_spill_to_parquet(job_id)
             result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
-            _prebuild_csv_zip(job_id, base_payload)
+            _prebuild_csv_zip(job_id, base_payload, patchwise=False)
+            _prebuild_csv_zip(job_id, base_payload, patchwise=True)
+            _prebuild_wow_mom(job_id, base_payload)
             result_store.update_progress(job_id, done=agg["done"], total=total)
             result_store.mark_complete(job_id)
             logger.info(
@@ -1615,6 +1837,17 @@ def run_optimization(
     _seq_from_date = base_payload.get("from_date") or base_payload.get("date_from") or ""
     _seq_to_date = base_payload.get("to_date") or base_payload.get("date_to") or ""
     _seq_index_str = str(base_payload.get("index") or base_payload.get("symbol") or "NIFTY").upper()
+
+    # Midcap cross-index overlay config (from the run's base payload). Passed into
+    # the per-combo XLSX so its Summary mirrors the verified backtest / master
+    # summary (Combined Live DD etc.) instead of NIFTY-only stats.
+    _seq_mc_legs = base_payload.get("midcap_legs") or None
+    _seq_mc_sa = base_payload.get("midcap_spot_adjustment") or None
+    _seq_mc_sym = (
+        (_seq_mc_legs[0].get("symbol") if (_seq_mc_legs and isinstance(_seq_mc_legs[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    _seq_filter_segments = base_payload.get("filter_segments") or None
 
     done = 0
     failures = 0
@@ -1683,6 +1916,10 @@ def run_optimization(
                     to_date=_seq_to_date,
                     index_str=_seq_index_str,
                     trading_days=(_RUST_CONTEXT or {}).get("trading_days") or [],
+                    midcap_legs=_seq_mc_legs,
+                    midcap_spot_adjustment=_seq_mc_sa,
+                    midcap_symbol=_seq_mc_sym,
+                    filter_segments=_seq_filter_segments,
                 )
 
             if tell is not None:
@@ -1700,7 +1937,9 @@ def run_optimization(
 
         # Write master summary CSV for ZIP download
         result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
-        _prebuild_csv_zip(job_id, base_payload)
+        _prebuild_csv_zip(job_id, base_payload, patchwise=False)
+        _prebuild_csv_zip(job_id, base_payload, patchwise=True)
+        _prebuild_wow_mom(job_id, base_payload)
 
         result_store.update_progress(job_id, done=done)
         result_store.mark_complete(job_id)

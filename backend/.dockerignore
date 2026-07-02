@@ -9,7 +9,6 @@ __pycache__
 dist
 build
 native/target
-intraday_server/target
 .git
 .gitignore
 .vscode

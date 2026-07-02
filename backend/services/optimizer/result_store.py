@@ -30,6 +30,33 @@ OPTIM_TTL = int(os.getenv("OPTIMIZE_RESULT_TTL", "86400"))
 OPTIM_SPILL_THRESHOLD = int(os.getenv("OPTIMIZE_PARQUET_SPILL_AT", "10000"))
 OPTIM_PARQUET_DIR = os.getenv("OPTIMIZE_PARQUET_DIR", "/data/cache/optim_results")
 
+# ── ZIP cache ────────────────────────────────────────────────────────────────
+# Shared by runner.py (pre-build) and routers/optimize.py (download) so they
+# always agree on the filename. Bump ZIP_BUILDER_VERSION when the XLSX format
+# changes and old ZIPs must be invalidated.
+ZIP_CACHE_DIR = os.getenv("OPTIMIZE_ZIP_DIR", "/data/cache/optim_zips")
+ZIP_BUILDER_VERSION = "v16"
+
+
+def zip_cache_path(job_id: str, patchwise: bool = False) -> str:
+    """Canonical path for a job's pre-built ZIP file."""
+    os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
+    ver = f"{ZIP_BUILDER_VERSION}-pw" if patchwise else ZIP_BUILDER_VERSION
+    return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ver}.zip")
+
+
+def wow_mom_cache_path(job_id: str, patchwise: bool = False) -> str:
+    """Canonical path for a job's pre-built WOW/MOM XLSX file."""
+    os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
+    suffix = "-pw" if patchwise else ""
+    return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ZIP_BUILDER_VERSION}-wm{suffix}.xlsx")
+
+
+def patchwise_summary_cache_path(job_id: str) -> str:
+    """Canonical path for a job's pre-built patchwise summary JSON file."""
+    os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
+    return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ZIP_BUILDER_VERSION}-pw-summary.json")
+
 
 _client: Optional[redis.Redis] = None
 
@@ -374,6 +401,10 @@ def write_combo_xlsx(
     to_date: str = "",
     index_str: str = "",
     trading_days: Optional[List] = None,
+    midcap_legs=None,
+    midcap_spot_adjustment=None,
+    midcap_symbol: str = "NIFTYMIDCAP100",
+    filter_segments=None,
 ) -> None:
     """Write a single combo's XLSX tradesheet to disk (called per-combo during execution).
 
@@ -416,6 +447,10 @@ def write_combo_xlsx(
             combo_label=combo_label,
             from_date=from_date,
             to_date=to_date,
+            midcap_legs=midcap_legs,
+            midcap_spot_adjustment=midcap_spot_adjustment,
+            midcap_symbol=midcap_symbol,
+            filter_segments=filter_segments,
         )
         dirpath = get_trades_dir(job_id)
         os.makedirs(dirpath, exist_ok=True)

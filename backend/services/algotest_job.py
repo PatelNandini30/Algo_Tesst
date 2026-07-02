@@ -544,6 +544,21 @@ def _safe_clear_fast_lookup() -> None:
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     job_t0 = time.perf_counter()
     payload = _normalize_request(request)
+
+    # NEW FEATURE (opt-in, isolated): multi-index / multi-expiry legs.
+    # Reached ONLY when the new builder set this flag. Routes to a separate
+    # module that splits legs by (index, expiry) and runs each group through
+    # the existing engine path, then merges. Existing strategies (flag absent)
+    # never enter here and run completely unchanged. Skips the single-index
+    # validate_index_payload (each leg-group is validated by the engine per its
+    # own index via data availability).
+    if payload.get("multi_index_mode"):
+        payload = _resolve_effective_request(payload)
+        _mi_from = payload.get("_effective_from", payload.get("from_date"))
+        _mi_to = payload.get("_effective_to", payload.get("to_date"))
+        from services.multi_index_feature import run_multi_index_feature
+        return run_multi_index_feature(payload, _mi_from, _mi_to)
+
     validate_index_payload(payload)
     logger.debug("[SERVICE] entry_dte=%s exit_dte=%s", payload.get('entry_dte'), payload.get('exit_dte'))
     payload = _resolve_effective_request(payload)

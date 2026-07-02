@@ -3,6 +3,7 @@ Celery tasks for background processing.
 """
 import sys
 import os
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,8 @@ from database import DATABASE_URL
 from migrate_data import Migrator
 from sqlalchemy import create_engine, text
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 @celery_app.task(bind=True)
@@ -58,22 +61,28 @@ def run_algotest_job(self, params: dict):
     # below is unchanged. See services/memory_gate.py.
     from services import memory_gate
     rid = self.request.id or ""
+    client_ip = str((params or {}).get("_client_ip") or "unknown")
+    logger.info("[BACKTEST] job %s started from ip=%s", rid[:8], client_ip)
     memory_gate.acquire(
         rid,
         memory_gate.cost_for("backtest"),
         on_wait=lambda: self.update_state(
-            state='PROCESSING', meta={'status': 'queued: waiting for memory budget'}
+            state='PROCESSING', meta={'status': 'queued: waiting for memory budget', 'client_ip': client_ip}
         ),
     )
     try:
-        self.update_state(state='PROCESSING', meta={'status': 'Running AlgoTest backtest'})
+        self.update_state(state='PROCESSING', meta={'status': 'Running AlgoTest backtest', 'client_ip': client_ip})
         from services.algotest_job import execute_algotest_job
         result = execute_algotest_job(params)
-        return _sanitize_result(result)
+        safe_result = _sanitize_result(result)
+        if isinstance(safe_result, dict):
+            safe_result["client_ip"] = client_ip
+        return safe_result
     except Exception as e:
         return _sanitize_result({
             'status': 'error',
-            'message': str(e)
+            'message': str(e),
+            'client_ip': client_ip,
         })
     finally:
         memory_gate.release(rid)
@@ -92,19 +101,22 @@ def run_optimize_job(self, spec: dict):
     # sweep starts; if busy the job waits (queued) instead of overcommitting RAM.
     from services import memory_gate
     rid = self.request.id or ""
+    client_ip = str((spec or {}).get("client_ip") or "unknown")
+    logger.info("[OPTIM] job %s started from ip=%s", rid[:8], client_ip)
     memory_gate.acquire(
         rid,
         memory_gate.cost_for("optimize"),
         on_wait=lambda: self.update_state(
-            state='PROCESSING', meta={'status': 'queued: waiting for memory budget'}
+            state='PROCESSING', meta={'status': 'queued: waiting for memory budget', 'client_ip': client_ip}
         ),
     )
     try:
         from services.optimizer.runner import run_optimization
-        self.update_state(state='PROCESSING', meta={'status': 'Starting optimization'})
+        self.update_state(state='PROCESSING', meta={'status': 'Starting optimization', 'client_ip': client_ip})
         result = run_optimization(
             job_id=self.request.id,
             base_payload=spec.get('base_payload') or {},
+            client_ip=client_ip,
             param_specs=spec.get('param_specs') or [],
             method=spec.get('method') or 'exhaustive',
             sample_n=spec.get('sample_n'),
@@ -129,9 +141,12 @@ def run_optimize_job(self, spec: dict):
                     break                       # ZIP is ready
         except Exception:
             pass  # Non-critical — ZIP will still build on-demand if this fails
-        return _sanitize_result(result)
+        safe_result = _sanitize_result(result)
+        if isinstance(safe_result, dict):
+            safe_result["client_ip"] = client_ip
+        return safe_result
     except Exception as e:
-        return _sanitize_result({'status': 'error', 'message': str(e)})
+        return _sanitize_result({'status': 'error', 'message': str(e), 'client_ip': client_ip})
     finally:
         memory_gate.release(rid)
 

@@ -593,6 +593,52 @@ def get_index_ohlc(symbol: str, date):
         return None
 
 
+# ── Futures (FUTIDX) cache wrappers (additive — multi-index futures hedge) ──
+def load_futures_cache(path) -> bool:
+    """Load (merge) a futures feather (Date,Symbol,ExpiryDate,Close) into the native cache."""
+    native = _load_native()
+    if native is None or not hasattr(native, "load_futures_cache"):
+        return False
+    try:
+        native.load_futures_cache(str(path))
+        return True
+    except Exception as exc:
+        logger.warning("[RUST_FAST] load_futures_cache failed for %s: %s", path, exc)
+        return False
+
+
+def futures_is_loaded() -> bool:
+    native = _load_native()
+    if native is None or not hasattr(native, "futures_is_loaded"):
+        return False
+    try:
+        return bool(native.futures_is_loaded())
+    except Exception:
+        return False
+
+
+def clear_futures_cache() -> None:
+    native = _load_native()
+    if native is None or not hasattr(native, "clear_futures_cache"):
+        return
+    try:
+        native.clear_futures_cache()
+    except Exception as exc:
+        logger.debug("[RUST_FAST] clear_futures_cache failed: %s", exc)
+
+
+def get_future_price(symbol: str, date, expiry) -> Optional[float]:
+    """Futures close for (symbol, date, expiry) from the native cache, or None."""
+    native = _load_native()
+    if native is None or not hasattr(native, "get_future_price"):
+        return None
+    try:
+        return native.get_future_price(_to_date_str(date), str(symbol).upper(), _to_date_str(expiry))
+    except Exception as exc:
+        logger.debug("[RUST_FAST] get_future_price failed: %s", exc)
+        return None
+
+
 def compute_midcap_legs_available() -> bool:
     native = _load_native()
     return native is not None and hasattr(native, "compute_midcap_legs")

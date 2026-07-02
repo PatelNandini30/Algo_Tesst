@@ -87,6 +87,10 @@ export default function OptimizationResults({
   const [zipProgress, setZipProgress] = useState(null);
   const [showDdMenu, setShowDdMenu] = useState(false);
   const [ddMode, setDdMode] = useState('overall');
+  // Method of the last successfully-downloaded tradesheets ZIP ('overall' |
+  // 'patchwise' | null). The master "Export XLSX" is gated behind this and must
+  // produce the summary in the SAME method so it matches the downloaded ZIP.
+  const [zipMethod, setZipMethod] = useState('patchwise');
   const pollRef = useRef(null);
 
   const fetchAll = useCallback(async () => {
@@ -136,6 +140,22 @@ export default function OptimizationResults({
   const total = meta?.total ?? totalCombos ?? 0;
   const progressPct = total > 0 ? Math.round((done / total) * 100) : 0;
   const status = meta?.status || jobStatus || 'queued';
+
+  // Free the optimizer worker if the user closes the tab, hard-refreshes, or
+  // navigates away mid-run. `pagehide` covers close/refresh/navigation but not a
+  // plain tab-switch. `keepalive` lets the DELETE outlive the page unload; the
+  // backend DELETE revokes the Celery task and releases the memory gate. Skip
+  // once the job has finished so we don't DELETE completed results.
+  useEffect(() => {
+    if (!jobId || status === 'success' || status === 'failed') return undefined;
+    const cancelOnExit = () => {
+      try {
+        fetch(`/api/optimize/jobs/${jobId}`, { method: 'DELETE', keepalive: true });
+      } catch {}
+    };
+    window.addEventListener('pagehide', cancelOnExit);
+    return () => window.removeEventListener('pagehide', cancelOnExit);
+  }, [jobId, status]);
 
   // Pre-build the ZIP silently as soon as the job succeeds so it's ready
   // when the user clicks download instead of making them wait then.
@@ -215,29 +235,46 @@ export default function OptimizationResults({
   }
 
   async function exportExcel() {
+    // Honor the user-selected download method. For patchwise, pull the
+    // patchwise-recomputed per-combo metrics from the backend (same compute that
+    // builds the patchwise ZIP's summary.csv) so this excel matches the ZIP.
+    let summaryByCombo = null;
+    if (zipMethod === 'patchwise') {
+      try {
+        const r = await fetch(`/api/optimize/jobs/${jobId}/summary?patchwise=true`);
+        if (r.ok) {
+          const data = await r.json();
+          summaryByCombo = new Map(
+            (data.rows || []).map((x) => [String(x.combo_id), x.summary || {}])
+          );
+        } else {
+          alert('Failed to build patchwise summary — exporting overall instead.');
+        }
+      } catch (e) {
+        alert(`Failed to build patchwise summary (${e?.message || e}) — exporting overall instead.`);
+      }
+    }
+
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Optimization Summary');
     // Build header with Sr.No first, then optimized-param cols, then Duration, then master summary.
     const headers = [
       'Sr. No.',
-      ...paramColumns.map((p) => p.label),
-      'Duration (ms)',
       ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => c.label),
     ];
     ws.addRow(headers);
     ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
     ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } };
     ws.getRow(1).alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.views = [{ state: 'frozen', xSplit: 1 + paramColumns.length, ySplit: 1 }];
+    ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
 
     rows.forEach((row, i) => {
-      const summary = row.summary || {};
+      const summary =
+        (summaryByCombo && summaryByCombo.get(String(row.combo_id))) ||
+        row.summary || {};
       const cols = row.combo_columns || {};
-      const combo = row.combo || {};
       const arr = [
         i + 1,
-        ...paramColumns.map((p) => combo[p.key]),
-        row.elapsed_ms != null ? Number(row.elapsed_ms) : null,
         ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => {
           if (c.key in cols) return cols[c.key];
           if (c.key in summary) return summary[c.key];
@@ -255,10 +292,35 @@ export default function OptimizationResults({
     });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `optimize_${jobId}.xlsx`;
+    a.download = `optimize_${jobId}${zipMethod === 'patchwise' ? '_patchwise' : '_overall'}.xlsx`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+  }
+
+  async function downloadWowMom() {
+    try {
+      const query = zipMethod === 'patchwise' ? '?patchwise=true' : '';
+      const r = await fetch(`/api/optimize/jobs/${jobId}/wow_mom.xlsx${query}`);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        alert(err.detail || err.error || 'Failed to download WOW/MOM summary');
+        return;
+      }
+      const blob = await r.blob();
+      const filename =
+        r.headers.get('x-filename') ||
+        `optimize_${jobId.slice(0, 8)}_WOW_MOM.xlsx`;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    } catch (e) {
+      alert(`Failed to download WOW/MOM summary: ${e?.message || e}`);
+    }
   }
 
   async function downloadTradesheets(patchwise = false) {
@@ -287,6 +349,8 @@ export default function OptimizationResults({
           a.click();
           document.body.removeChild(a);
           setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+          // Unlock the master "Export XLSX" and pin it to this download method.
+          setZipMethod(patchwise ? 'patchwise' : 'overall');
           return;
         }
         if (r.status === 202) {
@@ -539,21 +603,41 @@ export default function OptimizationResults({
             )}
             <button
               onClick={exportExcel}
-              disabled={rows.length === 0}
+              disabled={rows.length === 0 || status !== 'success'}
+              title={`Export master summary (${zipMethod === 'patchwise' ? 'Patchwise DD' : 'Overall System DD'})`}
               style={{
                 padding: '6px 12px',
                 fontSize: 11,
                 border: '1px solid var(--border-strong, #d1d5db)',
                 borderRadius: 6,
                 background: 'transparent',
-                cursor: rows.length === 0 ? 'not-allowed' : 'pointer',
+                cursor: (rows.length === 0 || status !== 'success') ? 'not-allowed' : 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 6,
-                opacity: rows.length === 0 ? 0.4 : 1,
+                opacity: (rows.length === 0 || status !== 'success') ? 0.4 : 1,
+              }}
+              >
+                <Download size={12} /> Export XLSX ({zipMethod === 'patchwise' ? 'Patchwise' : 'Overall'})
+              </button>
+            <button
+              onClick={downloadWowMom}
+              disabled={rows.length === 0 || status !== 'success'}
+              title={`Download the merged WOW/MOM summary for all combos (${zipMethod === 'patchwise' ? 'Patchwise DD' : 'Overall System DD'})`}
+              style={{
+                padding: '6px 12px',
+                fontSize: 11,
+                border: '1px solid var(--border-strong, #d1d5db)',
+                borderRadius: 6,
+                background: 'transparent',
+                cursor: (rows.length === 0 || status !== 'success') ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                opacity: (rows.length === 0 || status !== 'success') ? 0.4 : 1,
               }}
             >
-              <Download size={12} /> Export XLSX
+              <Download size={12} /> WOW & MOM ({zipMethod === 'patchwise' ? 'Patchwise' : 'Overall'})
             </button>
             <div style={{ position: 'relative' }}>
               <button
@@ -595,15 +679,15 @@ export default function OptimizationResults({
                 }}>
                   <button
                     style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', border: 'none', cursor: 'pointer', display: 'block' }}
-                    onClick={() => { setShowDdMenu(false); setDdMode('overall'); downloadTradesheets(false); }}
-                  >
-                    Overall System DD
-                  </button>
-                  <button
-                    style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', borderTop: '1px solid var(--border)', cursor: 'pointer', display: 'block' }}
                     onClick={() => { setShowDdMenu(false); setDdMode('patchwise'); downloadTradesheets(true); }}
                   >
                     Patchwise DD
+                  </button>
+                  <button
+                    style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', borderTop: '1px solid var(--border)', cursor: 'pointer', display: 'block' }}
+                    onClick={() => { setShowDdMenu(false); setDdMode('overall'); downloadTradesheets(false); }}
+                  >
+                    Overall System DD
                   </button>
                 </div>
               )}
@@ -799,47 +883,8 @@ export default function OptimizationResults({
                       )}
                     </th>
                   );
-                  // Inject the optimized-param headers right after the Sr. No.
                   if (c.key === 'sr_no') {
-                    return [
-                      th,
-                      ...paramColumns.map((p, pi) => (
-                        <th
-                          key={`pcol-${p.key}-${pi}`}
-                          style={{
-                            padding: '8px 6px',
-                            textAlign: 'left',
-                            borderBottom: '1px solid var(--border-strong, #e5e7eb)',
-                            whiteSpace: 'nowrap',
-                            fontSize: 10,
-                            letterSpacing: '0.03em',
-                            background: 'var(--bg-elevated,#fef3c7)',
-                            color: '#92400e',
-                            fontWeight: 600,
-                          }}
-                          title={`Optimized parameter: ${p.key}`}
-                        >
-                          {p.label}
-                        </th>
-                      )),
-                      <th
-                        key="duration-header"
-                        style={{
-                          padding: '8px 6px',
-                          textAlign: 'right',
-                          borderBottom: '1px solid var(--border-strong, #e5e7eb)',
-                          whiteSpace: 'nowrap',
-                          fontSize: 10,
-                          letterSpacing: '0.03em',
-                          background: 'var(--bg-elevated,#dcfce7)',
-                          color: 'var(--accent, #166534)',
-                          fontWeight: 600,
-                        }}
-                        title="Wall-clock time spent running this single combination"
-                      >
-                        Duration (ms)
-                      </th>,
-                    ];
+                    return th;
                   }
                   return th;
                 })}
@@ -858,7 +903,7 @@ export default function OptimizationResults({
               {rows.length === 0 && (
                 <tr>
                   <td
-                    colSpan={visibleColumns.length + paramColumns.length + 2}
+                    colSpan={visibleColumns.length + 2}
                     style={{ padding: 20, textAlign: 'center', opacity: 0.5 }}
                   >
                     {status === 'running'
@@ -922,38 +967,7 @@ export default function OptimizationResults({
                         </td>
                       );
                       if (c.key === 'sr_no') {
-                        const dur = row.elapsed_ms;
-                        return [
-                          cell,
-                          ...paramColumns.map((p, pi) => (
-                            <td
-                              key={`pcol-${p.key}-${pi}`}
-                              style={{
-                                padding: '6px 6px',
-                                borderBottom: '1px solid var(--border, #f1f5f9)',
-                                whiteSpace: 'nowrap',
-                                background: 'var(--bg-elevated,#fffbeb)',
-                                fontWeight: 500,
-                              }}
-                            >
-                              {formatCell(combo[p.key])}
-                            </td>
-                          )),
-                          <td
-                            key="duration-cell"
-                            style={{
-                              padding: '6px 6px',
-                              borderBottom: '1px solid var(--border, #f1f5f9)',
-                              whiteSpace: 'nowrap',
-                              textAlign: 'right',
-                              background: 'var(--bg-elevated,#f0fdf4)',
-                              fontFamily: 'monospace',
-                              fontSize: 10,
-                            }}
-                          >
-                            {dur != null ? Number(dur).toFixed(1) : '—'}
-                          </td>,
-                        ];
+                        return cell;
                       }
                       return cell;
                     })}

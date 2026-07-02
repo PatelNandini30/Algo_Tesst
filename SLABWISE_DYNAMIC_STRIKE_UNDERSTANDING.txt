@@ -1,0 +1,562 @@
+================================================================================
+ SLABWISE DYNAMIC STRIKE — FEATURE UNDERSTANDING & RESEARCH NOTE
+ (Research-analyst write-up · NO CODE CHANGED · for review before any build)
+ Author: Claude Code  |  Date: 2026-06-25  |  Repo: Algo_Test_Software (EOD)
+================================================================================
+
+HOW TO READ THIS DOCUMENT
+-------------------------
+Section 1  - The one-paragraph idea.
+Section 2  - Vocabulary (Pivot, Peak, ROC, Slab) defined precisely.
+Section 3  - The pivot/peak engine, step by step, with a number line.
+Section 4  - The slab grid (the 2-D lookup) explained.
+Section 5  - ONE COMPLETE WORKED TRADE EXAMPLE, day by day, entry by entry.
+Section 6  - Where this plugs into the existing code (no change, just the seams).
+Section 7  - ALL OPEN QUESTIONS. Each question has:
+                (a) why it matters,
+                (b) the possible answers,
+                (c) a mini trade example showing how each answer changes the result,
+                (d) my recommended default.
+Section 8  - What I will deliver once the questions are answered.
+
+A NOTE ON SCOPE (your hard rule):
+  This is a COMPLETELY NEW, ADDITIVE feature. Nothing existing changes. It is
+  inert unless explicitly turned on. It must work WITH or WITHOUT Midcap, and it
+  must coexist with spot-adjustment, rollover, re-entry, filters and the
+  optimizer without altering any of their math.
+
+
+================================================================================
+ SECTION 1 — THE IDEA IN ONE PARAGRAPH
+================================================================================
+
+Today, a leg's strike is chosen ONCE by a fixed rule (e.g. "always sell the
+OTM 2% put"). "Slabwise Dynamic Strike" replaces that fixed rule with a
+USER-DEFINED GRID. At every entry the engine looks at WHERE the market is —
+how far it has moved (the "ROC slab", the ROW) and how many staircase-style
+down-legs it has taken (the "active pivot", the COLUMN) — and reads the strike
+offset out of the grid cell where that row meets that column. As the market
+grinds down, the cell selected walks the strike progressively from OTM toward
+ITM (or whatever gradient the user types into the grid). The market's structure
+is tracked by a chain of PIVOTS and PEAKS built off the daily index close.
+
+
+================================================================================
+ SECTION 2 — VOCABULARY (PRECISE DEFINITIONS)
+================================================================================
+
+PIVOT 1   = The phase start. Its close is the anchor of the whole chain.
+            (Your example: 18700.)
+
+PEAK 1    = The HIGHEST close seen since Pivot 1. It trails UP only.
+
+*** USER CONSTRAINT (added): PEAK 2 MUST ALWAYS BE GREATER THAN PEAK 1. ***
+    Generalised: peaks are STRICTLY INCREASING across cycles
+    (Peak1 < Peak2 < Peak3 < ...). The peak is therefore a GLOBAL RUNNING
+    MAXIMUM that only ratchets UP and NEVER resets down to a new pivot.
+    A new pivot cycle (advancing the column) is recognised ONLY AFTER the
+    market prints a NEW HIGH above the previous cycle's peak and THEN falls N%
+    from that new high.
+    BIG CONSEQUENCE: in a pure downtrend made of LOWER highs, NO Pivot 3/4...
+    ever forms. Pivot 2 simply keeps TRAILING DOWN to capture the drawdown low.
+    The staircase only steps to the next column on a higher-high-then-N%-fall.
+
+N%        = The single user-defined fall threshold (your example: -5%). It is
+            the SAME for every cycle of the staircase.
+
+PIVOT 2   = The FIRST close that is N% or more below Peak 1. Once set, it
+            TRAILS DOWN only: every new LOWER close becomes the new Pivot 2.
+            It never trails back up.
+            (Your example: Peak1=1000, close 949 = -5.1% -> Pivot2 = 949;
+             later close 935 -> Pivot2 = 935; a close of 960 does NOT move it.)
+
+PEAK 2    = A NEW running-max high that is STRICTLY GREATER THAN PEAK 1, made at
+            some point after Pivot 2. Until such a higher high prints, there is
+            no Peak 2 and hence no Pivot 3.
+PIVOT 3   = The first close N% below Peak 2. Trails down. ...and so on, with
+            Peak 3 > Peak 2 required for Pivot 4, etc.
+
+So the staircase is:
+   Pivot1 -> (Peak1) -> Pivot2 (trails down) -> [wait for NEW HIGH > Peak1 = Peak2]
+          -> Pivot3 -> [wait for NEW HIGH > Peak2 = Peak3] -> Pivot4 -> ...
+
+ROC       = "Rate of Change" — a percentage move used to pick the SLAB (the row).
+            *** WHICH two points define this % is OPEN QUESTION A — see Sec 7. ***
+            Working assumption in this doc: ROC = % change of the current close
+            vs the PIVOT 1 anchor (cumulative). Flagged everywhere it matters.
+
+SLAB      = A user-defined ROC band (row). Example bands: 0-5, 5-10, 10-15,
+            15-20, 20+. Boundaries are user-editable.
+
+ACTIVE PIVOT = Which pivot is currently the latest one established as of the
+            entry date. Before any N% fall happens we are on Pivot 1; after the
+            first N% fall we are on Pivot 2; etc. This selects the COLUMN.
+
+GRID CELL = grid[ ROC slab (row) ][ active pivot (column) ] = the strike offset
+            (ITM/ATM/OTM, value, in % OR points) to use for THIS entry.
+
+
+================================================================================
+ SECTION 3 — THE PIVOT / PEAK ENGINE, STEP BY STEP
+================================================================================
+
+Walk the daily index closes left to right. Maintain four things:
+   * active_pivot_index  (starts at 1)
+   * current_pivot_close (starts = Pivot 1 close; trails DOWN within a cycle)
+   * running_peak        (GLOBAL running max; starts = Pivot 1 close; UP only,
+                          NEVER resets down -- enforces Peak2 > Peak1 > ...)
+   * peak_at_last_pivot  (the peak value locked when the last pivot fired;
+                          starts = Pivot 1 close)
+
+For each new daily close C:
+   1. If C > running_peak:  running_peak = C        (peak ratchets UP only)
+   2. trigger = running_peak * (1 + N/100)          (N=-5 -> trigger = peak*0.95)
+   3. If C <= trigger:
+        a. If running_peak > peak_at_last_pivot:     <-- a NEW, HIGHER peak exists
+              => NEW CYCLE: active_pivot_index += 1
+                            peak_at_last_pivot = running_peak   (this is Peak_k,
+                              guaranteed strictly > the previous peak)
+                            current_pivot_close = C
+        b. Else (no new higher high since last pivot):
+              => SAME CYCLE: current_pivot_close = min(current_pivot_close, C)
+                 (Pivot just TRAILS DOWN; column does NOT advance)
+
+KEY POINT: running_peak NEVER resets to the new pivot. That is what guarantees
+Peak2 > Peak1, and it is why a downtrend of LOWER highs only trails Pivot 2 and
+never reaches Pivot 3.
+
+NUMBER-LINE PICTURE (N% = -5%), reflecting the Peak2>Peak1 rule:
+
+  18700(P1)            19500(Peak1)
+     |---------- rises ----------|
+                                  \  fall 5% from 19500 -> 18525 trigger
+                                   18500 <= 18525  => PIVOT 2 @ 18500
+                                     \
+                                      18000 (new low) => Pivot2 TRAILS to 18000
+                                        /
+                                   recover to 19200 (LOWER high, < 19500)
+                                        \  fall again to 18100
+                                         18100 -> still PIVOT 2 (no new high, so
+                                         NO Pivot 3 -- Peak would be 19200<19500)
+                                           /
+                                   rally to NEW HIGH 20600 (> 19500 = Peak2) ✓
+                                          \  fall 5% from 20600 -> 19570 trigger
+                                           19500 <= 19570 => PIVOT 3 @ 19500
+                                           (Peak2 20600 > Peak1 19500  ✓)
+
+
+================================================================================
+ SECTION 4 — THE SLAB GRID (THE 2-D LOOKUP)
+================================================================================
+
+Rows    = ROC slabs (how FAR the market has moved).
+Columns = active pivot (how MANY N% down-legs have formed).
+Cells   = the strike offset to use (ITM/ATM/OTM, value, % or points).
+
+Your example grid:
+
+   SLAB     ROC band   | Pivot1 col | Pivot2 col | Pivot3 col
+   -------- ---------- | ---------- | ---------- | ----------
+   Slab 1   0 - 5 %    |  OTM 2%    |  OTM 1%    |  ATM
+   Slab 2   5 - 10 %   |  OTM 1%    |  ATM       |  ITM 1%
+   Slab 3   10 - 15 %  |  ATM       |  ITM 1%    |  ITM 2%
+   Slab 4   15 - 20 %  |  ITM 1%    |  ITM 2%    |  ITM 3%
+   Slab 5   20 % +     |  ITM 2%    |  ITM 3%    |  ITM 4%
+
+Reading rule at any entry:
+   1. Find the active pivot     -> picks the COLUMN.
+   2. Compute ROC, find its band-> picks the ROW.
+   3. The cell = the offset fed into the EXISTING strike resolver.
+
+Notice the diagonal gradient: down-and-right = deeper ITM. Persisting,
+deepening down-moves push the sold strike steadily into the money.
+
+
+================================================================================
+ SECTION 5 — ONE COMPLETE WORKED TRADE EXAMPLE
+================================================================================
+
+SETUP (assumptions stated so you can correct them):
+   * Index: NIFTY (strike step 50). Strategy: weekly short PUT, one leg.
+   * Slabwise Dynamic Strike: ON for this leg, grid = Section 4 table.
+   * N% = -5%.  ROC basis = from Pivot 1 (cumulative)  [OPEN QUESTION A].
+   * Phase Start (Pivot 1) close = 18700.
+   * Pivots/ROC evaluated on the daily close up to & including entry day
+     [timing = OPEN QUESTION F].
+   * Strike offset applied against ATM-at-entry using existing mround +
+     CE/PE direction (PE: OTM = lower strike, ITM = higher strike).
+
+DAY-BY-DAY STRUCTURE (index close path; only key dates shown). This path now
+RESPECTS the rule "Peak2 > Peak1": the column only advances after a NEW HIGH.
+ROC shown two ways so you can see the Question-A impact (cumulative vs from-peak).
+
+  Date  Close  Pivot/Peak state                          Active ROC(cum  ROC(fall  Slab*  Cell*
+                                                          pivot  vs18700) frm peak)        offset
+  ----- -----  ---------------------------------------- ----- -------- --------- ------ ----------
+  Wk0   18700  P1=18700, running_peak=18700               P1    0.0%     0.0%      Slab1  OTM 2%
+  Wk2   19500  peak ratchets up to 19500 (=Peak1)         P1   +4.3%     0.0%      Slab1  OTM 2%
+  Wk3   18500  18500<=19500*.95(18525) => P2=18500        P2   -1.07%    -5.13%    Slab1* OTM 1%
+  Wk4   18000  new low; P2 TRAILS to 18000; peak=19500    P2   -3.74%    -7.69%    Slab1* OTM 1%
+  Wk5   19200  LOWER high (<19500): peak STAYS 19500       P2   +2.67%    -1.54%    Slab1* OTM 1%
+  Wk6   18100  fall again, but NO new high => still P2     P2   -3.21%    -7.18%    Slab1* OTM 1%
+  Wk7   20600  NEW HIGH > Peak1 => running_peak=20600(Pk2) P2   +10.16%   0.0%      Slab1  OTM 1%
+  Wk8   19500  19500<=20600*.95(19570) => P3=19500        P3   +4.28%    -5.34%    Slab1* ATM
+  Wk9   17500  new low; P3 TRAILS to 17500; peak=20600    P3   -6.42%    -15.05%   Slab2* ITM 1%
+
+  * "Slab*" shown for the FALL-FROM-PEAK ROC basis (Question A, answer A3),
+    because with the strict-higher-peak rule the cumulative-from-Pivot1 ROC is
+    often POSITIVE at pivot-formation time (price is back near new highs), which
+    under downside-only handling (Question B1) would collapse everything to
+    Slab1. This is the key new insight from the Peak2>Peak1 rule -- see below.
+
+HOW EACH ENTRY'S STRIKE IS PICKED (using FALL-FROM-PEAK ROC = answer A3):
+
+  Wk0  ATM=18700. Cell OTM 2% (PE=>lower). 18700*0.98=18326 -> SELL 18350 PE.
+  Wk3  On Pivot 2 col. Fall from peak 19500 = -5.13% -> Slab2? edge; take Slab1
+       per chosen inclusivity. Cell OTM 1%. ATM=18500 -> 18315 -> SELL 18300 PE.
+  Wk8  Pivot 3 col (new high 20600 made Peak2 first). Fall from 20600 to 19500
+       = -5.34% -> Slab2 boundary. Cell at Slab1xPivot3 = ATM. ATM=19500 ->
+       SELL 19500 PE.
+  Wk9  Still Pivot 3, deeper fall from peak 20600 to 17500 = -15.05% -> Slab4
+       region; with Slab2 x Pivot3 example grid = ITM 1%. ATM=17500 ->
+       17500*1.01=17675 -> SELL 17700 PE.   <-- strike now ITM.
+
+READING OF THE BEHAVIOUR (with Peak2>Peak1 enforced):
+  The column (Pivot 1->2->3) now advances ONLY on genuine higher-high-then-fall
+  cycles, so it is a "number of confirmed new-peak selloffs" counter, not just a
+  drawdown counter. Between those, Pivot 2 trails the low and the strike is
+  driven mostly by the ROW (how far below the peak we are).
+
+  *** IMPORTANT INTERACTION (re-confirm Question A): with the strict-higher-peak
+  rule, "ROC cumulative from Pivot 1" frequently reads POSITIVE exactly when a
+  new pivot forms (because a new ALL-TIME high just printed). That makes A1+B1
+  (downside-only) sit in Slab 1 most of the time. A3 (FALL FROM LATEST PEAK) is
+  the basis that stays meaningful under this rule -- so this note nudges the
+  recommendation for Question A toward A3. PLEASE CONFIRM A vs the new rule. ***
+
+
+================================================================================
+ SECTION 6 — WHERE IT PLUGS INTO THE EXISTING CODE (NO CHANGE — JUST THE SEAMS)
+================================================================================
+
+The codebase already has everything needed to FEED a chosen offset; the only
+new thing is the SENSOR that decides which offset:
+
+  * Strike math already exists:
+      generic_algotest_engine.py: _resolve_strike()          (line ~843)
+      native/src/simulate.rs: atm_offset_strike()            (line ~121)
+      native/src/simulate.rs: compute_strike_for_leg()       (line ~567)
+    These already support ATM / ITM% / OTM% / points offsets. The grid only
+    needs to choose WHICH offset to hand them.
+
+  * The daily-close series for pivots already exists and already flows to Rust:
+      base.py: get_strike_data() / _spot_lookup_table         (lines ~304, ~1537)
+      engine_rust.py: run_rust_engine_pipeline(spot_by_date=...) (line ~2352)
+
+  * An entry-relative ROC already exists, but ONLY as a re-entry trigger,
+    NOT as a trailing/pivot indicator — confirming this pivot logic is new:
+      base.py: build_intervals()                              (line ~768)
+      engine_rust.py: _compute_spot_adjustment_trigger()      (line ~292)
+
+  * Per-leg config seam (where the grid + N% + slab edges would live):
+      strategy_types.py: StrikeSelection / Leg / StrategyDefinition (lines ~100+)
+    threaded via routers/backtest.py -> algotest_job.py -> engine_rust.py,
+    same payload dict the Rust path already receives.
+
+  * Rollover already supports fixed vs dynamic re-pick, so re-evaluating the
+    grid at re-entry is a natural hook (Question I).
+
+CONCLUSION: purely additive. New sensor + new per-leg config block, feeding the
+existing resolver. Midcap / spot-adjustment / optimizer math untouched.
+
+
+================================================================================
+ SECTION 7 — ALL OPEN QUESTIONS (with possible answers + trade impact)
+================================================================================
+
+Each question: WHY it matters | OPTIONS | TRADE EXAMPLE per option | MY DEFAULT.
+
+--------------------------------------------------------------------------------
+QUESTION A — ROC: measured from WHICH point? (THE #1 BLOCKER)
+--------------------------------------------------------------------------------
+WHY: It changes which slab row is picked, i.e. the strike, on every entry.
+
+OPTIONS:
+  A1) Cumulative from Pivot 1 (the original 18700) for the whole phase.
+  A2) From the ACTIVE pivot's close; resets toward 0 each new pivot.
+  A3) Fall from the latest PEAK (how far below Peak N we currently are).
+
+TRADE EXAMPLE (spot 14500 at Wk8; Pivot1=18700, Pivot3=16300, Peak3=16300):
+  A1: ROC = (14500-18700)/18700 = -22.46% -> Slab 5 -> ITM 4% -> SELL 15100 PE
+  A2: ROC = (14500-16300)/16300 = -11.04% -> Slab 3 -> ITM 2% -> SELL 16650 PE
+  A3: ROC = (14500-16300)/16300 = -11.04% (peak3=pivot3 here) -> Slab 3 -> ITM 2%
+  => A1 sells a much deeper ITM strike than A2/A3 for the same market.
+
+MY DEFAULT: *** REVISED after the "Peak2 > Peak1" rule -> now A3 (FALL FROM
+LATEST PEAK). *** Under the strict-higher-peak rule, a new pivot forms right
+after a NEW high, so A1 (cumulative from Pivot 1) is usually POSITIVE at that
+moment and would collapse to Slab 1 under downside-only handling. A3 keeps the
+ROW meaningful (how far below the latest peak we are). The columns still carry
+the "which pivot" axis independently. If you instead want A1, we should pair it
+with B2 (absolute magnitude) so rallies also populate slabs. PLEASE CONFIRM.
+
+--------------------------------------------------------------------------------
+QUESTION B — ROC sign: absolute magnitude, or downside-only / signed?
+--------------------------------------------------------------------------------
+WHY: Your slabs are written as positive bands but the whole staircase is falls.
+     What happens when the market is UP?
+
+OPTIONS:
+  B1) Downside-only: feature engages only on falls; if ROC >= 0 stay in Slab 1 /
+      Pivot 1 (default OTM) — a purely defensive mechanism.
+  B2) Absolute magnitude: a 12% RISE and a 12% FALL both map to Slab 3.
+  B3) Two separate grids (one for up moves, one for down moves).
+
+TRADE EXAMPLE (market RISES to 20900, +11.8% from 18700):
+  B1: ROC treated as 0 (no fall) -> Slab 1, Pivot 1 -> OTM 2% (default behaviour).
+  B2: |+11.8%| -> Slab 3 -> ATM (Pivot1 col) -> strike pulled to ATM on a rally.
+  B3: uses the user's separate "up" grid.
+
+MY DEFAULT: B1 (downside-only). The example table and the staircase are entirely
+fall-driven; treating rallies as "stay default" is the least surprising.
+
+--------------------------------------------------------------------------------
+QUESTION C — Beyond Pivot 3: what column applies for Pivot 4, 5, ...?
+--------------------------------------------------------------------------------
+WHY: Table has 3 pivot columns; staircases can go deeper.
+
+OPTIONS:
+  C1) Clamp to last column (Pivot 4,5,... all use Pivot 3 column).
+  C2) User-extendable columns (grid can be N wide).
+  C3) Wrap/cycle back to Pivot 1 column.
+
+TRADE EXAMPLE (a 4th N% fall forms Pivot 4, ROC in Slab 3):
+  C1: use Slab3 x Pivot3 cell = ITM 2%.
+  C2: use Slab3 x Pivot4 cell = whatever user typed (e.g. ITM 3%).
+  C3: use Slab3 x Pivot1 cell = ATM (resets the gradient — usually undesirable).
+
+MY DEFAULT: C1 (clamp) for v1 simplicity; C2 as a later enhancement if you want
+unlimited depth.
+
+--------------------------------------------------------------------------------
+QUESTION D — "Phase Start Date": is it the PATCH, the whole backtest, or filter?
+--------------------------------------------------------------------------------
+WHY: Decides where Pivot 1 (and the whole chain) RESETS.
+
+OPTIONS:
+  D1) Reset per PATCH (your patch-wise blocks that reset NAV to 100).
+  D2) One chain for the whole backtest (Pivot 1 = backtest start, runs through).
+  D3) Reset per STR/filter segment.
+
+TRADE EXAMPLE (3-patch run; patch 2 starts at 17000 after a fall):
+  D1: at patch 2 start Pivot1 RE-ANCHORS to 17000; ROC restarts from there.
+  D2: Pivot1 stays 18700 forever; patch 2 entries may already be deep in Slab 4/5.
+  D3: re-anchors whenever a new STR bullish/bearish segment begins.
+
+MY DEFAULT: D1 (reset per patch) — "phase" most naturally maps to your patch
+construct, and it keeps the staircase interpretable within each block.
+
+--------------------------------------------------------------------------------
+QUESTION E — Which PRICE SERIES drives pivots/peaks/ROC?
+--------------------------------------------------------------------------------
+WHY: Determines the input numbers entirely.
+
+OPTIONS:
+  E1) NIFTY (the trade index) daily CLOSE (EOD).
+  E2) Futures close.
+  E3) When Midcap is in play, run pivots on Midcap, or each index on its own.
+
+TRADE EXAMPLE: For a NIFTY weekly put on Wk5, E1 uses NIFTY close 16800; if the
+strategy were on MIDCPNIFTY, E3 would track the Midcap close instead.
+
+MY DEFAULT: E1 (the trade index's spot daily close). Midcap stays an overlay and
+the pivot chain tracks whatever index the leg trades.
+
+--------------------------------------------------------------------------------
+QUESTION F — Timing / no look-ahead.
+--------------------------------------------------------------------------------
+WHY: Backtests must not use information from the future.
+
+OPTIONS:
+  F1) Use closes up to AND INCLUDING the entry day's close.
+  F2) Use closes up to the PRIOR day (T-1) only.
+
+TRADE EXAMPLE (entry on Wk7, the day the close 16300 forms Pivot 3):
+  F1: Pivot 3 is recognised same day -> use Pivot3 column (ITM 2%).
+  F2: Pivot 3 not yet "known" at entry -> still on Pivot2 column (ITM 1%).
+
+MY DEFAULT: F1 if entries are evaluated at/after the close; F2 if entries are at
+the open. Depends on your existing entry-timing convention — please confirm.
+
+--------------------------------------------------------------------------------
+QUESTION G — How the offset is APPLIED (and "points" meaning).
+--------------------------------------------------------------------------------
+WHY: Must match existing strike conventions exactly.
+
+OPTIONS:
+  G1) Offset is vs ATM-at-entry using existing mround + CE/PE direction
+      (PE: OTM=lower, ITM=higher; CE: OTM=higher, ITM=lower).
+  G2) "points" = a fixed price offset from ATM (e.g. ITM 100 pts = ATM +/- 100).
+  G3) "points" = a count of strike STEPS (e.g. ITM 2 = 2 strikes ITM).
+
+TRADE EXAMPLE (spot 16800, NIFTY step 50, cell = ITM 1%):
+  G1 (%):     16800*1.01 = 16968 -> 16950 PE.
+  G2 (pts100):16800 + 100 = 16900 PE.
+  G3 (steps2):ATM 16800 + 2*50 = 16900 PE.
+
+MY DEFAULT: G1 for %, and let the user pick "%" vs "points"; treat "points" as
+G2 (price points) unless you prefer step-count.
+
+--------------------------------------------------------------------------------
+QUESTION H — SCOPE: per-leg grid or one strategy grid; shared pivot chain?
+--------------------------------------------------------------------------------
+WHY: Multi-leg strategies need a clear rule.
+
+OPTIONS:
+  H1) Per-leg grid, but ONE shared pivot chain (off the index).
+  H2) One grid for the whole strategy.
+  H3) Fully per-leg: each leg has its own grid AND its own pivot chain/N%.
+
+TRADE EXAMPLE (an iron-condor: a put leg and a call leg):
+  H1: both legs read the same Pivot/ROC state but can map it to different offsets.
+  H2: both legs use identical offsets.
+  H3: put leg and call leg can even use different N% and pivot chains.
+
+MY DEFAULT: H1 (per-leg grid, shared index pivot chain) — flexible yet
+interpretable.
+
+--------------------------------------------------------------------------------
+QUESTION I — Interaction with SPOT-ADJUSTMENT / ROLLOVER / RE-ENTRY.
+--------------------------------------------------------------------------------
+WHY: These re-pick strikes mid-strategy; the grid must behave predictably.
+
+OPTIONS:
+  I1) On any re-entry/rollover, RE-READ the grid at the re-entry date (fresh
+      slab + active pivot) -> dynamic strike each time. (Grid is independent of,
+      and additive to, the existing spot-adjustment trigger.)
+  I2) Lock the offset at the original entry; re-entries reuse it.
+  I3) Grid and spot-adjustment SHARE pivots (one mechanism).
+
+TRADE EXAMPLE (spot-adjustment fires on Wk5 fall to 16800, re-enter same day):
+  I1: re-entry reads Slab3 x Pivot2 = ITM 1% -> SELL 16950 PE (fresh).
+  I2: re-entry reuses Wk0's OTM 2% rule -> SELL ~16450 PE.
+  I3: the N% fall that drives pivots ALSO triggers the re-entry (no separate
+      spot-adjustment %).
+
+MY DEFAULT: I1 — keep spot-adjustment's own trigger UNCHANGED and independent;
+the grid simply re-evaluates at each (re)entry. This honours "works with
+adjustment" without touching adjustment math.
+
+--------------------------------------------------------------------------------
+QUESTION J — With / without MIDCAP.
+--------------------------------------------------------------------------------
+WHY: You require it to work both ways and never break Midcap.
+
+OPTIONS:
+  J1) Grid + pivots identical regardless of Midcap; Midcap overlay unchanged.
+  J2) Midcap gets its own parallel grid/pivot chain.
+
+TRADE EXAMPLE: A NIFTY put with the grid ON and Midcap overlay ON -> base trade's
+strike comes from the NIFTY pivot grid; the Midcap overlay rides on top exactly
+as today, no change to Midcap MAE/MFE/breach math.
+
+MY DEFAULT: J1 — feature is orthogonal to Midcap; Midcap stays an overlay.
+
+--------------------------------------------------------------------------------
+QUESTION K — FRONTEND input shape.
+--------------------------------------------------------------------------------
+WHY: You said "everything user defined."
+
+OPTIONS:
+  K1) An editable N x M matrix per leg: each cell = {ITM/ATM/OTM, value, %/pts};
+      plus a single N% field; plus editable slab boundary edges; plus a toggle.
+  K2) Fixed 5x3 grid (your example), only the values editable.
+  K3) Strategy-level single grid block.
+
+TRADE EXAMPLE: User types N% = -5, slab edges 0/5/10/15/20, and fills the 5x3
+cells with the Section-4 values; toggles "Slabwise Dynamic Strike" ON for leg 1.
+
+MY DEFAULT: K1 with sensible defaults pre-filled (your example table), slab count
+and column count adjustable later (ties to Question C/L).
+
+--------------------------------------------------------------------------------
+QUESTION L — Slab boundary INCLUSIVITY and count.
+--------------------------------------------------------------------------------
+WHY: Edge cases at exactly 5%, 10%, etc.
+
+OPTIONS:
+  L1) Lower-inclusive: [0,5), [5,10), ... (5.00% falls in Slab 2).
+  L2) Upper-inclusive: (0,5], (5,10], ... (5.00% falls in Slab 1).
+  L3) User-defined number of slabs (not fixed at 5).
+
+TRADE EXAMPLE (ROC exactly -5.00%):
+  L1: Slab 2 (5-10) -> different cell than L2: Slab 1 (0-5).
+
+MY DEFAULT: L1 (lower-inclusive) + L3 (allow any number of slabs).
+
+--------------------------------------------------------------------------------
+QUESTION M — Before any pivot forms / market only rises.
+--------------------------------------------------------------------------------
+WHY: Defines the starting/default state.
+
+OPTIONS:
+  M1) Stay on Pivot 1 column, Slab 1, until the first N% fall (default offset).
+  M2) Something else (please specify).
+
+TRADE EXAMPLE: Market drifts up for 6 weeks from 18700 -> every entry uses
+Slab1 x Pivot1 = OTM 2% (assuming downside-only ROC, Question B1).
+
+MY DEFAULT: M1.
+
+--------------------------------------------------------------------------------
+QUESTION N — AUDIT columns in the tradesheet.
+--------------------------------------------------------------------------------
+WHY: You verify everything against reference workbooks.
+
+OPTIONS:
+  N1) Add columns: Active Pivot, Pivot Close, Peak Close, ROC%, Slab #, Chosen
+      Offset, Resolved Strike — for every trade (and mirror in optimizer outputs).
+  N2) No extra columns (silent).
+
+TRADE EXAMPLE: Wk7 row would show Pivot=3, PivotClose=16300, Peak=17200,
+ROC=-12.83%, Slab=3, Offset=ITM 2%, Strike=16650.
+
+MY DEFAULT: N1 — essential for verification and parity (backtest == optimizer
+per-combo == master summary, per your hard rule).
+
+--------------------------------------------------------------------------------
+QUESTION O (extra) — N% definition: fall from PEAK only, or also intra-pivot?
+--------------------------------------------------------------------------------
+WHY: Confirm the trigger is strictly "N% below the running peak of the cycle".
+OPTIONS: O1) N% below current cycle's Peak (my assumption). O2) N% below the
+previous pivot. O3) N% day-over-day.
+MY DEFAULT: O1 — matches your worked example (Peak1=1000, -5% -> 949).
+
+--------------------------------------------------------------------------------
+QUESTION P (extra) — Does the grid drive strike for ALL entries in the phase,
+or only when an N% pivot has occurred?
+--------------------------------------------------------------------------------
+OPTIONS: P1) Always (from Pivot 1 onward, using Slab1/Pivot1 default early).
+         P2) Only after first pivot; before that, use the leg's normal rule.
+MY DEFAULT: P1 — simpler and consistent; the default cell reproduces the normal
+rule anyway if the user sets Slab1/Pivot1 = their usual offset.
+
+
+================================================================================
+ SECTION 8 — WHAT I WILL DELIVER ONCE QUESTIONS ARE ANSWERED
+================================================================================
+
+After you answer (priority: A, C, D, H, I, then the rest), I will produce — still
+with NO code change — a precise written SPEC containing:
+   1. Exact pivot/peak/ROC algorithm in pseudocode.
+   2. Exact grid lookup rule and offset-application rule.
+   3. The config schema (per-leg fields, defaults).
+   4. The integration points (which functions get the new optional inputs) and a
+      statement of what stays untouched (Midcap, spot-adj, optimizer math).
+   5. A fully numeric worked example against REAL NIFTY closes for a chosen
+      date range, with the proposed audit columns, so you can eyeball-verify
+      before any implementation begins.
+
+================================================================================
+ END OF DOCUMENT
+================================================================================

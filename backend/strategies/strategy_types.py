@@ -130,6 +130,7 @@ class Leg(BaseModel):
     """Single leg configuration in a strategy"""
     leg_number: int
     instrument: InstrumentType
+    index: Optional[str] = None  # Per-leg index override (multi-index feature). None -> inherits StrategyDefinition.index
     option_type: Optional[OptionType] = None  # Only for options
     position: PositionType  # Buy or Sell
     lots: int = 1

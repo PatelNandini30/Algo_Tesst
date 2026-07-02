@@ -37,7 +37,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Include routers
 from routers import backtest, expiry, strategies
 from routers.upload import router as upload_router
-from routers.intraday import router as intraday_router
 from routers.optimize import router as optimize_router
 
 @asynccontextmanager
@@ -75,7 +74,6 @@ app.include_router(backtest.router, prefix="/api", tags=["backtest"])
 app.include_router(expiry.router, prefix="/api", tags=["expiry"])
 app.include_router(strategies.router, prefix="/api", tags=["strategies"])
 app.include_router(upload_router, prefix="/api", tags=["data"])
-app.include_router(intraday_router)
 app.include_router(optimize_router, prefix="/api", tags=["optimize"])
 
 @app.get("/")

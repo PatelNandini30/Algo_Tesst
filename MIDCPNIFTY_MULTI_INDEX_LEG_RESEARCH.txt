@@ -1,0 +1,247 @@
+==============================================================================
+MULTI-INDEX + MULTI-EXPIRY LEGS (NIFTY + MIDCPNIFTY, WEEKLY + MONTHLY)
+Research & design note - for the research/strategy team
+Date: 2026-06-25 | Status: design, no code written yet
+Model confirmed against the existing "Call_Weekly_Sell_Put_Monthly" strategy.
+All numbers below are pulled from the live database and verified against NSE.
+==============================================================================
+
+------------------------------------------------------------------------------
+1. WHAT WE ARE BUILDING
+------------------------------------------------------------------------------
+HARD RULE: this is a COMPLETELY NEW, SELF-CONTAINED feature. No existing core
+logic is edited. The new multi-index/multi-expiry path is built as a separate
+module + separate endpoint, and it REUSES existing helper functions read-only
+(imports them, never modifies them). A routing gate sends only the new strategy
+shape to the new path; every existing strategy keeps running the existing code
+unchanged. See section 9 for the isolation architecture.
+
+A backtest where a single strategy can hold legs on DIFFERENT indices AND on
+DIFFERENT expiry cycles at the same time, e.g.:
+  - NIFTY      options leg  on WEEKLY expiry
+  - MIDCPNIFTY futures leg  on MONTHLY expiry
+  - MIDCPNIFTY options leg  on MONTHLY expiry
+
+Each leg trades on ITS OWN expiry. The tradesheet is cut at the SHORTEST cadence
+(weekly if any weekly leg exists); the longer (monthly) legs are CARRIED and
+MARKED-TO-MARKET at each shorter-cadence boundary, and only actually settle/roll
+at their own monthly expiry. This is exactly the mechanic the existing
+"Call_Weekly_Sell_Put_Monthly" strategy already uses (weekly call leg + monthly
+put leg) - we are generalising it to MULTIPLE INDICES.
+
+The existing NIFTY-only strategies and the existing NIFTY + Midcap100
+(hypothetical index) overlay are NOT changed.
+
+------------------------------------------------------------------------------
+2. THE DATA WE ACTUALLY HAVE (verified in the DB)
+------------------------------------------------------------------------------
+  Instrument                         Rows        Coverage               Usable?
+  MIDCPNIFTY options (OPTIDX)    1,230,777   2022-01-24 -> 2026-06-22    Yes*
+  MIDCPNIFTY futures (FUTIDX)        5,278   2022-01-24 -> 2026-06-22    Yes (clean/liquid)
+  MIDCPNIFTY spot (ATM ref)         1,606    partial                    Yes
+  NIFTY options/futures             full     2001 -> 2026               unchanged
+  NIFTYMIDCAP100 index (Midcap100)  5,816    2003 -> 2026               unchanged
+
+HARD LIMIT: MIDCPNIFTY data starts 24-Jan-2022. Any cadence row before that date
+cannot price the MIDCPNIFTY legs - they are marked "unavailable" and skipped (the
+run does not break).
+
+2a. LIQUIDITY REALITY (interpretation)
+MIDCPNIFTY OPTIONS liquidity sits almost entirely in the FRONT WEEKLY contract in
+the OLD regime; the MONTHLY/far contracts barely trade and their daily close is a
+THEORETICAL SETTLEMENT MARK, not a traded price (e.g. 01-Feb-2024 monthly turnover
+= 24 vs front-weekly 30,097,826). So in the OLD regime a MIDCPNIFTY MONTHLY OPTION
+leg is marked on stale prices. The MIDCPNIFTY FUTURES leg is liquid throughout.
+From late-2024 MIDCPNIFTY weeklies were discontinued, so the monthly IS the traded
+contract and the option leg becomes clean. The tradesheet must carry a
+liquidity/turnover flag so a frozen price is never silently counted as real.
+
+------------------------------------------------------------------------------
+3. EXPIRY CALENDARS - NIFTY vs MIDCPNIFTY (verified vs NSE)
+------------------------------------------------------------------------------
+The two indices have NOT always expired on the same day:
+  Period                  NIFTY monthly   MIDCPNIFTY monthly   Same day?
+  2022 -> ~Nov 2024       last Thursday   last Monday          NO (different)
+  ~Nov 2024 -> Aug 2025   last Thursday   last Thursday        Yes
+  From 1-Sep-2025         last Tuesday    last Tuesday         Yes
+Confirmed in our data: Feb-2024 NIFTY 29-Feb vs MIDCPNIFTY 26-Feb (3 days apart);
+May-2025 both 29-May; Dec-2025 both 30-Dec.
+WHY IT MATTERS: each leg follows its own calendar, so the engine must price each
+leg on its own expiry and never assume the calendars line up.
+
+------------------------------------------------------------------------------
+4. THE MODEL - WEEKLY CADENCE + HYPOTHETICAL WEEKLY MARKS
+------------------------------------------------------------------------------
+(This is the confirmed model, taken from Call_Weekly_Sell_Put_Monthly and
+extended to multiple indices.)
+
+DEFINITIONS
+  - CADENCE  = the shortest leg's expiry cycle in the strategy (weekly if any
+               weekly leg exists; otherwise monthly). One tradesheet ROW per
+               cadence cycle, "Expiry-To-Expiry" (entry = previous cadence expiry,
+               exit = this cadence expiry).
+  - SHORT LEG (e.g. NIFTY weekly): freshly entered every cadence cycle, settled at
+               its own (weekly) expiry. New strike each cycle.
+  - LONG LEG  (e.g. MIDCPNIFTY monthly future / option): held as ONE continuous
+               position, MARKED at each cadence boundary using a "Hypothetical
+               ExitPrice" (the contract's close that day - a mark, not a trade).
+               Next cycle's EntryPrice = this cycle's Hypothetical ExitPrice
+               (the carry). The long leg only ACTUALLY trades at:
+                 (i)  open,
+                 (ii) a re-strike (spot moved enough to reselect strike), or
+                 (iii) its own monthly expiry (settle + roll to next month).
+
+NET P&L per cadence row = short-leg P&L + the cadence-period MARK-CHANGE of every
+carried long leg. Cumulative / Peak / DD / %DD are computed at the cadence
+(weekly) level.
+
+TWO LAYERS OF ROLL
+  1. SHORT leg rolls every cadence cycle (new weekly contract + strike).
+  2. LONG leg rolls only at ITS OWN monthly expiry (and re-strikes on spot moves).
+
+------------------------------------------------------------------------------
+5. HOW EVERY EXISTING FEATURE WORKS UNDER THIS MODEL
+------------------------------------------------------------------------------
+  Feature           Behaviour
+  Filter (patches)  The last cadence row of each patch is clamped to the patch
+                    End date -> Exit Reason FILTER_END. Trades never cross a patch
+                    boundary. Long legs are settled/marked at the clamp date.
+  Re-entry          Within a cadence cycle, if a leg's SL/target fires, a new
+                    cadence sub-row opens same day (ReEntryIndex) and runs to the
+                    cycle/patch end. Short and long legs both follow.
+  Rollover          Native to the model: the SHORT leg rolls each cadence; each
+                    LONG leg rolls at its own monthly expiry (and re-strikes).
+  Spot-adjustment   A +/-X% breach truncates the cadence row to the breach date,
+                    tags SPOT_ADJ_*, and spawns a same-day re-entry row. Long legs
+                    are marked/settled at the breach date.
+  MAE / MFE         Per leg, over each leg's actual held window (cadence slice for
+                    long legs), using that instrument's real high/low.
+  Lot size          Per-symbol, date-dependent. NIFTY uses NIFTY lots; MIDCPNIFTY
+                    uses MIDCPNIFTY lots (75 -> 120 -> 140 -> 120).
+  Strike selection  ATM +/- % with ITM/OTM rounding, per leg, per index interval
+                    (NIFTY 50, MIDCPNIFTY 25). Short legs re-strike each cadence;
+                    long legs re-strike on spot move.
+
+------------------------------------------------------------------------------
+6. LEG-WISE WORKED EXAMPLE - LIVE DATA (MAY 2025)
+------------------------------------------------------------------------------
+Strategy: NIFTY WEEKLY CALL SELL + MIDCPNIFTY MONTHLY FUTURE LONG + MIDCPNIFTY
+MONTHLY PUT SELL.
+Cadence = NIFTY weekly (3 cycles). MIDCPNIFTY monthly contract = 29-May.
+Lots: NIFTY 75, MIDCPNIFTY 120. Prices per unit.
+NIFTY spot: 09->15 May 24,008->25,062 ; 16->22 25,020->24,610 ; 23->29 24,853->24,834.
+
+LEG A - NIFTY WEEKLY CALL (SELL): rolls every week, settles at weekly expiry
+ Entry   Exit    CallExpiry Strike EntryTurnover EntryPrice ExitTurnover HypoExitPrice CallP&L
+ 09-May  15-May  15-May(wk) 24300  2.04e12       91.90      2.28e11      766.05(settle) -674.15
+ 16-May  22-May  22-May(wk) 25100  3.27e12       145.85     5.66e12      0.20(settle)   +145.65
+ 23-May  29-May  29-May(wk) 25400  1.74e12       35.50      3.38e12      0.15(settle)   +35.35
+ (new strike each week; HypoExitPrice = weekly intrinsic settle; SELL P&L = Entry - Exit)
+
+LEG B - MIDCPNIFTY MONTHLY FUTURE (LONG): carried, marked weekly, rolls at 29-May
+ Entry   Exit    FutExpiry EntryTurnover EntryPrice          ExitTurnover HypoExitPrice        FutP&L
+ 09-May  15-May  29-May    21.76e9       12,040.30           10.98e9      12,782.30 (mark)     +742.00
+ 16-May  22-May  29-May    10.98e9       12,782.30 <-carried 10.56e9      12,511.45 (mark)     -270.85
+ 23-May  29-May  29-May    10.56e9       12,511.45 <-carried 10.07e9      12,698.80 (EXPIRY)   +187.35 -> roll Jun
+ (one continuous long; EntryPrice each week = prior HypoExitPrice; LONG P&L = Exit - Entry)
+
+LEG C - MIDCPNIFTY MONTHLY PUT 12000 (SELL): carried, marked weekly, expires 29-May
+ Entry   Exit    PutExpiry Strike EntryTurnover EntryPrice         ExitTurnover HypoExitPrice      PutP&L
+ 09-May  15-May  29-May    12000  31.83e9       345.05             15.08e9      39.90 (mark)       +305.15
+ 16-May  22-May  29-May    12000  15.08e9       39.90 <-carried    31.63e9      27.30 (mark)       +12.60
+ 23-May  29-May  29-May    12000  31.63e9       27.30 <-carried    106.29e9     0.10 (EXPIRY)      +27.20 -> roll Jun
+ (same carry as Leg B; SELL P&L = Entry - Exit; expires near-worthless, re-struck on Jun contract)
+
+NET (per weekly row = Leg A + Leg B + Leg C)
+ Entry   Exit    CallP&L  FutP&L   PutP&L  NetP&L  Net/Spot%  Cumulative(NAV=100) Peak    DD     %DD
+ 09-May  15-May  -674.15  +742.00  +305.15 +373.00 +1.55%     101.55              101.55  0      0
+ 16-May  22-May  +145.65  -270.85  +12.60  -112.60 -0.45%     101.10              101.55  -0.45  -0.44%
+ 23-May  29-May  +35.35   +187.35  +27.20  +249.90 +1.01%     102.11              102.11  0      0
+ (per-unit points; multiply each leg by its lot - NIFTY 75, MIDCPNIFTY 120 - for Rs)
+
+KEY READING
+  - LEG A (weekly): a NEW real entry->settle every week; independent strike each cycle.
+  - LEG B and C (monthly, cross-index): ONE position each, sliced into weekly marks.
+    The tell is EntryPrice = prior HypoExitPrice down the column. They really trade
+    only at open, re-strike, or their own monthly expiry (settle + roll at 29-May).
+  - NET is at the weekly cadence = weekly leg P&L + the weekly mark-change of each
+    carried monthly leg.
+
+------------------------------------------------------------------------------
+7. TRADESHEET STRUCTURE (per-leg column blocks)
+------------------------------------------------------------------------------
+The sheet carries ONE column block per leg, mirroring the existing
+weekly+monthly sample:
+  <Leg> Expiry | <Leg> Strike | <Leg> Entry Turnover | <Leg> EntryPrice |
+  <Leg> Exit Turnover | <Leg> Hypothetical ExitPrice | <Leg> P&L
+plus shared cadence columns:
+  Entry Date | Exit Date | Entry Spot | Exit Spot | Spot P&L |
+  Net P&L | Net P&L/Spot Pct | Cumulative | Peak | DD | %DD
+Each MIDCPNIFTY leg block also carries a liquidity/turnover flag so stale
+old-regime monthly-option marks are visible, not silently booked.
+
+GENERATION PIPELINE
+  1. Engine builds, per cadence cycle: short legs (fresh entry->settle) and long
+     legs (carried, marked via Hypothetical ExitPrice; settle/roll at own expiry).
+  2. Per-leg blocks + Net P&L are assembled per cadence row.
+  3. Analytics add Cumulative, Peak, DD, %DD at cadence level.
+  4. Workbook tabs: Trade Sheet, Summary, Patch wise (when filter present).
+Summary metrics (Overall Profit, Win %, CAGR, Max DD + days/period, Return/MaxDD,
+streaks, monthly grid, Live DD, outlier-stripped Live DD) are computed from the
+Net P&L / Net-Spot-% columns at cadence level.
+
+------------------------------------------------------------------------------
+8. FILTER-PATCH APPEARANCE (your 6 patches, cadence rows)
+------------------------------------------------------------------------------
+Patches: 29-03-2019..10-05-2019 ; 30-09-2019..28-02-2020 ; 29-07-2022..23-12-2022 ;
+28-04-2023..28-03-2024 ; 30-04-2024..31-12-2024 ; 28-03-2025..25-02-2026.
+Verified data availability:
+  Patch 1 & 2 (2019/2020): NIFTY present, MIDCPNIFTY = 0 days -> MIDCPNIFTY legs
+                           UNAVAILABLE (data starts 24-Jan-2022). NIFTY legs price.
+  Patch 3 (2022): NIFTY 100 days, MIDCPNIFTY opt 100, fut 100 -> full.
+  Patch 4 (2023-24): 230 / 230 / 230 -> full.
+  Patch 5 (2024): 168 / 168 / 168 -> full.
+  Patch 6 (2025-26): 227 / 227 / 227 -> full.
+Behaviour:
+  - Each patch -> a sequence of CADENCE rows; the LAST row of every patch is
+    clamped to its End date -> Exit Reason FILTER_END. Rows never cross a patch.
+  - Patches 1-2: MIDCPNIFTY leg blocks render UNAVAILABLE; only the NIFTY legs price.
+  - Old-regime MIDCPNIFTY monthly OPTION marks may be stale (flagged); MIDCPNIFTY
+    FUTURES stay clean. New-regime (patch 6) options are liquid.
+  - Long legs (MIDCPNIFTY monthly) are carried/marked across the cadence rows within
+    each patch and settle/roll at their own monthly expiry.
+
+------------------------------------------------------------------------------
+9. WHAT STAYS 100% UNTOUCHED
+------------------------------------------------------------------------------
+  - Existing NIFTY-only strategies and every NIFTY calculation.
+  - Existing NIFTY + Midcap100 (hypothetical index) overlay - separate path; a
+    Midcap100-only run is byte-for-byte identical before and after.
+
+------------------------------------------------------------------------------
+10. OPEN DECISIONS (need a call before build)
+------------------------------------------------------------------------------
+  1. Cadence rule: shortest-leg expiry drives the row cadence (weekly if any weekly
+     leg). Confirm.
+  2. Long-leg re-strike rule: when exactly does a carried monthly leg re-strike
+     (every cadence on spot move? only on its own expiry? a threshold)? Match the
+     existing weekly+monthly strategy's rule.
+  3. Long-leg roll timing: settle + reopen on the monthly expiry's close
+     (recommended), or earlier (N days before expiry).
+  4. Old-regime MIDCPNIFTY monthly OPTION pricing: use settled marks with a
+     liquidity flag (recommended) vs disallow the option leg pre-late-2024.
+  5. MAE/MFE basis for carried long legs: per-cadence slice (recommended) vs over
+     the full monthly hold.
+
+------------------------------------------------------------------------------
+11. ONE-LINE SUMMARY
+------------------------------------------------------------------------------
+Each leg trades on its own index and its own expiry; the tradesheet is cut at the
+shortest cadence (weekly); short legs roll every cycle while long (monthly) legs
+are carried and marked weekly via a Hypothetical ExitPrice and settle/roll at
+their own monthly expiry - exactly the existing Call_Weekly_Sell_Put_Monthly
+mechanic, extended to NIFTY + MIDCPNIFTY, with existing strategies untouched.
+
+==============================================================================
+END OF DOCUMENT
+==============================================================================

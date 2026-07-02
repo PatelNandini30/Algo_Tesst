@@ -24,7 +24,7 @@ import time
 import zipfile
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from services.optimizer import result_store
@@ -46,6 +46,14 @@ router = APIRouter()
 
 def _prepared_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     return _resolve_effective_request(_normalize_request(_normalize_payload_dates(raw)))
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    client = request.client
+    return client.host if client and client.host else "unknown"
 
 
 @router.get("/optimize/objectives")
@@ -100,19 +108,21 @@ async def preview_optimization(request: Dict[str, Any]):
 
 
 @router.post("/optimize/jobs")
-async def enqueue_optimization(request: Dict[str, Any]):
+async def enqueue_optimization(request: Request):
     """Validate and enqueue the run. Returns a Celery job_id."""
-    base_payload = _prepared_payload(request.get("base_payload") or {})
-    param_specs = request.get("param_specs") or []
-    method = (request.get("method") or "exhaustive").lower()
-    sample_n = request.get("sample_n")
-    objective_name = request.get("objective") or "total_pnl"
-    algorithm = request.get("algorithm")
-    seed = request.get("seed")
+    body = await request.json()
+    origin_ip = _client_ip(request)
+    base_payload = _prepared_payload(body.get("base_payload") or {})
+    param_specs = body.get("param_specs") or []
+    method = (body.get("method") or "exhaustive").lower()
+    sample_n = body.get("sample_n")
+    objective_name = body.get("objective") or "total_pnl"
+    algorithm = body.get("algorithm")
+    seed = body.get("seed")
     # Parallelism: user override from UI. Capped between 1 and cpu_count to
     # prevent thrashing. Unset → runner falls back to OPTIMIZE_PARALLELISM
     # env / cpu//2 default.
-    parallelism_raw = request.get("parallelism")
+    parallelism_raw = body.get("parallelism")
     parallelism: Optional[int] = None
     if parallelism_raw is not None:
         try:
@@ -144,9 +154,11 @@ async def enqueue_optimization(request: Dict[str, Any]):
         "algorithm": algorithm,
         "seed": seed,
         "parallelism": parallelism,
-        "zip_naming": request.get("zip_naming") or None,
+        "zip_naming": body.get("zip_naming") or None,
+        "client_ip": origin_ip,
     }
     task = run_optimize_job.apply_async(args=[spec], queue="optimize")
+    logger.info("[OPTIM] queued job %s from ip=%s objective=%s method=%s", task.id[:8], origin_ip, objective_name, method)
     return {
         "status": "queued",
         "job_id": task.id,
@@ -343,9 +355,6 @@ def _enrich_tradesheet_with_mae_mfe(csv_path: str, index_str: str) -> bool:
 # progress, and the frontend polls until the ZIP is ready on disk.  Subsequent
 # downloads stream from disk instantly.
 
-_ZIP_CACHE_DIR = "/data/cache/optim_zips"
-_ZIP_BUILDER_VERSION = "v10"  # v10: fix module-level _date_ms NameError (was CSV-fallback in v9); v9: summary adds Avg (Combined) Final MAE row
-
 _UNSAFE_ZIP_RE = re.compile(r'[/\\:*?"<>|]')
 
 def _safe_zip_name(name: str) -> str:
@@ -356,9 +365,7 @@ _zip_build_lock = threading.Lock()
 
 
 def _zip_cache_path(job_id: str, patchwise: bool = False) -> str:
-    os.makedirs(_ZIP_CACHE_DIR, exist_ok=True)
-    ver = f"{_ZIP_BUILDER_VERSION}-pw" if patchwise else _ZIP_BUILDER_VERSION
-    return os.path.join(_ZIP_CACHE_DIR, f"{job_id}.{ver}.zip")
+    return result_store.zip_cache_path(job_id, patchwise)
 
 
 def _build_one_xlsx(args: tuple) -> tuple:
@@ -394,7 +401,8 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import pandas as pd
 
-    state = _zip_build_state[job_id]
+    state_key = f"{job_id}:pw" if patchwise else job_id
+    state = _zip_build_state[state_key]
     try:
         meta = result_store.get_meta(job_id) or {}
         trades_dir = result_store.get_trades_dir(job_id)
@@ -513,8 +521,49 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
 
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
             # Root CSVs first — these are tiny and don't need parallel build.
+            # The master summary.csv must follow the user-selected download method:
+            # patchwise download → patchwise-recomputed summary (matches each combo's
+            # patchwise XLSX Summary); overall download → stored (overall) summary.
             for fname in root_csvs:
+                if patchwise and fname == "summary.csv":
+                    continue  # regenerated patchwise below
                 zf.write(os.path.join(trades_dir, fname), fname)
+
+            if patchwise:
+                try:
+                    from services.optimizer.excel_builder import (
+                        compute_xlsx_summary_metrics as _cmetrics,
+                    )
+                    _flat_rows = []
+                    for fname in combo_csvs:
+                        _ls = fname[:-4]
+                        _row = summary_by_label.get(_ls, {})
+                        try:
+                            _cdf = pd.read_csv(os.path.join(trades_dir, fname), dtype=str)
+                            _pw_metrics = _cmetrics(
+                                _cdf, _row.get("summary") or {},
+                                midcap_legs=_midcap_legs,
+                                midcap_spot_adjustment=_midcap_sa,
+                                midcap_symbol=_midcap_sym,
+                                patchwise=True,
+                                filter_segments=_filter_segments,
+                            )
+                            _flat = {
+                                "combo_id": _row.get("combo_id"),
+                                "combo_label": _row.get("combo_label") or _ls,
+                            }
+                            _flat.update({**(_row.get("summary") or {}), **_pw_metrics})
+                            _flat_rows.append(_flat)
+                        except Exception as _se:
+                            logger.warning("[ZIP] patchwise summary skipped for %s: %s", _ls, _se)
+                    if _flat_rows:
+                        zf.writestr("summary.csv", pd.DataFrame(_flat_rows).to_csv(index=False))
+                except Exception as _pwe:
+                    logger.warning("[ZIP] patchwise summary.csv regen failed: %s", _pwe)
+                    # Fall back to the stored (overall) summary so the ZIP isn't missing it.
+                    _stored_summary = os.path.join(trades_dir, "summary.csv")
+                    if os.path.isfile(_stored_summary):
+                        zf.write(_stored_summary, "summary.csv")
 
             if build_args:
                 # Track no-adjustment labels already written (strip numeric prefix)
@@ -638,6 +687,166 @@ async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(False)):
     )
 
 
+def _wm_adj_display(raw: Optional[str]) -> str:
+    """'NoAdjustment'→'No Adj', 'RiseBy1%'→'Rise 1%', 'FallsBy1%'→'Fall 1%',
+    'RisesOrFallsBy1%'→'Rise or Fall 1%'."""
+    import re as _re
+    s = (raw or "").strip()
+    if not s or s.lower().startswith("noadjust"):
+        return "No Adj"
+    m = _re.match(r"(RiseBy|FallsBy|RisesOrFallsBy)([\d.]+)%?", s)
+    if m:
+        word = {"RiseBy": "Rise", "FallsBy": "Fall", "RisesOrFallsBy": "Rise or Fall"}[m.group(1)]
+        return f"{word} {m.group(2)}%"
+    return s
+
+
+def _wm_strike_display(cc: Dict[str, Any]) -> str:
+    """Build 'CE ATM' / 'PE 1% ITM' / 'CE 3% OTM PE 0.5% ITM' from combo columns."""
+    def fmt(lbl: Optional[str], cepe: str) -> Optional[str]:
+        if not lbl or lbl == "-":
+            return None
+        return f"{cepe} {str(lbl).replace('_', ' ')}"
+    parts = [p for p in (fmt(cc.get("call_strike_label"), "CE"),
+                         fmt(cc.get("put_strike_label"), "PE")) if p]
+    return " ".join(parts) if parts else "Strategy"
+
+
+def _wm_strike_sort(cc: Dict[str, Any]) -> float:
+    """Row ordering: ATM first, then ITM (ascending %), then OTM (ascending %)."""
+    import re as _re
+    lbl = cc.get("call_strike_label")
+    if not lbl or lbl == "-":
+        lbl = cc.get("put_strike_label")
+    lbl = str(lbl or "").upper()
+    if not lbl or lbl == "ATM" or lbl == "-":
+        return 0.0
+    m = _re.match(r"([\d.]+)%_(ITM|OTM)", lbl)
+    if m:
+        mag = float(m.group(1))
+        return (1000.0 + mag) if m.group(2) == "ITM" else (2000.0 + mag)
+    return 3000.0
+
+
+@router.get("/optimize/jobs/{job_id}/wow_mom.xlsx")
+async def download_wow_mom(job_id: str, patchwise: bool = Query(False)):
+    """
+    Merged WOW & MOM summary across ALL combos: two sheets ('WOW Summary' +
+    'MOM Summary'), each stacking one block per combo (titled by combo label).
+    Each block is computed from the same `cleaned` rows the per-combo tradesheet
+    uses, so the blocks match the individual tradesheets exactly. Additive —
+    nothing existing changes.
+    """
+    import pandas as pd
+    from openpyxl import Workbook
+    from services.optimizer.excel_builder import build_cleaned_for_combo
+    from services.optimizer.wow_mom import write_merged_wow_mom
+
+    meta = result_store.get_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if meta.get("status") != "success":
+        raise HTTPException(status_code=400, detail=f"Job is not complete (status: {meta.get('status')})")
+
+    zip_naming = meta.get("zip_naming") or {}
+    lvl1 = _safe_zip_name(zip_naming.get("level1", "")) if zip_naming else ""
+    fname_out = f"{lvl1}_WOW_MOM.xlsx" if lvl1 else f"optimize_{job_id[:8]}_WOW_MOM.xlsx"
+
+    # Serve from disk cache if already built — first click builds, every
+    # subsequent click is instant.
+    cache_path = result_store.wow_mom_cache_path(job_id, patchwise)
+    if os.path.isfile(cache_path):
+        return FileResponse(
+            cache_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=fname_out,
+            headers={"X-Filename": fname_out},
+        )
+
+    trades_dir = result_store.get_trades_dir(job_id)
+    if not os.path.isdir(trades_dir):
+        raise HTTPException(status_code=404, detail="No tradesheets found.")
+
+    base_payload = meta.get("base_payload") or {}
+    midcap_legs = base_payload.get("midcap_legs") or None
+    midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
+    midcap_sym  = (
+        (midcap_legs[0].get("symbol") if (midcap_legs and isinstance(midcap_legs[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    filter_segments = base_payload.get("filter_segments") or None
+
+    label_by_safe: Dict[str, str] = {}
+    cols_by_safe: Dict[str, Dict[str, Any]] = {}
+    for row in result_store.get_all_results(job_id):
+        cls = row.get("combo_label_safe")
+        if cls:
+            label_by_safe[cls] = row.get("combo_label") or cls
+            cols_by_safe[cls] = row.get("combo_columns") or {}
+
+    files = sorted(os.listdir(trades_dir))
+    combo_csvs = [f for f in files if f.endswith(".csv") and f not in ("summary.csv", "run_config.csv")]
+    if not combo_csvs:
+        raise HTTPException(status_code=404, detail="No combos found for this job.")
+
+    combos: List[Dict[str, Any]] = []
+    for fname in combo_csvs:
+        label_safe = fname[:-4]
+        try:
+            tdf = pd.read_csv(os.path.join(trades_dir, fname))
+        except Exception as exc:
+            logger.warning("[WOW_MOM] read failed %s: %s", fname, exc)
+            continue
+        try:
+            cleaned, has_midcap = build_cleaned_for_combo(
+                tdf, midcap_legs, midcap_sa, midcap_sym,
+                patchwise=patchwise,
+                filter_segments=filter_segments,
+            )
+        except Exception as exc:
+            logger.warning("[WOW_MOM] cleaned build failed %s: %s", fname, exc)
+            continue
+        cc = cols_by_safe.get(label_safe) or {}
+        strike_disp = _wm_strike_display(cc)
+        adj_label = _wm_adj_display(cc.get("spot_adjustment"))
+        row_key = "|".join([strike_disp, str(cc.get("expiry") or ""), str(cc.get("shifting") or "")])
+        combos.append({
+            "title": f"{strike_disp} | {adj_label}" if cc else label_by_safe.get(label_safe, label_safe),
+            "cleaned": cleaned,
+            "has_midcap": has_midcap,
+            "adj_key": str(cc.get("spot_adjustment") or adj_label),
+            "adj_label": adj_label,
+            "row_key": row_key,
+            "row_sort": _wm_strike_sort(cc),
+        })
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    if not write_merged_wow_mom(wb, combos):
+        raise HTTPException(status_code=400, detail="No WOW/MOM data (combos produced 0 trades).")
+
+    # Save to disk cache so subsequent clicks are instant.
+    try:
+        tmp_path = cache_path + ".building"
+        wb.save(tmp_path)
+        os.replace(tmp_path, cache_path)
+    except Exception as _ce:
+        logger.warning("[WOW_MOM] cache write failed for %s: %s", job_id[:8], _ce)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname_out}"',
+            "X-Filename": fname_out,
+        },
+    )
+
+
 @router.get("/optimize/jobs/{job_id}/combo/{combo_id}/tradesheet")
 async def download_combo_tradesheet(job_id: str, combo_id: int):
     """
@@ -692,6 +901,82 @@ async def download_combo_tradesheet(job_id: str, combo_id: int):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/optimize/jobs/{job_id}/summary")
+async def get_optim_summary(job_id: str, patchwise: bool = Query(False)):
+    """
+    Per-combo master-summary metrics for the user-selected download method.
+
+      • overall  (default) → the stored (overall-DD) summaries, as shown in the table.
+      • patchwise           → metrics RECOMPUTED with the equity chain reset per patch,
+                              using the exact same compute_xlsx_summary_metrics that
+                              builds the patchwise ZIP's summary.csv — so the "summary
+                              excel of all optims" matches the patchwise tradesheets.
+
+    The frontend gates this behind a ZIP download, so the on-disk combo CSVs are
+    already MAE/MFE-enriched by the time a patchwise summary is requested.
+    """
+    meta = result_store.get_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    all_results = result_store.get_all_results(job_id)
+    if not patchwise:
+        return {"rows": [
+            {"combo_id": r.get("combo_id"), "summary": r.get("summary") or {}}
+            for r in all_results
+        ]}
+
+    # Serve pre-built patchwise summary from disk if available (worker builds it
+    # right after sweep completes so this is normally instant).
+    _pw_cache = result_store.patchwise_summary_cache_path(job_id)
+    if os.path.isfile(_pw_cache):
+        import json as _json
+        try:
+            with open(_pw_cache) as _fh:
+                return _json.load(_fh)
+        except Exception:
+            pass  # fall through to recompute
+
+    import pandas as pd
+    from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cmetrics
+
+    base_payload = meta.get("base_payload") or {}
+    _midcap_legs = base_payload.get("midcap_legs") or None
+    _midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
+    _midcap_sym  = (
+        (_midcap_legs[0].get("symbol") if (_midcap_legs and isinstance(_midcap_legs[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    _filter_segments = base_payload.get("filter_segments") or None
+    trades_dir = result_store.get_trades_dir(job_id)
+
+    def _build():
+        out = []
+        for r in all_results:
+            _ls = r.get("combo_label_safe") or ""
+            _stored = r.get("summary") or {}
+            _csv = os.path.join(trades_dir, f"{_ls}.csv")
+            if not _ls or not os.path.isfile(_csv):
+                out.append({"combo_id": r.get("combo_id"), "summary": _stored})
+                continue
+            try:
+                _df = pd.read_csv(_csv, dtype=str)
+                _m = _cmetrics(
+                    _df, _stored,
+                    midcap_legs=_midcap_legs, midcap_spot_adjustment=_midcap_sa,
+                    midcap_symbol=_midcap_sym, patchwise=True,
+                    filter_segments=_filter_segments,
+                )
+                out.append({"combo_id": r.get("combo_id"), "summary": {**_stored, **_m}})
+            except Exception as _e:
+                logger.warning("[OPTIM_DL] patchwise summary skipped for %s: %s", _ls, _e)
+                out.append({"combo_id": r.get("combo_id"), "summary": _stored})
+        return out
+
+    rows = await asyncio.get_event_loop().run_in_executor(None, _build)
+    return {"rows": rows}
 
 
 @router.delete("/optimize/jobs/{job_id}")

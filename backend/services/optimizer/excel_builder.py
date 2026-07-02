@@ -440,7 +440,17 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
     # Excel ratio DD / Peak.
     cumulative = 100.0
     peak = 100.0
+    _prev_pw_key = None
     for k in sorted_keys:
+        if patchwise and not has_midcap and _prev_pw_key is not None:
+            if _pw_seg_starts:
+                new_patch = _pw_seg_idx(k) != _pw_seg_idx(_prev_pw_key)
+            else:
+                new_patch = "FILTER_END" in (tm[_prev_pw_key].get("exitReason") or "").upper().split("+")
+            if new_patch:
+                cumulative = 100.0
+                peak = 100.0
+        _prev_pw_key = k
         t = tm[k]
         pct = t["pct"] if isinstance(t["pct"], float) else 0.0
         cumulative *= (1.0 + pct / 100.0)
@@ -456,7 +466,17 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
     prev_cum = 100.0
     prev_peak = 100.0
     first_done = False
+    _prev_pw_key_ln = None
     for k in sorted_keys:
+        if patchwise and not has_midcap and _prev_pw_key_ln is not None:
+            if _pw_seg_starts:
+                new_patch = _pw_seg_idx(k) != _pw_seg_idx(_prev_pw_key_ln)
+            else:
+                new_patch = "FILTER_END" in (tm[_prev_pw_key_ln].get("exitReason") or "").upper().split("+")
+            if new_patch:
+                prev_cum = 100.0
+                prev_peak = 100.0
+        _prev_pw_key_ln = k
         t = tm[k]
         mae  = t["finalMae"]   if isinstance(t["finalMae"],   float) else None
         peak = t["peak"]       if isinstance(t["peak"],        float) else None
@@ -497,7 +517,7 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
                 if _pw_seg_starts:
                     new_patch = _pw_seg_idx(k) != _pw_seg_idx(prev_k)
                 else:
-                    new_patch = (tm[prev_k].get("exitReason") or "").upper() == "FILTER_END"
+                    new_patch = "FILTER_END" in (tm[prev_k].get("exitReason") or "").upper().split("+")
                 if new_patch:
                     nav = 100.0; peak = 100.0; prev_nav = 100.0; prev_peak = 100.0
             t = tm[k]
@@ -674,8 +694,6 @@ def _write_patch_wise_sheet(
     filter_segments: Optional[List] = None,
 ) -> None:
     """Patch-wise phase distribution sheet — mirrors buildTradeExcel.js Sheet 3."""
-    if not has_midcap:
-        return
 
     GAP_MS = 30 * 86400000  # 30-day gap separates patches (fallback only)
 
@@ -788,20 +806,21 @@ def _write_patch_wise_sheet(
 
     _opt = "CE+PE" if (has_calls and has_puts) else ("CE" if has_calls else ("PE" if has_puts else "Options"))
     nifty_title = f"Nifty {_opt}"
+    _nifty_phase = {"title": nifty_title, "kind": "std", "dates": False,
+         "drive": lambda td: td["callPct"], "mae": lambda td: td["callMae"],
+         "detail_hdr": ["Net P&L %","Cumulative","Peak","DD","%DD","MAE","Lowest NAV","Actual Live DD"],
+         "side_hdr": ["Entry","Exit","CAGR","Net P&L %","Live DD"]}
     PHASES = [
         {"title": "Midcap Future", "kind": "midcap", "dates": True,
          "drive": lambda td: td["midcapPct"], "mae": lambda td: td["midcapMae"],
          "detail_hdr": ["Entry Date","Exit Date","Midcap Hypo P&L %","cumm","Peak","Close","Hypo MAE","Lowest NAV","Live DD"],
          "side_hdr": ["Entry","Exit","CAGR","Future P&L %","Live DD"]},
-        {"title": nifty_title, "kind": "std", "dates": False,
-         "drive": lambda td: td["callPct"], "mae": lambda td: td["callMae"],
-         "detail_hdr": ["Net P&L %","Cumulative","Peak","DD","%DD","MAE","Lowest NAV","Actual Live DD"],
-         "side_hdr": ["Entry","Exit","CAGR","Net P&L %","Live DD"]},
+        _nifty_phase,
         {"title": f"{nifty_title} + Midcap Future", "kind": "std", "dates": False,
          "drive": lambda td: td["combinedPct"], "mae": lambda td: td["combinedMae"],
          "detail_hdr": ["Net P&L %","Cumulative","Peak","DD","%DD","MAE","Lowest NAV","Actual Live DD"],
          "side_hdr": ["Entry","Exit","CAGR","Net P&L %","Live DD"]},
-    ]
+    ] if has_midcap else [_nifty_phase]
 
     ws = wb.create_sheet("Patch wise")
     ws.freeze_panes = "A5"
@@ -1147,46 +1166,41 @@ def _write_summary_sheet(
     mdd_end      = S.get("mdd_end_date")   or ""
     mdd_dur      = _to_num(S.get("mdd_duration_days")) or ""
 
-    # With a Midcap leg, derive Max DD / streaks / DD-period from the COMBINED
-    # NAV (the NIFTY S.max_dd_pct is wrong); mirrors the backtest Risk Metrics.
-    if has_midcap:
-        c_peak = 100.0; worst_dd = 0.0
-        worst_peak_ms = None; worst_trough_ms = None; peak_ms = None
-        win_run = loss_run = mx_win = mx_loss = 0
-        prev_exit_reason_dd = ""
-        prev_seg_idx_dd = None
-        for t in cleaned:
-            cp = _to_num(t.get("Combined Net P&L %"))
-            if cp is not None and math.isfinite(cp):
-                if cp > 0:   win_run += 1; loss_run = 0; mx_win  = max(mx_win, win_run)
-                elif cp < 0: loss_run += 1; win_run = 0; mx_loss = max(mx_loss, loss_run)
-            cc = _to_num(t.get("Combined Cumulative"))
-            if cc is not None and math.isfinite(cc):
-                xd = _parse_date_ms(t.get("Exit Date"))
-                # Reset the running peak at each patch boundary (same boundary as the
-                # combined chain) so the cumulative reset isn't read as a drawdown.
-                seg_idx = _pw_row_seg_idx(t.get("Entry Date"))
-                if patchwise and (
-                    (prev_seg_idx_dd is not None and seg_idx != prev_seg_idx_dd) if _pw_seg_starts
-                    else (prev_exit_reason_dd == "FILTER_END")
-                ):
-                    c_peak = cc; peak_ms = xd
-                elif cc >= c_peak:
-                    c_peak = cc; peak_ms = xd
-                else:
-                    dd = (cc / c_peak - 1) * 100 if c_peak != 0 else 0.0
-                    if dd < worst_dd:
-                        worst_dd = dd; worst_peak_ms = peak_ms; worst_trough_ms = xd
-                prev_seg_idx_dd = seg_idx
-            prev_exit_reason_dd = (t.get("Exit Reason") or "").upper()
-        max_dd_pct = worst_dd
-        max_win_str = mx_win; max_loss_str = mx_loss
-        if worst_peak_ms and worst_trough_ms:
-            mdd_dur = round((worst_trough_ms - worst_peak_ms) / 86400000)
-            mdd_start = datetime.utcfromtimestamp(worst_peak_ms / 1000).strftime("%Y-%m-%d")
-            mdd_end   = datetime.utcfromtimestamp(worst_trough_ms / 1000).strftime("%Y-%m-%d")
-        else:
-            mdd_dur = 0; mdd_start = ""; mdd_end = ""
+    # Max Drawdown = the single worst %DD on the equity curve — Combined NAV with a
+    # Midcap leg, NIFTY NAV otherwise — i.e. min over trades of (Cumulative/Peak − 1)×100.
+    # Computed straight from the Cumulative/Peak columns (units-safe) so the Summary can
+    # NEVER diverge from the per-trade %DD column, in BOTH overall and patchwise (those
+    # columns already carry the right peak basis: continuous for overall, per-patch reset
+    # for patchwise). Applies to midcap AND non-midcap alike.
+    _cum_col  = "Combined Cumulative" if has_midcap else "Cumulative"
+    _peak_col = "Combined Peak"       if has_midcap else "Peak"
+    _pct_col  = "Combined Net P&L %"  if has_midcap else "% P&L"
+    worst_dd = 0.0
+    worst_peak_ms = None; worst_trough_ms = None; peak_ms = None
+    win_run = loss_run = mx_win = mx_loss = 0
+    for t in cleaned:
+        cp = _to_num(t.get(_pct_col))
+        if cp is not None and math.isfinite(cp):
+            if cp > 0:   win_run += 1; loss_run = 0; mx_win  = max(mx_win, win_run)
+            elif cp < 0: loss_run += 1; win_run = 0; mx_loss = max(mx_loss, loss_run)
+        cc = _to_num(t.get(_cum_col))
+        pk = _to_num(t.get(_peak_col))
+        xd = _parse_date_ms(t.get("Exit Date"))
+        if cc is not None and pk not in (None, 0) and math.isfinite(cc):
+            if cc >= pk - 1e-9:
+                peak_ms = xd
+            else:
+                ddp = (cc / pk - 1) * 100
+                if ddp < worst_dd:
+                    worst_dd = ddp; worst_trough_ms = xd; worst_peak_ms = peak_ms
+    max_dd_pct = worst_dd
+    max_win_str = mx_win; max_loss_str = mx_loss
+    if worst_peak_ms and worst_trough_ms:
+        mdd_dur = round((worst_trough_ms - worst_peak_ms) / 86400000)
+        mdd_start = datetime.utcfromtimestamp(worst_peak_ms / 1000).strftime("%Y-%m-%d")
+        mdd_end   = datetime.utcfromtimestamp(worst_trough_ms / 1000).strftime("%Y-%m-%d")
+    else:
+        mdd_dur = 0; mdd_start = ""; mdd_end = ""
 
     car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
 
@@ -1279,7 +1293,7 @@ def _write_summary_sheet(
             # Reset the chain at each patch boundary (same boundary as the combined chain).
             if patchwise and (
                 (prev_seg_idx is not None and p.get("segIdx") != prev_seg_idx) if _pw_seg_starts
-                else (prev_exit_reason == "FILTER_END")
+                else ("FILTER_END" in (prev_exit_reason or "").split("+"))
             ):
                 cumulative = 100.0; peak = 100.0; prev_cum = 100.0; prev_peak = 100.0
             prev_seg_idx = p.get("segIdx")
@@ -1505,7 +1519,7 @@ def _write_summary_sheet(
             max_dd_yr = by_yr_max_dd.get(yr)
             r_mdd = (abs(total) / abs(max_dd_yr)) if (max_dd_yr and max_dd_yr != 0 and total != 0) else ""
             row_data = [yr, *[round(v, 2) for v in mos], round(total, 2),
-                        round(max_dd_yr, 2) if max_dd_yr is not None else "", "", r_mdd]
+                        max_dd_yr if max_dd_yr is not None else "", "", r_mdd]
             ws.row_dimensions[r].height = 18
             for ci2, val in enumerate(row_data, 1):
                 c = ws.cell(row=r, column=ci2, value=val)
@@ -1513,6 +1527,14 @@ def _write_summary_sheet(
                 is_tot  = ci2 == 14
                 if is_pct and (is_val or is_tot) and isinstance(val, (int, float)):
                     c.value = val / 100
+                    c.number_format = "0.00%"
+                    num_v = val
+                elif ci2 == 15 and isinstance(val, (int, float)):
+                    c.value = val / 100
+                    c.number_format = "0.00%"
+                    num_v = val
+                elif is_pct and ci2 == 14 and isinstance(val, (int, float)):
+                    c.value = val
                     c.number_format = "0.00%"
                     num_v = val
                 else:
@@ -1611,6 +1633,8 @@ def compute_xlsx_summary_metrics(
     midcap_legs=None,
     midcap_spot_adjustment=None,
     midcap_symbol: str = "NIFTYMIDCAP100",
+    patchwise: bool = False,
+    filter_segments=None,
 ) -> Dict[str, Any]:
     """
     Return a dict of every summary stat that _write_summary_sheet computes from
@@ -1618,6 +1642,9 @@ def compute_xlsx_summary_metrics(
     MAE/MFE enrichment so the master summary CSV matches each combo XLSX exactly.
     When midcap_legs is provided, the headline stats run on the COMBINED
     (NIFTY + Midcap) per-trade P&L and Midcap-specific fields are added.
+    When patchwise is set (patchwise ZIP download), the equity chain resets to
+    100 at each patch boundary — identical to the per-combo XLSX patchwise
+    Summary — so the master summary matches the individual combo summary.
     """
     S = summary or {}
     if trades_df is None or (hasattr(trades_df, "empty") and trades_df.empty):
@@ -1628,7 +1655,31 @@ def compute_xlsx_summary_metrics(
     midcap_by_trade, midcap_summary, has_midcap = compute_midcap_for_rows(
         rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
     )
-    tm, _grouped, _sorted_keys = _aggregate_trades(rows, has_midcap, midcap_by_trade)
+    tm, _grouped, _sorted_keys = _aggregate_trades(
+        rows, has_midcap, midcap_by_trade,
+        patchwise=patchwise, filter_segments=filter_segments,
+    )
+
+    # Patchwise reset boundaries (segment START dates), shared by the Max DD scan
+    # and the outlier Live DD scan so they reset at the same points as the per-combo
+    # XLSX patchwise Summary (mirrors _write_summary_sheet).
+    def _pw_seg_start_ms(s):
+        s = s or {}
+        return _date_ms(s.get("start") or s.get("Start") or s.get("from")
+                        or s.get("start_date") or s.get("startdt"))
+    _pw_seg_starts = sorted(ms for ms in (_pw_seg_start_ms(s) for s in (filter_segments or []))
+                            if ms is not None)
+
+    def _pw_row_seg_idx(entry_val) -> int:
+        em = _date_ms(entry_val)
+        i = -1
+        if em is not None:
+            for j, sm in enumerate(_pw_seg_starts):
+                if sm <= em:
+                    i = j
+                else:
+                    break
+        return i
 
     # Single source of truth for trade order: `_sorted_keys` is the CANONICAL
     # chronological (entry-date) order _aggregate_trades used to compute every
@@ -1639,6 +1690,17 @@ def compute_xlsx_summary_metrics(
     # column extraction but is no longer used to derive trade order.
     _key_order, _hc, _hp, _hf = _build_key_order(rows, has_midcap)
     cleaned = _build_cleaned_rows(rows, _key_order, tm, has_midcap, midcap_by_trade)
+
+    # First-seen Entry Date / Exit Reason per trade key (for patchwise segment
+    # bucketing in the Max DD + outlier Live DD scans below).
+    _key_entry_pw: Dict[str, Any] = {}
+    _key_exit_reason_pw: Dict[str, str] = {}
+    for _cr in cleaned:
+        _ck = str(_cr.get("Trade") or _cr.get("trade") or 1)
+        if _ck not in _key_entry_pw and _cr.get("Entry Date"):
+            _key_entry_pw[_ck] = _cr.get("Entry Date")
+        if _cr.get("Exit Reason"):
+            _key_exit_reason_pw[_ck] = (_cr.get("Exit Reason") or "").upper()
 
     sum_pct = 0.0; sum_pos_pct = 0.0; sum_neg_pct = 0.0
     win_cnt = 0;   loss_cnt = 0;      total_cnt = 0
@@ -1712,7 +1774,7 @@ def compute_xlsx_summary_metrics(
         sum_pct = sum_pos_pct = sum_neg_pct = 0.0
         win_cnt = loss_cnt = total_cnt = 0
         sum_net = 0.0; final_cum = 100.0
-        c_peak = 100.0; worst_dd = 0.0
+        worst_dd = 0.0
         win_net_sum = loss_net_sum = 0.0
         max_net_c = -math.inf; min_net_c = math.inf
         for _k in _chron_c:
@@ -1720,6 +1782,7 @@ def compute_xlsx_summary_metrics(
             cp = t2.get("combinedPct"); cp = cp if isinstance(cp, float) and math.isfinite(cp) else None
             cnet = _to_num(mc2.get("Combined Net P&L"))
             cc = t2.get("combinedCum"); cc = cc if isinstance(cc, float) and math.isfinite(cc) else None
+            cdd = t2.get("combinedPctDd"); cdd = cdd if isinstance(cdd, float) and math.isfinite(cdd) else None
             if cp is not None:
                 sum_pct += cp; total_cnt += 1
                 if cp > 0:   sum_pos_pct += cp; win_cnt  += 1
@@ -1732,11 +1795,9 @@ def compute_xlsx_summary_metrics(
                 elif cnet < 0: loss_net_sum += cnet
             if cc is not None:
                 final_cum = cc
-                if cc >= c_peak:
-                    c_peak = cc
-                else:
-                    dd = (cc / c_peak - 1) * 100 if c_peak != 0 else 0.0
-                    if dd < worst_dd: worst_dd = dd
+            # Max DD = worst Combined %DD (identical to the tradesheet column), both modes.
+            if cdd is not None and cdd < worst_dd:
+                worst_dd = cdd
         combined_max_dd = worst_dd
         if not math.isfinite(max_net_c): max_net_c = 0.0
         if not math.isfinite(min_net_c): min_net_c = 0.0
@@ -1752,9 +1813,20 @@ def compute_xlsx_summary_metrics(
     opt_cagr  = (math.pow(final_cum / 100, 1 / years) - 1) * 100 if years > 0 and final_cum > 0 else 0.0
     spot_cagr = (math.pow(spot_cum  / 100, 1 / years) - 1) * 100 if years > 0 and spot_cum  > 0 else 0.0
 
-    max_dd_pct = _to_num(S.get("max_dd_pct")) or 0.0
-    if has_midcap and combined_max_dd is not None:
-        max_dd_pct = combined_max_dd
+    # Max Drawdown = min %DD on the equity curve (Combined for midcap, NIFTY otherwise),
+    # read straight from Cumulative/Peak so the master == the per-combo tradesheet's %DD,
+    # for midcap AND non-midcap. Mirrors _write_summary_sheet exactly.
+    _mdd_cum_col  = "Combined Cumulative" if has_midcap else "Cumulative"
+    _mdd_peak_col = "Combined Peak"       if has_midcap else "Peak"
+    max_dd_pct = 0.0
+    for t in cleaned:
+        cc = _to_num(t.get(_mdd_cum_col)); pk = _to_num(t.get(_mdd_peak_col))
+        if cc is not None and pk not in (None, 0) and math.isfinite(cc):
+            ddp = (cc / pk - 1) * 100
+            if ddp < max_dd_pct:
+                max_dd_pct = ddp
+    if has_midcap:
+        combined_max_dd = max_dd_pct
     car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
 
     opt_sum = (
@@ -1785,7 +1857,9 @@ def compute_xlsx_summary_metrics(
         mae_v = t2.get(_mk)
         mae_v = mae_v if isinstance(mae_v, float) and math.isfinite(mae_v) else None
         if pct_v is not None:
-            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "mae": mae_v, "idx": len(trade_pairs)})
+            trade_pairs.append({"pct": pct_v, "ldd": ldd_v, "mae": mae_v, "idx": len(trade_pairs),
+                                 "exitReason": _key_exit_reason_pw.get(k, ""),
+                                 "segIdx": _pw_row_seg_idx(_key_entry_pw.get(k))})
 
     n_trades = len(trade_pairs)
     by_pct_desc = sorted(trade_pairs, key=lambda x: -x["pct"])
@@ -1814,8 +1888,18 @@ def compute_xlsx_summary_metrics(
         prev_cum = 100.0
         prev_peak = 100.0
         first_done = False
+        prev_exit_reason = ""
+        prev_seg_idx = None
         ldds = []
         for p in filtered:
+            # Reset the chain at each patch boundary (same boundary as the per-combo
+            # XLSX patchwise Summary) so the cumulative reset isn't read as a DD.
+            if patchwise and (
+                (prev_seg_idx is not None and p.get("segIdx") != prev_seg_idx) if _pw_seg_starts
+                else ("FILTER_END" in (prev_exit_reason or "").split("+"))
+            ):
+                cumulative = 100.0; peak = 100.0; prev_cum = 100.0; prev_peak = 100.0
+            prev_seg_idx = p.get("segIdx")
             pct = p["pct"]
             prev_peak = peak
             cumulative *= (1.0 + pct / 100.0)
@@ -1832,6 +1916,7 @@ def compute_xlsx_summary_metrics(
             else:
                 first_done = True
             prev_cum = cumulative
+            prev_exit_reason = p.get("exitReason") or ""
         if not ldds:
             return (0.0, 0.0)
         return (round(min(ldds), 4), round(sum(ldds) / len(ldds), 4))
@@ -1854,6 +1939,9 @@ def compute_xlsx_summary_metrics(
     _metrics = {
         "cagr_options":                          round(opt_cagr, 2),
         "cagr_spot":                             round(spot_cagr, 2),
+        # Max Drawdown = min %DD on the equity curve (Combined for midcap, NIFTY otherwise),
+        # for BOTH midcap and non-midcap — so the master summary == the per-combo tradesheet.
+        "max_dd_pct":                            max_dd_pct,
         "car_mdd":                               round(car_mdd, 4),
         "roi_vs_spot":                           round(roi_pct, 4),
         "avg_profit_per_trade_pct":              round(avg_pct, 4),
@@ -1916,7 +2004,7 @@ def compute_xlsx_summary_metrics(
             "max_win":              round(max_net_c, 2),
             "max_loss":             round(min_net_c, 2),
             "expectancy":           round(_expectancy, 6),
-            "max_dd_pct":           round(combined_max_dd, 4) if combined_max_dd is not None else (_to_num(S.get("max_dd_pct")) or 0.0),
+            "max_dd_pct":           max_dd_pct,
         })
 
     return _metrics
@@ -1942,10 +2030,15 @@ def _project_rows_for_midcap(rows: List[Dict]) -> List[Dict]:
                 (_to_num(l.get("FUT P&L")) or 0)
                 for l in legs
             )
-        pct = _to_num(main.get("% P&L"))
-        if pct is None:
-            es = _to_num(main.get("Entry Spot")) or 0.0
-            pct = (net / es * 100) if es else 0.0
+        # Recompute the NIFTY leg % at full (4-dp) precision to mirror the
+        # backtest engine exactly (engine_rust.py:1952 → round(net/spot*100, 4)).
+        # Reading the pre-rounded "% P&L" here (runner.py:1295 sets it via
+        # .round(2)) feeds a 2-dp NIFTY % into the Combined Net P&L % formula
+        # (Combined % = nifty% + Σ midcap leg %, midcap_overlay.py:357), drifting
+        # the optimizer's Combined % vs a direct backtest by ~0.003%/trade
+        # (~0.03% over a full run) even though the rupee P&L is identical.
+        es = _to_num(main.get("Entry Spot")) or 0.0
+        pct = round(net / es * 100.0, 4) if es else 0.0
         def _iso(v):
             d = _parse_date(v)
             return d.strftime("%Y-%m-%d") if d else None
@@ -2053,7 +2146,7 @@ def build_combo_xlsx(
         patchwise=patchwise,
         filter_segments=filter_segments,
     )
-    if has_midcap and filter_name:
+    if filter_name:
         _write_patch_wise_sheet(
             wb, tm, _grouped, _sorted_keys,
             has_midcap, midcap_by_trade,
@@ -2061,6 +2154,40 @@ def build_combo_xlsx(
             filter_segments=filter_segments,
         )
 
+    # WOW & MOM Summary (shared logic with the backtest export + merged summary).
+    try:
+        from services.optimizer.wow_mom import write_wow_mom_combined
+        write_wow_mom_combined(wb, cleaned, has_midcap, combo_label or "Strategy")
+    except Exception as _wm_exc:  # never block the tradesheet on the extra sheet
+        logging.getLogger(__name__).warning("[XLSX] WOW/MOM sheet skipped: %s", _wm_exc)
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def build_cleaned_for_combo(
+    trades_df: pd.DataFrame,
+    midcap_legs=None,
+    midcap_spot_adjustment=None,
+    midcap_symbol: str = "NIFTYMIDCAP100",
+    patchwise: bool = False,
+    filter_segments=None,
+):
+    """
+    Return (cleaned_rows, has_midcap) for a combo's trades — the same `cleaned`
+    list build_combo_xlsx feeds to the sheets. Used by the merged WOW/MOM
+    summary so each combo's block matches its individual tradesheet exactly.
+    """
+    if trades_df is None or (hasattr(trades_df, "empty") and trades_df.empty):
+        rows: List[Dict] = []
+    else:
+        rows = trades_df.where(trades_df.notna(), None).to_dict("records")
+    midcap_by_trade, _midcap_summary, has_midcap = compute_midcap_for_rows(
+        rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
+    )
+    key_order, _hc, _hp, _hf = _build_key_order(rows, has_midcap)
+    tm, _grouped, _sorted_keys = _aggregate_trades(
+        rows, has_midcap, midcap_by_trade, patchwise=patchwise, filter_segments=filter_segments)
+    cleaned = _build_cleaned_rows(rows, key_order, tm, has_midcap, midcap_by_trade)
+    return cleaned, has_midcap

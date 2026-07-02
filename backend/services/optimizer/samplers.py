@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from services.optimizer.param_expander import (
     _expand_values,
     count_combinations,
+    effective_combo_count,
     expand_param_specs,
 )
 
@@ -40,7 +41,9 @@ class ExhaustiveSampler:
         return iter(expand_param_specs(self.specs))
 
     def __len__(self) -> int:
-        return count_combinations(self.specs)
+        # Effective (deduped) count so progress/total match the combos actually
+        # produced when a gated toggle (e.g. spot_adjustment_enabled) is swept.
+        return effective_combo_count(self.specs)
 
     @property
     def kind(self) -> str:

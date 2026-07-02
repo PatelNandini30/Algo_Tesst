@@ -7,8 +7,6 @@ import OptimizePanel from './OptimizePanel';
 import OptimizationResults from './OptimizationResults';
 import Toggle from './ui/Toggle';
 import CalendarPicker from './ui/CalendarPicker';
-import TimeInput from './ui/TimeInput';
-import IntradaySlowPathWarning from './IntradaySlowPathWarning';
 
 // Convert DD/MM/YYYY to YYYY-MM-DD for API
 const toApiDate = (displayStr) => {
@@ -819,6 +817,11 @@ const StrategyBuilder = () => {
   const [midcapSpotAdjDirection, setMidcapSpotAdjDirection] = useState('rise');
   const [midcapSpotAdjValue, setMidcapSpotAdjValue] = useState(1.0);
   const [midcapSpotAdjUnits, setMidcapSpotAdjUnits] = useState('percent');
+  // Combine mode for when BOTH NIFTY and Midcap spot adjustment are on:
+  // 'earliest' (default) = whichever breaches first; 'confirm' = both must breach
+  // the SAME direction within N trading days of each other.
+  const [spotAdjCombineMode, setSpotAdjCombineMode] = useState('earliest');
+  const [spotAdjConfirmDays, setSpotAdjConfirmDays] = useState(0);
   const [bufferStrikeEnabled, setBufferStrikeEnabled] = useState(false);
   const [bufferStrikeValue, setBufferStrikeValue] = useState(0.5);
   const [bufferStrikeUnit, setBufferStrikeUnit] = useState('percent');
@@ -871,6 +874,32 @@ const [slippagePct, setSlippagePct] = useState(0);
       Object.entries(prev).map(([id, leg]) => [id, normalizeLegForSelectedIndex(leg)])
     ));
   }, [indexConfig, normalizeLegForSelectedIndex]);
+
+  // Force any leg on a monthly-only index (e.g. MIDCPNIFTY) to monthly expiry —
+  // both in display and payload. Guarded to avoid render loops.
+  useEffect(() => {
+    const _monthlyOnly = (idx) => !((getIndexConfig(idx) || {}).expiryBases || []).includes('weekly');
+    // A CROSS-index overlay leg (multi-index feature) is exempt — it may run
+    // weekly (date-aware). Only force monthly for SAME-index monthly-only legs.
+    const _crossIdx = (idx) => String(idx || instrument).toUpperCase() !== String(instrument).toUpperCase();
+    setLegs(prev => {
+      let changed = false;
+      const next = prev.map(l => {
+        if (l.segment !== 'midcap100' && !_crossIdx(l.index) && _monthlyOnly(l.index || instrument) && l.expiry !== 'monthly') {
+          changed = true;
+          return { ...l, expiry: 'monthly' };
+        }
+        return l;
+      });
+      return changed ? next : prev;
+    });
+    setDraftLeg(prev => {
+      if (prev.segment !== 'midcap100' && !_crossIdx(prev.index) && _monthlyOnly(prev.index || instrument) && prev.expiry !== 'monthly') {
+        return { ...prev, expiry: 'monthly' };
+      }
+      return prev;
+    });
+  }, [legs, draftLeg.index, draftLeg.segment, instrument]);
 
   const [overallSLEnabled, setOverallSLEnabled] = useState(false);
   const [overallSLType, setOverallSLType] = useState('max_loss');
@@ -925,8 +954,7 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
   const [cacheWarmReady, setCacheWarmReady] = useState(false);
   const [cacheWarmLabel, setCacheWarmLabel] = useState('');
-  const [backtestMode, setBacktestMode] = useState('eod'); // 'eod' | 'intraday'
-  const [intradayEntryTime, setIntradayEntryTime] = useState('09:20');
+  const [backtestMode, setBacktestMode] = useState('eod'); // kept 'eod' always; guards EOD-only UI (intraday removed)
   // Optimization panel state
   const [optimPanelOpen, setOptimPanelOpen] = useState(false);
   const [optimJob, setOptimJob] = useState(null); // { jobId, totalCombos, objective, runConfig }
@@ -938,8 +966,6 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [optimAlgorithm, setOptimAlgorithm] = useState('cma-es');
   const [optimObjective, setOptimObjective] = useState('total_pnl');
   const [optimParallelism, setOptimParallelism] = useState(null);
-  const [intradaySquareOffTime, setIntradaySquareOffTime] = useState('15:15');
-  const [slowPath, setSlowPath] = useState(false);
 
   const latestEntrySpot = useMemo(() => {
     const firstTrade = displayResults?.trades?.[0];
@@ -1047,6 +1073,22 @@ const [slippagePct, setSlippagePct] = useState(0);
       jobPollRef.current = null;
     }
   }, []);
+
+  // Free the worker if the user closes the tab, hard-refreshes, or navigates
+  // away while a backtest is still running. `pagehide` fires on close/refresh/
+  // navigation but NOT on a plain tab-switch, so we don't cancel jobs the user
+  // means to keep. `keepalive` lets the DELETE outlive the page unload (and the
+  // backend DELETE both revokes the Celery task and releases the memory gate).
+  useEffect(() => {
+    if (!jobId) return undefined;
+    const cancelOnExit = () => {
+      try {
+        fetch(`/api/algotest/jobs/${jobId}`, { method: 'DELETE', keepalive: true });
+      } catch {}
+    };
+    window.addEventListener('pagehide', cancelOnExit);
+    return () => window.removeEventListener('pagehide', cancelOnExit);
+  }, [jobId]);
 
   // ── Midcap cross-index overlay (additive) ─────────────────────────────────
   // After the NIFTY backtest completes, price the Midcap100 overlay leg(s) for
@@ -1445,9 +1487,14 @@ const [slippagePct, setSlippagePct] = useState(0);
         return false;
       }
     }
+    // Multi-index / multi-expiry feature: when any leg is on a different index
+    // than the strategy, legs are deliberately allowed to mix weekly + monthly
+    // expiries (each leg runs on its own cadence), so skip the basis-match checks.
+    const _stratIdx = String(instrument || 'NIFTY').toUpperCase();
+    const _isMultiIndex = legs.some(l => String(l.index || _stratIdx).toUpperCase() !== _stratIdx);
     // Only options legs carry a real weekly/monthly expiry. Futures and Midcap100
     // legs do not (Midcap follows the NIFTY trade's dates), so exclude them here.
-    if (expiryBasis === 'monthly') {
+    if (!_isMultiIndex && expiryBasis === 'monthly') {
       const weeklyLegs = legs
         .map((l, i) => ({ l, i }))
         .filter(({ l }) => l.segment === 'options' && ['weekly', 'next_weekly'].includes(l.expiry));
@@ -1457,7 +1504,7 @@ const [slippagePct, setSlippagePct] = useState(0);
         return false;
       }
     }
-    if (expiryBasis === 'weekly') {
+    if (!_isMultiIndex && expiryBasis === 'weekly') {
       const monthlyLegs = legs
         .map((l, i) => ({ l, i }))
         .filter(({ l }) => l.segment === 'options' && ['monthly', 'next_monthly'].includes(l.expiry));
@@ -1811,18 +1858,37 @@ const [slippagePct, setSlippagePct] = useState(0);
         segment: segmentType.toUpperCase(),
         position: l.position.toUpperCase(),
         lots: l.lot || 1,
+        // Per-leg index (multi-index feature). Defaults to the strategy index,
+        // so single-index strategies are unaffected.
+        index: String(l.index || instrument).toUpperCase(),
       };
 
       if (segmentType === 'options') {
         // Normalize 'call'/'put' UI values to 'CE'/'PE' for the backend
         const rawOpt = (l.option_type || '').toLowerCase();
         leg.option_type = rawOpt === 'call' ? 'CE' : rawOpt === 'put' ? 'PE' : l.option_type.toUpperCase();
-        leg.expiry = normalizeExpiryForIndex(l.expiry, instrument, 'options').toUpperCase();
-        leg.strike_interval = normalizeStrikeInterval(l.strike_interval);
+        // Same-index legs keep the EXACT original behaviour (user's Strike Gap
+        // via normalizeStrikeInterval). Only a CROSS-index leg (e.g. MIDCPNIFTY
+        // on a NIFTY strategy) defaults to that index's interval (25).
+        const _legIdx = String(l.index || instrument).toUpperCase();
+        const _isCrossIndex = _legIdx !== String(instrument).toUpperCase();
+        const _legCfg = getIndexConfig(_legIdx) || {};
+        const _legMonthlyOnly = !(_legCfg.expiryBases || []).includes('weekly');
+        const _legInterval = _isCrossIndex
+          ? (_legCfg.strikeInterval || normalizeStrikeInterval(l.strike_interval))
+          : normalizeStrikeInterval(l.strike_interval);
+        // Same-index monthly-only legs stay forced monthly (existing behaviour).
+        // A CROSS-index overlay leg respects the user's weekly/monthly choice —
+        // the multi-index feature prices weekly date-aware (e.g. MIDCPNIFTY
+        // weeklies existed 2022->late-2024; falls back to monthly otherwise).
+        leg.expiry = _isCrossIndex
+          ? String(l.expiry || _legCfg.defaultOptionExpiry || 'monthly').toUpperCase()
+          : (_legMonthlyOnly ? 'MONTHLY' : normalizeExpiryForIndex(l.expiry, _legIdx, 'options').toUpperCase());
+        leg.strike_interval = _legInterval;
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
           strike_type: l.strike_type.toUpperCase(),
-          strike_interval: normalizeStrikeInterval(l.strike_interval),
+          strike_interval: _legInterval,
           premium: l.premium_value,
           lower: l.premium_min,
           upper: l.premium_max,
@@ -1953,8 +2019,21 @@ const [slippagePct, setSlippagePct] = useState(0);
     );
     const effectiveExpiryType = allFuturesNextMonthly ? 'NEXT_MONTHLY' : expiryBasis.toUpperCase();
 
+    // Multi-index feature trigger (opt-in, conservative): ONLY when legs span
+    // more than one index, or a leg's index differs from the strategy index.
+    // Single-index strategies (even with mixed weekly/monthly legs) are NEVER
+    // rerouted, so existing behaviour is byte-identical.
+    const _stratIdx = String(instrument || 'NIFTY').toUpperCase();
+    const _legIndices = new Set(engineLegs.map(l => String(l.index || _stratIdx).toUpperCase()));
+    const multiIndexMode = engineLegs.length > 0 && (
+      _legIndices.size > 1 || (_legIndices.size === 1 && !_legIndices.has(_stratIdx))
+    );
+
     return {
       index: instrument,
+      // Opt-in flag routing this run to the isolated multi-index feature on the
+      // backend. Absent/false for every existing single-index strategy.
+      multi_index_mode: multiIndexMode,
       underlying,
       strategy_type: strategyType,
       expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
@@ -1993,6 +2072,16 @@ const [slippagePct, setSlippagePct] = useState(0);
             units: midcapSpotAdjUnits,
           }
         : null,
+      // Combine mode (only honored by the engine when BOTH NIFTY & Midcap spot
+      // adjustment are active). Default 'earliest' = unchanged behaviour.
+      spot_adjustment_combine_mode:
+        (spotAdjustmentEnabled && midcapLegs.length && midcapSpotAdjEnabled)
+          ? spotAdjCombineMode
+          : 'earliest',
+      spot_adjustment_confirm_days:
+        (spotAdjustmentEnabled && midcapLegs.length && midcapSpotAdjEnabled && spotAdjCombineMode === 'confirm')
+          ? Math.max(0, Number(spotAdjConfirmDays) || 0)
+          : 0,
       // Overall SL/TGT - send flat structure with correct field names expected by backend
       overall_sl_type: overallSLEnabled ? overallSLType : null,
       overall_sl_value: overallSLEnabled ? (overallSLValue === '' ? 0 : overallSLValue) : null,
@@ -2201,109 +2290,6 @@ const [slippagePct, setSlippagePct] = useState(0);
     }
   }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, rolloverToggle, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
 
-  const strikeTypeToIntradayOffset = (strikeType, optType) => {
-    if (!strikeType || strikeType === 'atm') return 0;
-    const m = String(strikeType).toLowerCase().match(/^(itm|otm)(\d+)$/);
-    if (!m) return 0;
-    const n = parseInt(m[2], 10);
-    const isCE = (optType || '').toUpperCase() === 'CE';
-    if (m[1] === 'otm') return isCE ? n : -n;
-    return isCE ? -n : n;
-  };
-
-  const runIntradayBacktest = useCallback(async () => {
-    if (legs.length === 0) { setError('Please add at least one leg'); return; }
-    if (loading) return;
-    setLoading(true);
-    setError(null);
-    setResults(null);
-    setRawResults(null);
-    setDisplayResults(null);
-    setSlowPath(false);
-    const optLegs = legs.filter(l => l.segment !== 'futures');
-    if (optLegs.length === 0) { setError('Intraday mode requires at least one options leg'); setLoading(false); return; }
-    if (instrument !== 'NIFTY') { setError('Intraday backtest is currently available for NIFTY only. Import data for other symbols to enable them.'); setLoading(false); return; }
-    const payload = {
-      symbol: instrument,
-      date_from: toApiDate(startDate),
-      date_to: toApiDate(endDate),
-      entry_time: intradayEntryTime,
-      square_off_time: intradaySquareOffTime,
-      legs: optLegs.map(l => {
-        const optType = l.option_type === 'call' ? 'CE' : 'PE';
-        const slMode = (l.stop_loss_mode || 'PERCENT').includes('PERCENT') ? 'percent' : 'points';
-        const tgtMode = (l.target_mode || 'PERCENT').includes('PERCENT') ? 'percent' : 'points';
-        return {
-          opt_type: optType,
-          action: l.position === 'sell' ? 'SELL' : 'BUY',
-          strike_selection: { mode: 'ATM', value: strikeTypeToIntradayOffset(l.strike_type, optType) },
-          expiry: (l.expiry || 'weekly').toUpperCase(),
-          quantity: l.lot || 1,
-          sl: l.stop_loss_enabled && l.stop_loss_value != null
-            ? { type: slMode, value: Number(l.stop_loss_value) }
-            : null,
-          target: l.target_enabled && l.target_value != null
-            ? { type: tgtMode, value: Number(l.target_value) }
-            : null,
-        };
-      }),
-    };
-    try {
-      const submitRes = await fetch('/api/intraday/backtest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (!submitRes.ok) {
-        const errBody = await submitRes.json().catch(() => null);
-        throw new Error(errBody?.detail || `Server error (${submitRes.status})`);
-      }
-      setSlowPath(submitRes.headers.get('X-Slow-Path') === 'true');
-
-      // The intraday API returns either:
-      //   200 + Arrow IPC body when result is cached in Redis (synchronous return), or
-      //   202 + JSON {"job_id":...} when work was queued — must be polled.
-      const submitCt = submitRes.headers.get('content-type') || '';
-      if (submitCt.includes('arrow') || submitCt.includes('octet-stream')) {
-        const buffer = await submitRes.arrayBuffer();
-        const { decodeTradesheet } = await import('../utils/arrowDecoder.js');
-        const trades = decodeTradesheet(buffer);
-        setResults(trades);
-        setDisplayResults(trades);
-        return;
-      }
-
-      const { job_id } = await submitRes.json();
-
-      // Poll until done or failed
-      const POLL_INTERVAL_MS = 800;
-      const MAX_POLLS = 150; // ~2 minutes
-      let polls = 0;
-      while (polls < MAX_POLLS) {
-        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-        polls++;
-        const pollRes = await fetch(`/api/intraday/jobs/${job_id}`);
-        const ct = pollRes.headers.get('content-type') || '';
-        if (ct.includes('arrow') || ct.includes('octet-stream')) {
-          const buffer = await pollRes.arrayBuffer();
-          const { decodeTradesheet } = await import('../utils/arrowDecoder.js');
-          const trades = decodeTradesheet(buffer);
-          setResults(trades);
-          setDisplayResults(trades);
-          return;
-        }
-        const body = await pollRes.json().catch(() => ({}));
-        if (body.status === 'failed') throw new Error(body.error || 'Backtest failed');
-        // still queued/running — keep polling
-      }
-      throw new Error('Intraday backtest timed out after 2 minutes');
-    } catch (err) {
-      setError(err.message || 'Intraday backtest failed');
-    } finally {
-      setLoading(false);
-    }
-  }, [legs, loading, startDate, endDate, intradayEntryTime, intradaySquareOffTime, instrument]);
-
   const strykNav = [
     { id: 'build', label: 'Build', Icon: LayoutGrid, onClick: () => { setActiveView('build'); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
     { id: 'results', label: 'Results', Icon: BarChart3, disabled: !displayResults, onClick: () => { if (displayResults) { setActiveView('results'); resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }); } } },
@@ -2396,34 +2382,6 @@ const [slippagePct, setSlippagePct] = useState(0);
       </header>
 
       <div className="max-w-screen-2xl mx-auto px-6 py-4">
-        {/* Instrument Strip */}
-        <div className="mb-4 bg-surface border border-default rounded-lg">
-          <div className="grid grid-cols-1 md:grid-cols-2">
-            {INDEX_GROUPS.map(group => (
-              <div key={group.key} className="px-4 py-3 border-b md:border-b-0 md:border-r last:border-r-0 border-subtle">
-                <div className="mb-2" style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.6rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)' }}>{group.title}</div>
-                <div className="flex flex-wrap gap-x-1 gap-y-1">
-                  {group.symbols.map(symbol => {
-                    const cfg = getIndexConfig(symbol);
-                    const active = instrument === symbol;
-                    return (
-                      <button
-                        key={symbol}
-                        type="button"
-                        onClick={() => selectInstrument(symbol)}
-                        className="instrument-btn"
-                        style={active ? { color: 'var(--accent)', background: 'var(--accent-bg)' } : {}}
-                        title={cfg.subtitle}
-                      >
-                        {symbol}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
 
         <div className="grid grid-cols-12 gap-4">
 
@@ -2435,33 +2393,38 @@ const [slippagePct, setSlippagePct] = useState(0);
                   <h3 className="section-heading">Configuration</h3>
             </div>
             <div className="p-4 space-y-4">
-                {/* Backtest Mode selector removed from UI — intraday handled by separate
-                    software. backtestMode stays 'eod' (default); logic left intact. */}
+                {/* Intraday backtest mode removed — handled by separate software.
+                    backtestMode stays 'eod' always; EOD-only guards below are kept. */}
 
-                {/* Intraday-specific timing fields */}
-                {backtestMode === 'intraday' && (
-                  <>
-                    <IntradaySlowPathWarning visible={slowPath} />
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="field-label">Entry Time</label>
-                        <TimeInput value={intradayEntryTime} onChange={setIntradayEntryTime} min="09:15" max="15:14" step={60} />
-                      </div>
-                      <div>
-                        <label className="field-label">Square-off Time</label>
-                        <TimeInput value={intradaySquareOffTime} onChange={setIntradaySquareOffTime} min="09:16" max="15:30" step={60} />
-                      </div>
-                    </div>
-                  </>
-                )}
-
-
-                {/* Instrument */}
+                {/* Instrument — moved from the strip into Configuration */}
                 <div>
                   <label className="field-label">Index</label>
-                  <div className="h-9 px-3 border border-default rounded text-sm bg-base flex items-center justify-between">
-                    <span className="font-semibold text-primary">{instrument}</span>
-                    <span className="text-xs text-muted">{indexConfig.subtitle}</span>
+                  <div className="space-y-2">
+                    {INDEX_GROUPS.map(group => (
+                      <div key={group.key}>
+                        <div style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.58rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4 }}>
+                          {group.title}
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {group.symbols.map(symbol => {
+                            const cfg = getIndexConfig(symbol);
+                            const active = instrument === symbol;
+                            return (
+                              <button
+                                key={symbol}
+                                type="button"
+                                onClick={() => selectInstrument(symbol)}
+                                className="instrument-btn"
+                                style={active ? { color: 'var(--accent)', background: 'var(--accent-bg)' } : {}}
+                                title={cfg.subtitle}
+                              >
+                                {symbol}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
 
@@ -2809,6 +2772,59 @@ const [slippagePct, setSlippagePct] = useState(0);
                           </div>
                         </div>
                       )}
+                      {/* Combine mode — only when BOTH NIFTY & Midcap spot adj are on */}
+                      {spotAdjustmentEnabled && midcapSpotAdjEnabled && (
+                        <div className="pt-3 mt-1 border-t border-subtle space-y-3">
+                          <div className="space-y-1">
+                            <p className="text-xs font-semibold text-muted uppercase tracking-wide">When both are on, trigger on</p>
+                            <div className="flex gap-2">
+                              {[
+                                { value: 'earliest', label: 'Whichever first' },
+                                { value: 'confirm', label: 'Whichever late' },
+                              ].map(opt => (
+                                <button
+                                  key={opt.value}
+                                  type="button"
+                                  onClick={() => setSpotAdjCombineMode(opt.value)}
+                                  className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                    spotAdjCombineMode === opt.value
+                                      ? 'bg-accent text-white border-accent'
+                                      : 'border-default text-secondary hover:bg-hover'
+                                  }`}
+                                >
+                                  {opt.label}
+                                </button>
+                              ))}
+                            </div>
+                            <p className="text-[11px] text-muted">
+                              {spotAdjCombineMode === 'earliest'
+                                ? 'Adjust when either NIFTY or Midcap breaches first (current behaviour).'
+                                : 'Adjust only when BOTH breach the same direction within N trading days — on the later (confirming) breach.'}
+                            </p>
+                          </div>
+                          {spotAdjCombineMode === 'confirm' && (
+                            <div className="space-y-1">
+                              <p className="text-xs font-semibold text-muted uppercase tracking-wide">Confirm within (N trading days)</p>
+                              <input
+                                type="number"
+                                min={0}
+                                max={20}
+                                step={1}
+                                value={spotAdjConfirmDays}
+                                onChange={e => {
+                                  const v = e.target.value;
+                                  if (v === '') { setSpotAdjConfirmDays(''); return; }
+                                  const n = parseInt(v, 10);
+                                  setSpotAdjConfirmDays(Number.isNaN(n) ? '' : Math.max(0, Math.min(20, n)));
+                                }}
+                                onBlur={() => setSpotAdjConfirmDays(prev => Math.max(0, Math.min(20, parseInt(prev, 10) || 0)))}
+                                className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
+                              />
+                              <p className="text-[11px] text-muted">0 = both must breach the same day.</p>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -3079,27 +3095,143 @@ const [slippagePct, setSlippagePct] = useState(0);
 
             {/* ── Top configurator panel ── */}
             <div className="bg-surface rounded-lg border border-default shadow-sm">
-              <div className="px-4 py-2.5 border-b border-subtle flex items-center gap-2">
-                <h3 className="section-heading">Leg Builder</h3>
-                <Tooltip text="Configure your leg settings then click Add Leg." />
+              {/* ── Index workspace tab header ── */}
+              <div className="border-b border-subtle">
+                <div className="px-4 pt-2.5 pb-1 flex items-center justify-between">
+                  <h3 className="section-heading">Leg Builder</h3>
+                  <Tooltip text="Pick an index tab to build a leg on that index, or pick Midcap100 Overlay for the hypothetical overlay leg." />
+                </div>
+                {/* Three tabs: NIFTY · MIDCPNIFTY · Midcap100 Overlay */}
+                <div className="px-3 flex items-end gap-0" style={{ marginBottom: -1 }}>
+                  {(() => {
+                    const activeTabKey = draftLeg.segment === 'midcap100'
+                      ? 'MIDCAP100'
+                      : String(draftLeg.index || instrument).toUpperCase();
+                    const tabs = [
+                      { value: 'NIFTY',     label: 'NIFTY',              type: 'index',   color: 'var(--accent)' },
+                      { value: 'MIDCPNIFTY',label: 'MIDCPNIFTY',         type: 'index',   color: '#2dd4bf' },
+                      { value: 'BANKNIFTY', label: 'BANKNIFTY',          type: 'index',   color: '#f97316' },
+                      { value: 'MIDCAP100', label: 'Midcap100 Overlay',  type: 'overlay', color: '#a78bfa' },
+                    ];
+                    return tabs.map(tab => {
+                      const isActive = activeTabKey === tab.value;
+                      const isOverlay = tab.type === 'overlay';
+                      const legCount = isOverlay
+                        ? legs.filter(l => l.segment === 'midcap100').length
+                        : legs.filter(l => l.segment !== 'midcap100' && String(l.index || instrument).toUpperCase() === tab.value).length;
+                      return (
+                        <button
+                          key={tab.value}
+                          onClick={() => {
+                            if (isOverlay) {
+                              setDraftLeg(prev => ({ ...prev, segment: 'midcap100' }));
+                            } else {
+                              const cfg = getIndexConfig(tab.value) || {};
+                              const monthlyOnly = !(cfg.expiryBases || []).includes('weekly');
+                              setDraftLeg(prev => ({
+                                ...prev,
+                                index: tab.value,
+                                segment: prev.segment === 'midcap100' ? 'options' : prev.segment,
+                                strike_interval: cfg.strikeInterval || prev.strike_interval,
+                                expiry: monthlyOnly ? 'monthly' : (cfg.defaultOptionExpiry || 'weekly'),
+                              }));
+                            }
+                          }}
+                          style={{
+                            fontFamily: isOverlay ? 'Outfit, sans-serif' : 'IBM Plex Mono, monospace',
+                            fontSize: '0.67rem',
+                            fontWeight: 700,
+                            letterSpacing: isOverlay ? '0' : '0.05em',
+                            padding: '6px 14px 8px',
+                            borderRadius: '6px 6px 0 0',
+                            border: isActive ? '1px solid var(--border-default)' : '1px solid transparent',
+                            borderBottom: isActive ? '2px solid var(--bg-surface)' : '2px solid transparent',
+                            background: isActive ? 'var(--bg-surface)' : 'transparent',
+                            color: isActive ? tab.color : 'var(--text-muted)',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 7,
+                            transition: 'color 0.15s',
+                            position: 'relative',
+                            zIndex: 1,
+                            borderLeft: isOverlay ? '1px solid var(--border-subtle)' : undefined,
+                            marginLeft: isOverlay ? 8 : 0,
+                          }}
+                        >
+                          {isOverlay && (
+                            <span style={{ fontSize: '0.6rem', opacity: 0.7 }}>◈</span>
+                          )}
+                          {tab.label}
+                          {legCount > 0 && (
+                            <span style={{
+                              background: isActive ? `${tab.color}22` : 'var(--bg-elevated)',
+                              color: isActive ? tab.color : 'var(--text-muted)',
+                              border: `1px solid ${isActive ? `${tab.color}55` : 'var(--border-default)'}`,
+                              borderRadius: 999,
+                              fontSize: '0.58rem',
+                              fontWeight: 700,
+                              padding: '1px 6px',
+                              minWidth: 18,
+                              textAlign: 'center',
+                              lineHeight: 1.6,
+                            }}>
+                              {legCount}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    });
+                  })()}
+                </div>
+                {/* Context bar — updates per active tab */}
+                {(() => {
+                  const isMidcap100Tab = draftLeg.segment === 'midcap100';
+                  const activeIdx = String(draftLeg.index || instrument).toUpperCase();
+                  const isMidcp = !isMidcap100Tab && activeIdx === 'MIDCPNIFTY';
+                  const barColor = isMidcap100Tab ? '#a78bfa' : (isMidcp ? '#2dd4bf' : 'var(--accent)');
+                  const barText = isMidcap100Tab
+                    ? 'Hypothetical overlay · follows NIFTY trade dates · no real strike or expiry'
+                    : (isMidcp ? 'Monthly expiry · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50');
+                  const barLabel = isMidcap100Tab ? 'MIDCAP100 OVERLAY' : activeIdx;
+                  return (
+                    <div style={{
+                      padding: '4px 16px 5px',
+                      background: 'var(--bg-elevated)',
+                      borderTop: '1px solid var(--border-subtle)',
+                      fontSize: '0.62rem',
+                      color: 'var(--text-muted)',
+                      fontFamily: 'Outfit, sans-serif',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}>
+                      <span>Working in</span>
+                      <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontWeight: 700, fontSize: '0.63rem', color: barColor }}>{barLabel}</span>
+                      <span style={{ color: 'var(--border-default)' }}>·</span>
+                      <span>{barText}</span>
+                    </div>
+                  );
+                })()}
               </div>
               <div className="px-4 py-3 flex flex-wrap items-end gap-3">
 
-                {/* Segment */}
-                <div>
-                  <label className="field-label">Select segments</label>
-                  <SegBtn
-                    options={[{ value: 'futures', label: 'Futures' }, { value: 'options', label: 'Options' }, { value: 'midcap100', label: 'Midcap100' }]}
-                    value={draftLeg.segment}
-                    onChange={v => setDraftLeg(prev => ({
-                      ...prev,
-                      segment: v,
-                      expiry: v === 'midcap100'
-                        ? prev.expiry
-                        : normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, instrument, v),
-                    }))}
-                  />
-                </div>
+                {/* Instrument — only for real index tabs (not Midcap100 Overlay) */}
+                {draftLeg.segment !== 'midcap100' && (
+                  <div>
+                    <label className="field-label">Instrument</label>
+                    <SegBtn
+                      options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
+                      value={draftLeg.segment}
+                      onChange={v => setDraftLeg(prev => ({
+                        ...prev,
+                        segment: v,
+                        expiry: normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, draftLeg.index || instrument, v),
+                      }))}
+                    />
+                  </div>
+                )}
+
 
                 {/* Total Lot */}
                 <div>
@@ -3139,7 +3271,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                     <select value={draftLeg.expiry}
                       onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
                       className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-36">
-                      {(draftLeg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
+                      {(draftLeg.segment === 'options' ? getOptionExpiryOptions(draftLeg.index || instrument) : FUTURES_EXPIRIES).map(opt => (
                         <option key={opt.value} value={opt.value}>{opt.label}</option>
                       ))}
                     </select>
@@ -3378,11 +3510,30 @@ const [slippagePct, setSlippagePct] = useState(0);
                                 ? `${leg.position === 'sell' ? 'SELL' : 'BUY'} MIDCAP100`
                                 : 'FUTURE'}
                           </span>
+                          {leg.segment !== 'midcap100' && (() => {
+                            const legIdx = String(leg.index || instrument).toUpperCase();
+                            const isMidcp = legIdx === 'MIDCPNIFTY';
+                            return (
+                              <span style={{
+                                fontFamily: 'IBM Plex Mono, monospace',
+                                fontSize: '0.59rem',
+                                fontWeight: 700,
+                                letterSpacing: '0.05em',
+                                padding: '1px 7px',
+                                borderRadius: 4,
+                                background: isMidcp ? 'rgba(45,212,191,0.12)' : 'var(--accent-bg)',
+                                color: isMidcp ? '#2dd4bf' : 'var(--accent)',
+                                border: `1px solid ${isMidcp ? 'rgba(45,212,191,0.35)' : 'color-mix(in srgb, var(--accent) 40%, transparent)'}`,
+                              }}>
+                                {legIdx}
+                              </span>
+                            );
+                          })()}
                           <span style={{ color: 'var(--text-muted)', fontSize: '0.65rem' }}>·</span>
                           <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.68rem', color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{leg.segment === 'midcap100' ? leg.midcap_mode : leg.expiry}</span>
                         </div>
                         <div className="flex items-center gap-3">
-                          <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.65rem', fontWeight: 700, color: 'var(--accent)' }}>{leg.lot * getLotSize(instrument, startDate)} units</span>
+                          <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.65rem', fontWeight: 700, color: 'var(--accent)' }}>{leg.lot * getLotSize(leg.index || instrument, startDate)} units</span>
                           <button onClick={() => removeLeg(leg.id)} className="p-1 rounded transition-colors"
                             style={{ color: 'var(--text-muted)' }}
                             onMouseEnter={e => { e.currentTarget.style.color = 'var(--loss)'; e.currentTarget.style.background = 'var(--loss-bg)'; }}
@@ -3400,19 +3551,21 @@ const [slippagePct, setSlippagePct] = useState(0);
                         )}
                         {/* Basic fields */}
                         <div className="flex flex-wrap items-end gap-3">
-                          <div>
-                            <label className="field-label">Segment</label>
-                            <SegBtn size="sm"
-                              options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }, { value: 'midcap100', label: 'Midcap100' }]}
-                              value={leg.segment}
-                              onChange={v => {
-                                updateLeg(leg.id, 'segment', v);
-                                if (v === 'futures' && leg.expiry === 'weekly') {
-                                  updateLeg(leg.id, 'expiry', 'monthly');
-                                }
-                              }}
-                            />
-                          </div>
+                          {leg.segment !== 'midcap100' && (
+                            <div>
+                              <label className="field-label">Instrument</label>
+                              <SegBtn size="sm"
+                                options={[{ value: 'options', label: 'Options' }, { value: 'futures', label: 'Futures' }]}
+                                value={leg.segment}
+                                onChange={v => {
+                                  updateLeg(leg.id, 'segment', v);
+                                  if (v === 'futures' && leg.expiry === 'weekly') {
+                                    updateLeg(leg.id, 'expiry', 'monthly');
+                                  }
+                                }}
+                              />
+                            </div>
+                          )}
                           <div>
                             <label className="field-label">Lots</label>
                             <input type="number" min={1} value={leg.lot}
@@ -3445,7 +3598,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <label className="field-label">Expiry</label>
                               <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
                                 className="h-7 px-2 border border-default rounded text-xs bg-surface w-28">
-                                {(leg.segment === 'options' ? optionExpiryOptions : FUTURES_EXPIRIES).map(opt => (
+                                {(leg.segment === 'options' ? getOptionExpiryOptions(leg.index || instrument) : FUTURES_EXPIRIES).map(opt => (
                                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                                 ))}
                               </select>
@@ -4331,7 +4484,7 @@ const [slippagePct, setSlippagePct] = useState(0);
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2">
           <div className="flex items-center gap-3">
             <button
-              onClick={backtestMode === 'intraday' ? runIntradayBacktest : runBacktest}
+              onClick={runBacktest}
               disabled={!canRunBacktest}
               className="run-btn px-9 py-3 rounded-xl"
             >

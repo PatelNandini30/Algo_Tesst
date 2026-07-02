@@ -21,7 +21,7 @@ docker compose build backend worker-backtests worker-backtests-fast
 
 echo ""
 echo "  Building remaining services..."
-docker compose build worker-uploads worker-backtests-intraday worker-backtests-intraday-slow frontend
+docker compose build worker-uploads frontend
 
 echo ""
 echo "[3/4] Starting all containers..."

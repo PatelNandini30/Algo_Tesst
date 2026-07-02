@@ -1,6 +1,6 @@
 """
 Memory-budget admission gate — prevents OOM by bounding the combined memory of
-concurrently *active* heavy jobs (backtest / optimize / intraday).
+concurrently *active* heavy jobs (backtest / optimize).
 
 This module is pure orchestration: it only controls WHEN a Celery task's body is
 allowed to start. It NEVER touches any backtest calculation, pricing, strike
@@ -47,7 +47,6 @@ _HASH_KEY = "algotest:mem_gate"
 _COSTS = {
     "backtest": int(os.environ.get("HEAVY_COST_BACKTEST_MB", "5000")),
     "optimize": int(os.environ.get("HEAVY_COST_OPTIMIZE_MB", "6000")),
-    "intraday": int(os.environ.get("HEAVY_COST_INTRADAY_MB", "2000")),
 }
 
 # Atomic acquire: reclaim expired reservations, then grant iff it fits OR the

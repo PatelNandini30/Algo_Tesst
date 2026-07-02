@@ -5,6 +5,7 @@ import {
 } from 'recharts';
 import { Download, X } from 'lucide-react';
 import ExcelJS from 'exceljs';
+import { writeWowMomSheet, buildWowMomTitle } from '../utils/wowMomSheet';
 
 const EXIT_REASON_COLORS = {
   Expiry:                           { bg: '#f1f5f9', text: '#475569', border: '#cbd5e1' },
@@ -66,686 +67,19 @@ const formatDateToDdMmYyyy = (value) => {
   return value;
 };
 
-const IntradayFullReport = ({ rows, onClose, showCloseButton }) => {
-  const [sortDir, setSortDir] = useState('asc');
-  const [page, setPage] = useState(1);
-  const PAGE_SIZE = 10;
-
-  if (rows.length === 0) {
-    return (
-      <div className="bg-surface rounded-lg border border-default shadow-sm p-6 text-center text-secondary text-sm">
-        {showCloseButton && onClose && (
-          <button onClick={onClose} className="float-right text-muted hover:text-primary"><X size={16} /></button>
-        )}
-        No trades found for the selected date range and strategy.
-      </div>
-    );
-  }
-
-  // Group by date for AlgoTest-style hierarchical Index
-  const byDate = useMemo(() => {
-    const m = new Map();
-    rows.forEach(r => {
-      const d = r.date;
-      if (!m.has(d)) m.set(d, []);
-      m.get(d).push(r);
-    });
-    return m;
-  }, [rows]);
-
-  const sortedDates = useMemo(() => {
-    const dates = Array.from(byDate.keys()).sort();
-    return sortDir === 'asc' ? dates : dates.reverse();
-  }, [byDate, sortDir]);
-
-  // Day-level P&L aggregates (stats + charts are per trade-day, not per leg)
-  const dayPnls = useMemo(() => {
-    const dMap = new Map();
-    rows.forEach(r => {
-      if (!dMap.has(r.date)) dMap.set(r.date, 0);
-      dMap.set(r.date, dMap.get(r.date) + (Number(r.pnl) || 0));
-    });
-    return Array.from(dMap.values());
-  }, [rows]);
-
-  const totalPnl = rows.reduce((s, r) => s + (Number(r.pnl) || 0), 0);
-  const tradeDays = byDate.size;
-  const winners = dayPnls.filter(p => p > 0);
-  const losers  = dayPnls.filter(p => p <= 0);
-  const winRate = tradeDays > 0 ? (winners.length / tradeDays * 100).toFixed(1) : '0';
-  const avgWin  = winners.length > 0 ? (winners.reduce((s, p) => s + p, 0) / winners.length).toFixed(2) : '0';
-  const avgLoss = losers.length  > 0 ? (losers.reduce( (s, p) => s + p, 0) / losers.length ).toFixed(2) : '0';
-
-  // Equity curve + drawdown — one point per trade day (date on x-axis)
-  const dayChartData = useMemo(() => {
-    const dMap = new Map();
-    rows.forEach(r => {
-      if (!dMap.has(r.date)) dMap.set(r.date, 0);
-      dMap.set(r.date, dMap.get(r.date) + (Number(r.pnl) || 0));
-    });
-    const dates = Array.from(dMap.keys()).sort();
-    let cum = 0, pk = 0;
-    return dates.map(date => {
-      const net = Math.round(dMap.get(date) * 100) / 100;
-      cum = Math.round((cum + net) * 100) / 100;
-      if (cum > pk) pk = cum;
-      const ddPct = pk > 0 ? parseFloat(((pk - cum) / pk * 100).toFixed(2)) : 0;
-      return { date, net, cumulative: cum, drawdown: -ddPct };
-    });
-  }, [rows]);
-
-  const maxDDPct = Math.max(0, ...dayChartData.map(d => -d.drawdown));
-
-  // Monthly returns
-  const monthlyData = useMemo(() => {
-    const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const byYM = {};
-    rows.forEach(r => {
-      const parts = (r.date || '').split('-');
-      if (parts.length !== 3) return;
-      const yr = parts[0]; const mm = parseInt(parts[1], 10) - 1;
-      if (!byYM[yr]) byYM[yr] = Array(12).fill(0);
-      byYM[yr][mm] = Math.round((byYM[yr][mm] + (Number(r.pnl) || 0)) * 100) / 100;
-    });
-    return Object.entries(byYM).sort().map(([yr, mos]) => ({
-      year: yr, months: mos,
-      total: Math.round(mos.reduce((s, v) => s + v, 0) * 100) / 100,
-    }));
-  }, [rows]);
-
-  const equityDomain = useMemo(() => {
-    const vals = dayChartData.map(d => d.cumulative);
-    if (!vals.length) return ['auto', 'auto'];
-    const min = Math.min(...vals); const max = Math.max(...vals);
-    const pad = (max - min) * 0.05 || 10;
-    return [parseFloat((min - pad).toFixed(2)), parseFloat((max + pad).toFixed(2))];
-  }, [dayChartData]);
-
-  const fmtDateShort = (d) => {
-    if (!d) return '';
-    const p = String(d).split('-');
-    if (p.length !== 3) return d;
-    const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    return `${M[parseInt(p[1], 10) - 1] || p[1]} '${p[0].slice(2)}`;
-  };
-
-  const IntradayTooltip = ({ active, payload, label }) => {
-    if (!active || !payload || !payload.length) return null;
-    return (
-      <div className="bg-base border border-strong rounded-lg p-3 shadow-xl text-xs">
-        <p className="text-muted mb-1">{label}</p>
-        {payload.map((e, i) => (
-          <p key={i} style={{ color: e.stroke || e.fill }} className="font-semibold">
-            {e.name}: {e.dataKey === 'drawdown' ? `${Number(e.value).toFixed(2)}%` : `₹${Number(e.value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-          </p>
-        ))}
-      </div>
-    );
-  };
-
-  // Build hierarchical report rows: day-summary + leg-detail
-  // Index numbering ALWAYS starts at 1 for first day, regardless of sort
-  const reportRows = useMemo(() => {
-    const out = [];
-    sortedDates.forEach((date, dayIdx) => {
-      const legs = byDate.get(date);
-      const dayPnl = legs.reduce((s, l) => s + (Number(l.pnl) || 0), 0);
-      const dayQty = legs.reduce((s, l) => s + (Number(l.quantity) || 0), 0);
-      const earliestEntry = legs.reduce((acc, l) => (!acc || (l.entry_time && l.entry_time < acc) ? l.entry_time : acc), null);
-      const latestExit    = legs.reduce((acc, l) => (!acc || (l.exit_time  && l.exit_time  > acc) ? l.exit_time  : acc), null);
-      out.push({
-        kind: 'day',
-        index: `${dayIdx + 1}`,
-        entryDate: date, exitDate: date,
-        entryTime: earliestEntry, exitTime: latestExit,
-        qty: dayQty,
-        pnl: dayPnl,
-      });
-      legs.forEach((leg, legIdx) => {
-        out.push({
-          kind: 'leg',
-          index: `${dayIdx + 1}.${legIdx + 1}`,
-          entryDate: date, exitDate: date,
-          entryTime: leg.entry_time, exitTime: leg.exit_time,
-          type: leg.opt_type,
-          strike: leg.strike,
-          bs: leg.action,
-          qty: leg.quantity,
-          entryPrice: leg.entry_price,
-          exitPrice: leg.exit_price,
-          exitReason: leg.exit_reason,
-          pnl: leg.pnl,
-        });
-      });
-    });
-    return out;
-  }, [sortedDates, byDate]);
-
-  // Pagination operates over DAYS, not rows — so a multi-leg day stays together
-  const totalDays = sortedDates.length;
-  const totalPages = Math.max(1, Math.ceil(totalDays / PAGE_SIZE));
-  const safePage = Math.min(page, totalPages);
-  const startDayIdx = (safePage - 1) * PAGE_SIZE;
-  const endDayIdx = Math.min(startDayIdx + PAGE_SIZE, totalDays);
-  const visibleDates = new Set(sortedDates.slice(startDayIdx, endDayIdx));
-  const visibleRows = reportRows.filter(r => visibleDates.has(r.entryDate));
-
-  const tradeCountStart = startDayIdx + 1;
-  const tradeCountEnd = endDayIdx;
-
-  const exportToExcel = async () => {
-    if (rows.length === 0) return;
-
-    const sorted = [...rows].sort((a, b) => {
-      const d = String(a.date || '').localeCompare(String(b.date || ''));
-      return d !== 0 ? d : String(a.entry_time || '').localeCompare(String(b.entry_time || ''));
-    });
-
-    const dateMap = new Map();
-    sorted.forEach(r => {
-      if (!dateMap.has(r.date)) dateMap.set(r.date, []);
-      dateMap.get(r.date).push(r);
-    });
-
-    const sortedDates = Array.from(dateMap.keys()).sort();
-    let cumPnl = 0, runPeak = 0;
-    const dayStats = sortedDates.map((date, dayIdx) => {
-      const legs = dateMap.get(date);
-      const netPnl = Math.round(legs.reduce((s, r) => s + (Number(r.pnl) || 0), 0) * 100) / 100;
-      cumPnl = cumPnl + netPnl;
-      if (cumPnl > runPeak) runPeak = cumPnl;
-      const dd    = runPeak - cumPnl;
-      const pctDd = runPeak > 0 ? (dd / runPeak) * 100 : 0;
-      return { date, dayIdx, legs, netPnl, cumPnl, peak: runPeak, dd, pctDd };
-    });
-
-    // ─── Palette ────────────────────────────────────────────────────────────
-    const C = {
-      navyBg:   { argb: 'FF1F3864' }, navyText: { argb: 'FFFFFFFF' },
-      sectionBg:{ argb: 'FF2C5F8A' }, sectionTx:{ argb: 'FFFFFFFF' },
-      headerBg: { argb: 'FF34495E' }, headerTx: { argb: 'FFFFFFFF' },
-      subHdrBg: { argb: 'FFD6E4F7' }, subHdrTx: { argb: 'FF1F3864' },
-      greenBg:  { argb: 'FFD4EFDF' }, greenTx:  { argb: 'FF1E7E34' },
-      redBg:    { argb: 'FFFDE8E8' }, redTx:    { argb: 'FFC0392B' },
-      labelBg:  { argb: 'FFF2F6FA' }, altRow:   { argb: 'FFF9FBFD' },
-      border:   { argb: 'FFB0C4D8' }, white:    { argb: 'FFFFFFFF' },
-    };
-    const thinBorder = (color = C.border) => ({
-      top: { style: 'thin', color }, left: { style: 'thin', color },
-      bottom: { style: 'thin', color }, right: { style: 'thin', color },
-    });
-    const boldFont = (sz = 11, color = { argb: 'FF000000' }) => ({ bold: true,  size: sz, color, name: 'Calibri' });
-    const normFont = (sz = 10, color = { argb: 'FF000000' }) => ({ bold: false, size: sz, color, name: 'Calibri' });
-    const centerAlign = { horizontal: 'center', vertical: 'middle' };
-    const leftAlign   = { horizontal: 'left',   vertical: 'middle' };
-
-    const wb = new ExcelJS.Workbook();
-    wb.creator = 'AlgoTest Backtest';
-    wb.created = new Date();
-    wb.calcProperties = { fullCalcOnLoad: true };
-
-    // ════ SHEET 1: TRADE SHEET ════
-    const ws1 = wb.addWorksheet('Trade Sheet', { views: [{ state: 'frozen', ySplit: 1 }] });
-    const colDefs = [
-      { header: 'Index',       key: 'idx',        width: 10 },
-      { header: 'Entry Date',  key: 'entryDate',  width: 13 },
-      { header: 'Entry Time',  key: 'entryTime',  width: 10 },
-      { header: 'Exit Date',   key: 'exitDate',   width: 13 },
-      { header: 'Exit Time',   key: 'exitTime',   width: 10 },
-      { header: 'Expiry',      key: 'expiry',     width: 12 },
-      { header: 'Type',        key: 'type',       width:  8 },
-      { header: 'Strike',      key: 'strike',     width: 10 },
-      { header: 'B/S',         key: 'bs',         width:  7 },
-      { header: 'Qty',         key: 'qty',        width:  7 },
-      { header: 'Entry Price', key: 'entryPrice', width: 12 },
-      { header: 'Exit Price',  key: 'exitPrice',  width: 11 },
-      { header: 'MAE',         key: 'mae',        width:  9 },
-      { header: 'MFE',         key: 'mfe',        width:  9 },
-      { header: 'P&L',         key: 'legPnl',     width: 10 },
-      { header: 'Net P&L',     key: 'netPnl',     width: 10 },
-      { header: 'Cumulative',  key: 'cumulative', width: 12 },
-      { header: 'Peak',        key: 'peak',       width: 10 },
-      { header: 'DD',          key: 'dd',         width: 10 },
-      { header: '%DD',         key: 'pctDd',      width:  9 },
-      { header: 'Exit Reason', key: 'exitReason', width: 14 },
-    ];
-    ws1.columns = colDefs.map(c => ({ key: c.key, width: c.width }));
-
-    const hdrRow = ws1.addRow(colDefs.map(c => c.header));
-    hdrRow.eachCell(cell => {
-      cell.font = boldFont(10, C.navyText);
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
-      cell.alignment = centerAlign;
-      cell.border = thinBorder();
-    });
-    hdrRow.height = 22;
-
-    const legPnlCol = colDefs.findIndex(c => c.key === 'legPnl') + 1;
-    const netPnlCol = colDefs.findIndex(c => c.key === 'netPnl') + 1;
-    const n = v => (v != null && v !== '' && Number.isFinite(Number(v))) ? Math.round(Number(v) * 100) / 100 : '';
-
-    let rowIdx = 0;
-    dayStats.forEach(({ date, dayIdx, legs, netPnl, cumPnl: cum, peak: pk, dd, pctDd }) => {
-      legs.forEach((leg, legIdx) => {
-        const first = legIdx === 0;
-        const pnlV = n(leg.pnl);
-        const r = ws1.addRow([
-          `${dayIdx + 1}.${legIdx + 1}`,
-          date,
-          leg.entry_time  || '',
-          date,
-          leg.exit_time   || '',
-          leg.expiry      || '',
-          leg.opt_type    || '',
-          n(leg.strike),
-          leg.action      || '',
-          leg.quantity != null ? Number(leg.quantity) : '',
-          n(leg.entry_price),
-          n(leg.exit_price),
-          n(leg.mae),
-          n(leg.mfe),
-          pnlV,
-          first ? netPnl : '',
-          first ? cum    : '',
-          first ? pk     : '',
-          first ? dd     : '',
-          first ? pctDd  : '',
-          leg.exit_reason || '',
-        ]);
-        const bg = rowIdx % 2 === 0 ? C.white : C.altRow;
-        r.eachCell(cell => {
-          cell.font   = normFont(10);
-          cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: bg };
-          cell.border = thinBorder();
-          cell.alignment = { vertical: 'middle' };
-          if (typeof cell.value === 'number') {
-            cell.numFmt = Number.isInteger(cell.value) ? '0' : '#,##0.00';
-          }
-        });
-        if (typeof pnlV === 'number') {
-          const c = r.getCell(legPnlCol);
-          c.font = boldFont(10, pnlV >= 0 ? C.greenTx : C.redTx);
-          c.fill = { type: 'pattern', pattern: 'solid', fgColor: pnlV >= 0 ? C.greenBg : C.redBg };
-        }
-        if (first && typeof netPnl === 'number') {
-          const c = r.getCell(netPnlCol);
-          c.font = boldFont(10, netPnl >= 0 ? C.greenTx : C.redTx);
-          c.fill = { type: 'pattern', pattern: 'solid', fgColor: netPnl >= 0 ? C.greenBg : C.redBg };
-        }
-        rowIdx++;
-      });
-    });
-
-    // ════ SHEET 2: SUMMARY ════
-    const ws2 = wb.addWorksheet('Summary');
-    ws2.columns = [{ width: 30 }, { width: 20 }, { width: 4 }, { width: 30 }, { width: 20 }];
-
-    const addTitle2 = (text, rn) => {
-      ws2.mergeCells(`A${rn}:E${rn}`);
-      const cell = ws2.getCell(`A${rn}`);
-      cell.value = text; cell.font = boldFont(13, C.navyText);
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.navyBg };
-      cell.alignment = centerAlign; ws2.getRow(rn).height = 26;
-    };
-    const addSection2 = (text, rn) => {
-      ws2.mergeCells(`A${rn}:E${rn}`);
-      const cell = ws2.getCell(`A${rn}`);
-      cell.value = '  ' + text; cell.font = boldFont(11, C.sectionTx);
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.sectionBg };
-      cell.alignment = leftAlign; ws2.getRow(rn).height = 20;
-    };
-    const addKv2 = (label, value, rn, col = 'A', alt = false, vc = null) => {
-      const vCol = String.fromCharCode(col.charCodeAt(0) + 1);
-      const lCell = ws2.getCell(`${col}${rn}`);
-      const vCell = ws2.getCell(`${vCol}${rn}`);
-      lCell.value = label; vCell.value = value;
-      lCell.font  = boldFont(10, { argb: 'FF2C3E50' });
-      lCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: alt ? C.altRow : C.labelBg };
-      lCell.alignment = leftAlign; lCell.border = thinBorder(C.border);
-      const numVal = typeof value === 'number' ? value : parseFloat(String(value || '').replace(/[+%₹,]/g, ''));
-      const autoColor = vc || (isNaN(numVal) ? null : numVal >= 0 ? C.greenTx : C.redTx);
-      vCell.font  = boldFont(10, autoColor || { argb: 'FF1A1A2E' });
-      vCell.fill  = { type: 'pattern', pattern: 'solid', fgColor: alt ? C.altRow : C.white };
-      vCell.alignment = leftAlign; vCell.border = thinBorder(C.border);
-      ws2.getRow(rn).height = 18;
-    };
-
-    const winners  = dayStats.filter(d => d.netPnl > 0);
-    const losers   = dayStats.filter(d => d.netPnl <= 0);
-    const totalPnl2 = Math.round(dayStats.reduce((s, d) => s + d.netPnl, 0) * 100) / 100;
-    const winRateN  = dayStats.length > 0 ? +(winners.length / dayStats.length * 100).toFixed(2) : 0;
-    const lossPctN  = dayStats.length > 0 ? +(losers.length  / dayStats.length * 100).toFixed(2) : 0;
-    const avgWinN   = winners.length > 0 ? +(winners.reduce((s, d) => s + d.netPnl, 0) / winners.length).toFixed(2) : 0;
-    const avgLossN  = losers.length  > 0 ? +(losers.reduce( (s, d) => s + d.netPnl, 0) / losers.length ).toFixed(2) : 0;
-    const maxWinN   = dayStats.length > 0 ? Math.max(...dayStats.map(d => d.netPnl)) : 0;
-    const maxLossN  = dayStats.length > 0 ? Math.min(...dayStats.map(d => d.netPnl)) : 0;
-    const maxDdN    = dayStats.length > 0 ? Math.max(...dayStats.map(d => d.dd))     : 0;
-    const maxDdPctN = dayStats.length > 0 ? Math.max(...dayStats.map(d => d.pctDd))  : 0;
-    let maxWinStreak = 0, maxLossStreak = 0, curW = 0, curL = 0;
-    dayStats.forEach(d => {
-      if (d.netPnl > 0) { curW++; maxWinStreak  = Math.max(maxWinStreak,  curW); curL = 0; }
-      else               { curL++; maxLossStreak = Math.max(maxLossStreak, curL); curW = 0; }
-    });
-
-    addTitle2('  INTRADAY BACKTEST SUMMARY', 1);
-    ws2.mergeCells('A2:E2');
-    const subCell2 = ws2.getCell('A2');
-    subCell2.value = `Generated: ${new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
-    subCell2.font  = normFont(10, { argb: 'FF555555' });
-    subCell2.alignment = centerAlign;
-    subCell2.fill  = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
-    ws2.getRow(2).height = 16;
-
-    let sRow = 4;
-    addSection2('PERFORMANCE OVERVIEW', sRow++);
-    addKv2('Total P&L',             `₹${totalPnl2.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow, 'A', false, totalPnl2 >= 0 ? C.greenTx : C.redTx);
-    addKv2('No. of Trade Days',     dayStats.length,   sRow++, 'D', false, { argb: 'FF1A1A2E' });
-    addKv2('Win %',                 `${winRateN}%`,    sRow,   'A', true,  C.greenTx);
-    addKv2('Loss %',                `${lossPctN}%`,    sRow++, 'D', true,  C.redTx);
-    addKv2('Avg Profit on Winners', `₹${avgWinN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`,  sRow,   'A', false, C.greenTx);
-    addKv2('Avg Loss on Losers',    `₹${avgLossN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow++, 'D', false, C.redTx);
-    addKv2('Max Profit (Single Day)', `₹${maxWinN.toLocaleString('en-IN',  { minimumFractionDigits: 2 })}`, sRow,   'A', true, C.greenTx);
-    addKv2('Max Loss (Single Day)',   `₹${maxLossN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow++, 'D', true, C.redTx);
-    sRow++;
-
-    addSection2('RISK METRICS', sRow++);
-    addKv2('Max Drawdown',          `₹${maxDdN.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, sRow,   'A', false, C.redTx);
-    addKv2('Max Drawdown %',        `${maxDdPctN.toFixed(2)}%`, sRow++, 'D', false, C.redTx);
-    sRow++;
-
-    addSection2('CONSISTENCY & STREAKS', sRow++);
-    addKv2('Max Win Streak',        `${maxWinStreak} days`,  sRow,   'A', false, C.greenTx);
-    addKv2('Max Losing Streak',     `${maxLossStreak} days`, sRow++, 'D', false, C.redTx);
-    sRow++;
-
-    addSection2('MONTHLY RETURNS (₹ Net P&L)', sRow++);
-    const MONTHS2 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const mthHdr2 = ['Year', ...MONTHS2, 'Total'];
-    for (let ci = 0; ci < mthHdr2.length; ci++) {
-      ws2.getColumn(ci + 1).width = ci === 0 ? 8 : ci <= 12 ? 9 : 10;
-    }
-    const mHdrRow2 = ws2.getRow(sRow);
-    mthHdr2.forEach((h, ci) => {
-      const cell = mHdrRow2.getCell(ci + 1);
-      cell.value = h; cell.font = boldFont(10, C.navyText);
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.headerBg };
-      cell.alignment = centerAlign; cell.border = thinBorder();
-    });
-    mHdrRow2.height = 20;
-    sRow++;
-
-    const byYM = {};
-    dayStats.forEach(({ date, netPnl: np }) => {
-      const parts = date.split('-');
-      if (parts.length !== 3) return;
-      const yr = parts[0].length === 4 ? parts[0] : parts[2];
-      const mm = parseInt(parts[0].length === 4 ? parts[1] : parts[1], 10) - 1;
-      if (!byYM[yr]) byYM[yr] = Array(12).fill(0);
-      byYM[yr][mm] = Math.round((byYM[yr][mm] + np) * 100) / 100;
-    });
-    Object.entries(byYM).sort().forEach(([yr, mos], ri) => {
-      const total = Math.round(mos.reduce((s, v) => s + v, 0) * 100) / 100;
-      const r2 = ws2.getRow(sRow);
-      [yr, ...mos, total].forEach((val, ci) => {
-        const cell = r2.getCell(ci + 1);
-        cell.value = val;
-        const num = typeof val === 'number' ? val : parseFloat(String(val || '').replace(/[%,]/g, ''));
-        const isValCol = ci >= 1 && ci <= 13;
-        if (isValCol && !isNaN(num) && num !== 0) {
-          cell.font = boldFont(10, num >= 0 ? C.greenTx : C.redTx);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: num >= 0 ? C.greenBg : C.redBg };
-        } else if (ci === 0) {
-          cell.font = boldFont(10, C.subHdrTx);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: C.subHdrBg };
-        } else {
-          cell.font = normFont(10);
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: ri % 2 === 0 ? C.white : C.altRow };
-        }
-        cell.alignment = centerAlign;
-        cell.border = thinBorder();
-      });
-      r2.height = 18;
-      sRow++;
-    });
-
-    const buffer = await wb.xlsx.writeBuffer();
-    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `intraday_backtest_${new Date().toISOString().split('T')[0]}.xlsx`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <div className="animate-results">
-      {showCloseButton && onClose && (
-        <button onClick={onClose} className="float-right p-1 rounded transition-colors" style={{ color: 'var(--text-muted)' }}
-          onMouseEnter={e => e.currentTarget.style.color = 'var(--text-primary)'}
-          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}><X size={15} /></button>
-      )}
-      <div className="mb-4 flex items-center gap-2">
-        <span style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.6rem', fontWeight: 700, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--text-muted)', borderLeft: '2px solid var(--accent)', paddingLeft: '8px' }}>Intraday Results</span>
-      </div>
-
-      {/* Stats grid */}
-      <div className="grid grid-cols-3 gap-2 mb-5 sm:grid-cols-6">
-        {[
-          { label: 'Total P&L',  value: `₹${totalPnl.toFixed(2)}`, color: totalPnl >= 0 ? 'var(--profit)' : 'var(--loss)' },
-          { label: 'Trade Days', value: tradeDays, color: 'var(--text-primary)' },
-          { label: 'Win Rate',   value: `${winRate}%`, color: Number(winRate) >= 50 ? 'var(--profit)' : 'var(--loss)' },
-          { label: 'Avg Win',    value: `₹${avgWin}`, color: 'var(--profit)' },
-          { label: 'Avg Loss',   value: `₹${avgLoss}`, color: 'var(--loss)' },
-          { label: 'Max DD',     value: `${maxDDPct.toFixed(2)}%`, color: maxDDPct > 0 ? 'var(--loss)' : 'var(--text-secondary)' },
-        ].map(({ label, value, color }) => (
-          <div key={label} className="stat-tile">
-            <div className="s-label">{label}</div>
-            <div className="s-value" style={{ color }}>{value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Equity Curve */}
-      <div className="chart-panel mb-4">
-        <h3 className="chart-panel-title">Equity Curve (Cumulative P&L)</h3>
-        <ResponsiveContainer width="100%" height={280}>
-          <AreaChart data={dayChartData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
-            <defs>
-              <linearGradient id="intradayEquityGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor="var(--chart-equity)" stopOpacity={0.15} />
-                <stop offset="95%" stopColor="var(--chart-equity)" stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
-            <XAxis dataKey="date" stroke="var(--border-default)"
-              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
-              tickFormatter={fmtDateShort} interval="preserveStartEnd" minTickGap={50} />
-            <YAxis stroke="var(--border-default)"
-              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
-              tickFormatter={v => v.toFixed(0)} domain={equityDomain} />
-            <Tooltip content={<IntradayTooltip />} />
-            <ReferenceLine y={0} stroke="var(--border-strong)" strokeWidth={1} />
-            <Area type="monotone" dataKey="cumulative" name="Cumulative P&L"
-              stroke="var(--chart-equity)" strokeWidth={2}
-              fill="url(#intradayEquityGrad)"
-              isAnimationActive={false} connectNulls dot={false}
-              baseValue={equityDomain[0]} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Drawdown Chart */}
-      <div className="chart-panel mb-4">
-        <h3 className="chart-panel-title">Drawdown (%)</h3>
-        <ResponsiveContainer width="100%" height={220}>
-          <AreaChart data={dayChartData} margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" vertical={false} />
-            <XAxis dataKey="date" stroke="var(--border-default)"
-              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
-              tickFormatter={fmtDateShort} interval="preserveStartEnd" minTickGap={50} />
-            <YAxis stroke="var(--border-default)"
-              tick={{ fontSize: 10, fill: 'var(--text-secondary)' }} tickLine={false}
-              tickFormatter={v => `${v.toFixed(1)}%`} />
-            <Tooltip content={<IntradayTooltip />} />
-            <ReferenceLine y={0} stroke="var(--border-strong)" strokeWidth={1} />
-            <Area type="monotone" dataKey="drawdown" name="Drawdown"
-              stroke="var(--chart-drawdown)" strokeWidth={1.5}
-              fill="var(--loss-bg)"
-              isAnimationActive={false} connectNulls dot={false} baseValue={0} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Monthly Returns */}
-      {monthlyData.length > 0 && (() => {
-        const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-        return (
-          <div className="chart-panel mb-4 overflow-x-auto">
-            <h3 className="chart-panel-title">Monthly Returns (₹ Net P&L)</h3>
-            <table className="w-full text-xs border-collapse" style={{ minWidth: 700 }}>
-              <thead>
-                <tr className="bg-base">
-                  <th className="px-2 py-1.5 text-center font-semibold text-secondary border border-default">Year</th>
-                  {MONTHS.map(m => (
-                    <th key={m} className="px-2 py-1.5 text-center font-semibold text-secondary border border-default">{m}</th>
-                  ))}
-                  <th className="px-2 py-1.5 text-center font-semibold text-secondary border border-default">Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {monthlyData.map(({ year, months, total }) => (
-                  <tr key={year}>
-                    <td className="px-2 py-1.5 text-center font-semibold text-primary border border-default bg-hover">{year}</td>
-                    {months.map((v, i) => (
-                      <td key={i}
-                        className={`px-2 py-1.5 text-right border border-default ${v > 0 ? 'text-profit' : v < 0 ? 'text-loss' : 'text-muted'}`}
-                        style={v > 0 ? { background: 'var(--profit-bg)' } : v < 0 ? { background: 'var(--loss-bg)' } : {}}>
-                        {v !== 0 ? v.toFixed(0) : '—'}
-                      </td>
-                    ))}
-                    <td className={`px-2 py-1.5 text-right font-semibold border border-default ${total > 0 ? 'text-profit' : total < 0 ? 'text-loss' : 'text-muted'}`}>
-                      {total.toFixed(0)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
-      })()}
-
-      {/* Full Report header — sort + range + download */}
-      <div className="flex items-center justify-between flex-wrap gap-3 mb-2 pt-2 border-t border-default">
-        <span className="text-base font-semibold text-primary">Full Report</span>
-        <div className="flex items-center gap-3 flex-wrap text-xs">
-          <span className="text-secondary">Sort By:</span>
-          <span className="px-2 py-1 rounded bg-base text-primary">Entry date</span>
-          <div className="inline-flex rounded border border-default overflow-hidden">
-            <button
-              type="button"
-              onClick={() => setSortDir('asc')}
-              className={`px-3 py-1 text-xs ${sortDir === 'asc' ? 'bg-accent text-white' : 'bg-surface text-secondary hover:bg-hover'}`}
-            >Asc</button>
-            <button
-              type="button"
-              onClick={() => setSortDir('desc')}
-              className={`px-3 py-1 text-xs ${sortDir === 'desc' ? 'bg-accent text-white' : 'bg-surface text-secondary hover:bg-hover'}`}
-            >Desc</button>
-          </div>
-          <span className="text-secondary">
-            Showing <strong className="text-primary">{tradeCountStart}-{tradeCountEnd}</strong> trade days out of <strong className="text-primary">{totalDays}</strong>
-          </span>
-        </div>
-      </div>
-
-      {/* Full Report table */}
-      <div className="overflow-x-auto border border-default rounded-lg">
-        <table className="w-full border-collapse trading-table">
-          <thead>
-            <tr>
-              <th className="text-center">Index</th>
-              <th className="text-left">Entry Date</th>
-              <th className="text-left">Entry Time</th>
-              <th className="text-left">Exit Date</th>
-              <th className="text-left">Exit Time</th>
-              <th className="text-center">Type</th>
-              <th className="text-right">Strike</th>
-              <th className="text-center">B/S</th>
-              <th className="text-right">Qty</th>
-              <th className="text-right">Entry ₹</th>
-              <th className="text-right">Exit ₹</th>
-              <th className="text-right">P&amp;L</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visibleRows.map((r) => {
-              const isDay = r.kind === 'day';
-              const pnlVal = Number(r.pnl);
-              return (
-                <tr key={r.index} className={isDay ? 'day-row' : ''}>
-                  <td className="text-center" style={{ color: isDay ? 'var(--accent)' : 'var(--text-muted)' }}>{r.index}</td>
-                  <td>{r.entryDate}</td>
-                  <td>{r.entryTime || '—'}</td>
-                  <td>{r.exitDate}</td>
-                  <td>{r.exitTime || '—'}</td>
-                  <td className="text-center" style={{ color: r.type === 'CE' ? 'var(--chart-equity)' : r.type === 'PE' ? 'var(--loss)' : 'var(--text-secondary)' }}>{!isDay ? r.type : ''}</td>
-                  <td className="text-right">{!isDay && r.strike != null ? Number(r.strike).toFixed(0) : ''}</td>
-                  <td className="text-center" style={{ color: r.bs === 'SELL' ? 'var(--loss)' : 'var(--profit)' }}>{!isDay ? r.bs : ''}</td>
-                  <td className="text-right">{r.qty != null ? r.qty : ''}</td>
-                  <td className="text-right">{!isDay && r.entryPrice != null ? Number(r.entryPrice).toFixed(2) : ''}</td>
-                  <td className="text-right">{!isDay && r.exitPrice != null ? Number(r.exitPrice).toFixed(2) : ''}</td>
-                  <td className="text-right font-semibold" style={{ color: pnlVal >= 0 ? 'var(--profit)' : 'var(--loss)' }}>
-                    {pnlVal.toFixed(2)}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Pagination + Download */}
-      <div className="mt-3 flex items-center justify-between flex-wrap gap-2">
-        <button
-          type="button"
-          onClick={exportToExcel}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-all"
-          style={{ fontFamily: 'Outfit, sans-serif', letterSpacing: '0.06em', color: 'var(--accent)', border: '1px solid var(--accent-bg)', background: 'var(--accent-bg)' }}
-          onMouseEnter={e => e.currentTarget.style.boxShadow = '0 0 12px var(--accent-glow)'}
-          onMouseLeave={e => e.currentTarget.style.boxShadow = 'none'}
-        >
-          <Download size={12} /> DOWNLOAD XLSX
-        </button>
-        <div className="flex items-center gap-1 text-xs">
-          <button type="button" disabled={safePage <= 1} onClick={() => setPage(1)}
-            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">«</button>
-          <button type="button" disabled={safePage <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}
-            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">‹</button>
-          {Array.from({ length: Math.min(6, totalPages) }, (_, i) => {
-            // Always show first page, current ±2, last page
-            const p = i + 1;
-            return (
-              <button key={p} type="button" onClick={() => setPage(p)}
-                className={`px-2.5 py-1 rounded border ${p === safePage ? 'border-accent bg-accent text-white' : 'border-default text-secondary hover:bg-hover'}`}>{p}</button>
-            );
-          })}
-          <button type="button" disabled={safePage >= totalPages} onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">›</button>
-          <button type="button" disabled={safePage >= totalPages} onClick={() => setPage(totalPages)}
-            className="px-2 py-1 rounded border border-default text-secondary disabled:opacity-40">»</button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
 const buildExcelFileName = (config) => {
   if (!config) return `backtest.xlsx`;
 
   const parts = [config.instrument || 'backtest'];
 
+  const _stratIdx = String(config.instrument || '').toUpperCase();
   (config.legs || []).forEach(leg => {
+    // Multi-index: tag a cross-index leg with its own index so the export name
+    // reflects it (e.g. ...+MIDCPNIFTY-BUY-FUT-MONTHLY). Same-index legs unchanged.
+    const _legIdx = String(leg.index || _stratIdx).toUpperCase();
+    if (leg.segment !== 'midcap100' && _legIdx && _legIdx !== _stratIdx) {
+      parts.push(_legIdx);
+    }
     if (leg.segment === 'midcap100') {
       // Cross-index Midcap leg — name it by position + symbol + pricing mode,
       // e.g. BUY_MIDCAP100_Hypothetical_Future  /  SELL_MIDCAP100_Spot.
@@ -825,13 +159,9 @@ const buildExcelFileName = (config) => {
   return parts.join('_') + '.xlsx';
 };
 
+
 const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false, strategyConfig, filterSegments = null }) => {
   if (!results) return null;
-
-  // Intraday backtest returns a flat array of trade objects with entry_time / exit_time fields.
-  if (Array.isArray(results)) {
-    return <IntradayFullReport rows={results} onClose={onClose} showCloseButton={showCloseButton} />;
-  }
 
   useEffect(() => {
     console.log('[ResultsPanel] mounted (single instance check)');
@@ -1199,7 +529,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     //    aggregates COMBINED (base + Midcap overlay). Recompute the displayed
     //    stats on the combined per-trade data so the UI matches the tradesheet
     //    (default Overall export). Mirrors the Excel formulas exactly. UI-only.
-    if (results?.midcap?.available) {
+    if (results?.midcap?.available ||
+        (results?.midcap?.byTrade && Object.keys(results.midcap.byTrade).length > 0)) {
       const byTrade = results.midcap.byTrade || {};
       const mcs = results.midcap.summary || {};
       const parseD = (s) => {
@@ -1269,6 +600,37 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       out.maxWinStreak = maxWinStk;
       out.maxLossStreak = maxLossStk;
       out.mddDuration = mddDuration;
+    } else {
+      // No Midcap: override Max DD with min %DD on the NIFTY equity (compound the
+      // per-trade %), so the on-screen Max DD == the tradesheet %DD column (overall),
+      // identical to the download/optim. Mirrors algotest_job's pct = Net P&L/Entry Spot.
+      const _pd = (s) => {
+        if (typeof s !== 'string' || !s) return null;
+        const p = s.includes('/') ? s.split('/') : s.split('-');
+        if (p.length !== 3) return null;
+        let y, m, d;
+        if (p[0].length === 4) { y = +p[0]; m = +p[1] - 1; d = +p[2]; }
+        else { d = +p[0]; m = +p[1] - 1; y = +p[2]; }
+        const t = Date.UTC(y, m, d);
+        return Number.isFinite(t) ? t : null;
+      };
+      let nav = 100, peak = 100, worstDD = 0, peakMs = null, wPeak = null, wTrough = null;
+      for (const g of groupedTrades) {
+        const net = Number(g.totalPnl); const es = Number(g.entrySpot);
+        const pct = (es > 1000 && Number.isFinite(net)) ? (net / es) * 100 : NaN;
+        const xD = _pd(g.exitDate);
+        if (Number.isFinite(pct)) {
+          nav = nav * (1 + pct / 100);
+          if (nav >= peak) { peak = nav; peakMs = xD; }
+          else { const dd = (nav / peak - 1) * 100; if (dd < worstDD) { worstDD = dd; wPeak = peakMs; wTrough = xD; } }
+        }
+      }
+      out.maxDDPct = worstDD;
+      const _fmtMs = (ms) => { const d = new Date(ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; };
+      if (wPeak != null && wTrough != null) {
+        out.mddDuration = Math.round((wTrough - wPeak) / 86400000);
+        out.mddStartDate = _fmtMs(wPeak); out.mddEndDate = _fmtMs(wTrough);
+      }
     }
 
     return out;
@@ -1584,10 +946,40 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       tm[k] = { net, pct:(spot>0?(net/spot)*100:0),
                 netMae1:tradeMae?.netMae1 ?? '', netMae2:tradeMae?.netMae2 ?? '', finalMae:tradeMae?.finalMae ?? '',
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
-                dd:toN(r['DD']), pctDd: (() => { const v = toN(r['%DD']); return v !== '' ? v / 100 : ''; })(),
+                dd:toN(r['DD']), pctDd: (() => { const v = toN(r['%DD']); return v !== '' ? v : ''; })(),
                 midcap: hasMidcap ? (midcapByTrade[k] || null) : null,
                 exitReason: mainRow?.['Exit Reason'] || '' };
     });
+
+    // NIFTY-only patchwise mode: recompute cumulative/peak/DD with patch resets so
+    // the Trade Sheet equity matches the Patch wise tab (mirrors what Midcap does via
+    // the Combined chain). Only runs when patchwise=true and no Midcap leg.
+    if (patchwise && !hasMidcap) {
+      const _seen = new Set(); const _pwKeys = [];
+      sortedTrades.forEach(_tr => {
+        const _k = String(_tr.Trade||_tr.trade||1);
+        if (!_seen.has(_k)) { _seen.add(_k); if (tm[_k]) _pwKeys.push(_k); }
+      });
+      let nav = 100, peak = 100;
+      _pwKeys.forEach((k, idx) => {
+        if (idx > 0) {
+          const prevKey = _pwKeys[idx - 1];
+          const newPatch = _pwSegStarts.length
+            ? (_pwSegIdxByKey(k) !== _pwSegIdxByKey(prevKey))
+            : ((tm[prevKey].exitReason || '').toUpperCase().split('+').includes('FILTER_END'));
+          if (newPatch) { nav = 100; peak = 100; }
+        }
+        const pct = tm[k].pct;
+        if (Number.isFinite(pct)) {
+          nav = nav * (1 + pct / 100);
+          peak = Math.max(peak, nav);
+          tm[k].cumulative = Number(nav.toFixed(4));
+          tm[k].peak       = Number(peak.toFixed(4));
+          tm[k].dd         = Number((nav - peak).toFixed(4));
+          tm[k].pctDd      = peak !== 0 ? Number(((nav / peak - 1) * 100).toFixed(4)) : '';
+        }
+      });
+    }
 
     // Combined NAV / Peak / DD / Net MAE / Lowest NAV chain (from Combined Net
     // P&L %) — only when a Midcap leg ran. These become the Combined Trade-Sheet
@@ -1606,7 +998,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
           const prevKey = orderKeys[idx - 1];
           const newPatch = _pwSegStarts.length
             ? (_pwSegIdxByKey(k) !== _pwSegIdxByKey(prevKey))
-            : ((tm[prevKey].exitReason || '').toUpperCase() === 'FILTER_END');
+            : ((tm[prevKey].exitReason || '').toUpperCase().split('+').includes('FILTER_END'));
           if (newPatch) { nav = 100; peak = 100; prevNav = 100; prevPeak = 100; }
         }
         const mc = tm[k].midcap;
@@ -1668,7 +1060,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       let prevCum = 100;
       let prevPeak = 100;
       let firstTradeDone = false;
+      let _prevTmKey = null;
       sortedTmKeys.forEach(k => {
+        // For NIFTY-only patchwise: reset prevCum/prevPeak at patch boundaries so
+        // LowestNAV and Actual Live DD anchor correctly to each patch's start (100).
+        if (patchwise && !hasMidcap && _prevTmKey !== null) {
+          const newPatch = _pwSegStarts.length
+            ? (_pwSegIdxByKey(k) !== _pwSegIdxByKey(_prevTmKey))
+            : ((tm[_prevTmKey].exitReason || '').toUpperCase().split('+').includes('FILTER_END'));
+          if (newPatch) { prevCum = 100; prevPeak = 100; }
+        }
+        _prevTmKey = k;
         const t    = tm[k];
         const mae  = (t.finalMae  !== '' && t.finalMae  != null) ? t.finalMae  : null;
         const peak = (t.peak      !== '' && t.peak      != null) ? t.peak      : null;
@@ -1793,7 +1195,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       'Spot P&L %':10,'CE P&L %':10,'PE P&L %':10,'Exit Reason':14,'Strike Shift Reason':40,'Expiry':12,'STR Segment':14,'Filter Segment':18,
       'Midcap Entry Spot':15,'Midcap Exit Spot':15,'Midcap Spot P&L':14,'Midcap Spot P&L %':15,'Midcap No Of Days':15,'Midcap Rollover Cost %':18,'Midcap Hypo P&L':15,'Midcap Hypo P&L %':16,'Midcap MAE':12,'Midcap MFE':12,
       'Combined Net P&L':15,'Combined Net P&L %':16,'Combined Cumulative':17,'Combined Peak':13,'Combined DD':12,'Combined %DD':12,'Combined Net MAE 1':16,'Combined Net MAE 2':16,'Combined Final MAE':15,'Combined Lowest NAV':16,'Combined Actual Live DD':18 };
-    const truePctCols = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %', '%DD']);
+    const truePctCols = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %']);
+    const pctAppendCols = new Set(['%DD', 'Combined %DD']);
     ws1.columns = keyOrder.map(k => ({ key: k, width: colWidths[k] || 10 }));
 
     // Header row style
@@ -1833,7 +1236,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         if (typeof cell.value === 'number') {
           const _maeCol = ['MAE','MFE','Net MAE 1','Net MAE 2','Final MAE',
             'Midcap MAE','Midcap MFE','Combined Net MAE 1','Combined Net MAE 2','Combined Final MAE'].includes(_colKey);
-          cell.numFmt = truePctCols.has(_colKey)
+          cell.numFmt = pctAppendCols.has(_colKey)
+            ? '0.00"%"'
+            : truePctCols.has(_colKey)
             ? '0.00%'
             : _maeCol
             ? '#,##0.0000'
@@ -2146,45 +1551,40 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const mddColor = C.redTx;
     // With a Midcap leg, derive risk/streak metrics from the COMBINED NAV;
     // otherwise use the NIFTY-based `stats` (unchanged).
+    // Max Drawdown = min over trades of (Cumulative/Peak-1)*100 on the equity curve —
+    // Combined NAV with a Midcap leg, NIFTY NAV otherwise. Read straight from the
+    // Cumulative/Peak columns (units-safe, already patch-reset when patchwise) so the
+    // export Summary == the per-trade %DD column, both overall AND patchwise, midcap
+    // AND non-midcap.
     let _maxDDPctJS, _mddDurationJS, _mddStartJS, _mddEndJS, _maxWinStreakJS, _maxLossStreakJS;
-    if (hasMidcap) {
-      let peak = 100, peakMs = null, worstDD = 0, worstPeakMs = null, worstTroughMs = null;
+    {
+      const cumKey  = hasMidcap ? 'Combined Cumulative' : 'Cumulative';
+      const peakKey = hasMidcap ? 'Combined Peak'       : 'Peak';
+      const pctKey  = hasMidcap ? 'Combined Net P&L %'  : '% P&L';
+      let peakMs = null, worstDD = 0, worstPeakMs = null, worstTroughMs = null;
       let winRun = 0, lossRun = 0, maxWin = 0, maxLoss = 0;
-      let prevSegIdxDD = null, prevExitReasonDD = '';
       for (const t of cleanedTrades) {
-        const pct = t['Combined Net P&L %'];
+        const pct = t[pctKey];
         if (typeof pct === 'number' && Number.isFinite(pct)) {
           if (pct > 0) { winRun++; lossRun = 0; if (winRun > maxWin) maxWin = winRun; }
           else if (pct < 0) { lossRun++; winRun = 0; if (lossRun > maxLoss) maxLoss = lossRun; }
         }
-        const cum = t['Combined Cumulative'];
-        if (typeof cum === 'number' && Number.isFinite(cum)) {
-          const xD = _parseDate(t['Exit Date']);
-          // Reset the running peak at each patch boundary (same boundary as the
-          // combined chain) so the cumulative reset isn't miscounted as a drawdown.
-          const _segIdx = _pwSegIdxByKey(String(t.Trade || t.trade || 1));
-          const _reset = patchwise && (_pwSegStarts.length
-            ? (prevSegIdxDD !== null && _segIdx !== prevSegIdxDD)
-            : (prevExitReasonDD === 'FILTER_END'));
-          if (_reset || cum >= peak) { peak = cum; peakMs = xD; }
-          else {
-            const dd = peak !== 0 ? (cum / peak - 1) * 100 : 0;
-            if (dd < worstDD) { worstDD = dd; worstPeakMs = peakMs; worstTroughMs = xD; }
-          }
-          prevSegIdxDD = _segIdx;
+        const cum = t[cumKey];
+        const pk = t[peakKey];
+        const xD = _parseDate(t['Exit Date']);
+        if (typeof cum === 'number' && typeof pk === 'number' && Number.isFinite(cum) && pk !== 0) {
+          if (cum >= pk - 1e-9) { peakMs = xD; }
+          else { const ddp = (cum / pk - 1) * 100; if (ddp < worstDD) { worstDD = ddp; worstTroughMs = xD; worstPeakMs = peakMs; } }
         }
-        prevExitReasonDD = (t['Exit Reason'] || '').toUpperCase();
       }
-      _maxDDPctJS = worstDD; _maxWinStreakJS = maxWin; _maxLossStreakJS = maxLoss;
+      _maxDDPctJS = worstDD;
+      _maxWinStreakJS  = hasMidcap ? maxWin  : (stats.maxWinStreak ?? 0);
+      _maxLossStreakJS = hasMidcap ? maxLoss : (stats.maxLossStreak ?? 0);
       const _fmtMs = (ms) => { const d = new Date(ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; };
       if (worstPeakMs != null && worstTroughMs != null) {
         _mddDurationJS = Math.round((worstTroughMs - worstPeakMs) / 86400000);
         _mddStartJS = _fmtMs(worstPeakMs); _mddEndJS = _fmtMs(worstTroughMs);
       } else { _mddDurationJS = 0; _mddStartJS = null; _mddEndJS = null; }
-    } else {
-      _maxDDPctJS = stats.maxDDPct ?? 0;
-      _mddDurationJS = stats.mddDuration; _mddStartJS = stats.mddStartDate; _mddEndJS = stats.mddEndDate;
-      _maxWinStreakJS = stats.maxWinStreak; _maxLossStreakJS = stats.maxLossStreak;
     }
     kv('Max Drawdown', `${_maxDDPctJS.toFixed(2)}%`, row, 'A', false, mddColor);
     kv('Max DD Days', _mddDurationJS, row++, 'D', false, mddColor);
@@ -2300,6 +1700,23 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       byYMSpotPct[ym.year][ym.monthIdx]= (byYMSpotPct[ym.year][ym.monthIdx]|| 0) + spotPct;
     });
 
+    // Per-year Max DD for the % Net P&L table: worst %DD (or Combined %DD with
+    // Midcap) among trades exiting that year — full precision, kept as a raw
+    // fraction-of-100 number so the cell can carry a '0.00%' display format
+    // instead of baking the 2-decimal rounding into the stored value.
+    const byYearMaxDDPct = {};
+    groupedTrades.forEach(group => {
+      const ym = parseToYearMonth(group?.exitDate || '');
+      if (!ym) return;
+      let dd = hasMidcap
+        ? Number(midcapByTrade[group.groupKey]?.['Combined %DD'])
+        : Number(group?.pct_dd);
+      if (!Number.isFinite(dd)) return;
+      if (byYearMaxDDPct[ym.year] == null || dd < byYearMaxDDPct[ym.year]) {
+        byYearMaxDDPct[ym.year] = dd;
+      }
+    });
+
     const mthData = Object.entries(byYM).sort().map(([yr, mos]) => {
       const total = mos.reduce((s, v) => s + v, 0);
       const extras = pivotExtrasByYear[yr] || ['', '', ''];
@@ -2314,7 +1731,15 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         const num  = typeof val==='number' ? val : parseFloat(String(val||'').replace(/[%,]/g,''));
         const isValCol = ci>=1 && ci<=12; // month columns
         const isTotalCol = ci===13;
+        const isMaxDdCol = ci===14;
+        if (isMaxDdCol && typeof val === 'number') {
+          cell.value = val;
+          cell.numFmt = '0.00%';
+        }
         if ((isValCol||isTotalCol) && !isNaN(num) && num!==0) {
+          cell.font = boldFont(10, num>=0 ? C.greenTx : C.redTx);
+          cell.fill = { type:'pattern', pattern:'solid', fgColor: num>=0 ? C.greenBg : C.redBg };
+        } else if (isMaxDdCol && !isNaN(num) && num!==0) {
           cell.font = boldFont(10, num>=0 ? C.greenTx : C.redTx);
           cell.fill = { type:'pattern', pattern:'solid', fgColor: num>=0 ? C.greenBg : C.redBg };
         } else if (ci===0) {
@@ -2335,7 +1760,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     row++;
     addSectionHeader('MONTHLY RETURNS (% Net P&L)', row++);
 
-    const mthHdrPct = ['Year',...MONTHS,'Total'];
+    const mthHdrPct = ['Year',...MONTHS,'Total','Max DD'];
     const mthColsPct = mthHdrPct.length;
     for (let ci = 0; ci < mthColsPct; ci++) {
       ws2.getColumn(ci+1).width = ci===0 ? 8 : 9;
@@ -2355,23 +1780,28 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
     const mthDataPct = Object.entries(byYMPct).sort().map(([yr, mos]) => {
       const total = mos.reduce((s, v) => s + v, 0);
-      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2)];
+      const maxDd = byYearMaxDDPct[yr] != null ? byYearMaxDDPct[yr] : '';
+      return [yr, ...mos, total, maxDd];
     });
 
     mthDataPct.forEach((dataRow, ri) => {
       const r2 = ws2.getRow(row);
       dataRow.forEach((val, ci) => {
         const cell = r2.getCell(ci+1);
-        const isValCol   = ci >= 1 && ci <= 12;
-        const isTotalCol = ci === 13;
+        const isValCol    = ci >= 1 && ci <= 12;
+        const isTotalCol  = ci === 13;
+        const isMaxDdCol  = ci === 14;
         if (isValCol || isTotalCol) {
           cell.value = typeof val === 'number' ? val / 100 : val;
           cell.numFmt = '0.00%';
+        } else if (isMaxDdCol) {
+          cell.value = typeof val === 'number' ? val / 100 : val;
+          if (typeof val === 'number') cell.numFmt = '0.00%';
         } else {
           cell.value = val;
         }
         const num = typeof val === 'number' ? val : parseFloat(String(val || ''));
-        if ((isValCol || isTotalCol) && !isNaN(num) && num !== 0) {
+        if ((isValCol || isTotalCol || isMaxDdCol) && !isNaN(num) && num !== 0) {
           cell.font = boldFont(10, num >= 0 ? C.greenTx : C.redTx);
           cell.fill = { type:'pattern', pattern:'solid', fgColor: num >= 0 ? C.greenBg : C.redBg };
         } else if (ci === 0) {
@@ -2553,7 +1983,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         // Reset the chain at each patch boundary (same boundary as the combined chain).
         const _reset = patchwise && (_pwSegStarts.length
           ? (prevSegIdx !== null && p.segIdx !== prevSegIdx)
-          : (prevExitReason === 'FILTER_END'));
+          : ((prevExitReason || '').split('+').includes('FILTER_END')));
         if (_reset) { cumulative = 100; peak = 100; prevCum = 100; prevPeak = 100; }
         prevSegIdx = p.segIdx; prevExitReason = p.exitReason || '';
         prevPeak = peak;
@@ -2666,7 +2096,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     // Midcap-only, NIFTY-only, Combined. Per phase the equity curve RESETS to
     // 100 at the start of every patch; a side table summarises CAGR / P&L% /
     // min Live DD per patch. Skipped entirely when no Midcap or no filter.
-    if (hasMidcap && Boolean(filterInfo)) {
+    if (Boolean(filterInfo)) {
       const numP = v => { const n = toNumber(v); return n == null ? null : n; };
       // chronological trade order (cascade re-entries placed by entry date)
       const _seenP = new Set(); const orderedKeys = [];
@@ -2740,7 +2170,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
             // via MAX(cumm, 100) — matching reference formula AR = MAX(AQ, 100).
             peak = Math.max(peak, cumm);
             // DD blank when at/above the peak (=IF(Peak>Cumm, Cumm-Peak, "")); %DD=0 then.
-            const dd = (peak > cumm) ? (cumm - peak) : ''; const pctDd = (typeof dd === 'number' && peak !== 0) ? dd/peak : 0;
+            const dd = (peak > cumm) ? (cumm - peak) : ''; const pctDd = (typeof dd === 'number' && peak !== 0) ? (dd/peak)*100 : 0;
             const mv = maeOf(td); const m = Number.isFinite(mv) ? mv : 0;
             // Lowest NAV anchors to the PREVIOUS trade's cumm; Live DD divides by
             // the PREVIOUS trade's peak (AV_prev) — matching the revised main
@@ -2756,17 +2186,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         };
         const _opt = hasCalls && hasPuts ? 'CE+PE' : hasCalls ? 'CE' : hasPuts ? 'PE' : 'Options';
         const niftyTitle = `Nifty ${_opt}`;
-        const PHASES = [
+        const _niftyPhase = { title: niftyTitle, kind: 'std', dates: false, drive: td => td.callPct, mae: td => td.callMae,
+            detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
+            sideHdr: ['Entry','Exit','CAGR','Net P&L %','Live DD'] };
+        const PHASES = hasMidcap ? [
           { title: 'Midcap Future', kind: 'midcap', dates: true, drive: td => td.midcapPct, mae: td => td.midcapMae,
             detailHdr: ['Entry Date','Exit Date','Midcap Hypo P&L %','cumm','Peak','Close','Hypo MAE','Lowest NAV','Live DD'],
             sideHdr: ['Entry','Exit','CAGR','Future P&L %','Live DD'] },
-          { title: niftyTitle, kind: 'std', dates: false, drive: td => td.callPct, mae: td => td.callMae,
-            detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
-            sideHdr: ['Entry','Exit','CAGR','Net P&L %','Live DD'] },
+          _niftyPhase,
           { title: `${niftyTitle} + Midcap Future`, kind: 'std', dates: false, drive: td => td.combinedPct, mae: td => td.combinedMae,
             detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
             sideHdr: ['Entry','Exit','CAGR','Net P&L %','Live DD'] },
-        ];
+        ] : [_niftyPhase];
         const wsP = wb.addWorksheet('Patch wise', { views: [{ state: 'frozen', ySplit: 4 }] });
         const hdrCell = (r, c, val, o={}) => { const cell = wsP.getRow(r).getCell(c); cell.value = val; cell.font = boldFont(o.size||10, o.tx||C.headerTx); cell.fill = { type:'pattern', pattern:'solid', fgColor: o.bg||C.headerBg }; cell.alignment = o.align||centerAlign; cell.border = thinBorder(); return cell; };
         const valCell = (r, c, val, fmt) => { const cell = wsP.getRow(r).getCell(c); cell.value = (val == null ? '' : val); cell.font = normFont(10); if (typeof val === 'number') cell.numFmt = fmt || '0.00'; cell.alignment = centerAlign; cell.border = thinBorder(); return cell; };
@@ -2796,7 +2227,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 valCell(rr, c2++, rw.lowestNav); valCell(rr, c2++, rw.liveDD, '0.00"%"');
               } else {
                 valCell(rr, c2++, rw.drive); valCell(rr, c2++, rw.cumm); valCell(rr, c2++, rw.peak);
-                valCell(rr, c2++, rw.dd); valCell(rr, c2++, rw.pctDd); valCell(rr, c2++, rw.mae);
+                valCell(rr, c2++, rw.dd); valCell(rr, c2++, rw.pctDd, '0.00"%"'); valCell(rr, c2++, rw.mae);
                 valCell(rr, c2++, rw.lowestNav); valCell(rr, c2++, rw.liveDD);
               }
               rr++;
@@ -2816,6 +2247,18 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         });
       }
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SHEET — WOW & MOM Summary (shared util; identical for backtest + optim).
+    // %DD here is m.pctDd — sourced from the engine's row_pct_dd, which the
+    // engine already converts decimal→percentage (generic_algotest_engine.py
+    // "row_pct_dd = trade.get('pct_dd', 0.0) * 100"); Combined %DD is the same
+    // scale (combinedPctDd = (nav/peak-1)*100). Both need /100 for Excel's %.
+    writeWowMomSheet(wb, cleanedTrades, {
+      hasMidcap,
+      title: buildWowMomTitle(strategyConfig),
+      ddIsPercent: true,
+    });
 
     // ── Download ─────────────────────────────────────────────────────────────
     const buffer = await wb.xlsx.writeBuffer();

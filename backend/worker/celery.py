@@ -12,7 +12,7 @@ celery_app = Celery(
     'algotest',
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=['worker.tasks', 'worker.tasks_intraday']
+    include=['worker.tasks']
 )
 
 # Configure Celery

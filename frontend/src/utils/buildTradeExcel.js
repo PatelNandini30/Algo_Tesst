@@ -15,6 +15,7 @@
  * opts     — { comboLabel?, fromDate?, toDate? }
  */
 import ExcelJS from 'exceljs';
+import { writeWowMomSheet, buildWowMomTitle } from './wowMomSheet';
 
 // ─── Palette (identical to ResultsPanel) ────────────────────────────────────
 const C = {
@@ -361,7 +362,15 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     // the Excel ratio DD / Peak.
     let cumulative = 100;
     let peak = 100;
+    let _prevPwKey = null;
     sortedTmKeys.forEach(k => {
+      if (patchwise && !hasMidcap && _prevPwKey !== null) {
+        const newPatch = _pwSegStarts.length
+          ? (_pwSegIdxByKey(k) !== _pwSegIdxByKey(_prevPwKey))
+          : ((tm[_prevPwKey].exitReason || '').toUpperCase().split('+').includes('FILTER_END'));
+        if (newPatch) { cumulative = 100; peak = 100; }
+      }
+      _prevPwKey = k;
       const t = tm[k];
       const pct = Number.isFinite(t.pct) ? t.pct : 0;
       cumulative *= (1 + pct / 100);
@@ -372,7 +381,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       t.cumulative = cumulative;
       t.peak = peak;
       t.dd = dd;
-      t.pctDd = peak !== 0 ? dd / peak : 0;
+      t.pctDd = peak !== 0 ? (dd / peak) * 100 : 0;
     });
 
     // Lowest NAV and Actual Live DD
@@ -380,7 +389,15 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     let prevCum = 100;
     let prevPeak = 100;
     let firstTradeDone = false;
+    let _prevPwKeyLN = null;
     sortedTmKeys.forEach(k => {
+      if (patchwise && !hasMidcap && _prevPwKeyLN !== null) {
+        const newPatch = _pwSegStarts.length
+          ? (_pwSegIdxByKey(k) !== _pwSegIdxByKey(_prevPwKeyLN))
+          : ((tm[_prevPwKeyLN].exitReason || '').toUpperCase().split('+').includes('FILTER_END'));
+        if (newPatch) { prevCum = 100; prevPeak = 100; }
+      }
+      _prevPwKeyLN = k;
       const t    = tm[k];
       const mae  = (t.finalMae  !== '' && t.finalMae  != null) ? t.finalMae  : null;
       const peak = (t.peak      !== '' && t.peak      != null) ? t.peak      : null;
@@ -415,7 +432,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
           const prevKey = sortedTmKeys[idx - 1];
           const newPatch = _pwSegStarts.length
             ? (_pwSegIdxByKey(k) !== _pwSegIdxByKey(prevKey))
-            : ((tm[prevKey].exitReason || '').toUpperCase() === 'FILTER_END');
+            : ((tm[prevKey].exitReason || '').toUpperCase().split('+').includes('FILTER_END'));
           if (newPatch) { nav = 100; peak = 100; prevNav = 100; prevPeak = 100; }
         }
         const t = tm[k];
@@ -486,7 +503,8 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
 
   // ── Build cleaned trade rows ────────────────────────────────────────────────
   const DATE_COLS  = new Set(['Entry Date', 'Exit Date', 'Expiry', 'Leg Exit Date', 'Lazy Entry Date', 'Lazy Exit Date']);
-  const TRUE_PCT_COLS = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %', '%DD']);
+  const TRUE_PCT_COLS = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %']);
+  const PCT_APPEND_COLS = new Set(['%DD', 'Combined %DD']);
   const MAE_COLS   = new Set(['MAE', 'MFE', 'Net MAE 1', 'Net MAE 2', 'Final MAE',
     'Midcap MAE', 'Midcap MFE', 'Combined Net MAE 1', 'Combined Net MAE 2', 'Combined Final MAE']);
 
@@ -649,7 +667,9 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       }
 
       if (typeof cell.value === 'number') {
-        cell.numFmt = TRUE_PCT_COLS.has(colKey)
+        cell.numFmt = PCT_APPEND_COLS.has(colKey)
+          ? '0.00"%"'
+          : TRUE_PCT_COLS.has(colKey)
           ? '0.00%'
           : MAE_COLS.has(colKey)
           ? '#,##0.0000'
@@ -770,45 +790,38 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     ? (Math.pow(_spotCumJS  / 100, 1 / _yearsJS) - 1) * 100 : 0;
   // Max DD / streaks / DD-period: from the COMBINED NAV with a Midcap leg
   // (the NIFTY S.max_dd_pct is wrong); otherwise the backend summary (unchanged).
+  // Max Drawdown = the single worst %DD on the equity curve — Combined NAV with a
+  // Midcap leg, NIFTY NAV otherwise — i.e. min over trades of (Cumulative/Peak-1)*100.
+  // Read straight from Cumulative/Peak (units-safe) so the Summary == the per-trade
+  // %DD column, both overall and patchwise, for midcap AND non-midcap alike.
   let _maxDDPctJS, _maxWinStreakJS, _maxLossStreakJS, mddStartDate, mddEndDate, mddDuration;
-  if (hasMidcap) {
-    let peak = 100, peakMs = null, worstDD = 0, worstPeakMs = null, worstTroughMs = null;
+  {
+    const cumKey  = hasMidcap ? 'Combined Cumulative' : 'Cumulative';
+    const peakKey = hasMidcap ? 'Combined Peak'       : 'Peak';
+    const pctKey  = hasMidcap ? 'Combined Net P&L %'  : '% P&L';
+    let peakMs = null, worstDD = 0, worstPeakMs = null, worstTroughMs = null;
     let winRun = 0, lossRun = 0, mxWin = 0, mxLoss = 0;
-    let prevExitReasonDD = '';
-    let prevSegIdxDD = null;
     for (const t of cleanedTrades) {
-      const pct = t['Combined Net P&L %'];
+      const pct = t[pctKey];
       if (typeof pct === 'number' && Number.isFinite(pct)) {
         if (pct > 0) { winRun++; lossRun = 0; if (winRun > mxWin) mxWin = winRun; }
         else if (pct < 0) { lossRun++; winRun = 0; if (lossRun > mxLoss) mxLoss = lossRun; }
       }
-      const cum = t['Combined Cumulative'];
-      if (typeof cum === 'number' && Number.isFinite(cum)) {
-        const xD = _parseDate2(String(t['Exit Date'] || ''));
-        // Reset the running peak at each patch boundary (same boundary as the
-        // combined chain) so the cumulative reset isn't miscounted as a drawdown.
-        const _segIdx = _pwSegIdxByKey(String(t.Trade || t.trade || 1));
-        const _reset = patchwise && (_pwSegStarts.length
-          ? (prevSegIdxDD !== null && _segIdx !== prevSegIdxDD)
-          : (prevExitReasonDD === 'FILTER_END'));
-        if (_reset) { peak = cum; peakMs = xD; }
-        else if (cum >= peak) { peak = cum; peakMs = xD; }
-        else { const dd = peak !== 0 ? (cum / peak - 1) * 100 : 0; if (dd < worstDD) { worstDD = dd; worstPeakMs = peakMs; worstTroughMs = xD; } }
-        prevSegIdxDD = _segIdx;
+      const cum = t[cumKey];
+      const pk = t[peakKey];
+      const xD = _parseDate2(String(t['Exit Date'] || ''));
+      if (typeof cum === 'number' && typeof pk === 'number' && Number.isFinite(cum) && pk !== 0) {
+        if (cum >= pk - 1e-9) { peakMs = xD; }
+        else { const ddp = (cum / pk - 1) * 100; if (ddp < worstDD) { worstDD = ddp; worstTroughMs = xD; worstPeakMs = peakMs; } }
       }
-      prevExitReasonDD = (t['Exit Reason'] || '').toUpperCase();
     }
-    _maxDDPctJS = worstDD; _maxWinStreakJS = mxWin; _maxLossStreakJS = mxLoss;
+    _maxDDPctJS = worstDD;
+    // Streaks: midcap from the combined chain; non-midcap keep the backend engine value.
+    _maxWinStreakJS  = hasMidcap ? mxWin  : (toNumber(S.max_win_streak)  ?? 0);
+    _maxLossStreakJS = hasMidcap ? mxLoss : (toNumber(S.max_loss_streak) ?? 0);
     const _fms = (ms) => { const d = new Date(ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; };
     if (worstPeakMs != null && worstTroughMs != null) { mddDuration = Math.round((worstTroughMs - worstPeakMs) / 86400000); mddStartDate = _fms(worstPeakMs); mddEndDate = _fms(worstTroughMs); }
     else { mddDuration = 0; mddStartDate = ''; mddEndDate = ''; }
-  } else {
-    _maxDDPctJS      = toNumber(S.max_dd_pct) ?? 0;
-    _maxWinStreakJS  = toNumber(S.max_win_streak)  ?? 0;
-    _maxLossStreakJS = toNumber(S.max_loss_streak) ?? 0;
-    mddStartDate     = S.mdd_start_date || '';
-    mddEndDate       = S.mdd_end_date   || '';
-    mddDuration      = toNumber(S.mdd_duration_days) ?? '';
   }
   const _maxDDPtsJS      = toNumber(S.max_dd_pts) ?? 0;
   const _carMddJS        = _maxDDPctJS !== 0 ? (_optCagrPctJS / 100) / Math.abs(_maxDDPctJS) : 0;
@@ -881,7 +894,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     filtered.forEach(p => {
       const _reset = patchwise && (_pwSegStarts.length
         ? (prevSegIdx !== null && p.segIdx !== prevSegIdx)
-        : (prevExitReason === 'FILTER_END'));
+        : ((prevExitReason || '').split('+').includes('FILTER_END')));
       if (_reset) {
         cumulative = 100; peak = 100; prevCum = 100; prevPeak = 100;
       }
@@ -1189,7 +1202,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const renderMonthRows = (dataMap, isPercent) => {
     Object.entries(dataMap).sort().forEach(([yr, mos], ri) => {
       const total = mos.reduce((s, v) => s + v, 0);
-      const maxDD = byYearMaxDD[yr] != null ? +byYearMaxDD[yr].toFixed(2) : '';
+      const maxDD = byYearMaxDD[yr] != null ? byYearMaxDD[yr] : '';
       const rMdd  = (typeof maxDD === 'number' && maxDD !== 0 && total !== 0)
         ? +(Math.abs(total) / Math.abs(maxDD)).toFixed(2)
         : '';
@@ -1199,8 +1212,12 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
         const cell = r2.getCell(ci + 1);
         const isValCol   = ci >= 1 && ci <= 12;
         const isTotalCol = ci === 13;
+        const isMaxDdCol = ci === 14;
         if (isPercent && (isValCol || isTotalCol)) {
           cell.value  = typeof val === 'number' ? val / 100 : val;
+          cell.numFmt = '0.00%';
+        } else if (isMaxDdCol && typeof val === 'number') {
+          cell.value  = val / 100;
           cell.numFmt = '0.00%';
         } else {
           cell.value = val;
@@ -1307,9 +1324,9 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
 
   // ════════════════════════════════════════════════════════════════════════════
   // SHEET 3 — PATCH WISE  (phase-wise distribution per filter patch)
-  // Identical to ResultsPanel Sheet 3. Only when Midcap leg + filter active.
+  // Identical to ResultsPanel Sheet 3. Active whenever a filter is present.
   // ════════════════════════════════════════════════════════════════════════════
-  if (hasMidcap && filterName) {
+  if (filterName) {
     const _seenP = new Set(); const orderedKeys = [];
     sortedTrades.forEach(_tr => {
       const _k = String(_tr.Trade || _tr.trade || 1);
@@ -1372,7 +1389,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
           const cumm = prevCumm * (1 + d / 100);
           peak = Math.max(peak, cumm);
           const dd = (peak > cumm) ? (cumm - peak) : '';
-          const pctDd = (typeof dd === 'number' && peak !== 0) ? dd / peak : 0;
+          const pctDd = (typeof dd === 'number' && peak !== 0) ? (dd / peak) * 100 : 0;
           const mv = maeOf(td); const m = Number.isFinite(mv) ? mv : 0;
           const lowestNav = prevCumm * (1 + m / 100);
           const liveDD = prevPeak !== 0 ? (lowestNav / prevPeak - 1) * 100 : 0;
@@ -1387,17 +1404,18 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
 
       const _opt = hasCalls && hasPuts ? 'CE+PE' : hasCalls ? 'CE' : hasPuts ? 'PE' : 'Options';
       const niftyTitle = `Nifty ${_opt}`;
-      const PHASES = [
+      const _niftyPhase = { title: niftyTitle, kind: 'std', dates: false, drive: td => td.callPct, mae: td => td.callMae,
+        detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
+        sideHdr: ['Entry','Exit','CAGR','Net P&L %','Live DD'] };
+      const PHASES = hasMidcap ? [
         { title: 'Midcap Future', kind: 'midcap', dates: true, drive: td => td.midcapPct, mae: td => td.midcapMae,
           detailHdr: ['Entry Date','Exit Date','Midcap Hypo P&L %','cumm','Peak','Close','Hypo MAE','Lowest NAV','Live DD'],
           sideHdr: ['Entry','Exit','CAGR','Future P&L %','Live DD'] },
-        { title: niftyTitle, kind: 'std', dates: false, drive: td => td.callPct, mae: td => td.callMae,
-          detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
-          sideHdr: ['Entry','Exit','CAGR','Net P&L %','Live DD'] },
+        _niftyPhase,
         { title: `${niftyTitle} + Midcap Future`, kind: 'std', dates: false, drive: td => td.combinedPct, mae: td => td.combinedMae,
           detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
           sideHdr: ['Entry','Exit','CAGR','Net P&L %','Live DD'] },
-      ];
+      ] : [_niftyPhase];
 
       const wsP = wb.addWorksheet('Patch wise', { views: [{ state: 'frozen', ySplit: 4 }] });
       const hdrCell = (r, c, val, o = {}) => {
@@ -1449,7 +1467,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
               valCell(rr, c2++, rw.lowestNav); valCell(rr, c2++, rw.liveDD, '0.00"%"');
             } else {
               valCell(rr, c2++, rw.drive); valCell(rr, c2++, rw.cumm); valCell(rr, c2++, rw.peak);
-              valCell(rr, c2++, rw.dd); valCell(rr, c2++, rw.pctDd); valCell(rr, c2++, rw.mae);
+              valCell(rr, c2++, rw.dd); valCell(rr, c2++, rw.pctDd, '0.00"%"'); valCell(rr, c2++, rw.mae);
               valCell(rr, c2++, rw.lowestNav); valCell(rr, c2++, rw.liveDD);
             }
             rr++;
@@ -1608,6 +1626,19 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       });
     }
   }
+
+  // ── WOW & MOM Summary (shared util; identical to backtest export) ──────────
+  // Optimizer combos use the combo label as the block title so the per-combo
+  // tradesheet and the merged WOW/MOM summary match exactly; fall back to the
+  // strategy-derived title for a plain backtest with no combo label.
+  // Both %DD and Combined %DD are computed here as (dd/peak)*100 — a
+  // percentage NUMBER, not a decimal fraction (unlike ResultsPanel.jsx's
+  // non-midcap %DD) — so tell the writer to always divide by 100.
+  writeWowMomSheet(wb, cleanedTrades, {
+    hasMidcap,
+    title: comboLabel || buildWowMomTitle(runConfig),
+    ddIsPercent: true,
+  });
 
   // ── Serialize ──────────────────────────────────────────────────────────────
   const buf  = await wb.xlsx.writeBuffer();

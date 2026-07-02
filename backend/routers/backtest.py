@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
+from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File, Request
 from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
 # NOTE: keep FastAPI imports at top for readability
@@ -611,31 +611,42 @@ def _run_algotest_job_process(payload: dict) -> dict:
     return execute_algotest_job(payload)
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    client = request.client
+    return client.host if client and client.host else "unknown"
+
+
 @router.post("/algotest")
-async def run_algotest_backtest_endpoint(request: dict):
+async def run_algotest_backtest_endpoint(request: Request):
     """
     Legacy synchronous endpoint kept for backwards compatibility.
     """
+    body = await request.json()
     try:
-        _validate_lazy_legs_payload(request or {})
-        validate_index_payload(request or {})
+        _validate_lazy_legs_payload(body or {})
+        validate_index_payload(body or {})
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         _backtest_process_executor,
         _run_algotest_job_process,
-        request,
+        body,
     )
     return result
 
 
 @router.post("/algotest/jobs")
-async def queue_algotest_job(request: dict):
+async def queue_algotest_job(request: Request):
     """
     Enqueue an AlgoTest backtest to run asynchronously via Celery.
     """
-    payload = _resolve_effective_request(_normalize_request(_normalize_payload_dates(request)))
+    body = await request.json()
+    origin_ip = _client_ip(request)
+    payload = _resolve_effective_request(_normalize_request(_normalize_payload_dates(body)))
     try:
         _validate_lazy_legs_payload(payload)
         validate_index_payload(payload)
@@ -663,7 +674,9 @@ async def queue_algotest_job(request: dict):
 
     queue_name = _backtest_queue_for_payload(payload)
     queue_depth = _queue_depth(queue_name)
+    payload["_client_ip"] = origin_ip
     task = run_algotest_job.apply_async(args=[payload], queue=queue_name)
+    logger.info("[BACKTEST] queued job %s from ip=%s queue=%s", task.id[:8], origin_ip, queue_name)
     return {"status": "queued", "job_id": task.id, "queue": queue_name, "queue_depth": queue_depth}
 
 

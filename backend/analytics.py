@@ -35,7 +35,7 @@ def create_summary_idx(df: pd.DataFrame) -> Dict[str, Any]:
     if '%DD' not in df.columns:
         # Use entry spot as reference capital (consistent with most backtest platforms)
         initial_capital = df.iloc[0]['Entry Spot'] if 'Entry Spot' in df.columns else df.iloc[0]['entry_spot']
-        df['%DD'] = np.where(df['DD'] == 0, 0, round(100 * (df['DD'] / initial_capital), 2))
+        df['%DD'] = np.where(df['DD'] == 0, 0, 100 * (df['DD'] / initial_capital))
     
     # Calculate summary statistics
     total_pnl = df['Net P&L'].sum()
