@@ -1871,6 +1871,7 @@ def run_optimization(
     parallelism: Optional[int] = None,
     zip_naming: Optional[Dict[str, Any]] = None,
     auto_download: bool = False,
+    node_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Top-level entry point invoked by the Celery task.
@@ -1954,7 +1955,8 @@ def run_optimization(
         # before the pool is built (after data load), by which time both
         # simultaneous jobs have registered → they split cleanly (e.g. 3+3)
         # instead of racing (6+3). Deregistered in the finally blocks below.
-        result_store.register_active_optim(job_id)
+        # PER-NODE: count only optims on THIS node, never other LAN nodes.
+        result_store.register_active_optim(job_id, node_id)
         parallelism = _solo_ceiling  # provisional (full box) to enter the parallel path
 
     if parallelism > 1:
@@ -2018,7 +2020,7 @@ def run_optimization(
             # reach this point only after both registered, so they split evenly
             # instead of one grabbing the whole box. A job that starts while
             # another is already mid-run correctly takes the smaller share.
-            _live = result_store.active_optim_count()
+            _live = result_store.active_optim_count(node_id)
             parallelism = max(1, _solo_ceiling // max(1, _live))
             logger.info(
                 "[OPTIM] dynamic parallelism: solo_ceiling=%d / live_optims=%d -> P=%d",
@@ -2086,7 +2088,7 @@ def run_optimization(
         finally:
             # Free this job's slot in the live-optim registry so the dynamic
             # divisor lets a waiting/other optim reclaim the box immediately.
-            result_store.unregister_active_optim(job_id)
+            result_store.unregister_active_optim(job_id, node_id)
 
     # ── Sequential path (smart sampling, or single-CPU fallback) ────────────
     market_meta: Dict[str, Any] = {}
@@ -2290,4 +2292,4 @@ def run_optimization(
         _teardown_market_data()
         # Sequential path also registered itself (exhaustive/random with P
         # clamped to 1) — free the live-optim slot here too.
-        result_store.unregister_active_optim(job_id)
+        result_store.unregister_active_optim(job_id, node_id)

@@ -1363,6 +1363,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     let _winCntJS = 0, _lossCntJS = 0, _totalCntJS = 0;
     let _sumNetJS = 0, _maxNetJS = -Infinity, _minNetJS = Infinity;
     let _finalCumJS = 100, _spotCumJS = 100;
+    let _initSpotJS = null, _finalSpotJS = null;   // cagr_spot from spot LEVELS
     let _minEntryMs = null, _maxExitMs = null;
     const _parseDate = (s) => {
       if (s instanceof Date) return s.getTime();
@@ -1395,9 +1396,9 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       const cum = _tCum(t);
       if (typeof cum === 'number' && Number.isFinite(cum)) _finalCumJS = cum;
       const eS = +t['Entry Spot'], xS = +t['Exit Spot'];
-      if (typeof n === 'number' && Number.isFinite(n) && Number.isFinite(eS) && Number.isFinite(xS) && eS > 0) {
-        _spotCumJS *= (xS / eS);
-      }
+      // cagr_spot from spot LEVELS (leg-independent, matches backend base.py:1075).
+      if (Number.isFinite(eS) && eS > 0 && _initSpotJS === null) _initSpotJS = eS;
+      if (Number.isFinite(xS) && xS > 0) _finalSpotJS = xS;
       const eD = _parseDate(t['Entry Date']);
       const xD = _parseDate(t['Exit Date']);
       if (eD != null && (_minEntryMs == null || eD < _minEntryMs)) _minEntryMs = eD;
@@ -1413,13 +1414,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const _expectancyJS = _avgLossPctJS !== 0
       ? ((_winRateJS / 100) * _avgWinPctJS / Math.abs(_avgLossPctJS) - (1 - _winRateJS / 100))
       : 0;
-    const _yearsJS = (_minEntryMs != null && _maxExitMs != null)
-      ? (_maxExitMs - _minEntryMs) / (365.25 * 86400000)
-      : 0;
-    const _optCagrPctJS = _yearsJS > 0 && _finalCumJS > 0
-      ? (Math.pow(_finalCumJS / 100, 1 / _yearsJS) - 1) * 100 : 0;
-    const _spotCagrPctJS = _yearsJS > 0 && _spotCumJS > 0
-      ? (Math.pow(_spotCumJS / 100, 1 / _yearsJS) - 1) * 100 : 0;
+    // Year span + CAGRs match the backend exactly (base.py:999,1075): integer days
+    // between first entry and last exit / 365.0, floored 0.01; cagr_spot from spot
+    // LEVELS; CAGR(options) clamped +/-99999, -100 on a wiped-out equity.
+    const _spanDaysJS = (_minEntryMs != null && _maxExitMs != null)
+      ? Math.round((_maxExitMs - _minEntryMs) / 86400000) : 0;
+    const _yearsJS = Math.max(_spanDaysJS / 365.0, 0.01);
+    const _optCagrPctJS = (_finalCumJS > 0)
+      ? Math.max(-99999, Math.min(99999, (Math.pow(_finalCumJS / 100, 1 / _yearsJS) - 1) * 100))
+      : -100;
+    const _spotCagrPctJS = (_initSpotJS && _finalSpotJS && _initSpotJS > 0 && _finalSpotJS > 0)
+      ? (Math.pow(_finalSpotJS / _initSpotJS, 1 / _yearsJS) - 1) * 100 : 0;
     // ROI vs Spot uses spot sum gated by Net P&L being a number (first-leg rows only)
     let _spotSumGatedJS = 0;
     for (const t of cleanedTrades) {

@@ -723,6 +723,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   let _winCntJS = 0, _lossCntJS = 0, _totalCntJS = 0;
   let _sumNetJS = 0, _maxNetJS = -Infinity, _minNetJS = Infinity;
   let _finalCumJS = 100, _spotCumJS = 100;
+  let _initSpotJS = null, _finalSpotJS = null;   // cagr_spot from spot LEVELS
   let _minEntryMs = null, _maxExitMs = null;
   let _spotSumGatedJS = 0;
   let _ceSumJS = 0, _peSumJS = 0, _futSumJS = 0;
@@ -771,9 +772,10 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     const cum = _gc(t);
     if (typeof cum === 'number' && Number.isFinite(cum)) _finalCumJS = cum;
     const eS = toNumber(t['Entry Spot']), xS = toNumber(t['Exit Spot']);
-    if (typeof n === 'number' && Number.isFinite(n) && eS !== null && xS !== null && eS > 0) {
-      _spotCumJS *= (xS / eS);
-    }
+    // cagr_spot from spot LEVELS (leg-independent, matches backend base.py:1075):
+    // first trade's Entry Spot and last trade's Exit Spot in canonical order.
+    if (eS !== null && eS > 0 && _initSpotJS === null) _initSpotJS = eS;
+    if (xS !== null && xS > 0) _finalSpotJS = xS;
     const eD = _parseDate2(String(t['Entry Date'] || ''));
     const xD = _parseDate2(String(t['Exit Date']  || ''));
     if (eD != null && (_minEntryMs == null || eD < _minEntryMs)) _minEntryMs = eD;
@@ -790,12 +792,18 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   const _expectancyJS = _avgLossPctJS !== 0
     ? ((_winRateJS / 100) * _avgWinPctJS / Math.abs(_avgLossPctJS) - (1 - _winRateJS / 100))
     : 0;
-  const _yearsJS = (_minEntryMs != null && _maxExitMs != null)
-    ? (_maxExitMs - _minEntryMs) / (365.25 * 86400000) : 0;
-  const _optCagrPctJS  = _yearsJS > 0 && _finalCumJS > 0
-    ? (Math.pow(_finalCumJS / 100, 1 / _yearsJS) - 1) * 100 : 0;
-  const _spotCagrPctJS = _yearsJS > 0 && _spotCumJS > 0
-    ? (Math.pow(_spotCumJS  / 100, 1 / _yearsJS) - 1) * 100 : 0;
+  // Year span + CAGRs match the backend exactly (base.py:999,1075): integer days
+  // between first entry and last exit / 365.0, floored 0.01; cagr_spot from spot
+  // LEVELS; CAGR(options) clamped +/-99999, -100 on a wiped-out equity.
+  const _spanDaysJS = (_minEntryMs != null && _maxExitMs != null)
+    ? Math.round((_maxExitMs - _minEntryMs) / 86400000) : 0;
+  const _yearsJS = Math.max(_spanDaysJS / 365.0, 0.01);
+  const _optCagrPctJS = (_finalCumJS > 0)
+    ? Math.max(-99999, Math.min(99999, (Math.pow(_finalCumJS / 100, 1 / _yearsJS) - 1) * 100))
+    : -100;
+  const _spotCagrPctJS = (_initSpotJS && _finalSpotJS && _initSpotJS > 0 && _finalSpotJS > 0)
+    ? (Math.pow(_finalSpotJS / _initSpotJS, 1 / _yearsJS) - 1) * 100
+    : 0;
   // Max DD / streaks / DD-period: from the COMBINED NAV with a Midcap leg
   // (the NIFTY S.max_dd_pct is wrong); otherwise the backend summary (unchanged).
   // Max Drawdown = the single worst %DD on the equity curve — Combined NAV with a

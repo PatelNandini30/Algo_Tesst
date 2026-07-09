@@ -712,56 +712,66 @@ def delete_job_trades(job_id: str) -> None:
 # Stored as a Redis hash {job_id: heartbeat_epoch}; entries older than
 # _ACTIVE_STALE_SEC (a crashed/killed job that never deregistered) are pruned
 # on read so they can't wedge the divisor high forever.
-_ACTIVE_KEY = "algotest:optim:active"
+_ACTIVE_KEY = "algotest:optim:active"       # legacy global key (kept for cleanup)
+_ACTIVE_KEY_PREFIX = "algotest:optim:active:"  # PER-NODE: :{node_id|local}
 _ACTIVE_STALE_SEC = 3 * 60 * 60  # 3h — longer than any real optim compute phase
 
 
-def register_active_optim(job_id: str) -> int:
-    """Mark this job as computing NOW and return the live optim count (incl.
-    self). Best-effort: if Redis is unavailable, returns 1 so the caller falls
-    back to full solo parallelism (safe — a single job never over-allocates)."""
+def _active_key(node_id: Optional[str]) -> str:
+    # Per-NODE live-optim set. The dynamic parallelism divisor must count only
+    # optims running on the SAME box, never optims on other LAN nodes (their
+    # CPU/RAM is unrelated to this box's free capacity). Default "local" = this box.
+    return _ACTIVE_KEY_PREFIX + (node_id or "local")
+
+
+def register_active_optim(job_id: str, node_id: Optional[str] = None) -> int:
+    """Mark this job as computing NOW on `node_id` (default: local, this box) and
+    return the live optim count for THAT node (incl. self). Best-effort: if Redis
+    is unavailable, returns 1 so the caller falls back to full solo parallelism
+    (safe — a single job never over-allocates)."""
     r = _redis()
     if r is None:
         return 1
     try:
         now = time.time()
-        r.hset(_ACTIVE_KEY, job_id, now)
+        key = _active_key(node_id)
+        r.hset(key, job_id, now)
         # Prune stale entries (crashed jobs) before counting.
         stale = []
-        for jid, ts in (r.hgetall(_ACTIVE_KEY) or {}).items():
+        for jid, ts in (r.hgetall(key) or {}).items():
             try:
                 if now - float(ts) > _ACTIVE_STALE_SEC:
                     stale.append(jid)
             except (TypeError, ValueError):
                 stale.append(jid)
         if stale:
-            r.hdel(_ACTIVE_KEY, *stale)
-        return max(1, r.hlen(_ACTIVE_KEY))
+            r.hdel(key, *stale)
+        return max(1, r.hlen(key))
     except Exception as exc:
         logger.warning("[OPTIM_STORE] register_active_optim failed: %s", exc)
         return 1
 
 
-def unregister_active_optim(job_id: str) -> None:
-    """Remove this job from the live set once its compute phase ends."""
+def unregister_active_optim(job_id: str, node_id: Optional[str] = None) -> None:
+    """Remove this job from its node's live set once its compute phase ends."""
     r = _redis()
     if r is None:
         return
     try:
-        r.hdel(_ACTIVE_KEY, job_id)
+        r.hdel(_active_key(node_id), job_id)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] unregister_active_optim failed: %s", exc)
 
 
-def active_optim_count() -> int:
-    """Current live optim count (pruned), for logging/introspection."""
+def active_optim_count(node_id: Optional[str] = None) -> int:
+    """Current live optim count for `node_id` (default: local), pruned."""
     r = _redis()
     if r is None:
         return 0
     try:
         now = time.time()
         cnt = 0
-        for _jid, ts in (r.hgetall(_ACTIVE_KEY) or {}).items():
+        for _jid, ts in (r.hgetall(_active_key(node_id)) or {}).items():
             try:
                 if now - float(ts) <= _ACTIVE_STALE_SEC:
                     cnt += 1

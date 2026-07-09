@@ -138,6 +138,7 @@ def run_optimize_job(self, spec: dict):
             parallelism=spec.get('parallelism'),
             zip_naming=spec.get('zip_naming'),
             auto_download=bool(spec.get('auto_download')),
+            node_id=node_id,
         )
         # Pre-build the tradesheets ZIP and wait for it to finish so the
         # user gets an instant download instead of a progress bar.
