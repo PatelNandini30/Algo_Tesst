@@ -1220,6 +1220,13 @@ def _write_summary_sheet(
                 if ddp < worst_dd:
                     worst_dd = ddp; worst_trough_ms = xd; worst_peak_ms = peak_ms
     max_dd_pct = worst_dd
+    # Overall + non-midcap: pin the magnitude to the backtest's OWN max_dd_pct
+    # (min of base.py's %DD column) so per-combo == backtest byte-for-byte; the loop
+    # above still supplies the MDD peak/trough dates. Patchwise/midcap keep worst_dd.
+    if not patchwise and not has_midcap:
+        _s_dd = _to_num(summary.get("max_dd_pct"))
+        if _s_dd is not None and math.isfinite(_s_dd):
+            max_dd_pct = _s_dd
     max_win_str = mx_win; max_loss_str = mx_loss
     if worst_peak_ms and worst_trough_ms:
         mdd_dur = round((worst_trough_ms - worst_peak_ms) / 86400000)
@@ -1893,12 +1900,24 @@ def compute_xlsx_summary_metrics(
     _mdd_cum_col  = "Combined Cumulative" if has_midcap else "Cumulative"
     _mdd_peak_col = "Combined Peak"       if has_midcap else "Peak"
     max_dd_pct = 0.0
-    for t in cleaned:
-        cc = _to_num(t.get(_mdd_cum_col)); pk = _to_num(t.get(_mdd_peak_col))
-        if cc is not None and pk not in (None, 0) and math.isfinite(cc):
-            ddp = (cc / pk - 1) * 100
-            if ddp < max_dd_pct:
-                max_dd_pct = ddp
+    # OVERALL + non-midcap: read the backtest's OWN %DD column (base.py:939 stamps
+    # it, base.py:1008 does float(%DD.min())) so the master is byte-identical to the
+    # backtest instead of re-deriving cum/peak and drifting at the 7th decimal.
+    # Patchwise (per-patch reset) and midcap (Combined) keep the recompute below.
+    _src_dd_used = False
+    if not patchwise and not has_midcap:
+        _src_dd = [_to_num(r.get("%DD")) for r in rows]
+        _src_dd = [v for v in _src_dd if v is not None and math.isfinite(v)]
+        if _src_dd:
+            max_dd_pct = float(min(_src_dd))
+            _src_dd_used = True
+    if not _src_dd_used:
+        for t in cleaned:
+            cc = _to_num(t.get(_mdd_cum_col)); pk = _to_num(t.get(_mdd_peak_col))
+            if cc is not None and pk not in (None, 0) and math.isfinite(cc):
+                ddp = (cc / pk - 1) * 100
+                if ddp < max_dd_pct:
+                    max_dd_pct = ddp
     if has_midcap:
         combined_max_dd = max_dd_pct
     car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
