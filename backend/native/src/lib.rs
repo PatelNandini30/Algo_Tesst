@@ -1,3 +1,4 @@
+mod analytics;
 mod intraday;
 mod optimizer;
 mod simulate;
@@ -1893,6 +1894,7 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simulate::simulate_trades_batch, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::resolve_trade_specs, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(analytics::compute_analytics_summary, m)?)?;
     m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
     // Index OHLC (additive — Midcap overlay)
     m.add_function(wrap_pyfunction!(load_index_ohlc, m)?)?;
