@@ -1011,6 +1011,115 @@ async def download_combo_tradesheet(job_id: str, combo_id: int):
     )
 
 
+@router.get("/optimize/jobs/{job_id}/combo/{combo_id}/tradesheet.xlsx")
+async def download_combo_tradesheet_xlsx(
+    job_id: str, combo_id: int, patchwise: bool = Query(False)
+):
+    """
+    Return the styled XLSX tradesheet for a single combination — the EXACT same
+    workbook that goes into the ZIP (built by excel_builder.build_combo_xlsx,
+    openpyxl). Serves the pre-built on-disk file when present (byte-identical to
+    the ZIP entry); otherwise builds it on-demand via the same code path the
+    sweep uses (result_store.write_combo_xlsx), caches it to disk, and serves it.
+
+    ?patchwise=true serves the per-patch-reset variant (patchwise/ subdir),
+    matching the patchwise ZIP; default false = overall.
+    """
+    meta = result_store.get_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    row = result_store.get_combo_by_id(job_id, combo_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Combo {combo_id} not found in job results")
+
+    combo_label_safe = row.get("combo_label_safe") or ""
+    if not combo_label_safe:
+        raise HTTPException(status_code=404, detail="Tradesheet not available for this combo")
+
+    trades_dir = result_store.get_trades_dir(job_id)
+    if patchwise:
+        xlsx_path = os.path.join(trades_dir, "patchwise", f"{combo_label_safe}.xlsx")
+    else:
+        xlsx_path = os.path.join(trades_dir, f"{combo_label_safe}.xlsx")
+    # Path-traversal guard (combo_label_safe is sanitized at write time, re-check).
+    if not os.path.abspath(xlsx_path).startswith(os.path.abspath(trades_dir)):
+        raise HTTPException(status_code=400, detail="Invalid combo label")
+
+    # Build on-demand if the pre-built file isn't on disk (e.g. cache evicted or
+    # this combo wasn't inline-finalized). Uses the SAME builder the ZIP uses so
+    # the output is identical to the ZIP entry.
+    if not os.path.isfile(xlsx_path):
+        csv_path = os.path.join(trades_dir, f"{combo_label_safe}.csv")
+        if not os.path.isfile(csv_path):
+            raise HTTPException(status_code=404, detail="Tradesheet file not found on disk")
+
+        def _build() -> None:
+            import pandas as _pd
+            base_payload = meta.get("base_payload") or {}
+            index_str = base_payload.get("index") or "NIFTY"
+            # Enrich MAE/MFE into the CSV first (idempotent), same as the CSV endpoint.
+            try:
+                _enrich_tradesheet_with_mae_mfe(csv_path, index_str)
+            except Exception as _exc:
+                logger.warning("[OPTIM_DL] xlsx enrich skipped for combo %d: %s", combo_id, _exc)
+            tdf = _pd.read_csv(csv_path)
+            # Coerce dtypes the builder expects (CSV is all strings on read).
+            for _c in ("Strike", "Entry Price", "Entry Spot", "Exit Price", "Exit Spot",
+                       "Cumulative", "Peak", "DD", "%DD", "Net P&L", "% P&L", "MAE", "MFE"):
+                if _c in tdf.columns:
+                    tdf[_c] = _pd.to_numeric(tdf[_c], errors="coerce")
+            midcap_legs = base_payload.get("midcap_legs") or None
+            midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
+            midcap_sym  = (
+                (midcap_legs[0].get("symbol") if (midcap_legs and isinstance(midcap_legs[0], dict)) else None)
+                or "NIFTYMIDCAP100"
+            )
+            filter_segments = base_payload.get("filter_segments") or None
+            from_date = base_payload.get("date_from") or base_payload.get("from_date") or ""
+            to_date   = base_payload.get("date_to") or base_payload.get("to_date") or ""
+            combo_label = row.get("combo_label") or combo_label_safe
+            # trading_days for the internal MAE/MFE enrich (already enriched above,
+            # but pass so the builder's own enrich is a no-op / consistent).
+            try:
+                _ohlc_pd, trading_days = _get_ohlc_pandas_for_index(index_str)
+            except Exception:
+                trading_days = None
+            if patchwise:
+                zip_naming = meta.get("zip_naming") or {}
+                filter_name = (zip_naming.get("level1") or "") if zip_naming else ""
+                result_store.write_combo_xlsx_patchwise(
+                    job_id, combo_label_safe, tdf, row.get("summary") or {},
+                    combo_label=combo_label, from_date=from_date, to_date=to_date,
+                    index_str=index_str, trading_days=trading_days,
+                    midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
+                    midcap_symbol=midcap_sym, filter_name=filter_name,
+                    filter_segments=filter_segments,
+                )
+            else:
+                result_store.write_combo_xlsx(
+                    job_id, combo_label_safe, tdf, row.get("summary") or {},
+                    combo_label=combo_label, from_date=from_date, to_date=to_date,
+                    index_str=index_str, trading_days=trading_days,
+                    midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
+                    midcap_symbol=midcap_sym, filter_segments=filter_segments,
+                )
+
+        await asyncio.get_event_loop().run_in_executor(None, _build)
+
+    if not os.path.isfile(xlsx_path):
+        raise HTTPException(status_code=500, detail="Failed to build tradesheet XLSX")
+
+    _pw = "_patchwise" if patchwise else ""
+    filename = f"combo_{combo_id}_{combo_label_safe[:60]}{_pw}.xlsx"
+    return FileResponse(
+        xlsx_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+        headers={"X-Filename": filename},
+    )
+
+
 @router.get("/optimize/jobs/{job_id}/summary")
 async def get_optim_summary(job_id: str, patchwise: bool = Query(True)):
     """

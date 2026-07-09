@@ -13,7 +13,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, X, Loader2, Settings, ArrowDown, ArrowUp, FileDown } from 'lucide-react';
 import { MASTER_SUMMARY_COLUMNS } from '../utils/strategyParamSchema';
-import buildTradeExcel from '../utils/buildTradeExcel';
 import { buildSummaryWorkbookBlob, rulesFilename, triggerBlobDownload } from '../utils/optimSummaryExport';
 import { resolveDownloadBase } from '../utils/downloadBase';
 
@@ -455,116 +454,22 @@ export default function OptimizationResults({
     if (downloadingRows.has(comboId)) return;
     setDownloadingRows((prev) => new Set(prev).add(comboId));
     try {
-      const r = await fetch(`/api/optimize/jobs/${jobId}/combo/${comboId}/tradesheet`);
+      // Download the SAME styled workbook that goes into the ZIP — built on the
+      // backend by excel_builder.build_combo_xlsx (openpyxl). No client-side
+      // ExcelJS rebuild or midcap overlay: the backend applies Midcap via the
+      // Rust engine, so the single-combo download matches the ZIP entry exactly.
+      const _pw = (ddMode === 'patchwise') ? 'true' : 'false';
+      const r = await fetch(`/api/optimize/jobs/${jobId}/combo/${comboId}/tradesheet.xlsx?patchwise=${_pw}`);
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
         alert(err.detail || `Failed to download tradesheet for combo ${comboId}`);
         return;
       }
 
-      // Parse CSV text into array of objects
-      const csvText = await r.text();
-      const lines = csvText.split('\n').filter(Boolean);
-      if (lines.length < 2) {
-        alert(`No trade data returned for combo ${comboId}`);
-        return;
-      }
-
-      // Simple CSV parser — handles quoted fields containing commas/newlines
-      const parseCSVLine = (line) => {
-        const fields = [];
-        let cur = '';
-        let inQuote = false;
-        for (let i = 0; i < line.length; i++) {
-          const ch = line[i];
-          if (ch === '"') {
-            if (inQuote && line[i + 1] === '"') { cur += '"'; i++; }
-            else { inQuote = !inQuote; }
-          } else if (ch === ',' && !inQuote) {
-            fields.push(cur);
-            cur = '';
-          } else {
-            cur += ch;
-          }
-        }
-        fields.push(cur);
-        return fields;
-      };
-
-      const headers = parseCSVLine(lines[0]);
-      const parsedTrades = lines.slice(1).map(line => {
-        const values = parseCSVLine(line);
-        const obj = {};
-        headers.forEach((h, i) => { obj[h.trim()] = values[i] !== undefined ? values[i].trim() : ''; });
-        return obj;
-      });
-
-      // Find the corresponding summary and combo label from rows state
-      const matchingRow = rows.find(row => (row.combo_id ?? null) === comboId || String(row.combo_id) === String(comboId));
-      const summary     = matchingRow?.summary || {};
-      const comboLabel  = matchingRow?.combo_label || `Combo ${comboId}`;
-
-      // Midcap cross-index overlay — compute via the SAME native engine the
-      // backtest uses (/api/midcap-overlay), so the single-combo Excel matches
-      // the backtest + the ZIP. Only when this run had a Midcap leg.
-      let midcapData = null;
-      // Midcap config: prefer the job meta (server source of truth — survives
-      // page reloads / works even if this panel was opened fresh), fall back to
-      // the launch-time prop.
-      const _bpMc = meta?.base_payload?.midcap_legs;
-      const _mcLegs = (Array.isArray(_bpMc) && _bpMc.length) ? _bpMc : midcapConfig?.midcap_legs;
-      const _mcSA = (Array.isArray(_bpMc) && _bpMc.length)
-        ? (meta?.base_payload?.midcap_spot_adjustment || null)
-        : (midcapConfig?.midcap_spot_adjustment || null);
-      if (Array.isArray(_mcLegs) && _mcLegs.length) {
-        try {
-          // Project per-leg rows → one row per trade for the overlay.
-          const _grp = {};
-          for (const t of parsedTrades) {
-            const k = String(t.Trade || t.trade || 1);
-            (_grp[k] = _grp[k] || []).push(t);
-          }
-          const _num = (v) => { const n = parseFloat(String(v ?? '').replace(/[,%₹\s]/g, '')); return Number.isFinite(n) ? n : null; };
-          const _proj = Object.entries(_grp).map(([k, legs]) => {
-            const main = legs.find(l => !l['ReEntryIndex'] && !l['ReEntryTrigger'] && !l['ReEntryMode']) || legs[0];
-            let net = _num(main['Net P&L']);
-            if (net == null) net = legs.reduce((s, l) => s + (_num(l['CE P&L']) || 0) + (_num(l['PE P&L']) || 0) + (_num(l['FUT P&L']) || 0), 0);
-            let pct = _num(main['% P&L']);
-            if (pct == null) { const es = _num(main['Entry Spot']) || 0; pct = es ? (net / es) * 100 : 0; }
-            return { trade_id: k, entry_date: main['Entry Date'], exit_date: main['Exit Date'], nifty_pnl: net, nifty_pnl_pct: pct };
-          });
-          const _resp = await fetch('/api/midcap-overlay', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            // Engine already applied the Midcap spot-adjustment (exit + re-entry);
-            // the overlay just prices the Midcap leg over each trade window. Pass null.
-            body: JSON.stringify({ rows: _proj, midcap_legs: _mcLegs, midcap_spot_adjustment: null, symbol: 'NIFTYMIDCAP100' }),
-          });
-          if (_resp.ok) {
-            const _r = await _resp.json();
-            if (_r?.available) {
-              const byTrade = {};
-              for (const rr of (_r.results || [])) { if (rr?.available) byTrade[String(rr.trade_id)] = rr; }
-              midcapData = { available: true, byTrade, summary: _r.summary || null, legs: _mcLegs };
-            }
-          }
-        } catch (_e) { /* non-fatal — fall back to NIFTY-only sheet */ }
-      }
-
-      const blob = await buildTradeExcel(parsedTrades, summary, {
-        comboLabel,
-        runConfig,
-        comboValues: matchingRow?.combo || {},
-        midcap: midcapData,
-        filterName: meta?.zip_naming?.level1 || '',
-        patchwise: ddMode === 'patchwise',
-        filterSegments: meta?.base_payload?.filter_segments || null,
-      });
-
-      // Derive filename from Content-Disposition or fallback
-      const disposition = r.headers.get('Content-Disposition') || '';
-      const match = disposition.match(/filename="?([^"]+)"?/);
-      const csvFilename = match ? match[1] : `combo_${comboId}_tradesheet.csv`;
-      const xlsxFilename = csvFilename.replace(/\.csv$/i, '.xlsx');
+      const blob = await r.blob();
+      const xlsxFilename = r.headers.get('X-Filename')
+        || (r.headers.get('Content-Disposition') || '').match(/filename="?([^"]+)"?/)?.[1]
+        || `combo_${comboId}_tradesheet.xlsx`;
 
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -572,6 +477,7 @@ export default function OptimizationResults({
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
+      URL.revokeObjectURL(a.href);
     } catch (e) {
       alert(`Failed to download tradesheet for combo ${comboId}: ${e?.message || e}`);
     } finally {
