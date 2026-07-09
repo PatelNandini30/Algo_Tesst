@@ -147,6 +147,16 @@ struct TradeAgg {
     main_entry_spot: Option<f64>,
     main_exit_spot: Option<f64>,
     main_spot_pnl: Option<f64>,
+    // Combined (midcap) chain — populated only when has_midcap.
+    nifty_mae: Option<f64>,        // Σ dir-legs MAE (None if any leg missing)
+    nifty_mfe: Option<f64>,        // Σ dir-legs MFE
+    combined_pct: Option<f64>,     // mc["Combined Net P&L %"]
+    combined_net: Option<f64>,     // mc["Combined Net P&L"]
+    combined_cum: Option<f64>,
+    combined_peak: Option<f64>,
+    combined_pct_dd: Option<f64>,
+    combined_final_mae: Option<f64>,
+    combined_actual_ldd: Option<f64>,
 }
 
 fn empty(py: Python<'_>) -> PyResult<PyObject> {
@@ -154,15 +164,18 @@ fn empty(py: Python<'_>) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (trades, summary, patchwise=false, filter_segments=None))]
+#[pyo3(signature = (trades, summary, patchwise=false, filter_segments=None, midcap_by_trade=None, midcap_summary=None))]
 pub fn compute_summary_metrics(
     trades: &PyList,
     summary: &PyDict,
     patchwise: bool,
     filter_segments: Option<&PyList>,
+    midcap_by_trade: Option<&PyDict>,
+    midcap_summary: Option<&PyDict>,
 ) -> PyResult<PyObject> {
     let py = trades.py();
     if trades.is_empty() { return empty(py); }
+    let has_midcap = midcap_by_trade.map_or(false, |m| !m.is_empty());
 
     // ── extract legs, preserving row order ──
     let mut legs: Vec<Leg> = Vec::with_capacity(trades.len());
@@ -268,6 +281,14 @@ pub fn compute_summary_metrics(
         };
         let pct = if spot != 0.0 { raw_net / spot * 100.0 } else { 0.0 };
         let mae_res = calc_trade_mae(&leg_refs, pct);
+        // Σ over ALL directional legs (feeds _calc_combined_final_mae); None if there
+        // are no dir legs OR any dir leg is missing MAE/MFE (mirrors the Python).
+        let dir_count = leg_refs.iter().filter(|l| l.is_dir).count();
+        let (mut nmae, mut nmfe) = if dir_count > 0 { (Some(0.0f64), Some(0.0f64)) } else { (None, None) };
+        for l in leg_refs.iter().filter(|l| l.is_dir) {
+            nmae = match (nmae, l.mae) { (Some(a), Some(v)) => Some(a + v), _ => None };
+            nmfe = match (nmfe, l.mfe) { (Some(a), Some(v)) => Some(a + v), _ => None };
+        }
         tm.insert(k.clone(), TradeAgg {
             net: raw_net, pct,
             final_mae: mae_res.map(|m| m.2),
@@ -275,6 +296,9 @@ pub fn compute_summary_metrics(
             cumulative: 0.0, peak: 0.0, pct_dd: 0.0, actual_ldd: None,
             main_entry: main.entry_date.clone(), main_exit: main.exit_date.clone(),
             main_entry_spot: main.entry_spot, main_exit_spot: main.exit_spot, main_spot_pnl: main.spot_pnl,
+            nifty_mae: nmae, nifty_mfe: nmfe,
+            combined_pct: None, combined_net: None, combined_cum: None, combined_peak: None,
+            combined_pct_dd: None, combined_final_mae: None, combined_actual_ldd: None,
         });
     }
 
@@ -344,6 +368,60 @@ pub fn compute_summary_metrics(
         prev_peak = tpeak;
     }
 
+    // ── Combined (midcap) chain — NAV / Peak / DD / FinalMAE / Live-DD (4dp) ──
+    if has_midcap {
+        let mbt = midcap_by_trade.unwrap();
+        let (mut nav, mut peak_c, mut prev_nav, mut prev_peak_c) = (100.0f64, 100.0f64, 100.0f64, 100.0f64);
+        let mut prev_ck: Option<String> = None;
+        for k in &sorted_keys {
+            if patchwise {
+                if let Some(pk) = &prev_ck {
+                    let new_patch = if !seg_starts.is_empty() {
+                        seg_idx(&tm[k].main_entry) != seg_idx(&tm[pk].main_entry)
+                    } else {
+                        tm[pk].exit_reason.to_uppercase().split('+').any(|s| s == "FILTER_END")
+                    };
+                    if new_patch { nav = 100.0; peak_c = 100.0; prev_nav = 100.0; prev_peak_c = 100.0; }
+                }
+            }
+            prev_ck = Some(k.clone());
+            let mc = mbt.get_item(k).ok().flatten();
+            let mc = mc.as_ref().and_then(|v| v.downcast::<PyDict>().ok());
+            let cpct = mc.and_then(|m| cell_f64(m, "Combined Net P&L %"));
+            if let Some(cpct) = cpct {
+                prev_nav = nav; prev_peak_c = peak_c;
+                nav *= 1.0 + cpct / 100.0;
+                if nav > peak_c { peak_c = nav; }
+                let cnet = mc.and_then(|m| cell_f64(m, "Combined Net P&L"));
+                let (nmae, nmfe) = { let t = &tm[k]; (t.nifty_mae, t.nifty_mfe) };
+                let mid_mae = mc.and_then(|m| cell_f64(m, "Midcap MAE")).unwrap_or(0.0);
+                let mid_mfe = mc.and_then(|m| cell_f64(m, "Midcap MFE")).unwrap_or(0.0);
+                // _calc_combined_final_mae: nm1 = mid_mfe + Σnifty_mae, nm2 = mid_mae + Σnifty_mfe
+                let cfmae = match (nmae, nmfe) {
+                    (Some(nm), Some(nf)) => {
+                        let nm1 = py_round(mid_mfe + nm, 4);
+                        let nm2 = py_round(mid_mae + nf, 4);
+                        Some(py_round(nm1.min(nm2).min(cpct), 4))
+                    }
+                    _ => None,
+                };
+                let t = tm.get_mut(k).unwrap();
+                t.combined_pct = Some(cpct);
+                t.combined_net = cnet;
+                t.combined_cum = Some(py_round(nav, 4));
+                t.combined_peak = Some(py_round(peak_c, 4));
+                t.combined_pct_dd = Some(if peak_c != 0.0 { py_round((nav / peak_c - 1.0) * 100.0, 4) } else { 0.0 });
+                if let Some(fmae) = cfmae {
+                    t.combined_final_mae = Some(fmae);
+                    let lowest_nav = prev_nav * (1.0 + fmae / 100.0);
+                    t.combined_actual_ldd = if prev_peak_c != 0.0 {
+                        Some(py_round((lowest_nav / prev_peak_c - 1.0) * 100.0, 4))
+                    } else { None };
+                }
+            }
+        }
+    }
+
     // ── summary assembly ──
     let s_f64 = |k: &str| -> Option<f64> {
         summary.get_item(k).ok().flatten().and_then(|v| if v.is_none() { None } else { v.extract::<f64>().ok() })
@@ -370,7 +448,37 @@ pub fn compute_summary_metrics(
 
     let init_spot = sorted_keys.first().and_then(|k| tm[k].main_entry_spot);
     let final_spot = sorted_keys.last().and_then(|k| tm[k].main_exit_spot);
-    let final_cum = sorted_keys.last().map(|k| tm[k].cumulative).unwrap_or(100.0);
+    let mut final_cum = sorted_keys.last().map(|k| tm[k].cumulative).unwrap_or(100.0);
+
+    // Midcap: recompute the headline aggregates on the COMBINED per-trade P&L
+    // (chronological), overriding the NIFTY sums. CAGR(Spot) stays NIFTY.
+    let (mut win_net_sum, mut loss_net_sum, mut max_net_c, mut min_net_c) =
+        (0.0f64, 0.0f64, f64::NEG_INFINITY, f64::INFINITY);
+    let mut combined_max_dd = 0.0f64;
+    if has_midcap {
+        sum_pct = 0.0; sum_pos = 0.0; sum_neg = 0.0;
+        win_cnt = 0; loss_cnt = 0; total_cnt = 0;
+        sum_net = 0.0;
+        let mut fc = 100.0f64;
+        for k in &sorted_keys {
+            let t = &tm[k];
+            if let Some(cp) = t.combined_pct {
+                sum_pct += cp; total_cnt += 1;
+                if cp > 0.0 { sum_pos += cp; win_cnt += 1; } else if cp < 0.0 { sum_neg += cp; loss_cnt += 1; }
+            }
+            if let Some(cnet) = t.combined_net {
+                sum_net += cnet;
+                if cnet > max_net_c { max_net_c = cnet; }
+                if cnet < min_net_c { min_net_c = cnet; }
+                if cnet > 0.0 { win_net_sum += cnet; } else if cnet < 0.0 { loss_net_sum += cnet; }
+            }
+            if let Some(cc) = t.combined_cum { fc = cc; }
+            if let Some(cdd) = t.combined_pct_dd { if cdd < combined_max_dd { combined_max_dd = cdd; } }
+        }
+        final_cum = fc;
+        if !max_net_c.is_finite() { max_net_c = 0.0; }
+        if !min_net_c.is_finite() { min_net_c = 0.0; }
+    }
 
     let avg_win_pct = if win_cnt > 0 { sum_pos / win_cnt as f64 } else { 0.0 };
     let avg_loss_pct = if loss_cnt > 0 { sum_neg / loss_cnt as f64 } else { 0.0 };
@@ -389,8 +497,18 @@ pub fn compute_summary_metrics(
         _ => 0.0,
     };
 
-    // max_dd: overall non-midcap → min(source %DD); patchwise → min over tm (cum/peak-1)*100
-    let max_dd_pct = if !patchwise {
+    // max_dd: overall non-midcap → min(source %DD); midcap → min over Combined
+    // Cumulative/Peak; patchwise non-midcap → min over tm (cum/peak-1)*100.
+    let max_dd_pct = if has_midcap {
+        let mut m = 0.0f64;
+        for k in &sorted_keys {
+            let t = &tm[k];
+            if let (Some(cc), Some(pk)) = (t.combined_cum, t.combined_peak) {
+                if pk != 0.0 { let ddp = (cc / pk - 1.0) * 100.0; if ddp < m { m = ddp; } }
+            }
+        }
+        m
+    } else if !patchwise {
         src_dd.iter().cloned().filter(|v| v.is_finite()).fold(0.0f64, f64::min)
     } else {
         let mut m = 0.0f64;
@@ -400,6 +518,7 @@ pub fn compute_summary_metrics(
         }
         m
     };
+    if has_midcap { combined_max_dd = max_dd_pct; }
     let car_mdd = if max_dd_pct != 0.0 { (opt_cagr / 100.0) / max_dd_pct.abs() } else { 0.0 };
 
     let opt_sum = if ce_sum != 0.0 || pe_sum != 0.0 { ce_sum + pe_sum } else if fut_sum != 0.0 { fut_sum } else { sum_net };
@@ -412,10 +531,16 @@ pub fn compute_summary_metrics(
     let mut pairs: Vec<Pair> = Vec::new();
     for k in &sorted_keys {
         let t = &tm[k];
-        if t.pct.is_finite() {
+        // midcap → combinedPct/combinedActualLDD/combinedFinalMae; else the NIFTY trio.
+        let (pv, lv, mv) = if has_midcap {
+            (t.combined_pct, t.combined_actual_ldd, t.combined_final_mae)
+        } else {
+            (if t.pct.is_finite() { Some(t.pct) } else { None }, t.actual_ldd, t.final_mae)
+        };
+        if let Some(pct) = pv {
             pairs.push(Pair {
-                pct: t.pct, ldd: t.actual_ldd, mae: t.final_mae, idx: pairs.len(),
-                exit_reason: tm[k].exit_reason.to_uppercase(),
+                pct, ldd: lv, mae: mv, idx: pairs.len(),
+                exit_reason: t.exit_reason.to_uppercase(),
                 seg_idx: seg_idx(&t.main_entry),
             });
         }
@@ -518,11 +643,37 @@ pub fn compute_summary_metrics(
     out.set_item("ce_pe_pnl_pct_without_top_1_outliers", py_round(total_pct_s - p1 - n1, 4))?;
     out.set_item("ce_pe_pnl_pct_without_top_2_outliers", py_round(total_pct_s - p2 - n2, 4))?;
     out.set_item("ce_pe_pnl_pct_without_top_3_outliers", py_round(total_pct_s - p3 - n3, 4))?;
-    out.set_item("has_midcap", false)?;
-    out.set_item("midcap_leg_pnl_sum", py.None())?;
-    out.set_item("midcap_leg_pnl_pct_sum", py.None())?;
-    out.set_item("combined_pnl_sum", py.None())?;
-    out.set_item("combined_pnl_pct_sum", py.None())?;
-    out.set_item("max_dd_pct_combined", py.None())?;
+    out.set_item("has_midcap", has_midcap)?;
+    if has_midcap {
+        let ms_f64 = |k: &str| -> f64 { midcap_summary.and_then(|m| cell_f64(m, k)).unwrap_or(0.0) };
+        out.set_item("midcap_leg_pnl_sum", py_round(ms_f64("midcap_leg_pnl_sum"), 2))?;
+        out.set_item("midcap_leg_pnl_pct_sum", py_round(ms_f64("midcap_leg_pnl_pct_sum"), 4))?;
+        out.set_item("combined_pnl_sum", py_round(ms_f64("combined_pnl_sum"), 2))?;
+        out.set_item("combined_pnl_pct_sum", py_round(ms_f64("combined_pnl_pct_sum"), 4))?;
+        out.set_item("max_dd_pct_combined", py_round(combined_max_dd, 4))?;
+        // Headline P&L overwrite with the COMBINED values (matches the combo Summary).
+        let win_rate = if total_cnt > 0 { win_cnt as f64 / total_cnt as f64 * 100.0 } else { 0.0 };
+        let loss_rate = if total_cnt > 0 { loss_cnt as f64 / total_cnt as f64 * 100.0 } else { 0.0 };
+        let expectancy = if avg_loss_pct != 0.0 {
+            ((win_rate / 100.0) * avg_win_pct - (loss_rate / 100.0) * avg_loss_pct.abs()) / avg_loss_pct.abs()
+        } else { 0.0 };
+        out.set_item("total_pnl", py_round(sum_net, 2))?;
+        out.set_item("total_pnl_pct", py_round(sum_pct, 4))?;
+        out.set_item("count", total_cnt)?;
+        out.set_item("win_pct", py_round(win_rate, 2))?;
+        out.set_item("loss_pct", py_round(loss_rate, 2))?;
+        out.set_item("avg_profit_per_trade", if total_cnt > 0 { py_round(sum_net / total_cnt as f64, 2) } else { 0.0 })?;
+        out.set_item("avg_win", if win_cnt > 0 { py_round(win_net_sum / win_cnt as f64, 2) } else { 0.0 })?;
+        out.set_item("avg_loss", if loss_cnt > 0 { py_round(loss_net_sum / loss_cnt as f64, 2) } else { 0.0 })?;
+        out.set_item("max_win", py_round(max_net_c, 2))?;
+        out.set_item("max_loss", py_round(min_net_c, 2))?;
+        out.set_item("expectancy", py_round(expectancy, 6))?;
+    } else {
+        out.set_item("midcap_leg_pnl_sum", py.None())?;
+        out.set_item("midcap_leg_pnl_pct_sum", py.None())?;
+        out.set_item("combined_pnl_sum", py.None())?;
+        out.set_item("combined_pnl_pct_sum", py.None())?;
+        out.set_item("max_dd_pct_combined", py.None())?;
+    }
     Ok(out.into())
 }

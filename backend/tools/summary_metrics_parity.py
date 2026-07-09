@@ -14,6 +14,9 @@ import pandas as pd
 from tools.parity_harness import PAYLOADS
 from services.algotest_job import execute_algotest_job
 from services.optimizer.excel_builder import compute_xlsx_summary_metrics as cxsm
+from services.optimizer.excel_builder import compute_midcap_for_rows
+
+_MIDCAP_LEGS = [{"midcap_mode": "hypothetical", "position": "buy", "lots": 1, "symbol": "NIFTYMIDCAP100"}]
 
 try:
     import algotest_native
@@ -47,18 +50,27 @@ for name, payload in PAYLOADS:
     S = res.get("summary") or {}
     if not trades:
         print(f"\n=== {name}: no trades ==="); continue
+    rows = pd.DataFrame(trades).where(pd.DataFrame(trades).notna(), None).to_dict("records")
+    by_trade, mc_summ, _has = compute_midcap_for_rows(rows, _MIDCAP_LEGS, None, "NIFTYMIDCAP100")
     for pw in (False, True):
-        ref = cxsm(pd.DataFrame(trades), S, patchwise=pw, filter_segments=None)
-        rust = algotest_native.compute_summary_metrics(trades, S, pw, None)
-        keys = sorted(set(ref) | set(rust))
-        diffs = [(k, ref.get(k, "<MISS>"), rust.get(k, "<MISS>"))
-                 for k in keys if not _match(ref.get(k, "<MISS>"), rust.get(k, "<MISS>"))]
-        tag = "patchwise" if pw else "overall  "
-        status = "PASS" if not diffs else "FAIL"
-        if diffs:
-            overall_fail += 1
-        print(f"{name[:34]:34s} {tag}: {status}  ({len(keys)} keys, {len(diffs)} diverging)")
-        for k, rv, ru in diffs:
-            print(f"      {k:38s} cxsm={rv!r}  rust={ru!r}")
+        for mode in ("nomidcap", "midcap"):
+            if mode == "nomidcap":
+                ref = cxsm(pd.DataFrame(trades), S, patchwise=pw, filter_segments=None)
+                rust = algotest_native.compute_summary_metrics(trades, S, pw, None, None, None)
+            else:
+                ref = cxsm(pd.DataFrame(trades), S, midcap_legs=_MIDCAP_LEGS,
+                           midcap_spot_adjustment=None, midcap_symbol="NIFTYMIDCAP100",
+                           patchwise=pw, filter_segments=None)
+                rust = algotest_native.compute_summary_metrics(trades, S, pw, None, by_trade, mc_summ)
+            keys = sorted(set(ref) | set(rust))
+            diffs = [(k, ref.get(k, "<MISS>"), rust.get(k, "<MISS>"))
+                     for k in keys if not _match(ref.get(k, "<MISS>"), rust.get(k, "<MISS>"))]
+            tag = f"{'patchwise' if pw else 'overall  '}/{mode:9s}"
+            status = "PASS" if not diffs else "FAIL"
+            if diffs:
+                overall_fail += 1
+            print(f"{name[:30]:30s} {tag}: {status}  ({len(keys)} keys, {len(diffs)} diverging)")
+            for k, rv, ru in diffs:
+                print(f"      {k:38s} cxsm={rv!r}  rust={ru!r}")
 
 print(f"\n{'ALL PASS' if overall_fail == 0 else str(overall_fail) + ' case(s) FAILED'}")
