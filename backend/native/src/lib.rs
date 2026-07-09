@@ -1,5 +1,6 @@
 mod analytics;
 mod intraday;
+mod mae;
 mod optimizer;
 mod simulate;
 
@@ -467,6 +468,26 @@ pub(crate) fn lookup_option_open(
     let type_id = opt_type_to_id(opt_type);
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
     cache.options_open.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied().map(|v| v as f64)
+}
+
+/// Day SETTLED price for one option contract on one date. None if absent. Used by
+/// MAE/MFE to substitute for a zero High/Low (illiquid / expiry day with no intraday
+/// trades) — mirrors the substitution baked into get_ohlc_range.
+pub(crate) fn lookup_option_settled(
+    date: &str,
+    index: &str,
+    strike: f64,
+    opt_type: &str,
+    expiry: &str,
+) -> Option<f64> {
+    let cache = CACHE.read().ok()?;
+    let cache = cache.as_ref()?;
+    let date_days = date_str_to_days(&normalize_date_str(date))?;
+    let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
+    let strike_key = to_i64_strike(strike);
+    let type_id = opt_type_to_id(opt_type);
+    let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
+    cache.options_settled.get(&(date_days, sym_id, strike_key, type_id, expiry_days)).copied().map(|v| v as f64)
 }
 
 /// Return the full strike chain for one (date, index, expiry, opt_type) as
@@ -1895,6 +1916,7 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simulate::resolve_trade_specs, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
     m.add_function(wrap_pyfunction!(analytics::compute_analytics_summary, m)?)?;
+    m.add_function(wrap_pyfunction!(mae::compute_mae_mfe_batch, m)?)?;
     m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
     // Index OHLC (additive — Midcap overlay)
     m.add_function(wrap_pyfunction!(load_index_ohlc, m)?)?;

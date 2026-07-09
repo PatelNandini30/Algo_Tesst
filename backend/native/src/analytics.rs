@@ -31,7 +31,7 @@ use pyo3::types::{PyDict, PyList};
 
 /// Python-compatible round(x, ndigits): round-half-to-EVEN (banker's). Matches
 /// CPython for the values that occur here; exact-halfway ties go to even.
-fn py_round(x: f64, ndigits: i32) -> f64 {
+pub(crate) fn py_round(x: f64, ndigits: i32) -> f64 {
     if !x.is_finite() {
         return x;
     }
