@@ -682,6 +682,9 @@ async def run_algotest_backtest_endpoint(request: Request):
     """
     Legacy synchronous endpoint kept for backwards compatibility.
     """
+    from services.maintenance import is_maintenance
+    if is_maintenance():
+        raise HTTPException(status_code=503, detail="System is under maintenance — backtests are temporarily disabled. Please try again shortly.")
     body = await request.json()
     try:
         _validate_lazy_legs_payload(body or {})
@@ -702,6 +705,9 @@ async def queue_algotest_job(request: Request):
     """
     Enqueue an AlgoTest backtest to run asynchronously via Celery.
     """
+    from services.maintenance import is_maintenance
+    if is_maintenance():
+        raise HTTPException(status_code=503, detail="System is under maintenance — backtests are temporarily disabled. Please try again shortly.")
     body = await request.json()
     origin_ip = _client_ip(request)
     payload = _resolve_effective_request(_normalize_request(_normalize_payload_dates(body)))

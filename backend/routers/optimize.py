@@ -142,6 +142,9 @@ async def preview_optimization(request: Dict[str, Any]):
 @router.post("/optimize/jobs")
 async def enqueue_optimization(request: Request):
     """Validate and enqueue the run. Returns a Celery job_id."""
+    from services.maintenance import is_maintenance
+    if is_maintenance():
+        raise HTTPException(status_code=503, detail="System is under maintenance — optimizations are temporarily disabled. Please try again shortly.")
     body = await request.json()
     origin_ip = _client_ip(request)
     base_payload = _prepared_payload(body.get("base_payload") or {})

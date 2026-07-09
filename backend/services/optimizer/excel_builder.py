@@ -1127,6 +1127,7 @@ def _write_summary_sheet(
     def _gc(t):
         return _to_num(t.get("Combined Cumulative")) if has_midcap else _to_num(t.get("Cumulative"))
 
+    _init_spot = None; _final_spot = None   # cagr_spot from spot LEVELS (see below)
     for t in cleaned:
         p = _gp(t); n = _gn(t)
         if p is not None and math.isfinite(p):
@@ -1142,8 +1143,11 @@ def _write_summary_sheet(
         cum = _gc(t)
         if cum is not None and math.isfinite(cum): final_cum = cum
         es = _to_num(t.get("Entry Spot")); xs = _to_num(t.get("Exit Spot"))
-        if n is not None and math.isfinite(n) and es and xs and es > 0:
-            spot_cum *= (xs / es)
+        # cagr_spot uses spot LEVELS (leg-independent, base.py:1075): first trade's
+        # Entry Spot and last trade's Exit Spot in canonical order, NOT compounded
+        # per-trade ratios. `cleaned` is already in canonical order.
+        if es and es > 0 and _init_spot is None: _init_spot = es
+        if xs and xs > 0: _final_spot = xs
         ed = _parse_date_ms(t.get("Entry Date")); xd = _parse_date_ms(t.get("Exit Date"))
         if ed and (min_entry_ms is None or ed < min_entry_ms): min_entry_ms = ed
         if xd and (max_exit_ms  is None or xd > max_exit_ms):  max_exit_ms  = xd
@@ -1164,12 +1168,22 @@ def _write_summary_sheet(
         )
     else:
         expectancy = 0.0
-    years = (
-        (max_exit_ms - min_entry_ms) / (365.25 * 86400 * 1000)
-        if (min_entry_ms is not None and max_exit_ms is not None) else 0.0
+    # Year span + CAGRs use the backtest convention (base.py:999,1075), identical to
+    # compute_xlsx_summary_metrics so master == this per-combo sheet == backtest:
+    # integer days between first entry and last exit / 365.0, floored 0.01; cagr_spot
+    # from spot LEVELS; CAGR(options) clamped +/-99999, -100 on a wiped-out equity.
+    _span_days = (round((max_exit_ms - min_entry_ms) / (86400 * 1000))
+                  if (min_entry_ms is not None and max_exit_ms is not None) else 0)
+    years = max(_span_days / 365.0, 0.01)
+    opt_cagr = (
+        max(-99999.0, min(99999.0, (math.pow(final_cum / 100, 1 / years) - 1) * 100))
+        if (years > 0 and final_cum > 0) else -100.0
     )
-    opt_cagr  = (math.pow(final_cum / 100, 1 / years) - 1) * 100 if years > 0 and final_cum > 0 else 0.0
-    spot_cagr = (math.pow(spot_cum / 100,  1 / years) - 1) * 100 if years > 0 and spot_cum  > 0 else 0.0
+    spot_cagr = (
+        100 * ((_final_spot / _init_spot) ** (1.0 / years) - 1)
+        if (years > 0 and _init_spot and _final_spot and _init_spot > 0 and _final_spot > 0)
+        else 0.0
+    )
     max_dd_pct   = _to_num(S.get("max_dd_pct")) or 0.0
     max_dd_pts   = _to_num(S.get("max_dd_pts")) or 0.0
     max_win_str  = _to_num(S.get("max_win_streak"))  or 0
@@ -1763,23 +1777,38 @@ def compute_xlsx_summary_metrics(
             spp = sp / es
         spot_pct_sum += spp if spp is not None else 0
 
-    for t in rows:
-        p = _to_num(t.get("% P&L")); n = _to_num(t.get("Net P&L"))
-        if p is not None and math.isfinite(p):
+    def _main_of(_legs):
+        return next((l for l in _legs
+                     if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
+                     and not l.get("ReEntryMode") and not _is_lazy(l)),
+                    _legs[0] if _legs else {})
+
+    # PER-TRADE accumulation. This previously iterated the raw per-LEG `rows`, which
+    # double-counted multi-leg trades and produced the cagr_spot (e.g. straddle
+    # 57.22 vs 25.37), avg_win/avg_loss/avg_profit_pct and roi_vs_spot divergence
+    # from the backtest + the per-combo tradesheet. `tm` holds the per-TRADE pct/net
+    # (identical to base.py's net_pnl_pct), so the master now matches them exactly.
+    for _k in _sorted_keys:
+        _tmr = tm.get(_k) or {}
+        p = _tmr.get("pct"); n = _tmr.get("net")
+        if isinstance(p, (int, float)) and math.isfinite(p):
             sum_pct += p; total_cnt += 1
             if p > 0:   sum_pos_pct += p; win_cnt  += 1
             elif p < 0: sum_neg_pct += p; loss_cnt += 1
-        if n is not None and math.isfinite(n):
+        if isinstance(n, (int, float)) and math.isfinite(n):
             sum_net += n
-            sp = _to_num(t.get("Spot P&L"))
-            if sp is not None: spot_sum_gated += sp
-        es = _to_num(t.get("Entry Spot")); xs = _to_num(t.get("Exit Spot"))
-        if n is not None and math.isfinite(n) and es and xs and es > 0:
-            spot_cum *= (xs / es)
-        ed = _parse_date_ms(t.get("Entry Date"))
-        xd = _parse_date_ms(t.get("Exit Date"))
+        _mn = _main_of(_grouped.get(_k) or [])
+        _sp = _to_num(_mn.get("Spot P&L"))
+        if _sp is not None: spot_sum_gated += _sp
+        ed = _parse_date_ms(_mn.get("Entry Date"))
+        xd = _parse_date_ms(_mn.get("Exit Date"))
         if ed and (min_entry_ms is None or ed < min_entry_ms): min_entry_ms = ed
         if xd and (max_exit_ms  is None or xd > max_exit_ms):  max_exit_ms  = xd
+    # cagr_spot inputs: spot LEVELS of the first/last trade by canonical entry-date
+    # order (leg-independent), matching base.py:1069-1075. The old per-leg spot_cum
+    # compounding is dropped.
+    _init_spot  = _to_num(_main_of(_grouped.get(_sorted_keys[0])  or []).get("Entry Spot")) if _sorted_keys else None
+    _final_spot = _to_num(_main_of(_grouped.get(_sorted_keys[-1]) or []).get("Exit Spot"))  if _sorted_keys else None
 
     # Final booked equity from the CANONICAL patch-aware chain (tm/_sorted_keys),
     # NOT the raw overall "Cumulative" column of rows — so CAGR(Options) and
@@ -1841,12 +1870,22 @@ def compute_xlsx_summary_metrics(
     avg_loss_pct = (sum_neg_pct / loss_cnt) if loss_cnt > 0 else 0.0
     avg_pct      = (sum_pct / total_cnt)    if total_cnt > 0 else 0.0
 
-    years = (
-        (max_exit_ms - min_entry_ms) / (365.25 * 86400 * 1000)
-        if (min_entry_ms is not None and max_exit_ms is not None) else 0.0
+    # Year span + CAGRs use the backtest's exact convention (base.py:999,1075):
+    # integer calendar days between first entry and last exit, / 365.0, floored at
+    # 0.01; CAGR(options) clamped to +/-99999, and -100 on a wiped-out equity.
+    _span_days = (round((max_exit_ms - min_entry_ms) / (86400 * 1000))
+                  if (min_entry_ms is not None and max_exit_ms is not None) else 0)
+    years = max(_span_days / 365.0, 0.01)
+    opt_cagr = (
+        max(-99999.0, min(99999.0, (math.pow(final_cum / 100, 1 / years) - 1) * 100))
+        if (years > 0 and final_cum > 0) else -100.0
     )
-    opt_cagr  = (math.pow(final_cum / 100, 1 / years) - 1) * 100 if years > 0 and final_cum > 0 else 0.0
-    spot_cagr = (math.pow(spot_cum  / 100, 1 / years) - 1) * 100 if years > 0 and spot_cum  > 0 else 0.0
+    # cagr_spot from spot LEVELS (leg-independent) — base.py:1075.
+    spot_cagr = (
+        100 * ((_final_spot / _init_spot) ** (1.0 / years) - 1)
+        if (years > 0 and _init_spot and _final_spot and _init_spot > 0 and _final_spot > 0)
+        else 0.0
+    )
 
     # Max Drawdown = min %DD on the equity curve (Combined for midcap, NIFTY otherwise),
     # read straight from Cumulative/Peak so the master == the per-combo tradesheet's %DD,
