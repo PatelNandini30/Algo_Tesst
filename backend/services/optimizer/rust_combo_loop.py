@@ -367,3 +367,55 @@ def log_shadow_diffs(job_id: str, combo_label: str, kind: str, diffs: List[str])
     for d in diffs[:50]:
         logger.warning("%s   %s", tag, d)
     return False
+
+
+# ── Shadow wiring — prove the ported Rust summary on real combos ─────────────
+
+def run_shadow_summary_check(
+    combo_id, combo_label, merged_payload, trades_df,
+    base_summary, python_flat_summary, python_summary_pw,
+    midcap_legs=None, midcap_spot_adjustment=None, midcap_symbol="NIFTYMIDCAP100",
+    filter_segments=None,
+) -> None:
+    """Shadow mode: recompute the per-combo summary with the RUST engine
+    (compute_optim_metrics + compute_summary_metrics, overall + patchwise) and diff it,
+    key-by-key, against the authoritative Python summary. Read-only — logs diffs, never
+    raises, never changes output. Only runs when OPTIMIZE_RUST_LOOP=shadow.
+
+    This is the design's §5 shadow gate: run it across a real sweep and it exercises the
+    ported summary on every strategy the corpus can't cover; a family graduates to
+    Rust-authoritative only when this is clean.
+    """
+    if rust_loop_mode() != "shadow":
+        return
+    reason = rust_batch_unsupported(merged_payload)
+    if reason is not None:
+        logger.info("[RUST_SHADOW combo=%s] not owned by Rust yet (%s) — skipped", combo_id, reason)
+        return
+    try:
+        import algotest_native  # type: ignore
+        if trades_df is None or (hasattr(trades_df, "empty") and trades_df.empty):
+            return
+        records = trades_df.where(trades_df.notna(), None).to_dict("records")
+        mbt, msumm = None, None
+        if midcap_legs:
+            from services.optimizer.excel_builder import compute_midcap_for_rows
+            mbt, msumm, _has = compute_midcap_for_rows(
+                records, midcap_legs, midcap_spot_adjustment, midcap_symbol or "NIFTYMIDCAP100")
+            mbt = mbt or None
+
+        opt_m = algotest_native.compute_optim_metrics(records, base_summary)
+        merged_summary = {**base_summary, **opt_m}
+        sm_over = algotest_native.compute_summary_metrics(records, merged_summary, False, filter_segments, mbt, msumm)
+        rust_flat = {**merged_summary, **sm_over}
+        log_shadow_diffs(combo_id, combo_label, "summary-overall",
+                         diff_summary(python_flat_summary or {}, rust_flat))
+
+        if python_summary_pw is not None:
+            # python_summary_pw is the RAW _cmetrics(patchwise) output (not merged with
+            # the base summary), so diff against the raw Rust _cmetrics output.
+            sm_pw = algotest_native.compute_summary_metrics(records, merged_summary, True, filter_segments, mbt, msumm)
+            log_shadow_diffs(combo_id, combo_label, "summary-patchwise",
+                             diff_summary(python_summary_pw or {}, sm_pw))
+    except Exception as exc:  # shadow is best-effort; never disturb the real run
+        logger.warning("[RUST_SHADOW combo=%s] shadow check errored: %s", combo_id, exc)

@@ -451,6 +451,20 @@ def _worker_entrypoint(
                 labels = label_combo(merged)
                 _combo_id = starting_combo_id + i
                 combo_label_safe = f"{_combo_id}_{safe_filename(labels['combo_label'])}"
+                # RUST SHADOW (OPTIMIZE_RUST_LOOP=shadow): recompute the summary with the
+                # ported Rust engine and diff it vs the Python summary above. Additive,
+                # read-only, default-off — proves the port on every real combo. Never
+                # affects output (Python stays authoritative in shadow mode).
+                try:
+                    from services.optimizer.rust_combo_loop import run_shadow_summary_check
+                    run_shadow_summary_check(
+                        _combo_id, labels.get("combo_label") or combo_label_safe, merged,
+                        trades_df, summary, flat_summary, _summary_pw,
+                        midcap_legs=_mc_legs, midcap_spot_adjustment=_mc_sa,
+                        midcap_symbol=_mc_sym, filter_segments=_filter_segments,
+                    )
+                except Exception:
+                    pass
                 row = {
                     "combo_id": _combo_id,
                     "combo": combo,
