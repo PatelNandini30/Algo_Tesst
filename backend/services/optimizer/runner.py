@@ -393,6 +393,106 @@ def _teardown_market_data() -> None:
         pass
 
 
+def _finalize_worker_count(default: int = 4) -> int:
+    """Dynamic worker count for post-sweep finalization (parallel XLSX / WOW-MOM
+    rebuild). Mirrors the sweep's own dynamic-P approach (see run_optimization):
+    a solo ceiling divided by how many optims are live right now, so a big
+    finalization pass doesn't oversubscribe CPU/RAM while a second optim is
+    concurrently sweeping or finalizing its own job. Pure resource sizing — no
+    calculation logic."""
+    try:
+        from services.optimizer.parallel import get_parallelism
+        env_par = int(os.environ.get("OPTIMIZE_PARALLELISM", "0") or "0")
+        solo = env_par if env_par >= 1 else get_parallelism()
+    except Exception:
+        solo = default
+    try:
+        live = max(1, result_store.active_optim_count())
+    except Exception:
+        live = 1
+    return max(1, solo // live)
+
+
+def _build_combo_xlsx_worker(args: tuple) -> Tuple[str, Optional[bytes], Optional[str]]:
+    """Module-level, picklable worker for parallel per-combo XLSX generation.
+
+    Must be module-level (not a closure) — ProcessPoolExecutor pickles the
+    callable, and local/nested functions can't be pickled. Pure function of its
+    inputs, identical computation to what previously ran inline via
+    ThreadPoolExecutor — openpyxl cell writes are CPU-bound and hold the GIL,
+    so threads gave near-zero real parallelism; separate processes give true
+    parallelism with byte-identical per-combo output.
+    """
+    (csv_path, label_safe, summary, combo_label, from_date, to_date,
+     midcap_legs, midcap_spot_adjustment, midcap_symbol, filter_name,
+     filter_segments, patchwise) = args
+    try:
+        import pandas as _pd_w
+        from services.optimizer.excel_builder import build_combo_xlsx as _build_xlsx_w
+        df = _pd_w.read_csv(csv_path, dtype=str)
+        xlsx_bytes = _build_xlsx_w(
+            df,
+            summary or {},
+            combo_label=combo_label,
+            from_date=from_date,
+            to_date=to_date,
+            midcap_legs=midcap_legs,
+            midcap_spot_adjustment=midcap_spot_adjustment,
+            midcap_symbol=midcap_symbol,
+            filter_name=filter_name,
+            filter_segments=filter_segments,
+            patchwise=patchwise,
+        )
+        return label_safe, xlsx_bytes, None
+    except Exception as exc:
+        return label_safe, None, str(exc)
+
+
+def _build_cleaned_combo_worker(args: tuple):
+    """Module-level, picklable worker for the WOW/MOM legacy-fallback rebuild
+    (CSV -> cleaned rows), used when the inline `wm` wasn't precomputed during
+    the sweep (always the case when OPTIMIZE_INLINE_FINALIZE=0). Pure function
+    of its inputs — identical computation to the previous sequential loop, now
+    parallelized across processes. Returns (cleaned, has_midcap, error)."""
+    (csv_path, midcap_legs, midcap_spot_adjustment, midcap_symbol, patchwise, filter_segments) = args
+    try:
+        import pandas as _pd_w
+        from services.optimizer.excel_builder import build_cleaned_for_combo as _build_cleaned_w
+        tdf = _pd_w.read_csv(csv_path)
+        cleaned, has_midcap = _build_cleaned_w(
+            tdf, midcap_legs, midcap_spot_adjustment, midcap_symbol,
+            patchwise=patchwise, filter_segments=filter_segments,
+        )
+        return cleaned, has_midcap, None
+    except Exception as exc:
+        return None, False, str(exc)
+
+
+def _download_mode_flags(base_payload: dict) -> tuple:
+    """
+    The user's launch-time choice of which download artifact to build
+    (ZIP + WOW/MOM + patchwise summary): "patchwise" (default, if the user
+    forgot to pick) or "overall". Building only the selected one instead of
+    always building both roughly halves finalization time on large sweeps —
+    the skipped variant can still be built on-demand later if ever requested,
+    it's just no longer pre-built automatically for every job.
+    Returns (want_patchwise, want_overall) — exactly one True unless an
+    unrecognized value somehow gets through, in which case both stay True
+    (fail open to the old always-build-both behavior rather than build nothing).
+    """
+    mode = str(base_payload.get("download_mode") or "patchwise").strip().lower()
+    if mode == "overall":
+        return False, True
+    if mode == "patchwise":
+        return True, False
+    return True, True
+
+
+def _resolved_download_mode(base_payload: dict) -> str:
+    mode = str((base_payload or {}).get("download_mode") or "patchwise").strip().lower()
+    return mode if mode in ("patchwise", "overall") else "patchwise"
+
+
 def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) -> None:
     """
     Enrich combo CSVs with MAE/MFE (OHLC already in _RUST_CONTEXT), build full
@@ -402,10 +502,9 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
     Called right before mark_complete while market data is still hot so the
     first download is instant — no lazy build needed.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    from concurrent.futures import as_completed as _as_completed
     import zipfile as _zf
     import pandas as _pd
-    from services.optimizer.excel_builder import build_combo_xlsx as _build_xlsx
 
     zip_path = result_store.zip_cache_path(job_id, patchwise=patchwise)
     if os.path.isfile(zip_path):
@@ -457,6 +556,9 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
 
     _meta_for_naming = result_store.get_meta(job_id) or {}
     _zip_naming = _meta_for_naming.get("zip_naming") or {}
+    # Mirrors routers/optimize.py's _build_zip_blocking — gates the "Patch wise"
+    # sheet in build_combo_xlsx (same as the on-demand download path).
+    _filter_name = (_zip_naming.get("level1") or "") if _zip_naming else ""
     if _zip_naming:
         _l1 = _safe_zip_name(_zip_naming.get("level1", "")) or "tradesheets"
         _l2 = _safe_zip_name(_zip_naming.get("level2", ""))
@@ -487,12 +589,21 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
     # Enrich each CSV with MAE/MFE in-memory, then derive every stat via the same
     # path as excel_builder._write_summary_sheet, and push corrections to Redis +
     # rewrite summary.csv so the master summary matches each combo XLSX exactly.
-    try:
+    # Runs on the OVERALL call only — it computes overall (non-patchwise) metrics
+    # regardless of `patchwise`, so running it again for the patchwise ZIP is pure
+    # redundant work. _prebuild_csv_zip(False) is always called before (True).
+    # Also fully skipped when the workers already computed these metrics inline
+    # during the sweep (row["inline_finalized"]) — the master summary is already
+    # correct, so this per-combo recompute would be pure duplicate work.
+    _step0_results = result_store.get_all_results(job_id) if not patchwise else []
+    _step0_needed = bool(_step0_results) and not all(r.get("inline_finalized") for r in _step0_results)
+    if not patchwise and _step0_needed:
+      try:
         from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _compute_metrics
         # Midcap overlay config (_mc_legs/_mc_sa/_mc_sym) is derived once at
         # function scope above. When present, the master summary metrics are
         # computed on the COMBINED P&L via the same native engine.
-        _all_results = result_store.get_all_results(job_id)
+        _all_results = _step0_results
         _result_by_label = {
             r.get("combo_label_safe", ""): r
             for r in _all_results if r.get("combo_label_safe")
@@ -541,44 +652,47 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
             result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
             logger.info("[OPTIM] Corrected summary metrics for %d combos in job %s",
                         len(_corrected), job_id[:8])
-    except Exception as _step0_exc:
+      except Exception as _step0_exc:
         logger.warning("[OPTIM] Step 0 metric correction failed for job %s: %s", job_id[:8], _step0_exc)
 
     # ── Fast path: per-combo XLSX files already written during execution ──────
-    xlsx_files_disk = sorted(f for f in files if f.endswith(".xlsx"))
+    # Both variants are built inline from the in-memory trades_df during the
+    # sweep (across the parallel workers), so the ZIP is just an assembly of
+    # pre-built files — no CSV re-read, no rebuild:
+    #   • overall   → trades_dir/{label}.xlsx
+    #   • patchwise → trades_dir/patchwise/{label}.xlsx (patch-reset equity)
+    # The ZIP is Excel-only (summary.csv / run_config.csv are intentionally NOT
+    # included — the master summary is a separate Export-XLSX download).
+    if patchwise:
+        _xlsx_src_dir = os.path.join(trades_dir, "patchwise")
+        _xlsx_files_disk = sorted(
+            f for f in (os.listdir(_xlsx_src_dir) if os.path.isdir(_xlsx_src_dir) else [])
+            if f.endswith(".xlsx")
+        )
+    else:
+        _xlsx_src_dir = trades_dir
+        _xlsx_files_disk = sorted(f for f in files if f.endswith(".xlsx"))
     combo_labels_set = {f[:-4] for f in combo_files}
-    xlsx_labels_set = {f[:-5] for f in xlsx_files_disk}
+    xlsx_labels_set = {f[:-5] for f in _xlsx_files_disk}
     if combo_labels_set and combo_labels_set.issubset(xlsx_labels_set):
-        # All combos already have an XLSX on disk (built inline with MAE/MFE
-        # from the in-memory trades_df). Skip Steps 1+2 entirely.
+        # Every combo already has its XLSX on disk — assemble the ZIP directly.
         os.makedirs(zip_dir, exist_ok=True)
         tmp_path = zip_path + ".building"
         try:
             with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED, compresslevel=3) as zf:
-                for fname in csv_files:
-                    if fname in root_files:
-                        zf.write(os.path.join(trades_dir, fname), fname)
-                for xlsx_fname in xlsx_files_disk:
+                for xlsx_fname in _xlsx_files_disk:
                     label_safe = xlsx_fname[:-5]
                     if label_safe in combo_labels_set:
                         arc_base = _arc_base(label_safe)
                         if arc_base is not None:
                             zf.write(
-                                os.path.join(trades_dir, xlsx_fname),
+                                os.path.join(_xlsx_src_dir, xlsx_fname),
                                 f"{arc_base}.xlsx",
                             )
-                for fname in combo_files:
-                    label_safe = fname[:-4]
-                    if label_safe not in xlsx_labels_set:
-                        fpath = os.path.join(trades_dir, fname)
-                        if os.path.isfile(fpath):
-                            arc_base = _arc_base(label_safe)
-                            if arc_base is not None:
-                                zf.write(fpath, f"{arc_base}.csv")
             os.replace(tmp_path, zip_path)
             logger.info(
-                "[OPTIM] Pre-built ZIP for job %s (fast-path, per-combo XLSX): %d xlsx",
-                job_id[:8], len(xlsx_files_disk),
+                "[OPTIM] Pre-built ZIP for job %s (fast-path, patchwise=%s): %d xlsx",
+                job_id[:8], patchwise, len(_xlsx_files_disk),
             )
         except Exception as _e:
             logger.warning("[OPTIM] ZIP fast-path failed for job %s: %s", job_id[:8], _e)
@@ -628,32 +742,29 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
         r.get("combo_label_safe", ""): r for r in all_results if r.get("combo_label_safe")
     }
 
-    def _make_xlsx(fname: str):
-        label_safe = fname[:-4]
-        csv_path = os.path.join(trades_dir, fname)
-        row = summary_by_label.get(label_safe, {})
-        try:
-            df = _pd.read_csv(csv_path, dtype=str)
-            xlsx_bytes = _build_xlsx(
-                df,
-                row.get("summary") or {},
-                combo_label=row.get("combo_label") or label_safe,
-                from_date=from_date,
-                to_date=to_date,
-                midcap_legs=_mc_legs,
-                midcap_spot_adjustment=_mc_sa,
-                midcap_symbol=_mc_sym,
-                filter_segments=_filter_segments,
-                patchwise=patchwise,
-            )
-            return label_safe, xlsx_bytes, None
-        except Exception as _e:
-            return label_safe, None, str(_e)
-
-    n_workers = min(4, max(1, (os.cpu_count() or 2) - 1))
+    # ProcessPoolExecutor, not ThreadPoolExecutor: build_combo_xlsx (openpyxl
+    # cell writes) is CPU-bound and holds the GIL, so threads gave near-zero
+    # real parallelism here (measured: 546 combos took 393s single-effective-
+    # threaded despite 4 "worker" threads — 2026-07-06). Separate processes
+    # give true parallelism with byte-identical per-combo output (pure function
+    # of its inputs — see _build_combo_xlsx_worker). Sized dynamically so this
+    # doesn't oversubscribe CPU/RAM alongside a second concurrently-running
+    # optim (mirrors the sweep's own dynamic-P logic).
+    from concurrent.futures import ProcessPoolExecutor
+    n_workers = _finalize_worker_count()
     xlsx_results: dict = {}
-    with ThreadPoolExecutor(max_workers=n_workers) as _ex:
-        futs = {_ex.submit(_make_xlsx, f): f for f in combo_files}
+    with ProcessPoolExecutor(max_workers=n_workers) as _ex:
+        futs = {}
+        for fname in combo_files:
+            label_safe = fname[:-4]
+            row = summary_by_label.get(label_safe, {})
+            args = (
+                os.path.join(trades_dir, fname), label_safe,
+                row.get("summary") or {}, row.get("combo_label") or label_safe,
+                from_date, to_date, _mc_legs, _mc_sa, _mc_sym,
+                _filter_name, _filter_segments, patchwise,
+            )
+            futs[_ex.submit(_build_combo_xlsx_worker, args)] = fname
         for fut in _as_completed(futs):
             ls, xlsx_bytes, err = fut.result()
             if xlsx_bytes is not None:
@@ -662,13 +773,13 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
                 logger.warning("[OPTIM] XLSX build failed for %s: %s", ls, err)
 
     # ── Step 3: Pack into ZIP (XLSX primary, CSV fallback for any that failed).
+    # Excel-only, same as the fast path above — summary.csv/run_config.csv are
+    # intentionally NOT included (the master summary is a separate Export-XLSX
+    # download; run_config.csv was leaking into every ZIP here, unwanted).
     os.makedirs(zip_dir, exist_ok=True)
     tmp_path = zip_path + ".building"
     try:
         with _zf.ZipFile(tmp_path, "w", _zf.ZIP_DEFLATED, compresslevel=3) as zf:
-            for fname in csv_files:
-                if fname in root_files:
-                    zf.write(os.path.join(trades_dir, fname), fname)
             for label_safe, xlsx_bytes in xlsx_results.items():
                 arc_base = _arc_base(label_safe)
                 if arc_base is not None:
@@ -696,14 +807,17 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
                 pass
 
 
-def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
+def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = True, want_overall: bool = True) -> None:
     """
-    Pre-build WOW/MOM XLSX files (overall and patchwise) right after sweep
-    completes so every subsequent download is a fast FileResponse from disk.
+    Pre-build WOW/MOM XLSX files right after sweep completes so every
+    subsequent download is a fast FileResponse from disk.
+
+    want_patchwise / want_overall gate which variant(s) actually get built —
+    the user's download_mode selection at launch time (default: patchwise
+    only) means the OTHER variant is skipped here entirely to cut finalization
+    time. It still builds on-demand later (slower path) if ever requested.
     """
-    import pandas as _pd
     from openpyxl import Workbook
-    from services.optimizer.excel_builder import build_cleaned_for_combo
     from services.optimizer.wow_mom import write_merged_wow_mom
     import re as _re
 
@@ -725,11 +839,13 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
 
     label_by_safe: dict = {}
     cols_by_safe: dict = {}
+    rows_by_safe: dict = {}
     for row in result_store.get_all_results(job_id):
         cls = row.get("combo_label_safe")
         if cls:
             label_by_safe[cls] = row.get("combo_label") or cls
             cols_by_safe[cls] = row.get("combo_columns") or {}
+            rows_by_safe[cls] = row
 
     files = sorted(os.listdir(trades_dir))
     combo_csvs = [f for f in files if f.endswith(".csv") and f not in ("summary.csv", "run_config.csv")]
@@ -756,23 +872,48 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
         return " ".join(parts) if parts else "Strategy"
 
     def _read_combos(pw: bool):
+        # Split fast-path (wm already inline-computed — cheap dict lookups,
+        # stays sequential) from slow-path (needs a CSV rebuild via
+        # build_cleaned_for_combo — CPU-bound, parallelized across processes).
+        # Under OPTIMIZE_INLINE_FINALIZE=0 EVERY combo takes the slow path, so
+        # this loop was a real bottleneck for large jobs when it ran
+        # sequentially (measured: 50-54s for 546 combos — 2026-07-06).
+        results: dict = {}
+        needs_rebuild: list = []
+        for fname in combo_csvs:
+            label_safe = fname[:-4]
+            _stored = rows_by_safe.get(label_safe) or {}
+            _wm = _stored.get("wm_pw" if pw else "wm_overall")
+            if _wm is not None:
+                results[label_safe] = (None, bool(_stored.get("has_midcap")), _wm)
+            else:
+                needs_rebuild.append((label_safe, fname))
+
+        if needs_rebuild:
+            from concurrent.futures import ProcessPoolExecutor, as_completed as _as_completed_wm
+            n_workers = _finalize_worker_count()
+            with ProcessPoolExecutor(max_workers=n_workers) as _ex:
+                futs = {}
+                for label_safe, fname in needs_rebuild:
+                    args = (
+                        os.path.join(trades_dir, fname), midcap_legs, midcap_sa,
+                        midcap_sym, pw, filter_segments,
+                    )
+                    futs[_ex.submit(_build_cleaned_combo_worker, args)] = (label_safe, fname)
+                for fut in _as_completed_wm(futs):
+                    label_safe, fname = futs[fut]
+                    cleaned, has_midcap, err = fut.result()
+                    if err:
+                        logger.warning("[WOW_MOM pre] cleaned build failed %s: %s", fname, err)
+                        continue
+                    results[label_safe] = (cleaned, has_midcap, None)
+
         combos = []
         for fname in combo_csvs:
             label_safe = fname[:-4]
-            try:
-                tdf = _pd.read_csv(os.path.join(trades_dir, fname))
-            except Exception as exc:
-                logger.warning("[WOW_MOM pre] read failed %s: %s", fname, exc)
-                continue
-            try:
-                cleaned, has_midcap = build_cleaned_for_combo(
-                    tdf, midcap_legs, midcap_sa, midcap_sym,
-                    patchwise=pw,
-                    filter_segments=filter_segments,
-                )
-            except Exception as exc:
-                logger.warning("[WOW_MOM pre] cleaned build failed %s: %s", fname, exc)
-                continue
+            if label_safe not in results:
+                continue  # read or cleaned-build failed — same as the previous skip
+            cleaned, has_midcap, _wm = results[label_safe]
             cc = cols_by_safe.get(label_safe) or {}
             strike_disp = _strike_display(cc)
             adj_label   = _adj_display(cc.get("spot_adjustment"))
@@ -780,6 +921,7 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
             combos.append({
                 "title": f"{strike_disp} | {adj_label}" if cc else label_by_safe.get(label_safe, label_safe),
                 "cleaned": cleaned,
+                "wm": _wm,
                 "has_midcap": has_midcap,
                 "adj_key": str(cc.get("spot_adjustment") or adj_label),
                 "adj_label": adj_label,
@@ -787,7 +929,8 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
             })
         return combos
 
-    for pw in (False, True):
+    _pw_variants = [pw for pw in (False, True) if (pw and want_patchwise) or (not pw and want_overall)]
+    for pw in _pw_variants:
         cache_path = result_store.wow_mom_cache_path(job_id, pw)
         if os.path.isfile(cache_path):
             continue
@@ -805,8 +948,10 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
             logger.warning("[OPTIM] WOW/MOM pre-build failed for job %s patchwise=%s: %s", job_id[:8], pw, exc)
 
     # Pre-build patchwise summary JSON so /summary?patchwise=true is instant.
+    # Skipped when the job's download_mode is "overall" — nobody will request
+    # it, and building it is a full per-combo metrics recompute.
     _summary_cache = result_store.patchwise_summary_cache_path(job_id)
-    if not os.path.isfile(_summary_cache):
+    if want_patchwise and not os.path.isfile(_summary_cache):
         try:
             import json as _json
             from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cmetrics
@@ -823,6 +968,11 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict) -> None:
             for _r in _all_results:
                 _ls = _r.get("combo_label_safe") or ""
                 _stored = _r.get("summary") or {}
+                # Fast path: patchwise metrics computed inline in the worker.
+                _inline_pw = _r.get("summary_pw")
+                if _inline_pw is not None:
+                    _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": {**_stored, **_inline_pw}})
+                    continue
                 _csv = os.path.join(_trades_dir, f"{_ls}.csv")
                 if not _ls or not os.path.isfile(_csv):
                     _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": _stored})
@@ -915,7 +1065,8 @@ def _is_bullish_leg(leg_type: str, leg_bs: str) -> bool:
     )
 
 
-def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame") -> Optional[float]:
+def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame",
+                              net_pnl_pct: Optional[float] = None) -> Optional[float]:
     """
     Compute finalMae for a group of trade legs.
     Mirrors buildTradeExcel.js calcTradeMae function exactly.
@@ -927,10 +1078,13 @@ def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame") -> Optional[float]:
     Unified rule (single-leg, multi-leg, options and futures alike):
       Net MAE 1 = sum(bullish MAE) + sum(bearish MFE)
       Net MAE 2 = sum(bullish MFE) + sum(bearish MAE)
-      Final MAE = min(Net MAE 1, Net MAE 2)
+      Final MAE = min(Net MAE 1, Net MAE 2)                  (single directional leg)
+      Final MAE = min(Net MAE 1, Net MAE 2, net_pnl_pct)     (>1 directional leg)
 
     When every leg shares one direction this collapses to "all MAE" vs
-    "all MFE"; mixed directions cross automatically.
+    "all MFE"; mixed directions cross automatically. For MULTI-leg trades the
+    realized Net P&L % floors Final MAE (mirrors excel_builder._calc_trade_mae);
+    single-leg keeps min(nm1, nm2) — its own MAE already bounds the loss.
 
     Returns None when MAE/MFE are all zero (not yet computed).
     """
@@ -967,7 +1121,44 @@ def _calc_final_mae_for_trade(trade_legs: "pd.DataFrame") -> Optional[float]:
 
     net_mae1 = bullish_mae + bearish_mfe  # type: ignore[operator]
     net_mae2 = bullish_mfe + bearish_mae  # type: ignore[operator]
-    return round(min(net_mae1, net_mae2) * 10000) / 10000
+    if len(dir_legs) > 1 and net_pnl_pct is not None:
+        final = min(net_mae1, net_mae2, net_pnl_pct)
+    else:
+        final = min(net_mae1, net_mae2)
+    return round(final * 10000) / 10000
+
+
+def _trade_net_pnl_pct(trade_legs: "pd.DataFrame") -> Optional[float]:
+    """Realized Net P&L % of a trade = main leg's Net P&L / Entry Spot * 100,
+    mirroring excel_builder._aggregate_trades' `pct`. Used to floor multi-leg
+    Final MAE. The main leg is the first non-re-entry, non-lazy row (fallback:
+    first row). Net P&L falls back to summing CE/PE/FUT P&L across legs."""
+    if trade_legs.empty:
+        return None
+
+    def _blank(v) -> bool:
+        return v is None or (isinstance(v, float) and v != v) \
+            or str(v).strip() in ("", "nan", "None")
+
+    main = None
+    for _, row in trade_legs.iterrows():
+        if _blank(row.get("ReEntryIndex")) and _blank(row.get("ReEntryTrigger")) \
+                and _blank(row.get("ReEntryMode")):
+            main = row
+            break
+    if main is None:
+        main = trade_legs.iloc[0]
+
+    spot = pd.to_numeric(pd.Series([main.get("Entry Spot")]), errors="coerce").iloc[0]
+    if pd.isna(spot) or spot == 0:
+        return None
+    net = pd.to_numeric(pd.Series([main.get("Net P&L")]), errors="coerce").iloc[0]
+    if pd.isna(net):
+        net = 0.0
+        for col in ("CE P&L", "PE P&L", "FUT P&L"):
+            if col in trade_legs.columns:
+                net += float(pd.to_numeric(trade_legs[col], errors="coerce").fillna(0).sum())
+    return float(net) / float(spot) * 100.0
 
 
 def _expiry_cands_str(expiry_str: str) -> List[str]:
@@ -1014,6 +1205,21 @@ def _compute_mae_mfe_batch(
     if df.empty or not trading_days:
         return df
     if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return df
+    # Safety valve, NOT a silent skip: OPTIMIZE_SKIP_MAE_MFE is only ever set by
+    # parallel.py after it has already retried the fork-safe pyarrow OHLC preload
+    # several times and logged the failure at ERROR level (see _worker_entrypoint).
+    # In that specific state, _RUST_CONTEXT has no "ohlc_df_pandas", so falling
+    # through to the Polars path below would try to use the parent's Rayon pool
+    # inside a forked child — which deadlocks (dead inherited thread pool), not
+    # just fails. A deadlocked worker is worse than one zeroed combo, so this
+    # narrow case still returns df unenriched. It is loud (ERROR upstream) and
+    # rare (retried first), never silent.
+    if (
+        os.environ.get("OPTIMIZE_SKIP_MAE_MFE", "0").strip().lower() in ("1", "true", "yes")
+        and _RUST_CONTEXT is not None
+        and "ohlc_df_pandas" not in _RUST_CONTEXT
+    ):
         return df
 
     try:
@@ -1157,7 +1363,7 @@ def _compute_mae_mfe_batch(
                 ["expiry_str", "OptionType", "strike_r", "date_str"]
             )[_val_cols]
         except Exception as exc:
-            logger.debug("[OPTIM] MAE/MFE pandas fast-path failed: %s", exc)
+            logger.warning("[OPTIM] MAE/MFE pandas fast-path failed: %s", exc)
             return df
     else:
         try:
@@ -1210,7 +1416,7 @@ def _compute_mae_mfe_batch(
                 .select(_sel)
             )
         except Exception as exc:
-            logger.debug("[OPTIM] MAE/MFE feather join failed: %s", exc)
+            logger.warning("[OPTIM] MAE/MFE feather join failed: %s", exc)
             return df
 
         if ohlc_raw.is_empty():
@@ -1226,7 +1432,7 @@ def _compute_mae_mfe_batch(
             _val_cols = ["High", "Low"] + (["SettledPrice"] if "SettledPrice" in ohlc_pd.columns else [])
             ohlc_idx = ohlc_pd.set_index(["expiry_str", "OptionType", "strike_r", "date_str"])[_val_cols]
         except Exception as exc:
-            logger.debug("[OPTIM] MAE/MFE ohlc index build failed: %s", exc)
+            logger.warning("[OPTIM] MAE/MFE ohlc index build failed: %s", exc)
             return df
 
     df = df.copy()
@@ -1357,7 +1563,10 @@ def _compute_live_dd_from_mae(
         if not tid:
             continue
         trade_legs = df[df["Trade"] == tid]
-        final_mae = _calc_final_mae_for_trade(trade_legs) if not trade_legs.empty else None
+        final_mae = (
+            _calc_final_mae_for_trade(trade_legs, _trade_net_pnl_pct(trade_legs))
+            if not trade_legs.empty else None
+        )
         cum = agg_row.get("Cumulative")
         if final_mae is not None:
             trade_lowest_nav[tid] = round(prev_cum * (1.0 + float(final_mae) / 100.0) * 100) / 100
@@ -1583,15 +1792,16 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         df["% P&L"]      = pct_vals
         df["Spot P&L"]   = spot_vals
 
-        # MAE/MFE and Live DD: skip during batch optimizer runs (OPTIMIZE_SKIP_MAE_MFE=1).
-        # Saves ~1.5s/combo by skipping the per-combo Polars feather scan.
-        # Live DD metrics fall back to booked %DD — accurate enough for ranking.
-        # Full MAE/MFE is only needed for tradesheet downloads.
-        _skip_mae = os.environ.get("OPTIMIZE_SKIP_MAE_MFE", "0").strip().lower() in ("1", "true", "yes")
-        if not _skip_mae:
-            _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
-            df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
-            df = _compute_live_dd_from_mae(df, aggregated)
+        # MAE/MFE and Live DD are always computed — never skipped. (Previously
+        # skipped per-combo when OPTIMIZE_SKIP_MAE_MFE was set, to save ~1.5s/combo,
+        # but that left tradesheets with silently zeroed MAE/MFE whenever the
+        # per-worker OHLC preload had a transient failure. parallel.py now retries
+        # that preload and only sets the flag after retries are exhausted, logging
+        # loudly (ERROR) when it does — so this path is now rare and always visible
+        # rather than silently producing zeros.)
+        _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
+        df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
+        df = _compute_live_dd_from_mae(df, aggregated)
 
         # Sort by Entry Date so cascade mini-trades (which get NEW trade_ids
         # appended at the end by engine_rust._sa_reentry_specs) interleave
@@ -1660,6 +1870,7 @@ def run_optimization(
     progress_every: int = 1,
     parallelism: Optional[int] = None,
     zip_naming: Optional[Dict[str, Any]] = None,
+    auto_download: bool = False,
 ) -> Dict[str, Any]:
     """
     Top-level entry point invoked by the Celery task.
@@ -1673,6 +1884,13 @@ def run_optimization(
     """
     obj = resolve_objective(objective)
     total = validate_request(base_payload, param_specs, method, sample_n)
+    logger.info(
+        "[OPTIM] job=%s launch download_mode=%s objective=%s method=%s",
+        job_id[:8],
+        _resolved_download_mode(base_payload),
+        obj.name,
+        method,
+    )
 
     result_store.init_job(
         job_id,
@@ -1682,8 +1900,21 @@ def run_optimization(
         # Persist base_payload so the on-demand ZIP builder (which reads from the
         # job meta) gets the date range AND the Midcap overlay config. Without
         # this, meta.base_payload was empty → ZIP combos had no Midcap columns.
+        # param_specs is ALSO persisted (additive) so a browser on a DIFFERENT
+        # machine that discovers this job via GET /optimize/jobs (system-wide
+        # list) can rebuild the same "Rules" block / summary filename the
+        # originating browser would have shown — see buildRulesInfo() in
+        # frontend/src/utils/optimRulesInfo.js.
+        # auto_download: user-controlled opt-in (Optimize panel toggle) — ONLY
+        # jobs with this set are adopted by any browser's AutoDownloadQueue
+        # (own tab, sibling tab, or a different PC via GET /optimize/jobs).
+        # Without this, every job — including ad-hoc/test runs — got swept
+        # into the auto-download widget on every open tab, which was pure
+        # clutter/noise for jobs nobody asked to have auto-downloaded.
         extra={"sample_n": sample_n, "algorithm": algorithm, "zip_naming": zip_naming,
                "base_payload": base_payload,
+               "param_specs": list(param_specs),
+               "auto_download": bool(auto_download),
                "client_ip": client_ip},
     )
 
@@ -1708,12 +1939,23 @@ def run_optimization(
     # each parallel worker reloads the full ~500MB options dataset independently,
     # causing OOM. The env var is the safe knob to raise it when hardware allows.
     _env_par = int(os.environ.get("OPTIMIZE_PARALLELISM", "0") or "0")
+    _solo_ceiling = 1
     if method not in ("exhaustive", "random"):
         parallelism = 1
-    elif _env_par >= 1:
-        parallelism = _env_par
-    elif parallelism is None or parallelism < 1:
-        parallelism = get_parallelism()
+    else:
+        # SOLO ceiling = full-box parallelism when this is the ONLY optim
+        # computing. OPTIMIZE_PARALLELISM (if set) is that ceiling; otherwise
+        # get_parallelism() derives it from the cgroup cpu/mem caps.
+        _solo_ceiling = _env_par if _env_par >= 1 else get_parallelism()
+        # Register this job as LIVE now — before the seconds-long market-data
+        # load — so a second optim starting at ~the same instant is already
+        # counted before EITHER job sizes its worker pool. The actual dynamic
+        # split (solo_ceiling // live_optims) is computed further down, right
+        # before the pool is built (after data load), by which time both
+        # simultaneous jobs have registered → they split cleanly (e.g. 3+3)
+        # instead of racing (6+3). Deregistered in the finally blocks below.
+        result_store.register_active_optim(job_id)
+        parallelism = _solo_ceiling  # provisional (full box) to enter the parallel path
 
     if parallelism > 1:
         try:
@@ -1768,6 +2010,20 @@ def run_optimization(
             # inheritance from the set_rust_context call above instead.
             _worker_ctx = {k: v for k, v in (prebuilt_rust_context or {}).items()
                            if k not in ("ohlc_df", "ohlc_df_pandas")}
+            # FINAL dynamic split — computed HERE (after data load) so any optim
+            # that launched alongside this one has already registered as live.
+            # Divide the full-box ceiling by the live optim count: 1 live → full
+            # box (max speed for a lone run), 2 live → half each (both fit CPU +
+            # RAM with no oversubscription / OOM). Two simultaneous jobs both
+            # reach this point only after both registered, so they split evenly
+            # instead of one grabbing the whole box. A job that starts while
+            # another is already mid-run correctly takes the smaller share.
+            _live = result_store.active_optim_count()
+            parallelism = max(1, _solo_ceiling // max(1, _live))
+            logger.info(
+                "[OPTIM] dynamic parallelism: solo_ceiling=%d / live_optims=%d -> P=%d",
+                _solo_ceiling, _live, parallelism,
+            )
             agg = run_parallel(
                 job_id=job_id,
                 base_payload=base_payload,
@@ -1780,11 +2036,31 @@ def run_optimization(
                 prebuilt_feather_root=feather_root,
                 prebuilt_rust_context=_worker_ctx,
             )
+            # Finalization — heartbeat each step so a job still moving through
+            # post-processing is never flagged stuck; only a step that itself
+            # hangs (as the 1183-combo patchwise pre-build once did for 6h)
+            # freezes the heartbeat and gets auto-cancelled by the watchdog.
+            result_store.heartbeat(job_id, phase="finalizing:spill")
             spill_path = result_store.maybe_spill_to_parquet(job_id)
+            result_store.heartbeat(job_id, phase="finalizing:summary_csv")
             result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
-            _prebuild_csv_zip(job_id, base_payload, patchwise=False)
-            _prebuild_csv_zip(job_id, base_payload, patchwise=True)
-            _prebuild_wow_mom(job_id, base_payload)
+            _want_pw, _want_ov = _download_mode_flags(base_payload)
+            logger.info(
+                "[OPTIM] job=%s finalizing downloads download_mode=%s want_patchwise=%s want_overall=%s",
+                job_id[:8],
+                _resolved_download_mode(base_payload),
+                _want_pw,
+                _want_ov,
+            )
+            if _want_ov:
+                result_store.heartbeat(job_id, phase="finalizing:zip_overall")
+                _prebuild_csv_zip(job_id, base_payload, patchwise=False)
+            if _want_pw:
+                result_store.heartbeat(job_id, phase="finalizing:zip_patchwise")
+                _prebuild_csv_zip(job_id, base_payload, patchwise=True)
+            result_store.heartbeat(job_id, phase="finalizing:wow_mom")
+            _prebuild_wow_mom(job_id, base_payload, want_patchwise=_want_pw, want_overall=_want_ov)
+            result_store.heartbeat(job_id, phase="finalizing:done")
             result_store.update_progress(job_id, done=agg["done"], total=total)
             result_store.mark_complete(job_id)
             logger.info(
@@ -1807,6 +2083,10 @@ def run_optimization(
             logger.error("[OPTIM] %s\n%s", msg, traceback.format_exc())
             result_store.mark_complete(job_id, error=msg)
             return {"status": "failed", "error": msg, "total": 0}
+        finally:
+            # Free this job's slot in the live-optim registry so the dynamic
+            # divisor lets a waiting/other optim reclaim the box immediately.
+            result_store.unregister_active_optim(job_id)
 
     # ── Sequential path (smart sampling, or single-CPU fallback) ────────────
     market_meta: Dict[str, Any] = {}
@@ -1877,6 +2157,33 @@ def run_optimization(
             optim_extra = compute_optim_metrics(trades_df, summary)
             flat_summary = {**summary, **optim_extra}
 
+            # Inline finalize (mirrors the parallel path): merge overall metrics
+            # (incl. avg_final_mae) into the stored summary and pre-compute the
+            # patchwise metrics so the master summary is correct for BOTH download
+            # modes without depending on an on-disk CSV recompute. Each in its own
+            # try so a patchwise failure never strips avg_final_mae from overall.
+            _seq_summary_pw = None
+            if not (hasattr(trades_df, "empty") and trades_df.empty):
+                from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _seq_cmetrics
+                try:
+                    _seq_over = _seq_cmetrics(
+                        trades_df, flat_summary, midcap_legs=_seq_mc_legs,
+                        midcap_spot_adjustment=_seq_mc_sa, midcap_symbol=_seq_mc_sym,
+                        patchwise=False, filter_segments=_seq_filter_segments,
+                    )
+                    flat_summary = {**flat_summary, **_seq_over}
+                except Exception as _seq_inl_exc:
+                    logger.warning("[OPTIM] inline overall finalize failed for combo %d: %s", done + 1, _seq_inl_exc)
+                try:
+                    _seq_summary_pw = _seq_cmetrics(
+                        trades_df, flat_summary, midcap_legs=_seq_mc_legs,
+                        midcap_spot_adjustment=_seq_mc_sa, midcap_symbol=_seq_mc_sym,
+                        patchwise=True, filter_segments=_seq_filter_segments,
+                    )
+                except Exception as _seq_inl_exc:
+                    logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", done + 1, _seq_inl_exc)
+                    _seq_summary_pw = None
+
             labels = label_combo(merged)
 
             row = {
@@ -1892,6 +2199,8 @@ def run_optimization(
                     "spot_adjustment": labels["spot_adjustment"],
                 },
                 "summary": flat_summary,
+                "summary_pw": _seq_summary_pw,
+                "inline_finalized": _seq_summary_pw is not None,
                 "objective_value": obj.extract(flat_summary),
                 "trade_count": int(flat_summary.get("count", 0) or 0),
                 "elapsed_ms": elapsed_ms,
@@ -1935,11 +2244,27 @@ def run_optimization(
         # Spill to parquet if needed (>= OPTIM_SPILL_THRESHOLD rows)
         spill_path = result_store.maybe_spill_to_parquet(job_id)
 
-        # Write master summary CSV for ZIP download
+        # Write master summary CSV for ZIP download (heartbeat each step so the
+        # watchdog never mistakes slow-but-progressing finalization for a hang).
+        result_store.heartbeat(job_id, phase="finalizing:summary_csv")
         result_store.write_summary_csv(job_id, result_store.get_all_results(job_id))
-        _prebuild_csv_zip(job_id, base_payload, patchwise=False)
-        _prebuild_csv_zip(job_id, base_payload, patchwise=True)
-        _prebuild_wow_mom(job_id, base_payload)
+        _want_pw, _want_ov = _download_mode_flags(base_payload)
+        logger.info(
+            "[OPTIM] job=%s finalizing downloads download_mode=%s want_patchwise=%s want_overall=%s",
+            job_id[:8],
+            _resolved_download_mode(base_payload),
+            _want_pw,
+            _want_ov,
+        )
+        if _want_ov:
+            result_store.heartbeat(job_id, phase="finalizing:zip_overall")
+            _prebuild_csv_zip(job_id, base_payload, patchwise=False)
+        if _want_pw:
+            result_store.heartbeat(job_id, phase="finalizing:zip_patchwise")
+            _prebuild_csv_zip(job_id, base_payload, patchwise=True)
+        result_store.heartbeat(job_id, phase="finalizing:wow_mom")
+        _prebuild_wow_mom(job_id, base_payload, want_patchwise=_want_pw, want_overall=_want_ov)
+        result_store.heartbeat(job_id, phase="finalizing:done")
 
         result_store.update_progress(job_id, done=done)
         result_store.mark_complete(job_id)
@@ -1963,3 +2288,6 @@ def run_optimization(
         return {"status": "failed", "error": msg, "total": done}
     finally:
         _teardown_market_data()
+        # Sequential path also registered itself (exhaustive/random with P
+        # clamped to 1) — free the live-optim slot here too.
+        result_store.unregister_active_optim(job_id)

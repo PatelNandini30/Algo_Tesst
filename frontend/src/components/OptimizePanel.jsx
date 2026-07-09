@@ -13,78 +13,11 @@ import { X, Play, AlertCircle, Loader2, Beaker, Check } from 'lucide-react';
 import {
   expandSchemaForLegs,
 } from '../utils/strategyParamSchema';
+import { buildZipNaming, buildRulesInfo } from '../utils/optimRulesInfo';
+import Toggle from './ui/Toggle';
 
 const DEFAULT_METHOD = 'exhaustive';
 const DEFAULT_OBJECTIVE = 'total_pnl';
-
-function _getSLType(legs, selectedList) {
-  // Check base payload legs
-  for (const leg of (legs || [])) if (leg.trailSL) return 'trail';
-  for (const leg of (legs || [])) if (leg.slWithBuffer?.value) return 'buffer';
-  for (const leg of (legs || [])) if (leg.stopLoss?.value) return 'sl';
-  // Fallback: check if SL params are being swept (base may not have SL pre-set)
-  const paths = (selectedList || []).map(s => s.path);
-  if (paths.some(p => p.includes('trailSL'))) return 'trail';
-  if (paths.some(p => p.includes('slWithBuffer'))) return 'buffer';
-  if (paths.some(p => p.includes('stopLoss'))) return 'sl';
-  return null;
-}
-
-function _getRolloverStrikeMode(legs) {
-  for (const leg of (legs || [])) {
-    if ((leg.segment || 'options') === 'options') return leg.rollover_strike_mode || 'fresh';
-  }
-  return 'fresh';
-}
-
-function buildZipNaming(basePayload, filterName, selectedList = []) {
-  if (!filterName) return null;
-  const legs = basePayload.legs || [];
-  // True when ANY spot-adjustment parameter is being swept — enabled toggle,
-  // pct, direction or units. (Previously only checked `_enabled`, so sweeping
-  // spot_adjustment_pct/direction still labelled the folder "No Adjustment"
-  // even though every combo applies a Rise/Fall adjustment.)
-  const sweepsAdjustment = selectedList.some(s => String(s.path || '').startsWith('spot_adjustment'));
-
-  // Leg descriptions — CE first, then PE
-  const order = ['CE', 'PE'];
-  const legDesc = (leg) => {
-    const t = (leg.option_type || '').toUpperCase();
-    const p = (leg.position || '').toLowerCase();
-    return `${t} ${(p === 'sell' || p === 'short') ? 'Sell' : 'Buy'}`;
-  };
-  const legsStr = order
-    .flatMap(t => legs.filter(l => (l.option_type || '').toUpperCase() === t).map(legDesc))
-    .join(' ');
-
-  const slType = _getSLType(legs, selectedList);
-  const slLevel2 = { trail: 'Trail SL', buffer: 'SL With Buffer', sl: 'SL' }[slType] || null;
-  const slLevel3 = { trail: 'With Trail SL', buffer: 'With SL Buffer', sl: 'With SL' }[slType] || null;
-
-  const adjEnabled = Boolean(basePayload.spot_adjustment_enabled);
-  const adjLevel2 = adjEnabled ? 'With Adj' : 'No Adj';
-  const adjLevel3 = adjEnabled ? 'Adjustment' : 'No Adjustment';
-
-  const hasRollover   = Boolean(basePayload.rollover_toggle);
-  const hasNoRollover = Boolean(basePayload.no_rollover);
-  const rolloverPart  = hasRollover ? 'Rollover' : hasNoRollover ? 'No Rollover' : null;
-  const strikePart    = (hasRollover || hasNoRollover)
-    ? (_getRolloverStrikeMode(legs) === 'fixed' ? 'Fixed' : 'Fresh')
-    : null;
-
-  const entryDte = Number(basePayload.entry_dte || 0);
-  const exitDte  = Number(basePayload.exit_dte  || 0);
-  const dteLevel2 = `T-${entryDte} to T-${exitDte}`;
-  const dteLevel3 = `T-${entryDte} to T-${exitDte}`;
-
-  const level2 = [slLevel2, sweepsAdjustment ? null : adjLevel2, rolloverPart, strikePart, dteLevel2].filter(Boolean).join(' ');
-  const level3Parts = ['Tradesheet of', legsStr, `In ${filterName}`];
-  if (!sweepsAdjustment) level3Parts.push(adjLevel3);
-  if (slLevel3) level3Parts.push(slLevel3);
-  level3Parts.push(dteLevel3);
-
-  return { level1: filterName, level2, level3: level3Parts.join(' ') };
-}
 
 function combosForSpec(spec) {
   if (spec.kind === 'enum') return (spec.values || []).length;
@@ -130,13 +63,31 @@ export default function OptimizePanel({
   objective, setObjective,
   parallelism, setParallelism,
   filterName,
+  nodeId, // LAN remote-worker routing (see remote-worker/); null = run locally
 }) {
   // Midcap params (Global — Midcap Spot Adjustment) only appear when the
   // strategy actually has a Midcap leg.
   const _hasMidcapLeg = Array.isArray(basePayload?.midcap_legs) && basePayload.midcap_legs.length > 0;
+  // Per-leg strike mode (STRIKE_TYPE / PCT_OF_ATM / STRADDLE_WIDTH / REL_LEG / …)
+  // exactly as chosen in the backtest builder, so the optimizer only offers the
+  // strike params that actually apply to each leg (hides the confusing rest).
+  const _legStrikeModes = useMemo(() => {
+    const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
+    return legs.map(l => String(l?.strike_selection?.type || '').toUpperCase());
+  }, [basePayload]);
   const allParams = useMemo(
-    () => expandSchemaForLegs(nLegs || 1).filter(p => !p.midcapOnly || _hasMidcapLeg),
-    [nLegs, _hasMidcapLeg],
+    () => expandSchemaForLegs(nLegs || 1)
+      .filter(p => !p.midcapOnly || _hasMidcapLeg)
+      // Strike-mode gating: a param tagged with strikeModes only shows when the
+      // leg's actual strike mode matches. If we can't resolve the leg's mode
+      // (no basePayload legs yet), fall back to showing it rather than hiding.
+      .filter(p => {
+        if (!Array.isArray(p.strikeModes)) return true;
+        const mode = _legStrikeModes[p.legIndex];
+        if (!mode) return true;
+        return p.strikeModes.includes(mode);
+      }),
+    [nLegs, _hasMidcapLeg, _legStrikeModes],
   );
   const grouped = useMemo(() => {
     const m = new Map();
@@ -149,6 +100,38 @@ export default function OptimizePanel({
 
   const [objectives, setObjectives] = useState([]);
   const [submitting, setSubmitting] = useState(false);
+  // Auto-download opt-in — jobs launched with this on are adopted by
+  // AutoDownloadQueue (this tab, sibling tabs on this PC). Persisted to
+  // localStorage (per-browser) so it remembers your last choice instead of
+  // silently resetting to OFF every time this panel is reopened — that reset
+  // was confusing: turning it on for one run gave no indication it wouldn't
+  // carry over to the next, so a later run could look "broken" when it was
+  // actually just off again (see auto_download=False on jobs the user
+  // expected to auto-download, 2026-07-06).
+  const _AUTO_DL_KEY = 'algotest.optim.autoDownload.v1';
+  const [autoDownload, setAutoDownload] = useState(() => {
+    try { return localStorage.getItem(_AUTO_DL_KEY) === '1'; } catch { return false; }
+  });
+  const handleAutoDownloadToggle = (v) => {
+    setAutoDownload(v);
+    try { localStorage.setItem(_AUTO_DL_KEY, v ? '1' : '0'); } catch { /* ignore */ }
+  };
+  // Which download artifact (ZIP + WOW/MOM + summary) the worker actually
+  // builds after the sweep — building only ONE instead of always building
+  // both roughly halves finalization time on large sweeps. Defaults to
+  // 'patchwise' if the user never touches this, per the standing rule that
+  // patchwise is the safe default when nothing is explicitly chosen.
+  const _DL_MODE_KEY = 'algotest.optim.downloadMode.v1';
+  const [downloadMode, setDownloadMode] = useState(() => {
+    try {
+      const v = localStorage.getItem(_DL_MODE_KEY);
+      return v === 'overall' ? 'overall' : 'patchwise';
+    } catch { return 'patchwise'; }
+  });
+  const handleDownloadModeChange = (v) => {
+    setDownloadMode(v);
+    try { localStorage.setItem(_DL_MODE_KEY, v); } catch { /* ignore */ }
+  };
   const [error, setError] = useState(null);
   const [preview, setPreview] = useState(null);
   const [cpuInfo, setCpuInfo] = useState({ cpu_count: 8, default_parallelism: 4 });
@@ -239,6 +222,7 @@ export default function OptimizePanel({
     return {
       ...(basePayload || {}),
       strike_shift_max_steps: Number(strikeShiftOverride) || 0,
+      download_mode: downloadMode,
     };
   }
 
@@ -256,6 +240,8 @@ export default function OptimizePanel({
         algorithm: method === 'smart' ? algorithm : null,
         parallelism: parallelism || cpuInfo.default_parallelism,
         zip_naming: buildZipNaming(_baseForNaming, filterName, selectedList),
+        node_id: nodeId || null,
+        auto_download: autoDownload,
       };
       const res = await fetch('/api/optimize/jobs', {
         method: 'POST',
@@ -284,6 +270,8 @@ export default function OptimizePanel({
             objectiveLabel: objLabel,
             totalCombos: data.total_combos,
           },
+          ruleConfig: buildRulesInfo(_baseForNaming, filterName, selectedList),
+          autoDownload,
         });
       }
       onClose && onClose();
@@ -661,6 +649,64 @@ export default function OptimizePanel({
                 <div>{error}</div>
               </div>
             )}
+
+            <div
+              style={{
+                marginTop: 8,
+                paddingTop: 10,
+                borderTop: '1px solid var(--border, #eef1f4)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+              }}
+            >
+              <Toggle enabled={autoDownload} onToggle={handleAutoDownloadToggle} size="sm" />
+              <div>
+                <div style={{ fontSize: 12, color: 'var(--text-primary)' }}>Auto-download when finished</div>
+                <div style={{ fontSize: 10.5, color: 'var(--text-secondary, #667085)' }}>
+                  ZIP, WOW/MOM &amp; Summary Excel download automatically — this tab or any open sibling tab on this PC. Remembers your last choice.
+                </div>
+              </div>
+            </div>
+
+            <div
+              style={{
+                marginTop: 8,
+                paddingTop: 10,
+                borderTop: '1px solid var(--border, #eef1f4)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+              }}
+            >
+              <div style={{ display: 'flex', flexShrink: 0, border: '1px solid var(--border-strong, #d1d5db)', borderRadius: 6, overflow: 'hidden' }}>
+                {['patchwise', 'overall'].map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => handleDownloadModeChange(m)}
+                    style={{
+                      padding: '5px 10px',
+                      fontSize: 11,
+                      border: 0,
+                      cursor: 'pointer',
+                      flexShrink: 0,
+                      whiteSpace: 'nowrap',
+                      background: downloadMode === m ? 'var(--accent, #2563eb)' : 'transparent',
+                      color: downloadMode === m ? '#fff' : 'var(--text-primary)',
+                    }}
+                  >
+                    {m === 'patchwise' ? 'Patchwise' : 'Overall'}
+                  </button>
+                ))}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 12, color: 'var(--text-primary)' }}>Download build (DD basis)</div>
+                <div style={{ fontSize: 10.5, color: 'var(--text-secondary, #667085)' }}>
+                  Only the selected one is built after the sweep — building both would take longer. Defaults to Patchwise if you forget to pick.
+                </div>
+              </div>
+            </div>
 
             <div
               style={{

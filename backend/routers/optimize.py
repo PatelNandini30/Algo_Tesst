@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from services import node_registry
 from services.optimizer import result_store
 from services.optimizer.objective import list_objectives, resolve_objective
 from services.optimizer.param_expander import count_combinations
@@ -74,6 +75,37 @@ async def get_system_info():
     return {"cpu_count": cpu, "default_parallelism": default}
 
 
+@router.get("/system/nodes")
+async def get_lan_nodes(request: Request):
+    """
+    Live LAN remote-worker nodes (see services/node_registry.py, remote-worker/)
+    for the frontend's "Core:" picker. "Local (this box)" is always available
+    and is NOT included here — it's the implicit default when node_id is unset.
+
+    Each node is flagged `stale` when its code fingerprint (services/code_version.py)
+    differs from THIS box's — i.e. it's running a mismatched image. The UI greys
+    those out and job submission refuses to route to them, so a remote running
+    outdated engine/optimizer code can never silently produce wrong or crashing
+    results.
+    """
+    caller_ip = _client_ip(request)
+    try:
+        from services.code_version import compute_code_version
+        my_version = compute_code_version()
+    except Exception:
+        my_version = ""
+    nodes = node_registry.list_nodes()
+    for node in nodes:
+        node["is_you"] = node.get("ip") == caller_ip
+        nv = node.get("version") or ""
+        # Stale only when we can actually compare (both versions known) and they
+        # differ. Unknown versions (old worker that never reported one) are left
+        # non-stale so the guard fails open rather than blocking everything.
+        node["stale"] = bool(my_version and nv and nv != my_version)
+    nodes.sort(key=lambda n: (not n.get("is_you"), n.get("ip") or ""))
+    return {"nodes": nodes, "server_version": my_version}
+
+
 @router.post("/optimize/preview")
 async def preview_optimization(request: Dict[str, Any]):
     """
@@ -119,14 +151,37 @@ async def enqueue_optimization(request: Request):
     objective_name = body.get("objective") or "total_pnl"
     algorithm = body.get("algorithm")
     seed = body.get("seed")
-    # Parallelism: user override from UI. Capped between 1 and cpu_count to
-    # prevent thrashing. Unset → runner falls back to OPTIMIZE_PARALLELISM
-    # env / cpu//2 default.
+    # Optional LAN remote-worker routing: if the UI's "Core:" picker selected a
+    # registered remote node, run this job on that node's dedicated queue
+    # instead of the local "optimize" queue. Unset (default) is unchanged
+    # local behavior. See services/node_registry.py.
+    node_id = body.get("node_id") or None
+    node_cpu_cap = os.cpu_count() or 8
+    if node_id:
+        # Staleness guard: refuse to route to a remote worker running a different
+        # code version than this box (mismatched image) — it would silently
+        # produce wrong or crashing results. See services/code_version.py.
+        if node_registry.is_stale(node_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Worker {node_id} is running an outdated version and can't "
+                    "run this job. Update that PC's remote-worker image, or pick "
+                    "a different worker / Local."
+                ),
+            )
+        node = node_registry.get_node(node_id)
+        if node and node.get("cpu_count"):
+            node_cpu_cap = int(node["cpu_count"])
+    # Parallelism: user override from UI. Capped between 1 and the target
+    # node's own core count (local box's os.cpu_count() when no node is
+    # selected) to prevent thrashing. Unset → runner falls back to
+    # OPTIMIZE_PARALLELISM env / cpu//2 default.
     parallelism_raw = body.get("parallelism")
     parallelism: Optional[int] = None
     if parallelism_raw is not None:
         try:
-            parallelism = max(1, min(int(parallelism_raw), os.cpu_count() or 8))
+            parallelism = max(1, min(int(parallelism_raw), node_cpu_cap))
         except (TypeError, ValueError):
             parallelism = None
 
@@ -156,15 +211,73 @@ async def enqueue_optimization(request: Request):
         "parallelism": parallelism,
         "zip_naming": body.get("zip_naming") or None,
         "client_ip": origin_ip,
+        "node_id": node_id,
+        # User opt-in (Optimize panel "auto-download" toggle) — see
+        # services/optimizer/runner.py init_job() for why this gates adoption
+        # into any browser's AutoDownloadQueue instead of every job.
+        "auto_download": bool(body.get("auto_download")),
     }
-    task = run_optimize_job.apply_async(args=[spec], queue="optimize")
-    logger.info("[OPTIM] queued job %s from ip=%s objective=%s method=%s", task.id[:8], origin_ip, objective_name, method)
+    logger.info(
+        "[OPTIM] enqueue resolved download_mode=%s index=%s date=%s..%s auto_download=%s",
+        (base_payload.get("download_mode") or "patchwise"),
+        base_payload.get("index") or base_payload.get("symbol") or "NIFTY",
+        base_payload.get("from_date") or base_payload.get("date_from") or "",
+        base_payload.get("to_date") or base_payload.get("date_to") or "",
+        bool(body.get("auto_download")),
+    )
+    queue_name = f"optimize@{node_id}" if node_id else "optimize"
+    task = run_optimize_job.apply_async(args=[spec], queue=queue_name)
+    if node_id:
+        node_registry.record_job_node(task.id, node_id)
+    logger.info(
+        "[OPTIM] queued job %s from ip=%s objective=%s method=%s queue=%s",
+        task.id[:8], origin_ip, objective_name, method, queue_name,
+    )
     return {
         "status": "queued",
         "job_id": task.id,
         "total_combos": total,
         "objective": objective_name,
         "method": method,
+        "queue": queue_name,
+    }
+
+
+@router.get("/optimize/jobs")
+async def list_optimize_jobs(limit: int = Query(200, ge=1, le=500)):
+    """List every known optimize job (any machine, any browser) with just
+    enough info for a browser that did NOT enqueue a job to still discover and
+    auto-download it by job_id — powers AutoDownloadQueue's system-wide poll
+    (frontend/src/components/AutoDownloadQueue.jsx) so results follow the job,
+    not the tab/PC that started it. Deliberately excludes bulky fields
+    (results rows) — callers already have dedicated endpoints for those.
+    """
+    jobs = result_store.list_recent_jobs(limit=limit)
+    return {
+        "jobs": [
+            {
+                "job_id": j.get("job_id"),
+                "status": j.get("status"),
+                "done": j.get("done"),
+                "total": j.get("total"),
+                "objective": j.get("objective"),
+                "method": j.get("method"),
+                "sample_n": j.get("sample_n"),
+                "algorithm": j.get("algorithm"),
+                "started_at": j.get("started_at"),
+                "zip_naming": j.get("zip_naming"),
+                "base_payload": j.get("base_payload"),
+                "param_specs": j.get("param_specs"),
+                "auto_download": j.get("auto_download", False),
+            }
+            # Only surface jobs the user explicitly opted into auto-download
+            # for (Optimize panel toggle) — this endpoint's sole consumer is
+            # AutoDownloadQueue's cross-tab/cross-PC discovery poll, so
+            # filtering here (not just client-side) is what actually enforces
+            # "don't show this until I turn the toggle on".
+            for j in jobs
+            if j.get("auto_download")
+        ]
     }
 
 
@@ -179,8 +292,17 @@ async def get_optimize_job(job_id: str):
         celery_state = None
 
     if not meta:
-        # The Celery task may still be pending in the queue
-        if celery_state in (None, "PENDING"):
+        # The Celery task may still be pending in the queue, OR — the race this
+        # branch must not misdiagnose — it may have just been picked up by a
+        # worker: run_optimize_job calls self.update_state(state='PROCESSING')
+        # BEFORE run_optimization()/init_job() has written the Redis meta a
+        # moment later. A poll landing in that ~1-3s startup window must NOT
+        # be reported as "unknown" (client code treats unknown as terminal —
+        # "job was cancelled" — and permanently stops polling a job that is
+        # actually just starting normally and about to succeed). Only report
+        # "unknown" for states that mean the task is truly gone without ever
+        # having written meta (revoked, or an odd finished-with-no-meta case).
+        if celery_state in (None, "PENDING", "STARTED", "PROCESSING", "RETRY"):
             return {"status": "queued"}
         return {"status": "unknown", "celery_state": celery_state}
 
@@ -433,7 +555,6 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
         _root_files = {"summary.csv", "run_config.csv"}
 
         combo_csvs = [f for f in csv_files if f not in _root_files]
-        root_csvs  = [f for f in csv_files if f in _root_files]
 
         state["total"] = len(combo_csvs)
         state["done"]  = 0
@@ -520,50 +641,9 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
         _use_adj_folders = _has_no_adj and _has_adj
 
         with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
-            # Root CSVs first — these are tiny and don't need parallel build.
-            # The master summary.csv must follow the user-selected download method:
-            # patchwise download → patchwise-recomputed summary (matches each combo's
-            # patchwise XLSX Summary); overall download → stored (overall) summary.
-            for fname in root_csvs:
-                if patchwise and fname == "summary.csv":
-                    continue  # regenerated patchwise below
-                zf.write(os.path.join(trades_dir, fname), fname)
-
-            if patchwise:
-                try:
-                    from services.optimizer.excel_builder import (
-                        compute_xlsx_summary_metrics as _cmetrics,
-                    )
-                    _flat_rows = []
-                    for fname in combo_csvs:
-                        _ls = fname[:-4]
-                        _row = summary_by_label.get(_ls, {})
-                        try:
-                            _cdf = pd.read_csv(os.path.join(trades_dir, fname), dtype=str)
-                            _pw_metrics = _cmetrics(
-                                _cdf, _row.get("summary") or {},
-                                midcap_legs=_midcap_legs,
-                                midcap_spot_adjustment=_midcap_sa,
-                                midcap_symbol=_midcap_sym,
-                                patchwise=True,
-                                filter_segments=_filter_segments,
-                            )
-                            _flat = {
-                                "combo_id": _row.get("combo_id"),
-                                "combo_label": _row.get("combo_label") or _ls,
-                            }
-                            _flat.update({**(_row.get("summary") or {}), **_pw_metrics})
-                            _flat_rows.append(_flat)
-                        except Exception as _se:
-                            logger.warning("[ZIP] patchwise summary skipped for %s: %s", _ls, _se)
-                    if _flat_rows:
-                        zf.writestr("summary.csv", pd.DataFrame(_flat_rows).to_csv(index=False))
-                except Exception as _pwe:
-                    logger.warning("[ZIP] patchwise summary.csv regen failed: %s", _pwe)
-                    # Fall back to the stored (overall) summary so the ZIP isn't missing it.
-                    _stored_summary = os.path.join(trades_dir, "summary.csv")
-                    if os.path.isfile(_stored_summary):
-                        zf.write(_stored_summary, "summary.csv")
+            # ZIP is Excel-only — summary.csv/run_config.csv are intentionally
+            # NOT included (the master summary is a separate Export-XLSX
+            # download; these were leaking into every downloaded ZIP, unwanted).
 
             if build_args:
                 # Track no-adjustment labels already written (strip numeric prefix)
@@ -611,8 +691,32 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
         state["error"] = str(exc)
 
 
+def _download_base_for_job(job_id: str) -> str:
+    """Base URL the browser should hit to download a job's on-disk artifacts
+    (ZIP / WOW-MOM / per-combo tradesheets). Those files live on the disk of
+    whichever worker RAN the job. For a job that ran on a LAN remote node, that's
+    the remote PC's own API (remote-worker/'s remote-api container, port
+    NODE_API_PORT) — the main box never has those files. Empty string = this box
+    ran it (use same-origin relative URLs, unchanged behavior)."""
+    try:
+        node = node_registry.get_job_node(job_id)
+        if node:
+            port = os.environ.get("NODE_API_PORT", "8100")
+            return f"http://{node}:{port}"
+    except Exception:
+        pass
+    return ""
+
+
+@router.get("/optimize/jobs/{job_id}/download-base")
+async def get_download_base(job_id: str):
+    """Where the frontend should fetch this job's file downloads from (its own
+    remote node, or same-origin for local jobs). See _download_base_for_job."""
+    return {"download_base": _download_base_for_job(job_id)}
+
+
 @router.get("/optimize/jobs/{job_id}/tradesheets.zip")
-async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(False)):
+async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(True)):
     """
     Returns the tradesheets ZIP, building it on first request.
 
@@ -630,7 +734,7 @@ async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(False)):
         _meta_for_name = result_store.get_meta(job_id) or {}
         _zip_naming = _meta_for_name.get("zip_naming") or {}
         _level1 = _safe_zip_name(_zip_naming.get("level1", "")) if _zip_naming else ""
-        _pw_suffix = "_patchwise" if patchwise else ""
+        _pw_suffix = "_patchwise" if patchwise else "_overall"
         filename = f"{_level1}{_pw_suffix}.zip" if _level1 else f"optimize_{job_id[:8]}_tradesheets{_pw_suffix}.zip"
         return FileResponse(
             cache_path,
@@ -729,7 +833,7 @@ def _wm_strike_sort(cc: Dict[str, Any]) -> float:
 
 
 @router.get("/optimize/jobs/{job_id}/wow_mom.xlsx")
-async def download_wow_mom(job_id: str, patchwise: bool = Query(False)):
+async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
     """
     Merged WOW & MOM summary across ALL combos: two sheets ('WOW Summary' +
     'MOM Summary'), each stacking one block per combo (titled by combo label).
@@ -750,7 +854,8 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(False)):
 
     zip_naming = meta.get("zip_naming") or {}
     lvl1 = _safe_zip_name(zip_naming.get("level1", "")) if zip_naming else ""
-    fname_out = f"{lvl1}_WOW_MOM.xlsx" if lvl1 else f"optimize_{job_id[:8]}_WOW_MOM.xlsx"
+    _pw_suffix = "_patchwise" if patchwise else "_overall"
+    fname_out = f"{lvl1}{_pw_suffix}_WOW_MOM.xlsx" if lvl1 else f"optimize_{job_id[:8]}{_pw_suffix}_WOW_MOM.xlsx"
 
     # Serve from disk cache if already built — first click builds, every
     # subsequent click is instant.
@@ -904,7 +1009,7 @@ async def download_combo_tradesheet(job_id: str, combo_id: int):
 
 
 @router.get("/optimize/jobs/{job_id}/summary")
-async def get_optim_summary(job_id: str, patchwise: bool = Query(False)):
+async def get_optim_summary(job_id: str, patchwise: bool = Query(True)):
     """
     Per-combo master-summary metrics for the user-selected download method.
 
@@ -928,20 +1033,13 @@ async def get_optim_summary(job_id: str, patchwise: bool = Query(False)):
             for r in all_results
         ]}
 
-    # Serve pre-built patchwise summary from disk if available (worker builds it
-    # right after sweep completes so this is normally instant).
-    _pw_cache = result_store.patchwise_summary_cache_path(job_id)
-    if os.path.isfile(_pw_cache):
-        import json as _json
-        try:
-            with open(_pw_cache) as _fh:
-                return _json.load(_fh)
-        except Exception:
-            pass  # fall through to recompute
-
-    import pandas as pd
-    from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cmetrics
-
+    # Patchwise metrics are computed inline in the worker (row["summary_pw"]) and
+    # stored per combo, so the master summary can be served straight from Redis —
+    # no disk/cache dependency, no silent fallback to the OVERALL summary. We do
+    # NOT serve the old one-shot patchwise-summary JSON cache: it was written once
+    # and never invalidated, so a stale/overall copy could survive across runs.
+    # A CSV recompute is used only as a last resort for combos that somehow lack
+    # an inline patchwise summary (e.g. inline finalize was disabled/failed).
     base_payload = meta.get("base_payload") or {}
     _midcap_legs = base_payload.get("midcap_legs") or None
     _midcap_sa   = base_payload.get("midcap_spot_adjustment") or None
@@ -953,12 +1051,24 @@ async def get_optim_summary(job_id: str, patchwise: bool = Query(False)):
     trades_dir = result_store.get_trades_dir(job_id)
 
     def _build():
+        import pandas as pd
+        from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cmetrics
         out = []
         for r in all_results:
-            _ls = r.get("combo_label_safe") or ""
             _stored = r.get("summary") or {}
+            # Fast path: patchwise metrics already computed inline in the worker.
+            _inline_pw = r.get("summary_pw")
+            if _inline_pw is not None:
+                out.append({"combo_id": r.get("combo_id"), "summary": {**_stored, **_inline_pw}})
+                continue
+            # Fallback: recompute patchwise metrics from the on-disk tradesheet.
+            _ls = r.get("combo_label_safe") or ""
             _csv = os.path.join(trades_dir, f"{_ls}.csv")
             if not _ls or not os.path.isfile(_csv):
+                logger.warning(
+                    "[OPTIM_DL] no inline patchwise summary and no CSV for %s; "
+                    "serving OVERALL summary for this combo", _ls or "<unlabeled>",
+                )
                 out.append({"combo_id": r.get("combo_id"), "summary": _stored})
                 continue
             try:
@@ -989,8 +1099,8 @@ async def cancel_optimize_job(job_id: str):
     # Free the memory-gate reservation immediately so a queued job can start
     # (the TTL would also reclaim it, but cancellation should free it at once).
     try:
-        from services import memory_gate
-        memory_gate.release(job_id)
+        from services import memory_gate, node_registry
+        memory_gate.release(job_id, node_id=node_registry.get_job_node(job_id))
     except Exception as exc:
         logger.debug("memory_gate release on cancel failed: %s", exc)
     result_store.delete_job(job_id)

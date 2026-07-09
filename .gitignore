@@ -22,3 +22,10 @@ frontend/dist/
 .claude/
 nifty_data/
 git-credential-manager/
+# remote-worker/ image export — a large binary artifact regenerated per code
+# update via `docker save`, not source. Never commit it.
+remote-worker/*.tar
+remote-worker/.env
+
+# Persisted ./start.sh --optimize preference (local, per-box)
+.start-optimize

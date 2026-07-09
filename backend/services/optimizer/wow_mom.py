@@ -645,9 +645,23 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     changes.
     """
     # Build each combo's wm + resolve grid axes.
+    def _intkeys(o):
+        # A stored wm (JSON round-trip through Redis) has its integer year/week
+        # dict keys turned into strings; restore them so year lookups match the
+        # int values in wow_years/mom_years.
+        if isinstance(o, dict):
+            return {(int(k) if isinstance(k, str) and k.lstrip("-").isdigit() else k): _intkeys(v)
+                    for k, v in o.items()}
+        if isinstance(o, list):
+            return [_intkeys(x) for x in o]
+        return o
+
     items = []
     for c in combos:
-        wm = _wm_from_cleaned(c["cleaned"], c.get("has_midcap", False))
+        # Use the pre-computed wm (built inline in the worker during the sweep)
+        # when present; otherwise derive it from the cleaned rows (legacy path).
+        _pre = c.get("wm")
+        wm = _intkeys(_pre) if _pre else _wm_from_cleaned(c["cleaned"], c.get("has_midcap", False))
         if not (wm["n_trades"] > 0):
             continue
         title = c.get("title") or "Strategy"
@@ -663,6 +677,25 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
         })
     if not items:
         return False
+
+    # Disambiguate combos that collapse to the SAME (row_key, adj_key) grid cell.
+    # This happens for a spread whose two legs are the same option type (e.g.
+    # PE Sell + PE Buy): the strike display can only show one leg, so several
+    # combos that differ only by the other leg's strike share an identical
+    # (row, adjustment) position. Without this they would all write into the same
+    # block and the 2nd+ would hit an already-merged header cell → crash
+    # ("'MergedCell' object attribute 'value' is read-only"). Each extra combo at
+    # an already-taken cell is pushed to its own stacked sub-row (and its title
+    # tagged) so no two blocks overlap. Jobs with NO collisions are untouched —
+    # the loop makes zero changes, so their output is byte-for-byte identical.
+    _cell_count: Dict[Tuple[str, str], int] = {}
+    for it in items:
+        cell = (it["row_key"], it["adj_key"])
+        n = _cell_count.get(cell, 0)
+        _cell_count[cell] = n + 1
+        if n > 0:
+            it["row_key"] = f'{it["row_key"]} ({n + 1})'
+            it["title"] = f'{it["title"]} ({n + 1})'
 
     # Column axis: unique adjustments, ordered No Adj → Rise → Fall → Rise or Fall.
     adj_seen: Dict[str, str] = {}   # adj_key → adj_label

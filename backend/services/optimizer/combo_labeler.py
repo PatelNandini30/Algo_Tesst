@@ -20,7 +20,7 @@ the structured combo dict for any logic.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from services.optimizer.param_expander import get_by_path
 
@@ -89,7 +89,19 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
             mult = float(strike_selection.get("straddle_multiplier", 1))
         except (TypeError, ValueError):
             mult = 1.0
-        return f"StraddleW{mult:g}"
+        # Raw +/- sign, applied identically to every leg (no CE/PE meaning).
+        direction = str(strike_selection.get("straddle_direction") or "+").strip()
+        sign = "-" if direction == "-" else "+"
+        return f"StraddleW{mult:g}_{sign}"
+    if kind == "rel_leg":
+        # Relative-to-Leg (Iron Condor wing): 'REL_L1_2G' = Leg 1 + 2 gaps.
+        # Matches the backtest export filename label (ResultsPanel.jsx).
+        try:
+            ref = int(strike_selection.get("ref_leg") or 1)
+            off = float(strike_selection.get("offset") or 0)
+        except (TypeError, ValueError):
+            ref, off = 1, 0.0
+        return f"REL_L{ref}_{off:g}G"
     return kind.upper()
 
 
@@ -162,6 +174,21 @@ def _find_leg(payload: Dict[str, Any], option_type: str) -> Optional[Dict[str, A
         if (leg.get("option_type") or "").upper() == target:
             return leg
     return None
+
+
+def _find_legs(payload: Dict[str, Any], option_type: str) -> List[Dict[str, Any]]:
+    """Return ALL legs with the given option_type (CE / PE), in payload order.
+
+    A spread whose two legs share an option type (e.g. PE Sell + PE Buy) has two
+    PE legs; labelling only the first (via _find_leg) silently drops the second,
+    so combos that differ only in the second leg's strike collapse to one label.
+    This returns every matching leg so the label can describe them all.
+    """
+    target = option_type.upper()
+    return [
+        leg for leg in (payload.get("legs") or [])
+        if isinstance(leg, dict) and (leg.get("option_type") or "").upper() == target
+    ]
 
 
 def _position_label(leg: Optional[Dict[str, Any]]) -> str:
@@ -251,33 +278,47 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         spot_adjustment     e.g. "NoAdjustment"
         combo_label         e.g. "CE_3.0%_OTM_Sell_PE_0.5%_ITM_Sell_NoAdjustment_Weekly_Expiry_T-1_To_T-1"
     """
-    ce_leg = _find_leg(payload, "CE")
-    pe_leg = _find_leg(payload, "PE")
-    call_strike = _strike_label(ce_leg.get("strike_selection") if ce_leg else None, "CE")
-    put_strike = _strike_label(pe_leg.get("strike_selection") if pe_leg else None, "PE")
-    call_pos = _position_label(ce_leg)
-    put_pos = _position_label(pe_leg)
-    ce_sl = _sl_label(ce_leg)
-    pe_sl = _sl_label(pe_leg)
+    # Describe EVERY leg, not just the first CE + first PE. For the common
+    # single-CE / single-PE strategy this produces byte-identical output to the
+    # previous first-leg-only logic (one CE segment then one PE segment); it only
+    # differs when a strategy has multiple legs of the same option type (e.g. a
+    # PE Sell + PE Buy spread), where both legs are now described so combos that
+    # differ only in the second leg no longer collapse to an identical label.
+    ce_legs = _find_legs(payload, "CE")
+    pe_legs = _find_legs(payload, "PE")
+
+    def _leg_segment(leg: Dict[str, Any], otype: str):
+        strike = _strike_label(leg.get("strike_selection"), otype)
+        pos = _position_label(leg)
+        sl = _sl_label(leg)
+        seg = f"{otype}_{strike}"
+        if pos:
+            seg += f"_{pos}"
+        if sl:
+            seg += f"_{sl}"
+        return seg, strike
+
     spot_adj = _spot_adjustment_label(payload)
     expiry = _expiry_label(payload)
     shift = _shift_label(payload)
 
     parts = []
-    if ce_leg is not None:
-        seg = f"CE_{call_strike}"
-        if call_pos:
-            seg += f"_{call_pos}"
-        if ce_sl:
-            seg += f"_{ce_sl}"
-        parts.append(seg)
-    if pe_leg is not None:
-        seg = f"PE_{put_strike}"
-        if put_pos:
-            seg += f"_{put_pos}"
-        if pe_sl:
-            seg += f"_{pe_sl}"
-        parts.append(seg)
+    call_strikes: List[str] = []
+    for _leg in ce_legs:
+        _seg, _st = _leg_segment(_leg, "CE")
+        parts.append(_seg)
+        call_strikes.append(_st)
+    put_strikes: List[str] = []
+    for _leg in pe_legs:
+        _seg, _st = _leg_segment(_leg, "PE")
+        parts.append(_seg)
+        put_strikes.append(_st)
+
+    # Master-summary strike columns: single leg → unchanged; multiple same-type
+    # legs → joined with '+' so each distinct multi-leg combo gets a distinct
+    # label (previously only the first leg per type was recorded).
+    call_strike = "+".join(call_strikes) if call_strikes else _strike_label(None, "CE")
+    put_strike = "+".join(put_strikes) if put_strikes else _strike_label(None, "PE")
     # Midcap cross-index overlay leg(s) — appended after the option legs, like
     # the backtest filename (only present when a Midcap leg ran).
     midcap_seg = _midcap_label(payload)

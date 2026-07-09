@@ -35,6 +35,30 @@ def _leg_expiry(leg: dict, default_expiry: str) -> str:
     return str(leg.get("expiry") or leg.get("expiry_type") or default_expiry).strip().upper()
 
 
+def _group_expiry_type(sym: str, glegs: List[dict], payload: dict, default_index: str) -> str:
+    """Strategy-level expiry cadence for an index group's engine sub-run.
+
+    - The strategy (base) index keeps the payload's expiry_type verbatim, so the
+      base group is byte-identical to a normal single-index run.
+    - Any other index group's cadence = the SHORTEST leg expiry (weekly if any
+      weekly leg AND the index actually supports weekly cadence), else monthly —
+      mirroring a standalone backtest on that index.
+    """
+    strat_idx = str(payload.get("index") or default_index).strip().upper()
+    if sym == strat_idx:
+        return str(payload.get("expiry_type") or "MONTHLY").strip().upper()
+    exps = [str(l.get("expiry") or l.get("expiry_type") or "").upper() for l in glegs]
+    if any(e.startswith("WEEK") for e in exps):
+        try:
+            from services.index_metadata import get_index_config as _gic
+            cfg = _gic(sym)
+            if cfg and any(str(b).upper().startswith("WEEK") for b in (cfg.expiry_bases or ())):
+                return "WEEKLY"
+        except Exception:
+            pass
+    return "MONTHLY"
+
+
 def _price_futures_group(
     payload: Dict[str, Any],
     symbol: str,
@@ -389,80 +413,61 @@ def run_multi_index_feature(
     default_expiry = str(payload.get("expiry_type") or "WEEKLY").strip().upper()
     legs: List[dict] = [l for l in (payload.get("legs") or []) if isinstance(l, dict)]
 
-    # ---- 1. Split into BASE legs (strategy index) + OVERLAY legs (other index) ----
-    # Case A: the base legs define the trades (one trade per base cycle); each
-    # overlay leg is priced over the SAME trade window and attached as Leg 2/3.
-    base_index = default_index
-    base_legs = [l for l in legs if _leg_index(l, default_index) == base_index]
-    overlay_legs = [l for l in legs if _leg_index(l, default_index) != base_index]
-    if not base_legs and legs:  # no leg on the strategy index → use first leg's index as base
-        base_index = _leg_index(legs[0], default_index)
-        base_legs = [l for l in legs if _leg_index(l, default_index) == base_index]
-        overlay_legs = [l for l in legs if _leg_index(l, default_index) != base_index]
+    # ---- 1. Group legs by INDEX. Each index-group runs the FULL engine ----
+    # Option A: every index's legs go through the existing engine path exactly
+    # like a standalone single-index backtest for that index — so rollover,
+    # legwise SL/target, filter, spot-adjustment, re-entry, MAE/MFE all apply to
+    # every group (including MIDCPNIFTY), not just the strategy index. Each group
+    # produces its OWN trades (its own expiry cadence); the groups are then merged
+    # into one combined tradesheet with a single compounded equity curve.
+    from collections import OrderedDict as _OrderedDict
+    groups: "OrderedDict[str, List[dict]]" = _OrderedDict()
+    # Strategy index first (so it stays group 0 / base), then any other indices.
+    groups[default_index] = []
+    for l in legs:
+        groups.setdefault(_leg_index(l, default_index), [])
+    for l in legs:
+        groups[_leg_index(l, default_index)].append(l)
+    groups = _OrderedDict((k, v) for k, v in groups.items() if v)  # drop empty
+    base_index = next(iter(groups), default_index)
 
     group_frames: List["pd.DataFrame"] = []
     group_meta: List[dict] = []
 
-    # ---- 2a. Run the base legs through the existing engine ----
-    base_df = None
-    if base_legs:
+    # ---- 2. Run each index-group through the existing engine ----
+    for gid, (sym, glegs) in enumerate(groups.items()):
+        grp_expiry = _group_expiry_type(sym, glegs, payload, default_index)
         sub = copy.deepcopy(payload)
-        sub["legs"] = base_legs
-        sub["index"] = base_index
+        sub["legs"] = glegs
+        sub["index"] = sym
+        sub["expiry_type"] = grp_expiry
+        sub["expiry_window"] = "weekly_expiry" if grp_expiry == "WEEKLY" else "monthly_expiry"
         sub.pop("multi_index_mode", None)  # never recurse
+        gdf = None
         try:
             try:
                 _safe_clear_fast_lookup()
                 bulk_clear_options()
             except Exception:
                 pass
-            bulk_load_options(base_index, effective_from, effective_to)
-            _build_fast_lookup_from_bulk(base_index, effective_from, effective_to)
-            base_df, _s, _p = _try_rust_engine(sub, base_index, effective_from, effective_to)
+            bulk_load_options(sym, effective_from, effective_to)
+            _build_fast_lookup_from_bulk(sym, effective_from, effective_to)
+            gdf, _s, _p = _try_rust_engine(sub, sym, effective_from, effective_to)
         except Exception as exc:
-            logger.warning("[MULTI_INDEX] base %s failed: %s", base_index, exc)
-            base_df = None
-    base_avail = base_df is not None and not getattr(base_df, "empty", True)
-    if base_avail:
-        base_df = base_df.copy()
-        base_df["_grp"] = 0
-        base_df["Group Index"] = base_index
-        base_df["Group Expiry"] = str(payload.get("expiry_type") or "WEEKLY").upper()
-    group_meta.append({
-        "index": base_index, "role": "base", "legs": len(base_legs),
-        "trades": int(base_df["Trade"].nunique()) if base_avail else 0, "available": bool(base_avail),
-    })
-
-    # ---- 2b. Overlay the other-index legs onto each base trade (Leg 2/3) ----
-    # Clear the base-index fast-lookup FIRST so the overlay's MIDCPNIFTY spot /
-    # option-premium DB lookups don't hit the NIFTY-only cache and return None.
-    try:
-        _safe_clear_fast_lookup()
-        bulk_clear_options()
-    except Exception:
-        pass
-    overlay_rows: List[dict] = []
-    if base_avail and overlay_legs:
-        try:
-            overlay_rows = _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from, effective_to)
-        except Exception as exc:
-            logger.warning("[MULTI_INDEX] overlay failed: %s", exc)
-            overlay_rows = []
-    from collections import Counter as _Counter
-    _oc = _Counter(r["Group Index"] for r in overlay_rows)
-    for _sym in sorted({_leg_index(l, default_index) for l in overlay_legs}):
+            logger.warning("[MULTI_INDEX] group %s failed: %s", sym, exc)
+            gdf = None
+        avail = gdf is not None and not getattr(gdf, "empty", True)
+        if avail:
+            gdf = gdf.copy()
+            gdf["_grp"] = gid
+            gdf["Group Index"] = sym
+            gdf["Group Expiry"] = grp_expiry
+            group_frames.append(gdf)
         group_meta.append({
-            "index": _sym, "role": "overlay", "rows": int(_oc.get(_sym, 0)),
-            "available": _oc.get(_sym, 0) > 0,
+            "index": sym, "role": ("base" if gid == 0 else "leg"), "legs": len(glegs),
+            "expiry": grp_expiry,
+            "trades": int(gdf["Trade"].nunique()) if avail else 0, "available": bool(avail),
         })
-
-    if base_avail:
-        frames = [base_df]
-        if overlay_rows:
-            odf = pd.DataFrame(overlay_rows)
-            odf["_grp"] = 0
-            frames.append(odf)
-        group_frames.append(pd.concat(frames, ignore_index=True))
 
     try:
         _safe_clear_fast_lookup()
@@ -473,7 +478,7 @@ def run_multi_index_feature(
     meta = {
         "multi_index": True,
         "groups": group_meta,
-        "indices": sorted({base_index} | {_leg_index(l, default_index) for l in overlay_legs}),
+        "indices": sorted(groups.keys()),
         "index": default_index,
         "from_date": payload.get("from_date"),
         "to_date": payload.get("to_date"),

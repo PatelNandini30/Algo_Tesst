@@ -59,16 +59,22 @@ def run_algotest_job(self, params: dict):
     # Admission gate: wait for a memory slot before the engine runs so concurrent
     # heavy jobs cannot overcommit RAM (no-OOM). Pure gating — the backtest math
     # below is unchanged. See services/memory_gate.py.
-    from services import memory_gate
+    from services import memory_gate, node_registry
     rid = self.request.id or ""
     client_ip = str((params or {}).get("_client_ip") or "unknown")
-    logger.info("[BACKTEST] job %s started from ip=%s", rid[:8], client_ip)
+    node_id = (params or {}).get("node_id") or None
+    logger.info("[BACKTEST] job %s started from ip=%s node=%s", rid[:8], client_ip, node_id or "local")
+    if node_id:
+        node_registry.record_job_node(rid, node_id)
     memory_gate.acquire(
         rid,
-        memory_gate.cost_for("backtest"),
+        # #2 dynamic cost: scale reservation by this backtest's date span.
+        memory_gate.cost_for_job("backtest", params),
         on_wait=lambda: self.update_state(
             state='PROCESSING', meta={'status': 'queued: waiting for memory budget', 'client_ip': client_ip}
         ),
+        node_id=node_id,
+        kind="backtest",
     )
     try:
         self.update_state(state='PROCESSING', meta={'status': 'Running AlgoTest backtest', 'client_ip': client_ip})
@@ -85,7 +91,7 @@ def run_algotest_job(self, params: dict):
             'client_ip': client_ip,
         })
     finally:
-        memory_gate.release(rid)
+        memory_gate.release(rid, node_id=node_id)
 
 
 @celery_app.task(bind=True)
@@ -99,16 +105,22 @@ def run_optimize_job(self, spec: dict):
     """
     # Admission gate (no-OOM): reserve the optimize memory budget before the
     # sweep starts; if busy the job waits (queued) instead of overcommitting RAM.
-    from services import memory_gate
+    from services import memory_gate, node_registry
     rid = self.request.id or ""
     client_ip = str((spec or {}).get("client_ip") or "unknown")
-    logger.info("[OPTIM] job %s started from ip=%s", rid[:8], client_ip)
+    node_id = (spec or {}).get("node_id") or None
+    logger.info("[OPTIM] job %s started from ip=%s node=%s", rid[:8], client_ip, node_id or "local")
+    if node_id:
+        node_registry.record_job_node(rid, node_id)
     memory_gate.acquire(
         rid,
-        memory_gate.cost_for("optimize"),
+        # #2 dynamic cost: scale reservation by this optim's date span.
+        memory_gate.cost_for_job("optimize", (spec or {}).get("base_payload")),
         on_wait=lambda: self.update_state(
             state='PROCESSING', meta={'status': 'queued: waiting for memory budget', 'client_ip': client_ip}
         ),
+        node_id=node_id,
+        kind="optimize",
     )
     try:
         from services.optimizer.runner import run_optimization
@@ -125,13 +137,15 @@ def run_optimize_job(self, spec: dict):
             seed=spec.get('seed'),
             parallelism=spec.get('parallelism'),
             zip_naming=spec.get('zip_naming'),
+            auto_download=bool(spec.get('auto_download')),
         )
         # Pre-build the tradesheets ZIP and wait for it to finish so the
         # user gets an instant download instead of a progress bar.
         try:
             import time as _time
             import requests as _req
-            _url = f'http://backend:8000/api/optimize/jobs/{self.request.id}/tradesheets.zip'
+            _backend_base = os.environ.get("BACKEND_BASE_URL", "http://backend:8000")
+            _url = f'{_backend_base}/api/optimize/jobs/{self.request.id}/tradesheets.zip'
             _req.get(_url, timeout=10)          # trigger the build (returns 202)
             _deadline = _time.time() + 20 * 60  # wait up to 20 minutes
             while _time.time() < _deadline:
@@ -148,7 +162,7 @@ def run_optimize_job(self, spec: dict):
     except Exception as e:
         return _sanitize_result({'status': 'error', 'message': str(e), 'client_ip': client_ip})
     finally:
-        memory_gate.release(rid)
+        memory_gate.release(rid, node_id=node_id)
 
 
 @celery_app.task(bind=True)
@@ -176,6 +190,15 @@ def warm_backtest_cache_task(self, params: dict):
 
         self.update_state(state='PROCESSING', meta={'status': 'Warming worker data cache'})
         stats = bulk_load_options(index, from_date, to_date)
+        if isinstance(stats, dict) and (stats.get('options_rows') or 0) > 0:
+            # A genuine DB reload happened (not just a feather-cache hit) — bump
+            # the data-version token so the Redis result cache stops serving
+            # tradesheets computed against the pre-warm data.
+            try:
+                from services.backtest_cache import bump_data_version
+                bump_data_version()
+            except Exception:
+                pass
         fast_lookup_built = False
         _rust_active = False
         try:

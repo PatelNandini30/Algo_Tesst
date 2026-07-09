@@ -70,14 +70,29 @@ export const OPTIM_PARAM_GROUPS = [
     forLeg: true,
     items: [
       {
+        // Only meaningful for a pct_of_atm / atm_straddle_prem_pct leg — both
+        // put the swept value in strike_selection.value.
         path: 'legs[I].strike_selection.value',
         label: 'Strike offset (pct_of_atm value)',
         unit: '%',
+        strikeModes: ['PCT_OF_ATM', 'ATM_STRADDLE_PREM_PCT'],
         ...RANGE(-5, 5, 0.5),
       },
       {
+        // Relative-to-Leg (Iron Condor wing): sweep the wing's offset in
+        // strike-gaps from its parent leg. Only meaningful for a rel_leg leg.
+        path: 'legs[I].strike_selection.offset',
+        label: 'Wing offset (relative-leg gaps)',
+        unit: 'gaps',
+        discrete: true,
+        strikeModes: ['REL_LEG'],
+        ...RANGE(1, 6, 1),
+      },
+      {
+        // ATM/ITM/OTM ladder — only for a strike_type / synthetic_future leg.
         path: 'legs[I].strike_selection.strike_type',
         label: 'Strike type (enum)',
+        strikeModes: ['STRIKE_TYPE', 'SYNTHETIC_FUTURE'],
         ...ENUM([
           'ATM',
           'ITM1', 'ITM2', 'ITM3', 'ITM4', 'ITM5', 'ITM6', 'ITM7', 'ITM8', 'ITM9', 'ITM10',
@@ -85,6 +100,24 @@ export const OPTIM_PARAM_GROUPS = [
         ]),
       },
       {
+        // Straddle Width: strike = nearest ATM ± (multiplier × ATM straddle
+        // premium), snapped to strike interval. Only meaningful for a
+        // straddle_width leg.
+        path: 'legs[I].strike_selection.straddle_multiplier',
+        label: 'Straddle Width — multiplier',
+        unit: 'x straddle',
+        strikeModes: ['STRADDLE_WIDTH'],
+        ...RANGE(0.25, 2, 0.25),
+      },
+      {
+        // "+" = OTM (away from ATM: up for CE, down for PE); "-" = ITM.
+        path: 'legs[I].strike_selection.straddle_direction',
+        label: 'Straddle Width — direction (OTM/ITM)',
+        strikeModes: ['STRADDLE_WIDTH'],
+        ...ENUM(['+', '-']),
+      },
+      {
+        // Expiry is not strike-mode specific — always available per leg.
         path: 'legs[I].expiry',
         label: 'Expiry window',
         ...ENUM(['WEEKLY', 'NEXT_WEEKLY', 'MONTHLY', 'NEXT_MONTHLY']),
@@ -222,6 +255,7 @@ export function expandSchemaForLegs(nLegs) {
           path: item.path.replace('[I]', `[${i}]`),
           label: `${item.label} (Leg ${i + 1})`,
           group: grp.group,
+          legIndex: i,
         });
       }
     }

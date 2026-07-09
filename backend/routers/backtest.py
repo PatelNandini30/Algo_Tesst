@@ -194,6 +194,23 @@ def _queue_depth(queue_name: str) -> int:
         return 0
 
 
+def _real_backtest_active() -> bool:
+    """True if an actual run_algotest_job (a user's 'Run Backtest' click) is
+    currently executing on either backtest worker — NOT a warm_backtest_cache_task.
+    Both backtest workers run at concurrency=1, so this is a reliable "is the
+    single slot taken by real work" check. Fails open (False) on any inspect
+    error so a broker hiccup never silently blocks warming."""
+    try:
+        active = celery_app.control.inspect(timeout=2).active() or {}
+        for _host, tasks in active.items():
+            for t in tasks:
+                if t.get("name") == "worker.tasks.run_algotest_job":
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 def _date_span_days(from_date: Any, to_date: Any) -> int:
     try:
         start = pd.to_datetime(_normalize_date(from_date))
@@ -363,10 +380,51 @@ async def warm_cache(request: dict):
     warm_timeout = float(os.environ.get("WARM_CACHE_WAIT_SECONDS", "90"))
     warm_payload = {"index": symbol, "from_date": from_date, "to_date": to_date}
     queue_name = _backtest_queue_for_payload(warm_payload)
-    task = warm_backtest_cache_task.apply_async(
-        args=[warm_payload],
-        queue=queue_name,
-    )
+
+    # Debounced date-picker edits (StrategyBuilder fires one of these per
+    # keystroke-pause) were each enqueuing a brand-new warm_backtest_cache_task
+    # onto the SAME queue real backtests use, so a burst of edits from a few
+    # users could pile up ahead of an actual run_algotest_job and make it look
+    # "stuck in queue". Collapse concurrent warm requests for the same symbol
+    # into the one already in flight instead of enqueuing a duplicate.
+    task = None
+    try:
+        from services.optimizer.result_store import _redis as _get_redis
+        _r = _get_redis()
+    except Exception:
+        _r = None
+    inflight_key = f"warm_inflight:{symbol}"
+    if _r is not None:
+        try:
+            existing_id = _r.get(inflight_key)
+            if existing_id:
+                existing_state = celery_app.AsyncResult(existing_id).state
+                if existing_state in ("PENDING", "STARTED", "RETRY"):
+                    task = celery_app.AsyncResult(existing_id)
+        except Exception:
+            pass
+    # A real "Run Backtest" click is the only thing that should ever occupy
+    # the single-concurrency backtest slot — don't let a background warm-up
+    # queue up behind/ahead of it. If nothing is already warming (no in-flight
+    # task to reuse) and a genuine backtest is running right now, skip warming
+    # entirely rather than competing for the slot.
+    if task is None and _real_backtest_active():
+        return {
+            "status": "skipped",
+            "queue": queue_name,
+            "message": "A backtest is currently running — skipping background cache warm.",
+        }
+
+    if task is None:
+        task = warm_backtest_cache_task.apply_async(
+            args=[warm_payload],
+            queue=queue_name,
+        )
+        if _r is not None:
+            try:
+                _r.set(inflight_key, task.id, ex=int(warm_timeout) + 30)
+            except Exception:
+                pass
 
     try:
         result = await asyncio.to_thread(task.get, timeout=warm_timeout, propagate=False)
@@ -672,11 +730,37 @@ async def queue_algotest_job(request: Request):
         except Exception as exc:
             logger.warning("Cache short-circuit failed, falling back to queue: %s", exc)
 
-    queue_name = _backtest_queue_for_payload(payload)
+    # Optional LAN remote-worker routing: if the UI's "Core:" picker selected a
+    # registered remote node, run this job on that node's dedicated queue
+    # instead of the local backtests/backtests_fast queue. Unset (default) is
+    # unchanged local behavior. See services/node_registry.py.
+    node_id = body.get("node_id") or None
+    if node_id:
+        # Staleness guard: don't route to a remote worker running a different
+        # code version than this box (mismatched image). See code_version.py.
+        from services import node_registry as _nr
+        if _nr.is_stale(node_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Worker {node_id} is running an outdated version and can't "
+                    "run this job. Update that PC's remote-worker image, or pick "
+                    "a different worker / Local."
+                ),
+            )
+        base_queue = _backtest_queue_for_payload(payload)
+        kind = "backtests_fast" if base_queue == "backtests_fast" else "backtests"
+        queue_name = f"{kind}@{node_id}"
+    else:
+        queue_name = _backtest_queue_for_payload(payload)
     queue_depth = _queue_depth(queue_name)
     payload["_client_ip"] = origin_ip
+    payload["node_id"] = node_id
     task = run_algotest_job.apply_async(args=[payload], queue=queue_name)
-    logger.info("[BACKTEST] queued job %s from ip=%s queue=%s", task.id[:8], origin_ip, queue_name)
+    if node_id:
+        from services import node_registry
+        node_registry.record_job_node(task.id, node_id)
+    logger.info("[BACKTEST] queued job %s from ip=%s queue=%s node=%s", task.id[:8], origin_ip, queue_name, node_id or "local")
     return {"status": "queued", "job_id": task.id, "queue": queue_name, "queue_depth": queue_depth}
 
 
@@ -844,8 +928,8 @@ async def cancel_algotest_job(job_id: str):
     except Exception as exc:
         logger.warning("Could not revoke backtest %s: %s", job_id, exc)
     try:
-        from services import memory_gate
-        memory_gate.release(job_id)
+        from services import memory_gate, node_registry
+        memory_gate.release(job_id, node_id=node_registry.get_job_node(job_id))
     except Exception as exc:
         logger.debug("memory_gate release on cancel failed: %s", exc)
     return {"status": "cancelled", "job_id": job_id}

@@ -92,6 +92,14 @@ def read_root():
 
 @app.get("/health")
 def health_check():
+    from scripts.prebuild_cache import is_warmup_complete
+    from fastapi.responses import JSONResponse
+    if not is_warmup_complete():
+        # Not ready yet (background cache warmup still running after startup) —
+        # 503 so Docker's own healthcheck AND the frontend's restart-overlay
+        # both correctly treat this container as not-yet-usable, not just
+        # "the HTTP process is listening".
+        return JSONResponse(status_code=503, content={"status": "warming"})
     return {"status": "ok"}
 
 

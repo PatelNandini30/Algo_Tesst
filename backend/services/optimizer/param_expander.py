@@ -214,6 +214,10 @@ def apply_combo(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dict[str, Any
 
 # Regex to match legs[N].strike_selection.value paths
 _STRIKE_VALUE_RE = re.compile(r"^legs\[(\d+)\]\.strike_selection\.value$")
+# Regex to match legs[N].strike_selection.straddle_multiplier / straddle_direction
+_STRADDLE_WIDTH_RE = re.compile(
+    r"^legs\[(\d+)\]\.strike_selection\.(straddle_multiplier|straddle_direction)$"
+)
 # _SPOT_ADJ_KEYS is defined above (near _GATED_PARAMS) so the gating rule can
 # reference it at module load.
 
@@ -237,6 +241,11 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
        midcap_spot_adjustment is a dict with enabled=True (the engine ignores it
        otherwise), and seed it BEFORE apply_combo so nested _set_by_path works
        even when the base payload had it null/disabled.
+
+    4. When `legs[N].strike_selection.straddle_multiplier` or
+       `.straddle_direction` is in the combo, also set
+       `legs[N].strike_selection.type = "straddle_width"` so both engines use
+       the swept width/direction (same pattern as the pct_of_atm case above).
     """
     midcap_sa_implied = any(str(k).startswith("midcap_spot_adjustment") for k in combo)
     if midcap_sa_implied and not isinstance((payload or {}).get("midcap_spot_adjustment"), dict):
@@ -266,6 +275,14 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
             current_type = get_by_path(new_payload, type_path, "")
             if str(current_type).lower() not in ("pct_of_atm", "percent_of_atm"):
                 _set_by_path(new_payload, type_path, "pct_of_atm")
+            continue
+        m = _STRADDLE_WIDTH_RE.match(path)
+        if m:
+            leg_idx = int(m.group(1))
+            type_path = f"legs[{leg_idx}].strike_selection.type"
+            current_type = get_by_path(new_payload, type_path, "")
+            if str(current_type).lower() != "straddle_width":
+                _set_by_path(new_payload, type_path, "straddle_width")
 
     return new_payload
 

@@ -154,6 +154,11 @@ fn atm_offset_strike(
 #[derive(Debug, Clone)]
 enum StrikeSel {
     Fixed(String),                  // ATM, ITM1..N, OTM1..N
+    // Strike defined RELATIVE to an earlier leg's resolved strike:
+    //   wing = parent_strike ± offset*interval  (+ for CALL, − for PUT).
+    // `ref_leg` is the 1-based leg number (== leg_id) of the parent, which
+    // MUST appear before this leg. Powers Iron Condor / vertical-spread wings.
+    RelToLeg { ref_leg: i64, offset: f64 },
     PctOfAtm { value: f64, direction: String },  // e.g. 0.5% OTM
     AtmStraddlePremPct(f64),        // value in percent — uses ATM straddle premium
     StraddleWidth { multiplier: f64, direction: String },
@@ -202,6 +207,16 @@ fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
         // Treat any token starting with ATM/ITM/OTM as a direct Fixed selector.
         m if m.starts_with("atm") || m.starts_with("itm") || m.starts_with("otm") => {
             Some(StrikeSel::Fixed(mode.to_uppercase()))
+        }
+        "rel_leg" => {
+            let ref_leg = sel
+                .get_item("ref_leg").ok().flatten()
+                .and_then(|v| v.extract::<i64>().ok())
+                .unwrap_or(0);
+            Some(StrikeSel::RelToLeg {
+                ref_leg,
+                offset: read_f64("offset").unwrap_or(0.0),
+            })
         }
         "pct_of_atm" => Some(StrikeSel::PctOfAtm {
             value: read_f64("value").unwrap_or(0.0),
@@ -471,6 +486,68 @@ fn pick_by_premium<'a>(
     })
 }
 
+/// Joint CE+PE liquidity validation/shift — used ONLY for `straddle_width`
+/// legs, which share the same requested strike across CE and PE by design
+/// (see `StrikeSel::StraddleWidth`). If either side is illiquid there, BOTH
+/// legs must shift TOGETHER to the first strike where CE AND PE are
+/// simultaneously tradeable — never leaving one leg alone at the original
+/// strike while the other moves elsewhere. Mirrors `validate_or_shift_strike`
+/// but the acceptance test is joint rather than per-option-type.
+fn validate_or_shift_straddle_strike(
+    strike: f64,
+    atm: f64,
+    interval: f64,
+    entry_date: &str,
+    expiry: &str,
+    index: &str,
+) -> Option<(f64, i32)> {
+    use crate::OptionDataStatus;
+    let is_tradeable = |s: f64, opt_type: &str| -> bool {
+        matches!(
+            crate::lookup_option_status(entry_date, index, s, opt_type, expiry),
+            OptionDataStatus::Tradeable(px) if px > 0.0
+        )
+    };
+    let is_joint_tradeable = |s: f64| -> bool { is_tradeable(s, "CE") && is_tradeable(s, "PE") };
+
+    if is_joint_tradeable(strike) {
+        return Some((strike, 0));
+    }
+
+    let direction: f64 = if strike > atm + 1e-6 {
+        -1.0
+    } else if strike < atm - 1e-6 {
+        1.0
+    } else {
+        // Requested strike IS atm and jointly illiquid — no single CE/PE-
+        // favored direction applies to both legs, so walk outward alternating
+        // +/- until a jointly-liquid strike is found.
+        let mut step = 1i32;
+        while step <= 500 {
+            for candidate in [strike + (step as f64) * interval, strike - (step as f64) * interval] {
+                if candidate > 0.0 && is_joint_tradeable(candidate) {
+                    return Some((candidate, step));
+                }
+            }
+            step += 1;
+        }
+        return None;
+    };
+
+    let dist = ((strike - atm).abs() / interval).round() as i32;
+    let max_walk = dist.max(1);
+    for step in 1..=max_walk {
+        let candidate = strike + direction * (step as f64) * interval;
+        if candidate <= 0.0 {
+            break;
+        }
+        if is_joint_tradeable(candidate) {
+            return Some((candidate, step));
+        }
+    }
+    None
+}
+
 /// Validate that `strike` has a tradeable contract on `entry_date` for the
 /// given (expiry, opt_type).  If the contract has zero turnover (stale close
 /// price), walk TOWARD ATM by `strike_interval` until a tradeable strike is
@@ -571,6 +648,7 @@ fn compute_strike_for_leg(
     index: &str,
     entry_spot: f64,
     strike_shift_max: i32,
+    resolved: &HashMap<i64, f64>,
 ) -> Option<(f64, f64)> {
     let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
     let is_call = leg.option_type.eq_ignore_ascii_case("CE")
@@ -580,6 +658,16 @@ fn compute_strike_for_leg(
     let computed: Option<f64> = match &leg.strike {
         StrikeSel::Fixed(sel) => {
             atm_offset_strike(entry_spot, leg.strike_interval, sel, &leg.option_type)
+        }
+        StrikeSel::RelToLeg { ref_leg, offset } => {
+            // Wing strike = parent leg's ALREADY-RESOLVED strike shifted by
+            // `offset` gaps in the leg's OTM direction (+ for CALL / − for PUT),
+            // matching the ITM/OTM convention. `resolved` holds the final
+            // (post zero-turnover-shift) strike of every earlier leg in THIS
+            // trade, keyed by 1-based leg number. Missing parent → skip leg.
+            let parent = *resolved.get(ref_leg)?;
+            let shift = offset * leg.strike_interval;
+            Some(if is_call { parent + shift } else { parent - shift })
         }
         StrikeSel::PctOfAtm { value, direction } => {
             // Match Python exactly. Semantic directions (OTM/ITM) are moneyness
@@ -651,7 +739,11 @@ fn compute_strike_for_leg(
             pick_by_premium(&qualifying, *upper, atm, is_call).map(|(s, _)| *s)
         }
         StrikeSel::StraddleWidth { multiplier, direction } => {
-            // shift = multiplier × (ATM CE + ATM PE), then snap.
+            // shift = multiplier × (ATM CE + ATM PE), then snap. direction is a
+            // raw +/- sign applied identically to every leg — "+" always adds
+            // the shift to ATM, "-" always subtracts — regardless of the leg's
+            // option_type or Buy/Sell (both legs of a straddle land on the
+            // same strike for the same direction setting; no CE/PE mirroring).
             let ce = lookup_option_price(entry_date, index, atm, "CE", expiry)?;
             let pe = lookup_option_price(entry_date, index, atm, "PE", expiry)?;
             let shift = *multiplier * (ce + pe);
@@ -676,10 +768,17 @@ fn compute_strike_for_leg(
     // Strike-shift fallback for zero-turnover contracts: walk TOWARD ATM
     // until a liquid strike is found (capped at ATM itself). Always-on; the
     // legacy `strike_shift_max` arg is retained for ABI compat but ignored.
-    let (final_strike, _shift_steps) = validate_or_shift_strike(
-        raw_strike, atm, leg.strike_interval, is_call,
-        entry_date, expiry, index, &leg.option_type, strike_shift_max,
-    )?;
+    // straddle_width legs share the same requested strike across CE/PE, so
+    // they use the JOINT liquidity walk (both must move together) instead of
+    // the per-option-type one every other mode uses.
+    let (final_strike, _shift_steps) = if matches!(leg.strike, StrikeSel::StraddleWidth { .. }) {
+        validate_or_shift_straddle_strike(raw_strike, atm, leg.strike_interval, entry_date, expiry, index)?
+    } else {
+        validate_or_shift_strike(
+            raw_strike, atm, leg.strike_interval, is_call,
+            entry_date, expiry, index, &leg.option_type, strike_shift_max,
+        )?
+    };
     Some((final_strike, raw_strike))
 }
 
@@ -701,7 +800,7 @@ fn compute_strike_for_leg(
 /// the empty result and fall back to the Python engine.
 ///
 /// Currently supported:
-///   * Strike modes: ATM, ITM1..N, OTM1..N, pct_of_atm
+///   * Strike modes: ATM, ITM1..N, OTM1..N, pct_of_atm, rel_leg (Iron Condor wing)
 ///   * Single or multi-leg strategies with same entry/exit DTE
 ///   * Slippage
 /// Not yet supported (caller falls back to Python):
@@ -797,13 +896,15 @@ pub fn resolve_trade_specs(
             // strategy run on the first missing strike (NSE data hole) and
             // forced the slower Python engine fallback for ALL combos.
             let mut leg_dicts: Vec<&PyDict> = Vec::with_capacity(legs.len());
+            let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(legs.len());
             for (leg_idx, leg) in legs.iter().enumerate() {
                 let (strike, requested_strike) = match compute_strike_for_leg(
-                    leg, entry_date, leg_expiry, &index, entry_spot, strike_shift_max,
+                    leg, entry_date, leg_expiry, &index, entry_spot, strike_shift_max, &resolved,
                 ) {
                     Some(v) => v,
                     None => continue 'rollover_trade,
                 };
+                resolved.insert((leg_idx + 1) as i64, strike);
                 let d = PyDict::new(py);
                 d.set_item("trade_id", *trade_id)?;
                 d.set_item("leg_id", (leg_idx + 1) as i64)?;
@@ -853,11 +954,13 @@ pub fn resolve_trade_specs(
         // Skip the trade (not the whole strategy) when a strike is missing —
         // matches the Python engine's per-trade tolerance for NSE data holes.
         let mut leg_dicts: Vec<&PyDict> = Vec::with_capacity(legs.len());
+        let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(legs.len());
         for (leg_idx, leg) in legs.iter().enumerate() {
-            let (strike, requested_strike) = match compute_strike_for_leg(leg, &entry_date, expiry, &index, entry_spot, strike_shift_max) {
+            let (strike, requested_strike) = match compute_strike_for_leg(leg, &entry_date, expiry, &index, entry_spot, strike_shift_max, &resolved) {
                 Some(v) => v,
                 None => continue 'dte_trade,
             };
+            resolved.insert((leg_idx + 1) as i64, strike);
             let d = PyDict::new(py);
             d.set_item("trade_id", trade_id)?;
             d.set_item("leg_id", (leg_idx + 1) as i64)?;

@@ -1080,6 +1080,70 @@ def _validate_or_shift_strike_python(
     return None
 
 
+def _validate_or_shift_straddle_strike_python(
+    strike: float,
+    atm: float,
+    interval: float,
+    entry_date: Optional[str],
+    expiry: Optional[str],
+    index: Optional[str],
+) -> Optional[float]:
+    """Joint CE+PE liquidity validation/shift for straddle_width legs — mirrors
+    Rust validate_or_shift_straddle_strike. Both legs share the same requested
+    strike; if either side is illiquid there, BOTH move together to the first
+    strike where CE AND PE are simultaneously tradeable."""
+    if not (entry_date and expiry and index):
+        return strike
+    try:
+        import algotest_native  # type: ignore
+    except ImportError:
+        return strike
+
+    def _tradeable(s: float, opt_type: str) -> bool:
+        fn = getattr(algotest_native, "get_option_status", None)
+        if fn is not None:
+            try:
+                return (fn(entry_date, index, s, opt_type, expiry) or "missing") == "tradeable"
+            except Exception:
+                return False
+        try:
+            px = algotest_native.get_option_price(entry_date, index, s, opt_type, expiry)
+            return px is not None and px > 0
+        except Exception:
+            return False
+
+    def _joint_ok(s: float) -> bool:
+        return _tradeable(s, "CE") and _tradeable(s, "PE")
+
+    if _joint_ok(strike):
+        return strike
+
+    if strike > atm + 1e-6:
+        direction = -1.0
+    elif strike < atm - 1e-6:
+        direction = 1.0
+    else:
+        # Requested strike IS atm and jointly illiquid — no single CE/PE-
+        # favored direction applies to both legs; walk outward alternating.
+        step = 1
+        while step <= 500:
+            for cand in (strike + step * interval, strike - step * interval):
+                if cand > 0 and _joint_ok(cand):
+                    return cand
+            step += 1
+        return None
+
+    dist = int(round(abs(strike - atm) / interval))
+    max_walk = max(dist, 1)
+    for step in range(1, max_walk + 1):
+        cand = strike + direction * step * interval
+        if cand <= 0:
+            break
+        if _joint_ok(cand):
+            return cand
+    return None
+
+
 def _compute_strike_for_leg_python(
     leg: Dict[str, Any],
     entry_spot: float,
@@ -1090,6 +1154,7 @@ def _compute_strike_for_leg_python(
     index: Optional[str] = None,
     strike_shift_max: int = 1,
     out_info: Optional[Dict[str, Any]] = None,
+    resolved_strikes: Optional[Dict[int, float]] = None,
 ) -> Optional[float]:
     """
     Python mirror of simulate.rs::compute_strike_for_leg.
@@ -1144,6 +1209,22 @@ def _compute_strike_for_leg_python(
                 return None
             return _validate(atm + n * interval if is_ce else atm - n * interval)
         return None
+
+    if sel_type == "rel_leg":
+        # Relative-to-leg (Iron Condor wing). Mirror of Rust StrikeSel::RelToLeg:
+        #   wing = parent_strike + offset*interval (CALL) / − (PUT).
+        # `resolved_strikes` maps 1-based leg number → that leg's final strike;
+        # the parent MUST be an earlier leg (resolved before this one).
+        try:
+            ref = int(sel.get("ref_leg") or 0)
+            off = float(sel.get("offset") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        parent = (resolved_strikes or {}).get(ref)
+        if parent is None:
+            return None
+        shift = off * interval
+        return _validate(parent + shift if is_ce else parent - shift)
 
     if sel_type == "pct_of_atm":
         try:
@@ -1216,8 +1297,17 @@ def _compute_strike_for_leg_python(
             mult = float(sel.get("straddle_multiplier") or 0.5)
             direction = str(sel.get("straddle_direction") or "+").strip()
             shift = mult * (float(ce_px) + float(pe_px))
+            # Raw +/- sign applied identically regardless of option_type: "+"
+            # always adds the shift, "-" always subtracts. Both legs of a
+            # straddle land on the same strike for the same direction.
             raw = atm - shift if direction == "-" else atm + shift
-            return round(raw / interval) * interval
+            req = round(raw / interval) * interval
+            if out_info is not None:
+                out_info["requested_strike"] = float(req)
+            # Joint CE+PE liquidity walk (not the generic per-leg _validate):
+            # both legs share this requested strike, so if either side is
+            # illiquid, BOTH must shift together to a strike liquid for both.
+            return _validate_or_shift_straddle_strike_python(req, atm, interval, entry_date, expiry, index)
         else:  # atm_straddle_prem_pct
             pct = float(sel.get("value") or 0.0)
             target = (pct / 100.0) * (float(ce_px) + float(pe_px))
@@ -1369,6 +1459,7 @@ def _build_fixed_entry_specs(
 
             _trade_specs: List[Dict[str, Any]] = []
             _trade_resolved = True
+            _resolved_strikes: Dict[int, float] = {}
             for leg_idx, leg in enumerate(legs_src):
                 if not isinstance(leg, dict):
                     return None
@@ -1398,7 +1489,7 @@ def _build_fixed_entry_specs(
                 strike = _compute_strike_for_leg_python(
                     leg, entry_spot, leg_interval,
                     entry_date=current_entry, expiry=leg_expiry, index=index_str,
-                    out_info=_shift_info,
+                    out_info=_shift_info, resolved_strikes=_resolved_strikes,
                 )
                 if strike is None:
                     # Strike unresolvable on this date — e.g. the requested strike
@@ -1409,6 +1500,7 @@ def _build_fixed_entry_specs(
                     # Python engine, which drops an unpriceable trade and continues.
                     _trade_resolved = False
                     break
+                _resolved_strikes[leg_idx + 1] = float(strike)
                 _trade_specs.append({
                     "trade_id": trade_id,
                     "leg_id": leg_idx + 1,
@@ -1581,6 +1673,7 @@ def _build_next_expiry_specs(
         # WHOLE cycle rather than emitting a partial trade.
         _trade_specs: List[Dict[str, Any]] = []
         _skip_trade = False
+        _resolved_strikes: Dict[int, float] = {}
         for leg_idx, (leg, is_next) in enumerate(zip(legs_src, leg_is_next)):
             if is_next:
                 if contract_exp is None:
@@ -1601,7 +1694,7 @@ def _build_next_expiry_specs(
             strike = _compute_strike_for_leg_python(
                 leg, entry_spot, leg_interval,
                 entry_date=entry_date, expiry=per_leg_expiry, index=index_str,
-                out_info=_shift_info,
+                out_info=_shift_info, resolved_strikes=_resolved_strikes,
             )
             if strike is None:
                 # Unresolvable strike for THIS cycle — most commonly the Ek+2
@@ -1611,6 +1704,7 @@ def _build_next_expiry_specs(
                 # that need data params still resolve normally when present.
                 _skip_trade = True
                 break
+            _resolved_strikes[leg_idx + 1] = float(strike)
             _trade_specs.append({
                 "trade_id": trade_id,
                 "leg_id": leg_idx + 1,
@@ -1731,8 +1825,12 @@ def _apply_min_days_filter(
                 # Subsequent trades — keep unmodified
                 kept_tids.add(tid)
 
-    # Rebuild specs list with entry_date overrides (and recomputed strikes)
+    # Rebuild specs list with entry_date overrides (and recomputed strikes).
+    # Per-trade resolved-strike buffer so a Relative-to-Leg wing re-offsets from
+    # its parent's recomputed strike at the shifted entry. Specs are in leg order
+    # within a trade, so a parent (lower leg_id) is resolved before its wing.
     result: List[Dict[str, Any]] = []
+    _md_resolved_by_tid: Dict[int, Dict[int, float]] = {}
     for s in specs:
         tid = int(s.get("trade_id", 0))
         if tid not in kept_tids:
@@ -1746,13 +1844,15 @@ def _apply_min_days_filter(
             leg = legs_src[leg_idx] if 0 <= leg_idx < len(legs_src) else {}
             spec_expiry = _normalize_iso(s.get("expiry"))
             _shift_info: Dict[str, Any] = {}
+            _md_rb = _md_resolved_by_tid.setdefault(tid, {})
             new_strike = _compute_strike_for_leg_python(
                 leg, new_spot, interval,
                 entry_date=new_entry, expiry=spec_expiry, index=index_str,
-                out_info=_shift_info,
+                out_info=_shift_info, resolved_strikes=_md_rb,
             )
             if new_strike is None:
                 return None  # Strike not resolvable — Python fallback
+            _md_rb[int(s.get("leg_id", 1))] = float(new_strike)
             s = dict(s)
             s["entry_date"] = new_entry
             s["strike"] = float(new_strike)
@@ -2376,7 +2476,12 @@ def run_rust_engine_pipeline(
     # returning zero trades. (Cache load happens in algotest_job before this call;
     # this catches the edge case where the feather was deleted and rebuild failed.)
     if not algotest_native.is_loaded():
-        logger.warning("[ENGINE_RUST] Rust cache not loaded — falling back to Python engine")
+        # No caller in this codebase actually falls back to Python (Rust-only
+        # rule) — returning None here means the caller rejects this payload
+        # (raises/hard-fails for the optimizer, returns None/no-result for a
+        # regular backtest). This just signals "cache wasn't ready," not that
+        # any Python computation happens next.
+        logger.warning("[ENGINE_RUST] Rust cache not loaded — rejecting payload (no Python fallback exists)")
         return None
 
     # Sorted expiry list used by NEXT_WEEKLY and LAZY_LEG expiry resolution.
@@ -3205,7 +3310,10 @@ def run_rust_engine_pipeline(
                         spot_adj_direction, spot_adj_pct, spot_adj_units,
                         trading_days, spot_by_date,
                     )
-                for _f_leg in _f_legs:
+                # leg_id order so a Relative-to-Leg wing anchors off its parent's
+                # re-anchored strike at this cascade date.
+                _f_resolved: Dict[int, float] = {}
+                for _f_leg in sorted(_f_legs, key=lambda _l: int(_l["leg_id"])):
                     _f_src = (
                         legs_src[_f_leg["leg_id"] - 1]
                         if 0 <= _f_leg["leg_id"] - 1 < len(legs_src) else {}
@@ -3222,8 +3330,10 @@ def run_rust_engine_pipeline(
                         _f_src, float(_f_spot), _f_si,
                         entry_date=_f_cur, expiry=_normalize_iso(_f_leg["expiry"]),
                         index=_fix4_index, out_info=_f_info,
+                        resolved_strikes=_f_resolved,
                     )
                     if _f_strk is not None:
+                        _f_resolved[int(_f_leg["leg_id"])] = float(_f_strk)
                         _fix4_anchor.setdefault(_f_cur, {})[int(_f_leg["leg_id"])] = float(_f_strk)
                 if not _fix4_ok:
                     break
@@ -3589,10 +3699,17 @@ def run_rust_engine_pipeline(
                 if spot is None:
                     break
                 _shift_info: Dict[str, Any] = {}
+                # A Relative-to-Leg wing re-enters relative to its parent short's
+                # strike. In per-leg re-entry only THIS leg re-enters; the parent
+                # short is unchanged, so offset from its ORIGINAL trade strike.
+                _re_resolved = {
+                    int(_l["leg_id"]): float(_l["strike"])
+                    for _l in legs if _l.get("strike") is not None
+                }
                 new_strike = _compute_strike_for_leg_python(
                     leg_src, float(spot), strike_interval,
                     entry_date=current_trig, expiry=parent_expiry, index=index_str,
-                    out_info=_shift_info,
+                    out_info=_shift_info, resolved_strikes=_re_resolved,
                 )
                 if new_strike is None:
                     break  # Strike not resolvable — skip this re-entry chain
@@ -3830,7 +3947,11 @@ def run_rust_engine_pipeline(
                 # longer leaves a gap to the next scheduled trade.
                 _bt_sl_reentry_from = None
 
-                for _btl in _bt_legs:
+                # Resolve legs in leg_id order so a Relative-to-Leg wing sees its
+                # parent's re-anchored strike (Iron Condor wings re-offset from the
+                # short's new bridge strike).
+                _bt_resolved: Dict[int, float] = {}
+                for _btl in sorted(_bt_legs, key=lambda _l: int(_l["leg_id"])):
                     _btl_src = (
                         legs_src[_btl["leg_id"] - 1]
                         if 0 <= _btl["leg_id"] - 1 < len(legs_src)
@@ -3852,9 +3973,11 @@ def run_rust_engine_pipeline(
                         expiry=_normalize_iso(_btl["expiry"]),
                         index=index_str,
                         out_info=_btl_shift_info,
+                        resolved_strikes=_bt_resolved,
                     )
                     if _btl_strike is None:
                         return None  # Strike unresolvable — Python fallback
+                    _bt_resolved[int(_btl["leg_id"])] = float(_btl_strike)
 
                     _btl_spec = {
                         "trade_id": _bt_cycle_tid,
@@ -4408,7 +4531,10 @@ def run_rust_engine_pipeline(
                     )
 
                     mini_specs: List[Dict[str, Any]] = []
-                    for _sa_leg in orig_legs_s:
+                    # leg_id order so a Relative-to-Leg wing re-offsets from the
+                    # short's NEW spot-adjusted strike (Iron Condor wing follows).
+                    _sa_resolved: Dict[int, float] = {}
+                    for _sa_leg in sorted(orig_legs_s, key=lambda _l: int(_l.get("leg_id") or 1)):
                         _sa_lidx = int(_sa_leg.get("leg_id") or 1) - 1
                         _sa_leg_src = legs_src[_sa_lidx] if _sa_lidx < len(legs_src) else {}
                         # Per-leg strike_interval override (e.g. user sets 100 for NIFTY).
@@ -4431,11 +4557,12 @@ def run_rust_engine_pipeline(
                         _sa_strike = _compute_strike_for_leg_python(
                             _sa_leg_src, _sa_spot, _sa_leg_interval,
                             entry_date=_sa_cur_entry, expiry=orig_expiry, index=_sa_index,
-                            out_info=_sa_strike_info,
+                            out_info=_sa_strike_info, resolved_strikes=_sa_resolved,
                         ) or float(_sa_leg.get("strike") or 0.0)
                         if not _sa_strike:
                             continue
                         _sa_lid = int(_sa_leg.get("leg_id") or 1)
+                        _sa_resolved[_sa_lid] = float(_sa_strike)
                         mini_specs.append({
                             "trade_id":     _sa_new_tid,
                             "leg_id":       _sa_lid,

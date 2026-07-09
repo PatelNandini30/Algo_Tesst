@@ -41,15 +41,20 @@
 #   worker-uploads                 :  500M
 #   frontend                       :  200M
 #   ───────────────────────────────────────
-#   Sum (default stack)            : 17,400M   (+10,000M when worker-optimize active)
+#   Sum (default stack)            : 17,400M   (+13,000M when worker-optimize active)
 #   Host RAM                       : ~15,160M (14.8 GiB)
 #   → The default stack overcommits modestly; the optimize worker (profile-gated)
-#     adds 10,000M when running 2 concurrent optimize jobs (concurrency=2, P=3).
+#     adds 13,000M when running 3 concurrent optimize jobs (concurrency=3, P=2;
+#     raised from 2 jobs / 10,000M on 2026-07-04 at the user's request).
 #     This deliberately overcommits 16 GB onto the 24 GB NVMe swap. The memory
-#     ADMISSION GATE (HEAVY_MEMORY_BUDGET_MB=14000) bounds total ACTIVE heavy
-#     work — 2 optims + 1 backtest run together, a 4th heavy job QUEUES — so the
+#     ADMISSION GATE (HEAVY_MEMORY_BUDGET_MB=19000) bounds total ACTIVE heavy
+#     work — 3 optims (3×4500=13,500) + 1 backtest (5000) = 18,500 all run
+#     together; a 2nd concurrent backtest QUEUES — so the
 #     overcommit can never exhaust RAM+swap (no OOM). All workers mmap-SHARE one
 #     copy of the OHLC feather, so real RAM is far below the per-container sums.
+#     (concurrency=3 is the hard cap on simultaneous optimize jobs; a 4th waits
+#     in the 'optimize' queue. A heartbeat WATCHDOG auto-cancels any job stuck
+#     with no progress >OPTIMIZE_STUCK_SECONDS — see services/optimizer/watchdog.py.)
 #     (Intraday is a separate product — its workers/api + the intraday-only
 #     cron-warmup were removed, reclaiming ~4.5 GB for this headroom.)
 #
@@ -59,6 +64,19 @@
 #   - shared_buffers=512MB / effective_cache_size=2GB  (kept modest — only 16 GB RAM)
 #   - work_mem=32MB, max_parallel_workers=2  (kept low to protect the RAM budget,
 #     not because of disk — CPU now has 20 threads to spare)
+#
+# *** LAN REMOTE WORKERS (added 2026-07): other in-house PCs can run the
+#   remote-worker/ package (a Celery worker container joining THIS box's
+#   Redis broker + Postgres over the LAN) to contribute their own separate
+#   CPU/RAM to optimize/backtest jobs. See services/node_registry.py and
+#   services/memory_gate.py (per-node budget — a remote node's memory-gate
+#   budget comes from ITS OWN reported RAM, not this box's HEAVY_MEMORY_BUDGET_MB,
+#   so remote jobs never compete with the local budget above). Redis/Postgres
+#   already publish on 0.0.0.0 below, so no networking change was needed here —
+#   only max_connections was raised (50→100) for the extra worker pools, which
+#   is a negligible (~KB range) memory cost and does NOT change the RAM budget
+#   math above. No auth was added (trusted in-house LAN, by user's explicit
+#   choice) — do not expose these ports outside the LAN.
 # ============================================================
 
 x-backend-env: &backend-env
@@ -106,14 +124,17 @@ x-backend-env: &backend-env
   # until a running job releases its slot. Idle warm caches page to SSD swap and
   # don't count. Pure orchestration — see services/memory_gate.py (no math touched).
   HEAVY_MEMORY_GATE: "1"
-  # Sized for: 2 concurrent optimize jobs (@ ~4500 each, P=3) + 1 backtest (5000)
-  # = 14000, so a backtest never queues behind optims. The gate still QUEUES a
-  # 4th heavy job (no overcommit); 24 GB NVMe swap is the final backstop. Real
-  # RAM is well under 14000 because all workers mmap-SHARE one copy of the OHLC
-  # feather (only the per-job f32 AHashMap ~2.6 GB is duplicated).
-  HEAVY_MEMORY_BUDGET_MB: "14000"
+  # Sized for: 3 concurrent optimize jobs (@ ~4500 each, P=2) = 13500 PLUS one
+  # backtest (5000) = 18500 ≤ 19000, so a backtest can ALWAYS run alongside the
+  # 3 optims (it never queues behind them). The hard cap on simultaneous optims
+  # is the worker's concurrency=3, not the gate. A *second* concurrent backtest
+  # (→23500) would queue — acceptable. 24 GB NVMe swap is the final backstop;
+  # real RAM is well under 18500 because all workers mmap-SHARE one copy of the
+  # OHLC feather (only the per-job f32 AHashMap ~2.6 GB is duplicated). Raised
+  # 14000→19000 on 2026-07-04 so 3 optims + 1 backtest coexist per user request.
+  HEAVY_MEMORY_BUDGET_MB: "19000"
   HEAVY_COST_BACKTEST_MB: "5000"
-  HEAVY_COST_OPTIMIZE_MB: "4500"          # one optimize job at P=3 (was 6000 at P=6)
+  HEAVY_COST_OPTIMIZE_MB: "4500"          # one optimize job at P=2 (was 6000 at P=6)
   HEAVY_GATE_WAIT_MAX_SECONDS: "600"      # then proceed anyway (SSD swap backstop)
   HEAVY_RESERVATION_TTL_SECONDS: "2400"   # auto-reclaim a crashed/cancelled slot
   # Route small ranges to a separate worker so they do not wait behind a long run.
@@ -152,7 +173,7 @@ services:
     shm_size: '512mb'
     command: >
       postgres
-      -c max_connections=50
+      -c max_connections=100
       -c shared_buffers=512MB
       -c effective_cache_size=2GB
       -c work_mem=32MB
@@ -194,7 +215,7 @@ services:
       --save ""
       --appendonly no
       --tcp-keepalive 60
-      --timeout 300
+      --timeout 0
     environment:
       REDIS_PASSWORD: ""
     ports:
@@ -361,33 +382,34 @@ services:
     # Shares the same image as worker-backtests; runs an exclusive 'optimize' queue
     # so long parameter sweeps don't block normal backtests.
     #
-    # concurrency=2: TWO optimize jobs at a time (results stay isolated per
+    # concurrency=3: THREE optimize jobs at a time (results stay isolated per
     # job_id — separate processes, separate optim:{job_id}:* keys + trade dirs).
-    # In-job parallelism HALVED to OPTIMIZE_PARALLELISM=3 so 2 jobs ≈ the CPU of
-    # one old P=6 job. Per-job memory at P=3 (billiard fork + CoW sharing):
-    #   - Rust AHashMap (f32): ~2.6 GB  (per JOB — duplicated across the 2 jobs)
+    # In-job parallelism = OPTIMIZE_PARALLELISM=2 so 3 jobs ≈ the same ~6
+    # combos-in-flight as the old 2×3 config (CPU-neutral). Per-job memory at
+    # P=2 (billiard fork + CoW sharing):
+    #   - Rust AHashMap (f32): ~2.6 GB  (per JOB — duplicated across the 3 jobs)
     #   - pandas ohlc_df_pandas: ~75 MB (CoW-inherited by workers)
     #   - Python/Celery overhead: ~500 MB
-    #   - 3 workers × ~400 MB private pages: ~1.2 GB
-    #   - Per job ≈ 4.3 GB → 2 jobs ≈ 8.6 GB (OHLC feather is mmap-shared, +~0.5)
-    # mem_limit raised to 10000M to hold both jobs (clean mmap pages reclaim
-    # first under pressure; cgroup won't OOM a job). Host impact when both run:
-    # ~9.5 GB optimizer + backtest (shares the OHLC mmap) + ~3 GB desktop +
-    # the separate intraday server — overcommits 16 GB onto the 24 GB NVMe swap;
-    # the memory gate caps total ACTIVE heavy work so it can never exhaust swap.
+    #   - 2 workers × ~400 MB private pages: ~0.8 GB
+    #   - Per job ≈ 3.9 GB → 3 jobs ≈ 11.7 GB (OHLC feather is mmap-shared, +~0.5)
+    # mem_limit 13000M holds all three (clean mmap pages reclaim + anonymous
+    # spill to the 24 GB NVMe swap under pressure; cgroup won't OOM a job). The
+    # memory gate + concurrency=3 cap total ACTIVE heavy work so it can never
+    # exhaust swap. Runs under the idle-aware reload supervisor (see command).
+    # A heartbeat watchdog auto-cancels any job stuck with no progress.
     profiles: ["optimize"]
     image: algotest-backend-app:latest
     container_name: algotest-worker-optimize
     restart: unless-stopped
-    command: >
-      celery -A worker.celery worker
-      --queues=optimize
-      --concurrency=2
-      -l info
-      --max-memory-per-child=5000000
-      --without-gossip
-      --without-mingle
-      --without-heartbeat
+    # Run under the idle-aware hot-reload supervisor (worker/dev_supervisor.py):
+    # it launches the Celery worker below and, when a bind-mounted *.py changes,
+    # restarts the worker ONLY while it is idle — new runs pick up new code with
+    # NO image rebuild, and an actively-running job is never disturbed. The real
+    # Celery command lives in RELOAD_CHILD_CMD.
+    command:
+      - python
+      - -m
+      - worker.dev_supervisor
     environment:
       <<: *backend-env
       # PYTHONOPTIMIZE=1 (override): the base image sets =2 (strips docstrings)
@@ -399,10 +421,52 @@ services:
       PYTHONOPTIMIZE: "1"
       BACKTEST_WORKERS: "1"
       OPTIMIZE_MAX_COMBOS: "100000"
-      # P=3: 3 billiard fork workers share the Rust AHashMap via CoW.
-      # Halved from 6 so 2 concurrent jobs (concurrency=2) use roughly the CPU/RAM
-      # of one old P=6 job. Each worker adds ~400 MB private pages.
-      OPTIMIZE_PARALLELISM: "3"
+      # SOLO CEILING (full-box parallelism when ONE optim runs). The runner
+      # (services/optimizer/runner.py) treats this as the max and DYNAMICALLY
+      # divides it by the number of optims computing right now (live-optim
+      # registry in result_store.py):
+      #     1 optim live  -> P=6  (all 12 cpus: 6 combos × RUST_SIM_THREADS=2)
+      #     2 optims live -> P=3 each (6 cpus each, 12 total — no oversubscribe)
+      # So a lone optim gets the whole box for max speed, but two never exceed
+      # the single-optim CPU/RAM envelope. concurrency=2 caps optims at 2, so P
+      # is only ever 6 or 3. Memory (feather ~2.6 GB is mmap-SHARED across all
+      # workers of all optims via the OS page cache; only ~0.5 GB parent +
+      # ~0.7 GB/worker is private): 1×P6 ≈ 7.6 GB, 2×P3 ≈ 8.1 GB — both under
+      # the 13 GB limit, leaving room for a concurrent backtest (~2.6 GB) with
+      # no OOM. Re-tuned 2026-07-06 for "max 2 optims, full speed when alone,
+      # dynamic split when two, never OOM" (per user).
+      OPTIMIZE_PARALLELISM: "6"
+      # Inline finalization OFF: doing patchwise XLSX + metrics + WOW/MOM per
+      # combo across many parallel workers saturates RAM/CPU (36x sweep inflation)
+      # — build them once at finalization instead.
+      OPTIMIZE_INLINE_FINALIZE: "0"
+      # ── Stuck-job watchdog (services/optimizer/watchdog.py) ──────────────────
+      # Runs as a daemon thread in THIS worker (guard = OPTIMIZE_WATCHDOG). It
+      # auto-cancels any optimize job whose progress heartbeat freezes for
+      # >OPTIMIZE_STUCK_SECONDS (a real hang) — a job that is still progressing
+      # is never touched. This is what guarantees the 2026-07-04 6h finalization
+      # hang can never recur. Checked every OPTIMIZE_WATCHDOG_INTERVAL seconds.
+      OPTIMIZE_WATCHDOG: "1"
+      OPTIMIZE_STUCK_SECONDS: "9000"        # 2.5h with no progress → cancel
+      OPTIMIZE_WATCHDOG_INTERVAL: "300"     # scan every 5 min
+      # ── Idle-aware hot reload (worker/dev_supervisor.py) ─────────────────────
+      # The supervisor (container command) runs this Celery worker and restarts
+      # it when bind-mounted code changes, but only while idle. concurrency=2 =
+      # at most TWO optimize jobs at once (results isolated per job_id); the
+      # dynamic P split (OPTIMIZE_PARALLELISM above) keeps two from thrashing
+      # CPU or RAM. A 3rd queued optim waits for a free slot.
+      RELOAD_ENABLE: "1"
+      RELOAD_WATCH_DIR: "/app"
+      RELOAD_POLL_SECONDS: "3"
+      RELOAD_CHILD_CMD: >-
+        celery -A worker.celery worker
+        --queues=optimize
+        --concurrency=2
+        -l info
+        --max-memory-per-child=5000000
+        --without-gossip
+        --without-mingle
+        --without-heartbeat
       # Keep MAE/MFE enabled so optimizer master-summary "Actual Live DD"
       # matches the downloaded tradesheet Summary sheet. If disabled, optimizer
       # summary falls back to booked DD/%DD while tradesheet downloads are
@@ -421,7 +485,7 @@ services:
       # are no dead inherited threads. RAYON_NUM_THREADS is intentionally
       # unset; the global rayon pool is never used by the engine.
       POLARS_MAX_THREADS: "1"
-      RUST_SIM_THREADS: "4"
+      RUST_SIM_THREADS: "2"
     user: "0:0"
     volumes: *backend-volumes
     depends_on:
@@ -438,13 +502,16 @@ services:
     deploy:
       resources:
         limits:
-          # 10000M: holds TWO concurrent optimize jobs at P=3. Each job ≈ 4.3 GB
-          # (f32 AHashMap ~2.6 GB + Python/Celery ~0.5 GB + 3 workers × 0.4 GB),
-          # the OHLC feather is mmap-shared (counted once) → ~8.6 GB + headroom.
-          # Clean mmap pages reclaim under cgroup pressure before any OOM.
-          # cpus 8.0: 2 jobs × 3 billiard workers + parents. Updated 2026-06-24.
-          memory: 10000M
-          cpus: "8.0"
+          # 13000M: holds THREE concurrent optimize jobs at P=2. Each job ≈ 3.9 GB
+          # (f32 AHashMap ~2.6 GB + Python/Celery ~0.5 GB + 2 workers × 0.4 GB),
+          # the OHLC feather is mmap-shared (counted once) → ~12 GB + headroom.
+          # Anonymous spillover pages to the 24 GB NVMe swap under pressure; the
+          # memory admission gate (HEAVY_MEMORY_BUDGET_MB) + concurrency=3 cap
+          # keep the ACTIVE set bounded so the cgroup never OOM-kills a job.
+          # cpus 12.0: 3 jobs × 2 billiard workers + parents; ~8 threads left for
+          # backend/postgres on the 20-thread i5-14500. Updated 2026-07-04.
+          memory: 13000M
+          cpus: "12.0"
         reservations:
           memory: 256M
     networks:

@@ -18,7 +18,7 @@ class IndexConfig:
 INDEX_CONFIGS = {
     "NIFTY": IndexConfig("NIFTY", True, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY"), 50),
     "BANKNIFTY": IndexConfig("BANKNIFTY", True, ("MONTHLY", "NEXT_MONTHLY"), 100),
-    "MIDCPNIFTY": IndexConfig("MIDCPNIFTY", True, ("MONTHLY", "NEXT_MONTHLY"), 25),
+    "MIDCPNIFTY": IndexConfig("MIDCPNIFTY", True, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY"), 25),
     "SENSEX": IndexConfig("SENSEX", False, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY"), 100),
 }
 

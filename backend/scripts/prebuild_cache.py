@@ -15,6 +15,18 @@ _WARM_YEARS = int(os.environ.get("PREBUILD_WARM_YEARS", "2"))
 _WARM_SYMBOL = os.environ.get("PREBUILD_SYMBOL", "NIFTY")
 _WARM_BULK_OPTIONS = os.environ.get("PREBUILD_BULK_OPTIONS", "0").strip().lower() in ("1", "true", "yes", "on")
 
+# Set once the background warmup below finishes (success OR failure — a
+# crashed warmup must not leave /health reporting "not ready" forever).
+# /health (main.py) gates on this so Docker's own healthcheck, and the
+# frontend's "server is restarting" overlay, both stay "not healthy" until
+# the container is actually ready to serve real requests correctly — not
+# just the instant the HTTP process starts accepting connections.
+_warmup_done = threading.Event()
+
+
+def is_warmup_complete() -> bool:
+    return _warmup_done.is_set()
+
 
 def _do_warmup():
     """Background thread: warm bulk_load + STR + trading calendar caches."""
@@ -101,6 +113,8 @@ def _do_warmup():
 
     except Exception as e:
         logger.error(f"[WARMUP] Warmup thread crashed: {e}")
+    finally:
+        _warmup_done.set()
 
 
 def start_background_warmup():

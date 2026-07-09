@@ -1,0 +1,129 @@
+# LAN remote-worker package.
+#
+# Run this on ANOTHER in-house PC to let it contribute its own CPU/RAM to
+# backtest and optimize jobs submitted from the main box's webapp. It runs one
+# Celery worker container that joins the main box's Redis broker + Postgres
+# over the LAN. This PC does NOT need the project source — only this folder
+# (docker-compose.yml + .env) and a pre-built image loaded via `docker load`.
+# See ../remote-worker/README.md for the full transfer/setup steps.
+#
+# This PC's own RAM is what gets budgeted (HEAVY_MEMORY_BUDGET_MB below) — it
+# never competes with the main box's own local budget. See ../backend/services/
+# node_registry.py and ../backend/services/memory_gate.py for how that works.
+services:
+  remote-worker:
+    image: algotest-backend-app:latest
+    container_name: algotest-remote-worker
+    restart: unless-stopped
+    command: >
+      celery -A worker.celery worker
+      --queues=backtests@${NODE_IP},backtests_fast@${NODE_IP},optimize@${NODE_IP}
+      --concurrency=${NODE_CONCURRENCY:-2}
+      -l info
+      --max-memory-per-child=5000000
+      --without-gossip
+      --without-mingle
+      --without-heartbeat
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@${MAIN_BOX_IP}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-algotest}"
+      REDIS_URL: "redis://${MAIN_BOX_IP}:${REDIS_PORT:-6379}/0"
+      # Pre-build the ZIP against THIS PC's own API (remote-api below) so the
+      # instant-download wait polls the locally-built file, not the main box
+      # (which never has this remote job's files). See worker/tasks.py.
+      BACKEND_BASE_URL: "http://remote-api:8000"
+      # result_store.py + backtest_cache.py read REDIS_HOST/REDIS_PORT (NOT
+      # REDIS_URL), defaulting to the Docker service name "redis" which only
+      # resolves inside the main box's compose network. On a remote PC that
+      # name is unreachable, so the optimizer silently fails to write progress/
+      # results ("[OPTIM_STORE] Redis unavailable ... redis:6379"). Point these
+      # at the main box's LAN IP too. (Newer images also parse REDIS_URL as a
+      # fallback, but setting these explicitly is harmless and back-compatible.)
+      REDIS_HOST: "${MAIN_BOX_IP}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      USE_POSTGRESQL: "true"
+      ALLOW_CSV_FALLBACK: "false"
+      NODE_IP: "${NODE_IP}"
+      NODE_CONCURRENCY: "${NODE_CONCURRENCY:-2}"
+      NODE_RAM_MB: "${NODE_RAM_MB:-0}"
+      # This PC's own memory-gate budget is auto-derived from its heartbeat-
+      # reported RAM (~70% of NODE_RAM_MB, see memory_gate.py _budget_for_node)
+      # once it's registered — independent of the main box's own
+      # HEAVY_MEMORY_BUDGET_MB. Only set NODE_HEAVY_MEMORY_BUDGET_MB below to
+      # override that auto-sizing (e.g. to leave more headroom for other apps
+      # on this PC); otherwise leave it unset.
+      HEAVY_MEMORY_BUDGET_MB: "${NODE_HEAVY_MEMORY_BUDGET_MB:-7000}"
+      HEAVY_COST_BACKTEST_MB: "${NODE_HEAVY_COST_BACKTEST_MB:-5000}"
+      HEAVY_COST_OPTIMIZE_MB: "${NODE_HEAVY_COST_OPTIMIZE_MB:-4500}"
+      OPTIMIZE_PARALLELISM: "${NODE_OPTIMIZE_PARALLELISM:-2}"
+      BULK_LOAD_MAX_MEMORY_MB: "1500"
+      PYTHONOPTIMIZE: "1"
+    # The image's default USER (appuser, non-root — backend/Dockerfile:9) can't
+    # write to a fresh named volume's root-owned dirs (e.g. /data/cache/optim_zips),
+    # which crashes optimize jobs with "Permission denied". Every worker service
+    # on the main box overrides this the same way (docker-compose.yml, all
+    # worker-* services) — match that here too.
+    user: "0:0"
+    volumes:
+      - remote_worker_cache:/data/cache
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A worker.celery inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${NODE_MEMORY_LIMIT_MB:-8000}M
+          cpus: "${NODE_CPU_LIMIT:-4.0}"
+
+  # Serves THIS PC's downloads (tradesheets ZIP / WOW-MOM / per-combo / patchwise
+  # summary) straight off its own /data/cache — where the worker above built
+  # them. The main box's backend maps job->node and points the browser here for
+  # a remote job (see routers/optimize.py _download_base_for_job). Job metadata
+  # is read from the shared main-box Redis; the files are local. Reachable at
+  # http://<NODE_IP>:${NODE_API_PORT:-8100} — this PC's firewall must allow the
+  # office LAN to reach that port (the browser hits it directly).
+  remote-api:
+    image: algotest-backend-app:latest
+    container_name: algotest-remote-api
+    restart: unless-stopped
+    command:
+      - granian
+      - --interface
+      - asgi
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --loop
+      - uvloop
+      - main:app
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-algotest}:${POSTGRES_PASSWORD:-algotest_password}@${MAIN_BOX_IP}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-algotest}"
+      REDIS_URL: "redis://${MAIN_BOX_IP}:${REDIS_PORT:-6379}/0"
+      REDIS_HOST: "${MAIN_BOX_IP}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      USE_POSTGRESQL: "true"
+      ALLOW_CSV_FALLBACK: "false"
+    user: "0:0"
+    ports:
+      - "${NODE_API_PORT:-8100}:8000"
+    volumes:
+      - remote_worker_cache:/data/cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 800M
+          cpus: "1.0"
+
+volumes:
+  remote_worker_cache:

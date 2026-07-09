@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal, Cpu } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
 import OptimizePanel from './OptimizePanel';
 import OptimizationResults from './OptimizationResults';
+import AutoDownloadQueue from './AutoDownloadQueue';
+import { appendToQueue, loadQueue } from '../utils/optimQueueStore';
 import Toggle from './ui/Toggle';
+import Dropdown from './ui/Dropdown';
 import CalendarPicker from './ui/CalendarPicker';
 
 // Convert DD/MM/YYYY to YYYY-MM-DD for API
@@ -57,10 +60,12 @@ const INDEX_CONFIG = {
   },
   MIDCPNIFTY: {
     label: 'MIDCPNIFTY',
-    subtitle: 'Monthly expiry only',
-    group: 'monthly_only',
+    subtitle: 'Weekly (till Nov 2024) & monthly',
+    group: 'weekly_monthly',
     backtestEnabled: true,
-    expiryBases: ['monthly'],
+    expiryBases: ['weekly', 'monthly'],
+    // Default stays MONTHLY (current NSE regime; weeklies ended Nov 2024) so
+    // existing behaviour is unchanged — weekly is opt-in for the historical era.
     defaultExpiryBasis: 'monthly',
     defaultOptionExpiry: 'monthly',
     strikeInterval: 25,
@@ -81,12 +86,12 @@ const INDEX_GROUPS = [
   {
     key: 'weekly_monthly',
     title: 'Weekly & Monthly Expiries',
-    symbols: ['NIFTY', 'SENSEX'],
+    symbols: ['NIFTY', 'SENSEX', 'MIDCPNIFTY'],
   },
   {
     key: 'monthly_only',
     title: 'Monthly Only Expiry',
-    symbols: ['MIDCPNIFTY', 'BANKNIFTY'],
+    symbols: ['BANKNIFTY'],
   },
 ];
 
@@ -861,6 +866,10 @@ const [slippagePct, setSlippagePct] = useState(0);
     atm_straddle_prem_pct: 0,
     straddle_multiplier: 0.5,
     straddle_direction: '+',
+    // Relative-to-leg strike (Iron Condor / spread wing): strike is derived
+    // from an earlier leg's resolved strike, shifted `offset` gaps further OTM.
+    ref_leg: 1,
+    offset: 0,
     // Midcap100 cross-index overlay leg (segment === 'midcap100'):
     midcap_mode: 'hypothetical',     // 'spot' | 'hypothetical'
     cost_pct_per_month: 0.5,         // carry cost for hypothetical mode
@@ -958,6 +967,14 @@ const [slippagePct, setSlippagePct] = useState(0);
   // Optimization panel state
   const [optimPanelOpen, setOptimPanelOpen] = useState(false);
   const [optimJob, setOptimJob] = useState(null); // { jobId, totalCombos, objective, runConfig }
+  // Every optimize job queued this session (appended, never replaced) — feeds
+  // AutoDownloadQueue so a job queued behind an already-running one still gets
+  // auto-downloaded (ZIP/WOW-MOM/summary, patchwise by default) the instant it
+  // finishes, even if its results panel was never opened. Hydrated from
+  // localStorage on mount so a refreshed tab (or one queued from a sibling
+  // tab) immediately resumes tracking the full backlog, not just this tab's
+  // own history.
+  const [optimQueueJobs, setOptimQueueJobs] = useState(() => loadQueue());
   // Lifted optimizer panel state — survives panel close/reopen
   const [optimChecked, setOptimChecked] = useState({});
   const [optimSavedValues, setOptimSavedValues] = useState({});
@@ -966,6 +983,40 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [optimAlgorithm, setOptimAlgorithm] = useState('cma-es');
   const [optimObjective, setOptimObjective] = useState('total_pnl');
   const [optimParallelism, setOptimParallelism] = useState(null);
+
+  // LAN remote-worker "Core:" picker — see remote-worker/ and
+  // backend/services/node_registry.py. selectedNode is null = run locally
+  // (unchanged default behavior); otherwise it's a node from /api/system/nodes.
+  const [lanNodes, setLanNodes] = useState([]);
+  const [selectedNodeId, setSelectedNodeId] = useState(null);
+  const [selectedNodeCores, setSelectedNodeCores] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      fetch('/api/system/nodes')
+        .then((r) => (r.ok ? r.json() : { nodes: [] }))
+        .then((d) => {
+          if (cancelled) return;
+          const nodes = Array.isArray(d?.nodes) ? d.nodes : [];
+          setLanNodes(nodes);
+          // Selected node dropped offline (heartbeat expired) OR went stale
+          // (its image no longer matches this box's code) — fall back to Local
+          // so a job is never routed to a node that would reject or mis-run it.
+          setSelectedNodeId((cur) => {
+            if (!cur) return cur;
+            const n = nodes.find((x) => x.node_id === cur);
+            return (!n || n.stale) ? null : cur;
+          });
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = setInterval(poll, 15000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+
+  const selectedNode = lanNodes.find((n) => n.node_id === selectedNodeId) || null;
 
   const latestEntrySpot = useMemo(() => {
     const firstTrade = displayResults?.trades?.[0];
@@ -1619,11 +1670,22 @@ const [slippagePct, setSlippagePct] = useState(0);
       });
     }
   };
-  const updateLeg = (id, field, value) => setLegs(prev => prev.map(l => {
+  const updateLeg = (id, field, value) => setLegs(prev => prev.map((l, idx) => {
     if (l.id !== id) return l;
     const next = { ...l, [field]: value };
     if (field === 'segment' || field === 'expiry') {
       next.expiry = normalizeExpiryForIndex(next.expiry, instrument, next.segment);
+    }
+    // Relative-to-Leg (Iron Condor wing): when a leg becomes rel_leg or its
+    // parent changes, auto-configure it as the protective wing of that parent —
+    // same option type, opposite position (Sell short → Buy wing).
+    if ((field === 'strike_criteria' && value === 'rel_leg') ||
+        (field === 'ref_leg' && next.strike_criteria === 'rel_leg')) {
+      const parent = prev[(Number(next.ref_leg) || 1) - 1];
+      if (parent && parent.segment === 'options') {
+        next.option_type = parent.option_type;
+        next.position = parent.position === 'sell' ? 'buy' : 'sell';
+      }
     }
     return next;
   }));
@@ -1908,9 +1970,21 @@ const [slippagePct, setSlippagePct] = useState(0);
         if (l.strike_criteria === 'atm_straddle_prem_pct') {
           leg.strike_selection.value = Number(l.atm_straddle_prem_pct) || 0;
         }
+        if (l.strike_criteria === 'rel_leg') {
+          // Wing strike = leg #ref_leg's resolved strike ± offset*gap (+ CALL /
+          // − PUT, applied engine-side). ref_leg is the 1-based leg number and
+          // MUST reference an earlier leg (validated before run).
+          leg.strike_selection.ref_leg = Number(l.ref_leg) || 1;
+          leg.strike_selection.offset = Number(l.offset) || 0;
+        }
         if (l.strike_criteria === 'straddle_width') {
           leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
           leg.straddle_direction = l.straddle_direction ?? '+';
+          // Engine (Rust + its Python mirror) reads these from inside
+          // strike_selection, not the flat leg fields above — mirror both so
+          // the configured width/direction actually reaches the engine.
+          leg.strike_selection.straddle_multiplier = leg.straddle_multiplier;
+          leg.strike_selection.straddle_direction = leg.straddle_direction;
         }
         if (rolloverToggle || noRollover) {
           leg.rollover_strike_mode = l.rollover_strike_mode || 'fresh';
@@ -2200,6 +2274,25 @@ const [slippagePct, setSlippagePct] = useState(0);
 
     if (!validateExpiry()) return;
 
+    // Relative-to-leg (Iron Condor wing) sanity: a rel_leg leg must reference an
+    // EARLIER leg (1-based position < its own). A dangling reference — e.g. after
+    // deleting the parent leg — would otherwise be silently dropped by the engine
+    // (0 trades) with no explanation. Fail loudly instead.
+    const relLegErrors = legs.reduce((acc, leg, idx) => {
+      if (leg.strike_criteria !== 'rel_leg') return acc;
+      const ref = Number(leg.ref_leg) || 0;
+      if (ref < 1 || ref > idx) acc.push(`Leg ${idx + 1}`);
+      return acc;
+    }, []);
+    if (relLegErrors.length > 0) {
+      showValidationError(
+        `Relative-to-Leg strike on ${relLegErrors.join(', ')} points to a missing or later leg. ` +
+        `Set it to reference an earlier leg (the short leg it protects).`,
+        6000
+      );
+      return; // Hard block
+    }
+
     const trailSLWarnings = legs.reduce((acc, leg, idx) => {
       if (!leg.trail_sl_enabled) return acc;
       const triggerVal = Number(leg.trail_sl_trigger);
@@ -2236,6 +2329,8 @@ const [slippagePct, setSlippagePct] = useState(0);
 
     const payload = buildPayload();
     const sanitized = sanitizePayload(payload);
+    // LAN remote-worker routing (see remote-worker/) — null = run locally, unchanged.
+    sanitized.node_id = selectedNodeId || null;
     stopJobPolling();
     setLoading(true);
     setError(null);
@@ -2288,7 +2383,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       setJobStatusLabel('');
       setError(err.message || 'Backtest queue failed');
     }
-  }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, rolloverToggle, validateExpiry, buildPayload, pollJobStatus, stopJobPolling]);
+  }, [legs, loading, startDate, endDate, entryDaysBefore, exitDaysBefore, expiryBasis, rolloverToggle, validateExpiry, buildPayload, pollJobStatus, stopJobPolling, selectedNodeId]);
 
   const strykNav = [
     { id: 'build', label: 'Build', Icon: LayoutGrid, onClick: () => { setActiveView('build'); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
@@ -2352,6 +2447,36 @@ const [slippagePct, setSlippagePct] = useState(0);
               <span className="text-muted text-xs">•</span>
               <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.68rem', color: 'var(--text-secondary)' }}>{legs.length} leg{legs.length !== 1 ? 's' : ''}</span>
             </div>
+            {/* Core: LAN remote-worker picker — null = run locally (unchanged default) */}
+            <Dropdown
+              label={<><Cpu size={11} style={{ marginRight: 4, verticalAlign: -1 }} />Core</>}
+              value={selectedNodeId}
+              onChange={(v) => {
+                setSelectedNodeId(v);
+                const node = lanNodes.find((n) => n.node_id === v);
+                setSelectedNodeCores(node ? node.cpu_count : null);
+              }}
+              options={[
+                { value: null, label: 'Local (this box)' },
+                ...lanNodes.map((n) => ({
+                  value: n.node_id,
+                  disabled: !!n.stale,
+                  label: (n.is_you ? `${n.hostname || n.ip} (you)` : (n.hostname || n.ip)) + (n.stale ? ' — update needed' : ''),
+                  sublabel: n.stale ? 'outdated' : `${n.cpu_count} cores`,
+                })),
+              ]}
+            />
+            {selectedNode && (
+              <Dropdown
+                label="Cores"
+                value={selectedNodeCores}
+                onChange={setSelectedNodeCores}
+                minWidth={90}
+                options={Array.from({ length: selectedNode.cpu_count || 1 }, (_, i) => i + 1).map((n) => ({
+                  value: n, label: String(n),
+                }))}
+              />
+            )}
             {/* Theme Toggle */}
             <button
               type="button"
@@ -3192,7 +3317,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                   const barColor = isMidcap100Tab ? '#a78bfa' : (isMidcp ? '#2dd4bf' : 'var(--accent)');
                   const barText = isMidcap100Tab
                     ? 'Hypothetical overlay · follows NIFTY trade dates · no real strike or expiry'
-                    : (isMidcp ? 'Monthly expiry · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50');
+                    : (isMidcp ? 'Weekly (till Nov 2024) & monthly · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50');
                   const barLabel = isMidcap100Tab ? 'MIDCAP100 OVERLAY' : activeIdx;
                   return (
                     <div style={{
@@ -3306,7 +3431,19 @@ const [slippagePct, setSlippagePct] = useState(0);
                   <div>
                     <label className="field-label">Strike Criteria</label>
                     <select value={draftLeg.strike_criteria}
-                      onChange={e => setDraftLeg(prev => ({ ...prev, strike_criteria: e.target.value }))}
+                      onChange={e => setDraftLeg(prev => {
+                        const next = { ...prev, strike_criteria: e.target.value };
+                        // Auto-configure a Relative-to-Leg wing from its parent short:
+                        // same option type, opposite position (Sell → Buy).
+                        if (e.target.value === 'rel_leg') {
+                          const parent = legs[(Number(prev.ref_leg) || 1) - 1];
+                          if (parent && parent.segment === 'options') {
+                            next.option_type = parent.option_type;
+                            next.position = parent.position === 'sell' ? 'buy' : 'sell';
+                          }
+                        }
+                        return next;
+                      })}
                       className="h-8 px-2 border border-default rounded text-xs bg-surface text-secondary focus:outline-none focus:ring-2 focus:ring-accent/40 w-44">
                       <option value="strike_type">Strike Type</option>
                       <option value="premium_range">Premium Range</option>
@@ -3317,6 +3454,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <option value="pct_of_atm">% of ATM</option>
                       <option value="synthetic_future">Synthetic Future</option>
                       <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
+                      {legs.length > 0 && <option value="rel_leg">Relative to Leg</option>}
                     </select>
                     {draftLeg.strike_criteria === 'straddle_width' && (
                       <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
@@ -3447,6 +3585,49 @@ const [slippagePct, setSlippagePct] = useState(0);
                             className="w-20 h-8 px-2 border border-default rounded text-xs text-center"
                           />
                           <span className="text-xs text-muted whitespace-nowrap">%</span>
+                        </div>
+                      </>
+                    )}
+
+                    {draftLeg.strike_criteria === 'rel_leg' && (
+                      <>
+                        <label className="field-label">Relative To</label>
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1 h-8">
+                            <select
+                              value={draftLeg.ref_leg ?? 1}
+                              onChange={e => setDraftLeg(prev => {
+                                const ref = parseInt(e.target.value, 10) || 1;
+                                const next = { ...prev, ref_leg: ref };
+                                const parent = legs[ref - 1];
+                                if (parent && parent.segment === 'options') {
+                                  next.option_type = parent.option_type;
+                                  next.position = parent.position === 'sell' ? 'buy' : 'sell';
+                                }
+                                return next;
+                              })}
+                              className="h-8 px-2 border border-default rounded text-xs bg-surface font-medium"
+                            >
+                              {legs.map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                            </select>
+                            <span className="text-xs text-muted whitespace-nowrap">offset</span>
+                            <input
+                              type="number"
+                              step="1"
+                              value={draftLeg.offset ?? 0}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, offset: parseInt(e.target.value, 10) || 0 }))}
+                              className="w-16 h-8 px-2 border border-default rounded text-xs text-center"
+                            />
+                            <span className="text-xs text-muted whitespace-nowrap">gaps</span>
+                          </div>
+                          <span className="text-xs text-muted">
+                            {(() => {
+                              const isCE = ['call', 'ce'].includes((draftLeg.option_type || '').toLowerCase());
+                              const off = draftLeg.offset ?? 0;
+                              const dir = isCE ? (off >= 0 ? '+' : '−') : (off >= 0 ? '−' : '+');
+                              return `strike = Leg ${draftLeg.ref_leg ?? 1} ${dir}${Math.abs(off)} gaps (further OTM ⇒ larger offset)`;
+                            })()}
+                          </span>
                         </div>
                       </>
                     )}
@@ -3638,6 +3819,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <option value="pct_of_atm">% of ATM</option>
                                   <option value="synthetic_future">Synthetic Future</option>
                                   <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
+                                  {idx > 0 && <option value="rel_leg">Relative to Leg</option>}
                                 </select>
                                 {leg.strike_criteria === 'straddle_width' && (
                                   <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
@@ -3761,6 +3943,40 @@ const [slippagePct, setSlippagePct] = useState(0);
                                           className="w-14 h-7 px-1 border border-default rounded text-xs text-center"
                                         />
                                         <span className="text-xs text-muted whitespace-nowrap">%</span>
+                                      </div>
+                                    </>
+                                  )}
+
+                                  {leg.strike_criteria === 'rel_leg' && (
+                                    <>
+                                      <label className="field-label">Relative To</label>
+                                      <div className="flex flex-col gap-0.5">
+                                        <div className="flex items-center gap-1">
+                                          <select
+                                            value={leg.ref_leg ?? 1}
+                                            onChange={e => updateLeg(leg.id, 'ref_leg', parseInt(e.target.value, 10) || 1)}
+                                            className="h-7 px-2 border border-default rounded text-xs bg-surface font-medium"
+                                          >
+                                            {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                                          </select>
+                                          <span className="text-xs text-muted whitespace-nowrap">offset</span>
+                                          <input
+                                            type="number"
+                                            step="1"
+                                            value={leg.offset ?? 0}
+                                            onChange={e => updateLeg(leg.id, 'offset', parseInt(e.target.value, 10) || 0)}
+                                            className="w-14 h-7 px-1 border border-default rounded text-xs text-center"
+                                          />
+                                          <span className="text-xs text-muted whitespace-nowrap">gaps</span>
+                                        </div>
+                                        <span className="text-xs text-muted">
+                                          {(() => {
+                                            const isCE = ['call', 'ce'].includes((leg.option_type || '').toLowerCase());
+                                            const off = leg.offset ?? 0;
+                                            const dir = isCE ? (off >= 0 ? '+' : '−') : (off >= 0 ? '−' : '+');
+                                            return `Leg ${leg.ref_leg ?? 1} ${dir}${Math.abs(off)} gaps`;
+                                          })()}
+                                        </span>
                                       </div>
                                     </>
                                   )}
@@ -4535,11 +4751,27 @@ const [slippagePct, setSlippagePct] = useState(0);
             objective={optimObjective} setObjective={setOptimObjective}
             parallelism={optimParallelism} setParallelism={setOptimParallelism}
             filterName={strFilter.enabled ? strFilter.filterName : null}
+            nodeId={selectedNodeId}
             onJobQueued={(info) => {
               // Capture the Midcap overlay config at launch so per-combo
               // downloads can apply the same overlay as the backtest.
-              setOptimJob({ ...info, midcapConfig: buildMidcapConfig() });
+              const fullInfo = { ...info, midcapConfig: buildMidcapConfig() };
+              setOptimJob(fullInfo);
               setOptimPanelOpen(false);
+              // Only track for auto-download when the user explicitly turned
+              // the toggle on in the Optimize panel — otherwise every ad-hoc
+              // run would clutter the widget on every open tab/PC. Viewing
+              // the just-launched job's progress (setOptimJob above) is
+              // unaffected either way.
+              if (info.autoDownload) {
+                // Append (never replace) so AutoDownloadQueue keeps watching
+                // every opted-in job queued this session, including ones
+                // queued behind an already-running job. Also persist to
+                // localStorage so a sibling tab (or this tab after a
+                // refresh) picks it up too.
+                setOptimQueueJobs((prev) => [...prev, fullInfo]);
+                appendToQueue(fullInfo);
+              }
             }}
           />
         )}
@@ -4549,6 +4781,7 @@ const [slippagePct, setSlippagePct] = useState(0);
             totalCombos={optimJob.totalCombos}
             objective={optimJob.objective}
             runConfig={optimJob.runConfig}
+            ruleConfig={optimJob.ruleConfig}
             midcapConfig={optimJob.midcapConfig}
             onClose={() => setOptimJob(null)}
             onApplyCombo={(combo) => {
@@ -4564,6 +4797,19 @@ const [slippagePct, setSlippagePct] = useState(0);
             }}
           />
         )}
+        {/* Strictly opt-in: this widget only ever tracks/shows a job when the
+            user turned ON the Optimize panel's "Auto-download" toggle for
+            that specific run (see OptimizePanel.jsx autoDownload state +
+            StrategyBuilder's onJobQueued handler, which only pushes into
+            optimQueueJobs when info.autoDownload is true). With the toggle
+            left off (its default), optimQueueJobs stays empty and this
+            renders nothing — no auto-download happens unless selected.
+            NOTE: it is NOT gated on activeView — the Optimize panel and its
+            Results panel are modals rendered OVER the Build screen (there is
+            no separate "optimize" activeView), so hiding this on
+            activeView==='build' would incorrectly hide it while a job the
+            user just launched is actively running/downloading. */}
+        <AutoDownloadQueue jobs={optimQueueJobs} patchwise />
         {lazyLegModal.open && (
           <LazyLegModal
             isOpen={lazyLegModal.open}

@@ -25,15 +25,18 @@ celery_app.conf.update(
     timezone='Asia/Kolkata',
     enable_utc=True,
     task_track_started=True,
-    # Raised 2026-06-05: large optimize sweeps (1000s of combos at ~3s each
-    # across 6 parallel workers) were hitting the soft cap and dying mid-run
-    # with SoftTimeLimitExceeded. Sized for 6000+ combo exhaustive sweeps:
-    # ~6000 combos / (6 workers / ~3s) ≈ 50-60 min compute + warmup + xlsx
-    # writes, so 3h soft / 3.5h hard gives comfortable headroom for even
-    # bigger runs. Time-only change — no memory/OOM impact (per-child RSS is
-    # still bounded by worker_max_memory_per_child below).
-    task_time_limit=16200,  # 4.5 hours hard kill
-    task_soft_time_limit=14400,  # 4 hours soft limit
+    # Time limits are a LAST-RESORT backstop only. The primary "not stuck"
+    # mechanism is the heartbeat watchdog (services/optimizer/watchdog.py), which
+    # cancels a job whose progress heartbeat freezes for >OPTIMIZE_STUCK_SECONDS
+    # (~2.5h) WITHOUT killing a job that is still actively progressing. These
+    # flat limits deliberately sit ABOVE any legitimate long run (a genuinely
+    # active exhaustive sweep may take hours) so they never cut off real work —
+    # they exist only to guarantee nothing can run truly forever if the watchdog
+    # itself is somehow unavailable. Note the 4.5h flat limit did NOT catch the
+    # 6h finalization hang on 2026-07-04 (the hung native step escaped billiard's
+    # timer), which is exactly why the watchdog was added.
+    task_time_limit=28800,  # 8 hours hard kill (backstop)
+    task_soft_time_limit=27000,  # 7.5 hours soft limit (backstop)
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=200,   # recycle workers less frequently now that memory is bounded
     # Raised from 2800000 → 5000000 on 2026-05-25: the feather grew to 706 MB
@@ -60,3 +63,67 @@ celery_app.conf.update(
 def test_task(self, x, y):
     """Test task to verify Celery is working."""
     return x + y
+
+
+from celery.signals import worker_ready as _worker_ready
+
+
+@_worker_ready.connect
+def _start_optimize_watchdog(**_kwargs):
+    """Start the stuck-job watchdog when THIS worker boots — but only on the
+    optimize worker (OPTIMIZE_WATCHDOG=1 in its compose env). Backtest/upload
+    workers and the backend (which merely imports this app to enqueue) never
+    start it. Fires once per worker process, in the MainProcess only."""
+    if os.environ.get("OPTIMIZE_WATCHDOG", "").strip() not in ("1", "true", "True"):
+        return
+    try:
+        from services.optimizer import watchdog
+        watchdog.start()
+    except Exception as exc:  # never block worker startup on the watchdog
+        import logging
+        logging.getLogger(__name__).warning("[WATCHDOG] failed to start: %s", exc)
+
+
+def _start_node_heartbeat():
+    """LAN remote-worker self-registration (see services/node_registry.py,
+    remote-worker/). Only runs when NODE_IP is set — local/default worker
+    containers are unaffected and are never registered as a 'node'."""
+    node_ip = os.environ.get("NODE_IP", "").strip()
+    if not node_ip:
+        return
+    import socket
+    import threading
+    import time as _time
+
+    cpu_count = os.cpu_count() or 1
+    try:
+        ram_mb = int(os.environ.get("NODE_RAM_MB", "0"))
+        if not ram_mb:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        ram_mb = int(line.split()[1]) // 1024
+                        break
+    except Exception:
+        ram_mb = 0
+    hostname = socket.gethostname()
+    interval = int(os.environ.get("NODE_HEARTBEAT_SECONDS", "15"))
+    try:
+        from services.code_version import compute_code_version
+        version = compute_code_version()
+    except Exception:
+        version = ""
+
+    def _loop():
+        from services import node_registry
+        while True:
+            try:
+                node_registry.heartbeat(node_ip, cpu_count, ram_mb, hostname, version=version)
+            except Exception:
+                pass
+            _time.sleep(interval)
+
+    threading.Thread(target=_loop, name="node-heartbeat", daemon=True).start()
+
+
+_start_node_heartbeat()

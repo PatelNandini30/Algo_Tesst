@@ -33,13 +33,85 @@ from typing import Any, Dict, List, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 
+def _cgroup_cpu_quota() -> Optional[float]:
+    """Effective CPU quota for this container (cgroup v2 `cpu.max`), or None."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            quota, period = fh.read().split()[:2]
+        if quota != "max":
+            return float(quota) / float(period)
+    except Exception:
+        pass
+    return None
+
+
+def _cgroup_mem_limit_mb() -> Optional[int]:
+    """Container memory limit in MB (cgroup v2 `memory.max`), or None."""
+    try:
+        with open("/sys/fs/cgroup/memory.max") as fh:
+            raw = fh.read().strip()
+        if raw != "max":
+            return int(raw) // (1024 * 1024)
+    except Exception:
+        pass
+    return None
+
+
 def get_parallelism() -> int:
-    """How many child processes to spawn. Default: cpu_count // 2, capped at 4."""
+    """How many child processes to spawn — DYNAMICALLY clamped to what this box
+    can sustain, so a too-high OPTIMIZE_PARALLELISM can never thrash the machine.
+
+    Why: on 2026-07-04, P=16 forked workers contending for memory bandwidth on
+    the shared ~2.6 GB Rust cache inflated per-combo time ~47x (205s vs 4.4s
+    solo) on this 16 GB box. The configured value is now a CEILING; the
+    effective value is min(configured, cpu_cap, mem_cap):
+
+      cpu_cap = container CPU quota // RUST_SIM_THREADS  (each worker runs its
+                own rayon pool of that many threads — oversubscription stalls
+                everyone on memory bandwidth, it does not add speed)
+      mem_cap = (container mem limit − shared cache/overhead reserve)
+                // per-worker private pages  (fork-CoW keeps the cache shared;
+                only private pages multiply per worker)
+
+    Tunables: OPTIMIZE_WORKER_PRIVATE_MB (default 700),
+    OPTIMIZE_MEM_RESERVE_MB (default 4500 ≈ Rust cache + parent + OHLC).
+    Pure orchestration — no calculation logic involved.
+    """
     explicit = os.environ.get("OPTIMIZE_PARALLELISM")
     if explicit and explicit.isdigit():
-        return max(1, int(explicit))
-    n = max(1, (os.cpu_count() or 2) // 2)
-    return min(n, 4)
+        requested = max(1, int(explicit))
+    else:
+        requested = min(max(1, (os.cpu_count() or 2) // 2), 4)
+
+    # CPU clamp: quota (fractional cpus) divided by per-worker rayon threads.
+    try:
+        sim_threads = max(1, int(os.environ.get("RUST_SIM_THREADS", "1")))
+    except (TypeError, ValueError):
+        sim_threads = 1
+    cpus = _cgroup_cpu_quota() or float(os.cpu_count() or 2)
+    cpu_cap = max(1, int(cpus // sim_threads))
+
+    # Memory clamp: only per-worker PRIVATE pages multiply (cache is CoW-shared).
+    try:
+        private_mb = max(100, int(os.environ.get("OPTIMIZE_WORKER_PRIVATE_MB", "700")))
+    except (TypeError, ValueError):
+        private_mb = 700
+    try:
+        reserve_mb = max(0, int(os.environ.get("OPTIMIZE_MEM_RESERVE_MB", "4500")))
+    except (TypeError, ValueError):
+        reserve_mb = 4500
+    mem_limit = _cgroup_mem_limit_mb()
+    mem_cap = max(1, (mem_limit - reserve_mb) // private_mb) if mem_limit else requested
+
+    effective = max(1, min(requested, cpu_cap, mem_cap))
+    if effective < requested:
+        logger.info(
+            "[OPTIM_PARALLEL] parallelism clamped %d -> %d (cpu_cap=%d @ %.1f cpus/"
+            "%d threads, mem_cap=%d @ limit=%sMB reserve=%dMB private=%dMB)",
+            requested, effective, cpu_cap, cpus, sim_threads,
+            mem_cap, mem_limit, reserve_mb, private_mb,
+        )
+    return effective
 
 
 def _chunk(combos: List[Dict[str, Any]], n_chunks: int) -> List[List[Dict[str, Any]]]:
@@ -184,7 +256,17 @@ def _worker_entrypoint(
             from services import rust_fast_path as _rfp_w
             from services.optimizer import runner as _runner_mod
             _rctx = _runner_mod._RUST_CONTEXT
-            if _rctx is not None and "ohlc_df_pandas" not in _rctx:
+            # MAE/MFE must never be silently skipped — retry the preload a few
+            # times (transient I/O/timing is the common cause of a first-try
+            # miss) before treating it as a real failure. Only after retries
+            # are exhausted do we fall back to OPTIMIZE_SKIP_MAE_MFE, and that
+            # fallback is now logged at ERROR (not swallowed) so a zeroed
+            # tradesheet is never a silent surprise.
+            _MAE_PRELOAD_ATTEMPTS = 3
+            _mae_last_err = None
+            for _mae_attempt in range(1, _MAE_PRELOAD_ATTEMPTS + 1):
+                if _rctx is None or "ohlc_df_pandas" in _rctx:
+                    break
                 _sym_upper = str(
                     base_payload.get("index") or base_payload.get("symbol") or "NIFTY"
                 ).upper()
@@ -193,7 +275,12 @@ def _worker_entrypoint(
                     / f"arrow-v2:bulk:{_sym_upper}:full"
                     / "options.feather"
                 )
-                if _feather_path.exists():
+                if not _feather_path.exists():
+                    _mae_last_err = FileNotFoundError(f"OHLC feather missing: {_feather_path}")
+                    if _mae_attempt < _MAE_PRELOAD_ATTEMPTS:
+                        time.sleep(1.0)
+                    continue
+                try:
                     _t0 = time.perf_counter()
                     # Only the columns _compute_mae_mfe_batch needs — skips
                     # Open/Close/Volume and any other heavy fields in the feather.
@@ -246,16 +333,26 @@ def _worker_entrypoint(
                         "[OPTIM_PARALLEL] OHLC pyarrow-loaded: %d rows, %.1f MB in %.2fs (fork-safe MAE/MFE)",
                         len(_ohlc_pd), _mem_mb, time.perf_counter() - _t0,
                     )
-                else:
-                    logger.warning(
-                        "[OPTIM_PARALLEL] OHLC feather not found at %s — MAE/MFE will be 0",
-                        _feather_path,
-                    )
-                    os.environ["OPTIMIZE_SKIP_MAE_MFE"] = "1"
+                except Exception as _load_exc:
+                    _mae_last_err = _load_exc
+                    if _mae_attempt < _MAE_PRELOAD_ATTEMPTS:
+                        logger.warning(
+                            "[OPTIM_PARALLEL] job=%s: OHLC preload attempt %d/%d failed (%s) — retrying",
+                            job_id, _mae_attempt, _MAE_PRELOAD_ATTEMPTS, _load_exc,
+                        )
+                        time.sleep(1.0)
+            if _rctx is not None and "ohlc_df_pandas" not in _rctx:
+                logger.error(
+                    "[OPTIM_PARALLEL] job=%s: OHLC preload for MAE/MFE FAILED after %d attempts "
+                    "(last error: %s) — MAE/MFE will be 0 for combos run by this worker until "
+                    "the underlying data/cache issue is fixed",
+                    job_id, _MAE_PRELOAD_ATTEMPTS, _mae_last_err,
+                )
+                os.environ["OPTIMIZE_SKIP_MAE_MFE"] = "1"
         except Exception as _ohlc_err:
-            logger.warning(
-                "[OPTIM_PARALLEL] OHLC pyarrow load failed: %s — MAE/MFE will be 0",
-                _ohlc_err,
+            logger.error(
+                "[OPTIM_PARALLEL] job=%s: OHLC pyarrow load crashed unexpectedly (%s) — MAE/MFE will be 0",
+                job_id, _ohlc_err,
             )
             os.environ["OPTIMIZE_SKIP_MAE_MFE"] = "1"
 
@@ -279,6 +376,22 @@ def _worker_entrypoint(
             or "NIFTYMIDCAP100"
         )
         _filter_segments = base_payload.get("filter_segments") or None
+        # filter_name (zip_naming level1) gates the "Patch wise" sheet in
+        # build_combo_xlsx — same source the finalization/download uses.
+        try:
+            _zip_naming = (result_store.get_meta(job_id) or {}).get("zip_naming") or {}
+            _filter_name = (_zip_naming.get("level1") or "") if _zip_naming else ""
+        except Exception:
+            _filter_name = ""
+
+        # Inline-finalization helpers: compute the patchwise summary + WOW/MOM data
+        # per combo (in parallel) so the sequential finalization is instant.
+        from services.optimizer.excel_builder import (
+            compute_xlsx_summary_metrics as _cmetrics,
+            build_cleaned_for_combo as _bcc,
+        )
+        from services.optimizer.wow_mom import _wm_from_cleaned
+        _INLINE_FINALIZE = os.environ.get("OPTIMIZE_INLINE_FINALIZE", "1").strip().lower() in ("1", "true", "yes")
 
         done = 0
         failures = 0
@@ -290,6 +403,51 @@ def _worker_entrypoint(
                 elapsed_ms = round((time.perf_counter() - t_combo) * 1000.0, 2)
                 optim_extra = compute_optim_metrics(trades_df, summary)
                 flat_summary = {**summary, **optim_extra}
+                # Inline finalization (from the in-memory trades_df, across the
+                # parallel workers) so the sequential finalization has nothing to
+                # recompute — the master summary is already corrected, and the
+                # patchwise summary + WOW/MOM data are pre-computed and stored:
+                #   • overall metrics merged into flat_summary  (= old Step 0)
+                #   • patchwise metrics                          → row["summary_pw"]
+                #   • WOW/MOM wm (overall + patchwise)           → row["wm_*"]
+                _summary_pw = None
+                _wm_over = _wm_pw = None
+                _has_mc = False
+                if _INLINE_FINALIZE and not (hasattr(trades_df, "empty") and trades_df.empty):
+                    # Overall metrics (incl. avg_final_mae) merged into the stored
+                    # summary. Kept in its own try so a patchwise failure below can
+                    # never strip avg_final_mae from the overall master summary.
+                    try:
+                        _over = _cmetrics(
+                            trades_df, flat_summary, midcap_legs=_mc_legs,
+                            midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
+                            patchwise=False, filter_segments=_filter_segments,
+                        )
+                        flat_summary = {**flat_summary, **_over}
+                    except Exception as _inl_exc:
+                        logger.warning("[OPTIM] inline overall finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                    # Patchwise metrics (row["summary_pw"]) — served directly by the
+                    # master-summary endpoint when download_mode=patchwise.
+                    try:
+                        _summary_pw = _cmetrics(
+                            trades_df, flat_summary, midcap_legs=_mc_legs,
+                            midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
+                            patchwise=True, filter_segments=_filter_segments,
+                        )
+                    except Exception as _inl_exc:
+                        logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                        _summary_pw = None
+                    # WOW/MOM cleaned data (overall + patchwise).
+                    try:
+                        _cl_o, _has_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                              patchwise=False, filter_segments=_filter_segments)
+                        _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                        patchwise=True, filter_segments=_filter_segments)
+                        _wm_over = _wm_from_cleaned(_cl_o, _has_mc)
+                        _wm_pw = _wm_from_cleaned(_cl_p, _has_mc)
+                    except Exception as _inl_exc:
+                        logger.warning("[OPTIM] inline WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                        _wm_over = _wm_pw = None
                 labels = label_combo(merged)
                 _combo_id = starting_combo_id + i
                 combo_label_safe = f"{_combo_id}_{safe_filename(labels['combo_label'])}"
@@ -306,6 +464,11 @@ def _worker_entrypoint(
                         "spot_adjustment": labels["spot_adjustment"],
                     },
                     "summary": flat_summary,
+                    "summary_pw": _summary_pw,
+                    "wm_overall": _wm_over,
+                    "wm_pw": _wm_pw,
+                    "has_midcap": bool(_has_mc),
+                    "inline_finalized": _summary_pw is not None,
                     "objective_value": obj.extract(flat_summary),
                     "trade_count": int(flat_summary.get("count", 0) or 0),
                     "elapsed_ms": elapsed_ms,
@@ -317,6 +480,7 @@ def _worker_entrypoint(
                 _skip_ts = os.environ.get("OPTIMIZE_SKIP_TRADESHEETS", "0").strip().lower() in ("1", "true", "yes")
                 if not _skip_ts and not trades_df.empty:
                     result_store.write_combo_tradesheet(job_id, combo_label_safe, trades_df)
+                    _tdays = (_runner_mod._RUST_CONTEXT or {}).get("trading_days") or []
                     result_store.write_combo_xlsx(
                         job_id,
                         combo_label_safe,
@@ -326,12 +490,35 @@ def _worker_entrypoint(
                         from_date=_from_date,
                         to_date=_to_date,
                         index_str=_index_str,
-                        trading_days=(_runner_mod._RUST_CONTEXT or {}).get("trading_days") or [],
+                        trading_days=_tdays,
                         midcap_legs=_mc_legs,
                         midcap_spot_adjustment=_mc_sa,
                         midcap_symbol=_mc_sym,
                         filter_segments=_filter_segments,
                     )
+                    # Also build the PATCHWISE variant directly from the same
+                    # in-memory trades_df — ONLY when inline finalization is on.
+                    # Gated with _INLINE_FINALIZE because these extra per-combo
+                    # MAE/MFE + build passes, run across many parallel workers,
+                    # saturate RAM/CPU and inflate the whole sweep; with it off
+                    # the patchwise ZIP is built once at finalization instead.
+                    if _INLINE_FINALIZE:
+                        result_store.write_combo_xlsx_patchwise(
+                            job_id,
+                            combo_label_safe,
+                            trades_df,
+                            flat_summary,
+                            combo_label=labels["combo_label"],
+                            from_date=_from_date,
+                            to_date=_to_date,
+                            index_str=_index_str,
+                            trading_days=_tdays,
+                            midcap_legs=_mc_legs,
+                            midcap_spot_adjustment=_mc_sa,
+                            midcap_symbol=_mc_sym,
+                            filter_name=_filter_name,
+                            filter_segments=_filter_segments,
+                        )
                 done += 1
                 logger.info(
                     "[OPTIM] combo %d done | %s | trades=%d pnl=%.0f obj=%.4f | %.0fms",
@@ -374,7 +561,39 @@ def run_parallel(
     Redis by the time this returns.
     """
     if parallelism <= 1:
-        raise ValueError("Use the sequential path for parallelism <= 1")
+        # The runner's dynamic split (solo_ceiling // live_optims) can legitimately
+        # resolve to P=1 when several optims run concurrently (e.g. ceiling 2 with
+        # 2 live → 2//2=1, or ceiling 3 with 2 live → 3//2=1). The runner has
+        # already committed to this (parallel) path by the time the split is
+        # computed (it must be, so concurrent optims register first), so we can't
+        # bounce back to the sequential branch here. Instead, run the single chunk
+        # IN-PROCESS via the exact same _worker_entrypoint the pool workers use —
+        # so per-combo computation and Redis writes are byte-for-byte identical,
+        # just without forking. Save/restore the caller's _RUST_CONTEXT because
+        # _worker_entrypoint tears market data down in its finally; the caller's
+        # finalization (ZIP MAE/MFE enrichment) needs trading_days to survive
+        # exactly as it does after the normal parallel path.
+        from services.optimizer import runner as _runner_mod
+        _saved_ctx = _runner_mod._RUST_CONTEXT
+        try:
+            res = _worker_entrypoint(
+                job_id,
+                base_payload,
+                combos,
+                objective_name,
+                1,
+                prebuilt_feather_root=prebuilt_feather_root,
+                prebuilt_rust_context=prebuilt_rust_context,
+            )
+        finally:
+            _runner_mod._RUST_CONTEXT = _saved_ctx
+        _done = int(res.get("done", 0))
+        if progress_cb:
+            try:
+                progress_cb(_done)
+            except Exception:
+                pass
+        return {"done": _done, "failures": int(res.get("failures", 0))}
 
     chunks = _chunk(combos, parallelism)
     total_done = 0

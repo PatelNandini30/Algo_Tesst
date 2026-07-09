@@ -142,12 +142,16 @@ const roundMae = (value) => Math.round(value * 10000) / 10000;
  * Unified rule (single-leg, multi-leg, options and futures alike):
  *   Net MAE 1 = sum(bullish MAE) + sum(bearish MFE)
  *   Net MAE 2 = sum(bullish MFE) + sum(bearish MAE)
- *   Final MAE = min(Net MAE 1, Net MAE 2)
+ *   Final MAE = min(Net MAE 1, Net MAE 2)                     (single directional leg)
+ *   Final MAE = min(Net MAE 1, Net MAE 2, Net P&L %)          (>1 directional leg)
  *
  * When every leg shares one direction this collapses to "all MAE" vs
- * "all MFE"; mixed directions cross automatically.
+ * "all MFE"; mixed directions cross automatically. For MULTI-leg trades the
+ * realized Net P&L % is folded into the min so the reconstructed combined
+ * excursion can never read better than what the trade actually booked
+ * (single-leg keeps min(nm1, nm2) — its own MAE already bounds the loss).
  */
-const calcTradeMae = (legs) => {
+const calcTradeMae = (legs, netPnlPct = null) => {
   const dirLegs = legs.filter(r => isOptionRow(r) || isFutureRow(r));
   if (dirLegs.length === 0) return null;
 
@@ -166,7 +170,10 @@ const calcTradeMae = (legs) => {
 
   const netMae1 = bullishMae + bearishMfe;
   const netMae2 = bullishMfe + bearishMae;
-  return { netMae1: roundMae(netMae1), netMae2: roundMae(netMae2), finalMae: roundMae(Math.min(netMae1, netMae2)) };
+  const finalMae = (dirLegs.length > 1 && Number.isFinite(netPnlPct))
+    ? Math.min(netMae1, netMae2, netPnlPct)
+    : Math.min(netMae1, netMae2);
+  return { netMae1: roundMae(netMae1), netMae2: roundMae(netMae2), finalMae: roundMae(finalMae) };
 };
 
 const getReEntryType = (trade) => {
@@ -324,10 +331,11 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       : legs.reduce((s, l) =>
           s + (parseFloat(l['CE P&L']) || 0) + (parseFloat(l['PE P&L']) || 0) + (parseFloat(l['FUT P&L']) || 0),
         0);
-    const tradeMae   = calcTradeMae(legs);
+    const pct        = spot > 0 ? (net / spot) * 100 : 0;
+    const tradeMae   = calcTradeMae(legs, pct);
     tm[k] = {
       net,
-      pct:        spot > 0 ? (net / spot) * 100 : 0,
+      pct,
       netMae1:    tradeMae?.netMae1  ?? '',
       netMae2:    tradeMae?.netMae2  ?? '',
       finalMae:   tradeMae?.finalMae ?? '',
@@ -1132,7 +1140,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   addSectionHeader('MONTHLY RETURNS (₹ Net P&L)', row++);
 
   const MONTHS  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  const mthHdr  = ['Year', ...MONTHS, 'Total', 'Max DD', 'DD Days', 'R/MDD'];
+  const mthHdr  = ['Year', ...MONTHS, 'Total', 'Max DD', 'R/MDD'];
   for (let ci = 0; ci < mthHdr.length; ci++) {
     ws2.getColumn(ci + 1).width = ci === 0 ? 8 : ci <= 12 ? 9 : ci === 13 ? 10 : ci === 14 ? 18 : 10;
   }
@@ -1204,9 +1212,9 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       const total = mos.reduce((s, v) => s + v, 0);
       const maxDD = byYearMaxDD[yr] != null ? byYearMaxDD[yr] : '';
       const rMdd  = (typeof maxDD === 'number' && maxDD !== 0 && total !== 0)
-        ? +(Math.abs(total) / Math.abs(maxDD)).toFixed(2)
+        ? +(total / Math.abs(maxDD)).toFixed(2)
         : '';
-      const rowData = [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), maxDD, '', rMdd];
+      const rowData = [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), maxDD, rMdd];
       const r2 = ws2.getRow(row);
       rowData.forEach((val, ci) => {
         const cell = r2.getCell(ci + 1);

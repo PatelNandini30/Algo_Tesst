@@ -84,10 +84,32 @@ def _compute_engine_version() -> str:
 CACHE_VERSION = _compute_engine_version()
 
 # Configuration
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+# See result_store.py for the rationale: prefer explicit REDIS_HOST, else parse
+# REDIS_URL (so LAN remote workers reach the main box's Redis, not the
+# unresolvable Docker name "redis"). Main box behavior is unchanged.
+def _resolve_redis_params():
+    if os.getenv("REDIS_HOST"):
+        return (
+            os.getenv("REDIS_HOST"),
+            int(os.getenv("REDIS_PORT", "6379")),
+            int(os.getenv("REDIS_DB", "0")),
+            os.getenv("REDIS_PASSWORD", None),
+        )
+    url = os.getenv("REDIS_URL")
+    if url:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        db_path = (u.path or "").strip("/")
+        return (
+            u.hostname or "redis",
+            u.port or 6379,
+            int(db_path) if db_path.isdigit() else 0,
+            u.password,
+        )
+    return "redis", 6379, 0, None
+
+
+REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD = _resolve_redis_params()
 CACHE_TTL_SECONDS = int(os.getenv("BACKTEST_CACHE_TTL", "86400"))  # 24 hours
 
 

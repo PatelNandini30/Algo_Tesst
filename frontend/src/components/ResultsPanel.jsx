@@ -112,6 +112,18 @@ const buildExcelFileName = (config) => {
         parts.push(`ATM_${pctStr}PCT_${moneyness}`);
       } else if (criteria === 'atm_straddle_prem_pct') {
         parts.push('STRADDLE');
+      } else if (criteria === 'straddle_width') {
+        const mult = leg.straddle_multiplier != null ? parseFloat(leg.straddle_multiplier) : 0.5;
+        const multStr = Number.isInteger(mult) ? String(mult) : parseFloat(mult.toFixed(2)).toString();
+        // Raw +/- sign, applied identically to every leg (no CE/PE meaning).
+        const sign = (leg.straddle_direction || '+').trim() === '-' ? '-' : '+';
+        parts.push(`SW_${multStr}X_${sign}`);
+      } else if (criteria === 'rel_leg') {
+        // Relative-to-Leg (Iron Condor wing): reflect parent + offset in gaps,
+        // e.g. REL_L1_2G  /  REL_L3_-1G — instead of a misleading "ATM".
+        const ref = Number(leg.ref_leg) || 1;
+        const off = Number(leg.offset) || 0;
+        parts.push(`REL_L${ref}_${off}G`);
       } else {
         parts.push((leg.strike_type || 'atm').toUpperCase());
       }
@@ -866,8 +878,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     // Unified rule (single-leg, multi-leg, options and futures alike):
     //   Net MAE 1 = sum(bullish MAE) + sum(bearish MFE)
     //   Net MAE 2 = sum(bullish MFE) + sum(bearish MAE)
-    //   Final MAE = min(Net MAE 1, Net MAE 2)
-    const calcTradeMae = (legs) => {
+    //   Final MAE = min(Net MAE 1, Net MAE 2)                  (single directional leg)
+    //   Final MAE = min(Net MAE 1, Net MAE 2, Net P&L %)       (>1 directional leg)
+    // For MULTI-leg trades the realized Net P&L % floors Final MAE so the
+    // reconstructed combined excursion can never read better than what the trade
+    // actually booked (single-leg keeps min(nm1, nm2) — its MAE already bounds it).
+    const calcTradeMae = (legs, netPnlPct = null) => {
       const dirLegs = legs.filter(r => isOptionRow(r) || isFutureRow(r));
       if (dirLegs.length === 0) return null;
 
@@ -886,10 +902,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
       const netMae1 = bullishMae + bearishMfe;
       const netMae2 = bullishMfe + bearishMae;
+      const finalMae = (dirLegs.length > 1 && Number.isFinite(netPnlPct))
+        ? Math.min(netMae1, netMae2, netPnlPct)
+        : Math.min(netMae1, netMae2);
       return {
         netMae1: roundMae(netMae1),
         netMae2: roundMae(netMae2),
-        finalMae: roundMae(Math.min(netMae1, netMae2)),
+        finalMae: roundMae(finalMae),
       };
     };
 
@@ -939,11 +958,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         : legs.reduce((s,l) => s+(parseFloat(l['CE P&L'])||0)+(parseFloat(l['PE P&L'])||0)+(parseFloat(l['FUT P&L'])||0), 0);
       const toN  = v => (v!=null&&v!==''&&!isNaN(parseFloat(v))) ? parseFloat(v) : '';
       const r    = mainRow || legs[0];
-      const tradeMae = calcTradeMae(legs);
+      const pct  = spot>0?(net/spot)*100:0;
+      const tradeMae = calcTradeMae(legs, pct);
       // Net MAE 1/2/Final columns stay NIFTY-only (existing behaviour). With a
       // Midcap leg these columns are dropped from the sheet; the COMBINED cross
       // is shown in the Combined Net MAE columns instead (computed in the chain).
-      tm[k] = { net, pct:(spot>0?(net/spot)*100:0),
+      tm[k] = { net, pct,
                 netMae1:tradeMae?.netMae1 ?? '', netMae2:tradeMae?.netMae2 ?? '', finalMae:tradeMae?.finalMae ?? '',
                 cumulative:toN(r['Cumulative']), peak:toN(r['Peak']),
                 dd:toN(r['DD']), pctDd: (() => { const v = toN(r['%DD']); return v !== '' ? v : ''; })(),
@@ -1618,7 +1638,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     addSectionHeader('MONTHLY RETURNS (₹ Net P&L)', row++);
 
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const mthHdr = ['Year',...MONTHS,'Total','Max DD','DD Days','R/MDD'];
+    const mthHdr = ['Year',...MONTHS,'Total','Max DD','R/MDD'];
 
     // Set wide columns for monthly table (columns A–R)
     const mthCols = mthHdr.length;
@@ -1708,9 +1728,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     groupedTrades.forEach(group => {
       const ym = parseToYearMonth(group?.exitDate || '');
       if (!ym) return;
+      // group.pct_dd is the RAW (non-patchwise, never-reset) %DD fixed at render
+      // time. In patchwise mode, tm[k].pctDd was already recomputed above with
+      // patch resets (matches the Trade Sheet's own %DD column) — use that
+      // instead, or this table silently reports the global drawdown.
       let dd = hasMidcap
         ? Number(midcapByTrade[group.groupKey]?.['Combined %DD'])
-        : Number(group?.pct_dd);
+        : (patchwise ? Number(tm[group.groupKey]?.pctDd) : Number(group?.pct_dd));
       if (!Number.isFinite(dd)) return;
       if (byYearMaxDDPct[ym.year] == null || dd < byYearMaxDDPct[ym.year]) {
         byYearMaxDDPct[ym.year] = dd;
@@ -1720,7 +1744,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const mthData = Object.entries(byYM).sort().map(([yr, mos]) => {
       const total = mos.reduce((s, v) => s + v, 0);
       const extras = pivotExtrasByYear[yr] || ['', '', ''];
-      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), ...extras];
+      // Max DD here mirrors the optimizer sheets: the %DD-based percentage
+      // (same value as the % table below), not the backend pivot's rupee /
+      // date-range string. R/MDD (extras[2]) still comes from the pivot.
+      const maxDdPct = byYearMaxDDPct[yr] != null ? byYearMaxDDPct[yr] : '';
+      return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), maxDdPct, extras[2]];
     });
 
     mthData.forEach((dataRow, ri) => {
@@ -1733,7 +1761,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         const isTotalCol = ci===13;
         const isMaxDdCol = ci===14;
         if (isMaxDdCol && typeof val === 'number') {
-          cell.value = val;
+          cell.value = val / 100;
           cell.numFmt = '0.00%';
         }
         if ((isValCol||isTotalCol) && !isNaN(num) && num!==0) {
@@ -1760,10 +1788,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     row++;
     addSectionHeader('MONTHLY RETURNS (% Net P&L)', row++);
 
-    const mthHdrPct = ['Year',...MONTHS,'Total','Max DD'];
+    const mthHdrPct = ['Year',...MONTHS,'Total','Max DD','R/MDD'];
     const mthColsPct = mthHdrPct.length;
     for (let ci = 0; ci < mthColsPct; ci++) {
-      ws2.getColumn(ci+1).width = ci===0 ? 8 : 9;
+      ws2.getColumn(ci+1).width = ci===0 ? 8 : ci<=12 ? 9 : ci===13 ? 10 : ci===14 ? 10 : 10;
     }
 
     const hdrRowPct = ws2.getRow(row);
@@ -1781,7 +1809,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     const mthDataPct = Object.entries(byYMPct).sort().map(([yr, mos]) => {
       const total = mos.reduce((s, v) => s + v, 0);
       const maxDd = byYearMaxDDPct[yr] != null ? byYearMaxDDPct[yr] : '';
-      return [yr, ...mos, total, maxDd];
+      // R/MDD is %Total / %MaxDD — both already percentage-points here, so no
+      // extra scaling is needed (matches the optimizer sheets' convention).
+      const rMdd = (typeof maxDd === 'number' && maxDd !== 0 && total !== 0)
+        ? +(total / Math.abs(maxDd)).toFixed(2)
+        : '';
+      return [yr, ...mos, total, maxDd, rMdd];
     });
 
     mthDataPct.forEach((dataRow, ri) => {

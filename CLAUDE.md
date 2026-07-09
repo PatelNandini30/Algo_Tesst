@@ -92,6 +92,11 @@ Key implications:
 - MAE/MFE is included in the tradesheet by default (`BACKTEST_INCLUDE_MAE_MFE=1`). Disable only for bulk perf tests.
 - Pandas 2.x compatibility shims live at the top of `main.py` (patches `DataFrame.sort_values` and `Series.sort_values`). Don't remove — the codebase still uses the legacy `by=` keyword in places.
 
+## Response style (user preference)
+
+- **Be fast and concise.** The user wants quick responses. Keep explanations short, skip long preambles/recaps, avoid repeating what was already said, and act instead of deliberating out loud. Prefer doing the work and reporting the result briefly over narrating options. Only expand when the user asks for detail.
+- **Limit token usage; do not cross boundaries.** Keep total token usage bounded — read only the specific file regions you need (not whole large files), avoid dumping large logs/command output into context, prefer targeted `grep`/`sed -n` over broad reads, and don't re-fetch or re-verify things already established in the conversation. Stay well within context limits.
+
 ## Working with prompts
 
 - **Always refine the prompt before acting.** Before starting any task, restate the user's request as a clearer, more precise prompt — resolve ambiguity, fill in implied scope, and confirm the refined intent (or proceed with it explicitly stated) rather than acting on the raw wording.

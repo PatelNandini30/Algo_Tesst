@@ -188,7 +188,7 @@ def _is_bullish_leg(leg: Dict) -> bool:
     )
 
 
-def _calc_trade_mae(legs: List[Dict]):
+def _calc_trade_mae(legs: List[Dict], net_pnl_pct: Optional[float] = None):
     """Replicate calcTradeMae from JS.
 
     Every leg (option or future) is classified by market direction:
@@ -198,7 +198,14 @@ def _calc_trade_mae(legs: List[Dict]):
     Unified rule (single-leg, multi-leg, options and futures alike):
       nm1 = sum(bullish MAE) + sum(bearish MFE)
       nm2 = sum(bullish MFE) + sum(bearish MAE)
-      final = min(nm1, nm2)
+      final = min(nm1, nm2)                              (single directional leg)
+      final = min(nm1, nm2, net_pnl_pct)                 (>1 directional leg)
+
+    For MULTI-leg trades the realized Net P&L % is folded into the min so the
+    reconstructed combined excursion can never read better than what the trade
+    actually booked (nm1/nm2 pair each leg's independent extremes, which may not
+    have occurred simultaneously). Single-leg keeps min(nm1, nm2) — its own MAE
+    already bounds the realized loss. Mirrors the Midcap Combined Final MAE rule.
     """
     dir_legs = [
         l for l in legs
@@ -229,7 +236,11 @@ def _calc_trade_mae(legs: List[Dict]):
 
     nm1 = bull_mae + bear_mfe
     nm2 = bull_mfe + bear_mae
-    return (_rnd(nm1), _rnd(nm2), _rnd(min(nm1, nm2)))
+    if len(dir_legs) > 1 and net_pnl_pct is not None:
+        final = min(nm1, nm2, net_pnl_pct)
+    else:
+        final = min(nm1, nm2)
+    return (_rnd(nm1), _rnd(nm2), _rnd(final))
 
 
 # ── Midcap cross-index overlay (mirrors ResultsPanel.exportToCSV exactly) ──────
@@ -392,11 +403,12 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
                 (_to_num(l.get("FUT P&L")) or 0)
                 for l in legs
             )
-        mae_res = _calc_trade_mae(legs)
+        _pct = (raw_net / spot * 100) if spot != 0 else 0.0
+        mae_res = _calc_trade_mae(legs, _pct)
 
         tm[k] = {
             "net":        raw_net,
-            "pct":        (raw_net / spot * 100) if spot != 0 else 0.0,
+            "pct":        _pct,
             "netMae1":    mae_res[0] if mae_res else "",
             "netMae2":    mae_res[1] if mae_res else "",
             "finalMae":   mae_res[2] if mae_res else "",
@@ -1471,7 +1483,7 @@ def _write_summary_sheet(
     _section("MONTHLY RETURNS (₹ Net P&L)", r); r += 1
 
     MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    mth_hdr = ["Year", *MONTHS, "Total", "Max DD", "DD Days", "R/MDD"]
+    mth_hdr = ["Year", *MONTHS, "Total", "Max DD", "R/MDD"]
 
     # Set wider column widths for month table
     for ci in range(1, len(mth_hdr) + 1):
@@ -1517,9 +1529,18 @@ def _write_summary_sheet(
         for yi, (yr, mos) in enumerate(sorted(data_map.items())):
             total = sum(mos)
             max_dd_yr = by_yr_max_dd.get(yr)
-            r_mdd = (abs(total) / abs(max_dd_yr)) if (max_dd_yr and max_dd_yr != 0 and total != 0) else ""
+            if is_pct:
+                # Net P&L % table only: R/MDD must be percent/percent. `total`
+                # here is already a percent sum (data_map=by_ym_pct); by_yr_max_dd
+                # is a fraction (dd/peak), so scale it to percentage-points to
+                # match `total` instead of dividing by the raw fraction.
+                max_dd_pct = (max_dd_yr * 100) if max_dd_yr is not None else None
+                r_mdd = (round(total / abs(max_dd_pct), 2)
+                         if (max_dd_pct and max_dd_pct != 0 and total != 0) else "")
+            else:
+                r_mdd = (total / abs(max_dd_yr)) if (max_dd_yr and max_dd_yr != 0 and total != 0) else ""
             row_data = [yr, *[round(v, 2) for v in mos], round(total, 2),
-                        max_dd_yr if max_dd_yr is not None else "", "", r_mdd]
+                        max_dd_yr if max_dd_yr is not None else "", r_mdd]
             ws.row_dimensions[r].height = 18
             for ci2, val in enumerate(row_data, 1):
                 c = ws.cell(row=r, column=ci2, value=val)
@@ -1530,7 +1551,12 @@ def _write_summary_sheet(
                     c.number_format = "0.00%"
                     num_v = val
                 elif ci2 == 15 and isinstance(val, (int, float)):
-                    c.value = val / 100
+                    # Max DD here is `by_yr_max_dd`, sourced from the cleaned
+                    # row's "%DD"/"Combined %DD" = _aggregate_trades' pctDd,
+                    # which is already a fraction (dd/peak, no *100) — same
+                    # convention the per-trade detail sheet uses as-is via
+                    # _TRUE_PCT_COLS. Don't divide again here.
+                    c.value = val
                     c.number_format = "0.00%"
                     num_v = val
                 elif is_pct and ci2 == 14 and isinstance(val, (int, float)):
@@ -1747,8 +1773,6 @@ def compute_xlsx_summary_metrics(
             sum_net += n
             sp = _to_num(t.get("Spot P&L"))
             if sp is not None: spot_sum_gated += sp
-        cum = _to_num(t.get("Cumulative"))
-        if cum is not None and math.isfinite(cum): final_cum = cum
         es = _to_num(t.get("Entry Spot")); xs = _to_num(t.get("Exit Spot"))
         if n is not None and math.isfinite(n) and es and xs and es > 0:
             spot_cum *= (xs / es)
@@ -1756,6 +1780,17 @@ def compute_xlsx_summary_metrics(
         xd = _parse_date_ms(t.get("Exit Date"))
         if ed and (min_entry_ms is None or ed < min_entry_ms): min_entry_ms = ed
         if xd and (max_exit_ms  is None or xd > max_exit_ms):  max_exit_ms  = xd
+
+    # Final booked equity from the CANONICAL patch-aware chain (tm/_sorted_keys),
+    # NOT the raw overall "Cumulative" column of rows — so CAGR(Options) and
+    # CAR/MDD honor the per-patch reset in patchwise mode. In overall mode this
+    # chain equals the raw Cumulative, so the value is unchanged. Uses _sorted_keys
+    # (canonical chronological order) so it is the true last trade, order-safe.
+    # The midcap block below overrides final_cum with the combined-chain value.
+    if _sorted_keys:
+        _last_cum = tm.get(_sorted_keys[-1], {}).get("cumulative")
+        if isinstance(_last_cum, float) and math.isfinite(_last_cum):
+            final_cum = _last_cum
 
     # With a Midcap leg, recompute the headline aggregates on the COMBINED
     # per-trade P&L (chronological), mirroring the combo Summary sheet. CAGR(Spot)

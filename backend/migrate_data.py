@@ -971,6 +971,28 @@ def _invalidate_caches_after_import() -> None:
         logger.debug("arrow cache clear skipped: %s", e)
 
 
+def _rewarm_caches_after_import(symbols, max_date) -> None:
+    """Proactively rebuild the per-symbol Arrow feather cache right after an
+    import, instead of leaving it to the next backtest request. Without this,
+    a stale-but-internally-consistent feather pair can be silently accepted as
+    "best available" (see base.py's spot-bounded acceptance check) until
+    something forces a real reload — which is exactly what let May/Jun 2026
+    NIFTY data sit unused in Postgres while the cache stayed pinned at Apr 30.
+    Best-effort: enqueued onto the fast backtest queue, never blocks the import."""
+    if not symbols or not max_date:
+        return
+    try:
+        from worker.tasks import warm_backtest_cache_task
+        for sym in symbols:
+            warm_backtest_cache_task.apply_async(
+                args=[{"index": sym, "from_date": "2000-01-01", "to_date": max_date}],
+                queue="backtests_fast",
+            )
+        logger.info("[CACHE] Queued cache re-warm for %s through %s", symbols, max_date)
+    except Exception as e:
+        logger.warning("cache re-warm enqueue failed: %s", e)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Migrator
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1212,6 +1234,7 @@ class Migrator:
                 and ((result.get("rows_inserted") or 0)
                      + (result.get("rows_updated") or 0)) > 0):
             _invalidate_caches_after_import()
+            _rewarm_caches_after_import(result.get("symbols"), result.get("max_date"))
         return result
 
     # ── option_data ───────────────────────────────────────────────────────
@@ -1262,6 +1285,9 @@ class Migrator:
         r["rows_skipped"]  = skipped + n_dup
         r["rows_valid"]    = len(df_valid)
         r["rows_inserted"] = r["rows_updated"] = 0
+        if not df_valid.empty:
+            r["symbols"]  = sorted(df_valid["symbol"].dropna().unique().tolist())
+            r["max_date"] = str(df_valid["trade_date"].max())
 
         df_db = self._align("option_data", df_valid)
         if self.dry_run or df_db.empty:
@@ -1329,6 +1355,9 @@ class Migrator:
         r["rows_skipped"]  = skipped + n_dup
         r["rows_valid"]    = len(df_valid)
         r["rows_inserted"] = r["rows_updated"] = 0
+        if not df_valid.empty:
+            r["symbols"]  = sorted(df_valid["symbol"].dropna().unique().tolist())
+            r["max_date"] = str(df_valid["trade_date"].max())
 
         df_db = self._align("spot_data", df_valid)
         if self.dry_run or df_db.empty:

@@ -12,9 +12,10 @@
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, X, Loader2, Settings, ArrowDown, ArrowUp, FileDown } from 'lucide-react';
-import ExcelJS from 'exceljs';
 import { MASTER_SUMMARY_COLUMNS } from '../utils/strategyParamSchema';
 import buildTradeExcel from '../utils/buildTradeExcel';
+import { buildSummaryWorkbookBlob, rulesFilename, triggerBlobDownload } from '../utils/optimSummaryExport';
+import { resolveDownloadBase } from '../utils/downloadBase';
 
 const POLL_MS = 1500;
 const FETCH_LIMIT = 500;
@@ -70,6 +71,7 @@ export default function OptimizationResults({
   totalCombos,
   objective: defaultObjective,
   runConfig,
+  ruleConfig,
   midcapConfig,
   onClose,
   onApplyCombo,
@@ -85,13 +87,96 @@ export default function OptimizationResults({
   const [configExpanded, setConfigExpanded] = useState(false);
   const [zipDownloading, setZipDownloading] = useState(false);
   const [zipProgress, setZipProgress] = useState(null);
-  const [showDdMenu, setShowDdMenu] = useState(false);
   const [ddMode, setDdMode] = useState('overall');
   // Method of the last successfully-downloaded tradesheets ZIP ('overall' |
   // 'patchwise' | null). The master "Export XLSX" is gated behind this and must
   // produce the summary in the SAME method so it matches the downloaded ZIP.
   const [zipMethod, setZipMethod] = useState('patchwise');
+  // The job only pre-builds ONE download artifact set (the mode chosen at
+  // launch, in OptimizePanel.jsx — defaults to patchwise). Once meta loads,
+  // default both dd pickers to that mode so the first click hits the fast,
+  // already-built path instead of silently triggering a slow on-demand build
+  // of the other variant. Only syncs once (didSyncDlMode) so it doesn't
+  // stomp a manual choice the user makes afterward.
+  const didSyncDlModeRef = useRef(false);
+  useEffect(() => {
+    if (didSyncDlModeRef.current) return;
+    const jobMode = meta?.base_payload?.download_mode;
+    if (jobMode === 'overall' || jobMode === 'patchwise') {
+      didSyncDlModeRef.current = true;
+      setDdMode(jobMode);
+      setZipMethod(jobMode);
+    }
+  }, [meta]);
+  const jobDownloadMode =
+    meta?.base_payload?.download_mode === 'overall' || meta?.base_payload?.download_mode === 'patchwise'
+      ? meta.base_payload.download_mode
+      : zipMethod;
+  const jobDownloadIsPatchwise = jobDownloadMode === 'patchwise';
   const pollRef = useRef(null);
+  const notifiedJobRef = useRef(null);
+  // Only set once we've actually observed this job in a non-terminal state —
+  // guards against dinging again if the user reopens an already-finished job.
+  const sawRunningJobRef = useRef(null);
+  const origTitleRef = useRef(typeof document !== 'undefined' ? document.title : '');
+
+  // Ask for OS-notification permission once a run is launched (this fires in
+  // response to the user's own "Launch Optimization" click a moment earlier,
+  // so most browsers allow the prompt). If denied/unavailable we just fall
+  // back to the in-app sound + title flash below — no error surfaced.
+  useEffect(() => {
+    if (jobId && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, [jobId]);
+
+  // Two-tone chime via the Web Audio API — no embedded audio asset needed,
+  // so nothing to fetch and nothing that can violate the sandboxed CSP.
+  function playDoneChime() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const tone = (freq, delayMs) => setTimeout(() => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.2, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.35);
+      }, delayMs);
+      tone(880, 0);
+      tone(1320, 150);
+    } catch {
+      // Autoplay/audio blocked — sound is a nice-to-have, not critical.
+    }
+  }
+
+  function notifyJobDone(status) {
+    if (notifiedJobRef.current === jobId) return;
+    notifiedJobRef.current = jobId;
+    playDoneChime();
+    const title = status === 'failed' ? 'Optimization failed' : 'Optimization complete';
+    const body = status === 'failed'
+      ? 'Your parameter sweep hit an error — open the panel to see details.'
+      : `Your parameter sweep finished — ${rows.length || meta?.total || ''} combos ready to review.`;
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      try { new Notification(title, { body }); } catch {}
+    }
+    // Flash the tab title so a backgrounded tab still signals completion;
+    // reverts on the next time the tab regains focus.
+    if (typeof document !== 'undefined' && document.hidden) {
+      document.title = `${status === 'failed' ? '⚠️' : '✅'} ${title}`;
+      const restore = () => {
+        document.title = origTitleRef.current;
+        document.removeEventListener('visibilitychange', restore);
+      };
+      document.addEventListener('visibilitychange', restore);
+    }
+  }
 
   const fetchAll = useCallback(async () => {
     if (!jobId) return;
@@ -117,15 +202,24 @@ export default function OptimizationResults({
         const r = await fetch(`/api/optimize/jobs/${jobId}`);
         if (!r.ok) return;
         const data = await r.json();
-        setJobStatus(data.status || 'queued');
+        // 'unknown' = job meta is gone (e.g. cancelled via DELETE, which
+        // deletes it from Redis) but the Celery state isn't simply "still
+        // queued" either — treat it as terminal/failed so this stops polling
+        // instead of showing "running" forever.
+        const effectiveStatus = data.status === 'unknown' ? 'failed' : (data.status || 'queued');
+        setJobStatus(effectiveStatus);
         setMeta(data.meta || null);
-        if (data.status === 'success' || data.status === 'failed') {
+        if (effectiveStatus === 'success' || effectiveStatus === 'failed') {
           clearInterval(pollRef.current);
           pollRef.current = null;
           fetchAll();
-        } else if (data.status !== 'queued') {
-          // Refresh partial results so the table fills in as combos complete.
-          fetchAll();
+          if (sawRunningJobRef.current === jobId) notifyJobDone(effectiveStatus);
+        } else {
+          sawRunningJobRef.current = jobId;
+          if (data.status !== 'queued') {
+            // Refresh partial results so the table fills in as combos complete.
+            fetchAll();
+          }
         }
       } catch {
         // swallow — polling will retry
@@ -163,7 +257,10 @@ export default function OptimizationResults({
   useEffect(() => {
     if (status === 'success' && rows.length > 0 && jobId && !zipPrebuiltRef.current) {
       zipPrebuiltRef.current = true;
-      fetch(`/api/optimize/jobs/${jobId}/tradesheets.zip`).catch(() => {});
+      // Trigger the ZIP pre-build on whichever node ran the job (remote or local).
+      resolveDownloadBase(jobId)
+        .then((base) => fetch(`${base}/api/optimize/jobs/${jobId}/tradesheets.zip`).catch(() => {}))
+        .catch(() => {});
     }
   }, [status, rows.length, jobId]);
   const eta = meta?.eta_seconds;
@@ -239,9 +336,10 @@ export default function OptimizationResults({
     // patchwise-recomputed per-combo metrics from the backend (same compute that
     // builds the patchwise ZIP's summary.csv) so this excel matches the ZIP.
     let summaryByCombo = null;
-    if (zipMethod === 'patchwise') {
+    if (jobDownloadIsPatchwise) {
       try {
-        const r = await fetch(`/api/optimize/jobs/${jobId}/summary?patchwise=true`);
+        const _base = await resolveDownloadBase(jobId);
+        const r = await fetch(`${_base}/api/optimize/jobs/${jobId}/summary?patchwise=true`);
         if (r.ok) {
           const data = await r.json();
           summaryByCombo = new Map(
@@ -255,53 +353,18 @@ export default function OptimizationResults({
       }
     }
 
-    const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('Optimization Summary');
-    // Build header with Sr.No first, then optimized-param cols, then Duration, then master summary.
-    const headers = [
-      'Sr. No.',
-      ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => c.label),
-    ];
-    ws.addRow(headers);
-    ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } };
-    ws.getRow(1).alignment = { horizontal: 'center', vertical: 'middle' };
-    ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
-
-    rows.forEach((row, i) => {
-      const summary =
-        (summaryByCombo && summaryByCombo.get(String(row.combo_id))) ||
-        row.summary || {};
-      const cols = row.combo_columns || {};
-      const arr = [
-        i + 1,
-        ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => {
-          if (c.key in cols) return cols[c.key];
-          if (c.key in summary) return summary[c.key];
-          return summary[c.key];
-        }),
-      ];
-      ws.addRow(arr);
-    });
-    ws.columns.forEach((col) => {
-      col.width = 16;
-    });
-    const buf = await wb.xlsx.writeBuffer();
-    const blob = new Blob([buf], {
-      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `optimize_${jobId}${zipMethod === 'patchwise' ? '_patchwise' : '_overall'}.xlsx`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    // Shared builder (utils/optimSummaryExport.js) — identical logic path
+    // used by the auto-download queue, so a manual export and an
+    // auto-downloaded one are always byte-for-byte the same.
+    const blob = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo);
+    triggerBlobDownload(blob, rulesFilename(ruleConfig, jobId, jobDownloadIsPatchwise ? '_patchwise' : '_overall'));
   }
 
   async function downloadWowMom() {
     try {
-      const query = zipMethod === 'patchwise' ? '?patchwise=true' : '';
-      const r = await fetch(`/api/optimize/jobs/${jobId}/wow_mom.xlsx${query}`);
+      const query = jobDownloadIsPatchwise ? '?patchwise=true' : '';
+      const _base = await resolveDownloadBase(jobId);
+      const r = await fetch(`${_base}/api/optimize/jobs/${jobId}/wow_mom.xlsx${query}`);
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
         alert(err.detail || err.error || 'Failed to download WOW/MOM summary');
@@ -323,7 +386,7 @@ export default function OptimizationResults({
     }
   }
 
-  async function downloadTradesheets(patchwise = false) {
+  async function downloadTradesheets(patchwise = true) {
     if (zipDownloading) return;
     setZipDownloading(true);
     setZipProgress({ done: 0, total: 0, elapsed: 0 });
@@ -332,9 +395,10 @@ export default function OptimizationResults({
       // still building (poll progress).
       const start = Date.now();
       const maxWaitMs = 20 * 60 * 1000;  // 20 min hard cap
+      const _base = await resolveDownloadBase(jobId);
       const zipUrl = patchwise
-        ? `/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
-        : `/api/optimize/jobs/${jobId}/tradesheets.zip`;
+        ? `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
+        : `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip`;
       while (true) {
         const r = await fetch(zipUrl);
         if (r.status === 200) {
@@ -604,7 +668,7 @@ export default function OptimizationResults({
             <button
               onClick={exportExcel}
               disabled={rows.length === 0 || status !== 'success'}
-              title={`Export master summary (${zipMethod === 'patchwise' ? 'Patchwise DD' : 'Overall System DD'})`}
+              title={`Export master summary (${jobDownloadIsPatchwise ? 'Patchwise DD' : 'Overall System DD'})`}
               style={{
                 padding: '6px 12px',
                 fontSize: 11,
@@ -618,12 +682,12 @@ export default function OptimizationResults({
                 opacity: (rows.length === 0 || status !== 'success') ? 0.4 : 1,
               }}
               >
-                <Download size={12} /> Export XLSX ({zipMethod === 'patchwise' ? 'Patchwise' : 'Overall'})
+                <Download size={12} /> Export XLSX ({jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'})
               </button>
             <button
               onClick={downloadWowMom}
               disabled={rows.length === 0 || status !== 'success'}
-              title={`Download the merged WOW/MOM summary for all combos (${zipMethod === 'patchwise' ? 'Patchwise DD' : 'Overall System DD'})`}
+              title={`Download the merged WOW/MOM summary for all combos (${jobDownloadIsPatchwise ? 'Patchwise DD' : 'Overall System DD'})`}
               style={{
                 padding: '6px 12px',
                 fontSize: 11,
@@ -637,11 +701,11 @@ export default function OptimizationResults({
                 opacity: (rows.length === 0 || status !== 'success') ? 0.4 : 1,
               }}
             >
-              <Download size={12} /> WOW & MOM ({zipMethod === 'patchwise' ? 'Patchwise' : 'Overall'})
+              <Download size={12} /> WOW & MOM ({jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'})
             </button>
             <div style={{ position: 'relative' }}>
               <button
-                onClick={() => setShowDdMenu(v => !v)}
+                onClick={() => downloadTradesheets(jobDownloadIsPatchwise)}
                 disabled={status !== 'success' || rows.length === 0 || zipDownloading}
                 style={{
                   padding: '6px 12px',
@@ -660,7 +724,7 @@ export default function OptimizationResults({
                     ? 'Available after run completes'
                     : zipDownloading
                       ? 'ZIP is being built…'
-                      : 'Download all tradesheets as ZIP'
+                      : `Download all tradesheets as ZIP (${jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'} DD — chosen at launch)`
                 }
               >
                 <Download size={12} />
@@ -668,31 +732,10 @@ export default function OptimizationResults({
                   ? (zipProgress && zipProgress.total > 0
                       ? `Building ZIP… ${zipProgress.done}/${zipProgress.total} (${Math.round(zipProgress.elapsed)}s)`
                       : `Building ZIP…${zipProgress ? ` ${Math.round(zipProgress.elapsed)}s` : ''}`)
-                  : `Download Tradesheets ZIP ▾`}
+                  : `Download Tradesheets ZIP (${jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'})`}
               </button>
-              {showDdMenu && (
-                <div style={{
-                  position: 'absolute', right: 0, top: '100%', marginTop: 4,
-                  zIndex: 50, borderRadius: 8, boxShadow: '0 4px 16px rgba(0,0,0,0.18)',
-                  overflow: 'hidden', background: 'var(--bg-card)', border: '1px solid var(--border)',
-                  minWidth: 200,
-                }}>
-                  <button
-                    style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', border: 'none', cursor: 'pointer', display: 'block' }}
-                    onClick={() => { setShowDdMenu(false); setDdMode('patchwise'); downloadTradesheets(true); }}
-                  >
-                    Patchwise DD
-                  </button>
-                  <button
-                    style={{ width: '100%', padding: '8px 14px', fontSize: 11, textAlign: 'left', background: 'transparent', borderTop: '1px solid var(--border)', cursor: 'pointer', display: 'block' }}
-                    onClick={() => { setShowDdMenu(false); setDdMode('overall'); downloadTradesheets(false); }}
-                  >
-                    Overall System DD
-                  </button>
-                </div>
-              )}
             </div>
-            {status === 'running' && (
+            {(status === 'running' || status === 'queued') && (
               <button
                 onClick={cancelJob}
                 style={{
@@ -708,7 +751,7 @@ export default function OptimizationResults({
               </button>
             )}
             <button
-              onClick={onClose}
+              onClick={(status === 'running' || status === 'queued') ? cancelJob : onClose}
               aria-label="Close"
               style={{
                 background: 'transparent',

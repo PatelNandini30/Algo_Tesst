@@ -22,10 +22,36 @@ import redis
 
 logger = logging.getLogger(__name__)
 
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+# Redis connection. Historically read from REDIS_HOST/REDIS_PORT (defaulting to
+# the Docker service name "redis"), while celery/memory_gate use REDIS_URL. On a
+# LAN remote worker (remote-worker/) the "redis" name doesn't resolve, so if
+# REDIS_HOST isn't explicitly set we parse REDIS_URL instead — one source of
+# truth, and no silent "[OPTIM_STORE] Redis unavailable" on remote nodes. Main
+# box is unaffected: it sets REDIS_URL=redis://redis:6379/0, which parses to the
+# same host/port the old default produced.
+def _resolve_redis_params():
+    if os.getenv("REDIS_HOST"):
+        return (
+            os.getenv("REDIS_HOST"),
+            int(os.getenv("REDIS_PORT", "6379")),
+            int(os.getenv("REDIS_DB", "0")),
+            os.getenv("REDIS_PASSWORD", None),
+        )
+    url = os.getenv("REDIS_URL")
+    if url:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        db_path = (u.path or "").strip("/")
+        return (
+            u.hostname or "redis",
+            u.port or 6379,
+            int(db_path) if db_path.isdigit() else 0,
+            u.password,
+        )
+    return "redis", 6379, 0, None
+
+
+REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD = _resolve_redis_params()
 OPTIM_TTL = int(os.getenv("OPTIMIZE_RESULT_TTL", "86400"))
 OPTIM_SPILL_THRESHOLD = int(os.getenv("OPTIMIZE_PARQUET_SPILL_AT", "10000"))
 OPTIM_PARQUET_DIR = os.getenv("OPTIMIZE_PARQUET_DIR", "/data/cache/optim_results")
@@ -111,6 +137,11 @@ def init_job(
         "total": int(total),
         "done": 0,
         "started_at": time.time(),
+        # Progress heartbeat — bumped on every combo + every finalization step.
+        # The watchdog kills a job only when THIS stops advancing (a real hang),
+        # never a job that is still making progress. See services/optimizer/watchdog.py.
+        "last_progress_at": time.time(),
+        "phase": "starting",
         "method": method,
         "objective": objective,
         "eta_seconds": None,
@@ -137,6 +168,7 @@ def update_progress(
         return
     meta = json.loads(raw)
     meta["done"] = int(done)
+    meta["last_progress_at"] = time.time()
     if total is not None:
         meta["total"] = int(total)
     if phase is not None:
@@ -167,12 +199,37 @@ def increment_done(job_id: str) -> None:
     meta = json.loads(raw)
     meta["done"] = int(cnt)
     meta["phase"] = "running"
+    meta["last_progress_at"] = time.time()
     started = meta.get("started_at") or time.time()
     elapsed = max(time.time() - started, 0.001)
     rate = cnt / elapsed if cnt > 0 else 0
     remaining = max(int(meta.get("total", cnt)) - cnt, 0)
     meta["eta_seconds"] = int(remaining / rate) if rate > 0 else None
     r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
+
+
+def heartbeat(job_id: str, phase: Optional[str] = None) -> None:
+    """Bump the job's progress heartbeat (and optionally its phase label).
+
+    Called at every finalization step boundary (spill, summary, ZIP, WOW/MOM)
+    so a job that is still moving through post-processing is NEVER seen as stuck
+    by the watchdog — only a step that itself hangs longer than the stuck
+    threshold freezes `last_progress_at`. Best-effort; never raises.
+    """
+    r = _redis()
+    if r is None:
+        return
+    try:
+        raw = r.get(_meta_key(job_id))
+        if not raw:
+            return
+        meta = json.loads(raw)
+        meta["last_progress_at"] = time.time()
+        if phase is not None:
+            meta["phase"] = phase
+        r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
+    except Exception as exc:  # pragma: no cover - heartbeat must never break a run
+        logger.debug("[OPTIM_STORE] heartbeat error for %s: %s", job_id, exc)
 
 
 def append_result(job_id: str, row: Dict[str, Any]) -> None:
@@ -211,6 +268,37 @@ def get_meta(job_id: str) -> Optional[Dict[str, Any]]:
         if cnt_raw is not None:
             meta["done"] = int(cnt_raw)
     return meta
+
+
+def list_recent_jobs(limit: int = 200) -> List[Dict[str, Any]]:
+    """List every optimize job with live meta (any machine, any browser) so a
+    browser that did NOT enqueue a job can still discover and auto-download it
+    by job_id — see routers/optimize.py GET /optimize/jobs and
+    frontend/src/components/AutoDownloadQueue.jsx's system-wide poll.
+
+    Cheap: SCANs the `optim:*:meta` keyspace (bounded by OPTIM_TTL — jobs
+    expire out of Redis on their own) rather than maintaining a separate index.
+    Returns newest-first, capped at `limit`.
+    """
+    r = _redis()
+    if r is None:
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        for key in r.scan_iter(match="optim:*:meta", count=200):
+            job_id = key.split(":")[1] if isinstance(key, str) else key.decode().split(":")[1]
+            try:
+                meta = get_meta(job_id)
+            except Exception:
+                continue
+            if not meta:
+                continue
+            out.append({"job_id": job_id, **meta})
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] list_recent_jobs scan failed: %s", exc)
+        return []
+    out.sort(key=lambda m: m.get("started_at") or 0, reverse=True)
+    return out[:limit]
 
 
 def _combo_fingerprint(row: Dict[str, Any]) -> str:
@@ -438,7 +526,7 @@ def write_combo_xlsx(
                     enriched = _compute_live_dd_from_mae(enriched, _agg)
                 trades_df = enriched
             except Exception as _mae_exc:
-                logger.debug("[OPTIM_STORE] MAE/MFE enrich skipped (%s): %s", combo_label_safe, _mae_exc)
+                logger.warning("[OPTIM_STORE] MAE/MFE enrich FAILED (%s): %s", combo_label_safe, _mae_exc)
 
         from services.optimizer.excel_builder import build_combo_xlsx
         xlsx_bytes = build_combo_xlsx(
@@ -459,6 +547,75 @@ def write_combo_xlsx(
             fh.write(xlsx_bytes)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] xlsx write failed (%s): %s", combo_label_safe, exc)
+
+
+def write_combo_xlsx_patchwise(
+    job_id: str,
+    combo_label_safe: str,
+    trades_df: Any,
+    summary: Dict[str, Any],
+    combo_label: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    index_str: str = "",
+    trading_days: Optional[List] = None,
+    midcap_legs=None,
+    midcap_spot_adjustment=None,
+    midcap_symbol: str = "NIFTYMIDCAP100",
+    filter_name: str = "",
+    filter_segments=None,
+) -> None:
+    """Write a combo's PATCHWISE XLSX tradesheet directly from trades_df during
+    the run — same builder the finalization/download uses, just fed the in-memory
+    trades instead of re-reading the CSV. Written to a `patchwise/` subdir so the
+    overall fast-path (which globs top-level *.xlsx) never picks it up. This lets
+    the patchwise ZIP be assembled by just zipping pre-built files (seconds)
+    instead of rebuilding every combo's XLSX from CSV at download time."""
+    if trades_df is None:
+        return
+    try:
+        if hasattr(trades_df, "empty") and trades_df.empty:
+            return
+        # Enrich MAE/MFE identically to the overall write (same code path).
+        if index_str and trading_days:
+            try:
+                from services.optimizer.runner import (
+                    _compute_mae_mfe_batch,
+                    _compute_live_dd_from_mae,
+                )
+                enriched = _compute_mae_mfe_batch(trades_df, index_str, trading_days)
+                if "Trade" in enriched.columns:
+                    _pr = enriched.drop_duplicates(subset=["Trade"], keep="first")
+                    _agg = _pr[["Trade"]].copy()
+                    for _c in ("Cumulative", "Peak", "DD", "%DD", "Net P&L"):
+                        if _c in _pr.columns:
+                            _agg[_c] = _pr[_c].values
+                    enriched = _compute_live_dd_from_mae(enriched, _agg)
+                trades_df = enriched
+            except Exception as _mae_exc:
+                logger.warning("[OPTIM_STORE] pw MAE/MFE enrich FAILED (%s): %s", combo_label_safe, _mae_exc)
+
+        from services.optimizer.excel_builder import build_combo_xlsx
+        xlsx_bytes = build_combo_xlsx(
+            trades_df,
+            summary,
+            combo_label=combo_label,
+            from_date=from_date,
+            to_date=to_date,
+            midcap_legs=midcap_legs,
+            midcap_spot_adjustment=midcap_spot_adjustment,
+            midcap_symbol=midcap_symbol,
+            filter_name=filter_name,
+            patchwise=True,
+            filter_segments=filter_segments,
+        )
+        dirpath = os.path.join(get_trades_dir(job_id), "patchwise")
+        os.makedirs(dirpath, exist_ok=True)
+        path = os.path.join(dirpath, f"{combo_label_safe}.xlsx")
+        with open(path, "wb") as fh:
+            fh.write(xlsx_bytes)
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] pw xlsx write failed (%s): %s", combo_label_safe, exc)
 
 
 def write_summary_csv(job_id: str, rows: List[Dict[str, Any]]) -> None:
@@ -545,3 +702,71 @@ def delete_job_trades(job_id: str) -> None:
             shutil.rmtree(dirpath, ignore_errors=True)
         except Exception as exc:
             logger.warning("[OPTIM_STORE] trade dir delete failed: %s", exc)
+
+
+# ── Live-optim registry (drives DYNAMIC worker/memory allocation) ──────────
+# How many optimize jobs are CURRENTLY in their compute phase, box-wide. The
+# parallel runner divides the "solo" (full-box) parallelism by this count, so:
+#   1 optim live  -> full box  (fast single run)
+#   2 optims live -> half each (both fit, no OOM, no CPU thrash)
+# Stored as a Redis hash {job_id: heartbeat_epoch}; entries older than
+# _ACTIVE_STALE_SEC (a crashed/killed job that never deregistered) are pruned
+# on read so they can't wedge the divisor high forever.
+_ACTIVE_KEY = "algotest:optim:active"
+_ACTIVE_STALE_SEC = 3 * 60 * 60  # 3h — longer than any real optim compute phase
+
+
+def register_active_optim(job_id: str) -> int:
+    """Mark this job as computing NOW and return the live optim count (incl.
+    self). Best-effort: if Redis is unavailable, returns 1 so the caller falls
+    back to full solo parallelism (safe — a single job never over-allocates)."""
+    r = _redis()
+    if r is None:
+        return 1
+    try:
+        now = time.time()
+        r.hset(_ACTIVE_KEY, job_id, now)
+        # Prune stale entries (crashed jobs) before counting.
+        stale = []
+        for jid, ts in (r.hgetall(_ACTIVE_KEY) or {}).items():
+            try:
+                if now - float(ts) > _ACTIVE_STALE_SEC:
+                    stale.append(jid)
+            except (TypeError, ValueError):
+                stale.append(jid)
+        if stale:
+            r.hdel(_ACTIVE_KEY, *stale)
+        return max(1, r.hlen(_ACTIVE_KEY))
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] register_active_optim failed: %s", exc)
+        return 1
+
+
+def unregister_active_optim(job_id: str) -> None:
+    """Remove this job from the live set once its compute phase ends."""
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.hdel(_ACTIVE_KEY, job_id)
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] unregister_active_optim failed: %s", exc)
+
+
+def active_optim_count() -> int:
+    """Current live optim count (pruned), for logging/introspection."""
+    r = _redis()
+    if r is None:
+        return 0
+    try:
+        now = time.time()
+        cnt = 0
+        for _jid, ts in (r.hgetall(_ACTIVE_KEY) or {}).items():
+            try:
+                if now - float(ts) <= _ACTIVE_STALE_SEC:
+                    cnt += 1
+            except (TypeError, ValueError):
+                pass
+        return cnt
+    except Exception:
+        return 0

@@ -29,16 +29,41 @@ fi
 cd "$(dirname "$0")"
 
 # ── Optional optimizer profile ───────────────────────────────────────────────
-# `./start.sh --optimize` also brings up the profile-gated worker-optimize
-# container (7000M mem_limit). Omitted by default to protect the 16 GB budget.
+# The profile-gated worker-optimize container is heavy (13000M mem_limit) and is
+# omitted by default to protect the 16 GB budget.
+#
+# Opt-in is PERSISTED so you don't have to retype the flag every run:
+#   ./start.sh --optimize      → enable now AND remember for future runs
+#   ./start.sh --no-optimize   → disable now AND forget the preference
+#   ./start.sh                 → use the remembered preference (default: off)
+# The preference lives in .start-optimize (next to this script, git-ignored).
 COMPOSE_PROFILE_ARGS=""
 START_OPTIMIZE=false
+OPTIMIZE_PREF_FILE=".start-optimize"
+
+# 1) Seed from the persisted preference (if any).
+if [ -f "$OPTIMIZE_PREF_FILE" ]; then
+    START_OPTIMIZE=true
+fi
+
+# 2) Explicit flags override and update the persisted preference.
 for arg in "$@"; do
     case "$arg" in
-        --optimize) START_OPTIMIZE=true; COMPOSE_PROFILE_ARGS="--profile optimize" ;;
+        --optimize)
+            START_OPTIMIZE=true
+            touch "$OPTIMIZE_PREF_FILE"
+            echo "[OPT] Optimizer profile remembered — future ./start.sh runs will include it (until --no-optimize)."
+            ;;
+        --no-optimize)
+            START_OPTIMIZE=false
+            rm -f "$OPTIMIZE_PREF_FILE"
+            echo "[OPT] Optimizer profile preference cleared — future ./start.sh runs will omit it."
+            ;;
     esac
 done
+
 if [ "$START_OPTIMIZE" = "true" ]; then
+    COMPOSE_PROFILE_ARGS="--profile optimize"
     echo ""
     echo "[OPT] Optimizer profile enabled — worker-optimize will be started."
 fi

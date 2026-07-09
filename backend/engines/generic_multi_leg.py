@@ -582,7 +582,7 @@ def run_generic_multi_leg(params: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[st
                 # Skip if entry >= exit (same or crossed)
                 if entry_date >= exit_date:
                     continue
-                    
+
                 adjusted_intervals.append({"From": entry_date, "To": exit_date})
             
             interval_df = pd.DataFrame(adjusted_intervals, columns=["From", "To"])
