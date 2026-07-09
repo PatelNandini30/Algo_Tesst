@@ -5,28 +5,43 @@ This module is PURELY ADDITIVE. Nothing in the live optimizer path imports it ye
 Phase 1 wires it in. With ``OPTIMIZE_RUST_LOOP=0`` (the default) the Rust batch path
 is never reached and the optimizer behaves exactly as today.
 
+HARD RULE (user): the optimizer must be **Rust-bounded only — NO Python fallback at
+any point**. See [[rust-only-no-python-fallback]]. There is no pure-Python engine on
+any live path (``run_algotest_backtest`` is already deleted). Today's per-combo path
+(``run_rust_engine_pipeline`` — Rust-priced, Python-orchestrated) is retained **solely
+as an offline / shadow PARITY REFERENCE**, never as a runtime fallback. When the Rust
+batch is authoritative, a combo it does not own **hard-fails (RuntimeError)** — it is
+never silently routed anywhere else.
+
 Three pieces (see RUST_COMBO_LOOP_DESIGN.md §5, §6.3):
 
 1. ``rust_loop_mode()`` — the ``OPTIMIZE_RUST_LOOP`` flag: ``{"0","shadow","1"}``.
-     0       today's fork-pool path only (Rust batch unreached) — the permanent fallback.
-     shadow  Python stays authoritative & produces the real output; the Rust batch runs
-             alongside and a differ logs mismatches. Risk-free evidence on real jobs.
-     1       Rust authoritative for whitelisted combos; everything else falls back to
-             the proven Python engine (``needs_python``).
+     0       today's engine only (Rust batch unreached) — the default while porting.
+     shadow  today's engine produces the real output AND is the parity reference; the
+             Rust batch runs alongside for the shapes it owns and a differ logs any
+             mismatch. Risk-free evidence on real jobs. (This is the ONLY place today's
+             engine is used at runtime — as the reference, not a fallback.)
+     1       Rust batch is the ONLY runtime calculation path. A combo the batch does not
+             own hard-fails via ``require_rust_supported`` — NO fallback. Turned on only
+             after every in-scope feature is ported to Rust and shadow-clean.
 
-2. ``needs_python(merged_payload)`` — a FAIL-CLOSED positive whitelist (design R5). It
-   inspects the EFFECTIVE post-merge config (the output of
+2. ``rust_batch_unsupported(merged_payload)`` — a FAIL-CLOSED coverage gate (design R5).
+   It inspects the EFFECTIVE post-merge config (the output of
    ``param_expander.apply_combo_for_optim``, which force-enables spot-adj / midcap /
    pct_of_atm / straddle_width) and returns a reason string for any shape the pure-Rust
-   batch does not yet own — anything unrecognized routes to Python. Returns ``None`` only
-   for shapes proven identical.
+   batch does not yet OWN. Returns ``None`` only for shapes the batch fully owns.
+   ``require_rust_supported`` raises RuntimeError on any non-None reason (the authoritative
+   hard-fail). As features are ported to Rust, the corresponding reject is lifted — and
+   only after that feature's parity corpus is clean — until the gate returns None for
+   everything and there is nothing left to hard-fail on.
 
 3. The shadow differ — ``diff_summary`` / ``diff_trades`` / ``diff_redis_row`` /
-   ``diff_xlsx_cells`` — compares the Python-authoritative artifacts against the Rust
-   shadow artifacts and returns human-readable diffs (logged, never raised).
+   ``diff_xlsx_cells`` — compares the reference (today's engine) artifacts against the
+   Rust batch artifacts and returns human-readable diffs (logged, never raised).
 
 Nothing here changes a single number: the flag gates whether the Rust path runs at all,
-the whitelist only ever *narrows* what Rust touches, and the differ is read-only.
+the coverage gate only ever *narrows* what Rust touches (and hard-fails otherwise —
+never falls back), and the differ is read-only.
 """
 from __future__ import annotations
 
@@ -56,18 +71,21 @@ def rust_loop_enabled() -> bool:
 
 
 def rust_loop_authoritative() -> bool:
-    """True only in mode "1" — Rust output is served for whitelisted combos."""
+    """True only in mode "1" — the Rust batch is the ONLY runtime path and a combo it
+    does not own hard-fails (no fallback)."""
     return rust_loop_mode() == "1"
 
 
-# ── 2. needs_python — fail-closed whitelist ──────────────────────────────────
+# ── 2. Rust-batch coverage gate — fail-closed, hard-fail (no Python fallback) ─
 #
 # The current pure-Rust batch owns ONLY: resolve_trade_specs_core +
 # simulate_trades_batch_core + (Python-side, for now) analytics/MAE-MFE. It does NOT
 # yet own the SL/Target/Trail scan (Phase 0b) nor any Python-orchestrated feature
-# (spot-adj, midcap, re-entry, next-weekly, lazy, filters, futures). So the whitelist
-# below rejects ALL of those. As each capability lands the corresponding reject is
-# lifted — and only after the parity corpus is clean for it (design R5, §7).
+# (spot-adj, midcap, re-entry, next-weekly, lazy, filters, futures). So the gate below
+# rejects ALL of those. A rejected combo does NOT fall back to Python — in authoritative
+# mode it hard-fails (require_rust_supported → RuntimeError). As each capability lands
+# the corresponding reject is lifted — and only after the parity corpus is clean for it
+# (design R5, §7) — until the gate returns None for everything.
 
 # Strike-selection modes compute_strike_for_leg resolves in Rust (engine_rust.py:1189+).
 _RUST_STRIKE_TYPES = frozenset({
@@ -128,13 +146,17 @@ def _leg_has_reentry(leg: Dict[str, Any]) -> bool:
     return _truthy(leg.get("reEntryOnSL")) or _truthy(leg.get("reEntryOnTarget"))
 
 
-def needs_python(merged_payload: Dict[str, Any]) -> Optional[str]:
-    """Return None if the combo can run in the pure-Rust batch, else a short reason
-    string it must fall back to the proven Python engine.
+def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
+    """Return None if the pure-Rust batch fully OWNS this combo, else a short reason
+    string it does not (yet).
+
+    This is a COVERAGE gate, NOT a routing-to-Python gate: a non-None reason means the
+    Rust batch can't produce this combo — in authoritative mode that HARD-FAILS
+    (see require_rust_supported); there is no Python fallback.
 
     FAIL-CLOSED: `merged_payload` MUST be the effective post-merge config
     (apply_combo_for_optim output) so force-enabled flags are visible. Anything not
-    positively recognized returns a reason (→ Python). Never returns None on doubt.
+    positively recognized returns a reason. Never returns None on doubt.
     """
     try:
         p = merged_payload or {}
@@ -178,12 +200,27 @@ def needs_python(merged_payload: Dict[str, Any]) -> Optional[str]:
 
         return None  # every gate passed → the pure-Rust batch owns this shape
     except Exception as exc:  # fail-closed on ANY unexpected shape
-        return f"whitelist-error:{exc}"
+        return f"coverage-gate-error:{exc}"
 
 
 def combo_supported(merged_payload: Dict[str, Any]) -> bool:
     """Convenience boolean — True iff the pure-Rust batch owns this combo."""
-    return needs_python(merged_payload) is None
+    return rust_batch_unsupported(merged_payload) is None
+
+
+def require_rust_supported(merged_payload: Dict[str, Any]) -> None:
+    """Authoritative-mode hard-fail: raise RuntimeError if the Rust batch does not own
+    this combo. This is the enforcement of the "Rust-bounded only, no Python fallback"
+    rule — an unsupported combo errors out; it is NEVER routed to today's engine at
+    runtime (that engine exists only as the offline/shadow parity reference).
+    """
+    reason = rust_batch_unsupported(merged_payload)
+    if reason is not None:
+        raise RuntimeError(
+            f"OPTIMIZE_RUST_LOOP=1 (Rust-bounded, no fallback): combo not owned by the "
+            f"Rust batch yet ({reason}). Port this feature to Rust before enabling "
+            f"authoritative mode for it."
+        )
 
 
 # ── 3. Shadow differ ─────────────────────────────────────────────────────────

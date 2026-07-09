@@ -12,8 +12,9 @@ import unittest
 
 from services.optimizer.rust_combo_loop import (
     rust_loop_mode,
-    needs_python,
+    rust_batch_unsupported,
     combo_supported,
+    require_rust_supported,
     diff_summary,
     diff_redis_row,
 )
@@ -44,30 +45,30 @@ class TestFlagDefault(unittest.TestCase):
 
 class TestWhitelistAcceptsSimpleShapes(unittest.TestCase):
     def test_single_leg_atm(self):
-        self.assertIsNone(needs_python({"legs": [_leg()]}))
+        self.assertIsNone(rust_batch_unsupported({"legs": [_leg()]}))
         self.assertTrue(combo_supported({"legs": [_leg()]}))
 
     def test_multi_leg_straddle(self):
         p = {"legs": [_leg(option_type="CE"), _leg(option_type="PE")]}
-        self.assertIsNone(needs_python(p))
+        self.assertIsNone(rust_batch_unsupported(p))
 
     def test_recognized_strike_modes(self):
         for t in ("strike_type", "", "pct_of_atm", "rel_leg", "closest_premium",
                   "premium_gte", "premium_lte", "premium_range", "straddle_width",
                   "atm_straddle_prem_pct", "atm", "itm2", "otm1"):
             p = {"legs": [_leg(strike_selection={"type": t})]}
-            self.assertIsNone(needs_python(p), f"{t!r} should be supported")
+            self.assertIsNone(rust_batch_unsupported(p), f"{t!r} should be supported")
 
     def test_rollover_is_supported(self):
         p = {"legs": [_leg()], "rollover_toggle": True, "expiry_type": "WEEKLY"}
-        self.assertIsNone(needs_python(p))
+        self.assertIsNone(rust_batch_unsupported(p))
 
 
 class TestWhitelistFailsClosed(unittest.TestCase):
-    """Every excluded feature MUST route to Python (needs_python returns a reason)."""
+    """Every excluded feature MUST route to Python (rust_batch_unsupported returns a reason)."""
 
     def _reject(self, payload, contains):
-        r = needs_python(payload)
+        r = rust_batch_unsupported(payload)
         self.assertIsNotNone(r, f"expected reject, got None for {payload}")
         self.assertIn(contains, r)
 
@@ -119,8 +120,27 @@ class TestWhitelistFailsClosed(unittest.TestCase):
         self._reject({"legs": []}, "no-legs")
 
     def test_malformed_payload(self):
-        self.assertIsNotNone(needs_python(None))
-        self.assertIsNotNone(needs_python({"legs": [42]}))
+        self.assertIsNotNone(rust_batch_unsupported(None))
+        self.assertIsNotNone(rust_batch_unsupported({"legs": [42]}))
+
+
+class TestHardFailNoFallback(unittest.TestCase):
+    """Authoritative mode must HARD-FAIL on unsupported combos — never fall back."""
+
+    def test_supported_does_not_raise(self):
+        require_rust_supported({"legs": [_leg()]})  # no exception
+
+    def test_unsupported_raises_runtime_error(self):
+        with self.assertRaises(RuntimeError):
+            require_rust_supported({"legs": [_leg()], "spot_adjustment_enabled": True})
+
+    def test_error_message_names_the_reason(self):
+        try:
+            require_rust_supported({"legs": [_leg(option_type="FUT", segment="futures")]})
+            self.fail("expected RuntimeError")
+        except RuntimeError as e:
+            self.assertIn("futures", str(e))
+            self.assertIn("no fallback", str(e).lower())
 
 
 class TestDiffers(unittest.TestCase):
