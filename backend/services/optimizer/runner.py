@@ -1933,7 +1933,7 @@ def run_optimization(
     # ── Parallel fast-path ──────────────────────────────────────────────────
     # Smart sampling needs the in-loop tell() feedback, so we always run it
     # sequentially. Exhaustive and Random are pure producers — safe to fan out.
-    from services.optimizer.parallel import get_parallelism, run_parallel
+    from services.optimizer.parallel import get_parallelism, run_parallel, _rust_loop_mode_safe
 
     # OPTIMIZE_PARALLELISM env var is the hard ceiling — it always overrides
     # the caller (frontend) value. On HDD hardware this must stay at 1 because
@@ -2156,37 +2156,55 @@ def run_optimization(
                 continue
             elapsed_ms = round((time.perf_counter() - t_combo) * 1000.0, 2)
 
-            optim_extra = compute_optim_metrics(trades_df, summary)
-            flat_summary = {**summary, **optim_extra}
+            _rust_mode = _rust_loop_mode_safe()
+            if _rust_mode == "1":
+                from services.optimizer.rust_combo_loop import (
+                    require_rust_supported, rust_authoritative_summary,
+                )
+                require_rust_supported(merged)  # Rust-bounded, no Python fallback
+                flat_summary, _seq_summary_pw = rust_authoritative_summary(
+                    trades_df, summary, merged, _seq_mc_legs, _seq_mc_sa, _seq_mc_sym, _seq_filter_segments)
+            else:
+                optim_extra = compute_optim_metrics(trades_df, summary)
+                flat_summary = {**summary, **optim_extra}
 
-            # Inline finalize (mirrors the parallel path): merge overall metrics
-            # (incl. avg_final_mae) into the stored summary and pre-compute the
-            # patchwise metrics so the master summary is correct for BOTH download
-            # modes without depending on an on-disk CSV recompute. Each in its own
-            # try so a patchwise failure never strips avg_final_mae from overall.
-            _seq_summary_pw = None
-            if not (hasattr(trades_df, "empty") and trades_df.empty):
-                from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _seq_cmetrics
-                try:
-                    _seq_over = _seq_cmetrics(
-                        trades_df, flat_summary, midcap_legs=_seq_mc_legs,
-                        midcap_spot_adjustment=_seq_mc_sa, midcap_symbol=_seq_mc_sym,
-                        patchwise=False, filter_segments=_seq_filter_segments,
-                    )
-                    flat_summary = {**flat_summary, **_seq_over}
-                except Exception as _seq_inl_exc:
-                    logger.warning("[OPTIM] inline overall finalize failed for combo %d: %s", done + 1, _seq_inl_exc)
-                try:
-                    _seq_summary_pw = _seq_cmetrics(
-                        trades_df, flat_summary, midcap_legs=_seq_mc_legs,
-                        midcap_spot_adjustment=_seq_mc_sa, midcap_symbol=_seq_mc_sym,
-                        patchwise=True, filter_segments=_seq_filter_segments,
-                    )
-                except Exception as _seq_inl_exc:
-                    logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", done + 1, _seq_inl_exc)
-                    _seq_summary_pw = None
+                # Inline finalize (mirrors the parallel path): merge overall metrics
+                # (incl. avg_final_mae) into the stored summary and pre-compute the
+                # patchwise metrics so the master summary is correct for BOTH download
+                # modes without depending on an on-disk CSV recompute. Each in its own
+                # try so a patchwise failure never strips avg_final_mae from overall.
+                _seq_summary_pw = None
+                if not (hasattr(trades_df, "empty") and trades_df.empty):
+                    from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _seq_cmetrics
+                    try:
+                        _seq_over = _seq_cmetrics(
+                            trades_df, flat_summary, midcap_legs=_seq_mc_legs,
+                            midcap_spot_adjustment=_seq_mc_sa, midcap_symbol=_seq_mc_sym,
+                            patchwise=False, filter_segments=_seq_filter_segments,
+                        )
+                        flat_summary = {**flat_summary, **_seq_over}
+                    except Exception as _seq_inl_exc:
+                        logger.warning("[OPTIM] inline overall finalize failed for combo %d: %s", done + 1, _seq_inl_exc)
+                    try:
+                        _seq_summary_pw = _seq_cmetrics(
+                            trades_df, flat_summary, midcap_legs=_seq_mc_legs,
+                            midcap_spot_adjustment=_seq_mc_sa, midcap_symbol=_seq_mc_sym,
+                            patchwise=True, filter_segments=_seq_filter_segments,
+                        )
+                    except Exception as _seq_inl_exc:
+                        logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", done + 1, _seq_inl_exc)
+                        _seq_summary_pw = None
 
             labels = label_combo(merged)
+            # RUST SHADOW (OPTIMIZE_RUST_LOOP=shadow): diff the Rust summary vs Python.
+            try:
+                from services.optimizer.rust_combo_loop import run_shadow_summary_check
+                run_shadow_summary_check(done + 1, labels.get("combo_label") or str(done + 1), merged,
+                    trades_df, summary, flat_summary, _seq_summary_pw,
+                    midcap_legs=_seq_mc_legs, midcap_spot_adjustment=_seq_mc_sa,
+                    midcap_symbol=_seq_mc_sym, filter_segments=_seq_filter_segments)
+            except Exception:
+                pass
 
             row = {
                 "combo_id": done + 1,
