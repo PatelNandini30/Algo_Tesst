@@ -907,6 +907,31 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             _meta_filter_segments = [{"start": s, "end": e} for (s, e) in _resolved_segs]
         except Exception:
             _meta_filter_segments = payload.get("filter_segments") or []
+
+        # --- Metric union: give the backtest summary the SAME field set as the
+        # optimizer master summary (which is {**base, **compute_optim_metrics,
+        # **compute_xlsx_summary_metrics}). Adds the optimizer-only fields —
+        # outliers, actual_live_dd, roi_vs_spot, car_mdd_live, ce/pe P&L,
+        # avg_final_mae, long_spot_pnl, etc. ADDITIVE: result_summary's own values
+        # WIN (the {**_u, **result_summary} order), so NO existing backtest number
+        # changes; only previously-absent keys are added.
+        try:
+            import pandas as _pd
+            from services.optimizer.metrics import compute_optim_metrics as _com
+            from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cxsm
+            _tdf = _pd.DataFrame(all_trades) if all_trades else _pd.DataFrame()
+            _u = {
+                **_com(_tdf, result_summary),
+                **_cxsm(_tdf, result_summary,
+                        midcap_legs=payload.get("midcap_legs") or None,
+                        midcap_spot_adjustment=payload.get("midcap_spot_adjustment") or None,
+                        patchwise=False,
+                        filter_segments=_meta_filter_segments or None),
+            }
+            result_summary = {**_u, **result_summary}
+        except Exception as _ue:
+            logger.warning("[SUMMARY_UNION] enrichment skipped: %s", _ue)
+
         result_payload = {
             'status': 'success',
             'trades': _make_json_safe(all_trades),
