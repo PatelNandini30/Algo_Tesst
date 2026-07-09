@@ -810,6 +810,138 @@ fn compute_strike_for_leg(
 ///   * STR filter, custom date filter
 ///   * Futures legs
 ///   * Strike modes: atm_straddle_prem_pct, straddle_width, premium_*
+/// Payload-derived config for `resolve_trade_specs_core` — all pure Rust so the
+/// core carries no PyO3 dependency and can be driven straight from the Rust
+/// combo loop (Phase 1).
+pub(crate) struct ResolveCfg {
+    legs: Vec<LegCfg>,
+    index: String,
+    entry_dte: u32,
+    exit_dte: u32,
+    slippage_pct: f64,
+    strike_shift_max: i32,
+    rollover_active: bool,
+    rollover_min_days: u32,
+    lot_size: i64,
+}
+
+/// Pure-Rust core of `resolve_trade_specs` — no PyO3, no GIL. Enumerates
+/// (trade, leg) tuples (rollover schedule when active, else one trade per
+/// expiry in the given order), resolves each leg's strike via
+/// `compute_strike_for_leg`, and commits a trade only when ALL its legs resolve
+/// — a missing strike skips just that trade (matching the Python engine's
+/// per-trade tolerance for NSE data holes), not the whole run. Returns the
+/// resolved specs in output order; the `#[pyfunction]` wrapper serialises them
+/// to the same dicts as before, and `simulate_trades_batch_core` consumes them
+/// directly (Phase 1) without a PyO3 round-trip.
+pub(crate) fn resolve_trade_specs_core(
+    cfg: &ResolveCfg,
+    expiry_dates: &[String],
+    trading_days: &[String],
+    spot_by_date: &HashMap<String, f64>,
+) -> Vec<TradeSpec> {
+    let mut out: Vec<TradeSpec> = Vec::new();
+
+    let mut td: Vec<String> = trading_days.to_vec();
+    td.sort();
+    let mut expiries_sorted: Vec<String> = expiry_dates.to_vec();
+    expiries_sorted.sort();
+
+    if cfg.rollover_active {
+        let schedule = build_rollover_schedule(
+            &expiries_sorted, &td, cfg.entry_dte, cfg.exit_dte, cfg.rollover_min_days,
+        );
+        'rollover_trade: for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry) in &schedule {
+            let entry_spot = match spot_by_date.get(entry_date) {
+                Some(&v) if v > 0.0 => v,
+                _ => continue,
+            };
+            let mut buf: Vec<TradeSpec> = Vec::with_capacity(cfg.legs.len());
+            let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
+            for (leg_idx, leg) in cfg.legs.iter().enumerate() {
+                let (strike, requested_strike) = match compute_strike_for_leg(
+                    leg, entry_date, leg_expiry, &cfg.index, entry_spot, cfg.strike_shift_max, &resolved,
+                ) {
+                    Some(v) => v,
+                    None => continue 'rollover_trade,
+                };
+                resolved.insert((leg_idx + 1) as i64, strike);
+                buf.push(TradeSpec {
+                    trade_id: *trade_id,
+                    leg_id: (leg_idx + 1) as i64,
+                    index: cfg.index.clone(),
+                    entry_date: entry_date.clone(),
+                    exit_date: exit_date.clone(),
+                    expiry: leg_expiry.clone(),
+                    strike: round2(strike),
+                    requested_strike: round2(requested_strike),
+                    strike_interval: leg.strike_interval,
+                    option_type: leg.option_type.clone(),
+                    position: leg.position.clone(),
+                    lots: leg.lots,
+                    lot_size: cfg.lot_size,
+                    slippage_pct: cfg.slippage_pct,
+                });
+            }
+            out.extend(buf);
+        }
+        return out;
+    }
+
+    let mut next_trade_id: i64 = 1;
+    'dte_trade: for expiry in expiry_dates {
+        let entry_date = match trading_day_before(expiry, cfg.entry_dte, &td) {
+            Some(v) => v,
+            None => continue,
+        };
+        let exit_date = match trading_day_before(expiry, cfg.exit_dte, &td) {
+            Some(v) => v,
+            None => continue,
+        };
+        if entry_date > exit_date {
+            continue;
+        }
+        // Spot is supplied by Python — it has the authoritative data path
+        // (Postgres, parquet, feather) and may be wider than the Rust feather.
+        let entry_spot = match spot_by_date.get(&entry_date) {
+            Some(&v) if v > 0.0 => v,
+            _ => continue,
+        };
+
+        let trade_id = next_trade_id;
+        let mut buf: Vec<TradeSpec> = Vec::with_capacity(cfg.legs.len());
+        let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
+        for (leg_idx, leg) in cfg.legs.iter().enumerate() {
+            let (strike, requested_strike) = match compute_strike_for_leg(
+                leg, &entry_date, expiry, &cfg.index, entry_spot, cfg.strike_shift_max, &resolved,
+            ) {
+                Some(v) => v,
+                None => continue 'dte_trade,
+            };
+            resolved.insert((leg_idx + 1) as i64, strike);
+            buf.push(TradeSpec {
+                trade_id,
+                leg_id: (leg_idx + 1) as i64,
+                index: cfg.index.clone(),
+                entry_date: entry_date.clone(),
+                exit_date: exit_date.clone(),
+                expiry: expiry.clone(),
+                strike: round2(strike),
+                requested_strike: round2(requested_strike),
+                strike_interval: leg.strike_interval,
+                option_type: leg.option_type.clone(),
+                position: leg.position.clone(),
+                lots: leg.lots,
+                lot_size: cfg.lot_size,
+                slippage_pct: cfg.slippage_pct,
+            });
+        }
+        out.extend(buf);
+        next_trade_id += 1;
+    }
+    out
+}
+
 #[pyfunction]
 pub fn resolve_trade_specs(
     payload: &PyDict,
@@ -821,7 +953,7 @@ pub fn resolve_trade_specs(
     let py = payload.py();
     let out = PyList::empty(py);
 
-    if let Some(_reason) = check_strategy_blockers(payload) {
+    if check_strategy_blockers(payload).is_some() {
         return Ok(out.into());
     }
     let (legs, leg_blocker) = extract_leg_cfgs(payload)?;
@@ -836,7 +968,6 @@ pub fn resolve_trade_specs(
         .and_then(|v| v.extract::<i64>().ok())
         .map(|n| n.clamp(0, 50) as i32)
         .unwrap_or(1);
-
     let index = payload
         .get_item("index").ok().flatten()
         .and_then(|v| v.extract::<String>().ok())
@@ -853,12 +984,6 @@ pub fn resolve_trade_specs(
         .get_item("slippage_pct").ok().flatten()
         .and_then(|v| v.extract::<f64>().ok())
         .unwrap_or(0.0);
-
-    let mut td: Vec<String> = trading_days;
-    td.sort();
-    let mut expiries_sorted: Vec<String> = expiry_dates.clone();
-    expiries_sorted.sort();
-
     // Slice 6: rollover_toggle support for WEEKLY/MONTHLY. When active, use
     // the rollover schedule builder which handles same-day chain + min-DTE
     // extension. Otherwise use the simple "one trade per expiry" path.
@@ -874,120 +999,48 @@ pub fn resolve_trade_specs(
             .to_uppercase();
         truthy && (etype == "WEEKLY" || etype == "MONTHLY")
     };
-
-    if rollover_active {
-        let rollover_min_days: u32 = payload
+    let rollover_min_days: u32 = if rollover_active {
+        payload
             .get_item("rollover_min_days_to_expiry").ok().flatten()
             .and_then(|v| v.extract::<u32>().ok())
-            .unwrap_or(0);
-        let schedule = build_rollover_schedule(
-            &expiries_sorted, &td, entry_dte, exit_dte, rollover_min_days,
-        );
-        'rollover_trade: for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry) in &schedule {
-            let entry_spot = match spot_by_date.get(entry_date) {
-                Some(&v) if v > 0.0 => v,
-                _ => continue,
-            };
-            // Resolve all legs into a per-trade buffer first. If ANY leg's
-            // strike data is missing on this date, skip just THIS trade and
-            // continue with the next one — mirrors the Python engine's
-            // "skip trade on missing strike" behaviour. Previously we returned
-            // an empty PyList here which silently aborted the entire 8-year
-            // strategy run on the first missing strike (NSE data hole) and
-            // forced the slower Python engine fallback for ALL combos.
-            let mut leg_dicts: Vec<&PyDict> = Vec::with_capacity(legs.len());
-            let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(legs.len());
-            for (leg_idx, leg) in legs.iter().enumerate() {
-                let (strike, requested_strike) = match compute_strike_for_leg(
-                    leg, entry_date, leg_expiry, &index, entry_spot, strike_shift_max, &resolved,
-                ) {
-                    Some(v) => v,
-                    None => continue 'rollover_trade,
-                };
-                resolved.insert((leg_idx + 1) as i64, strike);
-                let d = PyDict::new(py);
-                d.set_item("trade_id", *trade_id)?;
-                d.set_item("leg_id", (leg_idx + 1) as i64)?;
-                d.set_item("index", &index)?;
-                d.set_item("entry_date", entry_date)?;
-                d.set_item("exit_date", exit_date)?;
-                d.set_item("expiry", leg_expiry)?;
-                d.set_item("strike", round2(strike))?;
-                d.set_item("requested_strike", round2(requested_strike))?;
-                d.set_item("strike_interval", leg.strike_interval)?;
-                d.set_item("option_type", &leg.option_type)?;
-                d.set_item("position", &leg.position)?;
-                d.set_item("lots", leg.lots)?;
-                d.set_item("lot_size", lot_size)?;
-                d.set_item("slippage_pct", slippage_pct)?;
-                leg_dicts.push(d);
-            }
-            for d in leg_dicts {
-                out.append(d)?;
-            }
-        }
-        return Ok(out.into());
-    }
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
-    let mut next_trade_id: i64 = 1;
-    'dte_trade: for expiry in &expiry_dates {
-        let entry_date = match trading_day_before(expiry, entry_dte, &td) {
-            Some(v) => v,
-            None => continue,
-        };
-        let exit_date = match trading_day_before(expiry, exit_dte, &td) {
-            Some(v) => v,
-            None => continue,
-        };
-        if entry_date > exit_date {
-            continue;
-        }
-        // Spot is supplied by Python — it has the authoritative data path
-        // (Postgres, parquet, feather) and may be wider than the Rust feather.
-        let entry_spot = match spot_by_date.get(&entry_date) {
-            Some(&v) if v > 0.0 => v,
-            _ => continue,
-        };
+    let cfg = ResolveCfg {
+        legs, index, entry_dte, exit_dte, slippage_pct, strike_shift_max,
+        rollover_active, rollover_min_days, lot_size,
+    };
 
-        let trade_id = next_trade_id;
-        // Build per-trade legs in a buffer; commit only if ALL legs resolve.
-        // Skip the trade (not the whole strategy) when a strike is missing —
-        // matches the Python engine's per-trade tolerance for NSE data holes.
-        let mut leg_dicts: Vec<&PyDict> = Vec::with_capacity(legs.len());
-        let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(legs.len());
-        for (leg_idx, leg) in legs.iter().enumerate() {
-            let (strike, requested_strike) = match compute_strike_for_leg(leg, &entry_date, expiry, &index, entry_spot, strike_shift_max, &resolved) {
-                Some(v) => v,
-                None => continue 'dte_trade,
-            };
-            resolved.insert((leg_idx + 1) as i64, strike);
-            let d = PyDict::new(py);
-            d.set_item("trade_id", trade_id)?;
-            d.set_item("leg_id", (leg_idx + 1) as i64)?;
-            d.set_item("index", &index)?;
-            d.set_item("entry_date", &entry_date)?;
-            d.set_item("exit_date", &exit_date)?;
-            d.set_item("expiry", expiry)?;
-            d.set_item("strike", round2(strike))?;
-            d.set_item("requested_strike", round2(requested_strike))?;
-            d.set_item("strike_interval", leg.strike_interval)?;
-            d.set_item("option_type", &leg.option_type)?;
-            d.set_item("position", &leg.position)?;
-            d.set_item("lots", leg.lots)?;
-            d.set_item("lot_size", lot_size)?;
-            d.set_item("slippage_pct", slippage_pct)?;
-            leg_dicts.push(d);
-        }
-        for d in leg_dicts {
-            out.append(d)?;
-        }
-        next_trade_id += 1;
+    // Pure-Rust resolution — no Python objects touched, so release the GIL.
+    let specs = py.allow_threads(|| {
+        resolve_trade_specs_core(&cfg, &expiry_dates, &trading_days, &spot_by_date)
+    });
+
+    for s in &specs {
+        let d = PyDict::new(py);
+        d.set_item("trade_id", s.trade_id)?;
+        d.set_item("leg_id", s.leg_id)?;
+        d.set_item("index", &s.index)?;
+        d.set_item("entry_date", &s.entry_date)?;
+        d.set_item("exit_date", &s.exit_date)?;
+        d.set_item("expiry", &s.expiry)?;
+        d.set_item("strike", s.strike)?;
+        d.set_item("requested_strike", s.requested_strike)?;
+        d.set_item("strike_interval", s.strike_interval)?;
+        d.set_item("option_type", &s.option_type)?;
+        d.set_item("position", &s.position)?;
+        d.set_item("lots", s.lots)?;
+        d.set_item("lot_size", s.lot_size)?;
+        d.set_item("slippage_pct", s.slippage_pct)?;
+        out.append(d)?;
     }
     Ok(out.into())
 }
 
 #[derive(Debug, Clone)]
-struct TradeSpec {
+pub(crate) struct TradeSpec {
     trade_id: i64,
     leg_id: i64,
     index: String,
@@ -1005,7 +1058,7 @@ struct TradeSpec {
 }
 
 #[derive(Debug, Clone)]
-struct TradeResult {
+pub(crate) struct TradeResult {
     entry_price: f64,
     exit_price: f64,
     raw_entry_price: f64,
@@ -1185,30 +1238,31 @@ fn sim_pool() -> &'static rayon::ThreadPool {
 /// P&L computation are pure functions. Uses a process-local rayon pool so
 /// forked optimizer workers each create their own fresh thread pool rather
 /// than inheriting the parent's (which would deadlock after fork).
-#[pyfunction]
-pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
-    let py = trades.py();
-
-    let mut specs: Vec<TradeSpec> = Vec::with_capacity(trades.len());
-    for obj in trades.iter() {
-        let dict = obj.downcast::<PyDict>()?;
-        specs.push(dict_to_spec(dict));
-    }
-
-    // Release GIL while rayon scans the batch via the process-local pool.
+/// Pure-Rust core of `simulate_trades_batch` — no PyO3, no GIL, so the Rust
+/// combo loop (Phase 1) can call it directly on Rust-built specs instead of
+/// crossing the PyO3 boundary per combo. The `#[pyfunction]` wrapper below does
+/// the dict↔struct conversion and calls this unchanged.
+///
+/// Prices a slice of pre-resolved specs (Rayon-parallel over the process-local
+/// pool) then applies the Python engine's row-level post-processing:
+///   1. Drop EVERY leg of any trade where at least one leg is `missing` — the
+///      Python engine skips the whole trade if it can't price one leg, so a
+///      partial row would diverge from the snapshot.
+///   2. For surviving trades, the FIRST row matching the LOWEST leg_id reports
+///      the SUM of all per-leg net_pnl as its own net_pnl; other legs keep
+///      their per-leg net_pnl. Subsequent rows with the same (trade_id, leg_id)
+///      are re-entries (slice 6) and keep their own per-leg P&L. This mirrors
+///      the engine's "Trade Net P&L" column layout the parity tests check.
+///
+/// Returns the priced results (same order/length as `specs`) plus the set of
+/// `trade_id`s that had a missing leg — callers drop every row of those trades.
+pub(crate) fn simulate_trades_batch_core(
+    specs: &[TradeSpec],
+) -> (Vec<TradeResult>, std::collections::HashSet<i64>) {
     // lookup_option_price uses RwLock::read() — safe from multiple threads.
-    let mut results: Vec<TradeResult> = py.allow_threads(|| {
-        sim_pool().install(|| specs.par_iter().map(simulate_one).collect())
-    });
+    let mut results: Vec<TradeResult> =
+        sim_pool().install(|| specs.par_iter().map(simulate_one).collect());
 
-    // Post-process to match the Python engine's row-level conventions:
-    //   1. Drop EVERY leg of any trade where at least one leg is `missing`.
-    //      The Python engine skips the whole trade if it can't price one
-    //      leg — emitting a partial row would diverge from the snapshot.
-    //   2. For surviving trades, the row with the LOWEST leg_id reports
-    //      the SUM of all per-leg net_pnl as its own net_pnl. Other legs
-    //      keep their per-leg net_pnl as-is. This mirrors the engine's
-    //      "Trade Net P&L" column layout that the parity tests check.
     let mut bad_trades: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for (s, r) in specs.iter().zip(results.iter()) {
         if r.missing {
@@ -1227,11 +1281,6 @@ pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
             entry.1 = s.leg_id;
         }
     }
-    // Only the FIRST row matching the lowest leg_id gets the trade total.
-    // Subsequent rows with the same (trade_id, leg_id) are re-entries (slice 6) —
-    // they keep their per-leg net_pnl. This matches the Python engine where
-    // the parent row reports the trade-aggregated Net P&L and each re-entry
-    // row reports its own per-leg P&L.
     let mut total_assigned: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for (s, r) in specs.iter().zip(results.iter_mut()) {
         if let Some(&(total, lowest_leg)) = trade_totals.get(&s.trade_id) {
@@ -1241,6 +1290,23 @@ pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
             }
         }
     }
+
+    (results, bad_trades)
+}
+
+#[pyfunction]
+pub fn simulate_trades_batch(trades: &PyList) -> PyResult<PyObject> {
+    let py = trades.py();
+
+    let mut specs: Vec<TradeSpec> = Vec::with_capacity(trades.len());
+    for obj in trades.iter() {
+        let dict = obj.downcast::<PyDict>()?;
+        specs.push(dict_to_spec(dict));
+    }
+
+    // Release the GIL for the whole pure-Rust core (pricing + post-processing);
+    // none of it touches Python objects.
+    let (results, bad_trades) = py.allow_threads(|| simulate_trades_batch_core(&specs));
 
     let out = PyList::empty(py);
     for (spec, result) in specs.iter().zip(results.iter()) {
