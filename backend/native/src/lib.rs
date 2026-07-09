@@ -1,6 +1,7 @@
 mod analytics;
 mod intraday;
 mod mae;
+mod optim_metrics;
 mod optimizer;
 mod simulate;
 
@@ -1917,6 +1918,7 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
     m.add_function(wrap_pyfunction!(analytics::compute_analytics_summary, m)?)?;
     m.add_function(wrap_pyfunction!(mae::compute_mae_mfe_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(optim_metrics::compute_optim_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
     // Index OHLC (additive — Midcap overlay)
     m.add_function(wrap_pyfunction!(load_index_ohlc, m)?)?;

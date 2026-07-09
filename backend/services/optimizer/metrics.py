@@ -191,7 +191,15 @@ def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:
         df_all["__entry_sort__"] = pd.to_datetime(
             df_all["Entry Date"], errors="coerce", dayfirst=True
         )
-        df_all = df_all.sort_values("__entry_sort__", na_position="last")
+        # kind="stable": ties (a trade's legs share an entry date) keep input order
+        # so the "parent" is deterministically leg 1 (lowest leg), the intended row.
+        # Default quicksort is UNSTABLE and picked leg 2 for some multi-leg trades,
+        # making the outlier metrics implementation-dependent. Deterministic now, and
+        # matches the Rust port (algotest_native.compute_optim_metrics). Single-leg
+        # unaffected; multi-leg outlier fields now use leg-1 values.
+        df_all = df_all.sort_values(
+            "__entry_sort__", na_position="last", kind="stable"
+        )
     seen: set = set()
     parent_idx = []
     for idx, row in df_all.iterrows():
