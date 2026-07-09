@@ -951,6 +951,10 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                 'buffer_position_below': payload.get('buffer_position_below', True),
                 'spot_adjustment_enabled': bool(payload.get('spot_adjustment_enabled', False)),
                 'date_range': f"{effective_from} to {effective_to}",
+                # Carried so the backend "Download Tradesheet" endpoint can
+                # reproduce the Midcap overlay exactly (same builder as the ZIP).
+                'midcap_legs': payload.get('midcap_legs') or None,
+                'midcap_spot_adjustment': payload.get('midcap_spot_adjustment') or None,
             }),
             'cached': False,
         }

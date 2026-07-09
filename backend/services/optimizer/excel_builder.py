@@ -2204,12 +2204,16 @@ def build_combo_xlsx(
     filter_name: str = "",
     patchwise: bool = False,
     filter_segments=None,
+    force_patch_wise: bool = False,
 ) -> bytes:
     """
     Build a complete XLSX workbook (Trade Sheet + Summary + optional Patch wise)
     from a trades DataFrame and a summary dict. Returns raw bytes for ZIP embedding.
     When midcap_legs is provided the Midcap overlay is applied via the Rust engine.
-    When filter_name is set AND midcap is present, a Patch wise sheet is added.
+    When filter_name is set (or force_patch_wise is True), a Patch wise sheet is
+    added — force_patch_wise=True is used for the backtest download so the
+    phase-wise tab always appears (matching the frontend ExcelJS workbook), even
+    when there is no filter.
     """
     if trades_df is None or (hasattr(trades_df, "empty") and trades_df.empty):
         rows: List[Dict] = []
@@ -2239,7 +2243,7 @@ def build_combo_xlsx(
         patchwise=patchwise,
         filter_segments=filter_segments,
     )
-    if filter_name:
+    if filter_name or force_patch_wise:
         _write_patch_wise_sheet(
             wb, tm, _grouped, _sorted_keys,
             has_midcap, midcap_by_trade,

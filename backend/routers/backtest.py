@@ -664,6 +664,79 @@ async def export_summary(strategy_id: str):
     return response
 
 
+@router.post("/backtest/tradesheet.xlsx")
+async def download_backtest_tradesheet_xlsx(request: Request):
+    """
+    Build the backtest "Download Tradesheet" workbook on the backend using the
+    SAME styled builder the optimizer ZIP uses (excel_builder.build_combo_xlsx,
+    openpyxl) — so the backtest download has identical styling + numbers to the
+    ZIP entries, from one code path (no client-side ExcelJS rebuild).
+
+    force_patch_wise=True so the phase-wise "Patch wise" tab always appears,
+    matching today's frontend workbook even without a filter. The full workbook
+    is Trade Sheet + Summary + Patch wise + WOW & MOM Summary.
+
+    Body: { trades: [<per-leg row dicts>], summary: {...}, combo_label, from_date,
+            to_date, index, midcap_legs, midcap_spot_adjustment, filter_segments }
+    """
+    import io as _io
+    body = await request.json()
+    trades = body.get("trades") or []
+    summary = body.get("summary") or {}
+    if not trades:
+        raise HTTPException(status_code=400, detail="No trades provided")
+
+    df = pd.DataFrame(trades)
+    # Coerce the numeric columns the builder computes on (JSON values arrive as
+    # strings/mixed); _to_num inside the builder is tolerant, but this keeps the
+    # aggregation math on floats exactly as the in-engine DataFrame would be.
+    for _c in ("Strike", "Entry Price", "Exit Price", "Raw Entry Price", "Raw Exit Price",
+               "Entry Spot", "Exit Spot", "Spot P&L", "CE P&L", "PE P&L", "FUT P&L",
+               "Net P&L", "% P&L", "MAE", "MFE", "Cumulative", "Peak", "DD", "%DD"):
+        if _c in df.columns:
+            df[_c] = pd.to_numeric(df[_c], errors="coerce")
+
+    midcap_legs = body.get("midcap_legs") or None
+    midcap_sa   = body.get("midcap_spot_adjustment") or None
+    midcap_sym  = (
+        (midcap_legs[0].get("symbol") if (midcap_legs and isinstance(midcap_legs[0], dict)) else None)
+        or "NIFTYMIDCAP100"
+    )
+    combo_label = body.get("combo_label") or body.get("strategy_name") or "Strategy"
+    from_date   = body.get("from_date") or body.get("date_from") or ""
+    to_date     = body.get("to_date") or body.get("date_to") or ""
+    filter_segments = body.get("filter_segments") or None
+    patchwise   = bool(body.get("patchwise", False))
+
+    from services.optimizer.excel_builder import build_combo_xlsx
+    loop = asyncio.get_running_loop()
+
+    def _build() -> bytes:
+        return build_combo_xlsx(
+            df, summary,
+            combo_label=combo_label, from_date=from_date, to_date=to_date,
+            midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
+            midcap_symbol=midcap_sym, filter_segments=filter_segments,
+            patchwise=patchwise, force_patch_wise=True,
+        )
+
+    # Default (thread) executor: a single workbook build is light, and a local
+    # closure can't be pickled to the process pool. openpyxl is GIL-bound but the
+    # Midcap pricing inside releases the GIL (Rust), so this won't stall the loop.
+    xlsx_bytes = await loop.run_in_executor(None, _build)
+
+    _safe = "".join(c for c in str(combo_label) if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
+    filename = f"{_safe or 'tradesheet'}.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Filename": filename,
+        },
+    )
+
+
 def _run_algotest_job_process(payload: dict) -> dict:
     """Helper executed inside the ProcessPoolExecutor."""
     return execute_algotest_job(payload)
