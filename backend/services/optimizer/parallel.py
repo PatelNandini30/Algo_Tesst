@@ -128,6 +128,14 @@ def _chunk(combos: List[Dict[str, Any]], n_chunks: int) -> List[List[Dict[str, A
     return chunks
 
 
+def _rust_loop_mode_safe() -> str:
+    """OPTIMIZE_RUST_LOOP mode, resilient in forked workers (default "0" on any error)."""
+    try:
+        from services.optimizer.rust_combo_loop import rust_loop_mode
+        return rust_loop_mode()
+    except Exception:
+        return "0"
+
 def _worker_entrypoint(
     job_id: str,
     base_payload: Dict[str, Any],
@@ -401,53 +409,77 @@ def _worker_entrypoint(
                 t_combo = time.perf_counter()
                 trades_df, summary = _run_single_backtest(merged)
                 elapsed_ms = round((time.perf_counter() - t_combo) * 1000.0, 2)
-                optim_extra = compute_optim_metrics(trades_df, summary)
-                flat_summary = {**summary, **optim_extra}
-                # Inline finalization (from the in-memory trades_df, across the
-                # parallel workers) so the sequential finalization has nothing to
-                # recompute — the master summary is already corrected, and the
-                # patchwise summary + WOW/MOM data are pre-computed and stored:
-                #   • overall metrics merged into flat_summary  (= old Step 0)
-                #   • patchwise metrics                          → row["summary_pw"]
-                #   • WOW/MOM wm (overall + patchwise)           → row["wm_*"]
-                _summary_pw = None
-                _wm_over = _wm_pw = None
-                _has_mc = False
-                if _INLINE_FINALIZE and not (hasattr(trades_df, "empty") and trades_df.empty):
-                    # Overall metrics (incl. avg_final_mae) merged into the stored
-                    # summary. Kept in its own try so a patchwise failure below can
-                    # never strip avg_final_mae from the overall master summary.
-                    try:
-                        _over = _cmetrics(
-                            trades_df, flat_summary, midcap_legs=_mc_legs,
-                            midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
-                            patchwise=False, filter_segments=_filter_segments,
-                        )
-                        flat_summary = {**flat_summary, **_over}
-                    except Exception as _inl_exc:
-                        logger.warning("[OPTIM] inline overall finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
-                    # Patchwise metrics (row["summary_pw"]) — served directly by the
-                    # master-summary endpoint when download_mode=patchwise.
-                    try:
-                        _summary_pw = _cmetrics(
-                            trades_df, flat_summary, midcap_legs=_mc_legs,
-                            midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
-                            patchwise=True, filter_segments=_filter_segments,
-                        )
-                    except Exception as _inl_exc:
-                        logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
-                        _summary_pw = None
-                    # WOW/MOM cleaned data (overall + patchwise).
-                    try:
-                        _cl_o, _has_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
-                                              patchwise=False, filter_segments=_filter_segments)
-                        _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
-                                        patchwise=True, filter_segments=_filter_segments)
-                        _wm_over = _wm_from_cleaned(_cl_o, _has_mc)
-                        _wm_pw = _wm_from_cleaned(_cl_p, _has_mc)
-                    except Exception as _inl_exc:
-                        logger.warning("[OPTIM] inline WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
-                        _wm_over = _wm_pw = None
+                _rust_mode = _rust_loop_mode_safe()
+                if _rust_mode == "1":
+                    # Rust-authoritative summary — NO Python fallback (Rust-bounded rule).
+                    # Hard-fail on any shape the Rust batch does not own yet.
+                    from services.optimizer.rust_combo_loop import (
+                        require_rust_supported, rust_authoritative_summary,
+                    )
+                    require_rust_supported(merged)
+                    flat_summary, _summary_pw = rust_authoritative_summary(
+                        trades_df, summary, merged, _mc_legs, _mc_sa, _mc_sym, _filter_segments)
+                    _has_mc = bool(flat_summary.get("has_midcap"))
+                    _wm_over = _wm_pw = None
+                    if _INLINE_FINALIZE and not (hasattr(trades_df, "empty") and trades_df.empty):
+                        try:
+                            _cl_o, _has_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                                  patchwise=False, filter_segments=_filter_segments)
+                            _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                            patchwise=True, filter_segments=_filter_segments)
+                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc)
+                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc)
+                        except Exception as _inl_exc:
+                            logger.warning("[OPTIM] rust-mode WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                            _wm_over = _wm_pw = None
+                else:
+                    optim_extra = compute_optim_metrics(trades_df, summary)
+                    flat_summary = {**summary, **optim_extra}
+                    # Inline finalization (from the in-memory trades_df, across the
+                    # parallel workers) so the sequential finalization has nothing to
+                    # recompute — the master summary is already corrected, and the
+                    # patchwise summary + WOW/MOM data are pre-computed and stored:
+                    #   • overall metrics merged into flat_summary  (= old Step 0)
+                    #   • patchwise metrics                          → row["summary_pw"]
+                    #   • WOW/MOM wm (overall + patchwise)           → row["wm_*"]
+                    _summary_pw = None
+                    _wm_over = _wm_pw = None
+                    _has_mc = False
+                    if _INLINE_FINALIZE and not (hasattr(trades_df, "empty") and trades_df.empty):
+                        # Overall metrics (incl. avg_final_mae) merged into the stored
+                        # summary. Kept in its own try so a patchwise failure below can
+                        # never strip avg_final_mae from the overall master summary.
+                        try:
+                            _over = _cmetrics(
+                                trades_df, flat_summary, midcap_legs=_mc_legs,
+                                midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
+                                patchwise=False, filter_segments=_filter_segments,
+                            )
+                            flat_summary = {**flat_summary, **_over}
+                        except Exception as _inl_exc:
+                            logger.warning("[OPTIM] inline overall finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                        # Patchwise metrics (row["summary_pw"]) — served directly by the
+                        # master-summary endpoint when download_mode=patchwise.
+                        try:
+                            _summary_pw = _cmetrics(
+                                trades_df, flat_summary, midcap_legs=_mc_legs,
+                                midcap_spot_adjustment=_mc_sa, midcap_symbol=_mc_sym,
+                                patchwise=True, filter_segments=_filter_segments,
+                            )
+                        except Exception as _inl_exc:
+                            logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                            _summary_pw = None
+                        # WOW/MOM cleaned data (overall + patchwise).
+                        try:
+                            _cl_o, _has_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                                  patchwise=False, filter_segments=_filter_segments)
+                            _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                            patchwise=True, filter_segments=_filter_segments)
+                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc)
+                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc)
+                        except Exception as _inl_exc:
+                            logger.warning("[OPTIM] inline WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
+                            _wm_over = _wm_pw = None
                 labels = label_combo(merged)
                 _combo_id = starting_combo_id + i
                 combo_label_safe = f"{_combo_id}_{safe_filename(labels['combo_label'])}"

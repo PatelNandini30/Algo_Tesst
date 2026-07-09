@@ -419,3 +419,35 @@ def run_shadow_summary_check(
                              diff_summary(python_summary_pw or {}, sm_pw))
     except Exception as exc:  # shadow is best-effort; never disturb the real run
         logger.warning("[RUST_SHADOW combo=%s] shadow check errored: %s", combo_id, exc)
+
+
+def rust_authoritative_summary(
+    trades_df, base_summary, merged_payload,
+    midcap_legs=None, midcap_spot_adjustment=None, midcap_symbol="NIFTYMIDCAP100",
+    filter_segments=None,
+):
+    """OPTIMIZE_RUST_LOOP=1: compute the per-combo summary ENTIRELY in Rust — the
+    Rust-bounded, NO-Python-fallback path. The caller MUST first call
+    require_rust_supported(merged_payload) (raises on any un-ported shape); this
+    function does not fall back to Python for anything.
+
+    Returns (flat_summary, summary_pw) exactly as the Python path would have built them:
+      flat_summary = {**base_summary, **compute_optim_metrics, **compute_summary_metrics(overall)}
+      summary_pw   = compute_summary_metrics(patchwise)   (raw, as _cmetrics returns it)
+    """
+    import algotest_native  # type: ignore
+    if trades_df is None or (hasattr(trades_df, "empty") and trades_df.empty):
+        return dict(base_summary or {}), None
+    records = trades_df.where(trades_df.notna(), None).to_dict("records")
+    mbt, msumm = None, None
+    if midcap_legs:
+        from services.optimizer.excel_builder import compute_midcap_for_rows
+        mbt, msumm, _has = compute_midcap_for_rows(
+            records, midcap_legs, midcap_spot_adjustment, midcap_symbol or "NIFTYMIDCAP100")
+        mbt = mbt or None
+    opt_m = algotest_native.compute_optim_metrics(records, base_summary or {})
+    flat = {**(base_summary or {}), **opt_m}
+    over = algotest_native.compute_summary_metrics(records, flat, False, filter_segments, mbt, msumm)
+    flat = {**flat, **over}
+    pw = algotest_native.compute_summary_metrics(records, flat, True, filter_segments, mbt, msumm)
+    return flat, pw
