@@ -68,10 +68,21 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use crate::{
     apply_slippage, lookup_option_high, lookup_option_low, lookup_option_open,
-    lookup_option_price, lookup_spot_price, lookup_strikes_for_date, round2,
+    lookup_option_price, lookup_option_price_tradeable, lookup_spot_price,
+    lookup_strikes_for_date, round2,
 };
 
 // ── Slice 2 helpers ─────────────────────────────────────────────────────────
+
+/// Python-`:g`-style compact number formatting for strike-gap values (always
+/// whole numbers in practice — 25, 50, 100, 150...): no trailing ".0".
+fn fmt_g(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{}", v)
+    }
+}
 
 /// Mirrors `base.calculate_trading_days_before_expiry` exactly.
 ///
@@ -182,6 +193,45 @@ struct LegCfg {
     lots: i64,
     strike_interval: f64,
     strike: StrikeSel,
+    // Only meaningful when `strike` is StraddleWidth: true when another leg
+    // in the SAME trade shares this leg's multiplier+direction (so they
+    // resolve to the same strike and must shift together on joint CE+PE
+    // liquidity). False when this leg's strike is its own — shift on this
+    // leg's own option_type liquidity only, like every other strike mode.
+    straddle_use_joint: bool,
+    // Read ONLY on the YEARLY (pinned) path. Weekly/monthly rollover applies
+    // rollover_strike_mode in Python via _apply_fixed_rollover_strike, which is
+    // entangled with segment resolution and a documented post-buffer ordering —
+    // moving that is a separate slice. Under YEARLY that post-process cannot be
+    // used (it would carry one strike across every year), so the epoch lives here.
+    rollover_strike_mode: StrikeMode,
+}
+
+/// Per-leg strike carry policy. Both modes are the same mechanism — resolve a
+/// fresh strike at the start of an epoch, reuse it within — differing only in
+/// what resets the epoch:
+///   * Fresh: a new yearly cycle OR a new month
+///   * Fixed: a new yearly cycle only
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrikeMode {
+    Fresh,
+    Fixed,
+}
+
+/// True when this entry must resolve a FRESH strike rather than carry the
+/// epoch's. Month rollover is a slice compare on ISO `YYYY-MM-DD` — no date
+/// parsing needed.
+///
+/// This yields "Fresh re-strikes at month-end only, regardless of cadence"
+/// from one comparison: under MONTHLY cadence consecutive entries always land
+/// in different months, so Fresh re-strikes every entry (today's behaviour);
+/// under WEEKLY cadence the entries within a month share `[0..7]`, so only the
+/// first of each month re-strikes.
+fn opens_new_epoch(mode: StrikeMode, prev_entry: &str, entry: &str, new_cycle: bool) -> bool {
+    if new_cycle {
+        return true;
+    }
+    mode == StrikeMode::Fresh && entry.get(0..7) != prev_entry.get(0..7)
 }
 
 fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
@@ -317,6 +367,13 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
             .get_item("strike_interval").ok().flatten()
             .and_then(|v| v.extract::<f64>().ok())
             .unwrap_or(50.0);
+        // Set by run_rust_engine_pipeline (Python) on payload["legs"] before
+        // this same payload reaches resolve_trade_specs — true only when a
+        // sibling straddle_width leg shares this leg's multiplier+direction.
+        let straddle_use_joint = leg
+            .get_item("_straddle_use_joint_shift").ok().flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
 
         out.push(LegCfg {
             option_type: leg
@@ -333,6 +390,17 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
                 .unwrap_or(1),
             strike_interval,
             strike,
+            straddle_use_joint,
+            rollover_strike_mode: match leg
+                .get_item("rollover_strike_mode").ok().flatten()
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "fixed" => StrikeMode::Fixed,
+                _ => StrikeMode::Fresh, // matches the Python default
+            },
         });
     }
     Ok((out, None))
@@ -363,31 +431,76 @@ fn trading_day_gap(from_date: &str, to_date: &str, trading_days: &[String]) -> u
     if idx_to > idx_from { (idx_to - idx_from) as u32 } else { 0 }
 }
 
-/// Build a rollover trade schedule mirroring the Python engine's behavior
-/// when `rollover_toggle = True` and `expiry_type in ('WEEKLY','MONTHLY')`.
+/// One YEARLY cycle: `contract` is the pinned December expiry, held by every
+/// cadence segment whose CHAINED entry falls in the half-open window
+/// [`start`, `end`). `end` is the T-n exit (T=0 ⇒ `end == contract`).
 ///
-/// Returns a Vec of (trade_id, entry_date, exit_date, leg_expiry, original_expiry)
-/// where:
+/// Cycle N's `start` is cycle N-1's `end`, so the yearly roll (exit + same-day
+/// fresh re-entry on the next December) falls out of the existing same-day
+/// chain with no special case.
+#[derive(Clone, Debug)]
+pub(crate) struct YearlyCycle {
+    pub(crate) contract: String,
+    pub(crate) start: String,
+    pub(crate) end: String,
+}
+
+/// The December contract a segment ending on `exit_date` should hold: the FIRST
+/// cycle whose T-n boundary (`end`) is at or after that exit.
+///
+/// T-n is a THRESHOLD, not an exact exit date. A segment must be holdable for
+/// its WHOLE cadence period without breaching T-n, so if the current December
+/// would force a mid-segment exit the segment opens on the NEXT December
+/// instead. The yearly roll therefore always lands on a real cadence boundary
+/// (a monthly/weekly expiry) and never produces a 1-day stub.
+///
+/// Keying on the EXIT (not the entry) is the whole trick: at the 26-Nov monthly
+/// roll the schedule looks ahead to the 31-Dec exit, sees Dec-2020's T-1
+/// boundary (27-Nov) falls before it, and opens on Dec-2021 right there.
+fn cycle_for_exit<'a>(cycles: &'a [YearlyCycle], exit_date: &str) -> Option<&'a YearlyCycle> {
+    cycles.iter().find(|c| c.end.as_str() >= exit_date)
+}
+
+/// Build a rollover trade schedule mirroring the Python engine's behavior when
+/// `rollover_toggle = True` and `expiry_type in ('WEEKLY','MONTHLY','YEARLY')`.
+///
+/// Returns a Vec of (trade_id, entry_date, exit_date, leg_expiry,
+/// original_expiry, new_cycle) where:
 ///   * trade_id: 1-based sequence
 ///   * entry_date: same-day chain from previous trade's SCHEDULED exit (not extended)
 ///   * exit_date: original scheduled exit, possibly extended to next_expiry when
 ///                trading-day gap (entry → original_expiry) ≤ rollover_min_days
-///   * leg_expiry: original cur_expiry, advanced to next_expiry when min-DTE triggers
+///   * leg_expiry: the CONTRACT — cur_expiry (advanced to next_expiry when
+///                 min-DTE triggers), or the pinned December when `cycles` is set
 ///   * original_expiry: the cur_expiry from the schedule (used as the chain anchor)
+///   * new_cycle: this entry opens a new contract cycle (YEARLY only; see below)
 ///
 /// Python references:
 ///   - Schedule construction:   engines/generic_algotest_engine.py:3441-3502
 ///   - Same-day chain:           engines/generic_algotest_engine.py:3841-3902
 ///   - Trade-level min-DTE:      engines/generic_algotest_engine.py:3971-3991
 ///   - Per-leg contract advance: engines/generic_algotest_engine.py:4350-4366
-fn build_rollover_schedule(
+///
+/// Cadence-decoupled: `expiry_dates` is always the CADENCE list (weekly/monthly
+/// expiries) — its meaning is unchanged. `cycles` pins the CONTRACT:
+///   * `None`  ⇒ legacy: the contract IS the cadence element (`cur_exp`).
+///   * `Some`  ⇒ YEARLY: the contract is the December expiry of the cycle that
+///               owns the chained entry; the cadence only drives entry/exit.
+///
+/// The 6th tuple element is `new_cycle` — "this entry opens a new contract
+/// cycle". It must NOT be derived from "leg_expiry changed": with min-DTE
+/// active, trade N extends to `next_exp` and trade N+1's `cur_exp` IS that same
+/// `next_exp`, so `leg_expiry` repeats across two consecutive trades. It is
+/// never read on the unpinned path.
+fn build_rollover_schedule_pinned(
     expiry_dates: &[String],
     trading_days: &[String],
     entry_dte: u32,
     exit_dte: u32,
     rollover_min_days: u32,
-) -> Vec<(i64, String, String, String, String)> {
-    let mut out: Vec<(i64, String, String, String, String)> = Vec::new();
+    cycles: Option<&[YearlyCycle]>,
+) -> Vec<(i64, String, String, String, String, bool)> {
+    let mut out: Vec<(i64, String, String, String, String, bool)> = Vec::new();
     if expiry_dates.is_empty() || trading_days.is_empty() {
         return out;
     }
@@ -416,29 +529,56 @@ fn build_rollover_schedule(
     // Trade 1 keeps its scheduled entry (no prior anchor).
     let mut trade_id: i64 = 0;
     let mut prev_scheduled_exit: Option<String> = None;
-    for (sched_entry, sched_exit, cur_exp, next_exp) in &sched {
+    let mut prev_contract: Option<String> = None;
+    for (sched_entry, sched_exit_c, cur_exp, next_exp) in &sched {
         let actual_entry = match prev_scheduled_exit.as_ref() {
             Some(prev) => prev.clone(),
             None => sched_entry.clone(),
         };
 
+        // ── PIN (YEARLY only) ────────────────────────────────────────────────
+        // When `cycles` is None `contract == cur_exp`, so the unpinned path is
+        // value-identical to the pre-change code by construction.
+        //
+        // Keys on the segment's EXIT, not its entry: T-n is a threshold, so a
+        // segment opens on whichever December it can hold for its WHOLE cadence
+        // period. That makes the yearly roll land on a real cadence boundary and
+        // removes the need to truncate (and therefore to split records).
+        let sched_exit = sched_exit_c.clone();
+        let mut contract = cur_exp.clone();
+        if let Some(cycles) = cycles {
+            match cycle_for_exit(cycles, &sched_exit) {
+                Some(c) => contract = c.contract.clone(),
+                None => {
+                    // Past the last December we can pin — stop rather than
+                    // silently fall back to the cadence contract.
+                    prev_scheduled_exit = Some(sched_exit);
+                    continue;
+                }
+            }
+        }
+
         // Skip 0-day trades (entry >= exit). For T-0/T-0 first record this is
         // common; the chain takes over from the next record. Python: 3886-3890.
-        if actual_entry >= *sched_exit {
-            // Seed the chain anchor even if we don't emit, so the chain continues.
-            if prev_scheduled_exit.is_none() {
-                prev_scheduled_exit = Some(sched_exit.clone());
-            } else {
-                prev_scheduled_exit = Some(sched_exit.clone());
-            }
+        // Seed the chain anchor even if we don't emit, so the chain continues.
+        if actual_entry >= sched_exit {
+            prev_scheduled_exit = Some(sched_exit);
             continue;
         }
 
         // Step 3: apply min-DTE extension to determine actual exit + leg expiry.
         // Trading-day gap from actual_entry to cur_exp (the original target).
+        //
+        // Pinned ⇒ no-op. Under a pin this would set leg_expiry = next_exp, i.e.
+        // advance the contract to the next CADENCE element — swapping the
+        // Dec-2020 contract for a Jan-2020 weekly. Its predicate also measures
+        // the distance to the cadence date, not to the pinned contract (which
+        // has ~1y DTE for nearly every segment), so the condition it guards
+        // cannot arise. YEARLY + rollover_min_days is rejected upstream rather
+        // than silently ignored here.
         let mut actual_exit = sched_exit.clone();
-        let mut leg_expiry = cur_exp.clone();
-        if rollover_min_days > 0 {
+        let mut leg_expiry = contract.clone();
+        if rollover_min_days > 0 && cycles.is_none() {
             let gap = trading_day_gap(&actual_entry, cur_exp, trading_days);
             if gap <= rollover_min_days {
                 actual_exit = next_exp.clone();
@@ -446,10 +586,19 @@ fn build_rollover_schedule(
             }
         }
 
+        let new_cycle = prev_contract.as_deref() != Some(contract.as_str());
         trade_id += 1;
-        out.push((trade_id, actual_entry, actual_exit, leg_expiry, cur_exp.clone()));
+        out.push((
+            trade_id,
+            actual_entry,
+            actual_exit,
+            leg_expiry,
+            cur_exp.clone(),
+            new_cycle,
+        ));
         // Chain uses SCHEDULED exit (pre-extension) per Python engine semantics.
-        prev_scheduled_exit = Some(sched_exit.clone());
+        prev_scheduled_exit = Some(sched_exit);
+        prev_contract = Some(contract);
     }
 
     out
@@ -486,6 +635,28 @@ fn pick_by_premium<'a>(
     })
 }
 
+/// Step size the liquidity-shift walk uses to find a tradeable strike.
+///
+/// For the legacy 25/50/100 gaps the walk steps by the gap itself, so existing
+/// tradesheets stay byte-identical. A COARSE gap (500) would jump a whole
+/// 500-pt gap per step and skip every liquid listed strike in between, so the
+/// walk instead uses a finer per-index step: NIFTY→100, MIDCPNIFTY→50 (others
+/// default to their native liquid grid, 100). The 500 gap still governs ATM
+/// snap and offset stepping — only the liquidity search is fine-grained.
+/// Returns `(walk_step, is_coarse)`.
+fn liquidity_walk_step(index: &str, interval: f64) -> (f64, bool) {
+    if interval <= 100.0 {
+        return (interval, false);
+    }
+    let step = match index.to_ascii_uppercase().as_str() {
+        "NIFTY" => 100.0,
+        "MIDCPNIFTY" | "FINNIFTY" => 50.0,
+        "BANKNIFTY" | "SENSEX" | "BANKEX" => 100.0,
+        _ => 100.0,
+    };
+    (step, true)
+}
+
 /// Joint CE+PE liquidity validation/shift — used ONLY for `straddle_width`
 /// legs, which share the same requested strike across CE and PE by design
 /// (see `StrikeSel::StraddleWidth`). If either side is illiquid there, BOTH
@@ -502,6 +673,12 @@ fn validate_or_shift_straddle_strike(
     index: &str,
 ) -> Option<(f64, i32)> {
     use crate::OptionDataStatus;
+    // Coarse gaps (500) walk by a finer per-index step so BOTH legs land on a
+    // liquid listed strike instead of jumping a whole 500-pt gap. Legacy gaps:
+    // walk_step == interval (unchanged). Shadow `interval` so every walk below
+    // uses the fine step; the initial joint check does not use `interval`.
+    let (walk_step, _coarse) = liquidity_walk_step(index, interval);
+    let interval = walk_step;
     let is_tradeable = |s: f64, opt_type: &str| -> bool {
         matches!(
             crate::lookup_option_status(entry_date, index, s, opt_type, expiry),
@@ -573,24 +750,26 @@ fn validate_or_shift_strike(
     _max_shifts: i32, // retained for API compat; cap is now distance-to-ATM
 ) -> Option<(f64, i32)> {
     use crate::OptionDataStatus;
+    // Coarse gaps (500) walk by a finer per-index step so the search lands on a
+    // liquid listed strike instead of jumping a whole 500-pt gap. Legacy gaps:
+    // walk_step == interval (unchanged). Shadow `interval` so the direction cap
+    // and both walk loops below use the fine step; the status check does not.
+    let (walk_step, _coarse) = liquidity_walk_step(index, interval);
+    let interval = walk_step;
     // First check the requested strike's data status.
     let status = crate::lookup_option_status(entry_date, index, strike, opt_type, expiry);
     match status {
-        OptionDataStatus::Tradeable(px) => {
-            if px > 0.0 {
-                return Some((strike, 0)); // real price, no shift
-            }
-            return None;
+        OptionDataStatus::Tradeable(px) if px > 0.0 => {
+            return Some((strike, 0)); // real price, no shift
         }
-        OptionDataStatus::Missing => {
-            // No record for this strike on this date — DON'T shift.  The
-            // strike simply wasn't listed by NSE on this day; shifting would
-            // land us on an arbitrary strike that may not reflect intent.
-            return None;
-        }
-        OptionDataStatus::ZeroContracts => {
-            // Stale carry-over price — walk toward ATM to find liquid strike.
-        }
+        // Any other status is "no liquidity" and shifts toward a tradeable
+        // strike, for EVERY gap (25/50/100/500) and every strike-selection mode:
+        //   · ZeroContracts        — record exists but zero turnover (stale px)
+        //   · Missing              — strike not listed by NSE that day
+        //   · Tradeable(px <= 0.0) — listed but no usable price
+        // The walk below finds the nearest tradeable strike toward ATM (or
+        // outward in the OTM direction when the ATM strike itself is dead).
+        _ => {}
     }
     // Walk TOWARD ATM. Direction is opposite of (requested - atm).
     let direction: f64 = if strike > atm + 1e-6 {
@@ -629,6 +808,54 @@ fn validate_or_shift_strike(
             if px > 0.0 {
                 return Some((candidate, step));
             }
+        }
+    }
+    None
+}
+
+/// ATM CE + PE prices for straddle_width / atm_straddle_prem_pct, using the
+/// TRADEABLE price (filters zero-turnover/stale closes) — a straddle price
+/// built from a dead, untraded contract's stale close silently corrupts the
+/// shift formula (seen on MIDCPNIFTY: a 0-contract PE's stale close of
+/// 1223.85 vs a real ~330 nearby). If either side is illiquid at the leg's
+/// own gap, widen the gap used ONLY to source a liquid price (gap, 2x, 3x,
+/// 4x) — the leg's own strike gap for the formula/final snap is untouched.
+/// Returns `(ce, pe, source_reason)` — source_reason is empty when the base
+/// gap was already liquid. Mirrors
+/// engine_rust.py::_compute_strike_for_leg_python / _atm_straddle_prices.
+fn straddle_atm_prices(
+    atm: f64,
+    interval: f64,
+    entry_spot: f64,
+    entry_date: &str,
+    expiry: &str,
+    index: &str,
+) -> Option<(f64, f64, String)> {
+    if let (Some(c), Some(p)) = (
+        lookup_option_price_tradeable(entry_date, index, atm, "CE", expiry),
+        lookup_option_price_tradeable(entry_date, index, atm, "PE", expiry),
+    ) {
+        return Some((c, p, String::new()));
+    }
+    let missing_ce = lookup_option_price_tradeable(entry_date, index, atm, "CE", expiry).is_none();
+    let missing_pe = lookup_option_price_tradeable(entry_date, index, atm, "PE", expiry).is_none();
+    let missing = format!(
+        "{}{}",
+        if missing_ce { "CE" } else { "" },
+        if missing_pe { "PE" } else { "" },
+    );
+    for mult_n in [2.0, 3.0, 4.0] {
+        let w_gap = interval * mult_n;
+        let w_atm = (entry_spot / w_gap).round() * w_gap;
+        if let (Some(wc), Some(wp)) = (
+            lookup_option_price_tradeable(entry_date, index, w_atm, "CE", expiry),
+            lookup_option_price_tradeable(entry_date, index, w_atm, "PE", expiry),
+        ) {
+            let source = format!(
+                "{}→{} (ATM {} zero turnover)",
+                fmt_g(interval), fmt_g(w_gap), missing,
+            );
+            return Some((wc, wp, source));
         }
     }
     None
@@ -744,8 +971,9 @@ fn compute_strike_for_leg(
             // the shift to ATM, "-" always subtracts — regardless of the leg's
             // option_type or Buy/Sell (both legs of a straddle land on the
             // same strike for the same direction setting; no CE/PE mirroring).
-            let ce = lookup_option_price(entry_date, index, atm, "CE", expiry)?;
-            let pe = lookup_option_price(entry_date, index, atm, "PE", expiry)?;
+            let (ce, pe, _source) = straddle_atm_prices(
+                atm, leg.strike_interval, entry_spot, entry_date, expiry, index,
+            )?;
             let shift = *multiplier * (ce + pe);
             let raw = if direction.trim() == "-" {
                 atm - shift
@@ -757,8 +985,9 @@ fn compute_strike_for_leg(
         StrikeSel::AtmStraddlePremPct(pct) => {
             // target premium = pct% × (ATM CE + ATM PE), then closest-premium
             // for the leg's option type.
-            let ce = lookup_option_price(entry_date, index, atm, "CE", expiry)?;
-            let pe = lookup_option_price(entry_date, index, atm, "PE", expiry)?;
+            let (ce, pe, _source) = straddle_atm_prices(
+                atm, leg.strike_interval, entry_spot, entry_date, expiry, index,
+            )?;
             let target = (pct / 100.0) * (ce + pe);
             let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
             pick_by_premium(&chain, target, atm, is_call).map(|(s, _)| *s)
@@ -768,10 +997,13 @@ fn compute_strike_for_leg(
     // Strike-shift fallback for zero-turnover contracts: walk TOWARD ATM
     // until a liquid strike is found (capped at ATM itself). Always-on; the
     // legacy `strike_shift_max` arg is retained for ABI compat but ignored.
-    // straddle_width legs share the same requested strike across CE/PE, so
-    // they use the JOINT liquidity walk (both must move together) instead of
-    // the per-option-type one every other mode uses.
-    let (final_strike, _shift_steps) = if matches!(leg.strike, StrikeSel::StraddleWidth { .. }) {
+    // straddle_width legs share the same requested strike across CE/PE ONLY
+    // when a sibling leg has the same multiplier+direction (straddle_use_joint)
+    // — then they use the JOINT liquidity walk (both must move together).
+    // Otherwise (different multiplier, or no sibling straddle_width leg at
+    // all) this leg's strike is its own, so it uses the per-option-type walk
+    // every other mode uses.
+    let (final_strike, _shift_steps) = if matches!(leg.strike, StrikeSel::StraddleWidth { .. }) && leg.straddle_use_joint {
         validate_or_shift_straddle_strike(raw_strike, atm, leg.strike_interval, entry_date, expiry, index)?
     } else {
         validate_or_shift_strike(
@@ -780,6 +1012,103 @@ fn compute_strike_for_leg(
         )?
     };
     Some((final_strike, raw_strike))
+}
+
+/// Parse a single leg dict into a `LegCfg` — a minimal counterpart to
+/// `extract_leg_cfgs` for single-leg ad-hoc strike computation (no
+/// unsupported-feature rejection; that's only relevant to the full
+/// schedule-building path, not a bare strike lookup).
+fn leg_cfg_from_dict(leg: &PyDict) -> Option<LegCfg> {
+    let strike = extract_strike_sel(leg)?;
+    let strike_interval = leg
+        .get_item("strike_interval").ok().flatten()
+        .and_then(|v| v.extract::<f64>().ok())
+        .unwrap_or(50.0);
+    // Set by run_rust_engine_pipeline (Python) before this leg dict reaches
+    // Rust — true only when a sibling straddle_width leg shares this leg's
+    // multiplier+direction. See LegCfg.straddle_use_joint.
+    let straddle_use_joint = leg
+        .get_item("_straddle_use_joint_shift").ok().flatten()
+        .and_then(|v| v.extract::<bool>().ok())
+        .unwrap_or(false);
+    Some(LegCfg {
+        option_type: leg
+            .get_item("option_type").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_else(|| "CE".to_string()),
+        position: leg
+            .get_item("position").ok().flatten()
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_else(|| "SELL".to_string()),
+        lots: leg
+            .get_item("lots").ok().flatten()
+            .and_then(|v| v.extract::<i64>().ok())
+            .unwrap_or(1),
+        strike_interval,
+        strike,
+        straddle_use_joint,
+        // Irrelevant here: the carry policy is only read by the pinned rollover
+        // loop, which builds its LegCfgs via extract_leg_cfgs. A bare one-off
+        // strike lookup has no epoch to carry from.
+        rollover_strike_mode: StrikeMode::Fresh,
+    })
+}
+
+/// Single-leg strike resolution callable directly from Python — consolidates
+/// what `_compute_strike_for_leg_python` previously did as a CHAIN of many
+/// small Python↔Rust FFI calls (price lookups, tradeable checks, the
+/// zero-turnover walk, and for straddle_width/atm_straddle_prem_pct the
+/// gap-widening fallback) into ONE call. Used by the Python schedule
+/// builders that can't use the batched `resolve_trade_specs` path (Fixed
+/// Entry mode, NEXT_WEEKLY, re-entry, spot-adjustment, etc.) — those still
+/// build the entry/exit schedule in Python, but now resolve each leg's
+/// strike in Rust instead of many round-trips per leg.
+///
+/// Returns `(final_strike, requested_strike, atm_strike, ce_price, pe_price,
+/// straddle_price_source)` or `None` if the leg is unresolvable (missing
+/// data, unknown strike_selection.type, etc — caller falls back to the
+/// Python mirror). `ce_price`/`pe_price`/`straddle_price_source` are only
+/// populated for straddle_width / atm_straddle_prem_pct (display columns);
+/// blank/None for every other strike mode.
+#[pyfunction]
+pub fn compute_straddle_leg_strike(
+    leg: &PyDict,
+    entry_date: String,
+    expiry: String,
+    index: String,
+    entry_spot: f64,
+    strike_shift_max: i32,
+    resolved_strikes: HashMap<i64, f64>,
+) -> PyResult<Option<(f64, f64, f64, Option<f64>, Option<f64>, String)>> {
+    let cfg = match leg_cfg_from_dict(leg) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let result = compute_strike_for_leg(
+        &cfg, &entry_date, &expiry, &index, entry_spot, strike_shift_max, &resolved_strikes,
+    );
+    let (final_strike, requested_strike) = match result {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let atm = (entry_spot / cfg.strike_interval).round() * cfg.strike_interval;
+    let is_straddle_type = matches!(
+        cfg.strike,
+        StrikeSel::StraddleWidth { .. } | StrikeSel::AtmStraddlePremPct(_)
+    );
+    let mut ce_out = None;
+    let mut pe_out = None;
+    let mut source = String::new();
+    if is_straddle_type {
+        if let Some((ce, pe, src)) = straddle_atm_prices(
+            atm, cfg.strike_interval, entry_spot, &entry_date, &expiry, &index,
+        ) {
+            ce_out = Some(ce);
+            pe_out = Some(pe);
+            source = src;
+        }
+    }
+    Ok(Some((final_strike, requested_strike, atm, ce_out, pe_out, source)))
 }
 
 /// Slice 2 — resolve every (entry_date, exit_date, strike, leg) tuple for
@@ -823,6 +1152,10 @@ pub(crate) struct ResolveCfg {
     rollover_active: bool,
     rollover_min_days: u32,
     lot_size: i64,
+    /// YEARLY only: the pinned December contract per cycle. `None` on every
+    /// existing (weekly/monthly) path — the contract is then the cadence
+    /// element, exactly as before.
+    yearly_cycles: Option<Vec<YearlyCycle>>,
 }
 
 /// Pure-Rust core of `resolve_trade_specs` — no PyO3, no GIL. Enumerates
@@ -848,10 +1181,19 @@ pub(crate) fn resolve_trade_specs_core(
     expiries_sorted.sort();
 
     if cfg.rollover_active {
-        let schedule = build_rollover_schedule(
+        let schedule = build_rollover_schedule_pinned(
             &expiries_sorted, &td, cfg.entry_dte, cfg.exit_dte, cfg.rollover_min_days,
+            cfg.yearly_cycles.as_deref(),
         );
-        'rollover_trade: for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry) in &schedule {
+        // YEARLY strike epochs. Only touched when the contract is pinned — on
+        // every existing weekly/monthly run `epoch_strike` is never read or
+        // written, and rollover_strike_mode keeps being applied by Python's
+        // _apply_fixed_rollover_strike exactly as before.
+        let pinned = cfg.yearly_cycles.is_some();
+        let mut epoch_strike: HashMap<i64, f64> = HashMap::new();
+        let mut prev_entry: Option<String> = None;
+
+        'rollover_trade: for (trade_id, entry_date, exit_date, leg_expiry, _orig_expiry, new_cycle) in &schedule {
             let entry_spot = match spot_by_date.get(entry_date) {
                 Some(&v) if v > 0.0 => v,
                 _ => continue,
@@ -859,12 +1201,52 @@ pub(crate) fn resolve_trade_specs_core(
             let mut buf: Vec<TradeSpec> = Vec::with_capacity(cfg.legs.len());
             let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
             for (leg_idx, leg) in cfg.legs.iter().enumerate() {
-                let (strike, requested_strike) = match compute_strike_for_leg(
-                    leg, entry_date, leg_expiry, &cfg.index, entry_spot, cfg.strike_shift_max, &resolved,
-                ) {
-                    Some(v) => v,
-                    None => continue 'rollover_trade,
+                let leg_id = (leg_idx + 1) as i64;
+                let (strike, requested_strike) = if !pinned {
+                    // UNPINNED — literally the pre-change call. Do not route this
+                    // through the epoch logic: if `epoch_strike` were ever
+                    // consulted here, Fresh would silently start carrying strikes
+                    // across every existing run.
+                    match compute_strike_for_leg(
+                        leg, entry_date, leg_expiry, &cfg.index, entry_spot, cfg.strike_shift_max, &resolved,
+                    ) {
+                        Some(v) => v,
+                        None => continue 'rollover_trade,
+                    }
+                } else {
+                    let fresh = match prev_entry.as_deref() {
+                        None => true, // first emitted trade always resolves fresh
+                        Some(prev) => opens_new_epoch(leg.rollover_strike_mode, prev, entry_date, *new_cycle),
+                    };
+                    match (fresh, epoch_strike.get(&leg_id).copied()) {
+                        (false, Some(carried)) => {
+                            // Carry-over is RE-VALIDATED against this entry date
+                            // and this December contract — never blindly reused.
+                            // Python's carry skips the zero-turnover shift, which
+                            // is harmless over a few weeks on a short-dated
+                            // contract but not over ~12 months on a long-dated
+                            // one, where the strike can go unlisted/illiquid.
+                            let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
+                            let is_call = matches!(leg.option_type.to_ascii_uppercase().as_str(), "CE" | "CALL" | "C");
+                            match validate_or_shift_strike(
+                                carried, atm, leg.strike_interval, is_call, entry_date, leg_expiry,
+                                &cfg.index, &leg.option_type, cfg.strike_shift_max,
+                            ) {
+                                Some((s, _shifts)) => (s, carried),
+                                None => continue 'rollover_trade,
+                            }
+                        }
+                        _ => match compute_strike_for_leg(
+                            leg, entry_date, leg_expiry, &cfg.index, entry_spot, cfg.strike_shift_max, &resolved,
+                        ) {
+                            Some(v) => v,
+                            None => continue 'rollover_trade,
+                        },
+                    }
                 };
+                if pinned {
+                    epoch_strike.insert(leg_id, strike);
+                }
                 resolved.insert((leg_idx + 1) as i64, strike);
                 buf.push(TradeSpec {
                     trade_id: *trade_id,
@@ -884,6 +1266,13 @@ pub(crate) fn resolve_trade_specs_core(
                 });
             }
             out.extend(buf);
+            // Advance the epoch anchor only for trades that actually emitted —
+            // a trade dropped by `continue 'rollover_trade` (unresolvable leg)
+            // must not consume the month boundary, or the next real trade in a
+            // new month would wrongly carry the previous month's strike.
+            if pinned {
+                prev_entry = Some(entry_date.clone());
+            }
         }
         return out;
     }
@@ -987,17 +1376,17 @@ pub fn resolve_trade_specs(
     // Slice 6: rollover_toggle support for WEEKLY/MONTHLY. When active, use
     // the rollover schedule builder which handles same-day chain + min-DTE
     // extension. Otherwise use the simple "one trade per expiry" path.
+    let etype = payload
+        .get_item("expiry_type").ok().flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default()
+        .to_uppercase();
     let rollover_active = {
         let truthy = payload
             .get_item("rollover_toggle").ok().flatten()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
-        let etype = payload
-            .get_item("expiry_type").ok().flatten()
-            .and_then(|v| v.extract::<String>().ok())
-            .unwrap_or_default()
-            .to_uppercase();
-        truthy && (etype == "WEEKLY" || etype == "MONTHLY")
+        truthy && matches!(etype.as_str(), "WEEKLY" | "MONTHLY" | "YEARLY")
     };
     let rollover_min_days: u32 = if rollover_active {
         payload
@@ -1008,9 +1397,39 @@ pub fn resolve_trade_specs(
         0
     };
 
+    // YEARLY pins the contract to a December expiry; the cadence list only
+    // drives entry/exit. Python resolves the cycles (they are expiry_calendar
+    // rows + a T-n month offset against the trading calendar — neither of which
+    // Rust carries on the EOD path) exactly as it already resolves expiry_dates.
+    //
+    // Hard-fail rather than fall through: admitting YEARLY without the pin would
+    // leave leg_expiry = cur_exp, producing a plausible-but-wrong tradesheet
+    // that trades the CADENCE contract. That is worse than the silent disable
+    // this gate used to do. Never guess the pin.
+    let yearly_cycles: Option<Vec<YearlyCycle>> = if etype == "YEARLY" {
+        match extract_yearly_cycles(payload)? {
+            Some(c) if !c.is_empty() => Some(c),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "expiry_type=YEARLY requires a non-empty 'yearly_cycles' payload key \
+                     (list of {contract, start, end}); refusing to guess the pinned contract",
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    if yearly_cycles.is_some() && rollover_min_days > 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "expiry_type=YEARLY is incompatible with rollover_min_days_to_expiry: the min-DTE \
+             extension advances the contract to the next CADENCE element, which would swap the \
+             pinned December contract for a weekly. Use yearly_exit_months_before (T-n) instead",
+        ));
+    }
+
     let cfg = ResolveCfg {
         legs, index, entry_dte, exit_dte, slippage_pct, strike_shift_max,
-        rollover_active, rollover_min_days, lot_size,
+        rollover_active, rollover_min_days, lot_size, yearly_cycles,
     };
 
     // Pure-Rust resolution — no Python objects touched, so release the GIL.
@@ -1067,6 +1486,49 @@ pub(crate) struct TradeResult {
     exit_spot: f64,
     net_pnl: f64,
     missing: bool,
+}
+
+/// Read `payload["yearly_cycles"]` → `[{contract, start, end}, ...]`.
+///
+/// Python-injected (never user-supplied): `contract` is a December row of the
+/// monthly expiry_calendar and `end` is the T-n exit already snapped to a
+/// trading day. Returns `None` when the key is absent; errors on a malformed
+/// entry rather than dropping it — a silently-skipped cycle would leave its
+/// segments unpinned and trading the cadence contract.
+fn extract_yearly_cycles(payload: &PyDict) -> PyResult<Option<Vec<YearlyCycle>>> {
+    let item = match payload.get_item("yearly_cycles").ok().flatten() {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if item.is_none() {
+        return Ok(None);
+    }
+    let list = item.downcast::<PyList>().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("yearly_cycles must be a list of dicts")
+    })?;
+    let mut out: Vec<YearlyCycle> = Vec::with_capacity(list.len());
+    for (i, row) in list.iter().enumerate() {
+        let d = row.downcast::<PyDict>().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!("yearly_cycles[{}] must be a dict", i))
+        })?;
+        let contract = extract_str(d, "contract");
+        let start = extract_str(d, "start");
+        let end = extract_str(d, "end");
+        if contract.is_empty() || start.is_empty() || end.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "yearly_cycles[{}] needs non-empty contract/start/end (got {:?}/{:?}/{:?})",
+                i, contract, start, end
+            )));
+        }
+        if start >= end {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "yearly_cycles[{}] has start >= end ({} >= {}); the window is half-open [start, end)",
+                i, start, end
+            )));
+        }
+        out.push(YearlyCycle { contract, start, end });
+    }
+    Ok(Some(out))
 }
 
 fn extract_str(dict: &PyDict, key: &str) -> String {
@@ -1629,4 +2091,206 @@ pub fn apply_sl_with_buffer_batch(
         }
     }
     Ok(out.into())
+}
+
+#[cfg(test)]
+mod rollover_schedule_tests {
+    use super::*;
+
+    // Real NIFTY 2019 monthly expiries (the roll anchor agreed for YEARLY).
+    fn monthly_2019() -> Vec<String> {
+        [
+            "2019-02-28", "2019-03-28", "2019-04-25", "2019-05-30", "2019-06-27", "2019-07-25",
+            "2019-08-29", "2019-09-26", "2019-10-31", "2019-11-28", "2019-12-26",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    // Trading days: the expiries themselves plus the T-1 exit date. Enough for
+    // trading_day_before(exp, 0) == exp, which is what the T0/T0 chain uses.
+    fn trading_days() -> Vec<String> {
+        let mut v = monthly_2019();
+        v.push("2019-11-26".to_string());
+        v.sort();
+        v
+    }
+
+    fn cyc(contract: &str, start: &str, end: &str) -> YearlyCycle {
+        YearlyCycle { contract: contract.into(), start: start.into(), end: end.into() }
+    }
+
+    /// UNPINNED (every existing weekly/monthly run): contract == cadence element.
+    /// The T0/T0 same-day chain yields entry = prev expiry, exit = cur expiry.
+    #[test]
+    fn unpinned_contract_is_the_cadence_element() {
+        let out = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 0, None,
+        );
+        // Record 1 is skipped (entry == exit) and seeds the chain.
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[0].1, "2019-02-28");   // entry = prev expiry
+        assert_eq!(out[0].2, "2019-03-28");   // exit  = cur expiry
+        assert_eq!(out[0].3, "2019-03-28");   // leg_expiry = cadence element
+        assert_eq!(out[1].1, "2019-03-28");
+        assert_eq!(out[1].2, "2019-04-25");
+        assert_eq!(out[1].3, "2019-04-25");
+        // leg_expiry always tracks cur_exp when unpinned.
+        for r in &out {
+            assert_eq!(r.3, r.4, "unpinned: leg_expiry must equal cur_exp");
+        }
+    }
+
+    /// PINNED, T=0: every segment holds the December contract while entry/exit
+    /// still follow the monthly cadence — the reference fixture.
+    #[test]
+    fn pinned_holds_december_across_every_cadence_segment() {
+        let cycles = vec![cyc("2019-12-26", "2019-01-01", "2019-12-26")];
+        let out = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+        );
+        assert_eq!(out.len(), 10);
+        for r in &out {
+            assert_eq!(r.3, "2019-12-26", "pinned: leg_expiry must be the December contract");
+        }
+        // Cadence drives entry/exit — matches the fixture table exactly.
+        assert_eq!((out[0].1.as_str(), out[0].2.as_str()), ("2019-02-28", "2019-03-28"));
+        assert_eq!((out[1].1.as_str(), out[1].2.as_str()), ("2019-03-28", "2019-04-25"));
+        assert_eq!((out[2].1.as_str(), out[2].2.as_str()), ("2019-04-25", "2019-05-30"));
+        // Only the first trade opens the cycle.
+        assert!(out[0].5, "first trade opens the cycle");
+        assert!(out[1..].iter().all(|r| !r.5), "no later trade opens a new cycle");
+    }
+
+    /// THE CHAINED-ENTRY TRAP. For cadence element 2019-12-26 the step-1 entry
+    /// (dte=0) is 2019-12-26, which is NOT in cycle 1's half-open window and
+    /// would drop or mis-pin the trade. The CHAINED entry is 2019-11-28, which
+    /// is — so the last segment of the year must still hold Dec-2019.
+    #[test]
+    fn pinned_last_segment_of_year_holds_the_current_december() {
+        let cycles = vec![cyc("2019-12-26", "2019-01-01", "2019-12-26")];
+        let out = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+        );
+        let last = out.last().unwrap();
+        assert_eq!(last.1, "2019-11-28", "chained entry, not the step-1 entry");
+        assert_eq!(last.2, "2019-12-26");
+        assert_eq!(last.3, "2019-12-26", "must NOT roll to the next December early");
+    }
+
+    /// T-1 (snap-to-cadence): the yearly roll lands ON a cadence boundary, never
+    /// mid-segment. A segment holds the first December it can keep for its WHOLE
+    /// cadence period, so no 1-day stub is produced.
+    #[test]
+    fn pinned_tn_rolls_on_a_cadence_boundary_without_a_stub() {
+        // T-1 for Dec-2019 (26-Dec) = 26-Nov. Cadence: ... 31-Oct, 28-Nov, 26-Dec.
+        let cycles = vec![
+            cyc("2019-12-26", "2019-01-01", "2019-11-26"),
+            cyc("2020-12-31", "2019-11-26", "2020-11-26"),
+        ];
+        let out = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+        );
+        // 31-Oct -> 28-Nov exits AFTER the T-1 boundary (26-Nov), so it must open
+        // on the NEXT December rather than truncate.
+        let t = out.iter().find(|r| r.1 == "2019-10-31").expect("31-Oct segment");
+        assert_eq!(t.2, "2019-11-28", "exit stays on the cadence boundary (no truncation)");
+        assert_eq!(t.3, "2020-12-31", "must roll to the next December at the cadence boundary");
+        assert!(t.5, "opens a new cycle");
+
+        // No stub: every segment runs cadence-to-cadence, and no exit lands on
+        // the raw T-n date.
+        assert!(out.iter().all(|r| r.2 != "2019-11-26"), "no 1-day stub at the T-n date");
+        for w in out.windows(2) {
+            assert_eq!(w[0].2, w[1].1, "gap between {:?} and {:?}", w[0], w[1]);
+        }
+    }
+
+    /// REGRESSION: no cadence boundary may be skipped across a yearly roll.
+    /// Every monthly expiry in the window must appear as a segment exit.
+    #[test]
+    fn no_cadence_boundary_is_skipped_across_the_roll() {
+        let cycles = vec![
+            cyc("2019-12-26", "2019-01-01", "2019-11-26"),
+            cyc("2020-12-31", "2019-11-26", "2020-11-26"),
+        ];
+        let out = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+        );
+        for e in ["2019-03-28", "2019-11-28", "2019-12-26"] {
+            assert!(out.iter().any(|r| r.2 == e), "cadence boundary {e} missing from exits");
+        }
+        for w in out.windows(2) {
+            assert_eq!(w[0].2, w[1].1, "hole between {:?} and {:?}", w[0], w[1]);
+        }
+    }
+
+    /// min-DTE must be inert when pinned — otherwise it would advance
+    /// leg_expiry to the next CADENCE element, swapping December for a weekly.
+    #[test]
+    fn min_dte_is_inert_when_pinned() {
+        let cycles = vec![cyc("2019-12-26", "2019-01-01", "2019-12-26")];
+        let with_min = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 5, Some(&cycles),
+        );
+        let without = build_rollover_schedule_pinned(
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+        );
+        assert_eq!(with_min, without, "min-DTE must not perturb the pinned schedule");
+        for r in &with_min {
+            assert_eq!(r.3, "2019-12-26");
+        }
+    }
+}
+
+#[cfg(test)]
+mod strike_epoch_tests {
+    use super::*;
+
+    // Fresh re-strikes at MONTH-END only, regardless of roll cadence; Fixed only
+    // at a yearly-cycle boundary. Both are the same mechanism with a different
+    // reset trigger, so one predicate covers all four combos.
+
+    #[test]
+    fn monthly_cadence_fresh_restrikes_every_entry() {
+        // Consecutive monthly entries are always in different months, so Fresh
+        // re-strikes every time — identical to today's default behaviour.
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-02-28", "2019-03-28", false));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-03-28", "2019-04-25", false));
+    }
+
+    #[test]
+    fn weekly_cadence_fresh_holds_strike_within_a_month() {
+        // The sheet: 11000 held across every weekly roll in March, re-struck on
+        // the first roll of the next month.
+        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-07", "2019-03-14", false));
+        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-14", "2019-03-21", false));
+        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-21", "2019-03-28", false));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-03-28", "2019-04-04", false));
+    }
+
+    #[test]
+    fn fixed_never_restrikes_within_a_cycle_on_either_cadence() {
+        for (a, b) in [("2019-03-07", "2019-03-14"), ("2019-03-28", "2019-04-25"),
+                       ("2019-02-28", "2019-11-28")] {
+            assert!(!opens_new_epoch(StrikeMode::Fixed, a, b, false),
+                    "Fixed must hold its strike across {a} -> {b}");
+        }
+    }
+
+    #[test]
+    fn a_new_yearly_cycle_always_restrikes_even_for_fixed() {
+        // Fixed means fixed WITHIN a yearly cycle: the roll into the next
+        // December re-enters at a fresh strike from that day's spot.
+        assert!(opens_new_epoch(StrikeMode::Fixed, "2019-10-31", "2019-11-26", true));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-10-31", "2019-11-26", true));
+        // ...even when the roll day is in the same month as the previous entry.
+        assert!(opens_new_epoch(StrikeMode::Fixed, "2019-11-05", "2019-11-26", true));
+    }
+
+    #[test]
+    fn year_boundary_is_a_month_change_for_fresh() {
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-12-26", "2020-01-02", false));
+    }
 }

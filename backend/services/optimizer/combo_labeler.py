@@ -113,7 +113,11 @@ def _spot_adjustment_label(payload: Dict[str, Any]) -> str:
         pct = float(payload.get("spot_adjustment_value") or payload.get("spot_adjustment_pct") or 0)
     except (TypeError, ValueError):
         pct = 0.0
-    pct_str = f"{pct:g}%"
+    # Threshold can be a percent move or an absolute points move — label it as
+    # whatever the payload actually ran with, so a 150-point sweep doesn't get
+    # filed as "RiseBy150%".
+    units = str(payload.get("spot_adjustment_units") or "percent").lower()
+    pct_str = f"{pct:g}pts" if units == "points" else f"{pct:g}%"
     if direction in ("up", "rise", "rises"):
         return f"RiseBy{pct_str}"
     if direction in ("down", "fall", "falls"):
@@ -227,6 +231,31 @@ def _sl_label(leg: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def _find_futures_legs(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return all futures legs (segment == FUTURES), in payload order. Futures
+    carry no option_type, so the CE/PE labellers skip them entirely."""
+    return [
+        leg for leg in (payload.get("legs") or [])
+        if isinstance(leg, dict) and str(leg.get("segment") or "").upper() == "FUTURES"
+    ]
+
+
+def _futures_segment(leg: Optional[Dict[str, Any]]) -> str:
+    """Render a futures leg for the combo label / filename, e.g. 'FUT_Buy' or
+    'FUT_Sell_SL_50%'. Futures have no strike, so only position (+ any SL) is
+    shown — mirrors the CE_/PE_ option segments. Empty when leg is missing."""
+    if not isinstance(leg, dict):
+        return ""
+    pos = _position_label(leg)
+    sl = _sl_label(leg)
+    seg = "FUT"
+    if pos:
+        seg += f"_{pos}"
+    if sl:
+        seg += f"_{sl}"
+    return seg
+
+
 def _midcap_label(payload: Dict[str, Any]) -> str:
     """Midcap cross-index overlay segment for the combo label, matching the
     backtest filename: e.g. "BUY_MIDCAP100_Hypothetical_Future" / "..._Spot".
@@ -255,7 +284,8 @@ def _midcap_spot_adjustment_label(payload: Dict[str, Any]) -> str:
         pct = float(mc.get("pct") or mc.get("value") or 0)
     except (TypeError, ValueError):
         pct = 0.0
-    pct_str = f"{pct:g}%"
+    units = str(mc.get("units") or "percent").lower()
+    pct_str = f"{pct:g}pts" if units == "points" else f"{pct:g}%"
     if direction in ("up", "rise", "rises"):
         return f"MidcapRiseBy{pct_str}"
     if direction in ("down", "fall", "falls"):
@@ -313,6 +343,13 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         _seg, _st = _leg_segment(_leg, "PE")
         parts.append(_seg)
         put_strikes.append(_st)
+
+    # Futures legs (no strike) — appended after the option legs, e.g. 'FUT_Sell'.
+    # Previously dropped from the combo label / per-combo filename entirely.
+    for _leg in _find_futures_legs(payload):
+        _fseg = _futures_segment(_leg)
+        if _fseg:
+            parts.append(_fseg)
 
     # Master-summary strike columns: single leg → unchanged; multiple same-type
     # legs → joined with '+' so each distinct multi-leg combo gets a distinct

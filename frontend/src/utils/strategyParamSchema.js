@@ -167,12 +167,11 @@ export const OPTIM_PARAM_GROUPS = [
         unit: '% / pts',
         ...RANGE(1, 20, 1),
       },
-      {
-        path: 'slippage_pct',
-        label: 'Slippage %',
-        unit: '%',
-        ...RANGE(0, 0.5, 0.05),
-      },
+      // Slippage % sweep removed — slippage is per-leg now (each leg's own
+      // slippage_pct), not a strategy-level value, so there's nothing global
+      // left to sweep. Every combo already inherits each leg's own slippage
+      // from the base payload automatically (apply_combo_for_optim deep-
+      // copies the whole payload, including legs[].slippage_pct).
     ],
   },
   {
@@ -180,10 +179,19 @@ export const OPTIM_PARAM_GROUPS = [
     forLeg: false,
     items: [
       {
+        // Threshold is swept in whichever unit the %/pts toggle on this row is
+        // set to (OptimizePanel sends it as spot_adjustment_units on the base
+        // payload). unitOptions drives that toggle, and unitDefaults supplies
+        // the range preset each unit switches to.
         path: 'spot_adjustment_pct',
-        label: 'Spot Adjustment %',
+        label: 'Spot Adjustment',
         unit: '%',
         ...RANGE(0.5, 5, 0.5),
+        unitPayloadPath: 'spot_adjustment_units',
+        unitOptions: [
+          { key: 'percent', unit: '%', ...RANGE(0.5, 5, 0.5) },
+          { key: 'points', unit: 'pts', ...RANGE(50, 500, 50) },
+        ],
       },
       {
         path: 'spot_adjustment_direction',
@@ -207,10 +215,16 @@ export const OPTIM_PARAM_GROUPS = [
     midcapOnly: true,
     items: [
       {
+        // Same %/pts toggle as the NIFTY spot adjustment axis above.
         path: 'midcap_spot_adjustment.pct',
-        label: 'Midcap Spot Adjustment %',
+        label: 'Midcap Spot Adjustment',
         unit: '%',
         ...RANGE(0.5, 5, 0.5),
+        unitPayloadPath: 'midcap_spot_adjustment.units',
+        unitOptions: [
+          { key: 'percent', unit: '%', ...RANGE(0.5, 5, 0.5) },
+          { key: 'points', unit: 'pts', ...RANGE(50, 500, 50) },
+        ],
       },
       {
         path: 'midcap_spot_adjustment.direction',

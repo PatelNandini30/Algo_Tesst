@@ -55,6 +55,9 @@ services:
       HEAVY_COST_BACKTEST_MB: "${NODE_HEAVY_COST_BACKTEST_MB:-5000}"
       HEAVY_COST_OPTIMIZE_MB: "${NODE_HEAVY_COST_OPTIMIZE_MB:-4500}"
       OPTIMIZE_PARALLELISM: "${NODE_OPTIMIZE_PARALLELISM:-2}"
+      # Build combo tradesheets in Rust (all 4 sheets in one native call) — matches
+      # the main box. Cell-identical to openpyxl; ~1.5x faster real optims. Set 0 to revert.
+      OPTIMIZE_RUST_XLSX: "1"
       BULK_LOAD_MAX_MEMORY_MB: "1500"
       PYTHONOPTIMIZE: "1"
     # The image's default USER (appuser, non-root — backend/Dockerfile:9) can't

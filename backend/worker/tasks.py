@@ -211,11 +211,23 @@ def warm_backtest_cache_task(self, params: dict):
             self.update_state(state='PROCESSING', meta={'status': 'Warming worker lookup cache'})
             _build_fast_lookup_from_bulk(index, from_date, to_date)
             fast_lookup_built = True
+        # Keep the FUTIDX feather (Rust futures pricing source for mixed
+        # options+futures strategies) fresh alongside the options cache. This
+        # rebuilds the feather from the DB only when the DB signature changed
+        # (row count / max date) — a no-op otherwise. Best-effort; a failure
+        # here must never block the options cache warm.
+        futures_feather_ready = False
+        try:
+            from services.futures_cache_store import ensure_futures_loaded
+            futures_feather_ready = bool(ensure_futures_loaded(index))
+        except Exception:
+            pass
         return {
             'status': 'ready',
             'message': f'Worker cache warmed for {index} {from_date} to {to_date}',
             'elapsed_seconds': round(time.perf_counter() - t0, 3),
             'fast_lookup_built': fast_lookup_built,
+            'futures_feather_ready': futures_feather_ready,
             'stats': stats,
         }
     except Exception as e:

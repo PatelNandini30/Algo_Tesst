@@ -1556,6 +1556,12 @@ _rust_lookup_active: bool = False
 _bulk_data_version = None
 _bulk_dv_checked_at: float = 0.0
 
+# Per-symbol earliest-available-date cache (see _db_option_min_date /
+# bulk_load_options clamp below). Historical data doesn't get revised, so this
+# is safe to memoize for the life of the process — cleared on data_version
+# bump in case a backfill import ever adds OLDER history for a symbol.
+_symbol_min_date_cache: Dict[str, str] = {}
+
 
 def _invalidate_stale_bulk_lookup(sym_upper: str) -> None:
     """Drop in-memory + on-disk lookup state for ``sym_upper`` so the next load
@@ -1574,6 +1580,7 @@ def _invalidate_stale_bulk_lookup(sym_upper: str) -> None:
             _tbl.clear()
         except Exception:
             pass
+    _symbol_min_date_cache.pop(sym_upper, None)
     try:
         _feather_ohlc_loaded_symbols.discard(sym_upper)
     except Exception:
@@ -2299,27 +2306,98 @@ def is_super_trend_sl_date(date_str: str, config: Any) -> bool:
 # NEW FILTER SYSTEM - Date Range Filter for Backtest
 # ============================================================================
 
+_filter_segments_cache: Dict[str, list] = {}
+
+
 def get_filter_segments(config: str) -> list:
     """
-    Get filter segments for a given config.
-    
-    Args:
-        config: '5x1', '5x2', 'base2', or 'custom'
-    
-    Returns:
-        List of dicts with 'start' and 'end' keys (datetime.date objects)
+    Get filter segments for a given filter key.
+
+    Primary source is the folder-based `filter_date_sets` table (keyed by
+    filter_key, one filter per imported CSV). Legacy '5x1'/'5x2'/'base2' keys
+    still resolve via the old super_trend_segments path for safety, but they are
+    no longer offered in the UI.
+
+    Returns: list of {'start': datetime, 'end': datetime} dicts.
     """
     if not config:
         return []
-    
-    config = config.lower().strip()
-    
-    if config == 'base2':
-        return get_base2_segments()
-    elif config in ['5x1', '5x2']:
-        return get_super_trend_segments(config)
-    else:
+    key = str(config).strip()
+    if not key or key.lower() == 'none':
         return []
+
+    if key in _filter_segments_cache:
+        return _filter_segments_cache[key]
+
+    # New folder-based filters (filter_date_sets), keyed by filter_key verbatim.
+    try:
+        df = _repo.get_filter_date_segments(key)
+        if df is not None and not df.empty:
+            starts = pd.to_datetime(df['start_date']).tolist()
+            ends   = pd.to_datetime(df['end_date']).tolist()
+            segs = [
+                {'start': s.to_pydatetime(), 'end': e.to_pydatetime()}
+                for s, e in zip(starts, ends) if e >= s
+            ]
+            _filter_segments_cache[key] = segs
+            return segs
+    except Exception:
+        pass
+
+    # Legacy fallback (retained for safety; not surfaced in the UI).
+    lc = key.lower()
+    if lc == 'base2':
+        return get_base2_segments()
+    elif lc in ['5x1', '5x2']:
+        return get_super_trend_segments(lc)
+
+    _filter_segments_cache[key] = []
+    return []
+
+
+def get_filter_catalog() -> list:
+    """
+    Folder-grouped catalog of available filters for the UI / API.
+
+    Returns [{group_key, group_label,
+              filters: [{key, label, count, range, segments, preview}]}].
+    """
+    try:
+        df = _repo.get_filter_date_catalog()
+    except Exception:
+        df = None
+
+    groups: Dict[str, dict] = {}
+    order: list = []
+    if df is not None and not df.empty:
+        for _, r in df.iterrows():
+            gk = r['group_key']
+            if gk not in groups:
+                groups[gk] = {
+                    'group_key': gk,
+                    'group_label': r['group_label'],
+                    'filters': [],
+                }
+                order.append(gk)
+            segs = get_filter_segments(r['filter_key'])
+            serialized = [
+                {'start': s['start'].strftime('%Y-%m-%d'),
+                 'end':   s['end'].strftime('%Y-%m-%d')}
+                for s in segs if s.get('start') and s.get('end')
+            ]
+            rng = None
+            if serialized:
+                rng = {'from': min(x['start'] for x in serialized),
+                       'to':   max(x['end'] for x in serialized)}
+            groups[gk]['filters'].append({
+                'key': r['filter_key'],
+                'label': r['filter_label'],
+                'count': int(r['seg_count']),
+                'range': rng,
+                'segments': serialized,
+                'preview': serialized[:5],
+            })
+    return [groups[gk] for gk in order]
 
 
 _base2_segments_cache: Optional[list] = None
@@ -3482,6 +3560,61 @@ def calculate_strike_advanced(date, index, spot_price, strike_interval, option_t
 # These thin wrappers delegate to services/data_loader.py bulk functions.
 # Engines should call these instead of the original functions for fast lookups.
 
+def _db_option_max_date(symbol: str) -> Optional[str]:
+    """
+    Cheap indexed MAX(date) check against Postgres for one symbol — used to
+    refuse the "spot-bounded" feather-acceptance trap below when the DB
+    actually has newer option data than the on-disk feather's own internal
+    consistency check can see (e.g. new data was imported after the feather
+    was built, but the feather's own spot/options pair still agree with
+    each other and pass the older, DB-blind check).
+    """
+    try:
+        from sqlalchemy import text
+        with db_engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT MAX(date) FROM option_data WHERE symbol = :sym"),
+                {"sym": symbol.upper()},
+            ).first()
+        return str(row[0])[:10] if row and row[0] else None
+    except Exception as exc:
+        logger.debug("[BULK] DB max-date check failed for %s: %s", symbol, exc)
+        return None
+
+
+def _db_option_min_date(symbol: str) -> Optional[str]:
+    """
+    Cheap indexed MIN(date) check against Postgres for one symbol — used to
+    clamp a request's from_date to where this symbol's data actually begins
+    (e.g. MIDCPNIFTY options start 2022-01-24). Without this, a request whose
+    from_date predates a symbol's real history (common in multi-index combos
+    that apply the overall backtest range to every leg) can never match ANY
+    feather's coverage range and falls through to a live Postgres scan on
+    every single call — see _symbol_min_date_cache in bulk_load_options.
+    """
+    try:
+        from sqlalchemy import text
+        with db_engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT MIN(date) FROM option_data WHERE symbol = :sym"),
+                {"sym": symbol.upper()},
+            ).first()
+        if not row or not row[0]:
+            return None
+        candidate = str(row[0])[:10]
+        # Defensive: a forked worker can inherit a pooled DB connection from
+        # its parent (SQLAlchemy's engine/pool isn't fork-safe) — if two
+        # processes race on the same underlying socket, the wire protocol can
+        # desync and return garbage for an unrelated query (seen once as the
+        # literal string "1" instead of a date, which crashed the whole
+        # optimize job downstream). Validate before trusting/caching it.
+        pd.to_datetime(candidate)
+        return candidate
+    except Exception as exc:
+        logger.debug("[BULK] DB min-date check failed for %s: %s", symbol, exc)
+        return None
+
+
 def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
     """
     Load all option data for symbol/date-range into memory ONCE.
@@ -3518,6 +3651,43 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                 _bulk_data_version = _cur_dv
     except Exception:
         pass
+
+    # Clamp from_date to where this symbol's data actually begins. A request
+    # whose from_date predates all real history for this symbol (e.g. a
+    # multi-index combo applying the overall backtest range to a leg like
+    # MIDCPNIFTY that only has data from 2022-01-24) can never be satisfied by
+    # any feather's coverage range, so it fell through to a live Postgres scan
+    # on every call instead of ever hitting the cache. Clamping loses nothing —
+    # there's no data to find before this date anyway.
+    _sym_min_date = _symbol_min_date_cache.get(sym_upper)
+    if _sym_min_date is None:
+        _sym_min_date = _db_option_min_date(sym_upper)
+        if _sym_min_date:
+            _symbol_min_date_cache[sym_upper] = _sym_min_date
+    # Defensive: discard a cached value that isn't actually a valid date (e.g.
+    # poisoned by the non-fork-safe DB pool race — see _db_option_min_date)
+    # instead of crashing the whole job. Falls through as "no clamp available"
+    # and lets the next call retry from a hopefully-clean connection.
+    if _sym_min_date:
+        try:
+            _sym_min_dt = pd.to_datetime(_sym_min_date)
+        except Exception:
+            logger.warning(
+                "[BULK] Discarding invalid cached min-date %r for %s — skipping clamp this call",
+                _sym_min_date, sym_upper,
+            )
+            _symbol_min_date_cache.pop(sym_upper, None)
+            _sym_min_date = None
+            _sym_min_dt = None
+    else:
+        _sym_min_dt = None
+    if _sym_min_dt is not None and _sym_min_dt > requested_from:
+        logger.info(
+            "[BULK] Clamping %s from_date %s -> %s (symbol data starts %s)",
+            sym_upper, from_date, _sym_min_date, _sym_min_date,
+        )
+        from_date = _sym_min_date
+        requested_from = pd.to_datetime(_sym_min_date)
 
     # Fast early return: either Python partition or Rust already covers this range.
     if ((_bulk_bhav_by_date or _rust_lookup_active)
@@ -3663,15 +3833,28 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                         # Extension: feather may not reach to_date because DB spot data
                         # is behind Parquet options data. If the feather is internally
                         # consistent (spot_max == options_max in the feather pair), it
-                        # contains the best available data — any dates beyond _fmax have
-                        # no spot so produce no trades regardless. Accept it.
+                        # MIGHT contain the best available data — but only if Postgres
+                        # itself has nothing newer. Verify against the real DB max
+                        # before trusting the feather pair's own (possibly stale)
+                        # internal agreement — otherwise a feather built before a
+                        # later data import silently caps every request at its own
+                        # build-time ceiling forever (seen on MIDCPNIFTY: feather
+                        # capped at 2025-02-28 while Postgres had data to 2026-06-30).
                         if not _feather_covers and _fmin is not None and _fmin <= from_date and _spt_max_full is not None:
                             if _spt_max_full >= _fmax:
-                                _feather_covers = True
-                                logger.info(
-                                    "[BULK] Feather (%s→%s) is spot-bounded (spot=%s); accepting for to_date=%s",
-                                    _fmin, _fmax, _spt_max_full, to_date,
-                                )
+                                _db_max = _db_option_max_date(sym_upper)
+                                if _db_max is not None and _db_max > _fmax:
+                                    logger.warning(
+                                        "[BULK] Feather (%s→%s) looks spot-bounded but DB has newer data "
+                                        "(max=%s) — rejecting stale feather, forcing reload for %s",
+                                        _fmin, _fmax, _db_max, sym_upper,
+                                    )
+                                else:
+                                    _feather_covers = True
+                                    logger.info(
+                                        "[BULK] Feather (%s→%s) is spot-bounded (spot=%s); accepting for to_date=%s",
+                                        _fmin, _fmax, _spt_max_full, to_date,
+                                    )
                         # Staleness check: if spot feather is BEHIND the options feather
                         # in the same pair, the pair was written inconsistently (options
                         # came from a wider Parquet while spot came from a narrower DB

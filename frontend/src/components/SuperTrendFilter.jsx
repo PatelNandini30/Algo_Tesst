@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Loader2, Info, Upload, FileText, X } from 'lucide-react';
 import Toggle from './ui/Toggle';
-import { STR_FILTER_OPTIONS } from './constants';
 
 const parseSegments = (rawSegments = []) => {
   return rawSegments
@@ -29,8 +28,9 @@ const SkeletonLine = () => (
 );
 
 const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
-  const [selected, setSelected] = useState('5x1');
+  const [selected, setSelected] = useState('');
   const [filterCatalog, setFilterCatalog] = useState(null);
+  const [filterGroups, setFilterGroups] = useState([]);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [catalogError, setCatalogError] = useState('');
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -44,10 +44,11 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
   const [lateEntry, setLateEntry] = useState(false);
   const [minDaysToEntry, setMinDaysToEntry] = useState(3);
 
-  const selectedOption = useMemo(
-    () => STR_FILTER_OPTIONS.find(opt => opt.value === selected) ?? STR_FILTER_OPTIONS[0],
-    [selected],
-  );
+  const selectedOption = useMemo(() => {
+    if (selected === 'custom') return { value: 'custom', label: 'Custom CSV' };
+    const meta = filterCatalog?.[selected];
+    return { value: selected, label: meta?.label ?? (selected || 'Select a filter…') };
+  }, [selected, filterCatalog]);
 
   const handleOutsideClick = useCallback((event) => {
     if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
@@ -127,7 +128,17 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
       if (!data.success) {
         throw new Error(data.message || 'Failed to load filter segments');
       }
-      setFilterCatalog(data.filters || {});
+      const groups = Array.isArray(data.groups) ? data.groups : [];
+      const flat = data.filters || {};
+      setFilterGroups(groups);
+      setFilterCatalog(flat);
+      // Auto-select the first available filter when nothing valid is chosen yet
+      // (never override an active custom-CSV selection).
+      setSelected(prev => {
+        if (prev === 'custom') return prev;
+        if (prev && flat[prev]) return prev;
+        return groups[0]?.filters?.[0]?.key || prev;
+      });
     } catch (err) {
       setCatalogError(err.message || 'Failed to load filter segments.');
       setFilterCatalog({});
@@ -277,7 +288,7 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                     setCsvFileName('');
                     setCustomSegments([]);
                     setUploadError('');
-                    setSelected('5x1');
+                    setSelected(filterGroups[0]?.filters?.[0]?.key || '');
                   }}
                   className="ml-1 hover:text-loss"
                 >
@@ -301,22 +312,48 @@ const SuperTrendFilter = ({ enabled, onToggle, onFilterChange }) => {
                 <ChevronDown size={16} />
               </button>
               {dropdownOpen && (
-                <div className="absolute z-20 mt-1 w-full rounded-lg border border-default bg-surface shadow-lg">
-                  {STR_FILTER_OPTIONS.map(opt => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      onClick={() => {
-                        setSelected(opt.value);
-                        setDropdownOpen(false);
-                      }}
-                      className={`w-full text-left px-4 py-3 text-sm transition-colors ${
-                        opt.value === selected ? 'bg-accent text-inverse text-white' : 'text-secondary hover:bg-hover'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
+                <div className="absolute z-20 mt-1 w-full max-h-80 overflow-y-auto rounded-lg border border-default bg-surface shadow-lg">
+                  {filterGroups.length === 0 && (
+                    <div className="px-4 py-3 text-sm text-secondary">
+                      {catalogLoading ? 'Loading filters…' : 'No filters available'}
+                    </div>
+                  )}
+                  {filterGroups.map(group => (
+                    <div key={group.group_key}>
+                      <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-secondary bg-hover border-t border-default">
+                        {group.group_label}
+                      </div>
+                      {(group.filters || []).map(f => (
+                        <button
+                          key={f.key}
+                          type="button"
+                          onClick={() => {
+                            setSelected(f.key);
+                            setDropdownOpen(false);
+                          }}
+                          className={`w-full text-left px-4 py-2.5 text-sm transition-colors ${
+                            f.key === selected ? 'bg-accent text-inverse text-white' : 'text-secondary hover:bg-hover'
+                          }`}
+                          title={`${f.count} segments`}
+                        >
+                          {f.label}
+                        </button>
+                      ))}
+                    </div>
                   ))}
+                  {/* Custom CSV — upload flow unchanged */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelected('custom');
+                      setDropdownOpen(false);
+                    }}
+                    className={`w-full text-left px-4 py-2.5 text-sm border-t border-default transition-colors ${
+                      selected === 'custom' ? 'bg-accent text-inverse text-white' : 'text-secondary hover:bg-hover'
+                    }`}
+                  >
+                    Custom CSV
+                  </button>
                 </div>
               )}
             </div>

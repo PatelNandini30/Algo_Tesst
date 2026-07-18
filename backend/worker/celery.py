@@ -65,7 +65,39 @@ def test_task(self, x, y):
     return x + y
 
 
-from celery.signals import worker_ready as _worker_ready
+from celery.signals import worker_ready as _worker_ready, worker_process_init as _worker_process_init
+
+
+@_worker_process_init.connect
+def _reset_db_pool_after_fork(**_kwargs):
+    """Dispose the shared SQLAlchemy engine's pooled connections right after
+    THIS worker process forks from Celery's prefork MainProcess.
+
+    database.py's engine is a module-level singleton created once at import
+    time — if the MainProcess ever opened a connection before forking (or a
+    sibling fork did), every forked child inherits the same underlying DB
+    socket. Two processes reading/writing that one socket concurrently
+    desyncs the Postgres wire protocol: a query in one process can receive
+    bytes meant for a different process's query. Seen in practice as a
+    corrupted _db_option_min_date() result (a literal "1" instead of a date,
+    crashing an optimize job) and as get_expiry_dates() silently returning
+    zero rows (every combo in that job priced trades=0 with no error at all —
+    the more dangerous case since it looks like success).
+
+    Deliberately calls .dispose() on the SAME engine object every module
+    holds (database.engine, base.py's db_engine, etc. are all the same
+    instance — `from X import engine` binds a reference, not a copy) rather
+    than database.reset_engine(), which only replaces its own private
+    module-level variable and would leave every already-imported reference
+    (base.py's db_engine, etc.) pointing at the stale, still-shared pool.
+    dispose() mutates the existing Engine's pool in place, so every one of
+    those references transparently gets fresh, non-shared connections."""
+    try:
+        from database import engine as _shared_engine
+        _shared_engine.dispose()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("[DB POOL] post-fork dispose failed: %s", exc)
 
 
 @_worker_ready.connect

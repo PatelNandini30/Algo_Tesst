@@ -177,7 +177,8 @@ def _to_num(v) -> Optional[float]:
 
 
 def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
-                  dd_is_percent: bool, live_field: Optional[str] = None) -> Dict[str, Any]:
+                  dd_is_percent: bool, live_field: Optional[str] = None,
+                  yearly: bool = False) -> Dict[str, Any]:
     wow: Dict[int, Dict[int, float]] = {}
     mom_monthly: Dict[int, Dict[int, float]] = {}
     mom_dd: Dict[int, List[float]] = {}
@@ -204,7 +205,20 @@ def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
             if live_num is not None:
                 live_dec = live_num / 100.0
 
-        e = _parse_date(t.get("Expiry"))
+        # WOW week identity.
+        #
+        # Normally the Expiry: for a weekly/monthly strategy the trade IS its
+        # contract, so Expiry is the trade's natural week — and it deliberately
+        # keeps a contract's P&L in ONE week even when a T-n exit lands in the
+        # previous calendar week.
+        #
+        # Under YEARLY that same principle breaks it: the contract IS the whole
+        # year, so every trade shares one Expiry and the entire year collapses
+        # into a single cell (2019-12-26 → ISO week 52; 2020-12-31 → week 53).
+        # There the roll segment is the week, so the week identity comes from the
+        # Exit Date — mirroring what MOM already does below.
+        _wk_src = t.get("Exit Date") if yearly else t.get("Expiry")
+        e = _parse_date(_wk_src)
         if e is not None:
             y, w = _iso_year_week(e)
             wow.setdefault(y, {})
@@ -545,12 +559,12 @@ def _write_mom_block(S, wm, title, base_row: int, base_col: int = 1) -> int:
     for mi in range(12):
         S.h(r, cc + 2 + mi, "")
     if data_r1 >= m_data0:
-        tots = [wm["mom"][y]["total"] for y in wm["mom_years"] if wm["mom"][y].get("total") is not None]
-        mdds = [wm["mom"][y]["maxdd"] for y in wm["mom_years"] if wm["mom"][y].get("maxdd") is not None]
-        lives = [wm["mom"][y]["livedd"] for y in wm["mom_years"] if wm["mom"][y].get("livedd") is not None]
+        tots = [wm["mom"].get(y, {})["total"] for y in wm["mom_years"] if wm["mom"].get(y, {}).get("total") is not None]
+        mdds = [wm["mom"].get(y, {})["maxdd"] for y in wm["mom_years"] if wm["mom"].get(y, {}).get("maxdd") is not None]
+        lives = [wm["mom"].get(y, {})["livedd"] for y in wm["mom_years"] if wm["mom"].get(y, {}).get("livedd") is not None]
         rmdds = []
         for y in wm["mom_years"]:
-            t, d = wm["mom"][y].get("total"), wm["mom"][y].get("maxdd")
+            t, d = wm["mom"].get(y, {}).get("total"), wm["mom"].get(y, {}).get("maxdd")
             if t is not None and d:
                 rmdds.append(t / abs(d))
         n_sum = sum(tots)
@@ -565,11 +579,12 @@ def _write_mom_block(S, wm, title, base_row: int, base_col: int = 1) -> int:
     return r
 
 
-def _wm_from_cleaned(cleaned: List[Dict], has_midcap: bool) -> Dict[str, Any]:
+def _wm_from_cleaned(cleaned: List[Dict], has_midcap: bool, yearly: bool = False) -> Dict[str, Any]:
     ret_field = "Combined Net P&L %" if has_midcap else "% P&L"
     dd_field = "Combined %DD" if has_midcap else "%DD"
     live_field = "Combined Actual Live DD" if has_midcap else "Actual Live DD"
-    return build_wow_mom(cleaned, ret_field, dd_field, has_midcap, live_field=live_field)
+    return build_wow_mom(cleaned, ret_field, dd_field, has_midcap,
+                         live_field=live_field, yearly=yearly)
 
 
 def _set_wow_widths(ws, nw, base_col: int = 1):
@@ -590,9 +605,9 @@ def _set_mom_widths(ws, base_col: int = 1):
 
 # ── public entry points ────────────────────────────────────────────────────
 def write_wow_mom_combined(wb: Workbook, cleaned: List[Dict], has_midcap: bool,
-                           title: str) -> bool:
+                           title: str, yearly: bool = False) -> bool:
     """Single 'WOW & MOM Summary' sheet (WOW on top, MOM below). Mirrors JS."""
-    wm = _wm_from_cleaned(cleaned, has_midcap)
+    wm = _wm_from_cleaned(cleaned, has_midcap, yearly=yearly)
     if not (wm["n_trades"] > 0):
         return False
     ws = wb.create_sheet("WOW & MOM Summary")
@@ -602,6 +617,107 @@ def write_wow_mom_combined(wb: Workbook, cleaned: List[Dict], has_midcap: bool,
     _write_mom_block(S, wm, title, wow_total + 2)
     _set_wow_widths(ws, wm["n_weeks"])
     return True
+
+
+def _rgb6(color) -> Optional[str]:
+    """openpyxl color → visible 6-hex RGB (drop the alpha byte), or None."""
+    v = getattr(color, "rgb", None)
+    if isinstance(v, str) and len(v) == 8:
+        return v[2:].upper()
+    return None
+
+
+def _ws_to_ops(ws) -> Dict[str, Any]:
+    """Extract a fully-built openpyxl worksheet into the plain layout-ops dict the
+    Rust writer (algotest_native.write_layout_sheet_xlsx) consumes. The WOW/MOM sheet
+    leans on openpyxl's mutable cells (per-side medium borders, month-edge, drawdown
+    boxes, partial overwrites); extracting the FINAL cell state reproduces all of it
+    without re-implementing the block writers. Merge fillers + fully-default cells are
+    skipped; borders become per-side style lists so Rust redraws them exactly."""
+    from openpyxl.utils.cell import range_boundaries
+    from openpyxl.utils import column_index_from_string
+
+    merges: List[Tuple[int, int, int, int]] = []
+    covered: set = set()
+    for rng in ws.merged_cells.ranges:
+        r1, c1, r2, c2 = rng.min_row, rng.min_col, rng.max_row, rng.max_col
+        merges.append((r1, c1, r2, c2))
+        for rr in range(r1, r2 + 1):
+            for cc in range(c1, c2 + 1):
+                if (rr, cc) != (r1, c1):
+                    covered.add((rr, cc))
+
+    cells: List[Dict[str, Any]] = []
+    for row in ws.iter_rows():
+        for cell in row:
+            r, c = cell.row, cell.column
+            if (r, c) in covered:
+                continue
+            fill_rgb = (_rgb6(cell.fill.fgColor)
+                        if (cell.fill is not None and cell.fill.patternType) else None)
+            b = cell.border
+            sides = [getattr(getattr(b, s), "style", None)
+                     for s in ("top", "left", "bottom", "right")]
+            has_border = any(sides)
+            val = cell.value
+            if (val is None or val == "") and fill_rgb is None and not has_border:
+                continue
+            f = cell.font
+            if not has_border:
+                border: Any = False
+            elif all(s == "thin" for s in sides):
+                border = True
+            else:
+                border = sides
+            nf = cell.number_format
+            cells.append({
+                "r": r, "c": c,
+                "v": (None if val == "" else val),
+                "bold": bool(f.bold),
+                "size": float(f.size or 11),
+                "fc": (_rgb6(f.color) or "000000"),
+                "bg": fill_rgb,
+                "align": ("L" if cell.alignment.horizontal == "left" else "C"),
+                "border": border,
+                "nfmt": (None if nf in (None, "General") else nf),
+            })
+
+    col_widths = []
+    for letter, dim in ws.column_dimensions.items():
+        if dim.width is None:
+            continue
+        lo = dim.min or column_index_from_string(letter)
+        hi = dim.max or lo
+        for ci in range(lo, hi + 1):
+            col_widths.append((ci, float(dim.width)))
+    row_heights = [(r, float(dim.height))
+                   for r, dim in ws.row_dimensions.items() if dim.height is not None]
+
+    freeze = None
+    if ws.freeze_panes:
+        c0, r0, *_ = range_boundaries(ws.freeze_panes)
+        freeze = (r0 - 1, c0 - 1)   # openpyxl "B1" → set_freeze_panes(0, 1)
+
+    return {"name": ws.title, "cells": cells, "merges": merges,
+            "row_heights": row_heights, "col_widths": col_widths, "freeze": freeze}
+
+
+def wow_mom_ops(cleaned: List[Dict], has_midcap: bool, title: str,
+                yearly: bool = False) -> Optional[Dict[str, Any]]:
+    """Rust path — build the 'WOW & MOM Summary' sheet via openpyxl (unchanged logic),
+    then extract it to a layout-ops dict. Returns None when there are no trades."""
+    wm = _wm_from_cleaned(cleaned, has_midcap, yearly=yearly)
+    if not (wm["n_trades"] > 0):
+        return None
+    wb = Workbook()
+    wb.remove(wb.active)
+    # `yearly` MUST be forwarded: this call builds the sheet that is actually
+    # emitted (the `wm` above is only used for the n_trades check). Dropping it
+    # here silently rebuilt WOW with yearly=False, collapsing every yearly trade
+    # into its December expiry's ISO week.
+    if not write_wow_mom_combined(wb, cleaned, has_midcap, title, yearly=yearly):
+        return None
+    return _ws_to_ops(wb["WOW & MOM Summary"])
 
 
 def _adj_split(title: str) -> Tuple[str, str]:
@@ -661,7 +777,8 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
         # Use the pre-computed wm (built inline in the worker during the sweep)
         # when present; otherwise derive it from the cleaned rows (legacy path).
         _pre = c.get("wm")
-        wm = _intkeys(_pre) if _pre else _wm_from_cleaned(c["cleaned"], c.get("has_midcap", False))
+        wm = _intkeys(_pre) if _pre else _wm_from_cleaned(
+            c["cleaned"], c.get("has_midcap", False), yearly=bool(c.get("yearly", False)))
         if not (wm["n_trades"] > 0):
             continue
         title = c.get("title") or "Strategy"

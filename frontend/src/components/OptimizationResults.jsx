@@ -55,7 +55,7 @@ function friendlyParamLabel(path) {
     overall_sl_value: 'Overall SL',
     overall_target_value: 'Overall TP',
     buffer_strike_value: 'Buffer Strike',
-    spot_adjustment_pct: 'Spot Adj %',
+    spot_adjustment_pct: 'Spot Adj',
     spot_adjustment_direction: 'Spot Adj Dir',
   };
   if (FRIENDLY_TOP[path]) return FRIENDLY_TOP[path];
@@ -243,7 +243,14 @@ export default function OptimizationResults({
     if (!jobId || status === 'success' || status === 'failed') return undefined;
     const cancelOnExit = () => {
       try {
-        fetch(`/api/optimize/jobs/${jobId}`, { method: 'DELETE', keepalive: true });
+        // only_if_active=true: this local `status` is React state that only
+        // updates on the next ~1.5s poll tick, so it can still say "running"
+        // for a moment after the job actually finished server-side. Without
+        // this flag, closing the tab in that window deleted a job's trade
+        // files (including what WOW/MOM is built from) right after it
+        // completed. The backend re-checks the real status itself and skips
+        // the delete if the job already succeeded or failed.
+        fetch(`/api/optimize/jobs/${jobId}?only_if_active=true`, { method: 'DELETE', keepalive: true });
       } catch {}
     };
     window.addEventListener('pagehide', cancelOnExit);

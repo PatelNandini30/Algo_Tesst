@@ -5,6 +5,7 @@ import {
 } from 'recharts';
 import { Download, X } from 'lucide-react';
 import { writeWowMomSheet, buildWowMomTitle } from '../utils/wowMomSheet';
+import { buildRulesSheet } from '../utils/backtestRulesSheet';
 
 const EXIT_REASON_COLORS = {
   Expiry:                           { bg: '#f1f5f9', text: '#475569', border: '#cbd5e1' },
@@ -144,6 +145,20 @@ const buildExcelFileName = (config) => {
   if (entry) parts.push(entry);
   if (exit)  parts.push(exit);
 
+  // YEARLY: the leg tag already carries "YEARLY" (the December contract), but the
+  // roll cadence and the T-n roll month are strategy-level and would otherwise be
+  // invisible — two very different runs would share one filename.
+  if (String(config.expiryBasis || '').toLowerCase() === 'yearly') {
+    parts.push(String(config.rolloverCadence || 'monthly').toLowerCase() === 'weekly' ? 'WOW' : 'MOM');
+    const _ym = Number(config.yearlyExitMonthsBefore) || 0;
+    parts.push(`YT${_ym}`);
+    // Roll-through months: a Dec-only run and a Dec+Mar run must not collide on
+    // the filename. December-only stays untagged (existing names unchanged).
+    const _mon = { '03': 'MAR', '06': 'JUN', '09': 'SEP', '12': 'DEC' };
+    const _rm = Array.from(new Set(['12', ...((config.yearlyRollMonths) || ['12']).map(String)])).sort();
+    if (_rm.length > 1) parts.push(`ROLL_${_rm.map(m => _mon[m] || m).join('-')}`);
+  }
+
   if (config.spotAdjustmentEnabled) {
     const dir = (config.spotAdjustmentDirection || 'rise');
     const val = config.spotAdjustmentValue;
@@ -171,7 +186,7 @@ const buildExcelFileName = (config) => {
 };
 
 
-const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false, strategyConfig, filterSegments = null }) => {
+const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, showStrSegment = false, strategyConfig, filterSegments = null, rulesPayload = null, rulesFilterName = null }) => {
   if (!results) return null;
 
   useEffect(() => {
@@ -183,7 +198,8 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   
   console.log('[ResultsPanel] results:', JSON.stringify(results, null, 2).slice(0, 500));
   const { trades = [], summary = {}, pivot = {} } = results;
-  const slippagePct = Number(results?.meta?.slippage_pct || 0);
+  // Slippage is applied silently into Entry/Exit Price per leg — no separate
+  // indicator shown here on purpose.
   const chargesEnabled = Boolean(results?.meta?.charges_enabled);
   const bufferStrikeEnabled = Boolean(
     results?.meta?.buffer_strike_enabled ||
@@ -660,6 +676,12 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         ? meta.filter_segments
         : (Array.isArray(filterSegments) && filterSegments.length ? filterSegments : null);
       const _base = buildExcelFileName(strategyConfig).replace(/\.xlsx$/i, '');
+      // Leg-wise "Rules" first sheet — full per-leg configuration (options/futures/
+      // midcap, per-leg slippage, strike/SL/target) built from the run payload.
+      let _rulesSheet = null;
+      try {
+        if (rulesPayload) _rulesSheet = buildRulesSheet(rulesPayload, rulesFilterName || null);
+      } catch (_e) { _rulesSheet = null; }
       const body = {
         trades: results?.trades || [],
         summary: results?.summary || {},
@@ -671,6 +693,14 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         midcap_spot_adjustment: meta.midcap_spot_adjustment || null,
         filter_segments: _segs,
         patchwise: !!patchwise,
+        rules_sheet: _rulesSheet,
+        // Drives the WOW sheet's week identity: under YEARLY every trade shares
+        // one December Expiry, so WOW keys on Exit Date instead (see
+        // build_wow_mom). meta wins; strategyConfig is the fallback for results
+        // that predate the meta field.
+        expiry_type: meta.expiry_type
+          || String(strategyConfig?.expiryBasis || '').toUpperCase()
+          || '',
       };
       const r = await fetch('/api/backtest/tradesheet.xlsx', {
         method: 'POST',
@@ -780,7 +810,6 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               <h2 className="results-title">Backtest Results</h2>
               <p className="results-meta mt-1">
                 {stats.totalTrades} trades · {results.meta?.date_range || ''}
-                {slippagePct > 0 ? ` · ${slippagePct}% slippage` : ''}
                 {chargesEnabled ? ' · Zerodha charges applied' : ''}
               </p>
               {filterInfo && (
@@ -974,98 +1003,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
               </div>
             </div>
 
-            {/* Monthly Returns */}
-            {(() => {
-              const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-              const headers = pivot.headers && pivot.headers.length > 0
-                ? pivot.headers
-                : ['Year', ...MONTHS, 'Total', 'Max DD', 'DD Days', 'R/MDD'];
-
-              const extrasByYear = {};
-              (pivot.rows || []).forEach(r => {
-                const yr = String(r?.[0] ?? '');
-                if (!yr) return;
-                extrasByYear[yr] = [r?.[14] ?? '', r?.[15] ?? '', r?.[16] ?? ''];
-              });
-
-              const parseToYearMonth = (d) => {
-                if (!d && d !== 0) return null;
-                const s = String(d).trim();
-                if (!s) return null;
-                const parts = s.includes('/') ? s.split('/') : s.split('-');
-                if (parts.length !== 3) return null;
-                let dd, mm, yy;
-                if (parts[0].length === 4) { yy = parts[0]; mm = parts[1]; dd = parts[2]; }
-                else { dd = parts[0]; mm = parts[1]; yy = parts[2]; }
-                const year = String(yy);
-                const monthIdx = parseInt(mm, 10) - 1;
-                if (!year || !Number.isFinite(monthIdx) || monthIdx < 0 || monthIdx > 11) return null;
-                return { year, monthIdx };
-              };
-
-              const byYM = {};
-              groupedTrades.forEach(group => {
-                const exitDate = group.exitDate || '';
-                const ym = parseToYearMonth(exitDate);
-                if (!ym) return;
-                const net = Number(group.totalPnl ?? 0) || 0;
-                if (!byYM[ym.year]) byYM[ym.year] = Array(12).fill(0);
-                byYM[ym.year][ym.monthIdx] = (byYM[ym.year][ym.monthIdx] || 0) + net;
-              });
-
-              const rows = Object.entries(byYM).sort().map(([yr, mos]) => {
-                const total = mos.reduce((s, v) => s + v, 0);
-                const extras = extrasByYear[yr] || ['', '', ''];
-                return [yr, ...mos.map(v => +v.toFixed(2)), +total.toFixed(2), ...extras];
-              });
-
-              if (!rows || rows.length === 0) return null;
-
-              return (
-              <div className="chart-panel">
-                <h3 className="chart-panel-title">Monthly Returns</h3>
-                <div className="overflow-x-auto">
-                  <table className="min-w-full text-sm">
-                    <thead>
-                      <tr className="border-b-2 border-strong">
-                        {headers.map((header, idx) => (
-                          <th key={idx} className="px-4 py-3 text-center text-xs font-bold text-secondary uppercase tracking-wider">
-                            {header}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.map((row, rowIdx) => (
-                        <tr key={rowIdx} className="border-b border-default">
-                          {row.map((cell, cellIdx) => {
-                            const isNumeric = typeof cell === 'number';
-                            const isPositive = isNumeric && cell > 0;
-                            const isNegative = isNumeric && cell < 0;
-                            
-                            return (
-                              <td 
-                                key={cellIdx} 
-                                className={`px-4 py-3 text-center ${
-                                  cellIdx === 0 ? 'font-bold text-primary' : ''
-                                } ${
-                                  isPositive ? 'text-profit font-semibold' : 
-                                  isNegative ? 'text-loss font-semibold' : 
-                                  'text-muted'
-                                }`}
-                              >
-                                {isNumeric ? cell.toFixed(2) : cell || '-'}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-              );
-            })()}
+            {/* Monthly Returns grid removed from the UI — the month/year
+                breakdown lives ONLY in the exported workbook's
+                "WOW & MOM Summary" sheet (4th tab). Kept out of the UI
+                deliberately; do not re-add here. */}
 
             {/* Detailed Statistics Summary */}
             <div className="bg-surface rounded-xl p-4 shadow-sm border border-default">

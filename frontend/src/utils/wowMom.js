@@ -171,7 +171,7 @@ export function maxDd(rets) {
  *   wowYears:[], momYears:[], nWeeks, nTrades
  * }}
  */
-export function buildWowMom(trades, { retField, ddField, ddIsPercent, liveField }) {
+export function buildWowMom(trades, { retField, ddField, ddIsPercent, liveField, yearly = false }) {
   const wow = {};                     // {year: {week: decimal}}
   const momMonthly = {};              // {year: {monthIdx0: decimal}}
   const momDd = {};                   // {year: [decimal dd, …]}
@@ -195,8 +195,16 @@ export function buildWowMom(trades, { retField, ddField, ddIsPercent, liveField 
       if (lr !== '' && lr != null && Number.isFinite(Number(lr))) liveDec = Number(lr) / 100;
     }
 
-    // WoW — by Expiry
-    const eDate = parseDmy(t['Expiry']);
+    // WoW — by Expiry, EXCEPT under a YEARLY basis.
+    //
+    // Expiry is the right week identity for weekly/monthly: the trade IS its
+    // contract, and it deliberately keeps a contract's P&L in ONE week even when
+    // a T-n exit lands in the previous calendar week. Under YEARLY the contract
+    // is the whole year, so every trade shares one December Expiry and the year
+    // collapses into a single cell (2019-12-26 -> ISO week 52). There the roll
+    // segment is the week, so key on Exit Date — as MoM already does below.
+    // Mirrors backend wow_mom.py build_wow_mom(yearly=...).
+    const eDate = parseDmy(yearly ? t['Exit Date'] : t['Expiry']);
     if (eDate) {
       const { year, week } = isoYearWeek(eDate);
       if (!wow[year]) wow[year] = {};

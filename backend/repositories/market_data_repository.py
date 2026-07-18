@@ -277,6 +277,52 @@ class MarketDataRepository:
             df["end_date"] = pd.to_datetime(df["end_date"])
         return df
 
+    def get_filter_date_segments(self, filter_key: str) -> pd.DataFrame:
+        """Ordered [start_date, end_date] rows for one folder-based filter."""
+        cols = self._table_columns("filter_date_sets")
+        if not cols:
+            return pd.DataFrame(columns=["start_date", "end_date"])
+        q = text(
+            """
+            SELECT start_date, end_date
+            FROM filter_date_sets
+            WHERE filter_key = :fk
+            ORDER BY seq
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn, params={"fk": filter_key})
+        if not df.empty:
+            df["start_date"] = pd.to_datetime(df["start_date"])
+            df["end_date"] = pd.to_datetime(df["end_date"])
+        return df
+
+    def get_filter_date_catalog(self) -> pd.DataFrame:
+        """
+        One row per (group, filter) with segment count and date range, ordered
+        for display. Empty frame when the table is absent/empty.
+        """
+        cols = self._table_columns("filter_date_sets")
+        if not cols:
+            return pd.DataFrame(columns=[
+                "group_key", "group_label", "group_order", "filter_key",
+                "filter_label", "filter_order", "seg_count", "min_start", "max_end",
+            ])
+        q = text(
+            """
+            SELECT group_key, group_label, MIN(group_order)  AS group_order,
+                   filter_key, filter_label, MIN(filter_order) AS filter_order,
+                   COUNT(*) AS seg_count,
+                   MIN(start_date) AS min_start, MAX(end_date) AS max_end
+            FROM filter_date_sets
+            GROUP BY group_key, group_label, filter_key, filter_label
+            ORDER BY group_order, filter_order, filter_label
+            """
+        )
+        with self.engine.begin() as conn:
+            df = pd.read_sql(q, conn)
+        return df
+
     def get_available_date_range(self) -> dict:
         cols = self._table_columns("option_data")
         if not cols:

@@ -1202,8 +1202,26 @@ async def get_optim_summary(job_id: str, patchwise: bool = Query(True)):
 
 
 @router.delete("/optimize/jobs/{job_id}")
-async def cancel_optimize_job(job_id: str):
-    """Revoke the Celery task and drop result data."""
+async def cancel_optimize_job(job_id: str, only_if_active: bool = Query(False)):
+    """Revoke the Celery task and drop result data.
+
+    only_if_active=true is for the frontend's "abandon on tab-close/navigate"
+    cleanup (OptimizationResults.jsx's pagehide handler) — it must NOT wipe a
+    job's results if the job actually already finished by the time this
+    fires. The frontend's own "skip if already succeeded" check runs against
+    React state that only updates on the next ~1.5s poll tick, so there's a
+    real window where the job is done server-side but the client doesn't
+    know it yet — closing the tab in that window used to delete a job's
+    trade files (including what WOW/MOM is built from) right after it
+    finished. Checking status here, server-side, is authoritative and has no
+    polling lag, so that race can't happen. The explicit user-facing
+    "delete this job" button does not set this flag — it always deletes,
+    same as before.
+    """
+    if only_if_active:
+        _meta = result_store.get_meta(job_id)
+        if _meta and _meta.get("status") in ("success", "failed"):
+            return {"status": "kept", "job_id": job_id, "reason": f"job already {_meta.get('status')}"}
     try:
         celery_app.control.revoke(job_id, terminate=True)
     except Exception as exc:

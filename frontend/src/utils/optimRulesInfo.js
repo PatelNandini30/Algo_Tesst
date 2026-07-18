@@ -37,14 +37,19 @@ export function buildZipNaming(basePayload, filterName, selectedList = []) {
   const sweepsAdjustment = selectedList.some(s => String(s.path || '').startsWith('spot_adjustment'));
 
   const order = ['CE', 'PE'];
-  const legDesc = (leg) => {
-    const t = (leg.option_type || '').toUpperCase();
-    const p = (leg.position || '').toLowerCase();
-    return `${t} ${(p === 'sell' || p === 'short') ? 'Sell' : 'Buy'}`;
+  const _side = (p) => {
+    const s = String(p || '').toLowerCase();
+    return (s === 'sell' || s === 'short') ? 'Sell' : 'Buy';
   };
-  const legsStr = order
+  const _isFut = (l) => String(l.segment || '').toUpperCase() === 'FUTURES';
+  const legDesc = (leg) => `${(leg.option_type || '').toUpperCase()} ${_side(leg.position)}`;
+  const optLegsStr = order
     .flatMap(t => legs.filter(l => (l.option_type || '').toUpperCase() === t).map(legDesc))
     .join(' ');
+  // Futures legs have no option_type, so append them explicitly — otherwise they
+  // were dropped from the ZIP folder name (and the summary filename below).
+  const futLegsStr = legs.filter(_isFut).map(l => `FUT ${_side(l.position)}`).join(' ');
+  const legsStr = [optLegsStr, futLegsStr].filter(Boolean).join(' ');
 
   const slType = _getSLType(legs, selectedList);
   const slLevel2 = { trail: 'Trail SL', buffer: 'SL With Buffer', sl: 'SL' }[slType] || null;
@@ -104,13 +109,17 @@ function buildSpotAdjustmentSweepLabel(selectedList) {
   const parts = [];
   if (directionNames.length) parts.push(directionNames.join(', '));
   if (pctSpec) {
+    // The threshold is swept in percent OR absolute index points — the spec's
+    // own unit says which, so the rules line must not hardcode '%'.
+    const u = pctSpec.unit || '%';
+    const join = (arr) => `${arr.join(`${u}, `)}${u}`;
     if (pctSpec.kind === 'enum') {
-      parts.push(`${(pctSpec.values || []).join('%, ')}%`);
+      parts.push(join(pctSpec.values || []));
     } else if (pctSpec.kind === 'range') {
       const vals = _rangeValues(pctSpec);
       parts.push(vals && vals.length <= 8
-        ? `${vals.join('%, ')}%`
-        : `${pctSpec.min}%–${pctSpec.max}% (step ${pctSpec.step}%)`);
+        ? join(vals)
+        : `${pctSpec.min}${u}–${pctSpec.max}${u} (step ${pctSpec.step}${u})`);
     }
   }
   return parts.length ? parts.join(' @ ') : null;
@@ -192,29 +201,55 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
     }
     return parts.join(' ');
   };
+  const _side = (p) => {
+    const s = String(p || '').toLowerCase();
+    return (s === 'sell' || s === 'short') ? 'Sell' : 'Buy';
+  };
+  const _isFut = (l) => String(l.segment || '').toUpperCase() === 'FUTURES';
+  const _FUT_EXP = { WEEKLY: 'Weekly', MONTHLY: 'Monthly', NEXT_WEEKLY: 'Next Weekly', NEXT_MONTHLY: 'Next Monthly' };
   const legDesc = (leg, idx) => {
     const t = (leg.option_type || '').toUpperCase();
-    const p = (leg.position || '').toLowerCase();
-    const side = (p === 'sell' || p === 'short') ? 'Sell' : 'Buy';
+    const side = _side(leg.position);
     const strikeLabel = legStrikeLabel(leg, idx);
     return strikeLabel ? `${t} ${side} (${strikeLabel})` : `${t} ${side}`;
   };
+  const futDesc = (leg) => {
+    const side = _side(leg.position);
+    const exp = _FUT_EXP[String(leg.expiry || '').toUpperCase()] || leg.expiry || '';
+    return exp ? `FUT ${side} (${exp})` : `FUT ${side}`;
+  };
   const legsWithIdx = legs.map((l, i) => ({ l, i }));
-  const legLines = order.flatMap(t => legsWithIdx
-    .filter(({ l }) => (l.option_type || '').toUpperCase() === t)
-    .map(({ l, i }) => legDesc(l, i)));
+  // Options legs first (CE then PE), then any futures legs. Previously futures
+  // were dropped entirely from the Rules block (they carry no option_type).
+  const legLines = [
+    ...order.flatMap(t => legsWithIdx
+      .filter(({ l }) => (l.option_type || '').toUpperCase() === t)
+      .map(({ l, i }) => legDesc(l, i))),
+    ...legs.filter(_isFut).map(futDesc),
+  ];
   const optionTypes = [...new Set(legs.map(l => (l.option_type || '').toUpperCase()).filter(Boolean))];
+  if (legs.some(_isFut)) optionTypes.push('FUT');
 
   const EXPIRY_LABELS = {
     WEEKLY: 'Weekly',
     MONTHLY: 'Monthly',
     NEXT_WEEKLY: 'Next Weekly',
     NEXT_MONTHLY: 'Next Monthly',
+    YEARLY: 'Yearly (December)',
   };
   const legExpiries = [...new Set(legs.map(l => String(l.expiry || '').toUpperCase()).filter(Boolean))];
-  const expiryLabel = legExpiries.length
+  let expiryLabel = legExpiries.length
     ? legExpiries.map(e => EXPIRY_LABELS[e] || e).join(' / ')
     : (EXPIRY_LABELS[String(basePayload.expiry_type || '').toUpperCase()] || basePayload.expiry_type || '—');
+  // YEARLY: surface the roll-through months + cadence + T-n so the optim rules
+  // reflect the same settings as the backtest (Dec-only vs Dec+Mar etc).
+  if (String(basePayload.expiry_type || '').toUpperCase() === 'YEARLY') {
+    const _mon = { '03': 'Mar', '06': 'Jun', '09': 'Sep', '12': 'Dec' };
+    const _rm = [...new Set(['12', ...(basePayload.yearly_roll_months || ['12']).map(String)])].sort();
+    const _cad = basePayload.rollover_cadence === 'weekly' ? 'Weekly' : 'Monthly';
+    const _n = Number(basePayload.yearly_exit_months_before || 0);
+    expiryLabel = `Yearly [${_rm.map(m => _mon[m] || m).join('+')}] · ${_cad} · T-${_n}`;
+  }
 
   const slType = _getSLType(legs, selectedList);
   const slLabel = { trail: 'Trailing SL', buffer: 'SL With Buffer', sl: 'Stop Loss' }[slType] || 'No SL';
@@ -223,7 +258,20 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
   const rolloverOn = Boolean(basePayload.rollover_toggle);
   const noRolloverOn = Boolean(basePayload.no_rollover);
 
-  const slippagePct = Number(basePayload.slippage_pct) || 0;
+  // Slippage is per-leg now (no strategy-level slippage_pct) — show it only
+  // when at least one leg actually has a nonzero value.
+  const legSlippages = legs.map(l => Number(l.slippage_pct) || 0).filter(v => v > 0);
+  const slippageUniform = legSlippages.length > 0 && legSlippages.every(v => v === legSlippages[0]);
+
+  // Strike gap is per-leg and options-only (futures carry no strike). Show the
+  // single value when every option leg shares one, otherwise list the distinct
+  // gaps — mirrors the per-leg slippage treatment above. Not a sweepable param,
+  // so there is no "Varies" case.
+  const legGaps = legs
+    .filter(l => String(l.segment || 'OPTIONS').toUpperCase() !== 'FUTURES')
+    .map(l => Number(l.strike_interval ?? (l.strike_selection || {}).strike_interval) || 0)
+    .filter(v => v > 0);
+  const uniqueGaps = [...new Set(legGaps)].sort((a, b) => a - b);
 
   return {
     index: basePayload.index || basePayload.underlying || '—',
@@ -234,11 +282,20 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
     exitDte: Number(basePayload.exit_dte || 0),
     slLabel,
     spotAdjustment: adjEnabled
-      ? `Yes (${basePayload.spot_adjustment_direction || ''} ${basePayload.spot_adjustment_pct || ''}${basePayload.spot_adjustment_units === 'percent' ? '%' : ''})`.trim()
+      ? `Yes (${basePayload.spot_adjustment_direction || ''} ${basePayload.spot_adjustment_pct || ''}${basePayload.spot_adjustment_units === 'points' ? 'pts' : '%'})`.trim()
       : 'No',
     rollover: rolloverOn ? 'Rollover' : noRolloverOn ? 'No Rollover' : '—',
     filter: filterName || 'No Filter',
-    slippage: slippagePct > 0 ? `With Slippage (${slippagePct}%)` : 'No Slippage',
+    slippage: legSlippages.length === 0
+      ? 'No Slippage'
+      : slippageUniform
+        ? `With Slippage (${legSlippages[0]}%)`
+        : 'With Slippage (per-leg)',
+    strikeGap: uniqueGaps.length === 0
+      ? '—'
+      : uniqueGaps.length === 1
+        ? String(uniqueGaps[0])
+        : `per-leg (${uniqueGaps.join(', ')})`,
     cost: basePayload.charges_enabled ? 'With Cost' : 'No Cost',
     dateFrom: basePayload.date_from || '',
     dateTo: basePayload.date_to || '',
@@ -248,7 +305,7 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
       slLabel: paths.some(p => /^legs\[\d+\]\.(stopLoss|trailSL|slWithBuffer)/.test(p)),
       spotAdjustment: sweeps('spot_adjustment'),
       rollover: sweeps('rollover') || paths.includes('no_rollover'),
-      slippage: paths.includes('slippage_pct'),
+      slippage: paths.some(p => /^legs\[\d+\]\.slippage_pct$/.test(p)),
       cost: paths.includes('charges_enabled'),
       legs: paths.some(p => /^legs\[\d+\]\.(option_type|position)$/.test(p)),
     },

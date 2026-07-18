@@ -87,12 +87,12 @@ export const buildWowMomTitle = (config) => {
  *   caller's cleaned rows genuinely hold a decimal fraction.
  * @returns {boolean} true if a sheet was written (≥1 trade), false otherwise.
  */
-export function writeWowMomSheet(wb, cleanedTrades, { hasMidcap = false, title = 'Strategy', ddIsPercent = true } = {}) {
+export function writeWowMomSheet(wb, cleanedTrades, { hasMidcap = false, title = 'Strategy', ddIsPercent = true, yearly = false } = {}) {
   const wmRetField = hasMidcap ? 'Combined Net P&L %' : '% P&L';
   const wmDdField  = hasMidcap ? 'Combined %DD'       : '%DD';
   const wmLiveField = hasMidcap ? 'Combined Actual Live DD' : 'Actual Live DD';
   const wmDdIsPercent = ddIsPercent;
-  const wm = buildWowMom(cleanedTrades, { retField: wmRetField, ddField: wmDdField, ddIsPercent: wmDdIsPercent, liveField: wmLiveField });
+  const wm = buildWowMom(cleanedTrades, { retField: wmRetField, ddField: wmDdField, ddIsPercent: wmDdIsPercent, liveField: wmLiveField, yearly });
   if (!(wm.nTrades > 0)) return false;
 
   const PCT = '0.00%', RAT = '0.00', K = '0.0000', INT = '0';

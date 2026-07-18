@@ -384,6 +384,11 @@ def _worker_entrypoint(
             or "NIFTYMIDCAP100"
         )
         _filter_segments = base_payload.get("filter_segments") or None
+        # YEARLY: every trade shares one December Expiry, so WOW's normal
+        # bucket-by-Expiry would drop the whole year into ISO week 52. There the
+        # roll segment IS the week, so WOW keys on Exit Date instead. Read from
+        # the run's base payload — combos never vary expiry_type.
+        _is_yearly = str(base_payload.get("expiry_type") or "").upper() == "YEARLY"
         # filter_name (zip_naming level1) gates the "Patch wise" sheet in
         # build_combo_xlsx — same source the finalization/download uses.
         try:
@@ -427,8 +432,8 @@ def _worker_entrypoint(
                                                   patchwise=False, filter_segments=_filter_segments)
                             _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
                                             patchwise=True, filter_segments=_filter_segments)
-                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc)
-                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc)
+                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc, yearly=_is_yearly)
+                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc, yearly=_is_yearly)
                         except Exception as _inl_exc:
                             logger.warning("[OPTIM] rust-mode WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
                             _wm_over = _wm_pw = None
@@ -475,8 +480,8 @@ def _worker_entrypoint(
                                                   patchwise=False, filter_segments=_filter_segments)
                             _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
                                             patchwise=True, filter_segments=_filter_segments)
-                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc)
-                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc)
+                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc, yearly=_is_yearly)
+                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc, yearly=_is_yearly)
                         except Exception as _inl_exc:
                             logger.warning("[OPTIM] inline WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
                             _wm_over = _wm_pw = None
@@ -541,6 +546,7 @@ def _worker_entrypoint(
                         midcap_spot_adjustment=_mc_sa,
                         midcap_symbol=_mc_sym,
                         filter_segments=_filter_segments,
+                        yearly=_is_yearly,
                     )
                     # Also build the PATCHWISE variant directly from the same
                     # in-memory trades_df — ONLY when inline finalization is on.
@@ -564,6 +570,7 @@ def _worker_entrypoint(
                             midcap_symbol=_mc_sym,
                             filter_name=_filter_name,
                             filter_segments=_filter_segments,
+                            yearly=_is_yearly,
                         )
                 done += 1
                 logger.info(
@@ -669,6 +676,39 @@ def run_parallel(
         _get_db_engine().dispose()
     except Exception:
         pass
+
+    # Merge any OVERLAY index (e.g. MIDCPNIFTY on a multi-index strategy) into the
+    # Rust cache BEFORE forking, so the children share ONE copy copy-on-write.
+    #
+    # _overlay_legs_onto_base also calls ensure_symbol_merged(), but a merge done in
+    # a CHILD allocates ~600 MB of PRIVATE pages per worker — fork-CoW can only share
+    # what already exists at fork time. At P=6 that is ~3.5 GB of pure duplication,
+    # which OOM-killed the pool (cgroup SIGKILL -> WorkerLostError). Merging here
+    # makes the children's ensure_symbol_merged() a no-op via the inherited
+    # _merged_symbols set, restoring this module's load-once/fork-share design.
+    #
+    # Only worth doing when the parent already holds the base cache: otherwise the
+    # child's own load_cache() would REPLACE this merge (and clear _merged_symbols),
+    # putting us back to a per-child merge.
+    try:
+        if base_payload.get("multi_index_mode"):
+            from services import rust_fast_path as _rf_pre
+            if _rf_pre.get_loaded_feather_root():
+                _base_idx = str(base_payload.get("index") or "").strip().upper()
+                _ovl: List[str] = []
+                for _l in (base_payload.get("legs") or []):
+                    _s = str(_l.get("index") or _base_idx).strip().upper()
+                    if _s and _s != _base_idx and _s not in _ovl:
+                        _ovl.append(_s)
+                for _s in _ovl:
+                    if _rf_pre.ensure_symbol_merged(_s):
+                        logger.info(
+                            "[OPTIM_PARALLEL] pre-fork merged %s into the Rust cache — "
+                            "shared CoW across %d workers (avoids ~600 MB per child)",
+                            _s, parallelism,
+                        )
+    except Exception as _pre_exc:  # never block the sweep on an optimisation
+        logger.warning("[OPTIM_PARALLEL] pre-fork overlay merge skipped: %s", _pre_exc)
 
     t0 = time.perf_counter()
     pool = ctx.Pool(processes=parallelism)

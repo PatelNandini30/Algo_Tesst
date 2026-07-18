@@ -48,13 +48,17 @@ for name, payload in PAYLOADS:
     except Exception as e:
         print(f"\n=== {name}: OHLC load failed: {e} ==="); continue
 
-    # Python path (pandas fast-path via _RUST_CONTEXT)
+    # Python path (pandas fast-path via _RUST_CONTEXT). Force the Python engine
+    # (_MAE_PYTHON_REF) since we are diffing it against the Rust path.
     _prev = _r._RUST_CONTEXT
+    _prev_ref = _r._MAE_PYTHON_REF
     _r._RUST_CONTEXT = {"ohlc_df_pandas": ohlc_pd, "trading_days": tdays}
+    _r._MAE_PYTHON_REF = True
     try:
         py_df = _compute_mae_mfe_batch(pd.DataFrame(trades).copy(), index, tdays)
     finally:
         _r._RUST_CONTEXT = _prev
+        _r._MAE_PYTHON_REF = _prev_ref
     py_mae = list(py_df["MAE"]); py_mfe = list(py_df["MFE"])
 
     # Rust path (reads OHLC from the shared cache)

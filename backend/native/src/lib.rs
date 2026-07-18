@@ -1,10 +1,10 @@
 mod analytics;
-mod intraday;
 mod mae;
 mod optim_metrics;
 mod optimizer;
 mod simulate;
 mod summary_metrics;
+mod xlsx_writer;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -45,6 +45,12 @@ struct MarketCache {
     options_settled: AHashMap<(i32, u16, i64, u8, i32), f32>,
     // (date_days, symbol_id) → spot_close
     spot: AHashMap<(i32, u16), f64>,
+    // Symbols that own a NAMED spot series (their feather carried a Symbol column,
+    // or they were merged in by `merge_cache`). A miss for one of these is a real
+    // date gap, so it must NOT fall through to the u16::MAX bucket and silently
+    // return a DIFFERENT index's spot. Empty for legacy single-symbol feathers,
+    // which keeps the existing load_cache path byte-for-byte unchanged.
+    spot_named: AHashSet<u16>,
     // (date_days, symbol_id, expiry_days, opttype_id) → sorted [(strike, close)]
     strikes: AHashMap<(i32, u16, i32, u8), Vec<(f64, f64)>>,
     // Strikes with `contracts == 0` (zero turnover) — treated as untradeable by
@@ -66,6 +72,7 @@ impl Default for MarketCache {
             options_open: AHashMap::new(),
             options_settled: AHashMap::new(),
             spot: AHashMap::new(),
+            spot_named: AHashSet::new(),
             strikes: AHashMap::new(),
             untradeable: AHashSet::new(),
             symbol_ids: AHashMap::new(),
@@ -327,9 +334,12 @@ fn opt_type_to_id(s: &str) -> u8 {
 ///   - `ZeroContracts`    → contract row exists but contracts==0 (stale close)
 ///   - `Missing`          → no row at all in the cache for this strike/expiry
 ///
-/// `validate_or_shift_strike` shifts ONLY on `ZeroContracts`.  For `Missing`
-/// the trade is dropped (the strike simply wasn't listed — shifting risks
-/// landing on a wildly different strike).
+/// `validate_or_shift_strike` shifts toward a tradeable strike on ANY
+/// non-tradeable status — `ZeroContracts` (stale/no turnover) AND `Missing`
+/// (strike not listed that day) — for every gap and strike-selection mode.
+/// The walk is capped at the distance to ATM (never past it); for coarse 500
+/// gaps it steps by a finer per-index step (NIFTY 100 / MIDCPNIFTY 50) so it
+/// lands on a liquid listed strike instead of jumping a whole 500-pt gap.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum OptionDataStatus {
     Tradeable(f64),
@@ -517,13 +527,30 @@ pub(crate) fn lookup_spot_price(date: &str, index: &str) -> Option<f64> {
     let date_days = date_str_to_days(&normalize_date_str(date))?;
     let sym_upper = index.trim().to_uppercase();
     // Try named symbol first, then fallback to id 0 (single-symbol feathers store under id 0 with empty name)
-    if let Some(&sym_id) = cache.symbol_ids.get(&sym_upper) {
+    let known = cache.symbol_ids.get(&sym_upper);
+    if let Some(&sym_id) = known {
         if let Some(v) = cache.spot.get(&(date_days, sym_id)).copied() {
             return Some(v);
         }
+        // This symbol has its OWN named spot series (e.g. merged in by merge_cache),
+        // so a miss here is a genuine date gap — NOT licence to read the unnamed
+        // bucket, which belongs to a different index. Answer None honestly.
+        if cache.spot_named.contains(&sym_id) {
+            return None;
+        }
     }
-    // Fallback: empty-string symbol (feathers without Symbol column stored under id u16::MAX)
-    cache.spot.get(&(date_days, u16::MAX)).copied()
+    // Fallback: empty-string symbol (feathers without Symbol column stored under id u16::MAX).
+    // GATED: only valid when this cache actually pertains to the requested symbol —
+    // i.e. the symbol is one this cache knows (interned from the options side), or the
+    // cache has no named symbols at all (legacy pure single-symbol feather). Without
+    // this gate a DIFFERENT index silently received THIS cache's spot (e.g. an overlay
+    // MIDCPNIFTY leg got NIFTY's spot ~25323 instead of ~13161), corrupting strike
+    // selection / Entry-Exit Spot / % P&L. lookup_option_price already returns None for
+    // an unknown symbol; this makes spot behave consistently so callers can trust None.
+    if known.is_some() || cache.symbol_ids.is_empty() {
+        return cache.spot.get(&(date_days, u16::MAX)).copied();
+    }
+    None
 }
 
 fn load_table_from_path(path: &str) -> PyResult<Vec<arrow_array::RecordBatch>> {
@@ -760,6 +787,7 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
                         _ => u16::MAX,
                     }
                 } else { u16::MAX };
+                if sym_id != u16::MAX { cache.spot_named.insert(sym_id); }
                 cache.spot.insert((date_days, sym_id), close_v);
             }
             continue;
@@ -789,6 +817,7 @@ fn build_cache_from_batches(options_batches: Vec<arrow_array::RecordBatch>, spot
             } else {
                 u16::MAX  // no Symbol column: store under sentinel id
             };
+            if sym_id != u16::MAX { cache.spot_named.insert(sym_id); }
             cache.spot.insert((date_days, sym_id), close_v);
         }
     }
@@ -804,6 +833,78 @@ fn load_cache(options_path: String, spot_path: String) -> PyResult<()> {
     let mut guard = CACHE.write().unwrap();
     *guard = Some(cache);
     Ok(())
+}
+
+/// Move every entry of `src` into `dst`, remapping src's symbol ids into dst's
+/// interning namespace. Both caches interned independently starting at id 0, so the
+/// raw ids collide and MUST be translated rather than copied.
+///
+/// `sym_upper` owns src's u16::MAX ("unnamed") rows: spot feathers are written
+/// WITHOUT a Symbol column, so their rows land under the sentinel. Two such feathers
+/// merged blind would have the second index's spot overwrite the first's — so the
+/// unnamed rows are re-keyed under a real interned id here.
+fn merge_into(dst: &mut MarketCache, src: MarketCache, sym_upper: &str) {
+    let mut idmap: AHashMap<u16, u16> = AHashMap::new();
+    for (name, &sid) in src.symbol_ids.iter() {
+        let did = intern_symbol(&mut dst.symbol_ids, &mut dst.symbol_names, name);
+        idmap.insert(sid, did);
+    }
+    let unnamed_id = intern_symbol(&mut dst.symbol_ids, &mut dst.symbol_names, sym_upper);
+    let remap = |s: u16| -> u16 {
+        if s == u16::MAX { unnamed_id } else { *idmap.get(&s).unwrap_or(&s) }
+    };
+    for ((d, s, k, t, e), v) in src.options { dst.options.insert((d, remap(s), k, t, e), v); }
+    for ((d, s, k, t, e), v) in src.options_high { dst.options_high.insert((d, remap(s), k, t, e), v); }
+    for ((d, s, k, t, e), v) in src.options_low { dst.options_low.insert((d, remap(s), k, t, e), v); }
+    for ((d, s, k, t, e), v) in src.options_open { dst.options_open.insert((d, remap(s), k, t, e), v); }
+    for ((d, s, k, t, e), v) in src.options_settled { dst.options_settled.insert((d, remap(s), k, t, e), v); }
+    for ((d, s), v) in src.spot {
+        let ns = remap(s);
+        // Now a NAMED series: gaps must not leak to another index's unnamed bucket.
+        dst.spot_named.insert(ns);
+        dst.spot.insert((d, ns), v);
+    }
+    for ((d, s, e, t), v) in src.strikes { dst.strikes.insert((d, remap(s), e, t), v); }
+    for (d, s, k, t, e) in src.untradeable { dst.untradeable.insert((d, remap(s), k, t, e)); }
+}
+
+/// Merge a symbol's feather INTO the existing cache instead of replacing it.
+///
+/// `load_cache` swaps the whole cache, so a multi-index run could only ever hold one
+/// symbol resident — which is why the overlay had to price its legs off Postgres. This
+/// keeps both indices resident so the overlay can be served entirely from Rust.
+///
+/// `symbol` is required (not inferred): it attributes the feather's unnamed spot rows.
+/// See `merge_into`.
+#[pyfunction]
+fn merge_cache(symbol: String, options_path: String, spot_path: String) -> PyResult<()> {
+    let options_batches = load_table_from_path(&options_path)?;
+    let spot_batches = load_table_from_path(&spot_path)?;
+    let src = build_cache_from_batches(options_batches, spot_batches);
+    let sym_upper = symbol.trim().to_uppercase();
+    let mut guard = CACHE.write().unwrap();
+    match guard.as_mut() {
+        Some(dst) => merge_into(dst, src, &sym_upper),
+        None => {
+            // Nothing resident yet: same as a load, except the unnamed rows still get
+            // attributed to `symbol` so a later merge can't collide with them.
+            let mut dst = MarketCache::default();
+            merge_into(&mut dst, src, &sym_upper);
+            *guard = Some(dst);
+        }
+    }
+    Ok(())
+}
+
+/// Symbols currently resident in the cache — lets Python assert a merge landed
+/// instead of discovering a miss as a silent DB fallback.
+#[pyfunction]
+fn cache_symbols() -> PyResult<Vec<String>> {
+    let guard = CACHE.read().unwrap();
+    Ok(match guard.as_ref() {
+        Some(c) => { let mut v = c.symbol_names.clone(); v.sort(); v }
+        None => Vec::new(),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -863,12 +964,20 @@ fn lookup_index_ohlc(date: &str, symbol: &str) -> Option<(f64, f64, f64, f64)> {
     let cache = guard.as_ref()?;
     let date_days = date_str_to_days(&normalize_date_str(date))?;
     let sym_upper = symbol.trim().to_uppercase();
-    if let Some(&sym_id) = cache.symbol_ids.get(&sym_upper) {
+    let known = cache.symbol_ids.get(&sym_upper);
+    if let Some(&sym_id) = known {
         if let Some(v) = cache.ohlc.get(&(date_days, sym_id)).copied() {
             return Some(v);
         }
     }
-    cache.ohlc.get(&(date_days, u16::MAX)).copied()
+    // Same symbol-leak gate as lookup_spot_price: the unnamed (u16::MAX) bucket may only
+    // answer for a symbol this cache actually holds, else a different index would receive
+    // this cache's OHLC. This cache MERGES per-symbol feathers, so an unknown symbol here
+    // genuinely means "not loaded" and must return None rather than another index's bars.
+    if known.is_some() || cache.symbol_ids.is_empty() {
+        return cache.ohlc.get(&(date_days, u16::MAX)).copied();
+    }
+    None
 }
 
 /// Load (and MERGE) a per-symbol index-OHLC feather into the global cache.
@@ -1565,7 +1674,13 @@ fn check_leg_stop_loss_target(
                     .unwrap_or_else(|| expiry_date.clone());
                 let current_premium_raw = lookup_option_price(check_date, &index, strike, &option_type, &expiry);
                 let Some(current_premium_raw) = current_premium_raw else { continue };
-                let current_premium = apply_slippage(current_premium_raw, &position, "exit", slippage_pct);
+                // Per-leg slippage: this leg's own dict already carries the
+                // slippage_pct it was priced with (see simulate.rs TradeSpec) —
+                // legs can now have different slippage, so use that instead of
+                // the single call-level scalar. Falls back to the scalar if the
+                // leg dict is missing the field (defensive, shouldn't happen).
+                let leg_slippage = py_any_to_f64_opt(extract_leg_value(dict, "slippage_pct")).unwrap_or(slippage_pct);
+                let current_premium = apply_slippage(current_premium_raw, &position, "exit", leg_slippage);
                 cp = Some(current_premium);
                 let entry_premium = py_any_to_f64_opt(extract_leg_value(dict, "entry_premium"));
                 let Some(entry_premium) = entry_premium else { continue };
@@ -1797,7 +1912,9 @@ fn check_overall_stop_loss_target(
             let expiry = py_any_to_string_opt(extract_leg_value(dict, "_resolved_expiry")).unwrap_or_else(|| expiry_date.clone());
             let current_premium_raw = lookup_option_price(check_date, &index, strike, &option_type, &expiry);
             let Some(current_premium_raw) = current_premium_raw else { continue };
-            let current_premium = apply_slippage(current_premium_raw, &position, "exit", slippage_pct);
+            // Per-leg slippage — see check_leg_stop_loss_target for rationale.
+            let leg_slippage = py_any_to_f64_opt(extract_leg_value(dict, "slippage_pct")).unwrap_or(slippage_pct);
+            let current_premium = apply_slippage(current_premium_raw, &position, "exit", leg_slippage);
             has_data = true;
             let leg_live_pnl = if position == "BUY" {
                 (current_premium - entry_premium) * lots * lot_size
@@ -1902,6 +2019,8 @@ fn check_overall_stop_loss_target(
 #[pymodule]
 fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(cache_symbols, m)?)?;
     m.add_function(wrap_pyfunction!(clear_cache, m)?)?;
     m.add_function(wrap_pyfunction!(is_loaded, m)?)?;
     m.add_function(wrap_pyfunction!(get_option_price, m)?)?;
@@ -1911,16 +2030,19 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_strikes_for_date, m)?)?;
     m.add_function(wrap_pyfunction!(check_leg_stop_loss_target, m)?)?;
     m.add_function(wrap_pyfunction!(check_overall_stop_loss_target, m)?)?;
-    m.add_function(wrap_pyfunction!(intraday::pyfuncs::run_intraday_backtest, m)?)?;
     m.add_function(wrap_pyfunction!(optimizer::batch_compute_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(optimizer::run_optimization_batch, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::simulate_trades_batch, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::resolve_trade_specs, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate::compute_straddle_leg_strike, m)?)?;
     m.add_function(wrap_pyfunction!(simulate::apply_sl_with_buffer_batch, m)?)?;
     m.add_function(wrap_pyfunction!(analytics::compute_analytics_summary, m)?)?;
     m.add_function(wrap_pyfunction!(mae::compute_mae_mfe_batch, m)?)?;
     m.add_function(wrap_pyfunction!(optim_metrics::compute_optim_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(summary_metrics::compute_summary_metrics, m)?)?;
+    m.add_function(wrap_pyfunction!(xlsx_writer::write_trade_sheet_xlsx, m)?)?;
+    m.add_function(wrap_pyfunction!(xlsx_writer::write_layout_sheet_xlsx, m)?)?;
+    m.add_function(wrap_pyfunction!(xlsx_writer::write_workbook_xlsx, m)?)?;
     m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
     // Index OHLC (additive — Midcap overlay)
     m.add_function(wrap_pyfunction!(load_index_ohlc, m)?)?;

@@ -164,6 +164,11 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
             return "payload-not-dict"
 
         # ── Payload-level orchestration features (all Python-orchestrated today) ──
+        # Multi-index (per-leg index) runs price each leg from its OWN index series
+        # via run_multi_index_feature / run_sync_weekly_cadence — the single-index
+        # Rust batch must never claim them (it would misprice cross-index legs).
+        if _truthy(p.get("multi_index_mode")):
+            return "multi_index"
         if _truthy(p.get("spot_adjustment_enabled")):
             return "spot_adjustment"
         msa = p.get("midcap_spot_adjustment")
@@ -173,6 +178,13 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
             return "filter"
         if _truthy(p.get("overall_sl_value")) or _truthy(p.get("overall_target_value")):
             return "overall_sl_target"  # Phase 0b (SL scan) not yet extracted
+        # YEARLY pins the contract to a December expiry while the cadence list
+        # drives entry/exit, and needs the Python-resolved `yearly_cycles` to do
+        # it. This batch loop builds its own expiry inputs, so it would silently
+        # trade the CADENCE contract. Exclude explicitly rather than let an
+        # unrecognised expiry kind fall through as "supported".
+        if str(p.get("expiry_type") or "").upper() == "YEARLY":
+            return "yearly_expiry"
 
         legs = p.get("legs") or []
         if not isinstance(legs, list) or len(legs) == 0:

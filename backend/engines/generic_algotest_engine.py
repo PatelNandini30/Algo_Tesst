@@ -3505,15 +3505,20 @@ def run_algotest_backtest(params):
         spot_adjustment_pct = float(params.get('spot_adjustment_pct', 1.0))
     except (TypeError, ValueError):
         spot_adjustment_pct = 1.0
-    if spot_adjustment_pct < 0.25:
-        _log(f"[WARN] spot_adjustment_pct too low ({spot_adjustment_pct}) - clamping to 0.25")
-        spot_adjustment_pct = 0.25
-    elif spot_adjustment_pct > 5.0:
-        _log(f"[WARN] spot_adjustment_pct too high ({spot_adjustment_pct}) - clamping to 5.0")
-        spot_adjustment_pct = 5.0
+    # Resolve units BEFORE clamping: the 0.25–5.0 window is a percent rule, and
+    # applying it to a points threshold silently turned e.g. 1000 points into 5
+    # points. engine_rust.py (the live path) already gates its identical clamp on
+    # units == 'percent'; this is the same gate for the Python reference engine.
     spot_adjustment_units = str(params.get('spot_adjustment_units', 'percent') or 'percent').lower().strip()
     if spot_adjustment_units not in ('percent', 'points'):
         spot_adjustment_units = 'percent'
+    if spot_adjustment_units == 'percent':
+        if spot_adjustment_pct < 0.25:
+            _log(f"[WARN] spot_adjustment_pct too low ({spot_adjustment_pct}) - clamping to 0.25")
+            spot_adjustment_pct = 0.25
+        elif spot_adjustment_pct > 5.0:
+            _log(f"[WARN] spot_adjustment_pct too high ({spot_adjustment_pct}) - clamping to 5.0")
+            spot_adjustment_pct = 5.0
 
     # ── Buffer Strike Selection ───────────────────────────────────────────────
     buffer_strike_enabled = bool(params.get('buffer_strike_enabled', False))

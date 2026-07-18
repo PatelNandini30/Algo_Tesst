@@ -28,6 +28,10 @@ class ExpiryType(str, Enum):
     WEEKLY_T1 = "Weekly_T1"  # Next week
     WEEKLY_T2 = "Weekly_T2"  # Week after next
     MONTHLY_T1 = "Monthly_T1"  # Next month
+    # NSE's long-dated DECEMBER contract, held while the position re-books on a
+    # weekly/monthly cadence (rollover_cadence). NIFTY only — no other index
+    # lists long-dated December expiries.
+    YEARLY = "Yearly"
 
 class StrikeSelectionType(str, Enum):
     """Strike selection methods - matches AlgoTest"""

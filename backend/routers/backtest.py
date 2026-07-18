@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
 from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
 # NOTE: keep FastAPI imports at top for readability
-from engines.generic_algotest_engine import run_algotest_backtest, _apply_slippage, _calculate_fo_charges
+from engines.generic_algotest_engine import run_algotest_backtest, _calculate_fo_charges
 from services.algotest_job import execute_algotest_job, _normalize_request, _resolve_effective_request
 from services.backtest_cache import get_backtest_cache as _get_result_cache
 from services.index_metadata import validate_index_payload
@@ -244,13 +244,24 @@ def _normalize_recalc_numeric(value: Any) -> Optional[float]:
 
 def _recalculate_trade_prices(
     trades: List[Dict[str, Any]],
-    slippage_pct: float,
     charges_enabled: bool = False,
 ):
     """
-    Re-price every leg row using raw prices.
+    Re-price every leg row's transaction charges.
 
-    1. Applies slippage to raw entry/exit prices (existing behaviour).
+    Slippage is applied per-leg inside the engine now (each leg's own
+    Slippage % in the strategy builder), so it's already baked into every
+    row's Entry Price / Exit Price from the actual backtest run — this
+    function must NOT re-derive prices from Raw Entry/Exit Price plus a
+    single flat slippage_pct like it used to, since legs can carry different
+    slippage and that per-leg split isn't recoverable from a flat number.
+    Starts from each row's existing Entry/Exit Price (not Raw), and only
+    layers transaction charges on top. The caller always passes the
+    ORIGINAL, unmodified backtest trades (rawResults.trades, never a
+    previously-recalculated result), so repeated calls stay idempotent —
+    charges are computed fresh from the untouched post-slippage price every
+    time, never compounding.
+
     2. Optionally applies Zerodha F&O transaction charges as price adjustments:
        - SELL leg: effective_entry = entry - entry_charge_per_unit
                    effective_exit  = exit  + exit_charge_per_unit
@@ -267,8 +278,12 @@ def _recalculate_trade_prices(
     for raw_row in trades:
         row = dict(raw_row)
         position  = str(row.get('B/S',  '') or '').upper().strip()
-        raw_entry = _normalize_recalc_numeric(row.get('Raw Entry Price'))
-        raw_exit  = _normalize_recalc_numeric(row.get('Raw Exit Price'))
+        # Base is the row's OWN Entry/Exit Price — already correctly per-leg
+        # slippage-adjusted by the real backtest run. NOT Raw Entry/Exit
+        # Price (pre-slippage), since a flat slippage_pct can no longer
+        # reconstruct what each leg's own % actually did.
+        entry = _normalize_recalc_numeric(row.get('Entry Price'))
+        exit_ = _normalize_recalc_numeric(row.get('Exit Price'))
         trade_id  = row.get('Trade')
         leg_type  = str(row.get('Type', '') or '').upper().strip()
         is_leg_row = (
@@ -276,12 +291,10 @@ def _recalculate_trade_prices(
             and leg_type in {'CE', 'PE', 'FUT', 'CALL', 'PUT', 'C', 'P'}
         )
 
-        if is_leg_row and raw_entry is not None and raw_exit is not None:
-            # ── Step 1: apply slippage ────────────────────────────────────
-            new_entry = _apply_slippage(raw_entry, position, 'entry', slippage_pct)
-            new_exit  = _apply_slippage(raw_exit,  position, 'exit',  slippage_pct)
+        if is_leg_row and entry is not None and exit_ is not None:
+            new_entry, new_exit = entry, exit_
 
-            # ── Step 2: apply transaction charges ────────────────────────
+            # ── apply transaction charges ────────────────────────────────
             charges_inr = 0.0
             if charges_enabled:
                 qty_raw = _normalize_recalc_numeric(row.get('Qty'))
@@ -369,7 +382,11 @@ async def warm_cache(request: dict):
     The worker is the process that executes backtests, so warming only the
     FastAPI process gives a false readiness signal.
     """
-    request = _normalize_payload_dates(request)
+    # _normalize_payload_dates can hit Postgres synchronously (_get_db_max_date,
+    # uncached-symbol case) — run it off the event loop thread so a slow query
+    # doesn't stall every other request (including /health) on this single-
+    # worker process for its duration.
+    request = await asyncio.to_thread(_normalize_payload_dates, request)
     symbol = request.get('index', request.get('symbol', 'NIFTY'))
     from_date = request.get('from_date', request.get('date_from'))
     to_date = request.get('to_date', request.get('date_to'))
@@ -388,6 +405,7 @@ async def warm_cache(request: dict):
     # "stuck in queue". Collapse concurrent warm requests for the same symbol
     # into the one already in flight instead of enqueuing a duplicate.
     task = None
+    reused_inflight = False
     try:
         from services.optimizer.result_store import _redis as _get_redis
         _r = _get_redis()
@@ -401,6 +419,7 @@ async def warm_cache(request: dict):
                 existing_state = celery_app.AsyncResult(existing_id).state
                 if existing_state in ("PENDING", "STARTED", "RETRY"):
                     task = celery_app.AsyncResult(existing_id)
+                    reused_inflight = True
         except Exception:
             pass
     # A real "Run Backtest" click is the only thing that should ever occupy
@@ -425,6 +444,25 @@ async def warm_cache(request: dict):
                 _r.set(inflight_key, task.id, ex=int(warm_timeout) + 30)
             except Exception:
                 pass
+
+    # Only the request that actually CREATED this task blocks on task.get() —
+    # a request that reused an in-flight task_id (dedup above) must NOT also
+    # call task.get() on the same AsyncResult: concurrent .get() calls from
+    # different requests (each running in its own asyncio.to_thread worker
+    # thread) raced on Celery's Redis result-backend connection and corrupted
+    # the RESP protocol read (surfaced as "Protocol Error: b'...'" with a
+    # truncated/garbled task-result payload — repeating every ~90s for a
+    # symbol with several concurrent warm-cache pollers). Reused requests just
+    # report "warming" immediately; the owning request's blocking get() still
+    # gives fast synchronous "ready" responses when the warm finishes quickly.
+    if reused_inflight:
+        return {
+            "status": "warming",
+            "job_id": task.id,
+            "queue": queue_name,
+            "queue_depth": _queue_depth(queue_name),
+            "message": f"Worker cache warm already in progress for {symbol} {from_date} to {to_date}",
+        }
 
     try:
         result = await asyncio.to_thread(task.get, timeout=warm_timeout, propagate=False)
@@ -518,77 +556,47 @@ async def upload_filter_csv(file: UploadFile = File(...)):
 @router.get("/filter-segments")
 async def get_filter_segments():
     """
-    Get available filter segment metadata for each built-in filter.
-    Returns count, range, preview rows and the serialized segments for STR 5x1, 5x2 and base2.
+    Folder-grouped catalog of the available filters (from filter_date_sets).
+
+    Response:
+      {
+        "success": true,
+        "groups": [ {group_key, group_label,
+                     filters: [{key, label, count, range, segments, preview}]} ],
+        "filters": { <filter_key>: {label, count, range, segments, preview} }  # flat, for convenience
+      }
     """
     try:
         import sys, os
         _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         if _base_dir not in sys.path:
             sys.path.insert(0, _base_dir)
-        from base import (
-            get_filter_segments as base_get_filter_segments,
-            load_super_trend_dates,
-        )
+        from base import get_filter_catalog
 
-        # Ensure STR segments are loaded into memory so counts/range are accurate
-        load_super_trend_dates()
+        groups = get_filter_catalog()
 
-        filter_configs = [
-            ("5x1", "STR 5,1"),
-            ("5x2", "STR 5,2"),
-            ("base2", "base2"),
-        ]
-
+        # Flat map keyed by filter_key for any legacy caller.
         filters = {}
+        for grp in groups:
+            for f in grp.get("filters", []):
+                filters[f["key"]] = {
+                    "label": f["label"],
+                    "group_key": grp["group_key"],
+                    "group_label": grp["group_label"],
+                    "count": f["count"],
+                    "segments": f["segments"],
+                    "preview": f["preview"],
+                    "range": f["range"],
+                }
 
-        def _serialize_segments(segments):
-            serialized = []
-            for seg in segments:
-                start = seg.get("start")
-                end = seg.get("end")
-                if not start or not end:
-                    continue
-                try:
-                    start_iso = start.strftime("%Y-%m-%d")
-                except Exception:
-                    start_iso = str(start)
-                try:
-                    end_iso = end.strftime("%Y-%m-%d")
-                except Exception:
-                    end_iso = str(end)
-                serialized.append({"start": start_iso, "end": end_iso})
-            return serialized
-
-        def _range_from_segments(serialized):
-            if not serialized:
-                return None
-            starts = [s["start"] for s in serialized]
-            ends = [s["end"] for s in serialized]
-            return {
-                "from": min(starts),
-                "to": max(ends),
-            }
-
-        for config_key, label in filter_configs:
-            segments = base_get_filter_segments(config_key)
-            serialized_segments = _serialize_segments(segments)
-            summary_range = _range_from_segments(serialized_segments)
-            filters[config_key] = {
-                "label": label,
-                "count": len(serialized_segments),
-                "segments": serialized_segments,
-                "preview": serialized_segments[:5],
-                "range": summary_range,
-            }
-
-        return {"success": True, "filters": filters}
+        return {"success": True, "groups": groups, "filters": filters}
 
     except Exception as e:
         import traceback
         return {
             "success": False,
             "message": str(e),
+            "groups": [],
             "filters": {},
             "traceback": traceback.format_exc(),
         }
@@ -707,6 +715,10 @@ async def download_backtest_tradesheet_xlsx(request: Request):
     to_date     = body.get("to_date") or body.get("date_to") or ""
     filter_segments = body.get("filter_segments") or None
     patchwise   = bool(body.get("patchwise", False))
+    # Leg-wise "Rules" sheet (typed rows) rendered as the FIRST tab of the workbook.
+    # Built client-side (buildRulesSheet) from the strategy payload so it reflects
+    # the full per-leg configuration (options/futures/midcap, per-leg slippage, etc.).
+    rules_sheet = body.get("rules_sheet") or None
 
     from services.optimizer.excel_builder import build_combo_xlsx
     loop = asyncio.get_running_loop()
@@ -718,6 +730,10 @@ async def download_backtest_tradesheet_xlsx(request: Request):
             midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
             midcap_symbol=midcap_sym, filter_segments=filter_segments,
             patchwise=patchwise, force_patch_wise=True,
+            rules_sheet=rules_sheet,
+            # YEARLY: every trade shares one December Expiry, so WOW keys on
+            # Exit Date rather than collapsing the whole year into ISO week 52.
+            yearly=str(body.get("expiry_type") or "").upper() == "YEARLY",
         )
 
     # Default (thread) executor: a single workbook build is light, and a local
@@ -783,7 +799,9 @@ async def queue_algotest_job(request: Request):
         raise HTTPException(status_code=503, detail="System is under maintenance — backtests are temporarily disabled. Please try again shortly.")
     body = await request.json()
     origin_ip = _client_ip(request)
-    payload = _resolve_effective_request(_normalize_request(_normalize_payload_dates(body)))
+    # See warm_cache above — offload off the event loop for the same reason.
+    normalized_dates = await asyncio.to_thread(_normalize_payload_dates, body)
+    payload = _resolve_effective_request(_normalize_request(normalized_dates))
     try:
         _validate_lazy_legs_payload(payload)
         validate_index_payload(payload)
@@ -845,19 +863,18 @@ async def queue_algotest_job(request: Request):
 
 @router.post("/backtest/recalculate-slippage")
 async def recalculate_slippage(request: dict):
+    """Recalculates transaction charges only. Slippage is now per-leg and
+    baked in at backtest time (engine_rust.py), not re-derivable here from a
+    single flat %, so this endpoint no longer touches it — see
+    _recalculate_trade_prices."""
     trades = request.get('trades') or []
     if not isinstance(trades, list) or not trades:
         raise HTTPException(status_code=400, detail="No trades provided")
 
-    try:
-        slippage_pct = float(request.get('slippage_pct', 0) or 0)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Invalid slippage_pct")
-
     charges_enabled = bool(request.get('charges_enabled', False))
 
     recalculated_rows = _recalculate_trade_prices(
-        trades, slippage_pct, charges_enabled=charges_enabled
+        trades, charges_enabled=charges_enabled
     )
     trades_df = pd.DataFrame(recalculated_rows)
 
@@ -866,7 +883,7 @@ async def recalculate_slippage(request: dict):
             'trades': [],
             'summary': {},
             'pivot': {"headers": [], "rows": []},
-            'meta': {'slippage_pct': slippage_pct, 'charges_enabled': charges_enabled},
+            'meta': {'charges_enabled': charges_enabled},
         }
 
     for col in ['Entry Date', 'Exit Date', 'Leg Exit Date', 'Expiry']:
@@ -901,7 +918,7 @@ async def recalculate_slippage(request: dict):
         'trades': result_trades,
         'summary': result_summary,
         'pivot': result_pivot,
-        'meta': {'slippage_pct': slippage_pct, 'charges_enabled': charges_enabled},
+        'meta': {'charges_enabled': charges_enabled},
     }
 
 

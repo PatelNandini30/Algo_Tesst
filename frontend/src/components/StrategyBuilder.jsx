@@ -40,10 +40,13 @@ const isValidDisplayDate = (dateStr) => {
 const INDEX_CONFIG = {
   NIFTY: {
     label: 'NIFTY',
-    subtitle: 'Weekly & monthly expiries',
+    subtitle: 'Weekly, monthly & yearly expiries',
     group: 'weekly_monthly',
     backtestEnabled: true,
-    expiryBases: ['weekly', 'monthly'],
+    // 'yearly' = NSE's long-dated DECEMBER contract. NIFTY-only: it has 24 such
+    // contracts (2010-2030) while BANKNIFTY/MIDCPNIFTY/FINNIFTY have none, so
+    // listing it here alone is what keeps it off the other indices.
+    expiryBases: ['weekly', 'monthly', 'yearly'],
     defaultExpiryBasis: 'weekly',
     defaultOptionExpiry: 'weekly',
     strikeInterval: 50,
@@ -95,11 +98,24 @@ const INDEX_GROUPS = [
   },
 ];
 
+const EXPIRY_BASIS_LABELS = {
+  weekly: 'Weekly Expiry',
+  monthly: 'Monthly Expiry',
+  yearly: 'Yearly Expiry (December)',
+};
+
 const WEEKLY_OPTION_EXPIRIES = [
   { value: 'weekly', label: 'Weekly' },
   { value: 'next_weekly', label: 'Next Weekly' },
   { value: 'monthly', label: 'Monthly' },
   { value: 'next_monthly', label: 'Next Monthly' },
+];
+
+// Per-leg expiry choices when the strategy basis is YEARLY. The leg holds the
+// long-dated December contract; the roll cadence is a separate, strategy-level
+// control (rolloverCadence) — it is NOT the leg's expiry.
+const YEARLY_OPTION_EXPIRIES = [
+  { value: 'yearly', label: 'Yearly (December)' },
 ];
 
 const MONTHLY_OPTION_EXPIRIES = [
@@ -111,7 +127,11 @@ const FUTURES_EXPIRIES = MONTHLY_OPTION_EXPIRIES;
 
 const getIndexConfig = (symbol) => INDEX_CONFIG[String(symbol || 'NIFTY').toUpperCase()] || INDEX_CONFIG.NIFTY;
 
-const getOptionExpiryOptions = (symbol) => {
+// `basis` is optional: callers that omit it get the pre-yearly behaviour
+// unchanged. Under a YEARLY basis the only contract a leg can hold is the
+// December one, so the per-leg dropdown collapses to a single choice.
+const getOptionExpiryOptions = (symbol, basis) => {
+  if (String(basis || '').toLowerCase() === 'yearly') return YEARLY_OPTION_EXPIRIES;
   const config = getIndexConfig(symbol);
   return config.expiryBases.includes('weekly') ? WEEKLY_OPTION_EXPIRIES : MONTHLY_OPTION_EXPIRIES;
 };
@@ -121,11 +141,14 @@ const normalizeReEntryMode = (mode) => {
   return value || 'RE_ASAP';
 };
 
-const normalizeExpiryForIndex = (expiry, symbol, segment = 'options') => {
-  const options = segment === 'futures' ? FUTURES_EXPIRIES : getOptionExpiryOptions(symbol);
+const normalizeExpiryForIndex = (expiry, symbol, segment = 'options', basis) => {
+  const options = segment === 'futures' ? FUTURES_EXPIRIES : getOptionExpiryOptions(symbol, basis);
   const current = String(expiry || '').toLowerCase();
   if (options.some(opt => opt.value === current)) return current;
-  return segment === 'futures' ? 'monthly' : getIndexConfig(symbol).defaultOptionExpiry;
+  if (segment === 'futures') return 'monthly';
+  return String(basis || '').toLowerCase() === 'yearly'
+    ? 'yearly'
+    : getIndexConfig(symbol).defaultOptionExpiry;
 };
 
 const DATE_YEAR_MIN = 1900;
@@ -357,23 +380,42 @@ const getLotSize = (index, tradeDate) => {
 const STRIKE_INTERVALS = Object.fromEntries(
   Object.entries(INDEX_CONFIG).map(([symbol, config]) => [symbol, config.strikeInterval])
 );
-const STRIKE_INTERVAL_OPTIONS = [50, 100];
-const normalizeStrikeInterval = (value) => {
+const STRIKE_INTERVAL_OPTIONS = [25, 50, 100, 500, 1000];
+// Per-index selectable gaps: MIDCPNIFTY trades at every 25 points so it gets
+// 25/50/100; other indices only ever trade at their own native gap (50 or
+// 100), so showing 25 there would be a selectable-but-wrong option. Every index
+// also gets the coarse gaps 500 and 1000 — when a coarse strike is
+// illiquid/unlisted the backend liquidity-shift walks a finer per-index step
+// (NIFTY 100, MIDCPNIFTY 50) toward ATM to find a tradeable strike.
+//
+// 1000 exists chiefly for YEARLY (the long-dated December contract): in the
+// 26-Dec-2019 contract round-1000 strikes are ~59% liquid vs ~12% for every
+// other strike, because long-dated open interest only collects on round-1000s.
+const strikeIntervalOptionsForIndex = (symbol) => {
+  const native = STRIKE_INTERVALS[String(symbol || 'NIFTY').toUpperCase()] ?? 50;
+  return native === 25 ? [25, 50, 100, 500, 1000] : [50, 100, 500, 1000];
+};
+const normalizeStrikeInterval = (value, symbol) => {
   const parsed = Number(value);
-  return STRIKE_INTERVAL_OPTIONS.includes(parsed) ? parsed : 50;
+  const options = symbol ? strikeIntervalOptionsForIndex(symbol) : STRIKE_INTERVAL_OPTIONS;
+  if (options.includes(parsed)) return parsed;
+  return symbol ? (STRIKE_INTERVALS[String(symbol).toUpperCase()] ?? 50) : 50;
 };
 
-const StrikeIntervalSelect = ({ value, onChange, className = '' }) => (
+const StrikeIntervalSelect = ({ value, onChange, className = '', index = null }) => {
+  const options = index ? strikeIntervalOptionsForIndex(index) : STRIKE_INTERVAL_OPTIONS;
+  return (
   <select
-    value={normalizeStrikeInterval(value)}
-    onChange={e => onChange(normalizeStrikeInterval(e.target.value))}
+    value={normalizeStrikeInterval(value, index)}
+    onChange={e => onChange(normalizeStrikeInterval(e.target.value, index))}
     className={className}
   >
-    {STRIKE_INTERVAL_OPTIONS.map(interval => (
+    {options.map(interval => (
       <option key={interval} value={interval}>{interval}</option>
     ))}
   </select>
-);
+  );
+};
 
 function getBufferPreview(value, unit, applyTo, posAbove, posBelow, indexName = 'NIFTY') {
   const spot = 25000;
@@ -739,10 +781,39 @@ const StrategyBuilder = () => {
   const [underlying, setUnderlying] = useState('cash');
   const [strategyType, setStrategyType] = useState('positional');
   const [expiryBasis, setExpiryBasis] = useState('weekly');
+  // YEARLY only. The leg holds the December contract while the position is
+  // re-booked on this cadence — contract and cadence are two different
+  // calendars, which is what makes yearly different from every other basis.
+  const [rolloverCadence, setRolloverCadence] = useState('monthly');
+  // YEARLY only. Which long-dated expiry months the position rolls THROUGH.
+  // Default December-only = existing behaviour. Add March/June/September to
+  // alternate — the engine holds each contract until its own T-n, then rolls
+  // into the next selected long-dated expiry. Only these 4 months have
+  // long-dated NIFTY contracts. December stays the anchor and can't be removed.
+  const [yearlyRollMonths, setYearlyRollMonths] = useState(['12']);
+  // T-n MONTHS before the December expiry at which the yearly contract rolls to
+  // the next December. 0 = hold to expiry (default).
+  const [yearlyExitMonthsBefore, setYearlyExitMonthsBefore] = useState(0);
   const [rolloverToggle, setRolloverToggle] = useState(false);
   const [rolloverMinDaysToExpiry, setRolloverMinDaysToExpiry] = useState(0);
   const [noRollover, setNoRollover] = useState(false);
   const [noRolloverMinDays, setNoRolloverMinDays] = useState(0);
+  // YEARLY is meaningless without rollover: the engine only pins the December
+  // contract when rollover is active (simulate.rs rollover gate), so selecting
+  // yearly forces it on and clears min-DTE — which the engine REJECTS under
+  // yearly because it would advance the contract to the next cadence element.
+  // Switching away from yearly leaves the user's choices alone.
+  useEffect(() => {
+    if (expiryBasis !== 'yearly') return;
+    setRolloverToggle(true);
+    setNoRollover(false);
+    setRolloverMinDaysToExpiry(0);
+  }, [expiryBasis]);
+  // Sync Weekly Roll (multi-index mixed weekly+monthly): default ON, but inert
+  // unless the strategy qualifies (see syncRollQualifies) AND Re-entry Rollover
+  // is on. When engaged, the shortest (weekly) leg drives ONE cadence, every leg
+  // re-enters together each week, and monthly legs roll on their OWN monthly expiry.
+  const [syncWeeklyRollEnabled, setSyncWeeklyRollEnabled] = useState(true);
   // Strike-shift fallback: when the requested strike has no contract or zero
   // turnover (stale price), shift this many strike intervals further from ATM
   // in the originally-requested direction.  0 = no shift (drop trade if
@@ -775,11 +846,14 @@ const StrategyBuilder = () => {
   const expiryBasisOptions = useMemo(
     () => indexConfig.expiryBases.map(value => ({
       value,
-      label: value === 'weekly' ? 'Weekly Expiry' : 'Monthly Expiry',
+      label: EXPIRY_BASIS_LABELS[value] || 'Monthly Expiry',
     })),
     [indexConfig]
   );
-  const optionExpiryOptions = useMemo(() => getOptionExpiryOptions(instrument), [instrument]);
+  const optionExpiryOptions = useMemo(
+    () => getOptionExpiryOptions(instrument, expiryBasis),
+    [instrument, expiryBasis]
+  );
   const defaultOptionExpiry = indexConfig.defaultOptionExpiry;
   const unsupportedIndexMessage = `${instrument} backtest data is not available. Import option quotes and expiry calendar before running this index.`;
 
@@ -788,12 +862,15 @@ const StrategyBuilder = () => {
     // untouched so index changes don't rewrite them.
     leg.segment === 'midcap100' ? { ...leg } : {
       ...leg,
-      expiry: normalizeExpiryForIndex(leg.expiry, instrument, leg.segment),
-      strike_interval: normalizeStrikeInterval(leg.strike_interval),
+      // Passing expiryBasis coerces legs to 'yearly' when the basis is yearly
+      // (and back off it when the user leaves), so a leg can never be left on a
+      // weekly contract while the strategy claims to trade December.
+      expiry: normalizeExpiryForIndex(leg.expiry, instrument, leg.segment, expiryBasis),
+      strike_interval: normalizeStrikeInterval(leg.strike_interval, leg.index || instrument),
       re_entry_target_mode: normalizeReEntryMode(leg.re_entry_target_mode),
       re_entry_sl_mode: normalizeReEntryMode(leg.re_entry_sl_mode),
     }
-  ), [instrument]);
+  ), [instrument, expiryBasis]);
 
   const selectInstrument = useCallback((symbol) => {
     const nextConfig = getIndexConfig(symbol);
@@ -833,20 +910,28 @@ const StrategyBuilder = () => {
   const [bufferStrikeApplyTo, setBufferStrikeApplyTo] = useState('both');
   const [bufferPositionAbove, setBufferPositionAbove] = useState(true);
   const [bufferPositionBelow, setBufferPositionBelow] = useState(true);
-const [slippagePct, setSlippagePct] = useState(0);
   const [chargesEnabled, setChargesEnabled] = useState(false);
 
-  const clampSpotAdjustmentValue = useCallback((value) => {
+  // Unit-aware. The 0.25–5 window is a PERCENT rule and mirrors the engine's
+  // own percent clamp (engine_rust.py: max(0.25, min(5.0, pct)) applied only
+  // when units == 'percent'). A points threshold has no engine-side ceiling, so
+  // clamping it to 5 here silently turned a 1000-point threshold into 5 points
+  // — points are user-defined, floored only at 1 to keep them positive.
+  const clampSpotAdjustmentValue = useCallback((value, units = 'percent') => {
     const numeric = Number(value);
+    const isPoints = String(units).toLowerCase() === 'points';
     if (!Number.isFinite(numeric)) {
-      return 0.25;
+      return isPoints ? 1 : 0.25;
+    }
+    if (isPoints) {
+      return Math.max(1, numeric);
     }
     return Math.min(5, Math.max(0.25, numeric));
   }, []);
 
   const normalizedSpotAdjustmentValue = useMemo(
-    () => clampSpotAdjustmentValue(spotAdjustmentValue),
-    [clampSpotAdjustmentValue, spotAdjustmentValue]
+    () => clampSpotAdjustmentValue(spotAdjustmentValue, spotAdjustmentUnits),
+    [clampSpotAdjustmentValue, spotAdjustmentValue, spotAdjustmentUnits]
   );
 
   const [draftLeg, setDraftLeg] = useState({
@@ -910,6 +995,18 @@ const [slippagePct, setSlippagePct] = useState(0);
     });
   }, [legs, draftLeg.index, draftLeg.segment, instrument]);
 
+  // The left-column Index selector was removed — the Leg Builder index tabs are now
+  // the sole index control. The strategy's base index follows the FIRST real
+  // (non-overlay) leg's index, so single-index detection and the expiry basis stay
+  // correct (selectInstrument also refreshes the expiry basis for the new index).
+  useEffect(() => {
+    const firstReal = (legs || []).find(l => String(l.segment || '').toLowerCase() !== 'midcap100');
+    const idx = firstReal && firstReal.index ? String(firstReal.index).toUpperCase() : null;
+    if (idx && idx !== String(instrument).toUpperCase()) {
+      selectInstrument(idx);
+    }
+  }, [legs, instrument, selectInstrument]);
+
   const [overallSLEnabled, setOverallSLEnabled] = useState(false);
   const [overallSLType, setOverallSLType] = useState('max_loss');
   const [overallSLValue, setOverallSLValue] = useState(0);
@@ -928,9 +1025,9 @@ const [slippagePct, setSlippagePct] = useState(0);
   const [reentryOnTgtCount, setReentryOnTgtCount] = useState(1);
   const [strFilter, setStrFilter] = useState({
     enabled: false,
-    configId: '5x1',
-    configLabel: 'STR 5,1',
-    filterName: 'STR 5,1',
+    configId: '',
+    configLabel: '',
+    filterName: '',
     summary: null,
     segments: [],
     entryMode: 'dte',
@@ -1161,7 +1258,7 @@ const [slippagePct, setSlippagePct] = useState(0);
       ? {
           enabled: true,
           direction: midcapSpotAdjDirection,
-          pct: clampSpotAdjustmentValue(midcapSpotAdjValue),
+          pct: clampSpotAdjustmentValue(midcapSpotAdjValue, midcapSpotAdjUnits),
           units: midcapSpotAdjUnits,
         }
       : null;
@@ -1270,7 +1367,6 @@ const [slippagePct, setSlippagePct] = useState(0);
           }
           setRawResults(payload);
           setDisplayResults(payload);
-          setSlippagePct(payload?.meta?.slippage_pct ?? 0);
           setChargesEnabled(payload?.meta?.charges_enabled ?? false);
           setResults(payload);
           // Midcap overlay (additive): enrich with the cross-index leg if present.
@@ -1585,7 +1681,6 @@ const [slippagePct, setSlippagePct] = useState(0);
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(sanitizePayload({
           trades: rawResults.trades,
-          slippage_pct: Number(slippagePct) || 0,
           charges_enabled: chargesEnabled,
           initial_capital: 100000,
         })),
@@ -1605,7 +1700,6 @@ const [slippagePct, setSlippagePct] = useState(0);
         meta: {
           ...(rawResults.meta || {}),
           ...(data.meta || {}),
-          slippage_pct: Number(slippagePct) || 0,
           charges_enabled: chargesEnabled,
         },
       };
@@ -1617,7 +1711,7 @@ const [slippagePct, setSlippagePct] = useState(0);
     } finally {
       setIsRecalculating(false);
     }
-  }, [rawResults, slippagePct, chargesEnabled, applyMidcapOverlay]);
+  }, [rawResults, chargesEnabled, applyMidcapOverlay]);
 
   const addLegFromDraft = () => {
     if (legs.length >= 12) return;
@@ -1631,6 +1725,10 @@ const [slippagePct, setSlippagePct] = useState(0);
       trail_sl_enabled: false, trail_sl_mode: 'PERCENT', trail_sl_trigger: 0, trail_sl_move: 0,
       re_entry_target_enabled: false, re_entry_target_mode: 'RE_ASAP', re_entry_target_count: 1,
       re_entry_sl_enabled: false, re_entry_sl_mode: 'RE_ASAP', re_entry_sl_count: 1,
+      // This leg's own slippage toggle + %, independent of every other leg
+      // (e.g. a futures hedge leg can stay off while an options leg has its
+      // own value).
+      slippage_enabled: false, slippage_pct: 0,
       lazy_leg_sl_id: null,
       lazy_leg_target_id: null,
       simple_momentum_enabled: false, simple_momentum_mode: 'POINTS_UP', simple_momentum_value: 0,
@@ -1913,6 +2011,20 @@ const [slippagePct, setSlippagePct] = useState(0);
     return serialized;
   };
 
+  // Does the current leg set qualify for the unified weekly cadence? True when the
+  // legs span >1 index (multi-index) AND mix weekly + monthly expiries. Drives the
+  // visibility of the Sync Weekly Roll toggle; single-index / non-mixed => hidden.
+  const syncRollQualifies = useMemo(() => {
+    const el = (legs || []).filter(l => String(l.segment || '').toUpperCase() !== 'MIDCAP100');
+    if (!el.length) return false;
+    const si = String(instrument || 'NIFTY').toUpperCase();
+    const idx = new Set(el.map(l => String(l.index || si).toUpperCase()));
+    const multi = idx.size > 1 || (idx.size === 1 && !idx.has(si));
+    // Sync Roll is available for ANY multi-index run — mixed weekly+monthly (weekly
+    // cadence) OR all-monthly (shared monthly cadence). The backend picks the cadence.
+    return multi;
+  }, [legs, instrument]);
+
   const buildPayload = () => {
     const legsPayload = legs.map(l => {
       const segmentType = (l.segment || '').toLowerCase();
@@ -1923,29 +2035,36 @@ const [slippagePct, setSlippagePct] = useState(0);
         // Per-leg index (multi-index feature). Defaults to the strategy index,
         // so single-index strategies are unaffected.
         index: String(l.index || instrument).toUpperCase(),
+        // This leg's own slippage % — independent of every other leg. Toggle
+        // off always sends 0 regardless of whatever value is still typed in.
+        slippage_pct: l.slippage_enabled ? Math.max(0, Number(l.slippage_pct) || 0) : 0,
       };
 
       if (segmentType === 'options') {
         // Normalize 'call'/'put' UI values to 'CE'/'PE' for the backend
         const rawOpt = (l.option_type || '').toLowerCase();
         leg.option_type = rawOpt === 'call' ? 'CE' : rawOpt === 'put' ? 'PE' : l.option_type.toUpperCase();
-        // Same-index legs keep the EXACT original behaviour (user's Strike Gap
-        // via normalizeStrikeInterval). Only a CROSS-index leg (e.g. MIDCPNIFTY
-        // on a NIFTY strategy) defaults to that index's interval (25).
+        // Respect the user's own Strike Gap selection for the leg's OWN index
+        // (25/50/100 for MIDCPNIFTY, 50/100 elsewhere), falling back to that
+        // index's default only when unset. Previously a CROSS-index leg (e.g.
+        // MIDCPNIFTY on a NIFTY strategy) always forced the index default
+        // (25) regardless of what the user picked in the Strike Gap dropdown
+        // — silently discarding an explicit 50/100 choice.
         const _legIdx = String(l.index || instrument).toUpperCase();
         const _isCrossIndex = _legIdx !== String(instrument).toUpperCase();
         const _legCfg = getIndexConfig(_legIdx) || {};
         const _legMonthlyOnly = !(_legCfg.expiryBases || []).includes('weekly');
-        const _legInterval = _isCrossIndex
-          ? (_legCfg.strikeInterval || normalizeStrikeInterval(l.strike_interval))
-          : normalizeStrikeInterval(l.strike_interval);
+        const _legInterval = normalizeStrikeInterval(l.strike_interval, _legIdx);
         // Same-index monthly-only legs stay forced monthly (existing behaviour).
         // A CROSS-index overlay leg respects the user's weekly/monthly choice —
         // the multi-index feature prices weekly date-aware (e.g. MIDCPNIFTY
         // weeklies existed 2022->late-2024; falls back to monthly otherwise).
+        // NOTE: pass expiryBasis — without it a YEARLY leg is not in the
+        // weekly/monthly option list and would silently fall back to
+        // defaultOptionExpiry ('WEEKLY'), trading the wrong contract.
         leg.expiry = _isCrossIndex
           ? String(l.expiry || _legCfg.defaultOptionExpiry || 'monthly').toUpperCase()
-          : (_legMonthlyOnly ? 'MONTHLY' : normalizeExpiryForIndex(l.expiry, _legIdx, 'options').toUpperCase());
+          : (_legMonthlyOnly ? 'MONTHLY' : normalizeExpiryForIndex(l.expiry, _legIdx, 'options', expiryBasis).toUpperCase());
         leg.strike_interval = _legInterval;
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
@@ -2102,19 +2221,35 @@ const [slippagePct, setSlippagePct] = useState(0);
     const multiIndexMode = engineLegs.length > 0 && (
       _legIndices.size > 1 || (_legIndices.size === 1 && !_legIndices.has(_stratIdx))
     );
+    // Unified cadence: ANY multi-index run with rollover on. If any leg is weekly the
+    // backend uses the weekly cadence; if all legs are monthly it uses the shared
+    // monthly cadence. Every leg re-enters together each cycle. Scoped to multi-index
+    // — single-index runs are unaffected.
+    const syncWeeklyRoll = multiIndexMode
+      && rolloverToggle
+      && syncWeeklyRollEnabled;
 
     return {
       index: instrument,
       // Opt-in flag routing this run to the isolated multi-index feature on the
       // backend. Absent/false for every existing single-index strategy.
       multi_index_mode: multiIndexMode,
+      // Routes multi-index mixed weekly+monthly rollover runs to the unified
+      // weekly-cadence path (monthly legs roll on their own monthly expiry).
+      sync_weekly_roll: syncWeeklyRoll,
       underlying,
       strategy_type: strategyType,
       expiry_window: expiryBasis === 'weekly' ? 'weekly_expiry' : 'monthly_expiry',
-      rollover_toggle: (rolloverToggle || noRollover) && ['weekly', 'monthly'].includes(expiryBasis),
-      rollover_min_days_to_expiry: rolloverToggle ? rolloverMinDaysToExpiry : 0,
+      // YEARLY needs rollover_toggle TRUE — that is the only thing that makes the
+      // engine pin the December contract (simulate.rs rollover gate). Omitting
+      // 'yearly' here silently stripped it from the payload even though the UI
+      // toggle was on, so the run fell back to trading the cadence expiries.
+      rollover_toggle: (rolloverToggle || noRollover) && ['weekly', 'monthly', 'yearly'].includes(expiryBasis),
+      // min-DTE is REJECTED by the engine under yearly (it would advance the
+      // contract to the next cadence element). T-n is the yearly roll-early knob.
+      rollover_min_days_to_expiry: (rolloverToggle && expiryBasis !== 'yearly') ? rolloverMinDaysToExpiry : 0,
       no_rollover: noRollover && ['weekly', 'monthly'].includes(expiryBasis),
-      no_rollover_min_days: noRollover ? noRolloverMinDays : 0,
+      no_rollover_min_days: (noRollover && expiryBasis !== 'yearly') ? noRolloverMinDays : 0,
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
       square_off_mode: squareOffMode,
@@ -2133,7 +2268,6 @@ const [slippagePct, setSlippagePct] = useState(0);
       buffer_strike_apply_to: String(bufferStrikeApplyTo || 'both'),
       buffer_position_above: Boolean(bufferPositionAbove),
       buffer_position_below: Boolean(bufferPositionBelow),
-      slippage_pct: Math.max(0, Number(slippagePct) || 0),
       charges_enabled: chargesEnabled,
       legs: engineLegs,
       // Midcap cross-index overlay (additive; ignored by the engine).
@@ -2142,7 +2276,7 @@ const [slippagePct, setSlippagePct] = useState(0);
         ? {
             enabled: true,
             direction: midcapSpotAdjDirection,
-            pct: clampSpotAdjustmentValue(midcapSpotAdjValue),
+            pct: clampSpotAdjustmentValue(midcapSpotAdjValue, midcapSpotAdjUnits),
             units: midcapSpotAdjUnits,
           }
         : null,
@@ -2164,10 +2298,20 @@ const [slippagePct, setSlippagePct] = useState(0);
       date_from: getApiStartDate(startDate),
       date_to: getApiEndDate(endDate),
       expiry_type: effectiveExpiryType,
+      // YEARLY only (ignored by every other basis): the roll cadence and the
+      // T-n months at which the December contract rolls to the next December.
+      ...(effectiveExpiryType === 'YEARLY' ? {
+        rollover_cadence: rolloverCadence,
+        yearly_exit_months_before: Math.max(0, Math.min(11, Number(yearlyExitMonthsBefore) || 0)),
+        // Long-dated months to roll through. December is always included (the
+        // anchor); sorting keeps the payload stable so the cache key doesn't
+        // churn on checkbox order. Absent/December-only == existing behaviour.
+        yearly_roll_months: Array.from(new Set(['12', ...yearlyRollMonths])).sort(),
+      } : {}),
       filter: strFilter.enabled ? strFilter.configId : null,
       filter_config: strFilter.enabled ? strFilter.configId : null,
       filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
-      super_trend_config: (strFilter.enabled && strFilter.configId !== 'custom') ? strFilter.configId : 'None',
+      super_trend_config: 'None',
       filter_entry_mode: strFilter.enabled ? (strFilter.entryMode || 'dte') : 'dte',
       fixed_late_entry: strFilter.enabled && strFilter.entryMode === 'fixed' ? Boolean(strFilter.lateEntry) : false,
       min_days_to_entry: strFilter.enabled && strFilter.entryMode === 'min_days'
@@ -2521,37 +2665,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {/* Intraday backtest mode removed — handled by separate software.
                     backtestMode stays 'eod' always; EOD-only guards below are kept. */}
 
-                {/* Instrument — moved from the strip into Configuration */}
-                <div>
-                  <label className="field-label">Index</label>
-                  <div className="space-y-2">
-                    {INDEX_GROUPS.map(group => (
-                      <div key={group.key}>
-                        <div style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.58rem', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--text-muted)', marginBottom: 4 }}>
-                          {group.title}
-                        </div>
-                        <div className="flex flex-wrap gap-1">
-                          {group.symbols.map(symbol => {
-                            const cfg = getIndexConfig(symbol);
-                            const active = instrument === symbol;
-                            return (
-                              <button
-                                key={symbol}
-                                type="button"
-                                onClick={() => selectInstrument(symbol)}
-                                className="instrument-btn"
-                                style={active ? { color: 'var(--accent)', background: 'var(--accent-bg)' } : {}}
-                                title={cfg.subtitle}
-                              >
-                                {symbol}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
+                {/* Index selector removed — the Leg Builder index tabs (right) are the
+                    sole index control. The strategy's base index follows the first
+                    real leg's index (see the derive-instrument effect). */}
 
                 {/* Underlying */}
                 <div>
@@ -2579,6 +2695,78 @@ const [slippagePct, setSlippagePct] = useState(0);
                         <option key={opt.value} value={opt.value}>{opt.label}</option>
                       ))}
                     </select>
+                  </div>
+                )}
+
+                {/* Yearly (December) — contract and roll cadence are two
+                    different calendars, so both need their own control. */}
+                {backtestMode === 'eod' && expiryBasis === 'yearly' && (
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="field-label">Roll every</label>
+                      <select
+                        value={rolloverCadence}
+                        onChange={e => setRolloverCadence(e.target.value)}
+                        className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
+                      >
+                        <option value="monthly">Month (MOM)</option>
+                        <option value="weekly">Week (WOW)</option>
+                      </select>
+                      <p className="text-[11px] text-secondary mt-1">
+                        Re-books the position on this cadence while holding the long-dated contract.
+                      </p>
+                    </div>
+                    <div>
+                      <label className="field-label">Roll to next December</label>
+                      <select
+                        value={yearlyExitMonthsBefore}
+                        onChange={e => setYearlyExitMonthsBefore(+e.target.value)}
+                        className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
+                      >
+                        <option value={0}>T-0 (hold to expiry)</option>
+                        {[1, 2, 3, 4, 5, 6].map(n => (
+                          <option key={n} value={n}>{`T-${n} (${n} month${n === 1 ? '' : 's'} before)`}</option>
+                        ))}
+                      </select>
+                      <p className="text-[11px] text-secondary mt-1">
+                        {yearlyExitMonthsBefore === 0
+                          ? 'Holds 26-Dec-2019 to expiry, then rolls to 31-Dec-2020.'
+                          : `Exits ${yearlyExitMonthsBefore} month${yearlyExitMonthsBefore === 1 ? '' : 's'} early and re-enters the next long-dated contract at a fresh strike.`}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Roll-through months — YEARLY + rollover only. December is the
+                    anchor and can't be removed; add Mar/Jun/Sep to alternate. */}
+                {backtestMode === 'eod' && expiryBasis === 'yearly' && rolloverToggle && (
+                  <div>
+                    <label className="field-label">Roll through</label>
+                    <div className="flex flex-wrap gap-2 mt-1">
+                      {[['03', 'March'], ['06', 'June'], ['09', 'September'], ['12', 'December']].map(([m, label]) => {
+                        const isDec = m === '12';
+                        const on = isDec || yearlyRollMonths.includes(m);
+                        return (
+                          <button
+                            key={m}
+                            type="button"
+                            disabled={isDec}
+                            onClick={() => setYearlyRollMonths(prev =>
+                              prev.includes(m) ? prev.filter(x => x !== m) : [...prev, m])}
+                            className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                              on ? 'bg-accent text-white border-accent' : 'border-default text-secondary hover:bg-hover'
+                            } ${isDec ? 'opacity-70 cursor-default' : ''}`}
+                          >
+                            {label}{isDec ? ' (anchor)' : ''}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[11px] text-secondary mt-1">
+                      {Array.from(new Set(['12', ...yearlyRollMonths])).length === 1
+                        ? 'December only — rolls once a year (in November at T-1). Current behaviour.'
+                        : `Alternates through ${Array.from(new Set(['12', ...yearlyRollMonths])).sort().map(x => ({'03':'Mar','06':'Jun','09':'Sep','12':'Dec'}[x])).join(' + ')} — rolls into whichever long-dated expiry comes next, T-n before each.`}
+                    </p>
                   </div>
                 )}
 
@@ -2633,8 +2821,12 @@ const [slippagePct, setSlippagePct] = useState(0);
                   )}
                 </button>
                 <div className="p-4 space-y-4" style={{ display: advancedOpen ? 'block' : 'none' }}>
-                {/* Rollover Toggle — EOD weekly/monthly only */}
-                {backtestMode === 'eod' && ['weekly', 'monthly'].includes(expiryBasis) && (
+                {/* Rollover Toggle — EOD weekly/monthly/yearly.
+                    YEARLY REQUIRES it: the engine only pins the December
+                    contract when rollover is active (simulate.rs rollover gate),
+                    so without this the run silently falls back to trading the
+                    cadence expiries. */}
+                {backtestMode === 'eod' && ['weekly', 'monthly', 'yearly'].includes(expiryBasis) && (
                   <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <div className="flex flex-col gap-0.5">
@@ -2651,7 +2843,11 @@ const [slippagePct, setSlippagePct] = useState(0);
                         size="sm"
                       />
                     </div>
-                    {rolloverToggle && (
+                    {/* Min-DTE is meaningless (and REJECTED by the engine) under
+                        YEARLY: it advances the contract to the next CADENCE
+                        element, which would swap December for a weekly. T-n
+                        ("Roll to next December") is the yearly roll-early knob. */}
+                    {rolloverToggle && expiryBasis !== 'yearly' && (
                       <div className="space-y-2 pt-2 border-t border-default">
                         <p className="text-[11px] font-medium text-secondary pl-2">Min. days to expiry</p>
                         <p className="text-[10px] text-muted pl-2">
@@ -2674,6 +2870,32 @@ const [slippagePct, setSlippagePct] = useState(0);
                           ))}
                         </div>
                       </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Sync Roll — any multi-index run (weekly+monthly OR all-monthly) */}
+                {backtestMode === 'eod' && syncRollQualifies && (
+                  <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
+                          Sync Roll
+                        </span>
+                        <span className="text-[11px] text-muted pl-2">
+                          Multi-index: all legs square off and re-enter together on one shared cadence. Mixed weekly+monthly uses the weekly cadence; all-monthly uses the shared monthly cadence.
+                        </span>
+                      </div>
+                      <Toggle
+                        enabled={syncWeeklyRollEnabled}
+                        onToggle={(val) => setSyncWeeklyRollEnabled(val !== undefined ? Boolean(val) : !syncWeeklyRollEnabled)}
+                        size="sm"
+                      />
+                    </div>
+                    {syncWeeklyRollEnabled && !rolloverToggle && (
+                      <p className="text-[10px] text-amber-400 pl-2 pt-2 border-t border-default">
+                        Turn on Re-entry Rollover above to activate the unified cadence.
+                      </p>
                     )}
                   </div>
                 )}
@@ -2776,7 +2998,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                           <input
                             type="number"
                             min={0.25}
-                            max={spotAdjustmentUnits === 'percent' ? 20 : 10000}
+                            max={spotAdjustmentUnits === 'percent' ? 5 : 10000}
                             step={spotAdjustmentUnits === 'percent' ? 0.25 : 50}
                             value={spotAdjustmentValue}
                             onChange={e => {
@@ -2785,7 +3007,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                               const numeric = Number(nextValue);
                               setSpotAdjustmentValue(Number.isNaN(numeric) ? '' : numeric);
                             }}
-                            onBlur={() => setSpotAdjustmentValue(prev => clampSpotAdjustmentValue(prev))}
+                            onBlur={() => setSpotAdjustmentValue(prev => clampSpotAdjustmentValue(prev, spotAdjustmentUnits))}
                             className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
                           />
                           <div className="flex gap-1">
@@ -2862,7 +3084,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <input
                                 type="number"
                                 min={0.25}
-                                max={midcapSpotAdjUnits === 'percent' ? 20 : 10000}
+                                max={midcapSpotAdjUnits === 'percent' ? 5 : 10000}
                                 step={midcapSpotAdjUnits === 'percent' ? 0.25 : 50}
                                 value={midcapSpotAdjValue}
                                 onChange={e => {
@@ -2871,7 +3093,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   const n = Number(v);
                                   setMidcapSpotAdjValue(Number.isNaN(n) ? '' : n);
                                 }}
-                                onBlur={() => setMidcapSpotAdjValue(prev => clampSpotAdjustmentValue(prev))}
+                                onBlur={() => setMidcapSpotAdjValue(prev => clampSpotAdjustmentValue(prev, midcapSpotAdjUnits))}
                                 className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
                               />
                               <div className="flex gap-1">
@@ -3064,27 +3286,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                 {/* Strike Shift on Missing Contract control removed —
                     engine now always walks TOWARD ATM for zero-turnover
                     strikes and surfaces the reason in the tradesheet column. */}
-                <div>
-                  <label className="field-label">Slippage %</label>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="number"
-                      min={0}
-                      step={0.01}
-                      value={slippagePct}
-                      onChange={e => setSlippagePct(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
-                      onBlur={() => setSlippagePct(prev => {
-                        const numeric = Number(prev);
-                        return Number.isFinite(numeric) && numeric >= 0 ? numeric : 0;
-                      })}
-                      className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
-                    />
-                    <span className="text-xs text-muted">%</span>
-                  </div>
-                  <p className="mt-1 text-xs text-muted">
-                    Applied on both entry and exit. Sell gets worse by lower entry and higher exit. Buy gets worse by higher entry and lower exit.
-                  </p>
-                </div>
+                {/* Slippage % moved to per-leg control (each leg card below,
+                    "Slippage %" in the Advanced controls section) — there is
+                    no strategy-level slippage anymore. */}
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <label className="text-xs font-medium text-secondary">Transaction Charges</label>
@@ -3257,7 +3461,12 @@ const [slippagePct, setSlippagePct] = useState(0);
                                 ...prev,
                                 index: tab.value,
                                 segment: prev.segment === 'midcap100' ? 'options' : prev.segment,
-                                strike_interval: cfg.strikeInterval || prev.strike_interval,
+                                // Keep the user's chosen Strike Gap if it's valid for this
+                                // index (MIDCPNIFTY allows 25/50/100); only coerce when the
+                                // current gap isn't offered for the new index. Previously this
+                                // always reset to the index's native gap, silently discarding a
+                                // user's explicit 50 → 25 every time the tab was clicked.
+                                strike_interval: normalizeStrikeInterval(prev.strike_interval, tab.value),
                                 expiry: monthlyOnly ? 'monthly' : (cfg.defaultOptionExpiry || 'weekly'),
                               }));
                             }
@@ -3317,7 +3526,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                   const barColor = isMidcap100Tab ? '#a78bfa' : (isMidcp ? '#2dd4bf' : 'var(--accent)');
                   const barText = isMidcap100Tab
                     ? 'Hypothetical overlay · follows NIFTY trade dates · no real strike or expiry'
-                    : (isMidcp ? 'Weekly (till Nov 2024) & monthly · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50');
+                    : (expiryBasis === 'yearly'
+                        ? 'Yearly: holds the December contract · round-1000 strikes are the liquid ones'
+                        : (isMidcp ? 'Weekly (till Nov 2024) & monthly · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50'));
                   const barLabel = isMidcap100Tab ? 'MIDCAP100 OVERLAY' : activeIdx;
                   return (
                     <div style={{
@@ -3396,7 +3607,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                     <select value={draftLeg.expiry}
                       onChange={e => setDraftLeg(prev => ({ ...prev, expiry: e.target.value }))}
                       className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-36">
-                      {(draftLeg.segment === 'options' ? getOptionExpiryOptions(draftLeg.index || instrument) : FUTURES_EXPIRIES).map(opt => (
+                      {(draftLeg.segment === 'options' ? getOptionExpiryOptions(draftLeg.index || instrument, expiryBasis) : FUTURES_EXPIRIES).map(opt => (
                         <option key={opt.value} value={opt.value}>{opt.label}</option>
                       ))}
                     </select>
@@ -3489,6 +3700,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                     <StrikeIntervalSelect
                       value={draftLeg.strike_interval}
                       onChange={value => setDraftLeg(prev => ({ ...prev, strike_interval: value }))}
+                      index={draftLeg.index || instrument}
                       className="h-8 px-2 border border-default rounded text-xs bg-surface focus:outline-none focus:ring-2 focus:ring-accent/40 w-24"
                     />
                   </div>
@@ -3779,7 +3991,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                               <label className="field-label">Expiry</label>
                               <select value={leg.expiry} onChange={e => updateLeg(leg.id, 'expiry', e.target.value)}
                                 className="h-7 px-2 border border-default rounded text-xs bg-surface w-28">
-                                {(leg.segment === 'options' ? getOptionExpiryOptions(leg.index || instrument) : FUTURES_EXPIRIES).map(opt => (
+                                {(leg.segment === 'options' ? getOptionExpiryOptions(leg.index || instrument, expiryBasis) : FUTURES_EXPIRIES).map(opt => (
                                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                                 ))}
                               </select>
@@ -3852,6 +4064,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                                   <StrikeIntervalSelect
                                     value={leg.strike_interval}
                                     onChange={value => updateLeg(leg.id, 'strike_interval', value)}
+                                    index={leg.index || instrument}
                                     className="h-7 px-2 border border-default rounded text-xs bg-surface w-20"
                                   />
                                 </div>
@@ -4140,6 +4353,28 @@ const [slippagePct, setSlippagePct] = useState(0);
                               )}
                             </div>
                           </div>
+                          <div className="flex flex-wrap gap-x-4 gap-y-2">
+                            <div className="flex items-center gap-2">
+                              <Toggle
+                                enabled={Boolean(leg.slippage_enabled)}
+                                onToggle={(val) => updateLeg(leg.id, 'slippage_enabled', val !== undefined ? Boolean(val) : !leg.slippage_enabled)}
+                                size="sm"
+                              />
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Slippage %</span>
+                              {leg.slippage_enabled && (<>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  step={0.01}
+                                  value={leg.slippage_pct ?? 0}
+                                  onChange={e => updateLeg(leg.id, 'slippage_pct', e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+                                  onBlur={() => updateLeg(leg.id, 'slippage_pct', Math.max(0, Number(leg.slippage_pct) || 0))}
+                                  className="w-16 h-7 px-1 border border-default rounded text-xs text-center bg-surface"
+                                />
+                                <Tooltip text="This leg's own slippage — independent of every other leg (e.g. give an options leg slippage while a futures hedge leg stays off)." />
+                              </>)}
+                            </div>
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -4210,6 +4445,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                           <StrikeIntervalSelect
                             value={ll.strike_interval}
                             onChange={value => updateLazyLeg(ll.id, 'strike_interval', value)}
+                            index={instrument}
                             className="block mt-1 h-7 px-2 border border-default rounded text-xs bg-surface w-20"
                           />
                         </label>
@@ -4405,6 +4641,7 @@ const [slippagePct, setSlippagePct] = useState(0);
                       <StrikeIntervalSelect
                         value={ll.strike_interval}
                         onChange={value => updateLazyLeg(ll.id, 'strike_interval', value)}
+                        index={instrument}
                         className="mt-1 w-full h-7 px-2 border border-default rounded text-xs bg-surface"
                       />
                     </label>
@@ -4613,11 +4850,20 @@ const [slippagePct, setSlippagePct] = useState(0);
               filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
               filterSegments={strFilter.enabled ? strFilter.segments : null}
               showStrSegment={strFilter.enabled}
+              rulesPayload={buildPayload()}
+              rulesFilterName={strFilter.enabled ? strFilter.filterName : null}
               strategyConfig={{
                 instrument,
                 legs,
                 entryDaysBefore,
                 exitDaysBefore,
+                // YEARLY: contract and cadence are different calendars, so the
+                // export name must carry both or two very different runs would
+                // land on the same filename.
+                expiryBasis,
+                rolloverCadence,
+                yearlyExitMonthsBefore,
+                yearlyRollMonths,
                 spotAdjustmentEnabled,
                 spotAdjustmentDirection,
                 spotAdjustmentValue: normalizedSpotAdjustmentValue,
@@ -4625,27 +4871,13 @@ const [slippagePct, setSlippagePct] = useState(0);
                 // Midcap cross-index spot adjustment (for the filename).
                 midcapSpotAdjustmentEnabled: midcapSpotAdjEnabled && legs.some(l => l.segment === 'midcap100'),
                 midcapSpotAdjustmentDirection: midcapSpotAdjDirection,
-                midcapSpotAdjustmentValue: clampSpotAdjustmentValue(midcapSpotAdjValue),
+                midcapSpotAdjustmentValue: clampSpotAdjustmentValue(midcapSpotAdjValue, midcapSpotAdjUnits),
                 midcapSpotAdjustmentUnits: midcapSpotAdjUnits,
               }}
             />
             <div className="flex flex-wrap items-center gap-4 px-4 py-3 bg-surface border border-default border-t-0 rounded-b-xl">
-              <div className="flex items-center gap-2">
-                <label className="text-xs font-medium text-secondary whitespace-nowrap">
-                  Slippage (%)
-                </label>
-                <input
-                  type="number"
-                  min="0"
-                  max="10"
-                  step="0.1"
-                  value={slippagePct}
-                  onChange={e => setSlippagePct(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
-                  onBlur={() => setSlippagePct(prev => Number(prev) || 0)}
-                  className="w-20 px-2 py-1.5 text-sm border border-default rounded bg-surface text-primary text-center"
-                  placeholder="0"
-                />
-              </div>
+              {/* Slippage is per-leg now (set on each leg card) and already
+                  baked into these results — nothing to toggle here. */}
               <div className="flex items-center gap-2">
                 <label className="text-xs font-medium text-secondary whitespace-nowrap">
                   Txn Charges
@@ -4669,13 +4901,9 @@ const [slippagePct, setSlippagePct] = useState(0);
                   </>
                 )}
               </button>
-              {(displayResults?.meta?.slippage_pct > 0 || displayResults?.meta?.charges_enabled) && (
+              {displayResults?.meta?.charges_enabled && (
                 <span className="text-xs text-secondary">
-                  {displayResults.meta.slippage_pct > 0 && (
-                    <>Applied: <strong>{displayResults.meta.slippage_pct}%</strong> slippage</>
-                  )}
-                  {displayResults.meta.slippage_pct > 0 && displayResults.meta.charges_enabled && ' + '}
-                  {displayResults.meta.charges_enabled && <strong>Txn charges</strong>}
+                  Applied: <strong>Txn charges</strong>
                 </span>
               )}
             </div>

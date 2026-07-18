@@ -35,21 +35,18 @@ pub(crate) fn py_round(x: f64, ndigits: i32) -> f64 {
     if !x.is_finite() {
         return x;
     }
+    // Match Python round(x, n) EXACTLY. Python uses David-Gay dtoa: decimal-correct,
+    // round-half-to-EVEN. Neither (x*m).round() (half-away) nor an epsilon tie-break
+    // reproduces it — the scaling itself perturbs the value. Rust's float FORMATTING
+    // (Ryū) is also decimal-correct round-half-to-even, so `format!("{:.n}", x)` gives
+    // the identical string Python's round produces, and parsing it back yields the same
+    // f64. ndigits is always >= 0 here (2/4/6); a negative-digits fallback is kept for
+    // completeness (unused).
+    if ndigits >= 0 {
+        return format!("{:.*}", ndigits as usize, x).parse::<f64>().unwrap_or(x);
+    }
     let m = 10f64.powi(ndigits);
-    let scaled = x * m;
-    let floor = scaled.floor();
-    let diff = scaled - floor;
-    let rounded = if (diff - 0.5).abs() < 1e-9 {
-        // exact halfway → round to even
-        if (floor as i64) % 2 == 0 {
-            floor
-        } else {
-            floor + 1.0
-        }
-    } else {
-        scaled.round()
-    };
-    rounded / m
+    (x * m).round() / m
 }
 
 fn get_f64(d: &PyDict, key: &str) -> Option<f64> {

@@ -300,7 +300,7 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     custom strike_selection.type values not in the supported set, and re-entry
     modes outside the 5 supported modes above.
     """
-    from base import compute_analytics, build_pivot, get_spot_price_from_db, get_trading_calendar
+    from base import compute_analytics, build_pivot, get_trading_calendar
     from engines.generic_algotest_engine import get_lot_size
     from services.engine_rust import run_rust_engine_pipeline, priced_to_tradesheet_records
 
@@ -331,26 +331,35 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     if not days:
         return (None, None, None)
 
-    expiries_df = get_expiry_dates(
-        index,
-        payload.get("expiry_type", "weekly"),
-        effective_from,
-        _data_to,
-    )
-    if expiries_df is None or expiries_df.empty:
-        return (None, None, None)
-    col = "Current Expiry" if "Current Expiry" in expiries_df.columns else expiries_df.columns[0]
-    expiries = (
-        pd.to_datetime(expiries_df[col])
-        .sort_values()
-        .dt.strftime("%Y-%m-%d")
-        .unique()
-        .tolist()
-    )
+    # Resolves the expiry list exactly as before for weekly/monthly; for YEARLY
+    # it additionally returns the pinned December cycles that decouple the
+    # contract from the roll cadence. Raises (never silently degrades) on a bad
+    # yearly config.
+    from services.engine_rust import resolve_expiry_inputs
 
+    expiries, yearly_cycles = resolve_expiry_inputs(
+        index, payload, effective_from, _data_to, days
+    )
+    if not expiries:
+        return (None, None, None)
+    if yearly_cycles is not None:
+        payload = {**payload, "yearly_cycles": yearly_cycles}
+
+    # Rust-native lookup first (symbol-keyed in the native cache — verified
+    # against lib.rs's lookup_spot_price). Falls back to the DB-backed loader
+    # (explicit WHERE symbol=, genuinely per-symbol) rather than
+    # get_spot_price_from_db, which the fast-lookup monkey-patches to ignore
+    # the symbol and return whichever index bulk_load_options last activated
+    # — silently wrong for a multi-index group-per-index run where a LATER
+    # group's engine call would otherwise pull an EARLIER group's spot prices.
+    from services import rust_fast_path as rf
+    from services.data_loader import get_loader as _get_loader
+    _loader = _get_loader()
     spots = {}
     for d in days:
-        v = get_spot_price_from_db(d, index)
+        v = rf.get_spot_price(d, index)
+        if v is None:
+            v = _loader.get_spot_price(index, d)
         if v is not None:
             spots[d] = float(v)
     if not spots:
@@ -376,27 +385,45 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() not in ("0", "false", "no", "off"):
         try:
             from engines.generic_algotest_engine import _calculate_leg_mae_mfe
+            from services.engine_rust import _fut_leg_mae_mfe
+            _sorted_td_mae = sorted(days)
             for rec in records:
                 opt_type = rec.get("Type", "")
-                if opt_type not in ("CE", "PE"):
+                _is_fut = opt_type == "FUT"
+                if opt_type not in ("CE", "PE") and not _is_fut:
                     continue
-                leg = {
-                    'option_type': opt_type,
-                    'strike': rec.get("Strike"),
-                    'expiry': rec.get("Expiry"),
-                }
-                mae_val, mfe_val = _calculate_leg_mae_mfe(
-                    index=str(index).upper(),
-                    entry_date=rec.get("Entry Date"),
-                    exit_date=rec.get("Exit Date"),
-                    leg=leg,
-                    entry_price=rec.get("Entry Price"),
-                    position=rec.get("B/S", "SELL"),
-                    entry_spot=rec.get("Entry Spot"),
-                    trading_calendar_df=_trading_cal_df,
-                    exit_reason=rec.get("Exit Reason"),
-                    exit_price=rec.get("Exit Price"),
-                )
+                if _is_fut:
+                    # Feather-batch futures MAE/MFE (FUTIDX high/low, in-memory, no DB).
+                    mae_val, mfe_val = _fut_leg_mae_mfe(
+                        symbol=str(index).upper(),
+                        entry_date=rec.get("Entry Date"),
+                        exit_date=rec.get("Exit Date"),
+                        expiry=rec.get("Expiry"),
+                        entry_price=rec.get("Entry Price"),
+                        position=rec.get("B/S", "SELL"),
+                        entry_spot=rec.get("Entry Spot"),
+                        sorted_td=_sorted_td_mae,
+                        exit_reason=rec.get("Exit Reason"),
+                        exit_price=rec.get("Exit Price"),
+                    )
+                else:
+                    leg = {
+                        'option_type': opt_type,
+                        'strike': rec.get("Strike"),
+                        'expiry': rec.get("Expiry"),
+                    }
+                    mae_val, mfe_val = _calculate_leg_mae_mfe(
+                        index=str(index).upper(),
+                        entry_date=rec.get("Entry Date"),
+                        exit_date=rec.get("Exit Date"),
+                        leg=leg,
+                        entry_price=rec.get("Entry Price"),
+                        position=rec.get("B/S", "SELL"),
+                        entry_spot=rec.get("Entry Spot"),
+                        trading_calendar_df=_trading_cal_df,
+                        exit_reason=rec.get("Exit Reason"),
+                        exit_price=rec.get("Exit Price"),
+                    )
                 if mae_val is not None:
                     rec["MAE"] = mae_val
                 if mfe_val is not None:
@@ -556,6 +583,12 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         payload = _resolve_effective_request(payload)
         _mi_from = payload.get("_effective_from", payload.get("from_date"))
         _mi_to = payload.get("_effective_to", payload.get("to_date"))
+        # sync_weekly_roll => unified-cadence path (shortest leg drives one schedule,
+        # all legs enter/exit together each cycle, monthly legs roll on their own
+        # monthly expiry). Absent => the existing group-per-index path (unchanged).
+        if payload.get("sync_weekly_roll"):
+            from services.multi_index_feature import run_sync_weekly_cadence
+            return run_sync_weekly_cadence(payload, _mi_from, _mi_to)
         from services.multi_index_feature import run_multi_index_feature
         return run_multi_index_feature(payload, _mi_from, _mi_to)
 
@@ -595,7 +628,14 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
         expiry_type = payload.get('expiry_type', 'WEEKLY')
 
         logger.debug("[DATE RANGE] User=%s -> %s Effective=%s -> %s", request.get('from_date') or request.get('date_from'), request.get('to_date') or request.get('date_to'), effective_from, effective_to)
-        expiry_df = get_expiry_dates(index, expiry_type.lower(), effective_from, effective_to)
+        # Debug-logging only (never used for computation below). YEARLY has no
+        # calendar of its own — it rides the weekly/monthly cadence — and
+        # load_expiry() raises on an unknown basis in CSV mode, so resolve the
+        # cadence for the log rather than crashing in a debug line.
+        _dbg_expiry_type = expiry_type.lower()
+        if _dbg_expiry_type == 'yearly':
+            _dbg_expiry_type = str(payload.get('rollover_cadence') or 'monthly').lower()
+        expiry_df = get_expiry_dates(index, _dbg_expiry_type, effective_from, effective_to)
         
         logger.debug("[DEBUG] expiry_df type=%s len=%s", type(expiry_df), len(expiry_df) if expiry_df is not None else 'None')
         if expiry_df is not None and not expiry_df.empty:

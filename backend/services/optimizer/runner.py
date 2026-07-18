@@ -62,6 +62,12 @@ class OptimizationError(Exception):
     pass
 
 
+# Smallest spot-adjustment threshold the optimizer will sweep, per unit. Below
+# these the breach fires on nearly every trading day, which cascades into an
+# effectively unbounded number of bridge trades per run.
+MIN_SPOT_ADJ_BY_UNIT = {"percent": 0.1, "points": 10.0}
+
+
 def validate_request(
     base_payload: Dict[str, Any],
     param_specs: Sequence[Dict[str, Any]],
@@ -74,27 +80,43 @@ def validate_request(
     if not param_specs:
         raise OptimizationError("No parameters selected for optimization")
 
-    # Validate that any spot_adjustment_pct values being swept are >= 0.1.
-    # A value of 0 (or near-0) means "trigger on every tick" which creates
-    # an effectively infinite cascade of bridge trades per trading day.
+    # Validate that any swept spot-adjustment threshold clears the floor for the
+    # unit it's being swept in. The threshold is a percent move or an absolute
+    # index-point move depending on the payload's *_units, so the floor has to
+    # follow — 0.1 is a sane percent minimum but a nonsensical points one.
+    _mc_sa = base_payload.get("midcap_spot_adjustment")
+    _mc_units = str(
+        (_mc_sa.get("units") if isinstance(_mc_sa, dict) else None) or "percent"
+    ).lower()
+    _nifty_units = str(base_payload.get("spot_adjustment_units") or "percent").lower()
     for spec in param_specs:
         path = spec.get("path", "")
-        if "spot_adjustment_pct" in path or path == "spot_adjustment.pct":
-            from services.optimizer.param_expander import _expand_values
+        is_midcap = path.startswith("midcap_spot_adjustment")
+        is_spot_adj = (
+            "spot_adjustment_pct" in path
+            or path == "spot_adjustment.pct"
+            or path == "midcap_spot_adjustment.pct"
+        )
+        if not is_spot_adj:
+            continue
+        units = _mc_units if is_midcap else _nifty_units
+        floor = MIN_SPOT_ADJ_BY_UNIT.get(units, MIN_SPOT_ADJ_BY_UNIT["percent"])
+        unit_word = "points" if units == "points" else "percent"
+        from services.optimizer.param_expander import _expand_values
+        try:
+            vals = _expand_values(spec)
+        except Exception:
+            vals = []
+        for v in vals:
             try:
-                vals = _expand_values(spec)
-            except Exception:
-                vals = []
-            for v in vals:
-                try:
-                    if float(v) < 0.1:
-                        raise OptimizationError(
-                            f"spot_adjustment_pct value {v} is too small (minimum 0.1). "
-                            "Values below 0.1% trigger on nearly every trading day and "
-                            "cause extremely long runtimes."
-                        )
-                except (TypeError, ValueError):
-                    pass
+                if float(v) < floor:
+                    raise OptimizationError(
+                        f"Spot Adjustment value {v} is too small (minimum "
+                        f"{floor:g} {unit_word}). Thresholds below that trigger on "
+                        "nearly every trading day and cause extremely long runtimes."
+                    )
+            except (TypeError, ValueError):
+                pass
 
     grid_size = count_combinations(param_specs)
     if grid_size <= 0:
@@ -255,7 +277,6 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
     try:
         import pandas as pd
         import base as _base_mod
-        from base import get_expiry_dates
         from engines.generic_algotest_engine import get_lot_size
 
         t0 = time.perf_counter()
@@ -285,18 +306,16 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
                 if v is not None:
                     spots[d] = float(v)
 
-        expiry_type = payload.get("expiry_type", "weekly")
-        df_exp = get_expiry_dates(index, expiry_type, from_date, to_date)
-        expiries = []
-        if df_exp is not None and not df_exp.empty:
-            col = "Current Expiry" if "Current Expiry" in df_exp.columns else df_exp.columns[0]
-            expiries = (
-                pd.to_datetime(df_exp[col])
-                .sort_values()
-                .dt.strftime("%Y-%m-%d")
-                .unique()
-                .tolist()
-            )
+        # YEARLY has no calendar of its own: get_expiry_dates(index, "yearly")
+        # returns empty, which would leave `expiries` empty and kill the whole
+        # run. resolve_expiry_inputs returns the CADENCE list plus the pinned
+        # December cycles; for weekly/monthly it returns the identical list this
+        # block produced before.
+        from services.engine_rust import resolve_expiry_inputs
+
+        expiries, yearly_cycles = resolve_expiry_inputs(
+            index, payload, from_date, to_date, days
+        )
 
         lot_size = int(get_lot_size(index, days[0])) if days else 0
 
@@ -305,6 +324,7 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
             "expiries": expiries,
             "spots": spots,
             "lot_size": lot_size,
+            "yearly_cycles": yearly_cycles,
         }
         # Preload OHLC as a compact pandas DataFrame (pyarrow, float32, category).
         # Used by _compute_mae_mfe_batch for MAE/MFE in both sequential and
@@ -1037,6 +1057,12 @@ def _warm_feather_page_cache(feather_root: str) -> None:
 # per combo. Worker-local — never shared across processes.
 _RUST_CONTEXT: Optional[Dict[str, Any]] = None
 
+# Parity-reference switch: when True, _compute_mae_mfe_batch runs the Python engine
+# instead of the Rust path. Set ONLY by tools/mae_parity (to diff Rust vs Python)
+# and by the backend on-demand download enrich (a process without the native cache).
+# The live optim path keeps it False → Rust-only, no fallback.
+_MAE_PYTHON_REF: bool = False
+
 
 def set_rust_context(ctx: Optional[Dict[str, Any]]) -> None:
     global _RUST_CONTEXT
@@ -1221,6 +1247,39 @@ def _compute_mae_mfe_batch(
         and "ohlc_df_pandas" not in _RUST_CONTEXT
     ):
         return df
+
+    # ── Rust-ONLY (no Python fallback — user policy). Eager MAE/MFE from the
+    # shared native cache. Fork-safe (compute_mae_mfe_batch uses NO Rayon) and
+    # byte-identical to the Python engine below — proven by tools/mae_parity + a
+    # sweep-df parity check. Keeps MAE/MFE EAGER (during the sweep). Any Rust
+    # failure HARD-FAILS (surfaces the bug). The Python engine below is a PARITY
+    # REFERENCE ONLY, reached exclusively when _MAE_PYTHON_REF is set — by
+    # tools/mae_parity and by the backend on-demand download enrich (a process
+    # WITHOUT the native cache that uses the pandas OHLC frame instead).
+    if not _MAE_PYTHON_REF:
+        import algotest_native as _an_mae
+        if not _an_mae.is_loaded():
+            raise RuntimeError(
+                "MAE/MFE requires the native cache loaded — no Python fallback per policy"
+            )
+        _recs = df.to_dict("records")
+        for _r0 in _recs:
+            for _dc in ("Entry Date", "Exit Date"):
+                _v = _r0.get(_dc)
+                if hasattr(_v, "strftime"):
+                    _r0[_dc] = _v.strftime("%d-%m-%Y")
+        _pairs = _an_mae.compute_mae_mfe_batch(
+            _recs, index_str.upper(), list(trading_days)
+        )
+        if _pairs is None or len(_pairs) != len(df):
+            raise RuntimeError(
+                "Rust compute_mae_mfe_batch returned an invalid result "
+                f"(got {None if _pairs is None else len(_pairs)}, need {len(df)}) "
+                "— no Python fallback per policy"
+            )
+        df["MAE"] = [p[0] for p in _pairs]
+        df["MFE"] = [p[1] for p in _pairs]
+        return _apply_futures_mae_mfe(df, index_str, trading_days)
 
     try:
         import polars as pl
@@ -1527,6 +1586,54 @@ def _compute_mae_mfe_batch(
 
     df["MAE"] = mae_vals
     df["MFE"] = mfe_vals
+    return _apply_futures_mae_mfe(df, index_str, trading_days)
+
+
+def _apply_futures_mae_mfe(df, index_str, trading_days):
+    """Overwrite MAE/MFE on FUTURES rows with the feather-batch futures MAE/MFE.
+    The option-oriented batches leave FUT rows at 0; this fills them from the
+    FUTIDX high/low feather (same extremes math as options). Additive — option
+    rows are never touched. Same % units as the option MAE/MFE above."""
+    try:
+        if df is None or getattr(df, "empty", True) or "Type" not in df.columns:
+            return df
+        if not (df["Type"].astype(str).str.upper() == "FUT").any():
+            return df
+        import pandas as _pd
+        from services.engine_rust import _fut_leg_mae_mfe
+
+        def _iso(v):
+            if isinstance(v, str) and len(v) == 10 and v[2] == "-" and v[5] == "-":
+                return _pd.to_datetime(v, format="%d-%m-%Y").strftime("%Y-%m-%d")
+            return _pd.Timestamp(v).strftime("%Y-%m-%d")
+
+        _std = sorted({_iso(x) for x in trading_days})
+        for i in range(len(df)):
+            if str(df.iloc[i].get("Type") or "").upper() != "FUT":
+                continue
+            r = df.iloc[i]
+            try:
+                _xp = r.get("Exit Price")
+                mae, mfe = _fut_leg_mae_mfe(
+                    symbol=index_str.upper(),
+                    entry_date=_iso(r.get("Entry Date")),
+                    exit_date=_iso(r.get("Exit Date")),
+                    expiry=_iso(r.get("Expiry")),
+                    entry_price=float(r.get("Entry Price") or 0.0),
+                    position=str(r.get("B/S") or "SELL").upper(),
+                    entry_spot=float(r.get("Entry Spot") or 0.0),
+                    sorted_td=_std,
+                    exit_reason=r.get("Exit Reason"),
+                    exit_price=(float(_xp) if _xp not in (None, "") else None),
+                )
+                if mae is not None:
+                    df.at[df.index[i], "MAE"] = mae
+                if mfe is not None:
+                    df.at[df.index[i], "MFE"] = mfe
+            except Exception:
+                continue
+    except Exception:
+        return df
     return df
 
 
@@ -1619,6 +1726,14 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             run_rust_engine_pipeline,
             priced_to_tradesheet_records,
         )
+
+        # YEARLY: the pinned December cycles were resolved once during the
+        # rust_context preload; every combo reuses them. Without this the engine
+        # hard-fails ("reached the engine without 'yearly_cycles'") rather than
+        # silently trading the cadence contract.
+        _yearly_cycles = ctx.get("yearly_cycles")
+        if _yearly_cycles:
+            payload = {**payload, "yearly_cycles": _yearly_cycles}
 
         priced = run_rust_engine_pipeline(
             payload,
@@ -1736,7 +1851,9 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         # String formats trip pd.to_datetime(x, dayfirst=True): "2020-01-09"
         # becomes September 1 (YYYY-DD-MM), collapsing n_years to 0.01 and
         # blowing CAGR to 9e14. Timestamps pass through dayfirst cleanly.
-        _agg2, summary = compute_analytics(aggregated)
+        # NOTE: summary is NOT computed here any more — it is computed AFTER the
+        # per-leg propagation below, from the SAME frame shape the BACKTEST uses.
+        # (`_agg2` was always discarded; this call existed only for `summary`.)
 
         # Propagate trade-level Cumulative/Peak/DD/%DD onto the per-leg df.
         # Python convention: only the parent leg row of each trade carries these
@@ -1792,6 +1909,19 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         df["% P&L"]      = pct_vals
         df["Spot P&L"]   = spot_vals
 
+        # ── Summary: match the BACKTEST exactly (user rule: backtest is truth) ──
+        # The backtest (algotest_job.py:676) builds `pd.DataFrame(all_trades)` — EVERY
+        # leg row, in engine order, with Net P&L/Cumulative already on the parent rows —
+        # and hands THAT to compute_analytics. This path used to hand it the groupby-
+        # aggregated, Entry-Date-SORTED frame instead. Same function, different input →
+        # different answers for byte-identical trades: n_years and the spot change come
+        # from the FIRST/LAST row (a different last row flipped CAGR(Spot) -8.58 -> +8.34)
+        # and Max DD walks the equity curve in ROW ORDER. Sums/counts (trades, Net P&L,
+        # win%, expectancy) were unaffected, which is why only CAGR/DD diverged.
+        # `df` here is already the backtest's shape: per-leg rows, engine order (the
+        # chronological sort happens further down), dates still Timestamps.
+        _, summary = compute_analytics(df.copy())
+
         # MAE/MFE and Live DD are always computed — never skipped. (Previously
         # skipped per-combo when OPTIMIZE_SKIP_MAE_MFE was set, to save ~1.5s/combo,
         # but that left tradesheets with silently zeroed MAE/MFE whenever the
@@ -1826,6 +1956,45 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         return None
 
 
+def _run_single_backtest_multi_index(
+    payload: Dict[str, Any]
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Multi-index combo (payload['multi_index_mode'] set): route to the SAME feature
+    the DIRECT backtest uses, so EVERY leg is priced from its OWN index series
+    (per-leg index honored) instead of the single base-index Rust context. Without
+    this the optimizer priced e.g. a MIDCPNIFTY futures leg against the NIFTY series
+    (even producing pre-2022 futures prices MIDCPNIFTY never had).
+
+    Reuses run_sync_weekly_cadence / run_multi_index_feature verbatim (no calc logic
+    duplicated) → the per-combo tradesheet == a direct multi-index backtest for the
+    same combo. Returns (trades_df, summary) in the same shape as the Rust fast path.
+    """
+    import pandas as pd
+    from services.algotest_job import _resolve_effective_request
+    from services.multi_index_feature import (
+        run_multi_index_feature,
+        run_sync_weekly_cadence,
+    )
+    p = _resolve_effective_request(dict(payload))
+    _from = p.get("_effective_from") or p.get("from_date") or p.get("date_from")
+    _to = p.get("_effective_to") or p.get("to_date") or p.get("date_to")
+    if p.get("sync_weekly_roll"):
+        result = run_sync_weekly_cadence(p, _from, _to)
+    else:
+        result = run_multi_index_feature(p, _from, _to)
+    result = result or {}
+    df = pd.DataFrame(result.get("trades") or [])
+    # Normalize dates to DD-MM-YYYY strings — same shape the Rust fast path returns,
+    # so the downstream metrics / CSV builders see a consistent tradesheet.
+    for c in ("Entry Date", "Exit Date", "Leg Exit Date"):
+        if c in df.columns:
+            df[c] = pd.to_datetime(
+                df[c], errors="coerce", format="mixed", dayfirst=True
+            ).dt.strftime("%d-%m-%Y")
+    return df, (result.get("summary") or {})
+
+
 def _run_single_backtest(payload: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Run engine + analytics for one combo. Assumes market data already loaded.
@@ -1837,6 +2006,13 @@ def _run_single_backtest(payload: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[st
 
     Returns (trades_df, summary).
     """
+    # Multi-index combos are priced per-leg from each leg's OWN index series via the
+    # SAME path the direct backtest uses. The single base-index Rust fast path below
+    # cannot do this — it would price every leg (e.g. a MIDCPNIFTY future) against the
+    # base index (NIFTY). See _run_single_backtest_multi_index.
+    if payload.get("multi_index_mode"):
+        return _run_single_backtest_multi_index(payload)
+
     fast = _run_single_backtest_rust_fast(payload)
     if fast is not None:
         return fast
@@ -2249,6 +2425,10 @@ def run_optimization(
                     midcap_spot_adjustment=_seq_mc_sa,
                     midcap_symbol=_seq_mc_sym,
                     filter_segments=_seq_filter_segments,
+                    # YEARLY: WOW keys on Exit Date, not the (single) December
+                    # Expiry — see build_wow_mom. Combos never vary expiry_type,
+                    # so the run's base payload is the right source.
+                    yearly=str(base_payload.get("expiry_type") or "").upper() == "YEARLY",
                 )
 
             if tell is not None:

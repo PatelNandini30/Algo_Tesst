@@ -265,6 +265,18 @@ echo ""
 echo "[4/5] Service Status:"
 docker compose ps
 
+# Feather integrity self-heal — a warm racing the worker restart can truncate the
+# :full spot feather (spot loads request-bounded while options load wide → base.py
+# deletes the inconsistent pair → a narrow warm rewrites it short). rust_fast_path's
+# guard blocks that at runtime, but a warm racing the very restart that loads the new
+# guard can still slip one through. This rebuilds any short feather AFTER the stack is
+# healthy. Cache-only, non-fatal, and a healthy feather is a no-op.
+echo ""
+echo "[4.5/5] Verifying feather integrity (self-heal any truncated cache)..."
+docker compose exec -T -w /app -e PYTHONPATH=/app worker-backtests \
+  python3 verify_feathers.py 2>&1 \
+  | grep -aE "VERIFY_FEATHERS|: OK|TRUNCATED|REBUILT|FAILED|WARNING" | sed 's/^/  /' || true
+
 # Show logs
 echo ""
 echo "[5/5] Showing logs (Ctrl+C to stop watching)..."

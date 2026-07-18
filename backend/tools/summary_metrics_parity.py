@@ -15,6 +15,8 @@ from tools.parity_harness import PAYLOADS
 from services.algotest_job import execute_algotest_job
 from services.optimizer.excel_builder import compute_xlsx_summary_metrics as cxsm
 from services.optimizer.excel_builder import compute_midcap_for_rows
+import services.optimizer.excel_builder as _eb
+_eb._SUMMARY_PYTHON_REF = True  # this harness diffs the Python engine vs Rust — force Python
 
 _MIDCAP_LEGS = [{"midcap_mode": "hypothetical", "position": "buy", "lots": 1, "symbol": "NIFTYMIDCAP100"}]
 

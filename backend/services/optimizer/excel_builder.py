@@ -11,6 +11,7 @@ import calendar
 import io
 import logging
 import math
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -117,7 +118,7 @@ _DATE_COLS = {
     "Entry Date", "Exit Date", "Expiry",
     "Leg Exit Date", "Lazy Entry Date", "Lazy Exit Date",
 }
-_TRUE_PCT_COLS = {"Spot P&L %", "CE P&L %", "PE P&L %", "%DD"}
+_TRUE_PCT_COLS = {"Spot P&L %", "CE P&L %", "PE P&L %", "FUT P&L %", "%DD"}
 _MAE_COLS      = {"MAE", "MFE", "Net MAE 1", "Net MAE 2", "Final MAE",
                   "Midcap MAE", "Midcap MFE",
                   "Combined Net MAE 1", "Combined Net MAE 2", "Combined Final MAE"}
@@ -137,8 +138,10 @@ _COL_WIDTHS: Dict[str, int] = {
     "MAE": 9, "MFE": 9, "Net MAE 1": 10, "Net MAE 2": 10, "Final MAE": 10,
     "Net P&L": 10, "% P&L": 8, "Cumulative": 11, "Peak": 10, "DD": 9, "%DD": 8,
     "Lowest NAV": 13, "Actual Live DD": 15,
-    "Spot P&L %": 10, "CE P&L %": 10, "PE P&L %": 10,
-    "Exit Reason": 14, "Expiry": 12, "STR Segment": 14, "Filter Segment": 22,
+    "Spot P&L %": 10, "CE P&L %": 10, "PE P&L %": 10, "FUT P&L %": 10,
+    "ATM Strike": 11, "ATM Call Price": 13, "ATM Put Price": 13, "ATM Call+Put Price": 16,
+    "ATM Straddle Price Source": 40,
+    "Exit Reason": 14, "Strike Shift Reason": 40, "Expiry": 12, "STR Segment": 14, "Filter Segment": 22,
     "Midcap Entry Spot": 15, "Midcap Exit Spot": 15, "Midcap Spot P&L": 14,
     "Midcap Spot P&L %": 15, "Midcap No Of Days": 15, "Midcap Rollover Cost %": 18,
     "Midcap Hypo P&L": 15, "Midcap Hypo P&L %": 16, "Midcap MAE": 12, "Midcap MFE": 12,
@@ -312,12 +315,29 @@ def _build_key_order(rows: List[Dict], has_midcap: bool = False) -> List[str]:
     )
     has_str       = any(r.get("STR Segment")    not in (None, "") for r in rows)
     has_filter    = any(r.get("Filter Segment") not in (None, "") for r in rows)
+    # Strike Shift Reason — shown only when the engine shifted a strike toward
+    # ATM because the requested strike had zero turnover (so the user can see
+    # WHY a non-ATM strike was taken). Mirrors buildTradeExcel.js hasStrikeShift.
+    has_strike_shift = any(r.get("Strike Shift Reason") not in (None, "") for r in rows)
+    # Straddle-width context columns present only when the engine populated them
+    # (i.e. a straddle_width leg ran). Hidden for every other strike mode.
+    has_straddle  = any(r.get("ATM Strike") not in (None, "") for r in rows)
+    # Shown only when the ATM CE/PE straddle price itself was illiquid at the
+    # leg's own strike gap and had to be sourced from a wider gap — separate
+    # from Strike Shift Reason (which is about the final TRADED strike).
+    has_straddle_price_source = any(
+        r.get("ATM Straddle Price Source") not in (None, "") for r in rows
+    )
 
     order = [
         "Trade", "Leg", "Index", "Entry Date", "Exit Date", "Expiry",
         "Entry Spot", "Exit Spot", "Spot P&L", "Spot P&L %",
         "Type", "Strike",
     ]
+    if has_straddle:
+        order += ["ATM Strike", "ATM Call Price", "ATM Put Price", "ATM Call+Put Price"]
+        if has_straddle_price_source:
+            order.append("ATM Straddle Price Source")
     if has_buffer:
         order += ["buffer_ref_price", "buffer_strike_offset"]
     order.append("B/S")
@@ -338,7 +358,7 @@ def _build_key_order(rows: List[Dict], has_midcap: bool = False) -> List[str]:
     if has_puts:
         order += ["PE P&L", "PE P&L %"]
     if has_futures:
-        order.append("FUT P&L")
+        order += ["FUT P&L", "FUT P&L %"]
     # NIFTY trade-level P&L / NAV / drawdown — dropped from the Midcap sheet
     # (Combined versions in _MIDCAP_COLS replace them).
     if not has_midcap:
@@ -346,6 +366,8 @@ def _build_key_order(rows: List[Dict], has_midcap: bool = False) -> List[str]:
     if has_midcap:
         order += _MIDCAP_COLS
     order.append("Exit Reason")
+    if has_strike_shift:
+        order.append("Strike Shift Reason")
     if has_str:
         order.append("STR Segment")
     if has_filter:
@@ -403,7 +425,17 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
                 (_to_num(l.get("FUT P&L")) or 0)
                 for l in legs
             )
-        _pct = (raw_net / spot * 100) if spot != 0 else 0.0
+        # Multi-index trade (legs span >1 index): its return is the SUM of each leg's
+        # OWN % (leg P&L ÷ that leg's own-index spot), pre-computed as the parent row's
+        # "% P&L" — NOT Net ÷ one index's spot. Single-index / Midcap100-overlay trades
+        # (one Group Index) keep the Net ÷ Entry Spot behaviour, unchanged.
+        _idxs = {str(l.get("Group Index") or "").upper() for l in legs}
+        _idxs.discard("")
+        _stored_pct = _to_num(main.get("% P&L"))
+        if len(_idxs) > 1 and _stored_pct is not None:
+            _pct = _stored_pct
+        else:
+            _pct = (raw_net / spot * 100) if spot != 0 else 0.0
         mae_res = _calc_trade_mae(legs, _pct)
 
         tm[k] = {
@@ -418,7 +450,14 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
             "pctDd":      "",
             "lowestNav":  "",
             "actualLDD":  "",
-            "exitReason": (main.get("Exit Reason") or "").strip(),
+            # Union of ALL legs' exit reasons (used only for FILTER_END patchwise-
+            # reset detection, never displayed). A mixed options+futures trade's
+            # MAIN leg is the futures leg (exit reason EXPIRY), so a FILTER_END on
+            # the option leg would be missed and the patchwise reset would never
+            # fire. Unioning makes the detection leg-order-independent.
+            "exitReason": "+".join(
+                r for r in ((l.get("Exit Reason") or "").strip() for l in legs) if r
+            ),
         }
 
     # Booked Cumulative / Peak / DD / %DD and Lowest NAV / Actual Live DD pass.
@@ -683,6 +722,11 @@ def _build_cleaned_rows(rows: List[Dict], key_order: List[str], tm: Dict,
                 pnl = _to_num(trade.get("PE P&L"))
                 es  = _to_num(trade.get("Entry Spot"))
                 val = (pnl / es) if (pnl is not None and es and es != 0) else ""
+            elif key == "FUT P&L %":
+                # Per-leg futures P&L as a fraction of Entry Spot (matches CE/PE P&L %).
+                pnl = _to_num(trade.get("FUT P&L"))
+                es  = _to_num(trade.get("Entry Spot"))
+                val = (pnl / es) if (pnl is not None and es and es != 0) else ""
             else:
                 val = trade.get(key, "")
             if val is None or (isinstance(val, float) and math.isnan(val)):
@@ -696,6 +740,39 @@ def _build_cleaned_rows(rows: List[Dict], key_order: List[str], tm: Dict,
 
 def _write_patch_wise_sheet(
     wb: Workbook,
+    tm: Dict,
+    grouped: Dict,
+    sorted_keys: List[str],
+    has_midcap: bool,
+    midcap_by_trade: Optional[Dict],
+    has_calls: bool,
+    has_puts: bool,
+    filter_segments: Optional[List] = None,
+) -> None:
+    """openpyxl reference path — build the Patch wise sheet into wb (or nothing
+    when there are no patches, matching the original early return)."""
+    ws = wb.create_sheet("Patch wise")
+    sink = _OpenpyxlSink(ws)
+    _patch_wise_layout(sink, tm, grouped, sorted_keys, has_midcap, midcap_by_trade,
+                       has_calls, has_puts, filter_segments)
+    if not sink.wrote:
+        wb.remove(ws)
+
+
+def _patch_wise_ops(
+    tm, grouped, sorted_keys, has_midcap, midcap_by_trade,
+    has_calls, has_puts, filter_segments=None,
+) -> Optional[Dict]:
+    """Rust path — return the Patch wise layout as a plain ops dict, or None when
+    there are no patches (no sheet)."""
+    sink = _OpsSink("Patch wise")
+    _patch_wise_layout(sink, tm, grouped, sorted_keys, has_midcap, midcap_by_trade,
+                       has_calls, has_puts, filter_segments)
+    return sink.to_dict() if sink.cells else None
+
+
+def _patch_wise_layout(
+    sink,
     tm: Dict,
     grouped: Dict,
     sorted_keys: List[str],
@@ -724,10 +801,13 @@ def _write_patch_wise_sheet(
                      and not l.get("ReEntryMode") and not _is_lazy(l)), legs[0] if legs else {})
         spot = _to_num(main.get("Entry Spot")) or 0.0
         mc = (midcap_by_trade or {}).get(k) or {}
-        # NIFTY phase uses whatever option leg(s) are present (CE and/or PE), not
-        # just CE — so SELL PE / BUY PE / CE+PE all work. Sum option-leg P&L + MAE.
-        opt_legs = [l for l in legs if str(l.get("Type") or "").upper() in ("CE", "CALL", "PE", "PUT")]
-        nifty_pnl = sum((_to_num(l.get("CE P&L")) or 0.0) + (_to_num(l.get("PE P&L")) or 0.0) for l in opt_legs)
+        # Phase uses whatever DIRECTIONAL leg(s) are present — option legs (CE and/or
+        # PE) AND futures legs — so SELL PE / BUY PE / CE+PE / CE+FUT / FUT-only all
+        # work. The patch-wise DD must reflect the COMBINED position (options +
+        # futures); summing option P&L alone silently dropped a futures leg's P&L from
+        # the drawdown. Options-only runs are unchanged (no FUT rows to add).
+        opt_legs = [l for l in legs if str(l.get("Type") or "").upper() in ("CE", "CALL", "PE", "PUT", "FUT")]
+        nifty_pnl = sum((_to_num(l.get("CE P&L")) or 0.0) + (_to_num(l.get("PE P&L")) or 0.0) + (_to_num(l.get("FUT P&L")) or 0.0) for l in opt_legs)
         nifty_mae = sum((_to_num(l.get("MAE")) or 0.0) for l in opt_legs) if opt_legs else None
         cfm = t.get("combinedFinalMae", "")
         entry = main.get("Entry Date", "")
@@ -816,7 +896,12 @@ def _write_patch_wise_sheet(
                 "cagr": cagr, "pnl_sum": pnl_sum,
                 "live_dd_min": live_dd_min if live_dd_min != float("inf") else None}
 
-    _opt = "CE+PE" if (has_calls and has_puts) else ("CE" if has_calls else ("PE" if has_puts else "Options"))
+    # Derived locally (not a param) so callers/signatures stay unchanged: does any
+    # trade carry a futures leg? Drives the phase title so a mixed run reads e.g.
+    # "Nifty CE + FUT" instead of hiding the futures leg.
+    has_futures = any(str(l.get("Type") or "").upper() == "FUT"
+                      for legs in grouped.values() for l in legs)
+    _opt = " + ".join(n for n, h in (("CE", has_calls), ("PE", has_puts), ("FUT", has_futures)) if h) or "Options"
     nifty_title = f"Nifty {_opt}"
     _nifty_phase = {"title": nifty_title, "kind": "std", "dates": False,
          "drive": lambda td: td["callPct"], "mae": lambda td: td["callMae"],
@@ -834,20 +919,15 @@ def _write_patch_wise_sheet(
          "side_hdr": ["Entry","Exit","CAGR","Net P&L %","Live DD"]},
     ] if has_midcap else [_nifty_phase]
 
-    ws = wb.create_sheet("Patch wise")
-    ws.freeze_panes = "A5"
+    sink.freeze(4, 0)
 
-    def _hdr(r, c, val, bg=_HEADER_BG, tx=_WHITE_TXT, align=_CENTER):
-        cell = ws.cell(row=r, column=c, value=val)
-        cell.font = _font(True, 10, tx); cell.fill = _fill(bg)
-        cell.alignment = align; cell.border = _border()
+    def _hdr(r, c, val, bg=_HEADER_BG, tx=_WHITE_TXT, align="C"):
+        sink.cell(r, c, val, bold=True, size=10, fc=tx, bg=bg, align=align, border=True)
 
     def _val(r, c, val, num_fmt=None):
-        cell = ws.cell(row=r, column=c, value=(val if val is not None else ""))
-        cell.font = _font(False, 10)
-        if isinstance(val, (int, float)) and num_fmt:
-            cell.number_format = num_fmt
-        cell.alignment = _CENTER; cell.border = _border()
+        nf = num_fmt if (isinstance(val, (int, float)) and num_fmt) else None
+        sink.cell(r, c, (val if val is not None else ""), bold=False, size=10,
+                  fc="000000", bg=None, align="C", border=True, nfmt=nf)
 
     col = 1
     for phase in PHASES:
@@ -857,17 +937,13 @@ def _write_patch_wise_sheet(
         side_start = col + dW + 1
 
         # Row 1 — block title
-        t_cell = ws.cell(row=1, column=detail_start, value=phase["title"])
-        t_cell.font = _font(True, 11, _WHITE_TXT); t_cell.fill = _fill(_NAVY_BG)
-        t_cell.alignment = _LEFT
-        ws.merge_cells(start_row=1, start_column=detail_start,
-                       end_row=1, end_column=detail_start + dW - 1)
+        sink.cell(1, detail_start, phase["title"], bold=True, size=11,
+                  fc=_WHITE_TXT, bg=_NAVY_BG, align="L")
+        sink.merge(1, detail_start, detail_start + dW - 1)
         # Row 2 — subtitle
-        s_cell = ws.cell(row=2, column=detail_start, value="Phase wise Distribution")
-        s_cell.font = _font(True, 9, _SUB_HDR_TX); s_cell.fill = _fill(_SUB_HDR_BG)
-        s_cell.alignment = _LEFT
-        ws.merge_cells(start_row=2, start_column=detail_start,
-                       end_row=2, end_column=detail_start + dW - 1)
+        sink.cell(2, detail_start, "Phase wise Distribution", bold=True, size=9,
+                  fc=_SUB_HDR_TX, bg=_SUB_HDR_BG, align="L")
+        sink.merge(2, detail_start, detail_start + dW - 1)
         # Row 4 — detail headers
         for i, h in enumerate(phase["detail_hdr"]):
             _hdr(4, detail_start + i, h)
@@ -913,14 +989,63 @@ def _write_patch_wise_sheet(
 
         # Column widths
         for i in range(dW):
-            ws.column_dimensions[get_column_letter(detail_start + i)].width = 12
+            sink.col_width(detail_start + i, 12)
         for i in range(len(phase["side_hdr"])):
-            ws.column_dimensions[get_column_letter(side_start + i)].width = 12
+            sink.col_width(side_start + i, 12)
 
         col = side_start + len(phase["side_hdr"]) + 1
 
 
 # ── Sheet 1: Trade Sheet ──────────────────────────────────────────────────────
+
+def _write_rules_sheet(wb: Workbook, rules_sheet: List) -> None:
+    """Render a standalone leg-wise "Rules" sheet as the FIRST tab of the workbook.
+
+    `rules_sheet` is a list of typed rows built client-side from the strategy
+    payload (frontend buildRulesSheet), so the sheet reflects the full
+    configuration: strategy-level rules plus one section per leg (options CE/PE,
+    futures, or midcap overlay) with that leg's own strike/SL/target/slippage.
+    Row forms: ["title", text] · ["section", text] · ["kv", label, value] ·
+    ["spacer"].
+    """
+    ws = wb.create_sheet("Rules", 0)  # index 0 → first tab
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 58
+    wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    r = 1
+    for row in (rules_sheet or []):
+        if not row:
+            continue
+        kind = str(row[0] or "")
+        if kind == "title":
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+            c = ws.cell(row=r, column=1, value=(row[1] if len(row) > 1 else ""))
+            c.font = _font(bold=True, size=14, color=_WHITE_TXT)
+            c.fill = _fill(_NAVY_BG); c.alignment = _CENTER
+            ws.row_dimensions[r].height = 28
+        elif kind == "section":
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+            c = ws.cell(row=r, column=1, value="  " + (row[1] if len(row) > 1 else ""))
+            c.font = _font(bold=True, size=11, color=_WHITE_TXT)
+            c.fill = _fill(_SECTION_BG); c.alignment = _LEFT
+            ws.row_dimensions[r].height = 20
+        elif kind == "kv":
+            label = row[1] if len(row) > 1 else ""
+            value = row[2] if len(row) > 2 else ""
+            lc = ws.cell(row=r, column=1, value=label)
+            lc.font = _font(bold=True, size=10, color=_DARK2_TXT)
+            lc.fill = _fill(_LABEL_BG); lc.alignment = _LEFT; lc.border = _border()
+            vc = ws.cell(row=r, column=2, value=("" if value is None else value))
+            vc.font = _font(size=10, color=_DARK_TXT)
+            vc.fill = _fill(_WHITE); vc.alignment = wrap; vc.border = _border()
+            ws.row_dimensions[r].height = 18
+        elif kind == "spacer":
+            ws.row_dimensions[r].height = 6
+        else:
+            continue
+        r += 1
+    ws.freeze_panes = "A2"
+
 
 def _write_trade_sheet(wb: Workbook, cleaned: List[Dict], key_order: List[str]) -> None:
     ws = wb.create_sheet("Trade Sheet")
@@ -930,7 +1055,6 @@ def _write_trade_sheet(wb: Workbook, cleaned: List[Dict], key_order: List[str]) 
         ws.column_dimensions[get_column_letter(ci)].width = _COL_WIDTHS.get(key, 10)
 
     # Header
-    hdr = ws.append
     hdr_row = ws.row_dimensions[1]
     hdr_row.height = 22
     for ci, key in enumerate(key_order, 1):
@@ -1010,6 +1134,75 @@ def _write_trade_sheet(wb: Workbook, cleaned: List[Dict], key_order: List[str]) 
 
 # ── Sheet 2: Summary ─────────────────────────────────────────────────────────
 
+class _OpenpyxlSink:
+    """Writes layout ops directly into an openpyxl worksheet (the reference path)."""
+    def __init__(self, ws):
+        self.ws = ws
+        self.wrote = False
+
+    def cell(self, r, c, v, bold=False, size=10, fc="000000", bg=None,
+             align="L", border=False, nfmt=None):
+        self.wrote = True
+        cell = self.ws.cell(row=r, column=c, value=v)
+        cell.font = _font(bold=bold, size=size, color=fc)
+        if bg is not None:
+            cell.fill = _fill(bg)
+        cell.alignment = _CENTER if align == "C" else _LEFT
+        if border:
+            cell.border = _border()
+        if nfmt:
+            cell.number_format = nfmt
+
+    def merge(self, r, c1, c2):
+        self.ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
+
+    def row_height(self, r, h):
+        self.ws.row_dimensions[r].height = h
+
+    def col_width(self, c, w):
+        self.ws.column_dimensions[get_column_letter(c)].width = w
+
+    def freeze(self, nrows, ncols):
+        # nrows/ncols = count of frozen rows/cols (rust set_freeze_panes semantics).
+        self.ws.freeze_panes = f"{get_column_letter(ncols + 1)}{nrows + 1}"
+
+
+class _OpsSink:
+    """Records layout ops as plain data for the Rust layout writer
+    (algotest_native.write_layout_sheet_xlsx). Same call surface as _OpenpyxlSink so
+    the shared _summary_layout builds an identical sheet through either backend."""
+    def __init__(self, name):
+        self.name = name
+        self.cells = []
+        self.merges = []
+        self.row_heights = []
+        self.col_widths = []
+        self._freeze = None
+
+    def cell(self, r, c, v, bold=False, size=10, fc="000000", bg=None,
+             align="L", border=False, nfmt=None):
+        self.cells.append({"r": r, "c": c, "v": v, "bold": bold, "size": size,
+                           "fc": fc, "bg": bg, "align": align, "border": border,
+                           "nfmt": nfmt})
+
+    def merge(self, r, c1, c2):
+        self.merges.append((r, c1, c2))
+
+    def row_height(self, r, h):
+        self.row_heights.append((r, h))
+
+    def col_width(self, c, w):
+        self.col_widths.append((c, w))
+
+    def freeze(self, nrows, ncols):
+        self._freeze = (nrows, ncols)
+
+    def to_dict(self):
+        return {"name": self.name, "cells": self.cells, "merges": self.merges,
+                "row_heights": self.row_heights, "col_widths": self.col_widths,
+                "freeze": self._freeze}
+
+
 def _write_summary_sheet(
     wb: Workbook,
     cleaned: List[Dict],
@@ -1027,12 +1220,48 @@ def _write_summary_sheet(
     patchwise: bool = False,
     filter_segments: Optional[List] = None,
 ) -> None:
+    """openpyxl reference path — build the Summary sheet into wb."""
     ws = wb.create_sheet("Summary")
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 20
-    ws.column_dimensions["C"].width = 12
-    ws.column_dimensions["D"].width = 30
-    ws.column_dimensions["E"].width = 20
+    _summary_layout(_OpenpyxlSink(ws), cleaned, summary, tm, combo_label,
+                    from_date, to_date, has_calls, has_puts, has_futures,
+                    has_midcap, midcap_summary, chron_keys, patchwise, filter_segments)
+
+
+def _summary_ops(
+    cleaned, summary, tm, combo_label, from_date, to_date,
+    has_calls, has_puts, has_futures, has_midcap=False,
+    midcap_summary=None, chron_keys=None, patchwise=False, filter_segments=None,
+) -> Dict:
+    """Rust path — return the Summary layout as a plain ops dict (no openpyxl)."""
+    sink = _OpsSink("Summary")
+    _summary_layout(sink, cleaned, summary, tm, combo_label, from_date, to_date,
+                    has_calls, has_puts, has_futures, has_midcap, midcap_summary,
+                    chron_keys, patchwise, filter_segments)
+    return sink.to_dict()
+
+
+def _summary_layout(
+    sink,
+    cleaned: List[Dict],
+    summary: Dict[str, Any],
+    tm: Dict,
+    combo_label: str,
+    from_date: str,
+    to_date: str,
+    has_calls: bool,
+    has_puts: bool,
+    has_futures: bool,
+    has_midcap: bool = False,
+    midcap_summary: Optional[Dict] = None,
+    chron_keys: Optional[List[str]] = None,
+    patchwise: bool = False,
+    filter_segments: Optional[List] = None,
+) -> None:
+    sink.col_width(1, 30)
+    sink.col_width(2, 20)
+    sink.col_width(3, 12)
+    sink.col_width(4, 30)
+    sink.col_width(5, 20)
 
     S = summary or {}
     row = [1]
@@ -1058,40 +1287,29 @@ def _write_summary_sheet(
                     break
         return i
 
-    def _merge(r, c1="A", c2="E"):
-        ws.merge_cells(f"{c1}{r}:{c2}{r}")
+    def _merge(r, c1=1, c2=5):
+        sink.merge(r, c1, c2)
 
     def _title(text, r, bg=_NAVY_BG):
         _merge(r)
-        c = ws.cell(row=r, column=1, value=text)
-        c.font      = _font(bold=True, size=13, color=_WHITE_TXT)
-        c.fill      = _fill(bg)
-        c.alignment = _CENTER
-        ws.row_dimensions[r].height = 26
+        sink.cell(r, 1, text, bold=True, size=13, fc=_WHITE_TXT, bg=bg, align="C")
+        sink.row_height(r, 26)
 
     def _section(text, r):
         _merge(r)
-        c = ws.cell(row=r, column=1, value="  " + text)
-        c.font      = _font(bold=True, size=11, color=_WHITE_TXT)
-        c.fill      = _fill(_SECTION_BG)
-        c.alignment = _LEFT
-        ws.row_dimensions[r].height = 20
+        sink.cell(r, 1, "  " + text, bold=True, size=11, fc=_WHITE_TXT,
+                  bg=_SECTION_BG, align="L")
+        sink.row_height(r, 20)
 
     def _kv(label, value, r, col="A", alt=False, val_color=None):
         col_idx = ord(col.upper()) - ord("A") + 1
-        lc = ws.cell(row=r, column=col_idx, value=label)
-        vc = ws.cell(row=r, column=col_idx + 1, value=value)
-        lc.font = _font(bold=True, size=10, color=_DARK2_TXT)
-        lc.fill = _fill(_ALT_ROW if alt else _LABEL_BG)
-        lc.alignment = _LEFT
-        lc.border    = _border()
         num = _to_num(str(value or "").replace("+", "").replace("%", "").replace("₹", ""))
         auto_color = val_color or (_GREEN_TX if (num is not None and num >= 0) else _RED_TX if (num is not None and num < 0) else _DARK_TXT)
-        vc.font = _font(bold=True, size=10, color=auto_color)
-        vc.fill = _fill(_ALT_ROW if alt else _WHITE)
-        vc.alignment = _LEFT
-        vc.border    = _border()
-        ws.row_dimensions[r].height = 18
+        sink.cell(r, col_idx, label, bold=True, size=10, fc=_DARK2_TXT,
+                  bg=(_ALT_ROW if alt else _LABEL_BG), align="L", border=True)
+        sink.cell(r, col_idx + 1, value, bold=True, size=10, fc=auto_color,
+                  bg=(_ALT_ROW if alt else _WHITE), align="L", border=True)
+        sink.row_height(r, 18)
 
     # ── Compute stats from cleaned rows (mirrors JS) ──────────────────────────
     sum_pct = 0.0; sum_pos_pct = 0.0; sum_neg_pct = 0.0
@@ -1101,7 +1319,7 @@ def _write_summary_sheet(
     min_entry_ms = None; max_exit_ms = None
     spot_sum_gated = 0.0
     ce_sum = 0.0; pe_sum = 0.0; fut_sum = 0.0
-    ce_pct = 0.0; pe_pct = 0.0; spot_pct = 0.0
+    ce_pct = 0.0; pe_pct = 0.0; spot_pct = 0.0; fut_pct = 0.0
 
     def _parse_date_ms(v):
         d = _parse_date(v)
@@ -1114,6 +1332,11 @@ def _write_summary_sheet(
         cep = _to_num(t.get("CE P&L %")); ce_pct  += cep if cep is not None else 0
         pep = _to_num(t.get("PE P&L %")); pe_pct  += pep if pep is not None else 0
         spp = _to_num(t.get("Spot P&L %")); spot_pct += spp if spp is not None else 0
+        # FUT P&L % is not a stored column (computed per-row at write time), so derive
+        # it the same way — FUT P&L / Entry Spot — and accumulate for the Summary total.
+        _es = _to_num(t.get("Entry Spot"))
+        if fu is not None and _es not in (None, 0):
+            fut_pct += fu / _es
 
     # With a Midcap leg, ALL Performance Overview stats run on the COMBINED
     # (NIFTY + Midcap) per-trade P&L; otherwise NIFTY (unchanged). Combined
@@ -1374,10 +1597,9 @@ def _write_summary_sheet(
     if from_date or to_date:
         parts.append(f"{from_date or ''}{' → ' if from_date and to_date else ''}{to_date or ''}")
     parts.append(f"Generated: {datetime.now().strftime('%d %b %Y')}")
-    c2 = ws.cell(row=2, column=1, value="   ·   ".join(parts))
-    c2.font = _font(size=10, color="555555"); c2.alignment = _CENTER
-    c2.fill = _fill(_SUB_HDR_BG)
-    ws.row_dimensions[2].height = 16
+    sink.cell(2, 1, "   ·   ".join(parts), bold=False, size=10, fc="555555",
+              bg=_SUB_HDR_BG, align="C")
+    sink.row_height(2, 16)
 
     r = 4
     # ── SECTION 1: Performance Overview ──────────────────────────────────────
@@ -1409,42 +1631,37 @@ def _write_summary_sheet(
     # ROI vs Spot table
     def _hdr_cell(col, txt, rn):
         ci = ord(col.upper()) - ord("A") + 1
-        c = ws.cell(row=rn, column=ci, value=txt)
-        c.font = _font(bold=True, size=10, color=_WHITE_TXT)
-        c.fill = _fill(_HEADER_BG)
-        c.alignment = _CENTER; c.border = _border()
+        sink.cell(rn, ci, txt, bold=True, size=10, fc=_WHITE_TXT, bg=_HEADER_BG,
+                  align="C", border=True)
 
     _hdr_cell("A", "Type", r); _hdr_cell("B", "Sum", r); _hdr_cell("C", "%", r)
-    ws.merge_cells(f"D{r}:E{r}")
+    sink.merge(r, 4, 5)
     _hdr_cell("D", "ROI vs Spot", r)
-    ws.row_dimensions[r].height = 20
+    sink.row_height(r, 20)
     spot_row = r; r += 1
 
-    ws.merge_cells(f"D{spot_row + 1}:E{spot_row + 1}")
+    sink.merge(spot_row + 1, 4, 5)
     # With Midcap, ROI vs Spot = Combined % / Spot % shown as the raw ratio
     # (e.g. 1.5007); otherwise the existing percent display. sum_pct is already
     # Combined when has_midcap (the accumulation loop uses Combined values).
+    _roi_clr = _GREEN_TX if roi_pct >= 0 else _RED_TX
     if has_midcap:
-        roi_c = ws.cell(row=spot_row + 1, column=4, value=roi_pct)
-        roi_c.number_format = "General"
+        sink.cell(spot_row + 1, 4, roi_pct, bold=True, size=11, fc=_roi_clr,
+                  bg=_WHITE, align="C", border=True, nfmt="General")
     else:
-        roi_c = ws.cell(row=spot_row + 1, column=4, value=_fmt_pct(roi_pct))
-    roi_c.font = _font(bold=True, size=11, color=_GREEN_TX if roi_pct >= 0 else _RED_TX)
-    roi_c.fill = _fill(_WHITE); roi_c.alignment = _CENTER; roi_c.border = _border()
+        sink.cell(spot_row + 1, 4, _fmt_pct(roi_pct), bold=True, size=11, fc=_roi_clr,
+                  bg=_WHITE, align="C", border=True)
 
     def _type_row(label, value, pct_val):
-        lc = ws.cell(row=r, column=1, value=label)
-        vc = ws.cell(row=r, column=2, value=f"{float(value):,.2f}")
-        lc.font = _font(bold=True, size=10, color=_DARK2_TXT); lc.fill = _fill(_LABEL_BG)
-        lc.alignment = _LEFT; lc.border = _border()
-        vc.font = _font(bold=True, size=10, color=_GREEN_TX if value >= 0 else _RED_TX)
-        vc.fill = _fill(_WHITE); vc.alignment = _LEFT; vc.border = _border()
+        sink.cell(r, 1, label, bold=True, size=10, fc=_DARK2_TXT, bg=_LABEL_BG,
+                  align="L", border=True)
+        sink.cell(r, 2, f"{float(value):,.2f}", bold=True, size=10,
+                  fc=(_GREEN_TX if value >= 0 else _RED_TX), bg=_WHITE, align="L", border=True)
         if pct_val is not None:
             sign2 = "+" if pct_val >= 0 else ""
-            pc = ws.cell(row=r, column=3, value=f"{sign2}{float(pct_val):.2f}%")
-            pc.font = _font(bold=True, size=10, color=_GREEN_TX if pct_val >= 0 else _RED_TX)
-            pc.fill = _fill(_WHITE); pc.alignment = _LEFT; pc.border = _border()
-        ws.row_dimensions[r].height = 18
+            sink.cell(r, 3, f"{sign2}{float(pct_val):.2f}%", bold=True, size=10,
+                      fc=(_GREEN_TX if pct_val >= 0 else _RED_TX), bg=_WHITE, align="L", border=True)
+        sink.row_height(r, 18)
 
     # Use backend summary for Spot P&L sum and Spot P&L %.  After the engine
     # fix that puts Spot P&L only on first-leg rows, the local sums match
@@ -1457,7 +1674,7 @@ def _write_summary_sheet(
     _type_row("Spot P&L", _spot_sum_summary, _spot_pct_summary); r += 1
     if has_calls:   _type_row("CE P&L",        ce_sum,             ce_pct * 100);           r += 1
     if has_puts:    _type_row("PE P&L",         pe_sum,             pe_pct * 100);           r += 1
-    if has_futures: _type_row("FUT P&L",        fut_sum,            None);                   r += 1
+    if has_futures: _type_row("FUT P&L",        fut_sum,            fut_pct * 100);          r += 1
     if has_calls and has_puts:
         _type_row("CE + PE P&L", ce_sum + pe_sum, (ce_pct + pe_pct) * 100); r += 1
     # Midcap leg P&L + Combined rows (matches the backtest Summary Type block).
@@ -1484,11 +1701,10 @@ def _write_summary_sheet(
     _kv("Max DD Days",   str(mdd_dur or "—"),  r, "D", False, _RED_TX); r += 1
 
     dd_period = f"{mdd_start}  →  {mdd_end}" if (mdd_start and mdd_end) else "—"
-    ws.merge_cells(f"A{r}:E{r}")
-    ddc = ws.cell(row=r, column=1, value=f"Drawdown Period:  {dd_period}")
-    ddc.font = _font(bold=True, size=10, color=_RED_TX)
-    ddc.fill = _fill(_RED_BG); ddc.alignment = _CENTER; ddc.border = _border()
-    ws.row_dimensions[r].height = 18; r += 1
+    sink.merge(r, 1, 5)
+    sink.cell(r, 1, f"Drawdown Period:  {dd_period}", bold=True, size=10, fc=_RED_TX,
+              bg=_RED_BG, align="C", border=True)
+    sink.row_height(r, 18); r += 1
 
     _kv("Return / MaxDD", f"{car_mdd:.4f}", r, "A", True, _GREEN_TX if car_mdd >= 0 else _RED_TX); r += 1
 
@@ -1508,12 +1724,11 @@ def _write_summary_sheet(
 
     # Set wider column widths for month table
     for ci in range(1, len(mth_hdr) + 1):
-        col_key = get_column_letter(ci)
-        if ci == 1: ws.column_dimensions[col_key].width = 8
-        elif ci <= 13: ws.column_dimensions[col_key].width = 9
-        elif ci == 14: ws.column_dimensions[col_key].width = 10
-        elif ci == 15: ws.column_dimensions[col_key].width = 18
-        else: ws.column_dimensions[col_key].width = 10
+        if ci == 1: sink.col_width(ci, 8)
+        elif ci <= 13: sink.col_width(ci, 9)
+        elif ci == 14: sink.col_width(ci, 10)
+        elif ci == 15: sink.col_width(ci, 18)
+        else: sink.col_width(ci, 10)
 
     by_ym:     Dict[str, List[float]] = {}
     by_ym_pct: Dict[str, List[float]] = {}
@@ -1562,14 +1777,15 @@ def _write_summary_sheet(
                 r_mdd = (total / abs(max_dd_yr)) if (max_dd_yr and max_dd_yr != 0 and total != 0) else ""
             row_data = [yr, *[round(v, 2) for v in mos], round(total, 2),
                         max_dd_yr if max_dd_yr is not None else "", r_mdd]
-            ws.row_dimensions[r].height = 18
+            sink.row_height(r, 18)
             for ci2, val in enumerate(row_data, 1):
-                c = ws.cell(row=r, column=ci2, value=val)
+                cell_val = val
+                nfmt = None
                 is_val  = 2 <= ci2 <= 13
                 is_tot  = ci2 == 14
                 if is_pct and (is_val or is_tot) and isinstance(val, (int, float)):
-                    c.value = val / 100
-                    c.number_format = "0.00%"
+                    cell_val = val / 100
+                    nfmt = "0.00%"
                     num_v = val
                 elif ci2 == 15 and isinstance(val, (int, float)):
                     # Max DD here is `by_yr_max_dd`, sourced from the cleaned
@@ -1577,44 +1793,41 @@ def _write_summary_sheet(
                     # which is already a fraction (dd/peak, no *100) — same
                     # convention the per-trade detail sheet uses as-is via
                     # _TRUE_PCT_COLS. Don't divide again here.
-                    c.value = val
-                    c.number_format = "0.00%"
+                    cell_val = val
+                    nfmt = "0.00%"
                     num_v = val
                 elif is_pct and ci2 == 14 and isinstance(val, (int, float)):
-                    c.value = val
-                    c.number_format = "0.00%"
+                    cell_val = val
+                    nfmt = "0.00%"
                     num_v = val
                 else:
                     num_v = val if isinstance(val, (int, float)) else None
                 if (is_val or is_tot) and num_v is not None and num_v != 0:
-                    c.font = _font(bold=True, size=10, color=_GREEN_TX if num_v >= 0 else _RED_TX)
-                    c.fill = _fill(_GREEN_BG if num_v >= 0 else _RED_BG)
+                    bold = True; fc = _GREEN_TX if num_v >= 0 else _RED_TX
+                    bg = _GREEN_BG if num_v >= 0 else _RED_BG
                 elif ci2 == 1:
-                    c.font = _font(bold=True, size=10, color=_SUB_HDR_TX)
-                    c.fill = _fill(_SUB_HDR_BG)
+                    bold = True; fc = _SUB_HDR_TX; bg = _SUB_HDR_BG
                 else:
-                    c.font = _font(size=10)
-                    c.fill = _fill(_WHITE if yi % 2 == 0 else _ALT_ROW)
-                c.alignment = _CENTER; c.border = _border()
+                    bold = False; fc = "000000"; bg = _WHITE if yi % 2 == 0 else _ALT_ROW
+                sink.cell(r, ci2, cell_val, bold=bold, size=10, fc=fc, bg=bg,
+                          align="C", border=True, nfmt=nfmt)
             r += 1
 
+    def _month_header():
+        nonlocal r
+        sink.row_height(r, 20)
+        for ci2, h in enumerate(mth_hdr, 1):
+            sink.cell(r, ci2, h, bold=True, size=10, fc=_WHITE_TXT, bg=_HEADER_BG,
+                      align="C", border=True)
+        r += 1
+
     # Month header
-    ws.row_dimensions[r].height = 20
-    for ci2, h in enumerate(mth_hdr, 1):
-        c = ws.cell(row=r, column=ci2, value=h)
-        c.font = _font(bold=True, size=10, color=_WHITE_TXT)
-        c.fill = _fill(_HEADER_BG); c.alignment = _CENTER; c.border = _border()
-    r += 1
+    _month_header()
     _render_mth_rows(by_ym, False)
 
     r += 1
     _section("MONTHLY RETURNS (% Net P&L)", r); r += 1
-    ws.row_dimensions[r].height = 20
-    for ci2, h in enumerate(mth_hdr, 1):
-        c = ws.cell(row=r, column=ci2, value=h)
-        c.font = _font(bold=True, size=10, color=_WHITE_TXT)
-        c.fill = _fill(_HEADER_BG); c.alignment = _CENTER; c.border = _border()
-    r += 1
+    _month_header()
     _render_mth_rows(by_ym_pct, True)
 
     r += 1
@@ -1660,19 +1873,22 @@ def _write_summary_sheet(
         (f"{_outlier_base} Without Top 2 Outliers", pct_no_o2),
         (f"{_outlier_base} Without Top 3 Outliers", pct_no_o3),
     ]):
-        ws.merge_cells(f"A{r}:D{r}")
-        lc = ws.cell(row=r, column=1, value=label)
-        lc.font = _font(bold=True, size=10, color=_DARK2_TXT)
-        lc.fill = _fill(_LABEL_BG if si % 2 == 0 else _ALT_ROW)
-        lc.alignment = _LEFT; lc.border = _border()
-        vc = ws.cell(row=r, column=5, value=_fmt_pct(val))
-        vc.font = _font(bold=True, size=10, color=_GREEN_TX if val >= 0 else _RED_TX)
-        vc.fill = _fill(_WHITE if si % 2 == 0 else _ALT_ROW)
-        vc.alignment = _CENTER; vc.border = _border()
-        ws.row_dimensions[r].height = 18; r += 1
+        sink.merge(r, 1, 4)
+        sink.cell(r, 1, label, bold=True, size=10, fc=_DARK2_TXT,
+                  bg=(_LABEL_BG if si % 2 == 0 else _ALT_ROW), align="L", border=True)
+        sink.cell(r, 5, _fmt_pct(val), bold=True, size=10,
+                  fc=(_GREEN_TX if val >= 0 else _RED_TX),
+                  bg=(_WHITE if si % 2 == 0 else _ALT_ROW), align="C", border=True)
+        sink.row_height(r, 18); r += 1
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+# Parity-reference switch: when True, compute_xlsx_summary_metrics runs the Python
+# engine below instead of the Rust path — used ONLY by tools/summary_metrics_parity
+# to diff Rust vs Python. The live path keeps it False (Rust-only, no fallback).
+_SUMMARY_PYTHON_REF = False
+
 
 def compute_xlsx_summary_metrics(
     trades_df: pd.DataFrame,
@@ -1702,6 +1918,28 @@ def compute_xlsx_summary_metrics(
     midcap_by_trade, midcap_summary, has_midcap = compute_midcap_for_rows(
         rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
     )
+
+    # ── Rust-ONLY (no Python fallback — user policy). This entire summary engine
+    # is ported to Rust and byte-identical (proven by tools/summary_metrics_parity
+    # + an isolated 39-key/0-diff check, overall AND patchwise). It operates on the
+    # finished trades, so it is feature-agnostic — safe for ALL strategies incl.
+    # midcap / spot-adj / filter. Any Rust failure HARD-FAILS (surfaces the bug)
+    # rather than silently falling back. The Python engine below is a PARITY
+    # REFERENCE ONLY, reached exclusively when _SUMMARY_PYTHON_REF is set (by
+    # tools/summary_metrics_parity).
+    if not _SUMMARY_PYTHON_REF:
+        import algotest_native as _an_sm
+        _rust_sm = _an_sm.compute_summary_metrics(
+            rows, S, bool(patchwise), filter_segments,
+            (midcap_by_trade or None), midcap_summary,
+        )
+        if not isinstance(_rust_sm, dict):
+            raise RuntimeError(
+                "Rust compute_summary_metrics returned a non-dict "
+                f"({type(_rust_sm).__name__}) — no Python fallback per policy"
+            )
+        return _rust_sm
+
     tm, _grouped, _sorted_keys = _aggregate_trades(
         rows, has_midcap, midcap_by_trade,
         patchwise=patchwise, filter_segments=filter_segments,
@@ -1747,7 +1985,14 @@ def compute_xlsx_summary_metrics(
         if _ck not in _key_entry_pw and _cr.get("Entry Date"):
             _key_entry_pw[_ck] = _cr.get("Entry Date")
         if _cr.get("Exit Reason"):
-            _key_exit_reason_pw[_ck] = (_cr.get("Exit Reason") or "").upper()
+            # Accumulate the UNION of all legs' exit reasons (not last-leg-wins) so
+            # the Max DD / outlier Live DD patchwise scans detect a FILTER_END on
+            # ANY leg — matching the per-trade cumulative/peak/lowest-nav reset and
+            # keeping every scan resetting at the SAME boundaries for mixed
+            # options+futures trades (leg-order-independent).
+            _prev_er = _key_exit_reason_pw.get(_ck, "")
+            _cur_er = (_cr.get("Exit Reason") or "").upper()
+            _key_exit_reason_pw[_ck] = (_prev_er + "+" + _cur_er) if _prev_er else _cur_er
 
     sum_pct = 0.0; sum_pos_pct = 0.0; sum_neg_pct = 0.0
     win_cnt = 0;   loss_cnt = 0;      total_cnt = 0
@@ -2192,6 +2437,53 @@ def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustmen
     return by_trade, summ, True
 
 
+def _build_combo_xlsx_rust(
+    cleaned, key_order, summary, tm, grouped, sorted_keys,
+    combo_label, from_date, to_date, has_calls, has_puts, has_futures,
+    has_midcap, midcap_summary, midcap_by_trade, patchwise, filter_segments, want_patch,
+    yearly: bool = False,
+) -> bytes:
+    """Rust workbook path for build_combo_xlsx (OPTIMIZE_RUST_XLSX=1). Same 4 sheets,
+    same order, cell-identical. Trade Sheet is built in Rust from `cleaned`; Summary /
+    Patch / WOW come from their ops builders. Hard-fails if the native module or the
+    combined writer is unavailable (no openpyxl fallback)."""
+    import tempfile
+    import algotest_native as _an
+    if not hasattr(_an, "write_workbook_xlsx"):
+        raise RuntimeError("algotest_native.write_workbook_xlsx unavailable — rebuild the wheel")
+
+    summary_ops = _summary_ops(
+        cleaned, summary, tm, combo_label, from_date, to_date,
+        has_calls, has_puts, has_futures, has_midcap, midcap_summary,
+        chron_keys=sorted_keys, patchwise=patchwise, filter_segments=filter_segments,
+    )
+    patch_ops = None
+    if want_patch:
+        patch_ops = _patch_wise_ops(
+            tm, grouped, sorted_keys, has_midcap, midcap_by_trade,
+            has_calls, has_puts, filter_segments=filter_segments,
+        )
+    # Mirror the openpyxl path: never block the tradesheet on the extra WOW/MOM sheet.
+    wow_ops = None
+    try:
+        from services.optimizer.wow_mom import wow_mom_ops
+        wow_ops = wow_mom_ops(cleaned, has_midcap, combo_label or "Strategy", yearly=yearly)
+    except Exception as _wm_exc:
+        logging.getLogger(__name__).warning("[XLSX] WOW/MOM ops skipped: %s", _wm_exc)
+
+    fd, tp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        _an.write_workbook_xlsx(cleaned, key_order, summary_ops, patch_ops, wow_ops, tp)
+        with open(tp, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(tp)
+        except OSError:
+            pass
+
+
 def build_combo_xlsx(
     trades_df: pd.DataFrame,
     summary: Dict[str, Any],
@@ -2205,6 +2497,8 @@ def build_combo_xlsx(
     patchwise: bool = False,
     filter_segments=None,
     force_patch_wise: bool = False,
+    rules_sheet=None,
+    yearly: bool = False,
 ) -> bytes:
     """
     Build a complete XLSX workbook (Trade Sheet + Summary + optional Patch wise)
@@ -2233,6 +2527,26 @@ def build_combo_xlsx(
                                                    patchwise=patchwise, filter_segments=filter_segments)
     cleaned = _build_cleaned_rows(rows, key_order, tm, has_midcap, midcap_by_trade)
 
+    # Optional Rust workbook path (default off; opt-in via OPTIMIZE_RUST_XLSX=1). Builds
+    # the SAME four sheets in one Rust call — Trade Sheet in Rust from `cleaned`;
+    # Summary/Patch/WOW from their ops builders — cell-identical to the openpyxl path
+    # (tools/*_writer_verify gates). No Python fallback: a Rust error propagates.
+    # The standalone leg-wise "Rules" sheet is rendered only by the openpyxl path,
+    # so skip the Rust writer when a rules_sheet is present (the single backtest
+    # download). openpyxl cost is negligible for one workbook and the two paths are
+    # cell-identical (tools/workbook_verify) — the Rules sheet is purely additive.
+    if os.environ.get("OPTIMIZE_RUST_XLSX") == "1" and not rules_sheet:
+        return _build_combo_xlsx_rust(
+            cleaned, key_order, summary, tm, _grouped, _sorted_keys,
+            combo_label, from_date, to_date, has_calls, has_puts, has_futures,
+            has_midcap, midcap_summary, midcap_by_trade, patchwise, filter_segments,
+            bool(filter_name or force_patch_wise),
+            # Without this the Rust workbook path silently builds WOW with
+            # yearly=False, so every yearly trade collapses into its December
+            # expiry's ISO week (~7 cells) instead of spreading by Exit Date.
+            yearly=yearly,
+        )
+
     _write_trade_sheet(wb, cleaned, key_order)
     _write_summary_sheet(
         wb, cleaned, summary, tm,
@@ -2254,9 +2568,16 @@ def build_combo_xlsx(
     # WOW & MOM Summary (shared logic with the backtest export + merged summary).
     try:
         from services.optimizer.wow_mom import write_wow_mom_combined
-        write_wow_mom_combined(wb, cleaned, has_midcap, combo_label or "Strategy")
+        write_wow_mom_combined(wb, cleaned, has_midcap, combo_label or "Strategy", yearly=yearly)
     except Exception as _wm_exc:  # never block the tradesheet on the extra sheet
         logging.getLogger(__name__).warning("[XLSX] WOW/MOM sheet skipped: %s", _wm_exc)
+
+    # Standalone leg-wise "Rules" sheet as the FIRST tab (backtest download only).
+    if rules_sheet:
+        try:
+            _write_rules_sheet(wb, rules_sheet)
+        except Exception as _rs_exc:  # never block the download on the rules sheet
+            logging.getLogger(__name__).warning("[XLSX] Rules sheet skipped: %s", _rs_exc)
 
     buf = io.BytesIO()
     wb.save(buf)

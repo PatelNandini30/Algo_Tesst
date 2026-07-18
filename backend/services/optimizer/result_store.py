@@ -493,6 +493,7 @@ def write_combo_xlsx(
     midcap_spot_adjustment=None,
     midcap_symbol: str = "NIFTYMIDCAP100",
     filter_segments=None,
+    yearly: bool = False,
 ) -> None:
     """Write a single combo's XLSX tradesheet to disk (called per-combo during execution).
 
@@ -539,6 +540,7 @@ def write_combo_xlsx(
             midcap_spot_adjustment=midcap_spot_adjustment,
             midcap_symbol=midcap_symbol,
             filter_segments=filter_segments,
+            yearly=yearly,
         )
         dirpath = get_trades_dir(job_id)
         os.makedirs(dirpath, exist_ok=True)
@@ -564,6 +566,7 @@ def write_combo_xlsx_patchwise(
     midcap_symbol: str = "NIFTYMIDCAP100",
     filter_name: str = "",
     filter_segments=None,
+    yearly: bool = False,
 ) -> None:
     """Write a combo's PATCHWISE XLSX tradesheet directly from trades_df during
     the run — same builder the finalization/download uses, just fed the in-memory
@@ -608,6 +611,7 @@ def write_combo_xlsx_patchwise(
             filter_name=filter_name,
             patchwise=True,
             filter_segments=filter_segments,
+            yearly=yearly,
         )
         dirpath = os.path.join(get_trades_dir(job_id), "patchwise")
         os.makedirs(dirpath, exist_ok=True)

@@ -28,6 +28,7 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,33 @@ def _maybe_float(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _leg_slippage_pct(leg_src: Any) -> float:
+    """Per-leg slippage percentage. There is no strategy-level slippage_pct
+    anymore — each leg carries its own (frontend field: slippage_pct, set by
+    the leg's own Slippage % input). Absent/invalid defaults to 0 (no
+    slippage), not a fallback to any global value."""
+    if not isinstance(leg_src, dict):
+        return 0.0
+    try:
+        return max(0.0, float(leg_src.get("slippage_pct") or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_per_leg_slippage(specs: List[Dict[str, Any]], legs_src: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rust's resolve_trade_specs bakes ONE payload-level slippage_pct onto
+    every spec it builds. Overwrite it per-spec with that spec's own leg's
+    slippage_pct, since slippage is configured per leg now, not globally."""
+    for spec in specs:
+        try:
+            leg_idx = int(spec.get("leg_id") or 0) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= leg_idx < len(legs_src):
+            spec["slippage_pct"] = _leg_slippage_pct(legs_src[leg_idx])
+    return specs
 
 
 def _clamp_sl_buffer_fill(
@@ -452,15 +480,23 @@ def _load_filter_segments(payload: Dict[str, Any]) -> Optional[List[Tuple[str, s
         return None
 
     def _seg_iso(v) -> str:
-        # Normalize a segment boundary to ISO YYYY-MM-DD. Already-ISO / datetime
-        # values parse directly (no warning); only ambiguous slash/dash dates fall
-        # back to dayfirst=True so DD/MM/YYYY (e.g. "10/05/2019" = 10-May) is never
-        # misread as MM/DD (5-Oct). Keeps this loader consistent with
-        # parse_filter_csv (base.py), which already parses uploads day-first.
+        # Normalize a segment boundary to ISO YYYY-MM-DD.
+        #
+        # A datetime / date / Timestamp is ALREADY unambiguous — format it
+        # directly and NEVER reparse. This is the DB filter path (named filters
+        # from get_filter_segments hand us datetime objects): str(datetime) is
+        # "2019-05-10 00:00:00", whose " 00:00:00" defeats the year-first
+        # strptime formats below, after which dayfirst=True FLIPS every date
+        # with day<=12 & month<=12 (10-May -> 05-Oct), inverting segments.
+        if not isinstance(v, str) and hasattr(v, "strftime"):
+            return pd.Timestamp(v).strftime("%Y-%m-%d")
         text = str(v).strip()
-        # Try unambiguous year-first formats first (no warning, no flip), then
-        # fall back to dayfirst=True for genuine DD/MM-style inputs.
-        for _fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        # Strings: try unambiguous year-first formats first (no warning, no flip),
+        # then fall back to dayfirst=True for genuine DD/MM-style inputs so
+        # "10/05/2019" (=10-May) is never misread as MM/DD (5-Oct). Keeps this
+        # loader consistent with parse_filter_csv (base.py), which parses uploads
+        # day-first.
+        for _fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y%m%d"):
             try:
                 return pd.to_datetime(text, format=_fmt).strftime("%Y-%m-%d")
             except (ValueError, TypeError):
@@ -608,6 +644,277 @@ _STRIKE_INTERVALS: Dict[str, float] = {
 
 _NEXT_EXPIRY_TYPES: frozenset = frozenset({"NEXT_WEEKLY", "WEEKLY_T1", "NEXT_MONTHLY", "MONTHLY_T1"})
 
+# ── YEARLY expiry ─────────────────────────────────────────────────────────────
+# YEARLY trades NSE's long-dated DECEMBER contract (26-Dec-2019 → 31-Dec-2020 →
+# …) while the position is re-booked on the weekly/monthly cadence. Contract and
+# cadence are therefore two different calendars — everywhere else in the engine
+# they are the same list.
+#
+# The December expiries are already rows of the *monthly* expiry_calendar (the
+# long-dated contract and the December monthly expiry are the SAME contract; it
+# has simply been listed ~1826 days ahead), so no new table or ingestion.
+#
+# Only NIFTY has long-dated December contracts (verified: NIFTY 24 spanning
+# 2010-2030; BANKNIFTY/MIDCPNIFTY/FINNIFTY have zero) — index_metadata gates it.
+_YEARLY_CADENCES: frozenset = frozenset({"weekly", "monthly"})
+
+
+def _opens_new_epoch(mode: str, prev_entry: str, entry: str, new_cycle: bool) -> bool:
+    """
+    True when this entry must resolve a FRESH strike rather than carry the epoch's.
+
+    Python mirror of simulate.rs::opens_new_epoch. Fresh and Fixed are the same
+    mechanism — resolve once per epoch, reuse within — differing only in the reset:
+      * Fresh: a new yearly cycle OR a new month
+      * Fixed: a new yearly cycle only
+    Month rollover is a slice compare on ISO YYYY-MM-DD, no date parsing.
+
+    This yields "Fresh re-strikes at month-end only, regardless of cadence" from
+    one comparison: under MONTHLY cadence consecutive entries are always in
+    different months so Fresh re-strikes every entry (today's behaviour); under
+    WEEKLY cadence the entries within a month share [0:7], so only the first
+    re-strikes.
+    """
+    if new_cycle:
+        return True
+    return str(mode or "fresh").lower() != "fixed" and entry[:7] != prev_entry[:7]
+
+
+def _cycle_for_exit(
+    cycles: Optional[List[Dict[str, str]]], exit_date: str
+) -> Optional[Dict[str, str]]:
+    """
+    The December contract a segment ending on `exit_date` should hold: the FIRST
+    cycle whose T-n boundary (`end`) is at or after that exit.
+
+    T-n is a THRESHOLD, not an exact exit date. A segment must be holdable for
+    its WHOLE cadence period without breaching T-n — so if the current December
+    would force a mid-segment exit, the segment opens on the NEXT December
+    instead. The yearly roll therefore always lands on a real cadence boundary
+    (a monthly/weekly expiry) and never creates a 1-day stub.
+
+    Keying on the EXIT (not the entry) is the whole trick: at the 26-Nov monthly
+    roll the engine looks ahead to the 31-Dec exit, sees Dec-2020's T-1 boundary
+    (27-Nov) falls before it, and opens on Dec-2021 right there.
+
+    Python mirror of simulate.rs::cycle_for_exit.
+    """
+    if not cycles:
+        return None
+    for c in cycles:
+        if c["end"] >= exit_date:
+            return c
+    return None
+
+
+def _expiry_date_list(index: str, expiry_type: str, from_date: str, to_date: str) -> List[str]:
+    """
+    Sorted unique ISO expiry dates for (index, expiry_type) in range.
+
+    Exact reproduction of the block previously inlined at
+    algotest_job.py:334-349 — same get_expiry_dates args, same column choice,
+    same sort/unique — so non-YEARLY callers get a byte-identical list.
+    """
+    import pandas as pd
+    from base import get_expiry_dates  # type: ignore
+
+    df = get_expiry_dates(index, expiry_type, from_date, to_date)
+    if df is None or df.empty:
+        return []
+    col = "Current Expiry" if "Current Expiry" in df.columns else df.columns[0]
+    return (
+        pd.to_datetime(df[col]).sort_values().dt.strftime("%Y-%m-%d").unique().tolist()
+    )
+
+
+def _build_yearly_cycles(
+    december_expiries: List[str],
+    n_months: int,
+    from_date: str,
+    trading_days: List[str],
+    cadence_expiries: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
+    """
+    Build the pinned-contract cycles consumed by simulate.rs.
+
+    Each cycle is {contract, start, end} over the half-open window [start, end)
+    keyed by a segment's *entry* date. `end` is the T-n exit: n counts MONTHS
+    back from the December expiry, so n=0 means hold to expiry (the default).
+
+    Cycle N's `start` is cycle N-1's `end`. That shared boundary is what makes
+    the yearly roll — exit the old December and re-enter the new one the same
+    day — fall out of the schedule builder's existing same-day chain with no
+    special case.
+
+    `december_expiries` must be widened one year on BOTH sides of the backtest:
+    the first real cycle needs the PRIOR December as its start anchor, and the
+    last needs the NEXT December as its contract.
+    """
+    import pandas as pd
+
+    cycles: List[Dict[str, str]] = []
+    prev_end: Optional[str] = None
+    for contract in december_expiries:  # ascending
+        if n_months <= 0:
+            # T=0 → hold to expiry. Returned UNSNAPPED so the default can never
+            # perturb the schedule via a trading-day snap.
+            end = contract
+        else:
+            target = (
+                pd.Timestamp(contract) - pd.DateOffset(months=n_months)
+            ).strftime("%Y-%m-%d")
+            # Snap the T-n target to the NEAREST cadence boundary — not the last
+            # one at-or-before it.
+            #
+            # The position can only roll where the cadence lets it, so the cycle
+            # must end on a cadence date. Picking the last boundary BEFORE the
+            # target overshoots badly whenever the target falls just *before* a
+            # boundary: for Dec-2019 (expiry 26-Dec) T-1 targets 26-Nov, but the
+            # Nov expiry is 28-Nov — 2 days late — so "before" jumps back to
+            # 31-Oct and rolls 56 days early, i.e. T-1 silently behaves as T-2.
+            # Same in 2023 (63d) and 2024 (56d). Nearest keeps every year at
+            # 28-36 days ≈ the requested 1 month.
+            end = None
+            if cadence_expiries:
+                _t = pd.Timestamp(target)
+                _c = min(cadence_expiries, key=lambda c: abs((pd.Timestamp(c) - _t).days))
+                # Only accept a snap that is genuinely NEAR the target. A valid
+                # monthly snap is <= ~18 days off (half the max ~35-day gap);
+                # weekly, <= ~4. Anything further means the target lies outside
+                # the cadence range entirely — the widened prior December (long
+                # expired) or the final December beyond to_date — and min() would
+                # otherwise return the nearest *endpoint*, inventing a cycle.
+                if abs((pd.Timestamp(_c) - _t).days) <= 45:
+                    end = _c
+            if end is None:
+                end = _last_trading_day_on_or_before(target, trading_days)
+            if not end:
+                continue
+        start = prev_end or from_date
+        prev_end = end
+        if start >= end:
+            # Cycle already elapsed before the backtest starts (typically the
+            # widened prior December). It still seeds the next cycle's start.
+            continue
+        cycles.append({"contract": contract, "start": start, "end": end})
+    return cycles
+
+
+def resolve_expiry_inputs(
+    index: str,
+    payload: Dict[str, Any],
+    from_date: str,
+    to_date: str,
+    trading_days: List[str],
+) -> Tuple[List[str], Optional[List[Dict[str, str]]]]:
+    """
+    Resolve (expiry_dates, yearly_cycles) for the Rust engine.
+
+    Non-YEARLY → (the same list as before, None). Byte-identical by delegating
+    to _expiry_date_list.
+
+    YEARLY → (cadence expiries, pinned December cycles). Rust owns the schedule;
+    Python only resolves dates, exactly as it already does for weekly/monthly —
+    the December contract is an expiry_calendar row and the T-n offset needs the
+    trading calendar, neither of which Rust carries on the EOD path.
+    """
+    import pandas as pd
+
+    etype = str(payload.get("expiry_type") or "weekly").upper()
+
+    # CALLER-SUPPLIED cycles (multi-index sync cadence). The {contract,start,end}
+    # schedule has already been built from the MERGED roll boundaries across every
+    # leg's own index (whichever expires first ends the cycle for all legs), so
+    # honour it verbatim rather than deriving a December/yearly schedule.
+    # `sync_cadence_expiry_type` names the base leg's OWN expiry basis and is used
+    # only for the expiry_dates list (NEXT_WEEKLY / LAZY resolution).
+    # Purely additive: nothing else pre-supplies yearly_cycles, so every existing
+    # path (including real YEARLY) still falls through to the builder below.
+    if etype == "YEARLY" and payload.get("yearly_cycles"):
+        # `sync_cadence_expiries` (the MERGED roll boundaries across every leg's
+        # index) is the cadence when supplied: the cadence list is what drives
+        # entry/exit in Rust, so the earliest-expiry-wins boundary has to arrive
+        # here, not just in the cycles (which only pin the contract).
+        explicit = payload.get("sync_cadence_expiries")
+        if explicit:
+            return ([str(d) for d in explicit], list(payload["yearly_cycles"]))
+        return (
+            _expiry_date_list(
+                index,
+                payload.get("sync_cadence_expiry_type") or "weekly",
+                from_date,
+                to_date,
+            ),
+            list(payload["yearly_cycles"]),
+        )
+
+    if etype != "YEARLY":
+        return (
+            _expiry_date_list(
+                index, payload.get("expiry_type", "weekly"), from_date, to_date
+            ),
+            None,
+        )
+
+    cadence = str(payload.get("rollover_cadence") or "monthly").lower()
+    if cadence not in _YEARLY_CADENCES:
+        raise ValueError(
+            f"expiry_type=YEARLY needs rollover_cadence in {sorted(_YEARLY_CADENCES)}, "
+            f"got {cadence!r}"
+        )
+    cadence_expiries = _expiry_date_list(index, cadence, from_date, to_date)
+
+    wide_from = (pd.Timestamp(from_date) - pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+    wide_to = (pd.Timestamp(to_date) + pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+
+    # Which long-dated expiry MONTHS to roll through. Default December-only, so
+    # any run that doesn't set this is byte-identical to before. Selecting more
+    # (e.g. ["03","12"]) makes the position alternate: the cycle builder below
+    # already handles a multi-month sorted list, holding each contract until its
+    # own T-n and rolling into the next selected long-dated expiry. Only the 4
+    # months that actually have long-dated NIFTY contracts are allowed — the
+    # other 8 months have no long-dated series to pin to.
+    _LONGDATED_MONTHS = {"03", "06", "09", "12"}
+    roll_months_raw = payload.get("yearly_roll_months") or ["12"]
+    roll_months = {str(m).zfill(2) for m in roll_months_raw}
+    _bad = roll_months - _LONGDATED_MONTHS
+    if _bad:
+        raise ValueError(
+            f"expiry_type=YEARLY: yearly_roll_months must be a subset of "
+            f"{sorted(_LONGDATED_MONTHS)} (March/June/September/December — the only "
+            f"months with long-dated contracts); got invalid {sorted(_bad)}."
+        )
+    december = [
+        d for d in _expiry_date_list(index, "monthly", wide_from, wide_to)
+        if d[5:7] in roll_months
+    ]
+    if not december:
+        raise ValueError(
+            f"expiry_type=YEARLY: no long-dated contract found for {index} "
+            f"(months {sorted(roll_months)}) in {wide_from}..{wide_to}."
+        )
+
+    try:
+        n_months = int(payload.get("yearly_exit_months_before") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("yearly_exit_months_before must be an integer (months; 0 = hold to expiry)")
+    if n_months < 0 or n_months > 11:
+        raise ValueError(
+            f"yearly_exit_months_before must be 0..11 months, got {n_months}"
+        )
+
+    # cadence_expiries lets the T-n boundary snap to a date the position can
+    # actually roll on — see _build_yearly_cycles.
+    cycles = _build_yearly_cycles(
+        december, n_months, from_date, trading_days, cadence_expiries=cadence_expiries
+    )
+    if not cycles:
+        raise ValueError(
+            f"expiry_type=YEARLY: no yearly cycle covers {from_date}..{to_date} "
+            f"(December contracts: {december[:3]}…, T-{n_months} months)"
+        )
+    return (cadence_expiries, cycles)
+
 
 def _futures_get_exit_date(anchor: str, exit_mode: str, n_days: int, sorted_td: List[str]) -> str:
     """
@@ -632,6 +939,228 @@ def _futures_get_exit_date(anchor: str, exit_mode: str, n_days: int, sorted_td: 
     return anchor
 
 
+# ── Native futures data helpers (NO Postgres reads) ─────────────────────────
+# Futures pricing + contract-expiry resolution + rollover, all sourced from the
+# in-memory Rust FUTIDX cache (native get_future_price) plus an in-memory expiry
+# index built ONCE per process from the futures feather. Replaces the per-trade
+# Postgres reads (base.resolve_futures_pnl_with_rollover / get_future_price_from_db
+# / _resolve_futures_expiry_by_preference) that made futures backtests slow.
+# Behaviour mirrors those functions exactly for trade-by-trade parity.
+_FUT_EXPIRY_INDEX: Dict[str, Dict[str, List[str]]] = {}
+# symbol -> date -> expiry -> (high, low)  — feather-batch source for futures MAE/MFE.
+_FUT_OHLC_INDEX: Dict[str, Dict[str, Dict[str, Tuple[float, float]]]] = {}
+
+
+def _ensure_fut_expiry_index(symbol: str) -> Dict[str, List[str]]:
+    """Per-process {date -> sorted[expiry]} of FUTIDX contracts trading each day,
+    built once from the futures feather. Mirrors the per-date contract set that
+    base.get_all_futures_for_date returns (used by the expiry-preference resolvers).
+    Also populates _FUT_OHLC_INDEX (date->expiry->(high,low)) from the same feather
+    read, for the feather-batch futures MAE/MFE (no per-row DB query)."""
+    symu = str(symbol).upper()
+    idx = _FUT_EXPIRY_INDEX.get(symu)
+    if idx is not None:
+        return idx
+    idx = {}
+    ohlc: Dict[str, Dict[str, Tuple[float, float]]] = {}
+    try:
+        from services.futures_cache_store import ensure_futures_loaded, build_futures_feather
+        ensure_futures_loaded(symu)  # guarantees native price cache + fresh feather
+        import pyarrow.feather as _pf
+        from collections import defaultdict as _dd
+        path = build_futures_feather(symu)
+        if path is not None:
+            tbl = _pf.read_table(str(path))
+            _cols = tbl.column_names
+            dates = tbl.column("Date").to_pylist()
+            exps = tbl.column("ExpiryDate").to_pylist()
+            highs = tbl.column("High").to_pylist() if "High" in _cols else [None] * len(dates)
+            lows = tbl.column("Low").to_pylist() if "Low" in _cols else [None] * len(dates)
+            tmp: Dict[str, set] = _dd(set)
+            for d, e, h, l in zip(dates, exps, highs, lows):
+                ds = str(d)[:10]
+                es = str(e)[:10]
+                tmp[ds].add(es)
+                if h is not None and l is not None:
+                    ohlc.setdefault(ds, {})[es] = (float(h), float(l))
+            idx = {d: sorted(s) for d, s in tmp.items()}
+    except Exception as _exc:
+        logger.warning("[ENGINE_RUST] futures expiry index build failed for %s: %s", symu, _exc)
+    _FUT_EXPIRY_INDEX[symu] = idx
+    _FUT_OHLC_INDEX[symu] = ohlc
+    return idx
+
+
+def _fut_leg_mae_mfe(symbol, entry_date, exit_date, expiry, entry_price, position,
+                     entry_spot, sorted_td, exit_reason=None, exit_price=None):
+    """Feather-batch MAE/MFE for a FUTURES leg: scan the in-memory FUTIDX high/low
+    over (entry+1 .. exit) on the held contract, then reuse the SAME extremes math
+    the option path uses (cap-adverse-at-SL + _calculate_mae_mfe_from_extremes) so
+    futures MAE/MFE is directionally identical to options. No per-row DB query."""
+    _ensure_fut_expiry_index(symbol)  # populates _FUT_OHLC_INDEX
+    ohlc = _FUT_OHLC_INDEX.get(str(symbol).upper()) or {}
+    ed = str(entry_date)[:10]
+    xd = str(exit_date)[:10]
+    es = str(expiry)[:10]
+    highs: List[float] = []
+    lows: List[float] = []
+    for d in sorted_td:
+        if d <= ed:
+            continue
+        if d > xd:
+            break
+        hl = ohlc.get(d, {}).get(es)
+        if hl:
+            highs.append(hl[0])
+            lows.append(hl[1])
+    if not highs:  # same-day trade fallback: use the entry day itself
+        hl = ohlc.get(ed, {}).get(es)
+        if hl:
+            highs = [hl[0]]
+            lows = [hl[1]]
+    if not highs or not lows:
+        return None, None
+    try:
+        from engines.generic_algotest_engine import _cap_adverse_extreme_for_sl, _calculate_mae_mfe_from_extremes
+        _hi, _lo = _cap_adverse_extreme_for_sl(max(highs), min(lows), position, exit_reason, exit_price)
+        # FUTURES MAE/MFE is normalized by the FUTURES entry price (f_entry), not the
+        # index entry spot — matching the research-verified workbook convention
+        # (midcap_overlay.py ÷f_entry). The shared helper divides by its `entry_spot`
+        # arg, so pass entry_price there; both the reference point and denominator are
+        # then f_entry. (The options path still passes the real entry_spot, unchanged.)
+        return _calculate_mae_mfe_from_extremes(
+            entry_price=entry_price, position=position, entry_spot=entry_price,
+            max_high=_hi, min_low=_lo,
+        )
+    except Exception:
+        return None, None
+
+
+def _fut_resolve_expiry(symbol: str, date, preference: str = "monthly") -> Optional[str]:
+    """Mirror base._cached_futures_expiry_by_preference, from the in-memory index."""
+    ds = str(date)[:10]
+    exps = _ensure_fut_expiry_index(symbol).get(ds)
+    if not exps:
+        return None
+    filtered = [e for e in exps if e >= ds] or exps
+    if not filtered:
+        return None
+    if str(preference or "monthly").lower() == "next_monthly" and len(filtered) >= 2:
+        return filtered[1]
+    return filtered[0]
+
+
+def _fut_resolve_expiry_for_hold(symbol: str, entry_date, exit_date, preference: str = "monthly") -> Optional[str]:
+    """Contract to HOLD for a unit-exit trade (mixed options+futures): at entry,
+    the nearest contract whose expiry survives to exit_date. On a normal weekly
+    cycle (entry & exit in the same month) this equals _fut_resolve_expiry — the
+    current month — so existing behaviour is UNCHANGED. It differs only when the
+    entry lands ON/after a monthly expiry: then it rolls to the next month
+    instead of selecting a contract that expires before the exit (which would
+    otherwise price the future on an already-expired contract → flat P&L)."""
+    ed = str(entry_date)[:10]
+    xd = str(exit_date)[:10]
+    exps = _ensure_fut_expiry_index(symbol).get(ed)
+    if not exps:
+        return None
+    covering = [e for e in exps if e >= xd]           # survives to exit
+    if not covering:
+        covering = [e for e in exps if e >= ed] or exps  # degrade to old behaviour
+    if not covering:
+        return None
+    if str(preference or "monthly").lower() == "next_monthly" and len(covering) >= 2:
+        return covering[1]
+    return covering[0]
+
+
+def _fut_nearest_expiry(symbol: str, date) -> Optional[str]:
+    """Mirror base._cached_nearest_future_expiry (filter expiry>=date, take first)."""
+    ds = str(date)[:10]
+    exps = _ensure_fut_expiry_index(symbol).get(ds)
+    if not exps:
+        return None
+    filtered = [e for e in exps if e >= ds]
+    return filtered[0] if filtered else None
+
+
+def _fut_nearest_expiry_after(symbol: str, date, min_expiry) -> Optional[str]:
+    """Mirror base._cached_nearest_future_expiry_after (filter expiry>min, first)."""
+    ds = str(date)[:10]
+    me = str(min_expiry)[:10]
+    exps = _ensure_fut_expiry_index(symbol).get(ds)
+    if not exps:
+        return None
+    filtered = [e for e in exps if e > me]
+    return filtered[0] if filtered else None
+
+
+def _fut_price(symbol: str, date, expiry) -> Optional[float]:
+    """Native FUTIDX close for (symbol,date,expiry) from the Rust cache, with the
+    same ±1 expiry-day tolerance base.get_future_price_from_db applies."""
+    from services import rust_fast_path as _rf
+    from datetime import datetime as _dtc, timedelta as _td
+    ds = str(date)[:10]
+    es = str(expiry)[:10]
+    v = _rf.get_future_price(symbol, ds, es)
+    if v is not None:
+        return float(v)
+    for _delta in (1, -1):
+        try:
+            e2 = (_dtc.strptime(es, "%Y-%m-%d") + _td(days=_delta)).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        v = _rf.get_future_price(symbol, ds, e2)
+        if v is not None:
+            return float(v)
+    return None
+
+
+def _resolve_futures_pnl_native(entry_date, exit_date, symbol, position, preference="monthly"):
+    """Native-priced equivalent of base.resolve_futures_pnl_with_rollover — handles
+    monthly-contract rollover when the hold spans an expiry. Returns
+    (entry_price, exit_price, final_expiry_str). Reads ONLY the Rust cache."""
+    from datetime import datetime as _dtc, timedelta as _td
+    ed = str(entry_date)[:10]
+    xd = str(exit_date)[:10]
+    entry_expiry = _fut_resolve_expiry(symbol, ed, preference)
+    if not entry_expiry:
+        return None, None, None
+    entry_price = _fut_price(symbol, ed, entry_expiry)
+    if entry_price is None:
+        return None, None, None
+    if entry_expiry >= xd:
+        exit_price = _fut_price(symbol, xd, entry_expiry)
+        if exit_price is None:
+            exit_price = entry_price
+        return entry_price, exit_price, entry_expiry
+    # ── rollover: entry contract expires mid-hold ──
+    roll_date = entry_expiry
+    roll_price_old = _fut_price(symbol, roll_date, entry_expiry)
+    if roll_price_old is None:
+        _prev = (_dtc.strptime(roll_date, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+        roll_price_old = _fut_price(symbol, _prev, entry_expiry)
+    if roll_price_old is None:
+        roll_price_old = entry_price
+    next_expiry = _fut_nearest_expiry_after(symbol, roll_date, entry_expiry)
+    if not next_expiry:
+        return entry_price, roll_price_old, entry_expiry
+    roll_price_new = _fut_price(symbol, roll_date, next_expiry)
+    if roll_price_new is None:
+        roll_price_new = roll_price_old
+    if next_expiry >= xd:
+        exit_price = _fut_price(symbol, xd, next_expiry)
+        if exit_price is None:
+            exit_price = roll_price_new
+        return entry_price, exit_price, next_expiry
+    final_expiry = _fut_nearest_expiry(symbol, xd)
+    if not final_expiry:
+        return entry_price, roll_price_new, next_expiry
+    exit_price = _fut_price(symbol, xd, final_expiry)
+    if exit_price is None:
+        exit_price = roll_price_new
+    return entry_price, exit_price, final_expiry
+
+
 def _scan_futures_sl_target(
     entry_date: str,
     entry_price_raw: float,
@@ -649,9 +1178,8 @@ def _scan_futures_sl_target(
     Returns (actual_exit_date, exit_price_raw_or_None, exit_reason).
     exit_price_raw is None when nothing fires - caller keeps original price.
     Mirrors check_leg_stop_loss_target logic from generic_algotest_engine.py.
+    Prices come from the native Rust FUTIDX cache (_fut_price), not Postgres.
     """
-    from base import get_future_price_from_db
-
     sl = (leg_src.get("stopLoss") or {}) if isinstance(leg_src.get("stopLoss"), dict) else {}
     tp = (leg_src.get("targetProfit") or {}) if isinstance(leg_src.get("targetProfit"), dict) else {}
     trail = (leg_src.get("trailSL") or {}) if isinstance(leg_src.get("trailSL"), dict) else {}
@@ -688,7 +1216,7 @@ def _scan_futures_sl_target(
         if day > scheduled_exit:
             break
         try:
-            current = get_future_price_from_db(day, index, expiry=fut_expiry)
+            current = _fut_price(index, day, fut_expiry)
         except Exception:
             current = None
         if current is None or current <= 0:
@@ -742,31 +1270,71 @@ def _build_futures_specs(
       * []    → no trades produced.
       * [row, …] → priced futures rows.
     """
-    from base import resolve_futures_pnl_with_rollover
-
+    # Futures priced from the native Rust FUTIDX cache (no Postgres) — see
+    # _resolve_futures_pnl_native / _fut_price above.
     index = str(payload.get("index") or "NIFTY").upper()
     legs_src = payload.get("legs") or []
     entry_dte = int(payload.get("entry_dte") or 0)
     exit_dte = int(payload.get("exit_dte") or 0)
-    slippage = float(payload.get("slippage_pct") or 0.0)
+
+    # Rollover: under rollover a futures position HOLDS and ROLLS across expiries
+    # rather than round-tripping inside a single cycle. Applies to WEEKLY/MONTHLY
+    # (next_* futures route to the mixed-next-weekly builder, not here).
+    rollover_toggle = bool(payload.get("rollover_toggle", False))
+    _etype_rk = str(payload.get("expiry_type") or payload.get("expiry_window") or "").upper()
+    _rollover_mode = rollover_toggle and "NEXT" not in _etype_rk
 
     sorted_td = sorted(trading_days)
     sorted_exp = sorted(expiry_dates)
+    _n_exp = len(sorted_exp)
 
     out: List[Dict[str, Any]] = []
     prev_sched_exit: Optional[str] = None  # overlap-prevention sentinel
 
-    for trade_id, exp_str in enumerate(sorted_exp, start=1):
+    for _exp_i, exp_str in enumerate(sorted_exp):
+        trade_id = _exp_i + 1
         entry_date = _trading_day_n_before(exp_str, entry_dte, sorted_td)
         exit_date = _trading_day_n_before(exp_str, exit_dte, sorted_td)
         if not entry_date or not exit_date:
             continue
+
+        # ── Rollover re-anchor (mirrors the Python schedule,
+        # generic_algotest_engine ~3688-3736) ──
+        # Under rollover, entry_dte >= exit_dte puts entry on/after the exit WITHIN
+        # one cycle → a same-day round trip at a single price → 0 P&L (the exact
+        # symptom of the "entry=1/exit=1 rollover" report). Re-anchor the exit to
+        # the NEXT expiry (T-exit_dte) so the trade holds and rolls across the
+        # expiry, matching AlgoTest ("exit anchors to next expiry; roll to the
+        # next contract"). Non-rollover behaviour is left untouched.
+        _rolled = False
+        if _rollover_mode and entry_date >= exit_date:
+            _nxt = sorted_exp[_exp_i + 1] if _exp_i + 1 < _n_exp else None
+            if _nxt is not None:
+                _re_exit = _trading_day_n_before(_nxt, exit_dte, sorted_td)
+            else:
+                # Last cycle, no further expiry: clamp the hold to the last trading
+                # day in range (Python clamps to the segment/to_date end).
+                _re_exit = sorted_td[-1] if sorted_td else None
+            if _re_exit and _re_exit > entry_date:
+                exit_date = _re_exit
+                _rolled = True
+            else:
+                continue  # cannot form a real holding period
+
+        # Non-rollover, entry_dte == exit_dte → entry and exit fall on the same day
+        # → a same-day round trip at one price → ~0 P&L. Skip it (mirrors the Python
+        # engine, generic_algotest_engine ~3742). The frontend already blocks this
+        # combination unless rollover is on, so this only guards direct-API payloads.
+        if not _rolled and entry_date == exit_date:
+            continue
+
         entry_spot = spot_by_date.get(entry_date)
         if entry_spot is None:
             continue
         exit_spot = spot_by_date.get(exit_date, 0.0)
 
         # Overlap prevention: skip if entry before previous scheduled exit.
+        # Rollover chains same-day (entry == prev exit) — allowed (strict <).
         if prev_sched_exit is not None and entry_date < prev_sched_exit:
             continue
 
@@ -797,6 +1365,7 @@ def _build_futures_specs(
 
             position = str(leg.get("position") or "SELL").upper()
             lots = int(leg.get("lots") or 1)
+            _leg_slip = _leg_slippage_pct(leg)
 
             fut_pref_raw = str(leg.get("expiry") or "monthly").lower()
             fut_pref = "next_monthly" if fut_pref_raw in ("next_monthly", "next_month", "mid_month") else "monthly"
@@ -811,20 +1380,49 @@ def _build_futures_specs(
             except (TypeError, ValueError):
                 n_days = 5
 
-            fut_exit_trigger = _futures_get_exit_date(exp_str, exit_mode_raw, n_days, sorted_td)
-            fut_exit_date = min(fut_exit_trigger, effective_exit)
+            if _rolled:
+                # Rolled hold: exit is the re-anchored next-expiry date (do NOT
+                # clamp it back to this cycle's own expiry via _futures_get_exit_date
+                # — that would collapse the hold to a same-day round trip again).
+                # Price BOTH ends on the single futures contract that survives to
+                # the exit (the next-expiry contract) so the P&L is a clean
+                # single-contract move — no near/far basis mixing.
+                fut_exit_date = effective_exit
+                # Resolve the rolled contract from the RE-ANCHORED next-cycle exit
+                # (exit_date), NOT the filter-clamped fut_exit_date. On a filter /
+                # patch boundary the clamp shortens the hold back into the current-
+                # month window, which would pick the CURRENT contract even though
+                # the trade rolled into the NEXT one (the paired option leg holds
+                # the next). Using exit_date keeps the futures on the same month as
+                # the option; for a non-clamped trade exit_date == fut_exit_date so
+                # nothing changes.
+                _hold_expiry = _fut_resolve_expiry_for_hold(
+                    index, entry_date, exit_date, fut_pref
+                )
+                if not _hold_expiry:
+                    continue
+                entry_price_raw = _fut_price(index, entry_date, _hold_expiry)
+                exit_price_raw = _fut_price(index, fut_exit_date, _hold_expiry)
+                fut_expiry = _hold_expiry
+                if entry_price_raw is None:
+                    continue
+                if exit_price_raw is None:
+                    exit_price_raw = entry_price_raw
+            else:
+                fut_exit_trigger = _futures_get_exit_date(exp_str, exit_mode_raw, n_days, sorted_td)
+                fut_exit_date = min(fut_exit_trigger, effective_exit)
 
-            entry_price_raw, exit_price_raw, fut_expiry = resolve_futures_pnl_with_rollover(
-                entry_date=entry_date,
-                exit_date=fut_exit_date,
-                index=index,
-                position=position,
-                preference=fut_pref,
-            )
-            if entry_price_raw is None:
-                continue
-            if exit_price_raw is None:
-                exit_price_raw = entry_price_raw
+                entry_price_raw, exit_price_raw, fut_expiry = _resolve_futures_pnl_native(
+                    entry_date=entry_date,
+                    exit_date=fut_exit_date,
+                    symbol=index,
+                    position=position,
+                    preference=fut_pref,
+                )
+                if entry_price_raw is None:
+                    continue
+                if exit_price_raw is None:
+                    exit_price_raw = entry_price_raw
 
             # Save scheduled exit BEFORE the SL scan — re-entry (Task 3) uses it as cap.
             _orig_sched_exit = fut_exit_date
@@ -832,7 +1430,7 @@ def _build_futures_specs(
             # SL / Target / TrailSL scan for FUTURES leg.
             _scan_exit_date, _scan_exit_raw, _actual_exit_reason = _scan_futures_sl_target(
                 entry_date, float(entry_price_raw), position, leg, sorted_td,
-                _orig_sched_exit, index, fut_expiry or "", slippage,
+                _orig_sched_exit, index, fut_expiry or "", _leg_slip,
             )
             if _scan_exit_raw is not None:
                 fut_exit_date = _scan_exit_date
@@ -840,9 +1438,9 @@ def _build_futures_specs(
                 exit_spot = spot_by_date.get(fut_exit_date, exit_spot)
 
             # Slippage — mirrors _apply_slippage in generic_algotest_engine.py
-            if slippage > 0:
-                _entry_fac = (1.0 - slippage / 100.0) if position == "SELL" else (1.0 + slippage / 100.0)
-                _exit_fac = (1.0 + slippage / 100.0) if position == "SELL" else (1.0 - slippage / 100.0)
+            if _leg_slip > 0:
+                _entry_fac = (1.0 - _leg_slip / 100.0) if position == "SELL" else (1.0 + _leg_slip / 100.0)
+                _exit_fac = (1.0 + _leg_slip / 100.0) if position == "SELL" else (1.0 - _leg_slip / 100.0)
                 entry_price = round(max(float(entry_price_raw) * _entry_fac, 0.0), 2)
                 exit_price = round(max(float(exit_price_raw) * _exit_fac, 0.0), 2)
             else:
@@ -867,7 +1465,7 @@ def _build_futures_specs(
                 "position": position,
                 "lots": lots,
                 "lot_size": lot_size,
-                "slippage_pct": slippage,
+                "slippage_pct": _leg_slip,
                 "entry_price": entry_price,
                 "exit_price": exit_price,
                 "raw_entry_price": round(float(entry_price_raw), 4),
@@ -914,10 +1512,10 @@ def _build_futures_specs(
                     _re_idx = _sl_used_re + _tgt_used_re
 
                     try:
-                        _re_ep_raw, _re_xp_raw, _re_expiry = resolve_futures_pnl_with_rollover(
+                        _re_ep_raw, _re_xp_raw, _re_expiry = _resolve_futures_pnl_native(
                             entry_date=_re_entry_date,
                             exit_date=_sched_exit,
-                            index=index,
+                            symbol=index,
                             position=position,
                             preference=fut_pref,
                         )
@@ -930,7 +1528,7 @@ def _build_futures_specs(
 
                     _re_scan_date, _re_scan_raw, _re_reason = _scan_futures_sl_target(
                         _re_entry_date, float(_re_ep_raw), position, leg, sorted_td,
-                        _sched_exit, index, _re_expiry or fut_expiry or "", slippage,
+                        _sched_exit, index, _re_expiry or fut_expiry or "", _leg_slip,
                     )
                     if _re_scan_raw is not None:
                         _re_xp_raw = _re_scan_raw
@@ -939,7 +1537,7 @@ def _build_futures_specs(
                         _re_exit_date = _sched_exit
                         _re_reason = "EXPIRY"
 
-                    if slippage > 0:
+                    if _leg_slip > 0:
                         _re_ep = round(max(float(_re_ep_raw) * _entry_fac, 0.0), 2)
                         _re_xp = round(max(float(_re_xp_raw) * _exit_fac, 0.0), 2)
                     else:
@@ -962,7 +1560,7 @@ def _build_futures_specs(
                         "position": position,
                         "lots": lots,
                         "lot_size": lot_size,
-                        "slippage_pct": slippage,
+                        "slippage_pct": _leg_slip,
                         "entry_price": _re_ep,
                         "exit_price": _re_xp,
                         "raw_entry_price": round(float(_re_ep_raw), 4),
@@ -1006,6 +1604,22 @@ def _pick_by_premium(
     return min(chain, key=_key)
 
 
+def _liquidity_walk_step(index: Optional[str], interval: float) -> Tuple[float, bool]:
+    """Step size the liquidity-shift walk uses to find a tradeable strike —
+    Python mirror of Rust `liquidity_walk_step`. Legacy 25/50/100 gaps walk by
+    the gap itself (unchanged). A COARSE 500 gap walks by a finer per-index step
+    so it lands on a liquid listed strike instead of skipping a whole 500-pt
+    gap: NIFTY->100, MIDCPNIFTY->50 (others default to 100). The 500 gap still
+    governs ATM snap + offset stepping. Returns (walk_step, is_coarse)."""
+    if interval <= 100.0:
+        return interval, False
+    step = {
+        "NIFTY": 100.0, "MIDCPNIFTY": 50.0, "FINNIFTY": 50.0,
+        "BANKNIFTY": 100.0, "SENSEX": 100.0, "BANKEX": 100.0,
+    }.get((index or "").upper(), 100.0)
+    return step, True
+
+
 def _validate_or_shift_strike_python(
     strike: float,
     atm: float,
@@ -1042,12 +1656,15 @@ def _validate_or_shift_strike_python(
         except Exception:
             return "missing"
 
+    walk_step, _coarse = _liquidity_walk_step(index, interval)
+    interval = walk_step  # coarse (500) gaps walk by the fine per-index step
     st = _status(strike)
     if st == "tradeable":
         return strike
-    if st == "missing":
-        return None
-    # st == "zero_contracts" → walk TOWARD ATM (more liquid strikes).
+    # Any non-tradeable status ("zero_contracts" or "missing") is no-liquidity
+    # and shifts toward a tradeable strike, for EVERY gap and every strike mode.
+    # (Previously a "missing"/unlisted strike dropped the trade; now we always
+    # walk toward ATM to find a tradeable strike.)
     if strike > atm + 1e-6:
         direction = -1.0  # above ATM → walk down toward ATM
     elif strike < atm - 1e-6:
@@ -1114,6 +1731,9 @@ def _validate_or_shift_straddle_strike_python(
 
     def _joint_ok(s: float) -> bool:
         return _tradeable(s, "CE") and _tradeable(s, "PE")
+
+    walk_step, _coarse = _liquidity_walk_step(index, interval)
+    interval = walk_step  # coarse gaps walk by the fine per-index step
 
     if _joint_ok(strike):
         return strike
@@ -1286,15 +1906,74 @@ def _compute_strike_for_leg_python(
         return float(item[0]) if item else None
 
     if sel_type in ("straddle_width", "atm_straddle_prem_pct"):
+        # Fast path: the ENTIRE computation (formula, tradeable check,
+        # gap-widening fallback, joint zero-turnover walk) now lives natively
+        # in Rust (compute_straddle_leg_strike) as ONE call, replacing a chain
+        # of many small Python↔Rust FFI round-trips per leg — this is what
+        # made straddle_width (especially on thin-liquidity indices like
+        # MIDCPNIFTY) much slower than every other strike mode. Falls through
+        # to the pure-Python mirror below only if the native function is
+        # unavailable (older compiled extension) or raises.
+        _native_fn = getattr(algotest_native, "compute_straddle_leg_strike", None)
+        if _native_fn is not None:
+            try:
+                _native_result = _native_fn(
+                    leg, entry_date, expiry, index_up, entry_spot,
+                    int(strike_shift_max), dict(resolved_strikes or {}),
+                )
+            except Exception:
+                _native_result = None
+            if _native_result is not None:
+                _n_final, _n_requested, _n_atm, _n_ce, _n_pe, _n_source = _native_result
+                if out_info is not None:
+                    out_info["requested_strike"] = float(_n_requested)
+                    if _n_source:
+                        out_info["straddle_price_source"] = _n_source
+                return float(_n_final)
         try:
-            ce_px = algotest_native.get_option_price(entry_date, index_up, atm, "CE", expiry)
-            pe_px = algotest_native.get_option_price(entry_date, index_up, atm, "PE", expiry)
+            # Use the *tradeable* variant (filters zero-turnover/stale close
+            # prices), not get_option_price — a straddle price built from a
+            # dead, untraded contract's stale close silently corrupts the
+            # shift formula (seen on MIDCPNIFTY: a 0-contract PE's stale
+            # close of 1223.85 vs a real ~330 elsewhere).
+            ce_px = algotest_native.get_option_price_tradeable(entry_date, index_up, atm, "CE", expiry)
+            pe_px = algotest_native.get_option_price_tradeable(entry_date, index_up, atm, "PE", expiry)
+            _straddle_price_source = ""
+            if ce_px is None or pe_px is None:
+                # ATM straddle price illiquid at the leg's own strike gap —
+                # widen the GAP used only to source a liquid CE+PE price
+                # (gap, 2×gap, 3×gap, 4×gap), same rule for every index. The
+                # leg's own ATM/strike-gap ("atm", "interval" above) and the
+                # existing final-strike zero-turnover walk are untouched —
+                # this only replaces a bad price input to the shift formula.
+                _missing = ("CE" if ce_px is None else "") + ("PE" if pe_px is None else "")
+                _widened = None
+                for _mult_n in (2, 3, 4):
+                    _w_gap = interval * _mult_n
+                    _w_atm = round(entry_spot / _w_gap) * _w_gap
+                    _w_ce = algotest_native.get_option_price_tradeable(entry_date, index_up, _w_atm, "CE", expiry)
+                    _w_pe = algotest_native.get_option_price_tradeable(entry_date, index_up, _w_atm, "PE", expiry)
+                    if _w_ce is not None and _w_pe is not None:
+                        _widened = (_w_gap, _w_ce, _w_pe)
+                        break
+                if _widened is None:
+                    return None
+                _w_gap, ce_px, pe_px = _widened
+                _straddle_price_source = (
+                    f"{interval:g}→{_w_gap:g} (ATM {_missing} zero turnover)"
+                )
+            if out_info is not None and _straddle_price_source:
+                out_info["straddle_price_source"] = _straddle_price_source
         except Exception:
             return None
         if ce_px is None or pe_px is None:
             return None
         if sel_type == "straddle_width":
-            mult = float(sel.get("straddle_multiplier") or 0.5)
+            # NOTE: `or 0.5`, not `.get(..., 0.5)`, would silently turn a
+            # deliberate multiplier=0 (pure ATM) into 0.5 — 0 is falsy in
+            # Python. Explicit None-check preserves 0 correctly.
+            _mult_raw = sel.get("straddle_multiplier")
+            mult = float(_mult_raw) if _mult_raw is not None else 0.5
             direction = str(sel.get("straddle_direction") or "+").strip()
             shift = mult * (float(ce_px) + float(pe_px))
             # Raw +/- sign applied identically regardless of option_type: "+"
@@ -1304,10 +1983,15 @@ def _compute_strike_for_leg_python(
             req = round(raw / interval) * interval
             if out_info is not None:
                 out_info["requested_strike"] = float(req)
-            # Joint CE+PE liquidity walk (not the generic per-leg _validate):
-            # both legs share this requested strike, so if either side is
-            # illiquid, BOTH must shift together to a strike liquid for both.
-            return _validate_or_shift_straddle_strike_python(req, atm, interval, entry_date, expiry, index)
+            # Joint CE+PE liquidity walk ONLY when another straddle_width leg
+            # in this trade actually shares this same strike (same multiplier
+            # + direction — see _straddle_use_joint_shift annotation in
+            # run_rust_engine_pipeline). Otherwise this leg's strike is its
+            # own, unrelated to any sibling leg's contract, so it must shift
+            # on its OWN option_type's liquidity only, like every other mode.
+            if bool(leg.get("_straddle_use_joint_shift", False)):
+                return _validate_or_shift_straddle_strike_python(req, atm, interval, entry_date, expiry, index)
+            return _validate(req)
         else:  # atm_straddle_prem_pct
             pct = float(sel.get("value") or 0.0)
             target = (pct / 100.0) * (float(ce_px) + float(pe_px))
@@ -1347,7 +2031,31 @@ def _build_fixed_entry_specs(
     legs_src = payload.get("legs") or []
     index_str = str(payload.get("index") or "NIFTY").upper()
     interval = _STRIKE_INTERVALS.get(index_str, 50.0)
-    slippage = float(payload.get("slippage_pct") or 0.0)
+
+    # YEARLY: `expiry_dates` is the CADENCE list (weekly/monthly) and only drives
+    # entry/exit; the CONTRACT is the pinned December from `yearly_cycles`.
+    # Without this the fixed-entry path uses each cadence element AS the
+    # contract — silently trading weeklies while the UI says "Yearly".
+    _yearly_cycles: Optional[List[Dict[str, str]]] = (
+        payload.get("yearly_cycles")
+        if str(payload.get("expiry_type") or "").upper() == "YEARLY"
+        else None
+    )
+    if _yearly_cycles:
+        # Same reason as the rollover path: min-DTE advances the contract to the
+        # next CADENCE element, which would swap December for a weekly.
+        rollover_min_days = 0
+        no_rollover_min_days_val = 0
+    # Fresh's "re-strike" marker depends on the cadence:
+    #   * MONTHLY — re-strike at EVERY monthly roll, so key on the cadence expiry
+    #     (target_expiry). Consecutive monthly expiries are in different months,
+    #     and a mid-month filter start vs the month's roll are two different
+    #     expiries — both re-strike correctly.
+    #   * WEEKLY — hold within a CALENDAR month and re-strike at month-end, so
+    #     key on the entry date. A 28-Mar weekly entry (rolling into the w/c
+    #     04-Apr) is still March by the calendar, so it holds; the first April
+    #     entry re-strikes.
+    _yearly_cadence = str(payload.get("rollover_cadence") or "monthly").lower()
 
     sorted_expiries = sorted(expiry_dates)
 
@@ -1363,6 +2071,22 @@ def _build_fixed_entry_specs(
     trade_id = 1
 
     for seg_start, seg_end in effective_segs:
+        # YEARLY strike epochs (pinned path only). Fresh/Fixed are applied for
+        # weekly/monthly by the Python post-process `_apply_fixed_rollover_strike`,
+        # which early-returns under YEARLY. So the carry policy lives here.
+        #
+        # SEGMENT-WISE (user's rule "fixed should work segment wise"): the fixed
+        # strike is re-baselined to ATM at the start of every filter segment and
+        # held within it — matching weekly/monthly Fixed, which also takes its
+        # override from each segment's first trade. Resetting here (inside the
+        # loop) is the segment reset; `_opens_new_epoch` additionally re-strikes
+        # at a yearly roll via `new_cycle`, so a segment that spans a December
+        # roll re-strikes there too (the position re-enters fresh on the new
+        # contract). Untouched when _yearly_cycles is None.
+        _epoch_strike: Dict[int, float] = {}
+        _epoch_prev_cadence: Optional[str] = None
+        _epoch_prev_contract: Optional[str] = None
+
         current_entry = _next_trading_day_on_or_after(trading_days, seg_start)
         if current_entry is None or current_entry > seg_end:
             continue
@@ -1404,6 +2128,10 @@ def _build_fixed_entry_specs(
             if exit_date is None:
                 break
 
+            # YEARLY: the contract is resolved AFTER the 0-day loop settles
+            # exit_date (see below) — it depends on the exit, not the entry.
+            _pin: Optional[Dict[str, str]] = None
+
             # 0-day cycle: advance target expiry until exit > entry
             while exit_date <= current_entry:
                 if target_idx + 1 >= len(sorted_expiries):
@@ -1420,6 +2148,20 @@ def _build_fixed_entry_specs(
                 exit_date_new = _trading_day_n_before(target_expiry, exit_dte, trading_days)
                 exit_date = exit_date_new if exit_date_new else current_entry
 
+            # YEARLY: resolve the pinned December from the SETTLED exit. Must be
+            # after the 0-day loop, which re-assigns exit_date to the next
+            # cadence expiry (with exit_dte=0 the entry always lands ON a cadence
+            # expiry, so that loop always fires).
+            #
+            # The exit is NOT truncated: T-n is a threshold, so a segment simply
+            # opens on whichever December it can hold for its whole cadence
+            # period. The roll therefore lands on a real cadence boundary and no
+            # 1-day stub is produced.
+            #
+            # Resolved AFTER the segment clamp below — a filter-shortened segment
+            # is held for less time, so it may keep the NEARER December. Pinning
+            # off the unclamped exit would put the filter-end tail on a contract
+            # a whole year too far out.
             if exit_date <= current_entry:
                 if current_entry > seg_end:
                     break
@@ -1453,6 +2195,14 @@ def _build_fixed_entry_specs(
                 if not (rollover_toggle and not no_rollover_flag and exit_date < last_in_seg):
                     clamped = True
 
+            # YEARLY: resolve the pinned December from the FINAL (clamped) exit —
+            # see the note above the clamp. A filter-shortened segment is held for
+            # less time, so it may keep the NEARER December.
+            if _yearly_cycles is not None:
+                _pin = _cycle_for_exit(_yearly_cycles, exit_date)
+                if _pin is None:
+                    break
+
             entry_spot = spot_by_date.get(current_entry)
             if not entry_spot:
                 break
@@ -1470,7 +2220,12 @@ def _build_fixed_entry_specs(
                 # shifted contract isn't available (end of expiry list), skip just
                 # this trade and keep chaining.
                 _leg_is_next = str(leg.get("expiry") or "").upper() in _NEXT_EXPIRY_TYPES
-                if _leg_is_next:
+                if _pin is not None:
+                    # YEARLY: the contract is the pinned December, never a
+                    # cadence element. NEXT_* would shift it off the pin, so it
+                    # is rejected upstream rather than silently mis-contracted.
+                    leg_expiry = _pin["contract"]
+                elif _leg_is_next:
                     if target_idx + 1 >= len(sorted_expiries):
                         _trade_resolved = False
                         break
@@ -1486,11 +2241,41 @@ def _build_fixed_entry_specs(
                 except (TypeError, ValueError):
                     leg_interval = interval
                 _shift_info: Dict[str, Any] = {}
-                strike = _compute_strike_for_leg_python(
-                    leg, entry_spot, leg_interval,
-                    entry_date=current_entry, expiry=leg_expiry, index=index_str,
-                    out_info=_shift_info, resolved_strikes=_resolved_strikes,
-                )
+                # YEARLY carry policy. Outside yearly `_pin is None`, so this is
+                # skipped entirely and the strike resolves fresh per trade exactly
+                # as before (weekly/monthly Fixed is applied downstream by
+                # _apply_fixed_rollover_strike).
+                # MONTHLY keys on the cadence expiry (re-strike every roll, incl.
+                # a mid-month filter start); WEEKLY keys on the entry date (hold
+                # within a calendar month). See _yearly_cadence above.
+                _epoch_marker = target_expiry if _yearly_cadence == "monthly" else current_entry
+                _carried = None
+                if _pin is not None and _epoch_prev_cadence is not None:
+                    _new_cycle = _epoch_prev_contract != _pin["contract"]
+                    if not _opens_new_epoch(
+                        leg.get("rollover_strike_mode"), _epoch_prev_cadence,
+                        _epoch_marker, _new_cycle,
+                    ):
+                        _carried = _epoch_strike.get(leg_idx + 1)
+
+                if _carried is not None:
+                    # Re-validate the carried strike for liquidity against THIS
+                    # entry date and THIS December contract — never reuse blindly.
+                    # Over a ~12-month carry on a long-dated contract the strike
+                    # can go unlisted/illiquid.
+                    _atm = round(entry_spot / leg_interval) * leg_interval
+                    _is_ce = str(leg.get("option_type") or "CE").upper() in ("CE", "CALL", "C")
+                    strike = _validate_or_shift_strike_python(
+                        _carried, _atm, leg_interval, _is_ce, current_entry,
+                        leg_expiry, index_str, str(leg.get("option_type") or "CE").upper(), 1,
+                    )
+                    _shift_info["requested_strike"] = float(_carried)
+                else:
+                    strike = _compute_strike_for_leg_python(
+                        leg, entry_spot, leg_interval,
+                        entry_date=current_entry, expiry=leg_expiry, index=index_str,
+                        out_info=_shift_info, resolved_strikes=_resolved_strikes,
+                    )
                 if strike is None:
                     # Strike unresolvable on this date — e.g. the requested strike
                     # is a stale/zero-turnover contract with no inward strike to
@@ -1510,12 +2295,13 @@ def _build_fixed_entry_specs(
                     "expiry": leg_expiry,
                     "strike": float(strike),
                     "requested_strike": float(_shift_info.get("requested_strike") or strike),
+                    "straddle_price_source": _shift_info.get("straddle_price_source") or "",
                     "strike_interval": float(leg_interval),
                     "option_type": str(leg.get("option_type") or "CE").upper(),
                     "position": str(leg.get("position") or "SELL").upper(),
                     "lots": int(leg.get("lots") or 1),
                     "lot_size": int(lot_size),
-                    "slippage_pct": slippage,
+                    "slippage_pct": _leg_slippage_pct(leg),
                     # Exit was clamped to the segment/filter end (exit < natural
                     # expiry exit) → exit reason should be FILTER_END, not EXPIRY.
                     "_seg_clamped": clamped,
@@ -1528,6 +2314,16 @@ def _build_fixed_entry_specs(
             if _trade_resolved:
                 all_specs.extend(_trade_specs)
                 trade_id += 1
+                # Advance the epoch only for trades that actually emitted — a
+                # dropped trade must not consume the month boundary, or the next
+                # real trade in a new month would wrongly carry the old strike.
+                if _pin is not None:
+                    for _s in _trade_specs:
+                        _epoch_strike[int(_s["leg_id"])] = float(_s["strike"])
+                    _epoch_prev_cadence = (
+                        target_expiry if _yearly_cadence == "monthly" else current_entry
+                    )
+                    _epoch_prev_contract = _pin["contract"]
                 if clamped or no_rollover_flag or not rollover_toggle:
                     break
 
@@ -1536,6 +2332,206 @@ def _build_fixed_entry_specs(
             current_entry = exit_date  # same-day chain
 
     return all_specs
+
+
+def _build_fixed_entry_futures_specs(
+    payload: Dict[str, Any],
+    expiry_dates: List[str],
+    trading_days: List[str],
+    spot_by_date: Dict[str, float],
+    lot_size: int,
+    segments: Optional[List[Tuple[str, str]]],
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Fixed-entry ('fixed' filter_entry_mode) support for a FUTURES leg.
+
+    A futures leg is otherwise always routed to _build_futures_specs (DTE-based
+    entry scheduling), so Fixed Entry was silently ignored — with a date-list CSV
+    filter the DTE entry + segment clamp collapses every trade to zero. This
+    builder uses the SAME fixed-entry while-loop as _build_fixed_entry_specs
+    (enter on the segment start, exit at target_expiry - exit_dte clamped to the
+    segment end, chain within the segment when rollover is on) but prices the
+    leg with the native FUTIDX cache exactly like _build_futures_specs. Returns
+    fully-priced rows (bypass simulate_trades_batch). None if a leg is malformed.
+    """
+    rollover_toggle = bool(payload.get("rollover_toggle", False))
+    no_rollover_flag = bool(payload.get("no_rollover", False))
+    rollover_min_days = int(payload.get("rollover_min_days_to_expiry", 0) or 0)
+    no_rollover_min_days_val = int(payload.get("no_rollover_min_days", 0) or 0)
+    exit_dte = int(payload.get("exit_dte", 0) or 0)
+    legs_src = payload.get("legs") or []
+    index = str(payload.get("index") or "NIFTY").upper()
+
+    sorted_td = sorted(trading_days)
+    sorted_expiries = sorted(expiry_dates)
+
+    if segments is not None:
+        effective_segs = segments
+    else:
+        from_date = str(payload.get("from_date") or payload.get("date_from") or "")
+        to_date = str(payload.get("to_date") or payload.get("date_to") or "")
+        effective_segs = [(from_date, to_date)] if from_date and to_date else []
+
+    out: List[Dict[str, Any]] = []
+    trade_id = 1
+
+    for seg_start, seg_end in effective_segs:
+        current_entry = _next_trading_day_on_or_after(sorted_td, seg_start)
+        if current_entry is None or current_entry > seg_end:
+            continue
+        last_in_seg = _last_trading_day_on_or_before(seg_end, sorted_td)
+        if last_in_seg is None:
+            continue
+
+        max_iters = max(20, len(sorted_expiries) * 4)
+        iter_count = 0
+
+        while current_entry <= seg_end and iter_count < max_iters:
+            iter_count += 1
+            if current_entry < seg_start:
+                break
+
+            target_idx = bisect.bisect_left(sorted_expiries, current_entry)
+            if target_idx >= len(sorted_expiries):
+                break
+            target_expiry = sorted_expiries[target_idx]
+
+            if rollover_toggle and rollover_min_days > 0:
+                gap = _trading_day_gap_strict(current_entry, target_expiry, sorted_td)
+                if gap <= rollover_min_days and target_idx + 1 < len(sorted_expiries):
+                    target_idx += 1
+                    target_expiry = sorted_expiries[target_idx]
+            if no_rollover_flag and no_rollover_min_days_val > 0:
+                gap = _trading_day_gap_strict(current_entry, target_expiry, sorted_td)
+                if gap <= no_rollover_min_days_val and target_idx + 1 < len(sorted_expiries):
+                    target_idx += 1
+                    target_expiry = sorted_expiries[target_idx]
+
+            exit_date = _trading_day_n_before(target_expiry, exit_dte, sorted_td)
+            if exit_date is None:
+                break
+
+            # 0-day cycle: advance target expiry until exit > entry (mirror options).
+            while exit_date <= current_entry:
+                if target_idx + 1 >= len(sorted_expiries):
+                    next_td = _next_trading_day_on_or_after(sorted_td, sorted_expiries[-1] + "x")
+                    if next_td is None or next_td > seg_end:
+                        exit_date = current_entry
+                        break
+                    current_entry = next_td
+                    exit_date = current_entry
+                    break
+                target_idx += 1
+                target_expiry = sorted_expiries[target_idx]
+                _new = _trading_day_n_before(target_expiry, exit_dte, sorted_td)
+                exit_date = _new if _new else current_entry
+
+            if exit_date <= current_entry:
+                if current_entry > seg_end:
+                    break
+                continue
+
+            clamped = False
+            if exit_date > last_in_seg:
+                if last_in_seg <= current_entry:
+                    break
+                exit_date = last_in_seg
+                clamped = True
+            if target_expiry > last_in_seg:
+                if not (rollover_toggle and not no_rollover_flag and exit_date < last_in_seg):
+                    clamped = True
+
+            entry_spot = spot_by_date.get(current_entry)
+            if not entry_spot:
+                break
+            exit_spot = spot_by_date.get(exit_date, 0.0)
+
+            _emitted = False
+            for leg_id, leg in enumerate(legs_src, start=1):
+                if not isinstance(leg, dict):
+                    return None
+                if str(leg.get("segment") or "OPTION").upper() not in ("FUTURE", "FUTURES"):
+                    continue
+
+                position = str(leg.get("position") or "SELL").upper()
+                lots = int(leg.get("lots") or 1)
+                fut_pref_raw = str(leg.get("expiry") or "monthly").lower()
+                fut_pref = "next_monthly" if fut_pref_raw in ("next_monthly", "next_month", "mid_month") else "monthly"
+                _leg_slip = _leg_slippage_pct(leg)
+
+                # Native-priced, exactly like _build_futures_specs (no Postgres).
+                entry_price_raw, exit_price_raw, fut_expiry = _resolve_futures_pnl_native(
+                    entry_date=current_entry, exit_date=exit_date,
+                    symbol=index, position=position, preference=fut_pref,
+                )
+                if entry_price_raw is None:
+                    continue
+                if exit_price_raw is None:
+                    exit_price_raw = entry_price_raw
+
+                fut_exit_date = exit_date
+                _sc_date, _sc_raw, _reason = _scan_futures_sl_target(
+                    current_entry, float(entry_price_raw), position, leg, sorted_td,
+                    exit_date, index, fut_expiry or "", _leg_slip,
+                )
+                exit_reason = _reason
+                _exit_spot = exit_spot
+                if _sc_raw is not None:
+                    fut_exit_date = _sc_date
+                    exit_price_raw = _sc_raw
+                    _exit_spot = spot_by_date.get(fut_exit_date, exit_spot)
+                elif clamped:
+                    # Exit clamped to the segment/filter end (not a natural expiry).
+                    exit_reason = "FILTER_END"
+
+                if _leg_slip > 0:
+                    _ef = (1.0 - _leg_slip / 100.0) if position == "SELL" else (1.0 + _leg_slip / 100.0)
+                    _xf = (1.0 + _leg_slip / 100.0) if position == "SELL" else (1.0 - _leg_slip / 100.0)
+                    entry_price = round(max(float(entry_price_raw) * _ef, 0.0), 2)
+                    exit_price = round(max(float(exit_price_raw) * _xf, 0.0), 2)
+                else:
+                    entry_price = round(float(entry_price_raw), 2)
+                    exit_price = round(float(exit_price_raw), 2)
+
+                net_pnl = round(
+                    (entry_price - exit_price) if position == "SELL" else (exit_price - entry_price),
+                    4,
+                )
+
+                out.append({
+                    "trade_id": trade_id,
+                    "leg_id": leg_id,
+                    "index": index,
+                    "entry_date": current_entry,
+                    "exit_date": fut_exit_date,
+                    "expiry": fut_expiry or "",
+                    "strike": 0.0,
+                    "option_type": "FUT",
+                    "position": position,
+                    "lots": lots,
+                    "lot_size": lot_size,
+                    "slippage_pct": _leg_slip,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "raw_entry_price": round(float(entry_price_raw), 4),
+                    "raw_exit_price": round(float(exit_price_raw), 4),
+                    "net_pnl": net_pnl,
+                    "entry_spot": float(entry_spot),
+                    "exit_spot": float(_exit_spot),
+                    "exit_reason": exit_reason,
+                })
+                _emitted = True
+
+            if _emitted:
+                trade_id += 1
+
+            # Fixed-entry chaining: one trade per segment unless rollover keeps the
+            # chain alive within the segment (same rule as _build_fixed_entry_specs).
+            if clamped or no_rollover_flag or not rollover_toggle:
+                break
+            current_entry = exit_date
+
+    return out
 
 
 def _fetch_one_extra_expiry(
@@ -1558,7 +2554,15 @@ def _fetch_one_extra_expiry(
         from base import get_expiry_dates  # type: ignore
         # Determine whether we need weekly or monthly expiries.
         expiry_type_raw = str(payload.get("expiry_type") or "WEEKLY").upper()
-        if expiry_type_raw in ("MONTHLY", "NEXT_MONTHLY", "MONTHLY_T1"):
+        if expiry_type_raw == "YEARLY":
+            # YEARLY has no calendar of its own — the roll CADENCE is what this
+            # list holds, so the extra expiry must come from that calendar.
+            # Falling through to "weekly" would append a weekly expiry to a
+            # monthly cadence list and roll the position on a bogus date.
+            freq = str(payload.get("rollover_cadence") or "monthly").lower()
+            if freq not in ("weekly", "monthly"):
+                freq = "monthly"
+        elif expiry_type_raw in ("MONTHLY", "NEXT_MONTHLY", "MONTHLY_T1"):
             freq = "monthly"
         else:
             freq = "weekly"
@@ -1614,7 +2618,6 @@ def _build_next_expiry_specs(
     legs_src = [leg for leg in (payload.get("legs") or []) if isinstance(leg, dict)]
     index_str = str(payload.get("index") or "NIFTY").upper()
     interval = _STRIKE_INTERVALS.get(index_str, 50.0)
-    slippage = float(payload.get("slippage_pct") or 0.0)
 
     if not legs_src:
         return []
@@ -1714,12 +2717,13 @@ def _build_next_expiry_specs(
                 "expiry": per_leg_expiry,
                 "strike": float(strike),
                 "requested_strike": float(_shift_info.get("requested_strike") or strike),
+                "straddle_price_source": _shift_info.get("straddle_price_source") or "",
                 "strike_interval": float(leg_interval),
                 "option_type": str(leg.get("option_type") or "CE").upper(),
                 "position": str(leg.get("position") or "SELL").upper(),
                 "lots": int(leg.get("lots") or 1),
                 "lot_size": int(lot_size),
-                "slippage_pct": slippage,
+                "slippage_pct": _leg_slippage_pct(leg),
             })
 
         if _skip_trade or not _trade_specs:
@@ -1977,6 +2981,18 @@ def _apply_fixed_rollover_strike(
     if not bool(payload.get("rollover_toggle", False)):
         return specs  # Each segment has at most one trade — no-op
 
+    # YEARLY resolves the carry policy in Rust (simulate.rs `opens_new_epoch`),
+    # where the epoch resets per yearly cycle and — for Fresh — per month, and
+    # where a carried strike is re-validated for liquidity against the December
+    # contract.
+    #
+    # This post-process MUST NOT also run there. Its `effective_segs` falls back
+    # to [(from_date, to_date)] — one segment for the whole backtest — so it
+    # would treat every year as a single epoch and pin the 2019 strike onto the
+    # 2021 contract. That is a wrong tradesheet, not a redundant no-op.
+    if str(payload.get("expiry_type") or "").upper() == "YEARLY":
+        return specs
+
     legs_src = payload.get("legs") or []
     fixed_leg_ids: Set[int] = {
         idx + 1
@@ -2047,6 +3063,80 @@ def _apply_fixed_rollover_strike(
     return result
 
 
+def _payload_uses_straddle_width(payload: Dict[str, Any]) -> bool:
+    """True when ANY leg selects its strike via the ``straddle_width`` mode.
+
+    Drives whether the ATM-straddle context columns (ATM Strike / ATM Call /
+    ATM Put / ATM Call+Put) are added to the tradesheet — they are hidden for
+    every other strike mode. Purely a display gate: no calculation depends on
+    it.
+    """
+    for leg in (payload.get("legs") or []):
+        if not isinstance(leg, dict):
+            continue
+        sel = leg.get("strike_selection") or {}
+        if isinstance(sel, dict) and str(sel.get("type") or "").lower().strip() == "straddle_width":
+            return True
+    return False
+
+
+def _atm_straddle_prices(
+    native: Any,
+    cache: Dict[tuple, Optional[tuple]],
+    entry_date: Optional[str],
+    index: str,
+    entry_spot: float,
+    interval: float,
+    expiry: Optional[str],
+) -> Optional[tuple]:
+    """Return ``(atm_strike, ce_px, pe_px, ce+pe, source_reason)`` at trade
+    entry, or None.
+
+    Display-only: re-reads the SAME ATM CE/PE prices the straddle_width strike
+    selection already used — including the same liquidity check and gap-
+    widening fallback (gap, 2x, 3x, 4x) as _compute_strike_for_leg_python, so
+    this never shows a stale zero-turnover close price (e.g. a dead PE's
+    stale close of 1223.85) when the strike math itself used a corrected,
+    widened price. Cached per (entry_date, expiry, atm) so a multi-leg
+    straddle only hits the lookup once. Never affects strike/P&L.
+    """
+    if native is None or not (entry_date and expiry and interval and entry_spot and entry_spot > 0):
+        return None
+    atm = round(entry_spot / interval) * interval
+    key = (entry_date, expiry, atm)
+    if key in cache:
+        return cache[key]
+    try:
+        ce = native.get_option_price_tradeable(entry_date, index, atm, "CE", expiry)
+        pe = native.get_option_price_tradeable(entry_date, index, atm, "PE", expiry)
+        source = ""
+        if ce is None or pe is None:
+            missing = ("CE" if ce is None else "") + ("PE" if pe is None else "")
+            widened = None
+            for mult_n in (2, 3, 4):
+                w_gap = interval * mult_n
+                w_atm = round(entry_spot / w_gap) * w_gap
+                w_ce = native.get_option_price_tradeable(entry_date, index, w_atm, "CE", expiry)
+                w_pe = native.get_option_price_tradeable(entry_date, index, w_atm, "PE", expiry)
+                if w_ce is not None and w_pe is not None:
+                    widened = (w_gap, w_ce, w_pe)
+                    break
+            if widened is None:
+                cache[key] = None
+                return None
+            w_gap, ce, pe = widened
+            source = f"{interval:g}→{w_gap:g} (ATM {missing} zero turnover)"
+    except Exception:
+        cache[key] = None
+        return None
+    if ce is None or pe is None:
+        cache[key] = None
+        return None
+    res = (float(atm), round(float(ce), 2), round(float(pe), 2), round(float(ce) + float(pe), 2), source)
+    cache[key] = res
+    return res
+
+
 def priced_to_tradesheet_records(
     priced: List[Dict[str, Any]],
     payload: Dict[str, Any],
@@ -2094,6 +3184,48 @@ def priced_to_tradesheet_records(
     # cosmetic: no exit date, price, or P&L changes; no downstream calc keys off
     # the "EXPIRY" string (SL-cap / FILTER_END resets use other tokens).
     _tn_run = int(payload.get("exit_dte") or 0) > 0
+    # ATM-straddle context columns: only computed when the strategy actually
+    # uses the straddle_width strike mode (otherwise hidden entirely). Zero
+    # overhead + no extra keys for every other strategy.
+    _uses_sw = _payload_uses_straddle_width(payload)
+    _sw_native = None
+    _sw_cache: Dict[tuple, Optional[tuple]] = {}
+    # Per-leg strike gap sourced from the ORIGINAL payload leg config, not
+    # row.get("strike_interval") — the Rust-simulated row can normalize/
+    # overwrite that field to the index default, silently dropping a leg's
+    # own override (e.g. MIDCPNIFTY leg explicitly set to 50 while the index
+    # default is 25) and making the display ATM Strike land on a different
+    # grid than the actually-traded Strike.
+    _sw_leg_intervals: Dict[int, float] = {}
+    # The ATM-straddle context (ATM Strike/Call/Put/Sum) is a display fact for the
+    # OPTIONS leg that uses straddle_width — NOT necessarily leg 1. When a FUTURES
+    # leg is added first it becomes leg 1 and would wrongly carry these columns.
+    # Anchor them on the first straddle_width leg, else the first non-FUTURES leg.
+    _atm_anchor_leg_id = 1
+    if _uses_sw:
+        try:
+            import algotest_native as _sw_native  # type: ignore
+        except ImportError:
+            _sw_native = None
+        _first_opt_leg = None
+        _first_sw_leg = None
+        for _li, _lg in enumerate((payload.get("legs") or []), start=1):
+            if not isinstance(_lg, dict):
+                continue
+            _liv = _lg.get("strike_interval")
+            try:
+                _sw_leg_intervals[_li] = float(_liv) if _liv else _STRIKE_INTERVALS.get(
+                    str(_lg.get("index") or index_str).upper(), 50.0
+                )
+            except (TypeError, ValueError):
+                _sw_leg_intervals[_li] = _STRIKE_INTERVALS.get(index_str, 50.0)
+            if str(_lg.get("segment") or "").upper() not in ("FUTURES", "FUTURE") and _first_opt_leg is None:
+                _first_opt_leg = _li
+            _sel = _lg.get("strike_selection") or {}
+            if (_first_sw_leg is None and isinstance(_sel, dict)
+                    and str(_sel.get("type") or "").lower().strip() == "straddle_width"):
+                _first_sw_leg = _li
+        _atm_anchor_leg_id = _first_sw_leg or _first_opt_leg or 1
     out: List[Dict[str, Any]] = []
     for row in priced:
         opt_type = (row.get("option_type") or "").upper()
@@ -2125,9 +3257,13 @@ def priced_to_tradesheet_records(
         qty = int(row.get("lots") or 1) * int(row.get("lot_size") or lot_size or 1)
         # FUTURES: Strike = '' (matches Python engine convention); options: float.
         strike_val = "" if is_fut else float(row.get("strike") or 0.0)
-        # Strike Shift Reason — populated only when the engine shifted the
-        # requested strike toward ATM because the original contract had zero
-        # turnover on entry day. Empty when no shift was applied.
+        # Strike Shift Reason — populated whenever the engine moved the
+        # requested strike to a tradeable one because the original contract had
+        # no liquidity on entry day. Shows the ACTUAL cause (zero turnover vs
+        # strike-not-listed), the from→to strikes, the number of walk steps
+        # (using the finer per-index step for coarse 500 gaps), and the walk
+        # direction. Applies to EVERY strike-selection mode (the shift runs on
+        # the final strike of all modes) and every index. Empty when no shift.
         _shift_reason = ""
         try:
             _req = row.get("requested_strike")
@@ -2136,11 +3272,29 @@ def priced_to_tradesheet_records(
                 _act_f = float(strike_val)
                 if abs(_req_f - _act_f) > 1e-6:
                     _intvl = float(row.get("strike_interval") or 50.0) or 50.0
-                    _steps = max(1, int(round(abs(_act_f - _req_f) / _intvl)))
+                    _walk_step, _ = _liquidity_walk_step(index_str, _intvl)
+                    _steps = max(1, int(round(abs(_act_f - _req_f) / _walk_step)))
+                    _cause = "zero turnover"  # historical default (safe)
+                    try:
+                        import algotest_native  # type: ignore
+                        _stfn = getattr(algotest_native, "get_option_status", None)
+                        if _stfn is not None:
+                            _st = _stfn(
+                                _normalize_iso(row.get("entry_date")), index_str,
+                                _req_f, opt_type, _normalize_iso(row.get("expiry")),
+                            )
+                            if _st == "missing":
+                                _cause = "strike not listed"
+                            elif _st == "zero_contracts":
+                                _cause = "zero turnover"
+                    except Exception:
+                        pass
+                    _atm_f = (round(entry_spot / _intvl) * _intvl) if entry_spot else _act_f
+                    _dir = "toward ATM" if abs(_act_f - _atm_f) <= abs(_req_f - _atm_f) else "outward"
+                    _fmt = lambda x: int(x) if float(x).is_integer() else round(x, 2)
                     _shift_reason = (
-                        f"{int(_req_f) if _req_f.is_integer() else _req_f}→"
-                        f"{int(_act_f) if _act_f.is_integer() else _act_f} "
-                        f"(zero turnover, {_steps} step{'s' if _steps != 1 else ''})"
+                        f"{_fmt(_req_f)}→{_fmt(_act_f)} "
+                        f"({_cause}, {_steps} step{'s' if _steps != 1 else ''} {_dir})"
                     )
         except (TypeError, ValueError):
             pass
@@ -2150,7 +3304,7 @@ def priced_to_tradesheet_records(
                 "SCHEDULED_EXIT" if p.upper() == "EXPIRY" else p
                 for p in _exit_reason.split("+")
             )
-        out.append({
+        _rec = {
             "Trade": str(row.get("trade_id") or ""),
             "Leg": int(row.get("leg_id") or 1),
             "Index": index_str,
@@ -2184,6 +3338,7 @@ def priced_to_tradesheet_records(
             "% P&L": pct_pnl,
             "Exit Reason": _exit_reason,
             "Strike Shift Reason": _shift_reason,
+            "ATM Straddle Price Source": str(row.get("straddle_price_source") or ""),
             "ReEntryIndex": row.get("_reentry_index") or "",
             "ReEntryTrigger": str(row.get("_reentry_trigger") or ""),
             "ReEntryMode": str(row.get("_reentry_mode") or ""),
@@ -2191,7 +3346,31 @@ def priced_to_tradesheet_records(
             "Lazy Leg Name": "",
             "Lazy Entry Date": "",
             "Lazy Exit Date": "",
-        })
+        }
+        # Straddle-width only: surface the ATM strike + its CE/PE prices (and
+        # their sum) that the strike selection was derived from. Trade-level
+        # entry fact → written on the first-leg row only, blank on the rest.
+        if _uses_sw:
+            sw = {"ATM Strike": "", "ATM Call Price": "", "ATM Put Price": "", "ATM Call+Put Price": ""}
+            if _leg_id_val == _atm_anchor_leg_id and _sw_native is not None and entry_spot > 0:
+                _sw_interval = _sw_leg_intervals.get(_leg_id_val) or float(row.get("strike_interval") or 50.0)
+                _atm = _atm_straddle_prices(
+                    _sw_native, _sw_cache, _normalize_iso(row.get("entry_date")),
+                    index_str, entry_spot, _sw_interval,
+                    _normalize_iso(row.get("expiry")),
+                )
+                if _atm is not None:
+                    sw = {
+                        "ATM Strike": _atm[0], "ATM Call Price": _atm[1],
+                        "ATM Put Price": _atm[2], "ATM Call+Put Price": _atm[3],
+                    }
+                    # Prefer the strike-selection's own reason (row-sourced);
+                    # fall back to this display recompute's reason so the two
+                    # independent lookups never disagree in what's shown.
+                    if not _rec["ATM Straddle Price Source"] and _atm[4]:
+                        _rec["ATM Straddle Price Source"] = _atm[4]
+            _rec.update(sw)
+        out.append(_rec)
     return out
 
 
@@ -2426,6 +3605,213 @@ def _build_mixed_futures_next_weekly(
         _first = min(_rows, key=lambda _r: int(_r.get("leg_id") or 1))
         _first["net_pnl"] = _trade_total
 
+    # Order rows by (trade, leg) so leg-1 (carrying Spot P&L + the trade total) is
+    # FIRST within each trade — fixes the optim's `Spot P&L: first` aggregation
+    # picking a leading blank option row.
+    combined.sort(key=lambda _r: (int(_r.get("trade_id") or 0), int(_r.get("leg_id") or 0)))
+    return combined if combined else None
+
+
+def _build_mixed_futures_options(
+    payload: Dict[str, Any],
+    *,
+    expiry_dates: List[str],
+    trading_days: List[str],
+    lot_size: int,
+    spot_by_date: Dict[str, float],
+    square_off_mode: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    General mixed OPTIONS + FUTURES with UNIT-EXIT semantics: both legs enter and
+    exit together on the strategy/option trade window — mirroring the Python engine,
+    which anchors a mixed trade's exit to the option's current expiry
+    (``effective_to_date = ... else trade_curr_expiry``).
+
+    Additive design — reuses ALL existing option machinery:
+      * OPTION legs flow through the FULL normal pipeline via a recursive call on a
+        futures-stripped payload, so SL/Target, spot-adjustment, midcap, buffer
+        strike and segment gating behave exactly as an options-only run.
+      * FUTURES legs are RUST-PRICED (native ``get_future_price`` from the FUTIDX
+        Arrow cache) and aligned to each option trade's ``(entry_date -> trade
+        exit)``.  Contract-expiry RESOLUTION stays Python (calendar orchestration).
+        This is the agreed "Rust prices, Python orchestrates" split — no Python
+        pricing, no Python-engine fallback.
+
+    Returns:
+      * ``None``  → not the mixed case, or an unsupported / failed configuration
+                    (caller keeps existing behavior — nothing breaks).
+      * ``[]``    → option sub-run produced no trades.
+      * ``[row]`` → merged, priced option+futures rows (pre-tradesheet).
+    """
+    legs_src = payload.get("legs") or []
+    fut_legs = [
+        (i, l) for i, l in enumerate(legs_src, start=1)
+        if isinstance(l, dict)
+        and str(l.get("segment") or "OPTION").upper() in ("FUTURE", "FUTURES")
+    ]
+    opt_legs = [
+        (i, l) for i, l in enumerate(legs_src, start=1)
+        if isinstance(l, dict)
+        and str(l.get("segment") or "OPTION").upper() not in ("FUTURE", "FUTURES")
+    ]
+    if not fut_legs or not opt_legs:
+        return None  # mixed mode requires BOTH leg types
+
+    index = str(payload.get("index") or "NIFTY").upper()
+
+    # Native futures pricing source must be loaded for this index (self-refreshing).
+    try:
+        from services.futures_cache_store import ensure_futures_loaded
+        if not ensure_futures_loaded(index):
+            logger.warning("[ENGINE_RUST] mixed-fut: FUTIDX cache not loaded for %s — bailing", index)
+            return None
+    except Exception as _exc:
+        logger.warning("[ENGINE_RUST] mixed-fut: ensure_futures_loaded failed: %s", _exc)
+        return None
+
+    # ── 1) OPTION legs through the full normal pipeline (futures stripped) ──────
+    opt_payload = {**payload, "legs": [l for _, l in opt_legs]}
+    opt_rows = run_rust_engine_pipeline(
+        opt_payload,
+        expiry_dates=expiry_dates,
+        trading_days=trading_days,
+        lot_size=lot_size,
+        spot_by_date=spot_by_date,
+        square_off_mode=square_off_mode,
+    )
+    if opt_rows is None:
+        return None
+    if not opt_rows:
+        return []
+
+    # Remap option leg_ids (1..M in the sub-payload) back to original positions.
+    _opt_remap = {new: orig for new, (orig, _) in enumerate(opt_legs, start=1)}
+    for r in opt_rows:
+        if r.get("leg_id") in _opt_remap:
+            r["leg_id"] = _opt_remap[r["leg_id"]]
+
+    # ── 2) Trade windows from option rows ──────────────────────────────────────
+    # Unit-exit: the futures leg exits at the option trade's exit. When option legs
+    # disagree (multi-leg), the LATEST exit per entry_date is the trade exit.
+    trade_exit_by_entry: Dict[str, str] = {}
+    # Also track the option leg's EXPIRY cycle per entry — the futures leg holds the
+    # SAME contract month as the option, so a roll-in stub whose exit is clamped to a
+    # filter/patch boundary (exit in the CURRENT month while the option already rolled
+    # to NEXT) doesn't drop the futures back to the near contract.
+    opt_expiry_by_entry: Dict[str, str] = {}
+    for r in opt_rows:
+        e = r.get("entry_date")
+        x = r.get("exit_date")
+        if not e or not x:
+            continue
+        if e not in trade_exit_by_entry or x > trade_exit_by_entry[e]:
+            trade_exit_by_entry[e] = x
+        _ex = r.get("expiry")
+        if _ex and (e not in opt_expiry_by_entry or str(_ex) > opt_expiry_by_entry[e]):
+            opt_expiry_by_entry[e] = str(_ex)
+    if not trade_exit_by_entry:
+        return opt_rows  # no datable option trades — nothing to hedge
+
+    # ── 3) RUST-PRICED futures rows aligned to each option trade window ─────────
+    fut_rows: List[Dict[str, Any]] = []
+    for entry_date in sorted(trade_exit_by_entry.keys()):
+        trade_exit = trade_exit_by_entry[entry_date]
+        entry_spot = float(spot_by_date.get(entry_date) or 0.0)
+        exit_spot = float(spot_by_date.get(trade_exit) or 0.0)
+        for leg_id, leg in fut_legs:
+            position = str(leg.get("position") or "SELL").upper()
+            lots = int(leg.get("lots") or 1)
+            pref_raw = str(leg.get("expiry") or "monthly").lower()
+            pref = "next_monthly" if pref_raw in ("next_monthly", "next_month", "mid_month") else "monthly"
+            _leg_slip = _leg_slippage_pct(leg)
+
+            # Contract must survive to the unit-exit date; on an expiry-day entry
+            # this rolls to next month (normal weekly cycles resolve identically).
+            # Anchor the contract to the OPTION leg's EXPIRY cycle (not the possibly
+            # filter/patch-clamped trade_exit) so both legs hold the SAME month: on a
+            # roll-in stub the option has rolled to next month but trade_exit is
+            # clamped back into the current month, which would otherwise pick the near
+            # futures contract. opt_expiry >= trade_exit always, so the chosen contract
+            # still survives the actual hold. Falls back to trade_exit if unknown.
+            _contract_anchor = opt_expiry_by_entry.get(entry_date) or trade_exit
+            fut_expiry = _fut_resolve_expiry_for_hold(index, entry_date, _contract_anchor, pref)
+            if not fut_expiry:
+                logger.warning("[ENGINE_RUST] mixed-fut: no %s contract for %s @ %s", pref, index, entry_date)
+                return None
+            ep_raw = _fut_price(index, entry_date, fut_expiry)
+            xp_raw = _fut_price(index, trade_exit, fut_expiry)
+            if ep_raw is None:
+                logger.warning("[ENGINE_RUST] mixed-fut: no entry fut price %s %s exp=%s", index, entry_date, fut_expiry)
+                return None
+            if xp_raw is None:
+                xp_raw = ep_raw  # exit-day close missing → priced flat (matches Python guard)
+            ep_raw = float(ep_raw)
+            xp_raw = float(xp_raw)
+
+            if _leg_slip > 0:
+                _ef = (1.0 - _leg_slip / 100.0) if position == "SELL" else (1.0 + _leg_slip / 100.0)
+                _xf = (1.0 + _leg_slip / 100.0) if position == "SELL" else (1.0 - _leg_slip / 100.0)
+                entry_price = round(max(ep_raw * _ef, 0.0), 2)
+                exit_price = round(max(xp_raw * _xf, 0.0), 2)
+            else:
+                entry_price = round(ep_raw, 2)
+                exit_price = round(xp_raw, 2)
+
+            fut_rows.append({
+                "trade_id": 0,          # assigned in step 4
+                "leg_id": leg_id,
+                "index": index,
+                "entry_date": entry_date,
+                "exit_date": trade_exit,
+                "expiry": fut_expiry,
+                "strike": 0.0,
+                "option_type": "FUT",
+                "position": position,
+                "lots": lots,
+                "lot_size": lot_size,
+                "slippage_pct": _leg_slip,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "raw_entry_price": round(ep_raw, 4),
+                "raw_exit_price": round(xp_raw, 4),
+                "net_pnl": 0.0,         # set in step 5
+                "entry_spot": entry_spot,
+                "exit_spot": exit_spot,
+                "exit_reason": "EXPIRY",
+            })
+
+    # ── 4) Shared trade_ids by entry_date so opt+fut of one period share a tid ──
+    combined = list(opt_rows) + fut_rows
+    _all_entries = sorted({r["entry_date"] for r in combined})
+    _entry_to_tid = {e: i for i, e in enumerate(_all_entries, start=1)}
+    for r in combined:
+        r["trade_id"] = _entry_to_tid[r["entry_date"]]
+
+    # ── 5) Net-P&L convention (matches priced_to_tradesheet_records/simulate.rs) ─
+    # Per-leg P&L = (entry-exit) if SELL else (exit-entry), per UNIT (no lots/size).
+    # The FIRST leg (lowest leg_id) of each trade carries the TRADE-TOTAL; other
+    # legs carry their per-leg value. Recompute from PRICES so the merge is robust
+    # to whatever net_pnl convention the recursive option rows arrived with.
+    from collections import defaultdict as _dd
+    for r in combined:
+        _ep = float(r.get("entry_price") or 0.0)
+        _xp = float(r.get("exit_price") or 0.0)
+        _pos = str(r.get("position") or "SELL").upper()
+        r["net_pnl"] = round((_ep - _xp) if _pos == "SELL" else (_xp - _ep), 4)
+    _by_tid: Dict[int, List[Dict]] = _dd(list)
+    for r in combined:
+        _by_tid[int(r.get("trade_id") or 0)].append(r)
+    for _tid, _rows in _by_tid.items():
+        if len(_rows) <= 1:
+            continue
+        _total = round(sum(float(r.get("net_pnl") or 0.0) for r in _rows), 4)
+        min(_rows, key=lambda r: int(r.get("leg_id") or 1))["net_pnl"] = _total
+
+    # Order rows by (trade, leg) so the leg-1 row — which carries Spot P&L and the
+    # trade-total net_pnl — is FIRST within each trade. The optimizer's
+    # `Spot P&L: first` aggregation (and any first-row logic) then picks the real
+    # value instead of a leading option row whose Spot P&L is intentionally blank.
+    combined.sort(key=lambda _r: (int(_r.get("trade_id") or 0), int(_r.get("leg_id") or 0)))
     return combined if combined else None
 
 
@@ -2484,8 +3870,88 @@ def run_rust_engine_pipeline(
         logger.warning("[ENGINE_RUST] Rust cache not loaded — rejecting payload (no Python fallback exists)")
         return None
 
+    # ── YEARLY blockers ────────────────────────────────────────────────────────
+    # YEARLY pins the option contract to a December expiry while the cadence
+    # list drives entry/exit. Anything that assumes "contract == cadence element"
+    # must be rejected LOUDLY here rather than silently producing a
+    # plausible-but-wrong tradesheet. (simulate.rs separately rejects YEARLY
+    # without yearly_cycles, and YEARLY + rollover_min_days_to_expiry.)
+    if str(payload.get("expiry_type") or "").upper() == "YEARLY":
+        if not payload.get("yearly_cycles"):
+            raise ValueError(
+                "expiry_type=YEARLY reached the engine without 'yearly_cycles'. "
+                "Resolve the payload through engine_rust.resolve_expiry_inputs()."
+            )
+        # _build_futures_specs gates on `\"NEXT\" not in expiry_type`, which is
+        # True for YEARLY — futures would roll across the *cadence* list. Futures
+        # have their own monthly contracts and no December pin, so v1 blocks it
+        # instead of silently rolling them wrong.
+        # Same predicate _build_futures_specs uses to select its legs (:1241).
+        if any(
+            isinstance(_leg, dict)
+            and str(_leg.get("segment") or "OPTION").upper() in ("FUTURE", "FUTURES")
+            for _leg in (payload.get("legs") or [])
+        ):
+            raise ValueError(
+                "expiry_type=YEARLY does not support FUTURES legs yet: futures have "
+                "no long-dated December contract to pin to, and the futures rollover "
+                "builder would roll them across the option cadence."
+            )
+        # NEXT_* means "one expiry further out than the exit anchor" — under
+        # YEARLY the anchor is a cadence element, so it would shift the leg OFF
+        # the pinned December onto a weekly/monthly contract.
+        _bad = [
+            str(_l.get("expiry") or "").upper()
+            for _l in (payload.get("legs") or [])
+            if isinstance(_l, dict) and str(_l.get("expiry") or "").upper() in _NEXT_EXPIRY_TYPES
+        ]
+        if _bad:
+            raise ValueError(
+                f"expiry_type=YEARLY does not support {sorted(set(_bad))} legs: the "
+                "contract is pinned to December, so there is no 'next' contract to "
+                "shift to. Set the leg expiry to YEARLY."
+            )
+
     # Sorted expiry list used by NEXT_WEEKLY and LAZY_LEG expiry resolution.
     _sorted_expiries: List[str] = sorted(expiry_dates)
+
+    # ── straddle_width joint-shift eligibility ──────────────────────────────────
+    # Annotate each leg with whether it should use the JOINT CE+PE liquidity
+    # walk (both legs shift together) vs the standard per-option-type walk.
+    # Joint shifting is only correct when two straddle_width legs actually
+    # resolve to the SAME strike (same multiplier + direction) — with
+    # different multipliers each leg lands on a different strike, so forcing
+    # a joint check makes one leg's shift depend on an unrelated contract the
+    # OTHER leg doesn't even trade. Mutated in place on payload["legs"] (the
+    # same list object every downstream builder/native call reads) so this
+    # single pass covers every code path — DTE-mode Rust resolve_trade_specs,
+    # every Python schedule builder, and the native compute_straddle_leg_strike
+    # fast path — without threading a new parameter through each call site.
+    _sw_legs = payload.get("legs") or []
+    if isinstance(_sw_legs, list):
+        _sw_configs: Dict[int, tuple] = {}
+        for _si, _sleg in enumerate(_sw_legs, start=1):
+            if not isinstance(_sleg, dict):
+                continue
+            _ssel = _sleg.get("strike_selection") or {}
+            if not isinstance(_ssel, dict) or str(_ssel.get("type") or "").lower().strip() != "straddle_width":
+                continue
+            # Explicit None-check — `or 0.5` would silently turn a deliberate
+            # multiplier=0 into 0.5 (0 is falsy in Python), which would then
+            # wrongly "match" a genuinely different 0.5-multiplier sibling leg.
+            _smult_raw = _ssel.get("straddle_multiplier")
+            try:
+                _smult = round(float(_smult_raw), 6) if _smult_raw is not None else 0.5
+            except (TypeError, ValueError):
+                _smult = 0.5
+            _sdir = "-" if str(_ssel.get("straddle_direction") or "+").strip() == "-" else "+"
+            _sw_configs[_si] = (_smult, _sdir)
+        for _si, _sleg in enumerate(_sw_legs, start=1):
+            if _si in _sw_configs and isinstance(_sleg, dict):
+                _cfg = _sw_configs[_si]
+                _sleg["_straddle_use_joint_shift"] = any(
+                    _oi != _si and _ocfg == _cfg for _oi, _ocfg in _sw_configs.items()
+                )
 
     # ── FUTURES legs ────────────────────────────────────────────────────────────
     # FUTURES pricing uses base.resolve_futures_pnl_with_rollover (Python DB
@@ -2519,13 +3985,45 @@ def run_rust_engine_pipeline(
     original_segments = segments
 
     if _has_futures_leg:
-        # FUTURES legs are priced via base.resolve_futures_pnl_with_rollover
-        # (Python DB lookup), not the Rust feather.  Build and return complete
-        # priced rows directly — bypass simulate_trades_batch and SL/re-entry.
-        logger.warning(
-            "[ENGINE_RUST] PYTHON pricing path: strategy has FUTURES legs — "
-            "priced via base.resolve_futures_pnl_with_rollover (expected for futures)."
+        # FUTURES legs are priced from the native Rust FUTIDX cache
+        # (_resolve_futures_pnl_native / _fut_price — no Postgres), then built
+        # into complete priced rows directly, bypassing simulate_trades_batch.
+        logger.info(
+            "[ENGINE_RUST] RUST pricing path: strategy has FUTURES legs — "
+            "priced from the native FUTIDX cache (no Postgres reads)."
         )
+        # ── General mixed OPTIONS + FUTURES (unit-exit), Rust-priced — ADDITIVE ──
+        # Gate MIXED_FUT_RUST: unset/0 → existing behavior (unchanged); '1'/'on' →
+        # Rust-authoritative mixed path; 'shadow' → build it and log, but keep the
+        # existing path live (safe rollout). Only the general case (an option leg
+        # present AND no NEXT_WEEKLY/NEXT_MONTHLY leg — that has its own path below).
+        _mixed_gate = os.getenv("MIXED_FUT_RUST", "").strip().lower()
+        _has_opt_leg = any(
+            isinstance(_l, dict)
+            and str(_l.get("segment") or "OPTION").upper() not in ("FUTURE", "FUTURES")
+            for _l in (payload.get("legs") or [])
+        )
+        if _has_opt_leg and not _has_next_leg and _mixed_gate in ("1", "on", "true", "shadow"):
+            try:
+                _mixed_rows = _build_mixed_futures_options(
+                    payload,
+                    expiry_dates=expiry_dates,
+                    trading_days=trading_days,
+                    lot_size=lot_size,
+                    spot_by_date=spot_by_date,
+                    square_off_mode=square_off_mode,
+                )
+            except Exception as _mx_exc:
+                logger.warning("[ENGINE_RUST] mixed-fut build failed: %s", _mx_exc)
+                _mixed_rows = None
+            if _mixed_gate == "shadow":
+                logger.warning(
+                    "[ENGINE_RUST] MIXED_FUT_RUST=shadow: built %d mixed rows "
+                    "(not returned; existing path serves live)", len(_mixed_rows or [])
+                )
+                # fall through to existing behavior — live output unchanged
+            elif _mixed_rows is not None:
+                return _mixed_rows
         if _has_next_leg:
             # Mixed FUTURES + NEXT_WEEKLY: build each type separately, merge by period.
             try:
@@ -2536,6 +4034,16 @@ def run_rust_engine_pipeline(
                 logger.warning("[ENGINE_RUST] mixed FUTURES+NEXT_WEEKLY failed: %s", _exc)
                 _mixed = None
             return _mixed  # None → caller falls back to Python engine
+        # Fixed Entry for a futures-only strategy: schedule entries ON the filter
+        # segment starts (not by DTE) so a date-list CSV filter enters on its dates
+        # instead of collapsing to zero. Mixed opt+fut keeps its existing path.
+        if filter_entry_mode == "fixed" and not _has_opt_leg:
+            _fut_fx = _build_fixed_entry_futures_specs(
+                payload, expiry_dates, trading_days, spot_by_date, int(lot_size), segments,
+            )
+            if _fut_fx is None:
+                return None
+            return _fut_fx
         fut_rows = _build_futures_specs(
             payload, expiry_dates, trading_days, spot_by_date, int(lot_size), segments,
         )
@@ -2625,9 +4133,13 @@ def run_rust_engine_pipeline(
         # expiry) needs one expiry BEYOND it to roll into, otherwise the final
         # same-day chain trade (entry = last expiry, exit clamped to segment end)
         # is never generated. Same fix the DTE path applies.
+        # YEARLY needs the lookahead too: the cadence list is bounded by the
+        # backtest range, so without one extra expiry the chain has no boundary
+        # to exit into and simply stops at the last cadence date — dropping the
+        # filter-end tail (e.g. 25-Nov..30-Nov silently missing).
         _fixed_rollover_lookahead = (
             bool(payload.get("rollover_toggle", False))
-            and str(payload.get("expiry_type") or "").upper() in ("WEEKLY", "MONTHLY")
+            and str(payload.get("expiry_type") or "").upper() in ("WEEKLY", "MONTHLY", "YEARLY")
         )
         _fixed_expiry_dates = (
             _fetch_one_extra_expiry(expiry_dates, payload)
@@ -2655,6 +4167,7 @@ def run_rust_engine_pipeline(
         )
         if not specs:
             return None
+        specs = _apply_per_leg_slippage(specs, payload.get("legs") or [])
         if payload.get("buffer_strike_enabled"):
             specs = _apply_buffer_strike_to_specs(specs, payload)
         # Determine effective segment boundaries for the min_days adjustment.
@@ -2698,6 +4211,7 @@ def run_rust_engine_pipeline(
         if not specs:
             # Rust path rejected payload — feature outside supported slices.
             return None
+        specs = _apply_per_leg_slippage(specs, payload.get("legs") or [])
         # Clip specs whose exit exceeds to_date to the last trading day ≤ to_date.
         # This mirrors the Python engine which uses to_date as the effective exit
         # ceiling for the last rollover window.
@@ -3976,7 +5490,20 @@ def run_rust_engine_pipeline(
                         resolved_strikes=_bt_resolved,
                     )
                     if _btl_strike is None:
-                        return None  # Strike unresolvable — Python fallback
+                        # Bridge re-entry lands on a thin/illiquid strike with no
+                        # matching option contract for that date/expiry (e.g. a
+                        # NEXT_WEEKLY leg re-resolving during the Mar-2020 COVID
+                        # crash week). Skip just THIS bridge cycle rather than
+                        # rejecting the entire combo — mirrors the identical
+                        # _bt_all_ok=False/break pattern used a few lines below
+                        # for a simulate_trades_batch failure, and the same
+                        # "never zero the entire run on one bad strike" rule
+                        # _build_next_expiry_specs already applies elsewhere in
+                        # this file. All OTHER trades/cycles for this combo are
+                        # unaffected; the bridge chain for this one trade simply
+                        # stops advancing at its last successfully-resolved cycle.
+                        _bt_all_ok = False
+                        break
                     _bt_resolved[int(_btl["leg_id"])] = float(_btl_strike)
 
                     _btl_spec = {

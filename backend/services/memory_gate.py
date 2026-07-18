@@ -69,6 +69,17 @@ _COSTS = {
 _DYNAMIC_COST = os.environ.get("HEAVY_DYNAMIC_COST", "1").strip().lower() not in (
     "0", "off", "false", "no",
 )
+
+# Per-FORKED-CHILD private working set (MB) for an optimize sweep, on top of the
+# copy-on-write-shared Rust cache counted in the model's base.
+#
+# Sized from measurement, not guesswork (2026-07-17): with the overlay merged
+# PRE-fork, a P=6 multi-index sweep peaked at 3.25 GB total against a ~1.9 GB
+# shared cache -> roughly 225 MB of private pages per child. 400 is that rounded
+# up for headroom. NOTE: before the pre-fork merge fix each child privately
+# duplicated the ~600 MB overlay cache (~1.9 GB/child); if that regresses, this
+# constant is a lie and the gate will under-reserve again.
+_PER_CHILD_MB = int(os.environ.get("HEAVY_COST_OPTIMIZE_PER_CHILD_MB", "400"))
 _COST_MODEL = {
     # base_mb, per_year_mb, floor_mb  (base + per_year*7 ≈ the flat _COSTS above)
     "backtest": (
@@ -188,6 +199,28 @@ def cost_for_job(kind: str, base_payload: dict = None) -> int:
     base_mb, per_year_mb, floor_mb = _COST_MODEL[kind]
     years = _span_years(base_payload)
     est = int(base_mb + per_year_mb * years)
+
+    # FORK-WIDTH scaling. An optimize sweep forks P children; each holds its own
+    # PRIVATE working set on top of the copy-on-write-shared Rust cache, so real
+    # memory tracks P — not the date span this model was built on. Measured
+    # 2026-07-17: a P=6 multi-index sweep held ~1.9 GB per child (~11 GB total)
+    # while the span-only model reserved 3300 MB. The gate therefore admitted a
+    # job it under-estimated by 3.3x and the cgroup SIGKILLed it.
+    if kind == "optimize":
+        p = 0
+        try:
+            p = int((base_payload or {}).get("parallelism") or 0)
+        except Exception:
+            p = 0
+        if p > 1:
+            est += (p - 1) * _PER_CHILD_MB
+            # Deliberately NOT clamped to `ceiling`: that ceiling encodes the old
+            # span-only assumption, and clamping a genuine ~11 GB job down to
+            # 4500 MB is precisely what let the box overcommit. Clamp to the budget
+            # so a wide sweep still schedules (alone) and the next one QUEUES
+            # instead of racing it into the OOM killer.
+            return max(floor_mb, min(_BUDGET_MB, est))
+
     est = max(floor_mb, min(ceiling, est))
     logger.info(
         "[MEM_GATE] dynamic cost %s: %.1fy -> %d MB (base=%d per_year=%d floor=%d ceiling=%d)",

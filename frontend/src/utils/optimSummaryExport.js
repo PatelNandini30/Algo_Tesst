@@ -63,6 +63,8 @@ export function buildRuleRows(ruleConfig) {
   push('Index', ruleConfig.index);
   pushOrVaries('Option Type(s)', ruleConfig.optionTypes, swept.legs);
   pushOrVaries('Legs', ruleConfig.legs, swept.legs);
+  // Per-leg, options-only; omitted when unknown (e.g. a futures-only strategy).
+  if (ruleConfig.strikeGap && ruleConfig.strikeGap !== '—') push('Strike Gap', ruleConfig.strikeGap);
   pushOrVaries('Expiry', ruleConfig.expiry, swept.expiry);
   push('Entry / Exit DTE', `T-${ruleConfig.entryDte} to T-${ruleConfig.exitDte}`);
   if (swept.slLabel) push('Stop Loss', VARIES);

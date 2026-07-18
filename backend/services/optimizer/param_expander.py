@@ -258,6 +258,12 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
     spot_adj_implied = any(k in _SPOT_ADJ_KEYS for k in combo)
     if spot_adj_implied and "spot_adjustment_enabled" not in combo:
         new_payload["spot_adjustment_enabled"] = True
+    # NOTE: the swept threshold is read as percent or absolute index points
+    # depending on `spot_adjustment_units` in the base payload — the optimizer
+    # UI sends that explicitly with every run (%/pts toggle on the Spot
+    # Adjustment axis). Deliberately NOT normalised here: engine_rust.py already
+    # coerces anything outside {percent, points} to "percent" before applying
+    # the 0.25–5.0 percent clamp, so a second normalisation would be redundant.
 
     if midcap_sa_implied:
         msa = new_payload.get("midcap_spot_adjustment")

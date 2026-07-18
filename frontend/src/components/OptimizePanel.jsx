@@ -19,6 +19,27 @@ import Toggle from './ui/Toggle';
 const DEFAULT_METHOD = 'exhaustive';
 const DEFAULT_OBJECTIVE = 'total_pnl';
 
+/** Read a dotted path ('midcap_spot_adjustment.units') off an object. */
+function _getByDotPath(obj, path) {
+  return String(path)
+    .split('.')
+    .reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+/** Write a dotted path, cloning each nested level so the source object (and
+ *  anything else holding a reference to its sub-objects) is never mutated. */
+function _setByDotPath(root, path, value) {
+  const keys = String(path).split('.');
+  const last = keys.pop();
+  let cur = root;
+  for (const k of keys) {
+    cur[k] = (cur[k] != null && typeof cur[k] === 'object') ? { ...cur[k] } : {};
+    cur = cur[k];
+  }
+  cur[last] = value;
+  return root;
+}
+
 function combosForSpec(spec) {
   if (spec.kind === 'enum') return (spec.values || []).length;
   const { min, max, step } = spec;
@@ -75,6 +96,14 @@ export default function OptimizePanel({
     const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
     return legs.map(l => String(l?.strike_selection?.type || '').toUpperCase());
   }, [basePayload]);
+  // A futures leg has no strike, so every Strike-group sweep (offset / wing /
+  // strike-type / straddle-width / straddle-direction — all tagged strikeModes)
+  // is a no-op for it and just inflates the grid. Hide them for futures legs;
+  // the Expiry window param (no strikeModes) stays valid (the future rolls).
+  const _legIsFuture = useMemo(() => {
+    const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
+    return legs.map(l => String(l?.segment || '').toUpperCase() === 'FUTURES');
+  }, [basePayload]);
   const allParams = useMemo(
     () => expandSchemaForLegs(nLegs || 1)
       .filter(p => !p.midcapOnly || _hasMidcapLeg)
@@ -83,11 +112,13 @@ export default function OptimizePanel({
       // (no basePayload legs yet), fall back to showing it rather than hiding.
       .filter(p => {
         if (!Array.isArray(p.strikeModes)) return true;
+        // Futures leg: hide the whole Strike group (no strike exists).
+        if (_legIsFuture[p.legIndex]) return false;
         const mode = _legStrikeModes[p.legIndex];
         if (!mode) return true;
         return p.strikeModes.includes(mode);
       }),
-    [nLegs, _hasMidcapLeg, _legStrikeModes],
+    [nLegs, _hasMidcapLeg, _legStrikeModes, _legIsFuture],
   );
   const grouped = useMemo(() => {
     const m = new Map();
@@ -142,6 +173,71 @@ export default function OptimizePanel({
       ? basePayload.strike_shift_max_steps
       : 1
   );
+  // %/pts choice for params that declare unitOptions (the NIFTY + Midcap spot
+  // adjustment thresholds). Keyed by param path. Seeded below from whatever
+  // the strategy builder already had, so opening this panel never silently
+  // flips the base strategy's units.
+  const [unitChoice, setUnitChoice] = useState({});
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setUnitChoice((prev) => {
+      let next = prev;
+      for (const p of allParams) {
+        if (!p.unitPayloadPath || prev[p.path]) continue;
+        const fromBase = String(_getByDotPath(basePayload, p.unitPayloadPath) || '').toLowerCase();
+        if (next === prev) next = { ...prev };
+        next[p.path] = fromBase === 'points' ? 'points' : 'percent';
+      }
+      // Return the SAME object when nothing was seeded — basePayload is rebuilt
+      // on every StrategyBuilder render, so a fresh object here would re-render
+      // this panel forever.
+      return next;
+    });
+  }, [isOpen, allParams, basePayload]);
+
+  // The unit a param is currently being swept in, plus its matching preset.
+  function unitFor(p) {
+    return unitChoice[p.path] || 'percent';
+  }
+
+  /** Schema defaults for a param, resolved to the unit it's currently set to
+   *  (so a points-mode axis seeds 50–500, not the percent preset 0.5–5). */
+  function defaultsFor(p) {
+    const opt = (p.unitOptions || []).find((o) => o.key === unitFor(p));
+    return {
+      path: p.path,
+      label: p.label,
+      kind: p.kind,
+      min: opt ? opt.min : p.min,
+      max: opt ? opt.max : p.max,
+      step: opt ? opt.step : p.step,
+      values: p.values ? [...p.values] : undefined,
+      unit: opt ? opt.unit : p.unit,
+    };
+  }
+
+  function changeUnit(p, key) {
+    const opt = (p.unitOptions || []).find((o) => o.key === key);
+    if (!opt) return;
+    setUnitChoice((prev) => ({ ...prev, [p.path]: key }));
+    // Swap in the range preset for that unit — 0.5–5 (%) and 50–500 (pts) are
+    // not interchangeable numbers, so carrying the old range across a unit
+    // switch would silently produce a nonsense sweep.
+    setSavedValues((sv) => ({
+      ...sv,
+      [p.path]: {
+        ...(sv[p.path] || { path: p.path, label: p.label, kind: p.kind }),
+        path: p.path,
+        label: p.label,
+        kind: p.kind,
+        min: opt.min,
+        max: opt.max,
+        step: opt.step,
+        unit: opt.unit,
+      },
+    }));
+  }
 
   useEffect(() => {
     if (!isOpen) return;
@@ -163,13 +259,10 @@ export default function OptimizePanel({
   const selectedList = useMemo(() => {
     return allParams
       .filter((p) => checked[p.path])
-      .map((p) => savedValues[p.path] || {
-        path: p.path, label: p.label, kind: p.kind,
-        min: p.min, max: p.max, step: p.step,
-        values: p.values ? [...p.values] : undefined,
-        unit: p.unit,
-      });
-  }, [allParams, checked, savedValues]);
+      .map((p) => savedValues[p.path] || defaultsFor(p));
+    // defaultsFor reads unitChoice, so the memo must track it too.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allParams, checked, savedValues, unitChoice]);
 
   const gridSize = useMemo(() => totalCombos(selectedList), [selectedList]);
   const plannedRuns =
@@ -186,15 +279,7 @@ export default function OptimizePanel({
         // Checking — initialize savedValues if not already saved
         setSavedValues((sv) => {
           if (sv[p.path]) return sv; // keep existing saved values
-          return {
-            ...sv,
-            [p.path]: {
-              path: p.path, label: p.label, kind: p.kind,
-              min: p.min, max: p.max, step: p.step,
-              values: p.values ? [...p.values] : undefined,
-              unit: p.unit,
-            },
-          };
+          return { ...sv, [p.path]: defaultsFor(p) };
         });
         next[p.path] = true;
       }
@@ -219,11 +304,20 @@ export default function OptimizePanel({
 
   // Merge the strike-shift override into basePayload so it's applied per run.
   function basePayloadWithOverrides() {
-    return {
+    const out = {
       ...(basePayload || {}),
       strike_shift_max_steps: Number(strikeShiftOverride) || 0,
       download_mode: downloadMode,
     };
+    // Pin the %/pts unit for every spot-adjustment axis that is actually being
+    // swept. Without this the base payload's units decide, and a points sweep
+    // (e.g. 150) launched off a percent strategy would be read as 150% and
+    // clamped to 5% by the engine.
+    for (const p of allParams) {
+      if (!p.unitPayloadPath || !checked[p.path]) continue;
+      _setByDotPath(out, p.unitPayloadPath, unitFor(p));
+    }
+    return out;
   }
 
   async function launch() {
@@ -409,7 +503,7 @@ export default function OptimizePanel({
                 </div>
                 {items.map((p) => {
                   const isChecked = Boolean(checked[p.path]);
-                  const spec = savedValues[p.path] || p;
+                  const spec = savedValues[p.path] || defaultsFor(p);
                   return (
                     <div
                       key={p.path}
@@ -426,7 +520,42 @@ export default function OptimizePanel({
                           onChange={() => toggleParam(p)}
                         />
                         <span style={{ fontSize: 12, fontWeight: 500 }}>{p.label}</span>
-                        {p.unit && (
+                        {p.unitOptions ? (
+                          // %/pts selector — sweeps the threshold as a percent
+                          // move or an absolute index-point move.
+                          <span style={{ display: 'inline-flex', gap: 2, marginLeft: 4 }}>
+                            {p.unitOptions.map((o) => {
+                              const active = unitFor(p) === o.key;
+                              return (
+                                <button
+                                  key={o.key}
+                                  type="button"
+                                  title={o.key === 'points' ? 'Absolute index points' : 'Percent move'}
+                                  onClick={(e) => {
+                                    // Inside a <label> — don't let the click
+                                    // fall through and toggle the checkbox.
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    changeUnit(p, o.key);
+                                  }}
+                                  style={{
+                                    fontSize: 10,
+                                    lineHeight: 1,
+                                    padding: '3px 6px',
+                                    borderRadius: 4,
+                                    cursor: 'pointer',
+                                    border: `1px solid ${active ? 'var(--accent, #2563eb)' : 'var(--border-strong, #ddd)'}`,
+                                    background: active ? 'var(--accent, #2563eb)' : 'transparent',
+                                    color: active ? '#fff' : 'inherit',
+                                    opacity: active ? 1 : 0.6,
+                                  }}
+                                >
+                                  {o.unit}
+                                </button>
+                              );
+                            })}
+                          </span>
+                        ) : p.unit && (
                           <span style={{ fontSize: 10, opacity: 0.5, marginLeft: 4 }}>
                             ({p.unit})
                           </span>

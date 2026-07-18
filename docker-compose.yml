@@ -35,21 +35,39 @@
 # Per-container hard limits (default stack):
 #   postgres                       : 3500M
 #   redis                          :  700M
-#   backend                        : 2500M
+#   backend                        : 6000M  (temporarily raised 2026-07-13 from 2500M —
+#                                    a full-history feather rebuild, e.g. NIFTY back to
+#                                    2008, needs more than 2500M of raw Pandas/merge
+#                                    working memory before it compacts into the Arrow
+#                                    feather; confirmed via dmesg cgroup-OOM kills at
+#                                    2500M. Revert to 2500M once no longer needed for
+#                                    wide historical rebuilds — normal request-serving
+#                                    doesn't need this much.)
 #   worker-backtests               : 5000M  (own ~3.9 GB Rust cache)
 #   worker-backtests-fast          : 5000M  (own ~3.9 GB Rust cache)
 #   worker-uploads                 :  500M
 #   frontend                       :  200M
 #   ───────────────────────────────────────
-#   Sum (default stack)            : 17,400M   (+13,000M when worker-optimize active)
+#   Sum (default stack)            : 20,900M   (+13,000M when worker-optimize active)
 #   Host RAM                       : ~15,160M (14.8 GiB)
 #   → The default stack overcommits modestly; the optimize worker (profile-gated)
 #     adds 13,000M when running 3 concurrent optimize jobs (concurrency=3, P=2;
 #     raised from 2 jobs / 10,000M on 2026-07-04 at the user's request).
 #     This deliberately overcommits 16 GB onto the 24 GB NVMe swap. The memory
-#     ADMISSION GATE (HEAVY_MEMORY_BUDGET_MB=19000) bounds total ACTIVE heavy
-#     work — 3 optims (3×4500=13,500) + 1 backtest (5000) = 18,500 all run
-#     together; a 2nd concurrent backtest QUEUES — so the
+#     ADMISSION GATE (HEAVY_MEMORY_BUDGET_MB=11000) bounds total ACTIVE heavy
+#     work — target concurrency is 2 optims + 1 backtest:
+#       2 optims (P=3, ~4100 each) + 1 backtest (~2700) = 10,900  -> all run
+#       a 3rd optim (~12,300) does NOT fit -> QUEUES (status "queued")
+#
+#     LOWERED 19000 -> 11000 on 2026-07-17. The old 19000 could not queue at all:
+#     it sat ABOVE worker-optimize's own 12.7 GiB cgroup limit, so the kernel
+#     always SIGKILLed a child before the gate ever filled (WorkerLostError:
+#     signal 9). Its "3 optims (3x4500=13,500)" arithmetic ALSO exceeded that
+#     same 12.7 GiB cgroup. The 4500/optim figure assumed single-index; a
+#     multi-index sweep measured ~11,000 MB. Keep this budget BELOW the
+#     worker-optimize cgroup limit or the gate is decorative.
+#     Cost model note: reservations now scale by FORK WIDTH (parallelism), not
+#     date span — see memory_gate._PER_CHILD_MB. A 2nd concurrent backtest QUEUES — so the
 #     overcommit can never exhaust RAM+swap (no OOM). All workers mmap-SHARE one
 #     copy of the OHLC feather, so real RAM is far below the per-container sums.
 #     (concurrency=3 is the hard cap on simultaneous optimize jobs; a 4th waits
@@ -106,6 +124,10 @@ x-backend-env: &backend-env
   PREBUILD_WARM_YEARS: "8"
   # Tradesheet includes MAE/MFE by default; set to 0 only for bulk performance tests.
   BACKTEST_INCLUDE_MAE_MFE: "1"
+  # Build the combo tradesheet workbook in Rust (all 4 sheets in one native call).
+  # Cell-identical to the openpyxl path (tools/workbook_verify: 0 diffs, plain+midcap);
+  # 1.8-2.7x faster, scales with trade count. Set to 0 to revert to openpyxl rendering.
+  OPTIMIZE_RUST_XLSX: "1"
   # Persist hot caches across container recreates.
   PARQUET_CACHE_DIR: /data/cache/parquet
   ALGO_RUST_CACHE_DIR: /data/cache/arrow
@@ -132,7 +154,7 @@ x-backend-env: &backend-env
   # real RAM is well under 18500 because all workers mmap-SHARE one copy of the
   # OHLC feather (only the per-job f32 AHashMap ~2.6 GB is duplicated). Raised
   # 14000→19000 on 2026-07-04 so 3 optims + 1 backtest coexist per user request.
-  HEAVY_MEMORY_BUDGET_MB: "19000"
+  HEAVY_MEMORY_BUDGET_MB: "11000"
   HEAVY_COST_BACKTEST_MB: "5000"
   HEAVY_COST_OPTIMIZE_MB: "4500"          # one optimize job at P=2 (was 6000 at P=6)
   HEAVY_GATE_WAIT_MAX_SECONDS: "600"      # then proceed anyway (SSD swap backstop)
@@ -144,6 +166,13 @@ x-backend-env: &backend-env
   # Try Rust engine for supported strategies (slices 1-5); auto-falls back to
   # Python for buffer/futures/lazy/rollover/no-rollover/min_days/fixed-mode legs.
   ENGINE_BACKEND: "rust"
+  # General mixed OPTIONS+FUTURES: options through the normal Rust pipeline,
+  # futures Rust-priced from the FUTIDX feather, unit-exit at the option's
+  # current expiry. Verified trade-by-trade vs the Python engine (0 mismatches).
+  # unset/0 = old behavior (option leg dropped in the plain-mixed case); '1' =
+  # Rust-authoritative mixed path; 'shadow' = build+log only. See
+  # services/engine_rust.py::_build_mixed_futures_options.
+  MIXED_FUT_RUST: "1"
 
 x-backend-volumes: &backend-volumes
   - ./cleaned_csvs:/data/cleaned_csvs:ro
@@ -289,7 +318,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2500M
+          memory: 6000M
           cpus: "2.0"
         reservations:
           memory: 256M

@@ -62,11 +62,55 @@ def is_available() -> bool:
     return _load_native() is not None
 
 
+# Symbols merged INTO the resident cache on top of the primary (load_cache) symbol.
+# load_cache REPLACES the whole MarketCache, so every load_cache call site must clear
+# this — otherwise we'd believe a symbol is resident after it has been thrown away and
+# silently serve misses.
+_merged_symbols: set = set()
+
+
+def ensure_symbol_merged(symbol: str) -> bool:
+    """Merge `symbol`'s pre-built feather INTO the resident cache, additively.
+
+    The multi-index overlay prices a SECOND index's legs on top of the base run.
+    `load_cache` can only hold one symbol (it replaces), which is why the overlay
+    had to price from Postgres. This puts the overlay symbol alongside the base so
+    it can be served from Rust.
+
+    Idempotent for the current resident cache. Returns False if the feather is
+    missing — the caller decides whether that is fatal.
+    """
+    native = _load_native()
+    if native is None:
+        return False
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return False
+    if sym in _merged_symbols:
+        return True
+    root = _cache_root() / f"{_cache_version()}:bulk:{sym}:full"
+    options_path = root / "options.feather"
+    spot_path = root / "spot.feather"
+    if not options_path.exists() or not spot_path.exists():
+        logger.warning("[RUST_FAST] ensure_symbol_merged(%s): no feather at %s", sym, root)
+        return False
+    try:
+        native.merge_cache(sym, str(options_path), str(spot_path))
+        _merged_symbols.add(sym)
+        logger.info("[RUST_FAST] merged %s into resident cache — symbols now: %s",
+                    sym, ",".join(x for x in native.cache_symbols() if x))
+        return True
+    except Exception as exc:
+        logger.warning("[RUST_FAST] merge_cache(%s) failed: %s", sym, exc)
+        return False
+
+
 def clear_cache() -> None:
     global _loaded_cache_key
     native = _load_native()
     _calendar_cache.clear()
     _loaded_cache_key = None
+    _merged_symbols.clear()
     if native is None:
         return
     try:
@@ -236,6 +280,59 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
         options_path = root / "options.feather"
         spot_path = root / "spot.feather"
 
+        # ── Narrow/empty-load guard ──────────────────────────────────────────
+        # A load whose option range is NARROWER than the existing feather (or has
+        # no options at all) must NEVER replace it. Warming a pre-existence or
+        # single-segment date range for a symbol — e.g. a 2019-2021 filter
+        # segment, before MIDCPNIFTY's Jan-2022 launch — loads empty/partial data;
+        # without this guard the delete+write path below would overwrite the full
+        # bulk:SYM:full cache with that slice, wiping later dates → 0 trades on the
+        # next real run. Growing (wider incoming) still regenerates via _need_regen.
+        if options_path.exists() and spot_path.exists():
+            try:
+                import polars as _pl_guard
+                _keep = False
+                if options_df is None or options_df.is_empty():
+                    _keep = True
+                else:
+                    _exg = _pl_guard.scan_ipc(str(options_path)).select(["Date"]).collect()
+                    _ex_min, _ex_max = str(_exg["Date"].min())[:10], str(_exg["Date"].max())[:10]
+                    _in_min, _in_max = str(options_df["Date"].min())[:10], str(options_df["Date"].max())[:10]
+                    if _in_min > _ex_min or _in_max < _ex_max:
+                        _keep = True
+                # Independently protect SPOT. options and spot load from DIFFERENT
+                # sources with DIFFERENT ranges — options from the wide Parquet/feather
+                # shortcut, spot request-bounded from Postgres — so a warm can carry
+                # FULL options but only a NARROW spot slice. The options check above
+                # then passes it through and the write TRUNCATES the wider spot.feather
+                # → the recurring MIDCPNIFTY spot wipe (esp. on start.sh warms). The
+                # :full spot cache must only ever grow: keep the wider spot if the
+                # incoming one is narrower in either direction.
+                if not _keep and spot_df is not None and not spot_df.is_empty():
+                    try:
+                        _exs = _pl_guard.scan_ipc(str(spot_path)).select(["Date"]).collect()
+                        _sx_min, _sx_max = str(_exs["Date"].min())[:10], str(_exs["Date"].max())[:10]
+                        _si_min, _si_max = str(spot_df["Date"].min())[:10], str(spot_df["Date"].max())[:10]
+                        if _si_min > _sx_min or _si_max < _sx_max:
+                            _keep = True
+                    except Exception:
+                        pass
+                if _keep:
+                    _sig = (_file_signature(options_path), _file_signature(spot_path))
+                    if not (_loaded_cache_key == key and _loaded_cache_signature == _sig):
+                        native.load_cache(str(options_path), str(spot_path))
+                        # load_cache REPLACES the cache — anything merged before it is gone.
+                        _merged_symbols.clear()
+                        _loaded_cache_key = key
+                        _loaded_cache_signature = _sig
+                        _loaded_feather_root = str(root)
+                    logger.info(
+                        "[RUST_FAST] kept existing wider feather for %s (incoming load narrower/empty)", key
+                    )
+                    return True
+            except Exception as _guard_exc:
+                logger.debug("[RUST_FAST] narrow-load guard skipped (non-fatal): %s", _guard_exc)
+
         # If DataFrame is provided and the existing feather covers a narrower date
         # range, regenerate so the Rust cache reflects the full loaded dataset.
         # This range check costs ~ms via scan_ipc metadata-only read.
@@ -398,6 +495,8 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                 )
                 return False
         native.load_cache(str(options_path), str(spot_path))
+        # load_cache REPLACES the cache — anything merged before it is gone.
+        _merged_symbols.clear()
         _loaded_cache_key = key
         _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))
         _loaded_feather_root = str(root)
@@ -434,6 +533,8 @@ def load_cache_from_root(root: str) -> bool:
         return False
     try:
         native.load_cache(str(options_path), str(spot_path))
+        # load_cache REPLACES the cache — anything merged before it is gone.
+        _merged_symbols.clear()
         _loaded_cache_key = root
         _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))
         _loaded_feather_root = root

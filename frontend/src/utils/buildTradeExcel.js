@@ -344,7 +344,12 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       dd:         '',
       pctDd:      '',
       midcap:     hasMidcap ? (midcapByTrade[k] || null) : null,
-      exitReason: mainRow?.['Exit Reason'] || '',
+      // Union of ALL legs' exit reasons (used only for FILTER_END patchwise-reset
+      // detection, never displayed). A mixed options+futures trade's main leg is
+      // the futures leg (EXPIRY), so a FILTER_END on the option leg would be missed
+      // and the patchwise reset (cumulative/peak/lowest-nav) would never fire.
+      // Unioning makes the detection leg-order-independent.
+      exitReason: legs.map(l => l['Exit Reason'] || '').filter(Boolean).join('+'),
     };
   });
 
@@ -500,7 +505,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     ...(hasMidcap ? [] : ['Net MAE 1', 'Net MAE 2', 'Final MAE']),
     ...(hasCalls    ? ['CE P&L', 'CE P&L %']  : []),
     ...(hasPuts     ? ['PE P&L', 'PE P&L %']  : []),
-    ...(hasFutures  ? ['FUT P&L'] : []),
+    ...(hasFutures  ? ['FUT P&L', 'FUT P&L %'] : []),
     ...(hasMidcap ? [] : ['Net P&L', '% P&L', 'Cumulative', 'Peak', 'DD', '%DD', 'Lowest NAV', 'Actual Live DD']),
     ...(hasMidcap ? MIDCAP_COLS : []),
     'Exit Reason',
@@ -511,7 +516,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
 
   // ── Build cleaned trade rows ────────────────────────────────────────────────
   const DATE_COLS  = new Set(['Entry Date', 'Exit Date', 'Expiry', 'Leg Exit Date', 'Lazy Entry Date', 'Lazy Exit Date']);
-  const TRUE_PCT_COLS = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %']);
+  const TRUE_PCT_COLS = new Set(['Spot P&L %', 'CE P&L %', 'PE P&L %', 'FUT P&L %']);
   const PCT_APPEND_COLS = new Set(['%DD', 'Combined %DD']);
   const MAE_COLS   = new Set(['MAE', 'MFE', 'Net MAE 1', 'Net MAE 2', 'Final MAE',
     'Midcap MAE', 'Midcap MFE', 'Combined Net MAE 1', 'Combined Net MAE 2', 'Combined Final MAE']);
@@ -588,6 +593,8 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
         val = pctOfBase(trade['CE P&L'], trade['Entry Spot']);
       } else if (key === 'PE P&L %') {
         val = pctOfBase(trade['PE P&L'], trade['Entry Spot']);
+      } else if (key === 'FUT P&L %') {
+        val = pctOfBase(trade['FUT P&L'], trade['Entry Spot']);
       } else {
         val = trade[key];
       }
@@ -629,7 +636,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     'MAE': 9, 'MFE': 9, 'Net MAE 1': 10, 'Net MAE 2': 10, 'Final MAE': 10,
     'Net P&L': 10, '% P&L': 8, 'Cumulative': 11, 'Peak': 10, 'DD': 9, '%DD': 8,
     'Lowest NAV': 13, 'Actual Live DD': 15,
-    'Spot P&L %': 10, 'CE P&L %': 10, 'PE P&L %': 10,
+    'Spot P&L %': 10, 'CE P&L %': 10, 'PE P&L %': 10, 'FUT P&L %': 10,
     'Exit Reason': 14, 'Strike Shift Reason': 40, 'Expiry': 12, 'STR Segment': 14, 'Filter Segment': 22,
     'Midcap Entry Spot': 15, 'Midcap Exit Spot': 15, 'Midcap Spot P&L': 14, 'Midcap Spot P&L %': 15,
     'Midcap No Of Days': 15, 'Midcap Rollover Cost %': 18, 'Midcap Hypo P&L': 15, 'Midcap Hypo P&L %': 16,
@@ -727,7 +734,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   let _minEntryMs = null, _maxExitMs = null;
   let _spotSumGatedJS = 0;
   let _ceSumJS = 0, _peSumJS = 0, _futSumJS = 0;
-  let _cePctJS = 0, _pePctJS = 0, _spotPctJS = 0;
+  let _cePctJS = 0, _pePctJS = 0, _spotPctJS = 0, _futPctJS = 0;
 
   const _parseDate2 = (s) => {
     if (s instanceof Date) return s.getTime();
@@ -749,6 +756,10 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
     const cep = toNumber(t['CE P&L %']); if (cep !== null) _cePctJS += cep;
     const pep = toNumber(t['PE P&L %']); if (pep !== null) _pePctJS += pep;
     const spp = toNumber(t['Spot P&L %']); if (spp !== null) _spotPctJS += spp;
+    // FUT P&L % is not a stored column (computed per-row at write time), so derive
+    // it the same way — FUT P&L / Entry Spot — and accumulate for the Summary total.
+    const fup = pctOfBase(t['FUT P&L'], t['Entry Spot']);
+    if (typeof fup === 'number' && Number.isFinite(fup)) _futPctJS += fup;
   }
 
   // Trade-level stats only from first-leg rows (those with a numeric Net P&L).
@@ -1099,7 +1110,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
   _addTypeRow('Spot P&L', _spotSumSummary, _spotPctSummary); row++;
   if (hasCalls)            { _addTypeRow('CE P&L',      _ceSumJS,               _cePctJS * 100);              row++; }
   if (hasPuts)             { _addTypeRow('PE P&L',       _peSumJS,               _pePctJS * 100);              row++; }
-  if (hasFutures)          { _addTypeRow('FUT P&L',      _futSumJS,              null);                        row++; }
+  if (hasFutures)          { _addTypeRow('FUT P&L',      _futSumJS,              _futPctJS * 100);             row++; }
   if (hasCalls && hasPuts) { _addTypeRow('CE + PE P&L', _ceSumJS + _peSumJS,    (_cePctJS + _pePctJS) * 100); row++; }
   // Midcap leg P&L + Combined rows (matches the backtest Summary Type block).
   if (hasMidcap) {
@@ -1353,10 +1364,13 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
       const mainRow = legs.find(l => !l['ReEntryIndex'] && !l['ReEntryTrigger'] && !l['ReEntryMode'] && !isLazyLegRow(l)) || legs[0] || {};
       const spot = toNumber(mainRow['Entry Spot']) || 0;
       const mc = (tm[k] && tm[k].midcap) || {};
-      // NIFTY phase uses whatever option leg(s) are present (CE and/or PE), not
-      // just CE — so SELL PE / BUY PE / CE+PE all work. Sum option-leg P&L + MAE.
-      const optLegs = legs.filter(l => ['CE','CALL','PE','PUT'].includes((l['Type']||'').toUpperCase()));
-      const niftyPnl = optLegs.reduce((s,l) => s + (toNumber(l['CE P&L'])||0) + (toNumber(l['PE P&L'])||0), 0);
+      // Phase uses whatever DIRECTIONAL leg(s) are present — option legs (CE and/or
+      // PE) AND futures legs — so SELL PE / BUY PE / CE+PE / CE+FUT / FUT-only all
+      // work. The patch-wise DD must reflect the COMBINED position (options +
+      // futures); summing option P&L alone silently dropped a futures leg's P&L from
+      // the drawdown. Options-only runs are unchanged (no FUT rows to add).
+      const optLegs = legs.filter(l => isOptionRow(l) || isFutureRow(l));
+      const niftyPnl = optLegs.reduce((s,l) => s + (toNumber(l['CE P&L'])||0) + (toNumber(l['PE P&L'])||0) + (toNumber(l['FUT P&L'])||0), 0);
       const niftyMaeSum = optLegs.length ? optLegs.reduce((s,l) => s + (toNumber(l['MAE'])||0), 0) : null;
       const cfm = tm[k] ? tm[k].combinedFinalMae : '';
       return {
@@ -1418,7 +1432,7 @@ export default async function buildTradeExcel(trades, summary, opts = {}) {
         return { rows, entry: f.entry, exit: l.exit, cagr, pnlSum, liveDDMin: (liveDDMin === Infinity ? null : liveDDMin) };
       };
 
-      const _opt = hasCalls && hasPuts ? 'CE+PE' : hasCalls ? 'CE' : hasPuts ? 'PE' : 'Options';
+      const _opt = ['CE', 'PE', 'FUT'].filter((_, i) => [hasCalls, hasPuts, hasFutures][i]).join(' + ') || 'Options';
       const niftyTitle = `Nifty ${_opt}`;
       const _niftyPhase = { title: niftyTitle, kind: 'std', dates: false, drive: td => td.callPct, mae: td => td.callMae,
         detailHdr: ['Net P&L %','Cumulative','Peak','DD','%DD','MAE','Lowest NAV','Actual Live DD'],
