@@ -293,6 +293,9 @@ def _process_trade_legs(
 
     leg_rows = []
 
+    from engines.generic_algotest_engine import get_lot_size
+    _lot_size = int(get_lot_size(index_name, from_date) or 1)
+
     for leg in strategy_def.legs:
         leg_pnl         = 0.0
         leg_entry_price = None
@@ -344,17 +347,19 @@ def _process_trade_legs(
                 continue
             leg_exit_price = exit_row.iloc[0]["Close"]
 
+            # P&L = POINTS x LOTS (see native/src/simulate.rs:1652).
+            _leg_lots = int(getattr(leg, "lots", 1) or 1)
             if leg.position == PositionType.BUY:
-                leg_pnl = round(leg_exit_price - leg_entry_price, 2)
+                leg_pnl = round((leg_exit_price - leg_entry_price) * _leg_lots, 2)
             else:
-                leg_pnl = round(leg_entry_price - leg_exit_price, 2)
+                leg_pnl = round((leg_entry_price - leg_exit_price) * _leg_lots, 2)
 
             leg_rows.append(
                 {
                     "Type": leg.option_type.value,
                     "Strike": selected_strike,
                     "B/S": leg.position.value,
-                    "Qty": leg.lots,
+                    "Qty": _leg_lots * _lot_size,
                     "Entry Price": leg_entry_price,
                     "Exit Price": leg_exit_price,
                     "Net P&L": leg_pnl,
@@ -416,17 +421,19 @@ def _process_trade_legs(
                     leg_entry_price,
                 )
                 _debug_fut_log_count += 1
+            # P&L = POINTS x LOTS (see native/src/simulate.rs:1652).
+            _leg_lots = int(getattr(leg, "lots", 1) or 1)
             if leg.position == PositionType.BUY:
-                leg_pnl = round(leg_exit_price - leg_entry_price, 2)
+                leg_pnl = round((leg_exit_price - leg_entry_price) * _leg_lots, 2)
             else:
-                leg_pnl = round(leg_entry_price - leg_exit_price, 2)
+                leg_pnl = round((leg_entry_price - leg_exit_price) * _leg_lots, 2)
 
             leg_rows.append(
                 {
                     "Type": "FUT",
                     "Strike": "",
                     "B/S": leg.position.value,
-                    "Qty": leg.lots,
+                    "Qty": _leg_lots * _lot_size,
                     "Entry Price": leg_entry_price,
                     "Exit Price": leg_exit_price,
                     "Net P&L": leg_pnl,
