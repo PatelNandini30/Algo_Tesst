@@ -1542,7 +1542,16 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     "CE P&L": ce, "PE P&L": pe, "FUT P&L": fut, "Net P&L": pnl,
                     "% P&L": round(pnl / es * 100.0, 4) if es else 0.0,
                     **_sw_ctx,
-                    "Exit Reason": "OVERLAY", "MAE": _mae, "MFE": _mfe,
+                    # MAE/MFE must be commensurate with % P&L, which is lots-scaled
+                    # (points x lots) — summary_metrics.rs:336 compounds NAV by
+                    # % P&L while :362 applies MAE to that same NAV, so leaving
+                    # MAE unscaled understates Live DD / Max DD by ~1/lots. Both
+                    # _fmm (futures branch above) and _omm (option branch above)
+                    # return a plain unscaled ratio into these same `_mae`/`_mfe`
+                    # locals, so scale once here by THIS leg's own `lots` (the
+                    # local set at the top of this leg's iteration) — lot_size
+                    # excluded. Same convention as services/algotest_job.py.
+                    "Exit Reason": "OVERLAY", "MAE": round(_mae * lots, 4), "MFE": round(_mfe * lots, 4),
                     "Strike Shift Reason": _shift_reason,
                     "Group Index": sym,
                     "Group Expiry": ("MONTHLY" if is_fut else str(leg.get("expiry") or leg.get("expiry_type") or "MONTHLY").upper()),
