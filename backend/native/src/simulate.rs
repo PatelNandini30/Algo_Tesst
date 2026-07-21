@@ -1642,17 +1642,20 @@ fn simulate_one(s: &TradeSpec) -> TradeResult {
     let entry_px = apply_slippage(raw_entry, &s.position, "entry", s.slippage_pct);
     let exit_px = apply_slippage(raw_exit, &s.position, "exit", s.slippage_pct);
 
-    // Engine convention: Net P&L is in PREMIUM POINTS, not rupees.
-    // For SELL: net = entry - exit   (we receive entry, pay exit)
-    // For BUY : net = exit - entry
-    // Quantity (lots × lot_size) is informational and downstream uses it
-    // to compute Turnover, NOT to scale Net P&L. compute_analytics works
-    // off these per-share points and produces a points-based cumulative.
+    // Engine convention: Net P&L is in PREMIUM POINTS scaled by LOTS, not rupees.
+    // For SELL: net = (entry - exit) * lots   (we receive entry, pay exit)
+    // For BUY : net = (exit - entry) * lots
+    // lot_size is NOT part of P&L — it is informational and downstream uses it
+    // for the display Qty column (lots × lot_size) and Turnover only. This
+    // mirrors the intraday engine (iengine/src/engine.rs:2549).
+    // simulate_trades_batch_core sums these already-scaled per-leg values into
+    // the trade total, so the multiplier must NOT be re-applied there.
     let is_sell = s.position.trim().eq_ignore_ascii_case("SELL");
+    let lots = s.lots as f64;
     let net_pnl = if is_sell {
-        round2(entry_px - exit_px)
+        round2((entry_px - exit_px) * lots)
     } else {
-        round2(exit_px - entry_px)
+        round2((exit_px - entry_px) * lots)
     };
 
     TradeResult {
