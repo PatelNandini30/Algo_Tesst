@@ -3807,13 +3807,17 @@ def _build_mixed_futures_options(
         _ep = float(r.get("entry_price") or 0.0)
         _xp = float(r.get("exit_price") or 0.0)
         _pos = str(r.get("position") or "SELL").upper()
-        r["net_pnl"] = round((_ep - _xp) if _pos == "SELL" else (_xp - _ep), 4)
+        _r_lots = float(r.get("lots") or 1)
+        r["net_pnl"] = round(((_ep - _xp) if _pos == "SELL" else (_xp - _ep)) * _r_lots, 4)
     _by_tid: Dict[int, List[Dict]] = _dd(list)
     for r in combined:
         _by_tid[int(r.get("trade_id") or 0)].append(r)
     for _tid, _rows in _by_tid.items():
         if len(_rows) <= 1:
             continue
+        # _total sums the per-leg net_pnl values just scaled above — it is
+        # ALREADY lots-scaled (each leg's own lots). Do NOT multiply by lots
+        # again here or the trade-total leg would be scaled twice (lots^2).
         _total = round(sum(float(r.get("net_pnl") or 0.0) for r in _rows), 4)
         min(_rows, key=lambda r: int(r.get("leg_id") or 1))["net_pnl"] = _total
 
@@ -6803,7 +6807,8 @@ def run_rust_engine_pipeline(
             row["exit_price"] = round(float(adjusted_exit), 4)
             # P&L is POINTS x LOTS (lot_size excluded — display Qty only).
             per_leg_pnl_points = (entry_px - adjusted_exit) if position == "SELL" else (adjusted_exit - entry_px)
-            row["net_pnl"] = round(float(per_leg_pnl_points), 4)
+            _row_lots = float(row.get("lots") or 1)
+            row["net_pnl"] = round(float(per_leg_pnl_points) * _row_lots, 4)
 
     # Settlement-price fix for same-day expiry trades (T-0 or intraday-expiry).
     # The Rust feather has one LTP per (symbol, expiry, strike, type, date). When
@@ -6834,8 +6839,11 @@ def run_rust_engine_pipeline(
         settlement = round(settlement, 2)
         position = str(row.get("position") or "SELL").upper()
         entry_px = float(row.get("entry_price") or 0.0)
+        _row_lots = float(row.get("lots") or 1)
         net_pnl = round(
-            entry_px - settlement if position == "SELL" else settlement - entry_px, 4
+            (entry_px - settlement if position == "SELL" else settlement - entry_px)
+            * _row_lots,
+            4,
         )
         row["exit_price"] = settlement
         row["raw_exit_price"] = settlement
