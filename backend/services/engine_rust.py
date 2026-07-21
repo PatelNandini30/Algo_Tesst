@@ -1543,8 +1543,12 @@ def _build_futures_specs(
                         _re_ep = round(float(_re_ep_raw), 2)
                         _re_xp = round(float(_re_xp_raw), 2)
 
+                    # P&L = POINTS x LOTS. lot_size is NOT a factor — it feeds only the
+                    # display Qty column. Mirrors native/src/simulate.rs:1652.
                     _re_pnl = round(
-                        (_re_ep - _re_xp) if position == "SELL" else (_re_xp - _re_ep), 4
+                        ((_re_ep - _re_xp) if position == "SELL" else (_re_xp - _re_ep))
+                        * _lots,
+                        4,
                     )
 
                     out.append({
@@ -3611,6 +3615,9 @@ def _build_mixed_futures_next_weekly(
     for _tid, _rows in _by_tid.items():
         if len(_rows) <= 1:
             continue  # Single-leg trade — net_pnl already per-leg = trade total
+        # This sum is ALREADY lots-scaled (each leg's own lots, including the FUT
+        # re-entry rows from _build_futures_specs). Do NOT multiply by lots again
+        # here or the trade-total leg would be scaled twice (lots^2).
         _trade_total = round(sum(float(_r.get("net_pnl") or 0.0) for _r in _rows), 4)
         _first = min(_rows, key=lambda _r: int(_r.get("leg_id") or 1))
         _first["net_pnl"] = _trade_total

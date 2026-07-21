@@ -340,5 +340,88 @@ class TestMixedFuturesOptionsScalesWithLots(_EngineRustPipelineFixtureMixin, uni
                 self.assertAlmostEqual(ce_scaled["net_pnl"], expected_total, places=2)
 
 
+class TestFuturesReentrySpecsScalesWithLots(unittest.TestCase):
+    """FUTURES SL/target re-entry branch of _build_futures_specs (engine_rust.py
+    ~:1546, the `_re_pnl` row).
+
+    This path bypasses simulate_trades_batch entirely — run_rust_engine_pipeline
+    returns _build_futures_specs' rows directly for a futures-only strategy — so
+    if `_re_pnl` isn't scaled by the leg's own lots right there, nothing
+    downstream fixes it.
+
+    Synthetic and fully deterministic: the native futures-price helpers are
+    monkeypatched to a fixed price path so the SL fires on a known day with
+    trading days left before the scheduled exit — guaranteeing a re-entry row
+    is produced, rather than depending on whichever real NIFTY sessions
+    happened to move enough (which turns out NOT to leave room for a
+    re-entry in the captured 2024-Q1 futures_with_reentry_sl snapshot).
+    """
+
+    # entry=100 SELL; day-2 price 120 is a +20% adverse move -> trips the 5% SL
+    # on the very first scanned day, leaving 2024-01-03..01-09 free for a
+    # re-entry before the 2024-01-10 scheduled exit.
+    _PRICES = {
+        "2024-01-01": 100.0,   # main entry
+        "2024-01-02": 120.0,   # main SL day (adverse for SELL)
+        "2024-01-03": 90.0,    # re-entry entry price
+        "2024-01-04": 90.0,
+        "2024-01-05": 90.0,
+        "2024-01-08": 90.0,
+        "2024-01-09": 90.0,
+        "2024-01-10": 93.0,    # re-entry exit price (scheduled exit; no 2nd SL)
+    }
+    _TRADING_DAYS = [
+        "2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04",
+        "2024-01-05", "2024-01-08", "2024-01-09", "2024-01-10",
+    ]
+    _EXPIRY_DATES = ["2024-01-10"]
+
+    def _run(self, lots: int) -> list:
+        import unittest.mock as mock
+        import services.engine_rust as er
+
+        def _fake_fut_price(index, date, expiry):
+            return self._PRICES.get(date)
+
+        def _fake_resolve(entry_date, exit_date, symbol, position, preference="monthly"):
+            return self._PRICES.get(entry_date), self._PRICES.get(exit_date), "2024-01-25"
+
+        payload = {
+            "index": "NIFTY", "entry_dte": 7, "exit_dte": 0,
+            "legs": [{
+                "segment": "FUTURES", "option_type": "FUT", "position": "SELL",
+                "lots": lots, "expiry": "monthly", "fut_exit_mode": "ON_EXPIRY",
+                "stopLoss": {"mode": "PERCENT", "value": 5},
+                "reEntryOnSL": {"mode": "RE_ASAP", "count": 1},
+            }],
+        }
+        spot_by_date = {d: 21000.0 for d in self._TRADING_DAYS}
+
+        with mock.patch.object(er, "_fut_price", side_effect=_fake_fut_price), \
+             mock.patch.object(er, "_resolve_futures_pnl_native", side_effect=_fake_resolve):
+            return er._build_futures_specs(
+                payload, self._EXPIRY_DATES, self._TRADING_DAYS, spot_by_date, 65, None,
+            )
+
+    def test_futures_reentry_net_pnl_scales_with_lots(self):
+        one, two = self._run(1), self._run(2)
+        self.assertIsNotNone(one)
+        self.assertIsNotNone(two)
+
+        # "_reentry_trigger" is only stamped on rows appended by the re-entry
+        # while-loop, isolating exactly the branch under test.
+        re_one = [r for r in one if "_reentry_trigger" in r]
+        re_two = [r for r in two if "_reentry_trigger" in r]
+        self.assertEqual(len(re_one), 1, "expected exactly one re-entry row")
+        self.assertEqual(len(re_two), 1)
+
+        r1, r2 = re_one[0], re_two[0]
+        self.assertNotEqual(r1["net_pnl"], 0.0)
+        self.assertAlmostEqual(r2["net_pnl"], r1["net_pnl"] * 2, places=4)
+        # Prices are per-unit — only net_pnl scales.
+        self.assertEqual(r2["entry_price"], r1["entry_price"])
+        self.assertEqual(r2["exit_price"], r1["exit_price"])
+
+
 if __name__ == "__main__":
     unittest.main()
