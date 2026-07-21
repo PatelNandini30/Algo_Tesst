@@ -69,67 +69,93 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
-def _spec(lots: int) -> dict:
-    """A single CE SELL leg. Only `lots` varies between calls."""
-    return {
-        "trade_id": 1,
-        "leg_id": 1,
-        "index": "NIFTY",
-        "entry_date": "2024-01-01",
-        "exit_date": "2024-01-04",
-        "expiry": "2024-01-04",
-        "strike": 21500.0,
-        "strike_interval": 50.0,
-        "option_type": "CE",
-        "position": "SELL",
-        "lots": lots,
-        "lot_size": 65,
-        "slippage_pct": 0.0,
-    }
+import json
+from pathlib import Path
 
 
 class TestRustNetPnlScalesWithLots(unittest.TestCase):
+    """Rust net_pnl scales by the leg's own lots; prices must not.
+
+    Reuses the captured parity snapshot + its cache-warming helper, the same
+    way tests/test_simulate_rust.py does. A synthetic spec cannot work here:
+    simulate_one prices against the in-process Rust cache, which is cold in a
+    bare unittest process, so every row comes back `missing`.
+    """
+
     def setUp(self):
         try:
-            import algotest_native  # noqa: F401
+            import algotest_native  # type: ignore
+            self.native = algotest_native
         except ImportError:
-            self.skipTest("algotest_native not built")
+            self.skipTest("algotest_native not installed in this environment")
+
+        from tests.test_simulate_rust import _bulk_load_for_snapshot, _trade_to_spec
+
+        snap_path = (
+            Path(__file__).parent / "parity" / "snapshots" / "single_leg_ce_atm_sell.json"
+        )
+        if not snap_path.exists():
+            self.skipTest("snapshot single_leg_ce_atm_sell not captured yet")
+
+        snap = json.loads(snap_path.read_text())
+        self.payload = snap["payload"]
+        self.trades = snap["trades"]
+        self.assertGreater(len(self.trades), 0)
+
+        try:
+            _bulk_load_for_snapshot(self.payload)
+        except Exception as exc:
+            self.skipTest(f"could not load market data: {exc}")
+        self._to_spec = _trade_to_spec
+
+    def _run(self, lots: int) -> list:
+        """Price the whole snapshot with every leg forced to `lots`."""
+        specs = []
+        for t in self.trades:
+            spec = self._to_spec(t, self.payload)
+            spec["lots"] = lots
+            specs.append(spec)
+        # simulate_trades_batch returns a FLAT list (the (results, bad_trades)
+        # tuple belongs to the private _core fn, not the PyO3 wrapper).
+        return list(self.native.simulate_trades_batch(specs))
+
+    def _paired(self):
+        one, two = self._run(1), self._run(2)
+        pairs = [(a, b) for a, b in zip(one, two) if not a["missing"]]
+        self.assertGreater(len(pairs), 0, "snapshot produced no priced rows")
+        return pairs
 
     def test_net_pnl_doubles_when_lots_doubles(self):
-        import algotest_native
-
-        one, _ = algotest_native.simulate_trades_batch([_spec(1)])
-        two, _ = algotest_native.simulate_trades_batch([_spec(2)])
-
-        if not one or one[0].get("missing"):
-            self.skipTest("no market data for this spec")
-
-        self.assertAlmostEqual(two[0]["net_pnl"], one[0]["net_pnl"] * 2, places=2)
+        for a, b in self._paired():
+            self.assertAlmostEqual(b["net_pnl"], a["net_pnl"] * 2, places=2)
 
     def test_prices_do_not_scale(self):
-        import algotest_native
-
-        one, _ = algotest_native.simulate_trades_batch([_spec(1)])
-        two, _ = algotest_native.simulate_trades_batch([_spec(2)])
-
-        if not one or one[0].get("missing"):
-            self.skipTest("no market data for this spec")
-
-        self.assertEqual(two[0]["entry_price"], one[0]["entry_price"])
-        self.assertEqual(two[0]["exit_price"], one[0]["exit_price"])
+        for a, b in self._paired():
+            self.assertEqual(b["entry_price"], a["entry_price"])
+            self.assertEqual(b["exit_price"], a["exit_price"])
 
 
 if __name__ == "__main__":
     unittest.main()
 ```
 
+`_bulk_load_for_snapshot` calls `bulk_load_options`, which **reads** only. It does
+not call `build_cache`, so it does not write the shared feather — this is safe
+under the no-warm-cache-for-testing rule.
+
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `python -m unittest backend.tests.test_lot_quantity_scaling.TestRustNetPnlScalesWithLots -v`
+`algotest_native` exists only inside the `backend` container, whose `/app` root
+IS the `backend` package — so the module path there is `tests.…`, not
+`backend.tests.…`:
+
+```bash
+docker compose exec -T backend python -m unittest tests.test_lot_quantity_scaling.TestRustNetPnlScalesWithLots -v
+```
 
 Expected: `test_net_pnl_doubles_when_lots_doubles` FAILS — the two values are equal, not 2×. (`test_prices_do_not_scale` passes already; that is correct, it is a regression guard.)
 
-If both tests SKIP, the extension is not built or market data is absent. Build first (Step 4) and re-run before proceeding — a skipped test proves nothing.
+If both tests SKIP, market data is absent or the snapshot is missing. Resolve that before proceeding — a skipped test proves nothing.
 
 - [ ] **Step 3: Apply the change**
 
