@@ -1160,6 +1160,17 @@ fn _mc_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(|x| x.as_str())
 }
 
+// Lot-quantity scaling: this leg's OWN lots, read from its JSON config — never
+// derive from Qty/lot_size (that inverts a display column). Mirrors Python's
+// `int(leg.get("lots") or leg.get("lot") or 1)` truthy-or chain (a present-but-
+// zero "lots" falls through to "lot", then to the 1 default) so the two engines
+// agree byte-for-byte, including the `lots == 1` no-op case.
+fn _mc_lots(leg: &serde_json::Value) -> f64 {
+    let lots_field = _mc_f64(leg, "lots").filter(|&v| v != 0.0);
+    let lot_field = _mc_f64(leg, "lot").filter(|&v| v != 0.0);
+    lots_field.or(lot_field).unwrap_or(1.0).trunc()
+}
+
 // (date_days, sym) → (o,h,l,c) with the same named-then-sentinel fallback as lookup_index_ohlc.
 fn _mc_ohlc(cache: &IndexOhlcCache, sym_id: Option<u16>, dd: i32) -> Option<(f64, f64, f64, f64)> {
     if let Some(sid) = sym_id {
@@ -1280,6 +1291,7 @@ fn compute_midcap_legs(
                 .unwrap_or("spot")
                 .to_lowercase();
             let cost = if mode == "hypothetical" { _mc_f64(leg, "cost_pct_per_month").unwrap_or(0.0) } else { 0.0 };
+            let lots = _mc_lots(leg);
             let roll = cost / 100.0 * (no_of_days as f64) / 30.0;
             let sp = if position == "SELL" { -raw_spot_pnl } else { raw_spot_pnl };
             let sp_pct = sp / se;
@@ -1295,6 +1307,13 @@ fn compute_midcap_legs(
                 pnl = sp;
                 pnl_pct = sp_pct;
             }
+            // Scale exactly once, here, at the first point these become this
+            // leg's FINAL P&L (points x lots). Everything downstream —
+            // leg_pnl_total/leg_pnl_pct_total, Combined Net P&L{,%}, and the
+            // summary sum_leg/sum_comb accumulators — only SUMS these already-
+            // scaled values; do not re-multiply them by lots.
+            let pnl = pnl * lots;
+            let pnl_pct = pnl_pct * lots;
             leg_pnl_total += pnl;
             leg_pnl_pct_total += pnl_pct;
 
@@ -1331,6 +1350,14 @@ fn compute_midcap_legs(
                 }
                 _ => (0.0, 0.0),
             };
+            // MAE/MFE above is a plain unscaled ratio (rounded to 4dp) — scale by
+            // THIS leg's lots once, here at the call site, matching the write-
+            // site convention in midcap_overlay._leg_mae_mfe callers. Keeps
+            // "Midcap MAE"/"Midcap MFE" commensurate with the already lot-scaled
+            // NIFTY MAE/MFE that summary_metrics.rs:399 pairs them with (nm1 =
+            // Midcap MFE + NIFTY MAE, nm2 = Midcap MAE + NIFTY MFE).
+            let mae_pct = mae_pct * lots;
+            let mfe_pct = mfe_pct * lots;
             total_mae += mae_pct;
             total_mfe += mfe_pct;
         }
