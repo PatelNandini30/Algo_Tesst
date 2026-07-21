@@ -15,7 +15,7 @@
 - **Per-leg.** Each leg scales by its own `leg.lots`. Legs may carry different lot counts (a 2×1 ratio spread is valid). Index-agnostic.
 - **lots = 1 must stay byte-identical.** Multiplying by 1 is a no-op; any diff at 1 lot is a bug.
 - **Do not touch the Overall SL/Target threshold machinery.** `backend/services/engine_rust.py:240-268` and `backend/native/src/lib.rs:1920` are explicitly out of scope per the spec.
-- **Do not scale MAE/MFE.** They are ratios (`backend/native/src/mae.rs:191`) and are quantity-invariant by construction.
+- **MAE/MFE DO scale — see Task 7.** (This constraint originally said the opposite. That was wrong: `summary_metrics.rs:336` compounds NAV by the now-scaled `% P&L` while `:362` applies MAE to that same NAV, so leaving MAE unscaled understates Live DD / Max DD by ~1/lots.) Tasks 1–6 do NOT touch MAE/MFE; Task 7 scales them at the column-write sites only. `native/src/mae.rs` itself stays a pure ratio.
 - **Do not scale entry/exit prices.** They are per-unit by definition.
 - **Tests are `unittest`, not pytest:** `python -m unittest backend.tests.test_x`
 - **Rebuilding needs sudo:** build artifacts are root-owned; rebuild via `sudo ./start.sh`.

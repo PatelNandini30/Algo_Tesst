@@ -46,3 +46,20 @@ Task 6 GATE: ALL PASS on real data (post-rebuild).
   - multi-index Q1-2025 (NIFTY x3 + MIDCPNIFTY x2): 13 NIFTY rows x3 Qty 65->195;
     3 MIDCPNIFTY rows x2 Qty 120->240 (date-versioned lot size correct)
   NOTE: multi-index OOMs if run in same process as other backtests (16GB box) - run isolated.
+
+Task 7 (MAE/MFE lot scaling): COMPLETE
+  7a 6ee2b8af - lots key on tradesheet rows + backtest MAE/MFE scaled + backtest.py
+                now reads explicit lots (closes reviewer's Important finding)
+  7b 86cf6b76 - optimizer: rust-batch pairs, python path, _apply_futures_mae_mfe
+                (site D confirmed RAW/unscaled). tools/mae_parity.py ALL PASS.
+  7c dd886845 - multi-index overlay :1545 (covers both :1489 and futures branch);
+                :228 dead code, :1516 None placeholder - no change needed.
+  GATE (real data, NIFTY straddle Q1-2024, corrected to REQUIRE MAE scaling):
+    MAE/MFE scale exactly 2x; 2x1 ratio spread confirms x lots not lots^2
+    actual_live_dd_max -1.38 -> -2.78 (2.01x)
+    avg_final_mae      -0.2396 -> -0.4791 (2.00x)
+    max_dd_pct         -0.4287 -> -0.8572 (2.00x)
+    cagr_spot / long_spot_pnl / mdd_trade_number UNCHANGED (correct)
+  THREE-WAY PARITY GATE re-run after MAE change: PASS
+  NOTE: original Task 6 gate asserted MAE/MFE were INVARIANT - it encoded the
+  design error and passed. Corrected here.
