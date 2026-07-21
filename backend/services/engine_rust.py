@@ -6527,6 +6527,114 @@ def run_rust_engine_pipeline(
                     else:
                         break
 
+    # ── Phase 4: per-leg spot-adj re-entry ────────────────────────────────────
+    # A leg that adjusted out under Phase 3 must come back for the rest of its
+    # own window, otherwise it sits flat — the exact defect the yearly gate fix
+    # removed. Mirrors the whole-trade cascade above, with two differences:
+    #   · the mini-trade carries ONLY the breaching leg; the trade's other legs
+    #     are still running in the parent and must not be re-booked.
+    #   · it cascades on that leg's OWN config, so a 300-point leg keeps
+    #     measuring in points inside the residual window.
+    # New trade_ids like every other re-entry path, appended after the overlap
+    # walk (below) so being concurrent with the parent is not treated as an
+    # overlap. Empty without per-leg config, so nothing existing is touched.
+    _sa_leg_reentry_specs: List[Dict[str, Any]] = []
+    _sa_leg_reentry_by_new_tid: Dict[int, int] = {}
+    _sa_leg_reentry_reasons: Dict[Tuple[int, int, str], str] = {}
+    if spot_adj_leg_overrides and _sa_cascade_active and filter_entry_mode != "fixed":
+        _pl_index = str(payload.get("symbol") or payload.get("index") or "NIFTY").upper()
+        _pl_interval_default = _STRIKE_INTERVALS.get(_pl_index, 50.0)
+        # Continue past every id already handed out so mini-trades never collide.
+        _pl_new_tid = max(
+            [int(t) for t in by_trade.keys()]
+            + [int(s["trade_id"]) for s in reentry_specs]
+            + [int(s["trade_id"]) for s in _bt_bridge_specs]
+            + [int(s["trade_id"]) for s in _sa_reentry_specs]
+            + [0]
+        ) + 1
+        for (_pl_tid, _pl_lid) in sorted(spot_adj_leg_overrides.keys()):
+            _pl_cfg = _per_leg_sa.get(_pl_lid)
+            if not _pl_cfg:
+                continue
+            _pl_rows = by_trade.get(_pl_tid) or []
+            _pl_row = next(
+                (r for r in _pl_rows if int(r.get("leg_id") or 0) == _pl_lid), None
+            )
+            if _pl_row is None:
+                continue
+            _pl_expiry = _normalize_iso(_pl_row.get("expiry") or "")
+            _pl_sched_exit = _normalize_iso(_pl_row.get("exit_date") or "")
+            if not _pl_expiry or not _pl_sched_exit:
+                continue
+            if _pl_sched_exit > _pl_expiry:
+                _pl_sched_exit = _pl_expiry
+            _pl_cur_entry = spot_adj_leg_overrides[(_pl_tid, _pl_lid)]
+            _pl_src = legs_src[_pl_lid - 1] if 0 <= _pl_lid - 1 < len(legs_src) else {}
+            _pl_sel = (_pl_src or {}).get("strike_selection") or {}
+            _pl_iv_raw = (
+                (_pl_src or {}).get("strike_interval")
+                or (_pl_src or {}).get("strike_gap")
+                or (_pl_sel.get("strike_interval") if isinstance(_pl_sel, dict) else None)
+            )
+            try:
+                _pl_iv = float(_pl_iv_raw) if _pl_iv_raw else _pl_interval_default
+            except (TypeError, ValueError):
+                _pl_iv = _pl_interval_default
+            if _pl_iv not in (25.0, 50.0, 100.0, 500.0, 1000.0):
+                _pl_iv = _pl_interval_default
+            _pl_depth = 0
+            while _pl_depth < 250 and _pl_cur_entry < _pl_sched_exit:
+                _pl_depth += 1
+                _pl_spot = float(spot_by_date.get(_pl_cur_entry) or 0.0)
+                if not _pl_spot:
+                    break
+                # Re-entry re-bases on the trigger spot, matching the whole-trade
+                # cascade and the _trade_adj_baseline re-base rule.
+                _pl_next = _compute_spot_adjustment_trigger(
+                    _pl_cur_entry, _pl_spot, _pl_sched_exit,
+                    _pl_cfg["direction"], _pl_cfg["pct"], _pl_cfg["units"],
+                    trading_days, spot_by_date,
+                )
+                _pl_this_exit = (
+                    _pl_next if (_pl_next and _pl_next < _pl_sched_exit) else _pl_sched_exit
+                )
+                _pl_info: Dict[str, Any] = {}
+                _pl_strike = _compute_strike_for_leg_python(
+                    _pl_src, _pl_spot, _pl_iv,
+                    entry_date=_pl_cur_entry, expiry=_pl_expiry, index=_pl_index,
+                    out_info=_pl_info, resolved_strikes={},
+                ) or float(_pl_row.get("strike") or 0.0)
+                if not _pl_strike:
+                    break
+                _sa_leg_reentry_specs.append({
+                    "trade_id":     _pl_new_tid,
+                    "leg_id":       _pl_lid,
+                    "index":        _pl_row.get("index") or _pl_index,
+                    "entry_date":   _pl_cur_entry,
+                    "exit_date":    _pl_this_exit,
+                    "expiry":       _pl_expiry,
+                    "strike":       float(_pl_strike),
+                    "requested_strike": float(_pl_info.get("requested_strike") or _pl_strike),
+                    "strike_interval": float(_pl_iv),
+                    "option_type":  _pl_row.get("option_type") or "CE",
+                    "position":     _pl_row.get("position") or "SELL",
+                    "lots":         int(_pl_row.get("lots") or 1),
+                    "lot_size":     int(_pl_row.get("lot_size") or lot_size),
+                    "slippage_pct": float(_pl_row.get("slippage_pct") or 0.0),
+                })
+                _sa_leg_reentry_by_new_tid[_pl_new_tid] = _pl_tid
+                if _pl_next and _pl_next < _pl_sched_exit:
+                    _sa_leg_reentry_reasons[(_pl_new_tid, _pl_lid, _pl_cur_entry)] = (
+                        _spot_adj_reason_tag(
+                            _pl_cfg["direction"], _pl_spot, spot_by_date.get(_pl_next),
+                            _pl_cfg["pct"], _pl_cfg["units"],
+                        )
+                    )
+                _pl_new_tid += 1
+                if not (_pl_next and _pl_next < _pl_sched_exit):
+                    break
+                _pl_cur_entry = _pl_next
+
     # Step 5: Overlap prevention — mirrors engines/generic_algotest_engine.py:3680
     # If a trade's scheduled entry_date is on-or-before the previous trade's
     # ACTUAL exit (which may be earlier than scheduled due to SL/Target/Trail
@@ -6572,6 +6680,15 @@ def run_rust_engine_pipeline(
         if _sa_reentry_by_new_tid.get(s["trade_id"]) in kept_trades
     )
     adjusted_reason_by_date.update(_sa_reentry_reasons)
+    # Phase 4: per-leg spot-adj mini-trades, same survival rule. These are
+    # deliberately CONCURRENT with their parent (the parent's other legs are
+    # still open), which is why they are added here rather than walked through
+    # the overlap filter above. Empty without per-leg config.
+    adjusted_specs.extend(
+        s for s in _sa_leg_reentry_specs
+        if _sa_leg_reentry_by_new_tid.get(s["trade_id"]) in kept_trades
+    )
+    adjusted_reason_by_date.update(_sa_leg_reentry_reasons)
     if not adjusted_specs:
         return []
 
