@@ -4719,6 +4719,12 @@ def run_rust_engine_pipeline(
 
     spot_adj_overrides: Dict[int, str] = {}
     spot_adj_reasons: Dict[int, str] = {}
+    # Phase 3: breaches belonging to a leg that carries its own config, keyed by
+    # (trade_id, leg_id). Only that leg's exit is clamped; the rest of the trade
+    # runs to its own schedule. Empty without per-leg config, so every consumer
+    # falls through to the trade-level maps above unchanged.
+    spot_adj_leg_overrides: Dict[Tuple[int, int], str] = {}
+    spot_adj_leg_reasons: Dict[Tuple[int, int], str] = {}
     _nifty_active = bool(spot_adj_enabled and spot_adj_pct > 0)
     # The strategy-level scan still covers every leg that has NO config of its
     # own. If every leg brought its own, the strategy-level knob no longer has a
@@ -4838,25 +4844,25 @@ def run_rust_engine_pipeline(
                     _cands.append((midcap_trig, "MIDCAP"))
                 if midcp_trig:
                     _cands.append((midcp_trig, "MIDCPNIFTY"))
-                # Per-leg breaches join the same earliest-wins compare. Appended
-                # last so an index source keeps the existing tie-break; the list
-                # is empty without per-leg config, leaving min() untouched.
+                # Phase 3: a leg carrying its own config exits on its OWN breach
+                # and does not drag the other legs out with it, so its trigger is
+                # recorded per (trade, leg) instead of joining the trade-level
+                # earliest-wins compare. Index sources (NIFTY/MIDCAP/MIDCPNIFTY)
+                # and legs WITHOUT their own config keep the whole-trade rule.
                 for _lt, _lid in _leg_trigs:
-                    _cands.append((_lt, "LEG%d" % _lid))
+                    spot_adj_leg_overrides[(trade_id, _lid)] = _lt
+                    _lcfg_r = _per_leg_sa.get(_lid) or {}
+                    spot_adj_leg_reasons[(trade_id, _lid)] = _spot_adj_reason_tag(
+                        _lcfg_r.get("direction") or "rise",
+                        _leg_adj_baseline.get((trade_id, _lid), 0.0),
+                        spot_by_date.get(_lt),
+                        _lcfg_r.get("pct") or 0.0,
+                        _lcfg_r.get("units") or "percent",
+                    )
                 if _cands:
                     _win_date, _win_src = min(_cands, key=lambda c: c[0])
                     spot_adj_overrides[trade_id] = _win_date
-                    if _win_src.startswith("LEG"):
-                        _wl = int(_win_src[3:])
-                        _wcfg = _per_leg_sa.get(_wl) or {}
-                        spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
-                            _wcfg.get("direction") or "rise",
-                            _leg_adj_baseline.get((trade_id, _wl), 0.0),
-                            spot_by_date.get(_win_date),
-                            _wcfg.get("pct") or 0.0,
-                            _wcfg.get("units") or "percent",
-                        )
-                    elif _win_src == "NIFTY":
+                    if _win_src == "NIFTY":
                         spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
                             spot_adj_direction, entry_spot, spot_by_date.get(_win_date),
                             spot_adj_pct, spot_adj_units,
@@ -4910,6 +4916,29 @@ def run_rust_engine_pipeline(
         # Slice 7a: spot adjustment truncates the cycle exit BEFORE the SL scan.
         sl_cycle_exit = _normalize_iso(first_leg["exit_date"])
         spot_adj_clamp = spot_adj_overrides.get(trade_id)
+        # check_leg_stop_loss_target scans ONE window for every leg, so under
+        # per-leg spot adj the window must be the widest any leg still needs —
+        # shrinking it to the earliest breach would hide a later leg's SL. Each
+        # leg is still cut back to its own breach by the final_exit clamp below
+        # (an SL after the breach resolves to the breach date either way), so
+        # widening here cannot let a leg exit later than it should. Reduces to
+        # the trade-level clamp when no leg carries its own config.
+        if _per_leg_sa:
+            # Widest window any leg still needs: a leg with its own config needs
+            # only up to its own breach, but a leg WITHOUT one needs the full
+            # scheduled window — so it contributes sl_cycle_exit and the max
+            # leaves the window unshrunk. Taking max over only the per-leg
+            # triggers would cut every leg back to the earliest breach, which
+            # silently truncated legs that never opted in.
+            _sl_win_cands = []
+            for _lrow in legs:
+                _lid_w = int(_lrow.get("leg_id") or 0)
+                if _lid_w in _per_leg_sa:
+                    _c_w = spot_adj_leg_overrides.get((trade_id, _lid_w))
+                else:
+                    _c_w = spot_adj_overrides.get(trade_id)
+                _sl_win_cands.append(_c_w or sl_cycle_exit)
+            spot_adj_clamp = max(_sl_win_cands) if _sl_win_cands else spot_adj_clamp
         if spot_adj_clamp and spot_adj_clamp < sl_cycle_exit:
             sl_cycle_exit = spot_adj_clamp
         try:
@@ -6124,10 +6153,23 @@ def run_rust_engine_pipeline(
                 _reason_cands.append((overall_date, reason))
             # Slice 7a: Spot adjustment exit always clamps the final exit when
             # the SL/Overall date is later than the spot-adj trigger.
-            spot_adj_clamp = spot_adj_overrides.get(trade_id)
+            # Phase 3 — a leg that carries its own spot-adj config is clamped by
+            # ITS OWN breach and is NOT dragged out by the trade-level trigger
+            # (the strategy-level knob does not speak for a leg that opted out of
+            # it). A leg without its own config keeps reading the trade-level
+            # map, so with no per-leg config anywhere this is the original line.
+            _leg_id_sa = int(leg.get("leg_id") or (i + 1))
+            if _leg_id_sa in _per_leg_sa:
+                spot_adj_clamp = spot_adj_leg_overrides.get((trade_id, _leg_id_sa))
+                _sa_clamp_reason = spot_adj_leg_reasons.get(
+                    (trade_id, _leg_id_sa), "SPOT_ADJ_RISE"
+                )
+            else:
+                spot_adj_clamp = spot_adj_overrides.get(trade_id)
+                _sa_clamp_reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
             if spot_adj_clamp and final_exit >= spot_adj_clamp:
                 final_exit = spot_adj_clamp
-                reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
+                reason = _sa_clamp_reason
                 _reason_cands.append((spot_adj_clamp, reason))
             # `reason` now holds the OLD single (highest-priority) label — the
             # value this column used to carry. Combine all reasons whose
