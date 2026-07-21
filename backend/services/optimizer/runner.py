@@ -1278,8 +1278,20 @@ def _compute_mae_mfe_batch(
                 f"(got {None if _pairs is None else len(_pairs)}, need {len(df)}) "
                 "— no Python fallback per policy"
             )
-        df["MAE"] = [p[0] for p in _pairs]
-        df["MFE"] = [p[1] for p in _pairs]
+        # Scale each row's MAE/MFE by THAT ROW'S OWN lots (lot_size excluded).
+        # native/src/mae.rs stays a pure ratio by design (Task 7b) — this is the
+        # deliberate column-write scaling point, mirroring the identical
+        # treatment of this same Rust batch in algotest_job.py's live-backtest
+        # path (Task 7a). summary_metrics.rs compounds NAV by the now
+        # lots-scaled % P&L, so leaving MAE/MFE unscaled would understate
+        # Live DD / Max DD by ~1/lots. Missing "lots" (e.g. multi-index combos,
+        # scaled at their own site) defaults to 1 — a no-op.
+        _lots_list = (
+            pd.to_numeric(df["lots"], errors="coerce").fillna(1.0).tolist()
+            if "lots" in df.columns else [1.0] * len(df)
+        )
+        df["MAE"] = [p[0] * _lots_list[i] for i, p in enumerate(_pairs)]
+        df["MFE"] = [p[1] * _lots_list[i] for i, p in enumerate(_pairs)]
         return _apply_futures_mae_mfe(df, index_str, trading_days)
 
     try:
@@ -1348,11 +1360,15 @@ def _compute_mae_mfe_batch(
             _exit_price = float(row.get("Exit Price"))
         except (TypeError, ValueError):
             _exit_price = None
+        try:
+            _row_lots = float(row.get("lots") or 1)
+        except (TypeError, ValueError):
+            _row_lots = 1.0
         rows_data.append({
             "pos": pos, "opt_type": opt_type, "strike": strike,
             "expiry_str": expiry_str, "win_start": win_start, "win_end": exit_str,
             "entry_price": entry_price, "position": position, "entry_spot": entry_spot,
-            "exit_reason": _exit_reason, "exit_price": _exit_price,
+            "exit_reason": _exit_reason, "exit_price": _exit_price, "lots": _row_lots,
         })
 
     valid_rows = [r for r in rows_data if r is not None]
@@ -1582,8 +1598,12 @@ def _compute_mae_mfe_batch(
             mae = (min_low - entry_price) / entry_spot
             mfe = (max_high - entry_price) / entry_spot
 
-        mae_vals[pos] = round(mae * 100, 4)
-        mfe_vals[pos] = round(mfe * 100, 4)
+        # Scale by THIS row's own lots (lot_size excluded) — same column-write
+        # scaling point as the Rust batch branch above (Task 7b), so the two
+        # implementations that tools/mae_parity.py diffs stay identical at any
+        # given lots value (both read the same row's "lots").
+        mae_vals[pos] = round(mae * 100, 4) * r["lots"]
+        mfe_vals[pos] = round(mfe * 100, 4) * r["lots"]
 
     df["MAE"] = mae_vals
     df["MFE"] = mfe_vals
@@ -1627,10 +1647,21 @@ def _apply_futures_mae_mfe(df, index_str, trading_days):
                     exit_reason=r.get("Exit Reason"),
                     exit_price=(float(_xp) if _xp not in (None, "") else None),
                 )
+                # _fut_leg_mae_mfe returns a RAW ratio (delegates to
+                # _calculate_mae_mfe_from_extremes, same pure formula the
+                # option path uses — no lots factor anywhere in that call
+                # chain). This overwrite runs AFTER the option-row scaling
+                # above, so FUT rows need their OWN scaling here or they'd
+                # silently lose it (Task 7b site D). Mirrors the identical
+                # _fut_leg_mae_mfe scaling in algotest_job.py (Task 7a).
+                try:
+                    _fut_lots = float(r.get("lots") or 1)
+                except (TypeError, ValueError):
+                    _fut_lots = 1.0
                 if mae is not None:
-                    df.at[df.index[i], "MAE"] = mae
+                    df.at[df.index[i], "MAE"] = mae * _fut_lots
                 if mfe is not None:
-                    df.at[df.index[i], "MFE"] = mfe
+                    df.at[df.index[i], "MFE"] = mfe * _fut_lots
             except Exception:
                 continue
     except Exception:

@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import json
 from pathlib import Path
 
+import pandas as pd
+
 
 class TestRustNetPnlScalesWithLots(unittest.TestCase):
     """Rust net_pnl scales by the leg's own lots; prices must not.
@@ -550,6 +552,160 @@ class TestBacktestJobMaeMfeScalesByLots(unittest.TestCase):
                 self.assertAlmostEqual(float(r["MAE"]), float(snap_r["MAE"]), places=3)
                 self.assertAlmostEqual(float(r["MFE"]), float(snap_r["MFE"]), places=3)
         self.assertGreater(matched, 0, "no rows matched the captured snapshot by (Trade, Leg)")
+
+
+class TestOptimizerMaeMfeScalesByLots(unittest.TestCase):
+    """Task 7b: the OPTIMIZER's own MAE/MFE column-write sites in
+    services/optimizer/runner.py must scale by each row's own lots, exactly
+    like the backtest path (Task 7a, TestBacktestJobMaeMfeScalesByLots above):
+
+      - site B: _compute_mae_mfe_batch's Rust-batch branch (:1281-1282),
+        which writes algotest_native.compute_mae_mfe_batch's raw ratio.
+      - site C: _compute_mae_mfe_batch's Python/pandas branch (:1588-1589),
+        the parity-reference implementation tools/mae_parity.py diffs
+        against site B row-by-row — they must scale IDENTICALLY.
+      - site D: _apply_futures_mae_mfe, which OVERWRITES FUT rows with
+        services.engine_rust._fut_leg_mae_mfe's raw ratio AFTER site B/C —
+        it needs its own scaling or FUT rows silently lose it.
+
+    Fully synthetic and deterministic: algotest_native.compute_mae_mfe_batch
+    and _fut_leg_mae_mfe are monkeypatched to fixed RAW (unscaled) ratios, and
+    the Python branch is fed a tiny in-memory OHLC frame — no market data / DB
+    / native cache warm-up required. Only algotest_native's Python module
+    needs to be importable (matching the other tests in this file); if it
+    isn't, the whole class skips.
+    """
+
+    _ENTRY = 150.0
+    _SPOT = 21500.0
+    _HIGH = 160.0
+    _LOW = 80.0
+    _TRADING_DAYS = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04"]
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import algotest_native  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("algotest_native not installed in this environment")
+        # Raw (unscaled) ratio for a SELL leg, matching
+        # _calculate_mae_mfe_from_extremes: mae=(entry-high)/spot*100,
+        # mfe=(entry-low)/spot*100.
+        cls._raw_mae = round((cls._ENTRY - cls._HIGH) / cls._SPOT * 100, 4)
+        cls._raw_mfe = round((cls._ENTRY - cls._LOW) / cls._SPOT * 100, 4)
+
+    def _option_row(self, lots, with_lots_key=True):
+        row = {
+            "Trade": "1", "Leg": 1, "Type": "CE", "Strike": 21500.0, "B/S": "SELL",
+            "Entry Price": self._ENTRY, "Entry Spot": self._SPOT, "Exit Price": 90.0,
+            "Entry Date": "2024-01-01", "Exit Date": "2024-01-04",
+            "Expiry": "2024-01-04", "Exit Reason": "Target",
+            "MAE": 0.0, "MFE": 0.0,
+        }
+        if with_lots_key:
+            row["lots"] = lots
+        return row
+
+    def _run_site_b(self, lots, with_lots_key=True):
+        """Rust-batch branch (site B) — algotest_native mocked to a fixed raw pair."""
+        import unittest.mock as mock
+        import algotest_native
+        from services.optimizer import runner as _r
+
+        df = pd.DataFrame([self._option_row(lots, with_lots_key)])
+        raw_pairs = [(self._raw_mae, self._raw_mfe)]
+        with mock.patch.dict(os.environ, {"BACKTEST_INCLUDE_MAE_MFE": "1"}), \
+             mock.patch.object(algotest_native, "is_loaded", return_value=True), \
+             mock.patch.object(algotest_native, "compute_mae_mfe_batch", return_value=raw_pairs), \
+             mock.patch.object(_r, "_MAE_PYTHON_REF", False):
+            return _r._compute_mae_mfe_batch(df, "NIFTY", self._TRADING_DAYS)
+
+    def _run_site_c(self, lots, with_lots_key=True):
+        """Python/pandas branch (site C) — fed a tiny synthetic OHLC frame."""
+        import unittest.mock as mock
+        from services.optimizer import runner as _r
+
+        df = pd.DataFrame([self._option_row(lots, with_lots_key)])
+        ohlc_rows = [
+            {"Symbol": "NIFTY", "Date": pd.Timestamp(d),
+             "ExpiryDate": pd.Timestamp("2024-01-04"),
+             "OptionType": "CE", "strike_r": 21500,
+             "High": self._HIGH, "Low": self._LOW}
+            for d in ("2024-01-02", "2024-01-03", "2024-01-04")
+        ]
+        fake_ctx = {"ohlc_df_pandas": pd.DataFrame(ohlc_rows), "trading_days": self._TRADING_DAYS}
+        with mock.patch.dict(os.environ, {"BACKTEST_INCLUDE_MAE_MFE": "1"}), \
+             mock.patch.object(_r, "_RUST_CONTEXT", fake_ctx), \
+             mock.patch.object(_r, "_MAE_PYTHON_REF", True):
+            return _r._compute_mae_mfe_batch(df, "NIFTY", self._TRADING_DAYS)
+
+    def _fut_row(self, lots, with_lots_key=True):
+        row = {
+            "Trade": "1", "Leg": 1, "Type": "FUT", "B/S": "SELL",
+            "Entry Price": 21600.0, "Entry Spot": 21500.0, "Exit Price": 21785.95,
+            "Entry Date": "2024-01-03", "Exit Date": "2024-01-04",
+            "Expiry": "2024-01-25", "Exit Reason": "Expiry",
+            "MAE": 0.0, "MFE": 0.0,
+        }
+        if with_lots_key:
+            row["lots"] = lots
+        return row
+
+    def _run_site_d(self, lots, raw_mae=-0.976, raw_mfe=-0.0748, with_lots_key=True):
+        """FUT overwrite (site D) — _fut_leg_mae_mfe mocked to a fixed raw pair."""
+        import unittest.mock as mock
+        import services.engine_rust as er
+        from services.optimizer.runner import _apply_futures_mae_mfe
+
+        df = pd.DataFrame([self._fut_row(lots, with_lots_key)])
+        with mock.patch.object(er, "_fut_leg_mae_mfe", return_value=(raw_mae, raw_mfe)):
+            return _apply_futures_mae_mfe(df, "NIFTY", ["2024-01-03", "2024-01-04"])
+
+    # ── Site B: Rust batch branch ────────────────────────────────────────
+    def test_site_b_rust_batch_scales_by_row_lots(self):
+        one = self._run_site_b(1)
+        two = self._run_site_b(2)
+        self.assertAlmostEqual(float(one["MAE"].iloc[0]), self._raw_mae, places=4)
+        self.assertAlmostEqual(float(one["MFE"].iloc[0]), self._raw_mfe, places=4)
+        self.assertAlmostEqual(float(two["MAE"].iloc[0]), self._raw_mae * 2, places=4)
+        self.assertAlmostEqual(float(two["MFE"].iloc[0]), self._raw_mfe * 2, places=4)
+
+    # ── Site C: Python/pandas branch ─────────────────────────────────────
+    def test_site_c_python_path_scales_by_row_lots(self):
+        one = self._run_site_c(1)
+        two = self._run_site_c(2)
+        self.assertAlmostEqual(float(one["MAE"].iloc[0]), self._raw_mae, places=4)
+        self.assertAlmostEqual(float(one["MFE"].iloc[0]), self._raw_mfe, places=4)
+        self.assertAlmostEqual(float(two["MAE"].iloc[0]), self._raw_mae * 2, places=4)
+        self.assertAlmostEqual(float(two["MFE"].iloc[0]), self._raw_mfe * 2, places=4)
+
+    # ── B vs C parity: tools/mae_parity.py diffs these two branches row-by-row.
+    def test_site_b_and_site_c_scale_identically(self):
+        for lots in (1, 2, 3):
+            b = self._run_site_b(lots)
+            c = self._run_site_c(lots)
+            with self.subTest(lots=lots):
+                self.assertAlmostEqual(float(b["MAE"].iloc[0]), float(c["MAE"].iloc[0]), places=4)
+                self.assertAlmostEqual(float(b["MFE"].iloc[0]), float(c["MFE"].iloc[0]), places=4)
+
+    # ── Site D: FUT-row overwrite, runs AFTER B/C and must scale independently.
+    def test_site_d_futures_overwrite_scales_by_row_lots(self):
+        one = self._run_site_d(1)
+        two = self._run_site_d(2)
+        self.assertAlmostEqual(float(one["MAE"].iloc[0]), -0.976, places=4)
+        self.assertAlmostEqual(float(one["MFE"].iloc[0]), -0.0748, places=4)
+        self.assertAlmostEqual(float(two["MAE"].iloc[0]), -0.976 * 2, places=4)
+        self.assertAlmostEqual(float(two["MFE"].iloc[0]), -0.0748 * 2, places=4)
+
+    # ── Missing "lots" column (legacy CSV / multi-index combo) must default
+    # to 1 (no-op), not crash and not derive lots from Qty/lot_size.
+    def test_missing_lots_column_defaults_to_1_noop(self):
+        b = self._run_site_b(1, with_lots_key=False)
+        c = self._run_site_c(1, with_lots_key=False)
+        d = self._run_site_d(1, with_lots_key=False)
+        self.assertAlmostEqual(float(b["MAE"].iloc[0]), self._raw_mae, places=4)
+        self.assertAlmostEqual(float(c["MAE"].iloc[0]), self._raw_mae, places=4)
+        self.assertAlmostEqual(float(d["MAE"].iloc[0]), -0.976, places=4)
 
 
 if __name__ == "__main__":
