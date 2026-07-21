@@ -4,7 +4,7 @@
  * (AutoDownloadQueue.jsx) so the two paths can never produce different
  * numbers/layout. Pure client-side computation from already-fetched rows.
  */
-import ExcelJS from 'exceljs';
+import { resolveDownloadBase } from './downloadBase';
 import { MASTER_SUMMARY_COLUMNS } from './strategyParamSchema';
 
 const VARIES = 'Varies — see column below';
@@ -89,55 +89,34 @@ export function buildRuleRows(ruleConfig) {
  * patchwise-recomputed metrics (from GET .../summary?patchwise=true) to match
  * the patchwise ZIP; omit it to use each row's own (overall) summary.
  */
-export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo) {
-  const visibleColumns = visibleColumnsFor(rows);
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('Optimization Summary');
-
-  const ruleRows = buildRuleRows(ruleConfig);
-  ruleRows.forEach(([label, value], i) => {
-    const rowLabel = i === 0 ? `Rules: ${label}` : label;
-    const row = ws.addRow([rowLabel, value]);
-    row.getCell(1).font = { bold: true };
-  });
-  if (ruleRows.length) ws.addRow([]);
-  const headerRowIdx = ruleRows.length + (ruleRows.length ? 1 : 0) + 1;
-
-  const headers = [
-    'Sr. No.',
-    ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => c.label),
-  ];
-  const headerRow = ws.addRow(headers);
-  headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } };
-  headerRow.alignment = { horizontal: 'center', vertical: 'middle' };
-  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: headerRowIdx }];
-
-  rows.forEach((row, i) => {
-    const summary =
+export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId) {
+  // The WORKBOOK is built on the backend (services/optimizer/summary_workbook.py), so
+  // every .xlsx this product emits comes from one builder — openpyxl, server-side:
+  //   tradesheet -> excel_builder.build_combo_xlsx
+  //   WOW & MOM  -> wow_mom.write_merged_wow_mom
+  //   this sheet -> summary_workbook.build_summary_workbook
+  // We still resolve the per-combo summary and derive the Rules block here, because
+  // that reads the sweep config the client already holds; re-deriving it in Python
+  // would create a second implementation of the sweep-label logic, which is exactly
+  // the duplication this consolidation removes.
+  const payloadRows = rows.map((row) => ({
+    summary:
       (summaryByCombo && summaryByCombo.get(String(row.combo_id))) ||
-      row.summary || {};
-    const cols = row.combo_columns || {};
-    const arr = [
-      i + 1,
-      ...visibleColumns.filter((c) => c.key !== 'sr_no').map((c) => {
-        if (c.key in cols) return cols[c.key];
-        if (c.key in summary) return summary[c.key];
-        return summary[c.key];
-      }),
-    ];
-    const dataRow = ws.addRow(arr);
-    dataRow.eachCell((cell) => {
-      if (typeof cell.value === 'number') cell.numFmt = '0.00';
-    });
+      row.summary ||
+      {},
+    combo_columns: row.combo_columns || {},
+  }));
+  const base = await resolveDownloadBase(jobId);
+  const res = await fetch(`${base}/api/optimize/jobs/${jobId}/summary.xlsx`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows: payloadRows, rule_rows: buildRuleRows(ruleConfig) }),
   });
-  ws.columns.forEach((col) => {
-    col.width = 16;
-  });
-  const buf = await wb.xlsx.writeBuffer();
-  return new Blob([buf], {
-    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Summary build failed (HTTP ${res.status})`);
+  }
+  return res.blob();
 }
 
 /**

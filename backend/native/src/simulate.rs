@@ -205,6 +205,11 @@ struct LegCfg {
     // moving that is a separate slice. Under YEARLY that post-process cannot be
     // used (it would carry one strike across every year), so the epoch lives here.
     rollover_strike_mode: StrikeMode,
+    /// This leg's OWN expiry is YEARLY. Only such a leg holds the pinned December
+    /// contract; weekly/monthly legs in the same strategy keep trading their
+    /// cadence contract, which is what makes a mixed basket (CE weekly + PE
+    /// yearly) work. False on every non-yearly path, where it is never read.
+    is_yearly: bool,
 }
 
 /// Per-leg strike carry policy. Both modes are the same mechanism — resolve a
@@ -391,6 +396,11 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
             strike_interval,
             strike,
             straddle_use_joint,
+            is_yearly: leg
+                .get_item("expiry").ok().flatten()
+                .and_then(|v| v.extract::<String>().ok())
+                .map(|e| e.eq_ignore_ascii_case("YEARLY"))
+                .unwrap_or(false),
             rollover_strike_mode: match leg
                 .get_item("rollover_strike_mode").ok().flatten()
                 .and_then(|v| v.extract::<String>().ok())
@@ -1051,6 +1061,7 @@ fn leg_cfg_from_dict(leg: &PyDict) -> Option<LegCfg> {
         // loop, which builds its LegCfgs via extract_leg_cfgs. A bare one-off
         // strike lookup has no epoch to carry from.
         rollover_strike_mode: StrikeMode::Fresh,
+        is_yearly: false,
     })
 }
 
@@ -1202,6 +1213,18 @@ pub(crate) fn resolve_trade_specs_core(
             let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
             for (leg_idx, leg) in cfg.legs.iter().enumerate() {
                 let leg_id = (leg_idx + 1) as i64;
+                // PER-LEG contract. Pinned runs hand the December contract ONLY
+                // to legs whose own expiry is YEARLY; a weekly/monthly leg in the
+                // same basket takes the cadence element instead, so a mixed
+                // strategy (CE weekly + PE yearly) holds two different contracts
+                // while sharing one roll cadence. Unpinned runs are untouched:
+                // `pinned` is false, so this is always `leg_expiry` — including
+                // the min-DTE-advanced value, which `_orig_expiry` would lose.
+                let leg_expiry: &String = if pinned && !leg.is_yearly {
+                    _orig_expiry
+                } else {
+                    leg_expiry
+                };
                 let (strike, requested_strike) = if !pinned {
                     // UNPINNED — literally the pre-change call. Do not route this
                     // through the epoch logic: if `epoch_strike` were ever

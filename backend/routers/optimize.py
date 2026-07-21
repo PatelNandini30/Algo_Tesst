@@ -835,6 +835,45 @@ def _wm_strike_sort(cc: Dict[str, Any]) -> float:
     return 3000.0
 
 
+@router.post("/optimize/jobs/{job_id}/summary.xlsx")
+async def download_optimization_summary(job_id: str, request: Request):
+    """Build the "Optimization Summary" workbook on the BACKEND.
+
+    This replaces the ExcelJS builder that lived in the frontend
+    (optimSummaryExport.js), so every .xlsx the product emits now comes from one
+    place — openpyxl, server-side:
+        tradesheet -> excel_builder.build_combo_xlsx
+        WOW & MOM  -> wow_mom.write_merged_wow_mom
+        this sheet -> summary_workbook.build_summary_workbook
+
+    The caller POSTs {rows, rule_rows}: `rows` are the per-combo results it already
+    holds and `rule_rows` is the Rules block it already derived from the sweep config.
+    Re-deriving those here would mean a SECOND implementation of the sweep-label logic,
+    which is the exact duplication this consolidation removes — so the split is
+    deliberate: the caller supplies the data, this owns the workbook.
+    """
+    from services.optimizer.summary_workbook import build_summary_workbook
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=400, detail="`rows` must be a non-empty list")
+    rule_rows = payload.get("rule_rows") or []
+    try:
+        xlsx = build_summary_workbook(rows, rule_rows)
+    except Exception as exc:
+        logger.exception("[OPTIM] summary workbook build failed for %s", job_id)
+        raise HTTPException(status_code=500, detail=f"summary build failed: {exc}")
+    return StreamingResponse(
+        io.BytesIO(xlsx),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="optimize_summary.xlsx"'},
+    )
+
+
 @router.get("/optimize/jobs/{job_id}/wow_mom.xlsx")
 async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
     """

@@ -4,7 +4,6 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine
 } from 'recharts';
 import { Download, X } from 'lucide-react';
-import { writeWowMomSheet, buildWowMomTitle } from '../utils/wowMomSheet';
 import { buildRulesSheet } from '../utils/backtestRulesSheet';
 
 const EXIT_REASON_COLORS = {
@@ -362,6 +361,17 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         entrySpot:  parseFloat(leg1Row['Entry Spot']) || 0,
         exitSpot:   parseFloat(leg1Row['Exit Spot'])  || 0,
         totalPnl,
+        // The engine's own "% P&L" for the trade. On a MULTI-INDEX run this is the SUM
+        // of the per-leg percentages, each divided by ITS OWN index's spot — which is
+        // why it cannot be re-derived here as totalPnl / entrySpot: totalPnl is the
+        // COMBINED points of both legs while entrySpot is only the options index's, so
+        // the futures leg gets charged against the wrong price level (measured 14.63%
+        // where the tradesheet and Excel say 33.09%). Read it, don't recompute it —
+        // same rule as excel_builder._render_mth_rows and wow_mom.py.
+        pctPnl: (leg1Row['% P&L'] !== '' && leg1Row['% P&L'] != null
+                 && !isNaN(parseFloat(leg1Row['% P&L'])))
+          ? parseFloat(leg1Row['% P&L'])
+          : null,
         cumulative: (rawCumulative !== '' && rawCumulative != null && !isNaN(parseFloat(rawCumulative)))
           ? parseFloat(rawCumulative)
           : null,   // null so connectNulls can bridge it; equityData fallbacks to 100.0
@@ -519,6 +529,10 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
     // Previously this was the compounded final-cumulative NAV (finalCumulative - 100),
     // which differed from the tradesheet for any mix of wins/losses.
     const totalPnLPct = groupedTrades.reduce((sum, g) => {
+      // READ the engine's "% P&L" (see `pctPnl` above). Re-deriving it as
+      // totalPnl / entrySpot understates any multi-index run, because totalPnl spans
+      // both legs while entrySpot is one index's.
+      if (Number.isFinite(g.pctPnl)) return sum + g.pctPnl;
       const net = Number(g.totalPnl);
       return sum + (g.entrySpot > 1000 && Number.isFinite(net) ? (net / g.entrySpot) * 100 : 0);
     }, 0);
@@ -644,7 +658,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       let nav = 100, peak = 100, worstDD = 0, peakMs = null, wPeak = null, wTrough = null;
       for (const g of groupedTrades) {
         const net = Number(g.totalPnl); const es = Number(g.entrySpot);
-        const pct = (es > 1000 && Number.isFinite(net)) ? (net / es) * 100 : NaN;
+        // Same rule as the Total P&L tile — read the engine's % P&L so the equity /
+        // drawdown chain matches the tradesheet on multi-index runs.
+        const pct = Number.isFinite(g.pctPnl)
+          ? g.pctPnl
+          : ((es > 1000 && Number.isFinite(net)) ? (net / es) * 100 : NaN);
         const xD = _pd(g.exitDate);
         if (Number.isFinite(pct)) {
           nav = nav * (1 + pct / 100);
@@ -1301,9 +1319,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                                   const raw = parseFloat(leg['Net P&L']);
                                   return sum + (Number.isFinite(raw) ? raw : 0);
                                 }, 0);
-                            const tradePctPnl = group.entrySpot > 1000
-                              ? (tradeNetPnlPoints / group.entrySpot) * 100
-                              : 0;
+                            // Engine's % P&L when present (see `pctPnl` in groupedTrades) —
+                            // re-deriving understates multi-index trades.
+                            const tradePctPnl = Number.isFinite(group.pctPnl)
+                              ? group.pctPnl
+                              : (group.entrySpot > 1000
+                                  ? (tradeNetPnlPoints / group.entrySpot) * 100
+                                  : 0);
                             const totalChargesInr = chargesEnabled
                               ? rowsToRender.reduce((sum, leg) => sum + (parseFloat(leg['Charges']) || 0), 0)
                               : 0;

@@ -492,10 +492,17 @@ pub fn compute_summary_metrics(
     let opt_cagr = if years > 0.0 && final_cum > 0.0 {
         ((final_cum / 100.0).powf(1.0 / years) - 1.0).mul_add(100.0, 0.0).clamp(-99999.0, 99999.0)
     } else { -100.0 };
-    let spot_cagr = match (init_spot, final_spot) {
+    // SINGLE SOURCE OF TRUTH: the BACKTEST owns cagr_spot (base.py compute_analytics).
+    // Re-deriving it from init_spot/final_spot walks the per-TRADE "main" leg, which on
+    // a MULTI-INDEX strategy (e.g. NIFTY CE sell + MIDCPNIFTY FUT buy) can pair one
+    // index's entry spot with the other index's exit spot — dividing two unrelated price
+    // scales into a meaningless negative "CAGR" (measured: -68.49 vs the backtest's
+    // +5.82). `summary` is the backtest summary this fn is handed, so prefer it and fall
+    // back to the derivation only when the caller supplied none.
+    let spot_cagr = s_f64("cagr_spot").unwrap_or_else(|| match (init_spot, final_spot) {
         (Some(i), Some(f)) if years > 0.0 && i > 0.0 && f > 0.0 => 100.0 * ((f / i).powf(1.0 / years) - 1.0),
         _ => 0.0,
-    };
+    });
 
     // max_dd: overall non-midcap → min(source %DD); midcap → min over Combined
     // Cumulative/Peak; patchwise non-midcap → min over tm (cum/peak-1)*100.
@@ -609,15 +616,31 @@ pub fn compute_summary_metrics(
     let spot_chg_pct = s_f64("spot_change_pct").unwrap_or(py_round(spot_pct_sum * 100.0, 4));
 
     // ── build dict ──
+    // SINGLE SOURCE OF TRUTH: the BACKTEST owns every metric it already computed, so
+    // when `summary` carries a key we emit ITS value rather than our own re-derivation.
+    // This is not cosmetic — the bases genuinely differ. run_sync_weekly_cadence hands
+    // compute_analytics a UNIT-TRANSFORMED frame (Net P&L = per-leg "% P&L", Entry Spot
+    // = 100.0) so the backtest's percentage metrics are the Σ-per-leg-% return, while
+    // re-deriving here reads raw points ÷ ONE index's spot — which on a multi-index run
+    // divides the futures leg's points by the options index's spot. Measured on
+    // sync_weekly_roll: CAGR(Options) backtest 53.7 vs re-derived 3.12.
+    //
+    // Gated on !patchwise && !has_midcap: those two DELIBERATELY recompute on a
+    // different chain (per-patch equity reset / NIFTY+Midcap COMBINED per-trade P&L)
+    // that the plain backtest summary does not describe, so pinning them there would
+    // silently replace a correct patchwise/combined number with an overall NIFTY one.
+    let pin = |k: &str, computed: f64| -> f64 {
+        if patchwise || has_midcap { computed } else { s_f64(k).unwrap_or(computed) }
+    };
     let out = PyDict::new(py);
-    out.set_item("cagr_options", py_round(opt_cagr, 2))?;
+    out.set_item("cagr_options", py_round(pin("cagr_options", opt_cagr), 2))?;
     out.set_item("cagr_spot", py_round(spot_cagr, 2))?;
-    out.set_item("max_dd_pct", max_dd_pct)?;
-    out.set_item("car_mdd", py_round(car_mdd, 4))?;
+    out.set_item("max_dd_pct", pin("max_dd_pct", max_dd_pct))?;
+    out.set_item("car_mdd", py_round(pin("car_mdd", car_mdd), 4))?;
     out.set_item("roi_vs_spot", py_round(roi_pct, 4))?;
-    out.set_item("avg_profit_per_trade_pct", py_round(avg_pct, 4))?;
-    out.set_item("avg_win_pct", py_round(avg_win_pct, 4))?;
-    out.set_item("avg_loss_pct", py_round(avg_loss_pct, 4))?;
+    out.set_item("avg_profit_per_trade_pct", py_round(pin("avg_profit_per_trade_pct", avg_pct), 4))?;
+    out.set_item("avg_win_pct", py_round(pin("avg_win_pct", avg_win_pct), 4))?;
+    out.set_item("avg_loss_pct", py_round(pin("avg_loss_pct", avg_loss_pct), 4))?;
     out.set_item("ce_pnl_total", py_round(ce_sum, 2))?;
     out.set_item("ce_pnl_pct", py_round(ce_pct_sum * 100.0, 4))?;
     out.set_item("pe_pnl_total", py_round(pe_sum, 2))?;

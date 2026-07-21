@@ -1402,7 +1402,21 @@ def _summary_layout(
         max(-99999.0, min(99999.0, (math.pow(final_cum / 100, 1 / years) - 1) * 100))
         if (years > 0 and final_cum > 0) else -100.0
     )
-    spot_cagr = (
+    # (cagr_options is taken from the single engine in the AUTHORITATIVE READ block
+    # below — unconditionally, so patchwise/midcap are covered too.)
+    # SINGLE SOURCE OF TRUTH: the BACKTEST owns cagr_spot (base.py compute_analytics),
+    # mirroring summary_metrics.rs. Re-deriving it here walked the per-LEG rows and on a
+    # multi-index run paired one index's entry spot with the other's exit spot — two
+    # unrelated price scales (measured: -68.49 vs the backtest's +5.82). This layout fn
+    # feeds BOTH renderers (openpyxl _write_summary_sheet and the Rust _summary_ops
+    # writer), so pinning it here is the one place that fixes the sheet. The derivation
+    # survives only as a fallback for callers that pass no summary.
+    # `is None`, NOT `or` — must match summary_metrics.rs's unwrap_or_else, which fires
+    # only when the key is ABSENT. With `or`, a genuine cagr_spot of 0.0 fell through to
+    # the derivation, so Rust reported 0.00 while Python reported the (cross-index)
+    # derived value — a fresh divergence on exactly the sync_weekly_roll path.
+    _S_cagr_spot = _to_num(S.get("cagr_spot"))
+    spot_cagr = _S_cagr_spot if _S_cagr_spot is not None else (
         100 * ((_final_spot / _init_spot) ** (1.0 / years) - 1)
         if (years > 0 and _init_spot and _final_spot and _init_spot > 0 and _final_spot > 0)
         else 0.0
@@ -1459,6 +1473,7 @@ def _summary_layout(
         mdd_dur = 0; mdd_start = ""; mdd_end = ""
 
     car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
+    # (car_mdd is taken from the single engine in the AUTHORITATIVE READ block below.)
 
     opt_sum = (
         (ce_sum + pe_sum)   if (has_calls and has_puts) else
@@ -1519,12 +1534,26 @@ def _summary_layout(
     n_trades  = len(trade_pairs)
     by_pct_desc = sorted(trade_pairs, key=lambda x: -x["pct"])
 
-    _p1  = by_pct_desc[0]["pct"] if n_trades > 0 else 0.0
-    _p2  = _p1 + by_pct_desc[1]["pct"] if n_trades > 1 else _p1
-    _p3  = _p2 + by_pct_desc[2]["pct"] if n_trades > 2 else _p2
-    _n1  = by_pct_desc[n_trades - 1]["pct"] if n_trades > 0 else 0.0
-    _n2  = _n1 + by_pct_desc[n_trades - 2]["pct"] if n_trades > 1 else _n1
-    _n3  = _n2 + by_pct_desc[n_trades - 3]["pct"] if n_trades > 2 else _n2
+    # READ, don't re-derive (see the unification block in build_combo_xlsx). The local
+    # derivation ranks EVERY trade together, while the authoritative engine ranks over
+    # the patch-aware chain — so on a patchwise sheet the two disagreed
+    # (positive_outlier_1 3.5 here vs the engine's 1.7396). Kept as the fallback for
+    # callers that pass no metrics.
+    def _outl(key, computed):
+        v = _to_num(S.get(key))
+        return v if v is not None else computed
+
+    _p1  = _outl("positive_outlier_1", by_pct_desc[0]["pct"] if n_trades > 0 else 0.0)
+    _p2  = _outl("positive_outlier_2",
+                 (_p1 + by_pct_desc[1]["pct"]) if n_trades > 1 else _p1)
+    _p3  = _outl("positive_outlier_3",
+                 (_p2 + by_pct_desc[2]["pct"]) if n_trades > 2 else _p2)
+    _n1  = _outl("negative_outlier_1",
+                 by_pct_desc[n_trades - 1]["pct"] if n_trades > 0 else 0.0)
+    _n2  = _outl("negative_outlier_2",
+                 (_n1 + by_pct_desc[n_trades - 2]["pct"]) if n_trades > 1 else _n1)
+    _n3  = _outl("negative_outlier_3",
+                 (_n2 + by_pct_desc[n_trades - 3]["pct"]) if n_trades > 2 else _n2)
     total_pct_sum = sum(p["pct"] for p in trade_pairs)
     pct_no_o1 = total_pct_sum - _p1 - _n1
     pct_no_o2 = total_pct_sum - _p2 - _n2
@@ -1575,10 +1604,44 @@ def _summary_layout(
     # leg is present, NIFTY otherwise; trade_pairs["mae"] already holds the right one).
     _final_maes = [p["mae"] for p in trade_pairs if p["mae"] is not None]
     avg_final_mae = round(sum(_final_maes) / len(_final_maes), 2) if _final_maes else 0.0
-    ldd_no_o1  = _ldd_exc_stats(1, 1)
-    ldd_no_o2  = _ldd_exc_stats(2, 2)
-    ldd_no_o3  = _ldd_exc_stats(3, 3)
+    # READ, don't re-derive: build_combo_xlsx folded the Rust engine's metrics into `S`,
+    # so these come from the SAME computation the master summary renders. _ldd_exc_stats
+    # survives only as the fallback for callers that hand us no metrics (it is the
+    # implementation that disagreed with both Rust and the Python reference on the
+    # patchwise chain — -1.56 vs the -1.81 those two agree on).
+    def _ldd_pair(n, computed):
+        _mn = _to_num(S.get(f"outlier_dd_{n}"))
+        _av = _to_num(S.get(f"outlier_dd_{n}_avg"))
+        return (_mn, _av) if (_mn is not None and _av is not None) else computed
+
+    ldd_no_o1  = _ldd_pair(1, _ldd_exc_stats(1, 1))
+    ldd_no_o2  = _ldd_pair(2, _ldd_exc_stats(2, 2))
+    ldd_no_o3  = _ldd_pair(3, _ldd_exc_stats(3, 3))
     car_mdd_live = (opt_cagr / 100) / abs(live_dd_min) if live_dd_min != 0 else 0.0
+
+    # ── AUTHORITATIVE READ ────────────────────────────────────────────────────────
+    # Everything above this line is now only a FALLBACK for callers that hand us no
+    # metrics. build_combo_xlsx folded the single engine's output into `S`, and that
+    # output is already mode-correct — Rust's `pin` returns the backtest's value for a
+    # plain run and its own per-patch / Combined value for patchwise / midcap — so we
+    # take it unconditionally. Reading it here (rather than gating on `not patchwise`)
+    # is what removes _summary_layout as an independent implementation: on a patchwise
+    # sheet the local derivations disagreed with the engine on cagr_options (23.27 vs
+    # 7.81), max_dd_pct (-9.42 vs -3.09) and the avg_* family.
+    def _auth(key, computed):
+        v = _to_num(S.get(key))
+        return v if v is not None else computed
+
+    opt_cagr      = _auth("cagr_options", opt_cagr)
+    max_dd_pct    = _auth("max_dd_pct", max_dd_pct)
+    car_mdd       = _auth("car_mdd", car_mdd)
+    car_mdd_live  = _auth("car_mdd_live", car_mdd_live)
+    avg_win_pct   = _auth("avg_win_pct", avg_win_pct)
+    avg_loss_pct  = _auth("avg_loss_pct", avg_loss_pct)
+    avg_pct       = _auth("avg_profit_per_trade_pct", avg_pct)
+    live_dd_min   = _auth("actual_live_dd_max", live_dd_min)
+    live_dd_avg   = _auth("actual_live_dd_avg", live_dd_avg)
+    avg_final_mae = _auth("avg_final_mae", avg_final_mae)
 
     def _fmt_pct(v, signed=True):
         prefix = "+" if (signed and v >= 0) else ""
@@ -1733,6 +1796,13 @@ def _summary_layout(
     by_ym:     Dict[str, List[float]] = {}
     by_ym_pct: Dict[str, List[float]] = {}
     by_yr_max_dd: Dict[str, float] = {}
+    # Per-year RUPEE drawdown, for the ₹ table's R/MDD. by_yr_max_dd holds the %DD
+    # FRACTION, so the ₹ table was computing rupees ÷ fraction — 521.28 / 0.001436 =
+    # 363,008 — a quotient with no dimension. `cleaned` is already in canonical
+    # chronological order, so a running cumsum over it gives the rupee curve directly.
+    by_yr_max_dd_rs: Dict[str, float] = {}
+    _cum_rs = 0.0
+    _peak_rs = 0.0
 
     def _ym(v):
         d = _parse_date(v)
@@ -1748,13 +1818,31 @@ def _summary_layout(
         else:
             net_v = _to_num(t.get("Net P&L"))
             if net_v is None: continue
-            spot_v = _to_num(t.get("Entry Spot")) or 0.0
-            pct_v  = (net_v / spot_v * 100) if spot_v > 0 else 0.0
+            # READ the tradesheet's own "% P&L" — do NOT re-derive it. On the sync
+            # multi-index path a trade's parent row carries the COMBINED Net P&L (both
+            # legs) while its Entry Spot is only the OPTIONS index's, so net_v/spot_v
+            # divided a combined P&L by one index's spot: measured 28.474% on the NIFTY
+            # rows where the tradesheet says 55.182%. "% P&L" is already the correct
+            # per-leg sum. This is the exact field wow_mom.py:583 reads, which is why
+            # the MOM sheet always matched and this table did not. Single-index is
+            # unaffected — there the two are identical by construction.
+            pct_v = _to_num(t.get("% P&L"))
+            if pct_v is None:
+                spot_v = _to_num(t.get("Entry Spot")) or 0.0
+                pct_v  = (net_v / spot_v * 100) if spot_v > 0 else 0.0
         ym = _ym(t.get("Exit Date"))
         if not ym: continue
         yr, mi = ym
         by_ym.setdefault(yr, [0.0]*12)[mi]     += net_v
         by_ym_pct.setdefault(yr, [0.0]*12)[mi] += pct_v
+        # Rupee equity curve -> deepest rupee dip whose trade EXITS in this year,
+        # mirroring how by_yr_max_dd tracks the worst %DD per year.
+        _cum_rs += net_v
+        if _cum_rs > _peak_rs:
+            _peak_rs = _cum_rs
+        _dd_rs = _cum_rs - _peak_rs
+        if yr not in by_yr_max_dd_rs or _dd_rs < by_yr_max_dd_rs[yr]:
+            by_yr_max_dd_rs[yr] = _dd_rs
         dd_v = _to_num(t.get("Combined %DD") if has_midcap else t.get("%DD"))
         if dd_v is not None:
             if yr not in by_yr_max_dd or dd_v < by_yr_max_dd[yr]:
@@ -1765,16 +1853,28 @@ def _summary_layout(
         for yi, (yr, mos) in enumerate(sorted(data_map.items())):
             total = sum(mos)
             max_dd_yr = by_yr_max_dd.get(yr)
+            # R/MDD — numerator and denominator must share units, and the quotient is
+            # clamped to +/-99999 (the ceiling compute_analytics uses for car_mdd) so a
+            # year whose deepest dip is float-noise-small can't blow up to six figures.
+            # A year with NO drawdown has an undefined ratio -> "—", not a blank cell.
+            def _rmdd(num, den):
+                if not den or den == 0:
+                    return "—"
+                if not num:
+                    return "—"
+                return round(max(-99999.0, min(99999.0, num / abs(den))), 2)
+
             if is_pct:
-                # Net P&L % table only: R/MDD must be percent/percent. `total`
-                # here is already a percent sum (data_map=by_ym_pct); by_yr_max_dd
-                # is a fraction (dd/peak), so scale it to percentage-points to
-                # match `total` instead of dividing by the raw fraction.
+                # % table: percent / percent. `total` is already a percent sum
+                # (data_map=by_ym_pct); by_yr_max_dd is a fraction (dd/peak), so scale
+                # it to percentage-points to match instead of dividing by the fraction.
                 max_dd_pct = (max_dd_yr * 100) if max_dd_yr is not None else None
-                r_mdd = (round(total / abs(max_dd_pct), 2)
-                         if (max_dd_pct and max_dd_pct != 0 and total != 0) else "")
+                r_mdd = _rmdd(total, max_dd_pct)
             else:
-                r_mdd = (total / abs(max_dd_yr)) if (max_dd_yr and max_dd_yr != 0 and total != 0) else ""
+                # ₹ table: rupees / RUPEES. It used to divide `total` (rupees) by
+                # by_yr_max_dd (a %DD fraction) — 521.28 / 0.001436 = 363,008.36, with
+                # that same fraction rendered as "-0.14%" in the column beside it.
+                r_mdd = _rmdd(total, by_yr_max_dd_rs.get(yr))
             row_data = [yr, *[round(v, 2) for v in mos], round(total, 2),
                         max_dd_yr if max_dd_yr is not None else "", r_mdd]
             sink.row_height(r, 18)
@@ -2133,7 +2233,15 @@ def compute_xlsx_summary_metrics(
         if (years > 0 and final_cum > 0) else -100.0
     )
     # cagr_spot from spot LEVELS (leg-independent) — base.py:1075.
-    spot_cagr = (
+    # Mirrors summary_metrics.rs: the BACKTEST owns cagr_spot. This Python engine is a
+    # PARITY REFERENCE for the Rust one, so it must pin the same value — otherwise
+    # tools/summary_metrics_parity would report a false PASS on multi-index payloads.
+    # `is None`, NOT `or` — must match summary_metrics.rs's unwrap_or_else, which fires
+    # only when the key is ABSENT. With `or`, a genuine cagr_spot of 0.0 fell through to
+    # the derivation, so Rust reported 0.00 while Python reported the (cross-index)
+    # derived value — a fresh divergence on exactly the sync_weekly_roll path.
+    _S_cagr_spot = _to_num(S.get("cagr_spot"))
+    spot_cagr = _S_cagr_spot if _S_cagr_spot is not None else (
         100 * ((_final_spot / _init_spot) ** (1.0 / years) - 1)
         if (years > 0 and _init_spot and _final_spot and _init_spot > 0 and _final_spot > 0)
         else 0.0
@@ -2526,6 +2634,34 @@ def build_combo_xlsx(
     tm, _grouped, _sorted_keys = _aggregate_trades(rows, has_midcap, midcap_by_trade,
                                                    patchwise=patchwise, filter_segments=filter_segments)
     cleaned = _build_cleaned_rows(rows, key_order, tm, has_midcap, midcap_by_trade)
+
+    # ── SINGLE SOURCE OF TRUTH ────────────────────────────────────────────────────
+    # Compute the summary metrics ONCE — in Rust (compute_xlsx_summary_metrics
+    # delegates to algotest_native.compute_summary_metrics) — and fold them into the
+    # `summary` dict that BOTH sheet builders already receive. _summary_layout then
+    # READS these numbers instead of re-deriving them, so the per-combo Summary sheet
+    # cannot drift from the master summary or from the backtest.
+    #
+    # Metrics WIN the merge, in every mode:
+    #   * plain (non-patchwise, non-midcap) — the Rust engine already pins each value
+    #     to the backtest's own (`pin` in summary_metrics.rs), so taking it IS taking
+    #     the backtest's number;
+    #   * patchwise / midcap — it holds the per-patch-reset / NIFTY+Midcap COMBINED
+    #     value, which the plain backtest summary does not describe at all.
+    # This also retires a THIRD implementation: _summary_layout's own patchwise
+    # outlier-stripped Live DD disagreed with BOTH Rust and the Python reference engine
+    # (outlier_dd_1 -1.56 vs the -1.81 those two agree on — gated by
+    # tools/summary_metrics_parity at 39 keys / 0 diverging). Two independent
+    # implementations against one; the merge removes the outlier.
+    try:
+        summary = {**(summary or {}), **compute_xlsx_summary_metrics(
+            trades_df, summary,
+            midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_spot_adjustment,
+            midcap_symbol=midcap_symbol, patchwise=patchwise,
+            filter_segments=filter_segments,
+        )}
+    except Exception as exc:
+        logger.warning("[XLSX] summary metric unification skipped: %s", exc)
 
     # Optional Rust workbook path (default off; opt-in via OPTIMIZE_RUST_XLSX=1). Builds
     # the SAME four sheets in one Rust call — Trade Sheet in Rust from `cleaned`;

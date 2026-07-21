@@ -718,7 +718,13 @@ def delete_job_trades(job_id: str) -> None:
 # on read so they can't wedge the divisor high forever.
 _ACTIVE_KEY = "algotest:optim:active"       # legacy global key (kept for cleanup)
 _ACTIVE_KEY_PREFIX = "algotest:optim:active:"  # PER-NODE: :{node_id|local}
-_ACTIVE_STALE_SEC = 3 * 60 * 60  # 3h — longer than any real optim compute phase
+_ACTIVE_STALE_SEC = 5 * 60  # 5min — safe because runner.py refreshes (touch_active_optim)
+# every ~60s while a job is genuinely alive, regardless of how long the whole
+# sweep takes; a job only goes stale here if its process actually died (crash,
+# SIGKILL, container restart) and stopped refreshing. Previously 3h with NO
+# heartbeat refresh at all, so a single crashed/killed job could throttle every
+# other concurrent optim on this node to a fraction of its normal parallelism
+# for up to 3 hours.
 
 
 def _active_key(node_id: Optional[str]) -> str:
@@ -754,6 +760,22 @@ def register_active_optim(job_id: str, node_id: Optional[str] = None) -> int:
     except Exception as exc:
         logger.warning("[OPTIM_STORE] register_active_optim failed: %s", exc)
         return 1
+
+
+def touch_active_optim(job_id: str, node_id: Optional[str] = None) -> None:
+    """Refresh this job's last-seen timestamp in the live-optim registry, without
+    the prune-scan/count overhead of register_active_optim. Call periodically
+    (e.g. every ~60s from a heartbeat thread) while a job is genuinely still
+    computing, so _ACTIVE_STALE_SEC can be kept short — a job that misses its
+    heartbeats (crashed, killed, container restarted) goes stale quickly instead
+    of throttling other jobs' parallelism for hours."""
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.hset(_active_key(node_id), job_id, time.time())
+    except Exception as exc:
+        logger.debug("[OPTIM_STORE] touch_active_optim failed: %s", exc)
 
 
 def unregister_active_optim(job_id: str, node_id: Optional[str] = None) -> None:

@@ -111,12 +111,12 @@ const WEEKLY_OPTION_EXPIRIES = [
   { value: 'next_monthly', label: 'Next Monthly' },
 ];
 
-// Per-leg expiry choices when the strategy basis is YEARLY. The leg holds the
-// long-dated December contract; the roll cadence is a separate, strategy-level
-// control (rolloverCadence) — it is NOT the leg's expiry.
-const YEARLY_OPTION_EXPIRIES = [
-  { value: 'yearly', label: 'Yearly (December)' },
-];
+// The Yearly choice ADDED to a leg's normal list when the strategy basis is
+// YEARLY. It is additive, not exclusive: each leg picks its own contract, so a
+// basket can mix (e.g. CE SELL weekly + PE BUY yearly). The engine pins the
+// December contract only to legs set to Yearly; the rest trade their cadence
+// contract. The roll cadence stays a strategy-level control (rolloverCadence).
+const YEARLY_LEG_EXPIRY = { value: 'yearly', label: 'Yearly (December)' };
 
 const MONTHLY_OPTION_EXPIRIES = [
   { value: 'monthly', label: 'Monthly' },
@@ -131,9 +131,12 @@ const getIndexConfig = (symbol) => INDEX_CONFIG[String(symbol || 'NIFTY').toUppe
 // unchanged. Under a YEARLY basis the only contract a leg can hold is the
 // December one, so the per-leg dropdown collapses to a single choice.
 const getOptionExpiryOptions = (symbol, basis) => {
-  if (String(basis || '').toLowerCase() === 'yearly') return YEARLY_OPTION_EXPIRIES;
   const config = getIndexConfig(symbol);
-  return config.expiryBases.includes('weekly') ? WEEKLY_OPTION_EXPIRIES : MONTHLY_OPTION_EXPIRIES;
+  const base = config.expiryBases.includes('weekly') ? WEEKLY_OPTION_EXPIRIES : MONTHLY_OPTION_EXPIRIES;
+  // Under a YEARLY basis, Yearly is APPENDED to the normal list rather than
+  // replacing it, so each leg chooses independently. Replacing the list forced
+  // every leg to Yearly, which made a mixed basket impossible.
+  return String(basis || '').toLowerCase() === 'yearly' ? [...base, YEARLY_LEG_EXPIRY] : base;
 };
 
 const normalizeReEntryMode = (mode) => {
@@ -842,6 +845,17 @@ const StrategyBuilder = () => {
     () => legs.some(l => l.segment === 'midcap100'),
     [legs]
   );
+  // A MIDCPNIFTY leg of ANY segment (options or futures) — unlike Midcap100, which
+  // is an untradeable overlay, MIDCPNIFTY is a real index the strategy holds. Its
+  // presence is what reveals the MIDCPNIFTY spot-adjustment block.
+  const hasMidcpniftyLeg = useMemo(
+    () => legs.some(l => l.segment !== 'midcap100'
+                    && String(l.index || instrument).toUpperCase() === 'MIDCPNIFTY'),
+    [legs, instrument]
+  );
+  // Any second-index adjustment block on screen -> the first block needs its
+  // "· NIFTY" qualifier so the two aren't ambiguous.
+  const hasSecondIndexSpotAdj = hasMidcapLeg || hasMidcpniftyLeg;
   const indexConfig = useMemo(() => getIndexConfig(instrument), [instrument]);
   const expiryBasisOptions = useMemo(
     () => indexConfig.expiryBases.map(value => ({
@@ -899,6 +913,13 @@ const StrategyBuilder = () => {
   const [midcapSpotAdjDirection, setMidcapSpotAdjDirection] = useState('rise');
   const [midcapSpotAdjValue, setMidcapSpotAdjValue] = useState(1.0);
   const [midcapSpotAdjUnits, setMidcapSpotAdjUnits] = useState('percent');
+  // Per-index spot adjustment for a MIDCPNIFTY leg. Unlike the Midcap100 block
+  // above (an overlay), this index is genuinely traded, so its breach truncates
+  // the whole trade and re-enters same-day exactly like the NIFTY one.
+  const [midcpSpotAdjEnabled, setMidcpSpotAdjEnabled] = useState(false);
+  const [midcpSpotAdjDirection, setMidcpSpotAdjDirection] = useState('rise');
+  const [midcpSpotAdjValue, setMidcpSpotAdjValue] = useState(1.0);
+  const [midcpSpotAdjUnits, setMidcpSpotAdjUnits] = useState('percent');
   // Combine mode for when BOTH NIFTY and Midcap spot adjustment are on:
   // 'earliest' (default) = whichever breaches first; 'confirm' = both must breach
   // the SAME direction within N trading days of each other.
@@ -1748,7 +1769,7 @@ const StrategyBuilder = () => {
       premium_max: 0,
       pct_atm_moneyness: 'OTM',
       pct_value: 0,
-      expiry: normalizeExpiryForIndex(prev.expiry, instrument, prev.segment),
+      expiry: normalizeExpiryForIndex(prev.expiry, instrument, prev.segment, expiryBasis),
       atm_straddle_prem_pct: 0,
       straddle_multiplier: 0.5,
       straddle_direction: '+',
@@ -1772,7 +1793,7 @@ const StrategyBuilder = () => {
     if (l.id !== id) return l;
     const next = { ...l, [field]: value };
     if (field === 'segment' || field === 'expiry') {
-      next.expiry = normalizeExpiryForIndex(next.expiry, instrument, next.segment);
+      next.expiry = normalizeExpiryForIndex(next.expiry, instrument, next.segment, expiryBasis);
     }
     // Relative-to-Leg (Iron Condor wing): when a leg becomes rel_leg or its
     // parent changes, auto-configure it as the protective wing of that parent —
@@ -1796,7 +1817,7 @@ const StrategyBuilder = () => {
       if (!prev[id]) return prev;
       const nextLeg = { ...prev[id], [field]: value };
       if (field === 'expiry' || field === 'segment') {
-        nextLeg.expiry = normalizeExpiryForIndex(nextLeg.expiry, instrument, nextLeg.segment);
+        nextLeg.expiry = normalizeExpiryForIndex(nextLeg.expiry, instrument, nextLeg.segment, expiryBasis);
       }
       return { ...prev, [id]: nextLeg };
     });
@@ -1959,7 +1980,7 @@ const StrategyBuilder = () => {
       position: (ll.position || 'sell').toUpperCase(),
       lots: ll.lot || 1,
       option_type: optType === 'call' ? 'CE' : 'PE',
-      expiry: normalizeExpiryForIndex(ll.expiry || defaultOptionExpiry, instrument, 'options').toUpperCase(),
+      expiry: normalizeExpiryForIndex(ll.expiry || defaultOptionExpiry, instrument, 'options', expiryBasis).toUpperCase(),
       strike_interval: normalizeStrikeInterval(ll.strike_interval),
       strike_selection: {
         type: strikeType,
@@ -2278,6 +2299,17 @@ const StrategyBuilder = () => {
             direction: midcapSpotAdjDirection,
             pct: clampSpotAdjustmentValue(midcapSpotAdjValue, midcapSpotAdjUnits),
             units: midcapSpotAdjUnits,
+          }
+        : null,
+      // MIDCPNIFTY per-index spot adjustment. Engine reads this only when a
+      // MIDCPNIFTY leg is present; absent/null keeps the existing paths intact.
+      midcpnifty_spot_adjustment: (hasMidcpniftyLeg && midcpSpotAdjEnabled)
+        ? {
+            enabled: true,
+            symbol: 'MIDCPNIFTY',
+            direction: midcpSpotAdjDirection,
+            pct: clampSpotAdjustmentValue(midcpSpotAdjValue, midcpSpotAdjUnits),
+            units: midcpSpotAdjUnits,
           }
         : null,
       // Combine mode (only honored by the engine when BOTH NIFTY & Midcap spot
@@ -2955,7 +2987,7 @@ const StrategyBuilder = () => {
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                       <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
-                        Spot Adjustment{hasMidcapLeg ? ' · NIFTY' : ''}
+                        Spot Adjustment{hasSecondIndexSpotAdj ? ' · NIFTY' : ''}
                       </span>
                       <Tooltip text="Exit the trade on the day the closing spot price crosses your set percentage from the entry spot. Rise exits when spot closes above target, Fall exits when spot closes below target, Both exits on either breach. With a Midcap100 leg present, this applies to NIFTY; use the Midcap100 toggle below for that leg — if both are set, whichever breaches first exits." />
                     </div>
@@ -3170,6 +3202,92 @@ const StrategyBuilder = () => {
                               <p className="text-[11px] text-muted">0 = both must breach the same day.</p>
                             </div>
                           )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Per-index: MIDCPNIFTY spot adjustment. Shown whenever the
+                      strategy holds a MIDCPNIFTY leg (options OR futures). */}
+                  {hasMidcpniftyLeg && (
+                    <div className="pt-3 mt-1 border-t border-subtle space-y-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-semibold uppercase tracking-wide text-secondary">
+                          MIDCPNIFTY
+                        </span>
+                        <Toggle
+                          enabled={midcpSpotAdjEnabled}
+                          onToggle={(val) => setMidcpSpotAdjEnabled(prev => val !== undefined ? Boolean(val) : !prev)}
+                          size="sm"
+                        />
+                      </div>
+                      {midcpSpotAdjEnabled && (
+                        <div className="space-y-4 pt-1">
+                          <div className="space-y-1">
+                            <p className="text-xs font-semibold text-muted uppercase tracking-wide">Direction</p>
+                            <div className="flex gap-2">
+                              {[
+                                { value: 'rise', label: '↑ Rise' },
+                                { value: 'fall', label: '↓ Fall' },
+                                { value: 'both', label: '↕ Both' },
+                              ].map(opt => (
+                                <button
+                                  key={opt.value}
+                                  type="button"
+                                  onClick={() => setMidcpSpotAdjDirection(opt.value)}
+                                  className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                    midcpSpotAdjDirection === opt.value
+                                      ? 'bg-accent text-white border-accent'
+                                      : 'border-default text-secondary hover:bg-hover'
+                                  }`}
+                                >
+                                  {opt.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-xs font-semibold text-muted uppercase tracking-wide">Threshold</p>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                min={0.25}
+                                max={midcpSpotAdjUnits === 'percent' ? 5 : 10000}
+                                step={midcpSpotAdjUnits === 'percent' ? 0.25 : 50}
+                                value={midcpSpotAdjValue}
+                                onChange={e => {
+                                  const v = e.target.value;
+                                  if (v === '') { setMidcpSpotAdjValue(''); return; }
+                                  const n = Number(v);
+                                  setMidcpSpotAdjValue(Number.isNaN(n) ? '' : n);
+                                }}
+                                onBlur={() => setMidcpSpotAdjValue(prev => clampSpotAdjustmentValue(prev, midcpSpotAdjUnits))}
+                                className="w-24 border border-default rounded-lg px-3 py-1.5 text-sm"
+                              />
+                              <div className="flex gap-1">
+                                {['percent', 'points'].map(u => (
+                                  <button
+                                    key={u}
+                                    type="button"
+                                    onClick={() => {
+                                      setMidcpSpotAdjUnits(u);
+                                      setMidcpSpotAdjValue(u === 'percent' ? 1.0 : 200);
+                                    }}
+                                    className={`px-3 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                                      midcpSpotAdjUnits === u
+                                        ? 'bg-accent text-white border-accent'
+                                        : 'border-default text-secondary hover:bg-hover'
+                                    }`}
+                                  >
+                                    {u === 'percent' ? '% Pct' : 'Pts'}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                            <p className="text-[11px] text-muted">
+                              MIDCPNIFTY spot data starts 01-Jan-2020 — earlier ranges are rejected.
+                            </p>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -3562,7 +3680,7 @@ const StrategyBuilder = () => {
                       onChange={v => setDraftLeg(prev => ({
                         ...prev,
                         segment: v,
-                        expiry: normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, draftLeg.index || instrument, v),
+                        expiry: normalizeExpiryForIndex(v === 'futures' ? 'monthly' : prev.expiry, draftLeg.index || instrument, v, expiryBasis),
                       }))}
                     />
                   </div>

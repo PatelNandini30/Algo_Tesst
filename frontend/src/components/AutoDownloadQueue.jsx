@@ -94,7 +94,7 @@ async function autoDownloadJob(job, patchwise, onLabel) {
     }
   }
   const rows = await fetchAllRows(jobId, job.totalCombos);
-  const wb = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo);
+  const wb = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId);
   const summaryFile = rulesFilename(ruleConfig, jobId, suffix);
   triggerBlobDownload(wb, summaryFile);
   files.push(summaryFile);

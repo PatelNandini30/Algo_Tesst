@@ -692,6 +692,134 @@ def _build_sync_cycles(all_legs: List[dict], cadence: str, cadence_index: str,
     cycles: List[Dict[str, str]] = []
     bounds: List[str] = []
     prev_end: Optional[str] = None
+
+    # ── Stateful walk (replaces the raw union of calendars) ──────────────────────
+    # The earliest T-n roll across the legs ends the cycle and BOTH legs exit. What
+    # they re-enter depends on WHICH leg triggered:
+    #   * MONTHLY leg triggered -> every leg advances. Otherwise the weekly leg would
+    #     re-enter a contract that dies inside the new cycle, forcing an immediate
+    #     second exit: the 25-Jul-2023 case, where MIDCPNIFTY's future rolled on 25-Jul
+    #     but the CE stayed on the 27-Jul weekly, producing a 1-day trade and a wash
+    #     round-trip that entered and exited the SAME 28-Aug future a day apart.
+    #   * WEEKLY leg triggered -> only it advances; the monthly holds its live contract
+    #     to its own T-n. (Anything else would roll the future weekly — the tradesheet
+    #     shows one future held across four weekly cycles with the prices chained.)
+    # The union approach could not express this: it emitted a cycle per raw expiry, so
+    # a monthly roll landing mid-week always chopped that week in two.
+    #
+    # Only the BOUNDARIES change here. Each cycle's contract is still chosen by
+    # _holdable_contract at the cycle END, so merging 25-Jul..26-Jul into 25-Jul..02-Aug
+    # makes the 27-Jul weekly unholdable and the CE lands on 03-Aug by itself.
+    _is_monthly = lambda t: not str(t[1] or "").upper().startswith("WEEK")
+    _pos = {t: 0 for t in tracks}
+    for t in tracks:                      # seat each track on its first live contract
+        s = track_series.get(t) or []
+        while _pos[t] < len(s):
+            r = _nth_trading_day_before(s[_pos[t]], exit_dte, tdays)
+            if r is not None and r > from_iso:
+                break
+            _pos[t] += 1
+
+    _walk_bounds: List[str] = []
+    for _ in range(4000):                 # bounded; real runs need a few hundred
+        rolls = {}
+        for t in tracks:
+            s = track_series.get(t) or []
+            if _pos[t] >= len(s):
+                rolls = {}
+                break
+            r = _nth_trading_day_before(s[_pos[t]], exit_dte, tdays)
+            if r is None:
+                rolls = {}
+                break
+            rolls[t] = r
+        if not rolls:
+            break
+        _end = min(rolls.values())
+        if _end > to_iso:
+            break
+        _trig = [t for t in tracks if rolls[t] == _end]
+        # the cadence boundary is the expiry of whichever contract just rolled
+        _walk_bounds.append((track_series[_trig[0]])[_pos[_trig[0]]])
+        _monthly_fired = any(_is_monthly(t) for t in _trig)
+        # PAIR-TRADE ALIGNMENT. The legs hedge each other, so leaving one on a
+        # September future while the other moves to an October weekly breaks the
+        # offset the strategy depends on. When the WEEKLY triggers and a monthly
+        # leg's contract is nearly dead anyway, retire it early so both legs move
+        # together (25-Sep-2024: the MIDCPNIFTY 30-Sep future had 2 days left while
+        # the CE went to the 03-Oct weekly).
+        # Bounded at 3 days ON PURPOSE — an unconditional same-month rule was tried
+        # and reverted on 2026-07-18 because it pushed legs off contracts that were
+        # still healthy (see the note in the union path below). Measured over
+        # 2023-06..2026-06 there are 7 different-month boundaries: six have 1-3 days
+        # left (align, cost is trivial) and one has 35 (2025-04-23 — aligning there
+        # would make the weekly leg hold a month-dated option, changing what the
+        # strategy trades). The data has no case between 3 and 35, so the threshold
+        # separates two genuinely different situations rather than tuning a knob.
+        # LIQUIDITY GUARD on the early roll. Retiring the monthly a day or two early
+        # is only safe if the contract we move INTO is actually traded — otherwise we
+        # swap a live, liquid future for one with no market. Measured over
+        # 2023-06..2026-06 the rule fires 17 times; the incoming contract's volume as
+        # a share of the outgoing one's runs 2%, 5%, 12% | 20%, 24%, 24%, 31%, 31%,
+        # 38%, 50%, 56%, 60%, 67%, 80%, 84%, 86%, 99%. Three are dead — worst is
+        # 20-Sep-2023, where the 30-Oct future had 212 lots against September's 4,059
+        # and did not clear 1,600 until September expired. Unlike the 3-day cut (a
+        # clean 3-vs-35 split) this is a continuum, so 15% is a judgement call placed
+        # in the widest low-end gap (11.7% -> 20.2%) rather than an obvious boundary.
+        # RELATIVE, not absolute: MIDCPNIFTY near-month volume went ~4k (2023) to ~21k
+        # (2024), so a fixed lot count would drift with the liquidity regime.
+        # PAIR-TRADE ALIGNMENT, same-month test. The legs hedge each other, so they
+        # should sit on the same month wherever the calendar allows it. When the WEEKLY
+        # triggers, retire the monthly early ONLY IF its next contract lands in the same
+        # month the weekly is moving to — that is the only case where moving early
+        # actually buys alignment:
+        #   25-Sep-2024  CE -> 03-Oct (Oct), FUT -> 28-Oct (Oct)  SAME  -> roll early
+        #   20-Sep-2023  CE -> 28-Sep (Sep), FUT -> 30-Oct (Oct)  DIFF  -> hold, let the
+        #                FUT's own 22-Sep roll end the cycle on the liquid Sept contract
+        #   23-Oct-2024  CE -> 31-Oct (Oct), FUT -> 25-Nov (Nov)  DIFF  -> hold, cycle
+        #                ends 25-Oct with both legs still on October
+        # This REPLACES an earlier days-remaining threshold (N<=3): the day count was a
+        # proxy for "is the roll cheap", but the thing that matters is whether it makes
+        # the pair match. The same-month test excludes the cases the threshold got wrong
+        # without needing to tune a number.
+        # NOTE it cannot fix every mismatch, and must not try: once a month's future has
+        # expired (Oct-2024 died 28-Oct, Apr-2025 died 24-Apr) its weeklies run on with
+        # no same-month future left to hold. Forcing alignment there means the weekly
+        # abandoning the month's MOST liquid contract (30-Apr-2025 traded 5.86M lots vs
+        # 362k on 08-May) — that is the floor reverted on 2026-07-18; see the note in the
+        # union path below. Those tails stay cross-month by design.
+        #
+        # There is deliberately NO liquidity condition on the early roll. An earlier
+        # version required the incoming contract to trade >=15% of the outgoing one's
+        # volume; across 2023-04..2026-06 that fired exactly once (24-May-2023, entering
+        # 27-Jun-2023 at 0 lots vs 8) and its only effect was to break the pair on that
+        # date. MIDCPNIFTY futures are thin enough in 2023 that the FRONT month traded 8
+        # lots, so a volume ratio there compares noise with noise while the strategy is
+        # already holding those contracts. Pairing is structural; liquidity is a separate
+        # concern and must not silently override it.
+        _weekly_fired = any(not _is_monthly(t) for t in _trig)
+        _wk_month = None
+        for _wt in _trig:
+            if not _is_monthly(_wt):
+                _ws = track_series.get(_wt) or []
+                if _pos[_wt] + 1 < len(_ws):
+                    _wk_month = _ws[_pos[_wt] + 1][:7]
+                break
+        for t in tracks:
+            _adv = t in _trig or (_monthly_fired and not _is_monthly(t))
+            if (not _adv) and _weekly_fired and _is_monthly(t) and _wk_month:
+                _ser = track_series.get(t) or []
+                _nxt = _ser[_pos[t] + 1] if _pos[t] + 1 < len(_ser) else None
+                if _nxt is not None and _nxt[:7] == _wk_month:
+                    _adv = True
+                    logger.info("[SYNC_CADENCE] early roll at %s: %s -> %s to pair with "
+                                "the weekly's %s contract",
+                                _end, _ser[_pos[t]], _nxt, _wk_month)
+            if _adv:
+                _pos[t] += 1
+    if _walk_bounds:
+        raw_bounds = _walk_bounds
+
     for b in raw_bounds:
         end = _nth_trading_day_before(b, exit_dte, tdays)
         if not end:
@@ -919,7 +1047,8 @@ def _reload_bulk_if_needed(symbol: str, from_date: str, to_date: str) -> None:
 
 
 def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from, effective_to,
-                            exit_dte: int = 0):
+                            exit_dte: int = 0,
+                            sched_end_by_entry: Optional[List[Tuple[str, str]]] = None):
     """Case A: for EACH base trade [entry,exit], price each overlay leg (other
     index) over that SAME window and return them as extra Leg rows sharing the
     trade's id/dates. Futures priced in Rust (get_future_price); options via the
@@ -1053,6 +1182,32 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
             continue
         entry_iso = entry_dt.strftime("%Y-%m-%d")
         exit_iso = exit_dt.strftime("%Y-%m-%d")
+        # LOOKAHEAD FIX. Pick the contract against the cycle's SCHEDULED end, not
+        # the actual exit. When spot-adj (or an SL) truncates a trade mid-cycle the
+        # actual exit moves EARLIER, which can leave a contract that was about to
+        # roll still "holdable" — so the overlay leg sat in a different month from
+        # the base leg (25-Oct-2023: CE 02-Nov vs FUT 30-Oct; 24-Jul-2024: CE 01-Aug
+        # vs FUT 29-Jul). It is also lookahead: at ENTRY you cannot know the trade
+        # will be cut short, so you could only have bought the contract that covers
+        # the scheduled window. Pricing still uses the ACTUAL entry/exit dates —
+        # only holdability moves.
+        # Resolve by CONTAINMENT, not by exact cycle-start match: a same-day
+        # spot-adj re-entry starts mid-cycle, and it needs the same scheduled end
+        # as the trade it continues.
+        # HALF-OPEN [start, end): consecutive cycles SHARE a boundary date (one
+        # cycle's end is the next one's start), so a closed test matches the
+        # PREVIOUS cycle on that date and hands back an end that is the entry
+        # itself — which defeats the whole fix. The trade that opens on a
+        # boundary belongs to the cycle STARTING there.
+        sel_iso = exit_iso
+        for _cs, _ce in (sched_end_by_entry or ()):
+            if _cs <= entry_iso < _ce:
+                sel_iso = _ce
+                break
+            if _cs > entry_iso:
+                break                   # sorted; past this entry
+        if sel_iso < exit_iso:
+            sel_iso = exit_iso          # never select on a window shorter than real
         max_leg = int(grp["Leg"].max()) if "Leg" in grp.columns else 1
         leg_off = 0
         # No same-month floor (removed 2026-07-18 — see _build_sync_cycles). Each
@@ -1115,7 +1270,7 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                 _shift_reason = ""        # set when the strike walk moved the strike
                 if is_fut:
                     # monthly futures contract alive on BOTH the entry and exit day
-                    contract = _pick_monthly(fut_exps, exit_iso, lambda e: rf.get_future_price(sym, entry_iso, e) is not None and rf.get_future_price(sym, exit_iso, e) is not None, floor_month=_floor_month)
+                    contract = _pick_monthly(fut_exps, sel_iso, lambda e: rf.get_future_price(sym, entry_iso, e) is not None and rf.get_future_price(sym, exit_iso, e) is not None, floor_month=_floor_month)
                     if contract is None:
                         continue
                     ep = rf.get_future_price(sym, entry_iso, contract)
@@ -1157,25 +1312,79 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                         continue
                     opt = str(leg.get("option_type") or "CE").upper()
                     opt = "CE" if opt in ("CALL", "CE") else "PE"
-                    try:
-                        strike = _compute_strike_for_leg_python(leg, float(espot), interval) if _compute_strike_for_leg_python else round(float(espot) / interval) * interval
-                    except Exception:
-                        strike = round(float(espot) / interval) * interval
-                    if strike is None:
-                        continue
-                    # Option contract priced on BOTH days. Expiry basis follows the
-                    # leg: WEEKLY -> nearest weekly (where they exist, e.g. 2024),
-                    # else the near MONTHLY. Strike-shift to the nearest traded
-                    # strike (ATM, then +/-1,2,3 intervals) so a thin/missing
-                    # exact-ATM strike doesn't drop the leg.
+                    # Expiry basis follows the leg: WEEKLY -> nearest weekly (where
+                    # they exist, e.g. 2024), else the near MONTHLY.
                     leg_exp = str(leg.get("expiry") or leg.get("expiry_type") or "MONTHLY").upper()
                     _pick = _pick_weekly if leg_exp.startswith("WEEK") else _pick_monthly
+
+                    # PREMIUM-BASED STRIKE MODES on an overlay (non-base) leg.
+                    # _compute_strike_for_leg_python resolves straddle_width /
+                    # closest_premium / premium_gte|lte|range / atm_straddle_prem_pct only
+                    # when it is ALSO given entry_date + expiry + index (it must read the
+                    # real option chain to price them). This call site passed none of the
+                    # three, so every premium mode returned None and the very next
+                    # `if strike is None: continue` dropped the leg — silently, every
+                    # cycle. A MIDCPNIFTY "Straddle Width" leg therefore produced zero
+                    # rows while the NIFTY base leg (which runs through engine_rust) was
+                    # fine. Only ATM/ITM/OTM/pct_of_atm ever worked here.
+                    #
+                    # Chicken-and-egg: the premium lookup needs an expiry, but the expiry
+                    # is normally chosen AFTER the strike. Resolve it in two phases —
+                    # probe an ATM strike purely to establish which contract is live and
+                    # has data, then compute the real strike against that contract.
+                    _sel = leg.get("strike_selection") or {}
+                    _sel_type = str((_sel or {}).get("type") or "strike_type").lower().strip()
+                    _needs_chain = _sel_type in (
+                        "straddle_width", "atm_straddle_prem_pct",
+                        "closest_premium", "premium_gte", "premium_lte", "premium_range",
+                    )
+                    _probe_expiry = None
+                    if _needs_chain:
+                        _atm_probe = round(float(espot) / interval) * interval
+                        # Widen the probe outward: a thin exact-ATM strike must not stop
+                        # us identifying the contract the leg would trade.
+                        for _pd in (0, 1, -1, 2, -2, 3, -3):
+                            _ps = _atm_probe + _pd * interval
+                            _probe_expiry = _pick(
+                                opt_exps, sel_iso,
+                                lambda e, _s=_ps: _premium(entry_iso, _s, opt, e) is not None,
+                                floor_month=_floor_month,
+                            )
+                            if _probe_expiry is not None:
+                                break
+                    try:
+                        if _compute_strike_for_leg_python is None:
+                            strike = round(float(espot) / interval) * interval
+                        elif _needs_chain and _probe_expiry is not None:
+                            strike = _compute_strike_for_leg_python(
+                                leg, float(espot), interval,
+                                entry_date=entry_iso, expiry=_probe_expiry, index=sym,
+                            )
+                        else:
+                            strike = _compute_strike_for_leg_python(leg, float(espot), interval)
+                    except Exception as _sx:
+                        logger.debug("[MULTI_INDEX] %s strike resolve failed (%s): %s",
+                                     sym, _sel_type, _sx)
+                        strike = None
+                    if strike is None:
+                        # Do NOT fall back to plain ATM here: a premium mode that could
+                        # not be resolved is a DIFFERENT strike from ATM, and silently
+                        # substituting one would misreport the strategy. Skip loudly.
+                        if _needs_chain:
+                            logger.warning(
+                                "[MULTI_INDEX] %s leg dropped on %s: strike mode '%s' "
+                                "could not be resolved (probe expiry=%s)",
+                                sym, entry_iso, _sel_type, _probe_expiry,
+                            )
+                        continue
+                    # Strike-shift to the nearest traded strike (requested, then
+                    # +/-1,2,3 intervals) so a thin/missing strike doesn't drop the leg.
                     base_strike = strike
                     contract = ep = xp = None
                     for _ds in (0, 1, -1, 2, -2, 3, -3):
                         cs = base_strike + _ds * interval
                         c = _pick(
-                            opt_exps, exit_iso,
+                            opt_exps, sel_iso,
                             lambda e, _s=cs: _premium(entry_iso, _s, opt, e) is not None and _premium(exit_iso, _s, opt, e) is not None,
                             floor_month=_floor_month,
                         )
@@ -1458,6 +1667,33 @@ def run_multi_index_feature(
     except Exception as exc:
         logger.warning("[MULTI_INDEX] compute_analytics failed: %s", exc)
         summary = {}
+
+    # cagr_spot must be measured on the OPTIONS leg's index. On THIS path the rows are
+    # not legs of one trade — each index contributes its OWN trades, concatenated (e.g.
+    # 37 NIFTY CE trades + 36 MIDCPNIFTY FUT trades) — so compute_analytics's
+    # first-Entry-Spot/last-Exit-Spot lands on NIFTY's entry and MIDCPNIFTY's exit and
+    # divides two unrelated price scales: measured -8.45% where NIFTY actually did
+    # +8.21%. (The sync path has the same recovery below; this one needs its own
+    # because there is no shared-trade structure to key off.)
+    try:
+        _sp = combined
+        if "Type" in _sp.columns:
+            _opt_rows = _sp[_sp["Type"].astype(str).str.upper().isin(("CE", "PE"))]
+            if not _opt_rows.empty:
+                _sp = _opt_rows
+        _sp = _sp.sort_values(["Entry Date", "Trade"], kind="stable")
+        _es = pd.to_numeric(_sp["Entry Spot"], errors="coerce").replace(0, np.nan).dropna()
+        _xs = pd.to_numeric(_sp["Exit Spot"], errors="coerce").replace(0, np.nan).dropna()
+        if len(_es) and len(_xs):
+            _i, _f = float(_es.iloc[0]), float(_xs.iloc[-1])
+            _days = (pd.to_datetime(_sp["Exit Date"]).max()
+                     - pd.to_datetime(_sp["Entry Date"]).min()).days
+            _ny = max(_days / 365.0, 0.01)
+            if _i > 0 and _f > 0:
+                summary["cagr_spot"] = round(100 * ((_f / _i) ** (1.0 / _ny) - 1), 2)
+    except Exception as exc:
+        logger.warning("[MULTI_INDEX] cagr_spot recovery failed: %s", exc)
+
     try:
         pivot = build_pivot(agg, "Exit Date")
     except Exception:
@@ -1685,8 +1921,13 @@ def run_sync_weekly_cadence(
                 _ov_exit_dte = max(0, int(payload.get("exit_dte") or 0))
             except (TypeError, ValueError):
                 _ov_exit_dte = 0
+            # Scheduled cycle ends keyed by entry date, so a truncated trade still
+            # selects the contract its FULL window needed (see the lookahead note in
+            # _overlay_legs_onto_base).
+            _sched_end = sorted((c["start"], c["end"]) for c in (_cycles or []))
             ov_rows = _overlay_legs_onto_base(base_df, overlay_legs, cadence_index,
-                                              effective_from, effective_to, _ov_exit_dte)
+                                              effective_from, effective_to, _ov_exit_dte,
+                                              sched_end_by_entry=_sched_end)
         except Exception as exc:
             logger.warning("[SYNC_CADENCE] overlay failed: %s", exc)
             ov_rows = []
@@ -1757,6 +1998,50 @@ def run_sync_weekly_cadence(
     except Exception as exc:
         logger.warning("[SYNC_CADENCE] compute_analytics failed: %s", exc)
         summary = {}
+
+    # `_mini` pushed the per-leg "% P&L" through the Net P&L column so the NAV compounds
+    # the Σ-per-leg-% return (intended, above). Side effect: compute_analytics's POINT
+    # metrics were then sums of PERCENTS — total_pnl 3.77 where the real Net P&L is
+    # 407.65, and likewise max_win / max_loss / avg_profit_per_trade, all ~100x off and
+    # rendered under point labels. Restate those four from the real points in `agg`;
+    # the %-based NAV, CAGR and drawdown are deliberately left untouched.
+    try:
+        _net_pts = pd.to_numeric(agg["Net P&L"], errors="coerce").dropna()
+        if len(_net_pts):
+            summary["total_pnl"] = round(float(_net_pts.sum()), 2)
+            summary["max_win"] = round(float(_net_pts.max()), 2)
+            summary["max_loss"] = round(float(_net_pts.min()), 2)
+            summary["avg_profit_per_trade"] = round(float(_net_pts.mean()), 2)
+    except Exception as exc:
+        logger.warning("[SYNC_CADENCE] point-metric restatement failed: %s", exc)
+
+    # `_mini` carries a SYNTHETIC Entry Spot of 100.0 (so the NAV is built on the
+    # Σ-per-leg-% return, above) and no Exit Spot at all, so compute_analytics can only
+    # return cagr_spot = 0.0 — the spot benchmark is silently lost on this path. Recover
+    # it from the REAL spots on the OPTIONS leg (user rule: spot comes from the options
+    # leg, never the futures leg — on a multi-index run they are different indices with
+    # different price scales). base.py's exact convention: first trade's Entry Spot, last
+    # trade's Exit Spot, (last exit - first entry).days / 365, floored at 0.01.
+    # The backtest is the source of truth, so this value is what the optim per-combo
+    # sheet and the Rust master summary both pin to downstream.
+    try:
+        _sp = combined
+        if "Type" in _sp.columns:
+            _opt_rows = _sp[_sp["Type"].astype(str).str.upper().isin(("CE", "PE"))]
+            if not _opt_rows.empty:
+                _sp = _opt_rows
+        _sp = _sp.sort_values(["Entry Date", "Trade", "Leg"], kind="stable")
+        _es = pd.to_numeric(_sp["Entry Spot"], errors="coerce").replace(0, np.nan).dropna()
+        _xs = pd.to_numeric(_sp["Exit Spot"], errors="coerce").replace(0, np.nan).dropna()
+        if len(_es) and len(_xs):
+            _i, _f = float(_es.iloc[0]), float(_xs.iloc[-1])
+            _days = (pd.to_datetime(agg["Exit Date"]).max()
+                     - pd.to_datetime(agg["Entry Date"]).min()).days
+            _ny = max(_days / 365.0, 0.01)
+            if _i > 0 and _f > 0:
+                summary["cagr_spot"] = round(100 * ((_f / _i) ** (1.0 / _ny) - 1), 2)
+    except Exception as exc:
+        logger.warning("[SYNC_CADENCE] cagr_spot recovery failed: %s", exc)
     try:
         pivot = build_pivot(agg, "Exit Date")
     except Exception:

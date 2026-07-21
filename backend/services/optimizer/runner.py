@@ -31,6 +31,7 @@ from __future__ import annotations
 import bisect
 import logging
 import os
+import threading
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -2117,6 +2118,9 @@ def run_optimization(
     # causing OOM. The env var is the safe knob to raise it when hardware allows.
     _env_par = int(os.environ.get("OPTIMIZE_PARALLELISM", "0") or "0")
     _solo_ceiling = 1
+    _hb_stop_event = None  # only set below for exhaustive/random, which register;
+    # smart-sampling methods never register, so the finally blocks must guard
+    # this before calling .set() — checked with `if _hb_stop_event is not None`.
     if method not in ("exhaustive", "random"):
         parallelism = 1
     else:
@@ -2134,6 +2138,20 @@ def run_optimization(
         # PER-NODE: count only optims on THIS node, never other LAN nodes.
         result_store.register_active_optim(job_id, node_id)
         parallelism = _solo_ceiling  # provisional (full box) to enter the parallel path
+
+        # Keep this job's live-optim timestamp fresh for as long as it's
+        # genuinely still computing — _ACTIVE_STALE_SEC is short (5 min) so a
+        # crashed/killed job stops throttling others quickly, but a real sweep
+        # can run far longer than that. Stopped in the finally blocks below,
+        # same place unregister_active_optim already lives.
+        _hb_stop_event = threading.Event()
+
+        def _active_optim_heartbeat():
+            while not _hb_stop_event.wait(60):
+                result_store.touch_active_optim(job_id, node_id)
+
+        _hb_thread = threading.Thread(target=_active_optim_heartbeat, daemon=True)
+        _hb_thread.start()
 
     if parallelism > 1:
         try:
@@ -2262,6 +2280,8 @@ def run_optimization(
             result_store.mark_complete(job_id, error=msg)
             return {"status": "failed", "error": msg, "total": 0}
         finally:
+            if _hb_stop_event is not None:
+                _hb_stop_event.set()
             # Free this job's slot in the live-optim registry so the dynamic
             # divisor lets a waiting/other optim reclaim the box immediately.
             result_store.unregister_active_optim(job_id, node_id)
@@ -2488,6 +2508,8 @@ def run_optimization(
         return {"status": "failed", "error": msg, "total": done}
     finally:
         _teardown_market_data()
+        if _hb_stop_event is not None:
+            _hb_stop_event.set()
         # Sequential path also registered itself (exhaustive/random with P
         # clamped to 1) — free the live-optim slot here too.
         result_store.unregister_active_optim(job_id, node_id)

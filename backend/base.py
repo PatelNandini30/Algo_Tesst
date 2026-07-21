@@ -857,7 +857,17 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     entry_date_col = 'Entry Date'
     exit_date_col  = 'Exit Date'
 
-    df = df.sort_values(entry_date_col).reset_index(drop=True)
+    # Entry/Exit dates arrive either as Timestamps (single-index optimizer path) or as
+    # dd-mm-yyyy STRINGS (both multi-index paths stringify before calling us). Sorting
+    # the raw column sorted those strings LEXICOGRAPHICALLY — '01-08-2023' ahead of
+    # '27-06-2023' — so every multi-index run walked its equity curve out of order
+    # (Cumulative / Peak / max_dd) and took n_years from the wrong start date. Sorting
+    # on parsed datetimes is identical when the column already holds Timestamps.
+    _entry_dt = pd.to_datetime(df[entry_date_col], errors='coerce', dayfirst=True)
+    df = (df.assign(_sort_dt=_entry_dt)
+            .sort_values('_sort_dt', kind='stable')
+            .drop(columns='_sort_dt')
+            .reset_index(drop=True))
 
     spot_cols = ['Entry Spot', 'Exit Spot', 'Spot P&L']
     for col in spot_cols:
@@ -888,7 +898,12 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         trade_df['Exit Spot'] = df['Exit Spot'] if 'Exit Spot' in df.columns else np.nan
         trade_df['Spot P&L'] = df['Spot P&L'] if 'Spot P&L' in df.columns else np.nan
 
-    _adf = trade_df.sort_values(entry_date_col).reset_index(drop=True)
+    # Same lexicographic trap as the row sort above — parse before ordering.
+    _adf = (trade_df.assign(_sort_dt=pd.to_datetime(trade_df[entry_date_col],
+                                                    errors='coerce', dayfirst=True))
+                    .sort_values('_sort_dt', kind='stable')
+                    .drop(columns='_sort_dt')
+                    .reset_index(drop=True))
 
     entry_spot_series = _adf['Entry Spot'] if 'Entry Spot' in _adf.columns else pd.Series(np.nan, index=_adf.index)
     entry_spot_nonzero = entry_spot_series.replace(0, np.nan)
@@ -994,8 +1009,11 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         else:
             cur_win = cur_loss = 0
 
-    start_date = pd.to_datetime(_adf[entry_date_col].min(), dayfirst=True)
-    end_date   = pd.to_datetime(_adf[exit_date_col].max(), dayfirst=True)
+    # .min()/.max() on a STRING column is lexicographic too — parse the whole column
+    # first, then take the extremes, so n_years (and therefore both CAGRs) is measured
+    # between the true first entry and true last exit.
+    start_date = pd.to_datetime(_adf[entry_date_col], errors='coerce', dayfirst=True).min()
+    end_date   = pd.to_datetime(_adf[exit_date_col],  errors='coerce', dayfirst=True).max()
     n_years    = max((end_date - start_date).days / 365.0, 0.01)
 
     final_nav = cumulative_series[-1] if cumulative_series else 0.0
@@ -1160,8 +1178,13 @@ def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
 
     exit_date_col = 'Exit Date' if 'Exit Date' in df.columns else 'exit_date'
 
-    df = df.sort_values(exit_date_col).reset_index(drop=True)
-    df[exit_date_col] = pd.to_datetime(df[exit_date_col], dayfirst=True)
+    # PARSE BEFORE SORTING. The multi-index paths hand us dd-mm-yyyy STRINGS, and
+    # sorting those lexicographically puts '01-08-2023' ahead of '27-06-2023' — so the
+    # global cumulative curve, its running peak, every per-year Max Drawdown and every
+    # drawdown date range below were built in the wrong chronological order. Identical
+    # result when the column already holds Timestamps (single-index optimizer path).
+    df[exit_date_col] = pd.to_datetime(df[exit_date_col], errors='coerce', dayfirst=True)
+    df = df.sort_values(exit_date_col, kind='stable').reset_index(drop=True)
 
     # ── Build GLOBAL cumulative curve (same as compute_analytics) ────────────
     df['_Global_Cumulative'] = df['Net P&L'].cumsum()
@@ -1223,7 +1246,16 @@ def build_pivot(df: pd.DataFrame, expiry_col: str) -> Dict[str, Any]:
             max_dd = 0
 
         # ── R/MDD ─────────────────────────────────────────────────────────────
-        r_mdd = round(total_pnl / abs(max_dd), 2) if max_dd != 0 else 0
+        # Both sides are RUPEES here (total_pnl and max_dd come off the same Net P&L
+        # curve), so the ratio is dimensionally sound — but it still needs the same
+        # +/-99999 ceiling compute_analytics puts on car_mdd, because a year whose
+        # deepest dip is float-noise-small blows the quotient up to six figures.
+        # max_dd == 0 means NO drawdown that year: R/MDD is undefined, not zero, so
+        # emit None ("—") rather than a 0 that reads as "no return per unit risk".
+        if max_dd == 0:
+            r_mdd = None
+        else:
+            r_mdd = round(max(-99999.0, min(99999.0, total_pnl / abs(max_dd))), 2)
 
         yearly_data.append({
             'year':          year,

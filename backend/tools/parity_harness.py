@@ -82,7 +82,7 @@ import pandas as pd  # noqa: E402
 # the real app payload schema inferred from routers/backtest.py (_normalize_*),
 # services/algotest_job.py (execute_algotest_job / _normalize_request /
 # _resolve_effective_request), services/engine_rust.py (per-leg keys), and the
-# existing verify_both.py reference payload.
+# reference payload (formerly backend/verify_both.py, removed as dead code).
 #
 # Leg schema (from engine_rust.py):
 #   segment="OPTIONS", option_type="CE"/"PE", position="BUY"/"SELL",

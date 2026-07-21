@@ -760,33 +760,29 @@ def _build_yearly_cycles(
             # perturb the schedule via a trading-day snap.
             end = contract
         else:
-            target = (
-                pd.Timestamp(contract) - pd.DateOffset(months=n_months)
-            ).strftime("%Y-%m-%d")
-            # Snap the T-n target to the NEAREST cadence boundary — not the last
-            # one at-or-before it.
+            _tgt = pd.Timestamp(contract) - pd.DateOffset(months=n_months)
+            target = _tgt.strftime("%Y-%m-%d")
+            # T-n means "roll in the MONTH n months before the contract's month".
+            # So take the LAST cadence boundary inside that month — never the
+            # merely-nearest date, which can sit in the following month.
             #
-            # The position can only roll where the cadence lets it, so the cycle
-            # must end on a cadence date. Picking the last boundary BEFORE the
-            # target overshoots badly whenever the target falls just *before* a
-            # boundary: for Dec-2019 (expiry 26-Dec) T-1 targets 26-Nov, but the
-            # Nov expiry is 28-Nov — 2 days late — so "before" jumps back to
-            # 31-Oct and rolls 56 days early, i.e. T-1 silently behaves as T-2.
-            # Same in 2023 (63d) and 2024 (56d). Nearest keeps every year at
-            # 28-36 days ≈ the requested 1 month.
-            end = None
-            if cadence_expiries:
-                _t = pd.Timestamp(target)
-                _c = min(cadence_expiries, key=lambda c: abs((pd.Timestamp(c) - _t).days))
-                # Only accept a snap that is genuinely NEAR the target. A valid
-                # monthly snap is <= ~18 days off (half the max ~35-day gap);
-                # weekly, <= ~4. Anything further means the target lies outside
-                # the cadence range entirely — the widened prior December (long
-                # expired) or the final December beyond to_date — and min() would
-                # otherwise return the nearest *endpoint*, inventing a cycle.
-                if abs((pd.Timestamp(_c) - _t).days) <= 45:
-                    end = _c
-            if end is None:
+            # Nearest-date snapping was wrong at month ends. Dec-2025 (30-Dec) at
+            # T-1 targets 30-Nov; on WEEKLY cadence the neighbours are 25-Nov
+            # (5 days) and 02-Dec (2 days), so "nearest" picked 02-Dec — a
+            # DECEMBER boundary — and T-1 stopped meaning "roll in November".
+            # MONTHLY cadence hid this: with one boundary per month the two rules
+            # always agreed, which is why 2019/2020/2023/2024 were unaffected and
+            # still resolve to the same dates under this rule.
+            _tgt_month = _tgt.strftime("%Y-%m")
+            _in_month = [c for c in (cadence_expiries or []) if c[:7] == _tgt_month]
+            if _in_month:
+                end = max(_in_month)
+            else:
+                # No cadence boundary in the target month: the target lies outside
+                # the loaded cadence range — the widened PRIOR December (long
+                # elapsed, dropped by the start >= end guard below) or the final
+                # December beyond to_date. Fall back to the trading calendar, as
+                # before, so edge cycles behave exactly as they did.
                 end = _last_trading_day_on_or_before(target, trading_days)
             if not end:
                 continue
@@ -2220,10 +2216,15 @@ def _build_fixed_entry_specs(
                 # shifted contract isn't available (end of expiry list), skip just
                 # this trade and keep chaining.
                 _leg_is_next = str(leg.get("expiry") or "").upper() in _NEXT_EXPIRY_TYPES
-                if _pin is not None:
-                    # YEARLY: the contract is the pinned December, never a
-                    # cadence element. NEXT_* would shift it off the pin, so it
-                    # is rejected upstream rather than silently mis-contracted.
+                # PER-LEG contract under YEARLY. Only a leg whose OWN expiry is
+                # YEARLY gets the pinned December; a weekly/monthly leg in the
+                # same strategy keeps trading its cadence contract. That is what
+                # lets a mixed basket work — e.g. CE SELL weekly + PE BUY yearly
+                # — with every leg re-booking on the shared cadence but holding
+                # its own contract. When no leg is yearly the pin is inert, so
+                # non-yearly strategies are untouched.
+                _leg_is_yearly = str(leg.get("expiry") or "").upper() == "YEARLY"
+                if _pin is not None and _leg_is_yearly:
                     leg_expiry = _pin["contract"]
                 elif _leg_is_next:
                     if target_idx + 1 >= len(sorted_expiries):
@@ -3897,19 +3898,28 @@ def run_rust_engine_pipeline(
                 "no long-dated December contract to pin to, and the futures rollover "
                 "builder would roll them across the option cadence."
             )
-        # NEXT_* means "one expiry further out than the exit anchor" — under
-        # YEARLY the anchor is a cadence element, so it would shift the leg OFF
-        # the pinned December onto a weekly/monthly contract.
-        _bad = [
-            str(_l.get("expiry") or "").upper()
+        # NEXT_* is fine now that the pin is PER-LEG: a NEXT_WEEKLY leg is simply
+        # not a yearly leg, so it never touches the December pin and resolves off
+        # the cadence list exactly as it would under a weekly basis. (Previously
+        # the pin was applied to every leg, so NEXT_* had to be rejected.)
+        # At least one leg must actually be YEARLY, though — otherwise the run is
+        # a weekly/monthly strategy wearing a YEARLY label and the December
+        # contract would never be used. EXCEPT multi-index SYNC cadence
+        # (run_sync_weekly_cadence), which drives its merged roll boundaries by
+        # setting expiry_type="YEARLY" + yearly_cycles on the cadence-index's OWN
+        # weekly/monthly legs — none of which are individually "YEARLY" by
+        # design (the December pin is irrelevant there; sync_cadence_expiries is
+        # what actually drives entry/exit). Gate on the sync cadence itself
+        # rather than on "YEARLY", matching the same carve-out already used for
+        # the spot-adjustment re-entry gate below, so a genuine yearly strategy
+        # keeps its existing behaviour.
+        if not payload.get("sync_cadence_expiries") and not any(
+            isinstance(_l, dict) and str(_l.get("expiry") or "").upper() == "YEARLY"
             for _l in (payload.get("legs") or [])
-            if isinstance(_l, dict) and str(_l.get("expiry") or "").upper() in _NEXT_EXPIRY_TYPES
-        ]
-        if _bad:
+        ):
             raise ValueError(
-                f"expiry_type=YEARLY does not support {sorted(set(_bad))} legs: the "
-                "contract is pinned to December, so there is no 'next' contract to "
-                "shift to. Set the leg expiry to YEARLY."
+                "expiry_type=YEARLY but no leg has expiry=YEARLY. Set at least one "
+                "leg to Yearly, or switch the strategy basis to weekly/monthly."
             )
 
     # Sorted expiry list used by NEXT_WEEKLY and LAZY_LEG expiry resolution.
@@ -4385,7 +4395,16 @@ def run_rust_engine_pipeline(
     has_midcap_spot_adj = bool(_mc_sa_cfg_early.get("enabled")) and (
         (_maybe_float(_mc_sa_cfg_early.get("pct")) or 0) > 0
     )
-    if not any_risk and not has_overall_top and not has_spot_adj and not has_midcap_spot_adj:
+    # MIDCPNIFTY spot adjustment likewise needs the risk/re-entry pass below. Omitting
+    # it here made the trigger work ONLY when some other risk control happened to be
+    # on: with NIFTY spot-adj enabled the run fell through and MIDCPNIFTY fired, but
+    # MIDCPNIFTY on its own took this early return and produced ZERO triggers.
+    _mn_sa_cfg_early = payload.get("midcpnifty_spot_adjustment") or {}
+    has_midcp_spot_adj = bool(_mn_sa_cfg_early.get("enabled")) and (
+        (_maybe_float(_mn_sa_cfg_early.get("pct")) or 0) > 0
+    )
+    if (not any_risk and not has_overall_top and not has_spot_adj
+            and not has_midcap_spot_adj and not has_midcp_spot_adj):
         # No risk controls → priced output is the final answer. Tag the LAST
         # trade of each filter patch as FILTER_END (the user's rule), not just
         # the (entry,expiry)-clamped trade — so a boundary trade that expired
@@ -4477,6 +4496,52 @@ def run_rust_engine_pipeline(
             midcap_adj_enabled = False
     _midcap_active = bool(midcap_adj_enabled and midcap_adj_pct > 0 and midcap_spot_by_date)
 
+    # ── MIDCPNIFTY spot adjustment (additive; gated on its own config) ─────────
+    # Same shape as the Midcap100 block above, but the reference index is a
+    # TRADEABLE one that the strategy actually holds a leg in (multi-index
+    # NIFTY + MIDCPNIFTY). Its close series lives in spot_data, not index_ohlc —
+    # MidcapCloseLookup falls back to it. Close-only is sufficient: the trigger
+    # reads one value per day and never touches high/low.
+    # When midcpnifty_spot_adjustment is absent/disabled NOTHING below runs.
+    _mn_sa = payload.get("midcpnifty_spot_adjustment") or {}
+    midcp_adj_enabled = bool(_mn_sa.get("enabled"))
+    midcp_adj_pct = _maybe_float(_mn_sa.get("pct")) or 0.0
+    midcp_adj_direction = str(_mn_sa.get("direction") or "rise").lower()
+    if midcp_adj_direction not in ("rise", "fall", "both"):
+        midcp_adj_direction = "rise"
+    midcp_adj_units = str(_mn_sa.get("units") or "percent").lower()
+    if midcp_adj_units not in ("percent", "points"):
+        midcp_adj_units = "percent"
+    if midcp_adj_enabled and midcp_adj_pct > 0 and midcp_adj_units == "percent":
+        midcp_adj_pct = max(0.25, min(5.0, midcp_adj_pct))
+    midcp_sa_symbol = str(_mn_sa.get("symbol") or "MIDCPNIFTY").upper()
+    midcp_spot_by_date: Dict[str, float] = {}
+    if midcp_adj_enabled and midcp_adj_pct > 0 and trading_days:
+        _mn_lk = _get_midcap_sa_lookup(midcp_sa_symbol)   # raises -> hard fail
+        for _d in trading_days:
+            _c = _mn_lk.close(_d)
+            if _c is not None:
+                midcp_spot_by_date[_d] = float(_c)
+        # Rust-only/no-fallback rule: a silently never-triggering adjustment is
+        # indistinguishable from a broken feature, so refuse the run instead.
+        # MIDCPNIFTY's spot starts 2020-01-01; anything earlier has no reference.
+        if not midcp_spot_by_date:
+            raise RuntimeError(
+                f"[ENGINE_RUST] {midcp_sa_symbol} spot adjustment is enabled but no "
+                f"{midcp_sa_symbol} spot exists for {trading_days[0]}..{trading_days[-1]}. "
+                "Start the backtest from a date this index has data for."
+            )
+        _missing = [d for d in trading_days if d not in midcp_spot_by_date]
+        if _missing and _missing[0] <= trading_days[0]:
+            _have = sorted(midcp_spot_by_date)
+            raise RuntimeError(
+                f"[ENGINE_RUST] {midcp_sa_symbol} spot adjustment is enabled but its "
+                f"spot only starts {_have[0]} — the run begins {trading_days[0]}, so "
+                f"{len(_missing)} early session(s) have no reference level. "
+                f"Start the backtest on or after {_have[0]}."
+            )
+    _midcp_active = bool(midcp_adj_enabled and midcp_adj_pct > 0 and midcp_spot_by_date)
+
     # ── Combine mode (additive; only meaningful when BOTH NIFTY & Midcap active) ──
     # 'earliest' (default) = current behaviour: whichever index breaches first
     #            triggers the adjustment (see _compute_spot_adjustment_trigger).
@@ -4553,7 +4618,7 @@ def run_rust_engine_pipeline(
     # Confirm mode only engages when BOTH adjustments are active AND the user chose
     # it. Otherwise everything below falls through to the existing earliest path.
     _confirm_mode = bool(_combine_mode == "confirm" and _nifty_active and _midcap_active)
-    if _nifty_active or _midcap_active:
+    if _nifty_active or _midcap_active or _midcp_active:
         for trade_id, legs in by_trade.items():
             legs.sort(key=lambda r: r["leg_id"])
             first = legs[0]
@@ -4591,8 +4656,25 @@ def run_rust_engine_pipeline(
                         trading_days, midcap_spot_by_date,
                     )
 
+            # MIDCPNIFTY breach (additive — measured on the MIDCPNIFTY index the
+            # strategy actually holds a leg in). Truncates the SAME trade, so the
+            # existing re-entry chain re-enters BOTH legs the same day; that is the
+            # pair-trading rule, not a per-leg exit.
+            midcp_trig = None
+            if _midcp_active:
+                mn_entry_spot = midcp_spot_by_date.get(entry_iso) or 0.0
+                if mn_entry_spot > 0:
+                    midcp_trig = _compute_spot_adjustment_trigger(
+                        entry_iso, mn_entry_spot, scheduled_exit,
+                        midcp_adj_direction, midcp_adj_pct, midcp_adj_units,
+                        trading_days, midcp_spot_by_date,
+                    )
+
             if _confirm_mode:
                 # Both indices must breach the SAME direction within N trading days.
+                # Confirm pairs exactly TWO series (NIFTY + Midcap100) — pairing three
+                # is undefined — so MIDCPNIFTY does not participate here and is left
+                # to the earliest-wins path below.
                 _c_nbase = entry_spot if entry_spot > 0 else float(
                     first.get("entry_spot") or spot_by_date.get(entry_iso) or 0.0
                 )
@@ -4608,20 +4690,40 @@ def run_rust_engine_pipeline(
                     spot_adj_reasons[trade_id] = (
                         f"SPOT_ADJ_{_c_dir}+MIDCAP_SPOT_ADJ_{_c_dir}"
                     )
-            # Earliest breach wins.
-            elif nifty_trig and (not midcap_trig or nifty_trig <= midcap_trig):
-                spot_adj_overrides[trade_id] = nifty_trig
-                spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
-                    spot_adj_direction, entry_spot, spot_by_date.get(nifty_trig),
-                    spot_adj_pct, spot_adj_units,
-                )
-            elif midcap_trig:
-                spot_adj_overrides[trade_id] = midcap_trig
-                _mc_e = midcap_spot_by_date.get(entry_iso) or 0.0
-                _mc_t = midcap_spot_by_date.get(midcap_trig) or 0.0
-                spot_adj_reasons[trade_id] = (
-                    "MIDCAP_SPOT_ADJ_RISE" if _mc_t >= _mc_e else "MIDCAP_SPOT_ADJ_FALL"
-                )
+            else:
+                # Earliest breach wins, across EVERY enabled reference index. This was
+                # a hardcoded 2-way compare (NIFTY vs Midcap100); it is a list now so a
+                # third source (MIDCPNIFTY) composes instead of displacing one. Order
+                # matters only for ties: NIFTY first preserves the previous tie-break,
+                # where NIFTY won on `nifty_trig <= midcap_trig`.
+                _cands = []
+                if nifty_trig:
+                    _cands.append((nifty_trig, "NIFTY"))
+                if midcap_trig:
+                    _cands.append((midcap_trig, "MIDCAP"))
+                if midcp_trig:
+                    _cands.append((midcp_trig, "MIDCPNIFTY"))
+                if _cands:
+                    _win_date, _win_src = min(_cands, key=lambda c: c[0])
+                    spot_adj_overrides[trade_id] = _win_date
+                    if _win_src == "NIFTY":
+                        spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
+                            spot_adj_direction, entry_spot, spot_by_date.get(_win_date),
+                            spot_adj_pct, spot_adj_units,
+                        )
+                    elif _win_src == "MIDCAP":
+                        _mc_e = midcap_spot_by_date.get(entry_iso) or 0.0
+                        _mc_t = midcap_spot_by_date.get(_win_date) or 0.0
+                        spot_adj_reasons[trade_id] = (
+                            "MIDCAP_SPOT_ADJ_RISE" if _mc_t >= _mc_e else "MIDCAP_SPOT_ADJ_FALL"
+                        )
+                    else:
+                        _mn_e = midcp_spot_by_date.get(entry_iso) or 0.0
+                        _mn_t = midcp_spot_by_date.get(_win_date) or 0.0
+                        spot_adj_reasons[trade_id] = (
+                            "MIDCPNIFTY_SPOT_ADJ_RISE" if _mn_t >= _mn_e
+                            else "MIDCPNIFTY_SPOT_ADJ_FALL"
+                        )
 
     # Slice 5: Overall SL / Target detection.
     # Engine flow (engines/generic_algotest_engine.py:4553-4594):
@@ -4790,7 +4892,7 @@ def run_rust_engine_pipeline(
         and _maybe_float((leg.get("slWithBuffer") or {}).get("value"))
         for leg in legs_src
     )
-    if _fix4_fixed_legs and _fix4_has_slb and (spot_adj_enabled or _midcap_active) and spot_adj_overrides:
+    if _fix4_fixed_legs and _fix4_has_slb and (spot_adj_enabled or _midcap_active or _midcp_active) and spot_adj_overrides:
         # (1) anchor strikes per re-anchor date — mirrors the bridge cascade strike
         #     resolution + the natural-ATM fallback in the carry-forward below.
         _fix4_anchor: Dict[str, Dict[int, float]] = {}
@@ -5364,7 +5466,7 @@ def run_rust_engine_pipeline(
     # (Defined unconditionally so the spot-adj re-entry block below can chain from
     # it even when this bridge block doesn't run.)
     _bt_new_tid = _reentry_new_tid
-    if (spot_adj_enabled or _midcap_active) and spot_adj_overrides and (
+    if (spot_adj_enabled or _midcap_active or _midcp_active) and spot_adj_overrides and (
         (_rollover_toggle and filter_entry_mode == "fixed") or _has_fixed_strike_opt_legs
     ):
         for _bt_id, _bt_trigger in list(spot_adj_overrides.items()):
@@ -5437,6 +5539,30 @@ def run_rust_engine_pipeline(
                         ):
                             _bt_casc_trig = _bt_mc_casc
                             _bt_casc_is_midcap = True
+                # Same re-base + re-scan for MIDCPNIFTY. Omitting this would truncate
+                # the ORIGINAL trade on a MIDCPNIFTY breach but never re-check the
+                # bridge re-entries — the exact defect the Midcap block above exists
+                # to fix.
+                _bt_casc_is_midcp = False
+                if _midcp_active:
+                    _bt_mn_entry = midcp_spot_by_date.get(_bt_cur_entry) or 0.0
+                    if _bt_mn_entry > 0:
+                        _bt_mn_casc = _compute_spot_adjustment_trigger(
+                            _bt_cur_entry,
+                            _bt_mn_entry,
+                            _bt_cycle_exit,
+                            midcp_adj_direction,
+                            midcp_adj_pct,
+                            midcp_adj_units,
+                            trading_days,
+                            midcp_spot_by_date,
+                        )
+                        if _bt_mn_casc and (
+                            not _bt_casc_trig or _bt_mn_casc < _bt_casc_trig
+                        ):
+                            _bt_casc_trig = _bt_mn_casc
+                            _bt_casc_is_midcap = False
+                            _bt_casc_is_midcp = True
                 # Confirm mode overrides the earliest-based trigger for this cycle:
                 # both indices must breach the SAME direction within N trading days.
                 _bt_confirm_dir = None
@@ -5449,6 +5575,7 @@ def run_rust_engine_pipeline(
                         _confirm_days, trading_days, spot_by_date, midcap_spot_by_date,
                     )
                     _bt_casc_is_midcap = False
+                    _bt_casc_is_midcp = False
                 _bt_this_exit = (
                     _bt_casc_trig
                     if (_bt_casc_trig and _bt_casc_trig < _bt_cycle_exit)
@@ -5565,6 +5692,13 @@ def run_rust_engine_pipeline(
                             _btl_reason = (
                                 "MIDCAP_SPOT_ADJ_RISE" if _bt_mc_t2 >= _bt_mc_e2
                                 else "MIDCAP_SPOT_ADJ_FALL"
+                            )
+                        elif _bt_casc_is_midcp:
+                            _bt_mn_e2 = midcp_spot_by_date.get(_bt_cur_entry) or 0.0
+                            _bt_mn_t2 = midcp_spot_by_date.get(_bt_casc_trig) or 0.0
+                            _btl_reason = (
+                                "MIDCPNIFTY_SPOT_ADJ_RISE" if _bt_mn_t2 >= _bt_mn_e2
+                                else "MIDCPNIFTY_SPOT_ADJ_FALL"
                             )
                         else:
                             _btl_reason = _spot_adj_reason_tag(
@@ -5951,6 +6085,28 @@ def run_rust_engine_pipeline(
         # the bridge (Slice 7b) and stays excluded via the filter_entry_mode
         # guard on the `if` immediately below.
         or _sa_expiry_type in ("WEEKLY", "MONTHLY")
+        # Multi-index SYNC cadence. run_sync_weekly_cadence drives its merged roll
+        # boundaries by setting expiry_type="YEARLY" + yearly_cycles, so none of the
+        # WEEKLY/MONTHLY tests above match and this whole block was skipped — a
+        # spot-adj breach exited and never re-entered, leaving exactly the gap the
+        # comment above says must not happen (measured: 15 breaches in a 133-trade
+        # run, zero re-entries; single-index and the group-per-index multi path both
+        # re-enter correctly). Gate on the sync cadence itself rather than on
+        # "YEARLY", so a genuine yearly strategy keeps its existing behaviour.
+        or bool(payload.get("sync_cadence_expiries"))
+        # Genuine YEARLY. The clause above deliberately left real yearly runs out
+        # while the feature was unverified, which gave them the SAME defect it was
+        # added to fix: the breach exits and never re-enters. Measured on a 2024
+        # NIFTY weekly-cadence yearly run — 9 breaches, 18 SPOT_ADJ exits, ZERO
+        # re-entries (row count 102 -> 102), against 8 re-entries (104 -> 120) for
+        # the identical weekly strategy. The residual-window body below is
+        # expiry-agnostic: it rides `orig_exit_date` (the leg's SCHEDULED exit,
+        # i.e. the weekly/monthly cadence exit under a yearly pin) and only falls
+        # back to `orig_expiry` when the scheduled exit is later — so pinning the
+        # contract to a far-off December never widens the window.
+        # Gated on yearly_cycles so this admits only a properly-resolved yearly
+        # run, matching the hard-fail contract at :3881.
+        or (_sa_expiry_type == "YEARLY" and bool(payload.get("yearly_cycles")))
     )
     if spot_adj_overrides and _sa_cascade_active and filter_entry_mode != "fixed":
         if True:  # legacy indentation
@@ -6032,6 +6188,22 @@ def run_rust_engine_pipeline(
                                 trading_days,
                                 midcap_spot_by_date,
                             )
+                    # Same re-scan for MIDCPNIFTY on this re-entry window.
+                    _mn_casc = None
+                    _mc_casc_is_midcp = False
+                    if _midcp_active:
+                        _mn_entry_c = midcp_spot_by_date.get(_sa_cur_entry) or 0.0
+                        if _mn_entry_c > 0:
+                            _mn_casc = _compute_spot_adjustment_trigger(
+                                _sa_cur_entry,
+                                _mn_entry_c,
+                                _sa_cur_exit,
+                                midcp_adj_direction,
+                                midcp_adj_pct,
+                                midcp_adj_units,
+                                trading_days,
+                                midcp_spot_by_date,
+                            )
                     # Earliest sub-trigger wins; track which source it came from.
                     if _sa_casc and _mc_casc:
                         if _mc_casc < _sa_casc:
@@ -6040,6 +6212,10 @@ def run_rust_engine_pipeline(
                     elif _mc_casc:
                         _sa_casc = _mc_casc
                         _mc_casc_is_midcap = True
+                    if _mn_casc and (not _sa_casc or _mn_casc < _sa_casc):
+                        _sa_casc = _mn_casc
+                        _mc_casc_is_midcap = False
+                        _mc_casc_is_midcp = True
                     # Confirm mode overrides the earliest-based sub-trigger for this
                     # re-entry window: both indices, SAME direction, within N days.
                     _sa_confirm_dir = None
@@ -6052,6 +6228,7 @@ def run_rust_engine_pipeline(
                             _confirm_days, trading_days, spot_by_date, midcap_spot_by_date,
                         )
                         _mc_casc_is_midcap = False
+                        _mc_casc_is_midcp = False
                     _sa_this_exit = (
                         _sa_casc if (_sa_casc and _sa_casc < _sa_cur_exit)
                         else _sa_cur_exit
@@ -6078,7 +6255,18 @@ def run_rust_engine_pipeline(
                             _sa_leg_interval = float(_sa_leg_interval_raw) if _sa_leg_interval_raw else _sa_interval
                         except (TypeError, ValueError):
                             _sa_leg_interval = _sa_interval
-                        if _sa_leg_interval not in (50.0, 100.0, 25.0):
+                        # Sanity-whitelist the leg's gap; anything else falls back to
+                        # the index default. The list must track the gaps the UI can
+                        # actually emit (STRIKE_INTERVAL_OPTIONS = 25/50/100/500/1000).
+                        # It was written when 25/50/100 were the only choices and was
+                        # never widened, so a leg on the coarse gaps silently re-struck
+                        # at the index default on EVERY spot-adj re-entry: measured on a
+                        # 2019-2026 NIFTY yearly run at gap 1000, 67 of 233 re-entries
+                        # landed on the 50-grid (10850, 12250, 17250 ...) while all 86
+                        # scheduled trades stayed on the 1000-grid. Scheduled trades were
+                        # never affected — they read the leg value at :2239 with no
+                        # whitelist, and Rust likewise has no such clamp.
+                        if _sa_leg_interval not in (25.0, 50.0, 100.0, 500.0, 1000.0):
                             _sa_leg_interval = _sa_interval
                         _sa_strike_info: Dict[str, Any] = {}
                         _sa_strike = _compute_strike_for_leg_python(
@@ -6117,6 +6305,13 @@ def run_rust_engine_pipeline(
                                 _sa_reason = (
                                     "MIDCAP_SPOT_ADJ_RISE" if _mc_t2 >= _mc_e2
                                     else "MIDCAP_SPOT_ADJ_FALL"
+                                )
+                            elif _mc_casc_is_midcp:
+                                _mn_e2 = midcp_spot_by_date.get(_sa_cur_entry) or 0.0
+                                _mn_t2 = midcp_spot_by_date.get(_sa_casc) or 0.0
+                                _sa_reason = (
+                                    "MIDCPNIFTY_SPOT_ADJ_RISE" if _mn_t2 >= _mn_e2
+                                    else "MIDCPNIFTY_SPOT_ADJ_FALL"
                                 )
                             else:
                                 _sa_reason = _spot_adj_reason_tag(

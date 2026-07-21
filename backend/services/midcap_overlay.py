@@ -92,6 +92,29 @@ class MidcapCloseLookup:
                 ),
                 {"s": self.symbol},
             ).fetchall()
+            if not rows:
+                # index_ohlc only carries the pure overlay indices (NIFTYMIDCAP100).
+                # A TRADEABLE index used as a spot-adjustment reference — MIDCPNIFTY
+                # on a multi-index strategy — has its series in spot_data instead.
+                # That table is close-only, which is all the spot-adjustment needs:
+                # _compute_spot_adjustment_trigger reads one value per day and never
+                # touches high/low. mae_mfe() therefore degenerates to close-vs-close
+                # here, so do NOT wire this symbol into the overlay P&L path, which
+                # does depend on the true intraday range.
+                rows = conn.execute(
+                    text(
+                        "SELECT date::text, close, close, close "
+                        "FROM spot_data WHERE symbol = :s AND close IS NOT NULL "
+                        "ORDER BY date"
+                    ),
+                    {"s": self.symbol},
+                ).fetchall()
+                if rows:
+                    logger.info(
+                        "[MIDCAP_LOOKUP] %s not in index_ohlc — using close-only "
+                        "spot_data series (%d sessions, %s..%s)",
+                        self.symbol, len(rows), rows[0][0], rows[-1][0],
+                    )
         self._series = {r[0]: float(r[3]) for r in rows if r[3] is not None}
         self._hl = {
             r[0]: (

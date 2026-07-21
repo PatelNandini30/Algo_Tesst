@@ -362,7 +362,7 @@ export default function OptimizationResults({
     // Shared builder (utils/optimSummaryExport.js) — identical logic path
     // used by the auto-download queue, so a manual export and an
     // auto-downloaded one are always byte-for-byte the same.
-    const blob = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo);
+    const blob = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId);
     triggerBlobDownload(blob, rulesFilename(ruleConfig, jobId, jobDownloadIsPatchwise ? '_patchwise' : '_overall'));
   }
 
