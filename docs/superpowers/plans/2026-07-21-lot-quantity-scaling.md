@@ -374,30 +374,39 @@ This engine writes `"Qty": leg.lots` (raw lots) where every other writer emits `
 
 Append to `backend/tests/test_lot_quantity_scaling.py`:
 
+Write a **behavioural** test — assert on the rows `_process_trade_legs` actually
+emits, not on its source text. Patch `_get_bhav_data` so the test needs no
+market data.
+
+Open `backend/engines/generic_multi_leg.py:236` (`_get_bhav_data`) and
+`:129` (`_get_all_strikes_for_expiry`) to see the exact DataFrame columns
+expected, then build minimal frames matching that shape. Construct a
+`StrategyDefinition` with two option legs — leg 1 at `lots=2`, leg 2 at
+`lots=1` — and call `_process_trade_legs` directly.
+
+Assert exactly these, which are what the task changes:
+
 ```python
-class TestMultiLegQtyConvention(unittest.TestCase):
-    """generic_multi_leg must emit Qty = lots x lot_size like every other writer.
-
-    The charges recalc divides by Qty to get per-unit charges, so emitting raw
-    lots inflated them by a factor of lot_size (65x on NIFTY).
-    """
-
-    def test_qty_is_lots_times_lot_size_not_raw_lots(self):
-        import inspect
-        from engines import generic_multi_leg
-
-        src = inspect.getsource(generic_multi_leg)
-        self.assertNotIn(
-            '"Qty": leg.lots,', src,
-            "generic_multi_leg still emits raw lots as Qty; must be lots * lot_size",
-        )
+        # leg 1: 2 lots x NIFTY lot size 65
+        self.assertEqual(rows[0]["Qty"], 130)
+        # leg 2: 1 lot x 65
+        self.assertEqual(rows[1]["Qty"], 65)
+        # P&L scales by that leg's own lots, not by lot_size
+        self.assertAlmostEqual(rows[0]["Net P&L"], leg1_points * 2, places=2)
+        self.assertAlmostEqual(rows[1]["Net P&L"], leg2_points * 1, places=2)
 ```
+
+where `leg1_points` / `leg2_points` are the entry-minus-exit differences your
+fixture frames imply. Name the class `TestMultiLegQtyConvention`.
+
+Do **not** fall back to an `inspect.getsource` string assertion — it passes on
+code that is broken in every other respect.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `python -m unittest backend.tests.test_lot_quantity_scaling.TestMultiLegQtyConvention -v`
 
-Expected: FAIL — `generic_multi_leg still emits raw lots as Qty; must be lots * lot_size`
+Expected: FAIL on the `Qty` assertion (`1 != 130` — raw lots emitted) and on the P&L assertion (unscaled). If the test SKIPs or errors on fixture setup, fix the fixture before proceeding — a skip proves nothing.
 
 - [ ] **Step 3: Apply the change to the options branch (`:347-362`)**
 
@@ -548,8 +557,10 @@ class TestLegacyEngineScales(unittest.TestCase):
                 21500.0,           # fallback_spot
                 0.0,               # slippage_pct
             )
-        except Exception:
-            self.skipTest("_recalc_leg_pnl needs market data")
+        except (KeyError, TypeError, ValueError) as exc:
+            # Narrow on purpose: a bare `except Exception` here would swallow a
+            # genuine regression in _recalc_leg_pnl and report it as a skip.
+            self.skipTest(f"_recalc_leg_pnl needs market data: {exc}")
 
         exit_prem = tleg["exit_premium"]
         self.assertAlmostEqual(tleg["pnl"], (150.0 - exit_prem) * 2, places=2)
