@@ -77,3 +77,11 @@ POST-FINAL-REVIEW FIXES + REBUILD #2 — ALL GATES GREEN
     three-way summary parity gate        PASS
     real-data NIFTY straddle 1v2 lot     PASS (P&L + MAE/MFE scale 2x, 2x1 spread
                                          confirms x lots not lots^2)
+
+CORRECTION: the "parity reference diverges at lots>1" caveat was WRONG/EMPTY.
+  run_algotest_backtest's only caller is tests/parity/compare.py:84, reached only
+  via tests/test_engine_parity.py -- which ERRORS 35/35 at compare.py:121 with
+  "NotImplementedError: run_optimization_batch ... scaffolded but not yet
+  implemented" (pre-existing, unrelated to this branch). The harness cannot run,
+  so the Python engine body is dead end-to-end and there is NO divergence to
+  worry about. The Task 4 revert was simply correct; no follow-up needed.
