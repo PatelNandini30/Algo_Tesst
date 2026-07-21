@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Response, Header, UploadFile, File
 from typing import Dict, Any, List, Optional, Tuple
 # Import generic multi-leg engine
 # NOTE: keep FastAPI imports at top for readability
-from engines.generic_algotest_engine import run_algotest_backtest, _calculate_fo_charges
+from engines.generic_algotest_engine import run_algotest_backtest, _calculate_fo_charges, get_lot_size
 from services.algotest_job import execute_algotest_job, _normalize_request, _resolve_effective_request
 from services.backtest_cache import get_backtest_cache as _get_result_cache
 from services.index_metadata import validate_index_payload
@@ -314,11 +314,20 @@ def _recalculate_trade_prices(
                     new_entry = round(new_entry + epu, 2)   # buy costs more
                     new_exit  = round(new_exit  - xpu, 2)   # sell-to-close gets less
 
-            # ── Step 3: P&L (per-unit points) ────────────────────────────
+            # ── Step 3: P&L = POINTS x LOTS ──────────────────────────────
+            # Charges were already folded into the PER-UNIT prices above, so
+            # the points difference is charge-correct; scale it by lots to
+            # match the engine (native/src/simulate.rs:1652). Qty is
+            # lots x lot_size, so lots = Qty / lot_size.
+            _row_lot_size = int(get_lot_size(row.get('Index') or 'NIFTY',
+                                             row.get('Entry Date')) or 1) or 1
+            _qty_raw = _normalize_recalc_numeric(row.get('Qty'))
+            _qty = float(_qty_raw) if _qty_raw and _qty_raw > 0 else float(_row_lot_size)
+            _row_lots = max(1, int(round(_qty / _row_lot_size)))
             if position == 'BUY':
-                leg_pnl = new_exit - new_entry
+                leg_pnl = (new_exit - new_entry) * _row_lots
             else:
-                leg_pnl = new_entry - new_exit
+                leg_pnl = (new_entry - new_exit) * _row_lots
 
             row['Entry Price'] = new_entry
             row['Exit Price']  = new_exit
