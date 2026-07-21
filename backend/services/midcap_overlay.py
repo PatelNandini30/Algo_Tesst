@@ -284,8 +284,12 @@ def compute_midcap_legs(
 
     `rows`: [{trade_id, reentry_index?, entry_date, exit_date, nifty_pnl, nifty_pnl_pct}]
     Returns {results: [...per row...], summary: {...}, available: bool}.
-    Per-row quantities are normalized to 1 unit (points / % of entry spot),
-    matching the sample workbook; `lots` is carried but not scaled (open item).
+    Per-leg P&L and MAE/MFE are scaled by that leg's OWN `lots` (points x lots;
+    `lot_size` plays no part — it only feeds the display Qty column elsewhere),
+    matching the convention already applied on the NIFTY side so `Combined Net
+    P&L`/`%` and the Net MAE 1/2 cross-pairing (summary_metrics.rs:399) stay
+    commensurate at lots > 1. `lots == 1` is a no-op, matching the sample
+    workbook byte-for-byte.
     `lookup` may be injected for testing; otherwise built from the symbol.
     """
     symbol = (symbol or DEFAULT_SYMBOL).upper()
@@ -353,6 +357,10 @@ def compute_midcap_legs(
             position = str(leg.get("position", "buy")).upper()
             mode = str(leg.get("midcap_mode") or leg.get("mode") or "spot").lower()
             cost = (_f(leg.get("cost_pct_per_month")) or 0.0) if mode == "hypothetical" else 0.0
+            # Lot-quantity scaling: this leg's OWN lots, read from its config —
+            # never derive from Qty/lot_size (that inverts a display column).
+            # Same idiom as services/multi_index_feature.py.
+            lots = int(leg.get("lots") or leg.get("lot") or 1)
             sp = -raw_spot_pnl if position == "SELL" else raw_spot_pnl
             sp_pct = sp / spot_entry  # fraction
             roll = cost / 100.0 * no_of_days / 30.0
@@ -365,13 +373,28 @@ def compute_midcap_legs(
                 rollover_pct_repr = csign * roll * 100.0
             else:
                 pnl, pnl_pct = sp, sp_pct
+            # Scale exactly once, here, at the first point these become this
+            # leg's FINAL P&L (points x lots). Everything downstream —
+            # leg_pnl_total/leg_pnl_pct_total, Combined Net P&L{,%}, and the
+            # summary sum_leg_pnl/sum_combined_pnl accumulators — only SUMS
+            # these already-scaled values; do not re-multiply them by lots.
+            pnl *= lots
+            pnl_pct *= lots
             leg_pnl_total += pnl
             leg_pnl_pct_total += pnl_pct
             # MAE/MFE on the leg's price path: carry-adjusted (Hypo) OHLC for
-            # hypothetical mode, raw OHLC for spot mode.
+            # hypothetical mode, raw OHLC for spot mode. _leg_mae_mfe() returns
+            # a plain unscaled ratio (may gain other callers later) — scale by
+            # THIS leg's lots once, here at the call site, matching the write-
+            # site convention in multi_index_feature.py. This keeps "Midcap
+            # MAE"/"Midcap MFE" commensurate with the already lot-scaled NIFTY
+            # MAE/MFE that summary_metrics.rs:399 pairs them with (nm1 = Midcap
+            # MFE + NIFTY MAE, nm2 = Midcap MAE + NIFTY MFE).
             mae_pct, mfe_pct = _leg_mae_mfe(
                 lookup, entry, midcap_exit, entry_iso, midcap_exit_iso, spot_entry, position, cost
             )
+            mae_pct *= lots
+            mfe_pct *= lots
             total_mae += mae_pct
             total_mfe += mfe_pct
 
