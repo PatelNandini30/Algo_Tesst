@@ -127,6 +127,101 @@ class TestOverlayMaeMfeScalesByLots(unittest.TestCase):
         self.assertAlmostEqual(rows["FUT"]["MFE"], 6.0, places=6)
 
 
+class TestOverlayPnlScalesByLotsMatchingMae(unittest.TestCase):
+    """Task 7d fix: the reviewer-flagged bug was MAE/MFE scaled by lots at
+    :1554 while Net/CE/PE/FUT P&L on the SAME row (built at :1300 futures /
+    :1455 options) stayed at 1x — a row carrying 2x MAE against 1x P&L.
+    P&L must scale by that leg's OWN lots, exactly like MAE/MFE, so the two
+    stay commensurate (both x lots, at the same factor)."""
+
+    def _run(self, opt_lots: int, fut_lots: int) -> dict:
+        from services import multi_index_feature as mif
+
+        overlay_legs = [
+            {
+                "segment": "OPTIONS", "option_type": "CE", "position": "SELL",
+                "lots": opt_lots, "index": "NIFTY", "expiry": "MONTHLY",
+                "strike_interval": 50,
+                "strike_selection": {"type": "strike_type", "strike_type": "ATM"},
+            },
+            {
+                "segment": "FUTURES", "position": "BUY",
+                "lots": fut_lots, "index": "NIFTY", "expiry": "MONTHLY",
+            },
+        ]
+
+        with (
+            mock.patch.object(mif, "_data_expiries", return_value=["2024-01-04"]),
+            mock.patch.object(mif, "_fut_illiquid_days", return_value=set()),
+            mock.patch("base.get_trading_calendar",
+                       side_effect=RuntimeError("no calendar in unit test")),
+            mock.patch("services.futures_cache_store.ensure_futures_loaded"),
+            mock.patch("services.rust_fast_path.ensure_symbol_merged"),
+            mock.patch("services.rust_fast_path.get_spot_price", return_value=21500.0),
+            mock.patch(
+                "services.rust_fast_path.get_future_price",
+                side_effect=lambda sym, day, exp: 21600.0 if day == "2024-01-04" else 21500.0,
+            ),
+            mock.patch(
+                "services.rust_fast_path.get_option_price",
+                side_effect=lambda day, sym, strike, opt, exp: 90.0 if day == "2024-01-04" else 150.0,
+            ),
+            mock.patch(
+                "engines.generic_algotest_engine._calculate_leg_mae_mfe",
+                return_value=(8.0, 5.0),
+            ),
+            mock.patch(
+                "services.engine_rust._fut_leg_mae_mfe",
+                return_value=(6.0, 3.0),
+            ),
+        ):
+            rows = mif._overlay_legs_onto_base(
+                _base_df(), overlay_legs, "NIFTY", "2024-01-01", "2024-01-04",
+            )
+        self.assertEqual(len(rows), 2)
+        return {r["Type"]: r for r in rows}
+
+    def test_lots_1_pnl_matches_raw_points(self):
+        """lots=1: unscaled points, no-op multiplication (byte-identical)."""
+        rows = self._run(opt_lots=1, fut_lots=1)
+        # CE SELL: entry 150.0 -> exit 90.0 => pnl = 150 - 90 = 60
+        self.assertAlmostEqual(rows["CE"]["Net P&L"], 60.0, places=6)
+        self.assertAlmostEqual(rows["CE"]["CE P&L"], 60.0, places=6)
+        # FUT BUY: entry 21500.0 -> exit 21600.0 => pnl = 21600 - 21500 = 100
+        self.assertAlmostEqual(rows["FUT"]["Net P&L"], 100.0, places=6)
+        self.assertAlmostEqual(rows["FUT"]["FUT P&L"], 100.0, places=6)
+
+    def test_each_leg_pnl_scales_by_its_own_lots(self):
+        """3x2 spread mirrors the MAE/MFE test: CE P&L = 60*3=180,
+        FUT P&L = 100*2=200 — not lots**2, not cross-leg."""
+        rows = self._run(opt_lots=3, fut_lots=2)
+        self.assertAlmostEqual(rows["CE"]["Net P&L"], 180.0, places=6)
+        self.assertAlmostEqual(rows["FUT"]["Net P&L"], 200.0, places=6)
+
+    def test_pnl_and_mae_scale_by_the_SAME_lots_factor(self):
+        """The actual bug: MAE/lots-ratio and P&L/points-ratio must agree on
+        the multiplier applied to each row so the row is internally
+        consistent (both x lots, never one x1 and the other xlots)."""
+        rows = self._run(opt_lots=3, fut_lots=2)
+        ce_pnl_factor = rows["CE"]["Net P&L"] / 60.0     # raw CE points = 60
+        ce_mae_factor = rows["CE"]["MAE"] / 8.0           # raw CE MAE ratio = 8.0
+        self.assertAlmostEqual(ce_pnl_factor, ce_mae_factor, places=6)
+        self.assertAlmostEqual(ce_pnl_factor, 3.0, places=6)  # == opt_lots
+
+        fut_pnl_factor = rows["FUT"]["Net P&L"] / 100.0   # raw FUT points = 100
+        fut_mae_factor = rows["FUT"]["MAE"] / 6.0          # raw FUT MAE ratio = 6.0
+        self.assertAlmostEqual(fut_pnl_factor, fut_mae_factor, places=6)
+        self.assertAlmostEqual(fut_pnl_factor, 2.0, places=6)  # == fut_lots
+
+    def test_rows_carry_explicit_lots_key(self):
+        """Downstream (routers/backtest.py charges recalc) must read an
+        explicit `lots` off the row instead of guessing from Qty/lot_size or
+        misreading `Index` (a trade number here, not a symbol)."""
+        rows = self._run(opt_lots=3, fut_lots=2)
+        self.assertEqual(rows["CE"]["lots"], 3)
+        self.assertEqual(rows["FUT"]["lots"], 2)
+
+
 class TestOverlayBlankRowMaeMfeStayNone(unittest.TestCase):
     """Audit finding for :1516 — a leg priced off a non-trading bar (stale
     close) blanks the whole row including MAE/MFE = None. There is no ratio

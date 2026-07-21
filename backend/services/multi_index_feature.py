@@ -213,8 +213,12 @@ def _price_futures_group(
                 pos = "BUY" if pos.startswith("B") else "SELL"
                 lots = int(leg.get("lots") or leg.get("lot") or 1)
                 lot_size = int(get_lot_size_for_index(symbol, entry_day))
-                # P&L per unit (matches the engine's per-share convention).
-                pnl = round((xp - ep) if pos == "BUY" else (ep - xp), 2)
+                # P&L = points x THIS leg's own lots (lot_size excluded), same
+                # convention as _overlay_legs_onto_base's futures/options branches.
+                # NOTE: `_price_futures_group` currently has no call sites in the
+                # repo (audited 2026-07-21) — fixed here anyway so it isn't a
+                # live landmine if it is ever wired up.
+                pnl = round(((xp - ep) if pos == "BUY" else (ep - xp)) * lots, 2)
                 es = float(entry_spot) if entry_spot else ep
                 xs = float(exit_spot) if exit_spot else xp
                 leg_no += 1
@@ -1297,7 +1301,12 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                         continue
                     ep_raw, xp_raw = round(float(ep), 2), round(float(xp), 2)
                     ep, xp = _slip(ep_raw, xp_raw, pos)
-                    pnl = round((xp - ep) if pos == "BUY" else (ep - xp), 2)
+                    # P&L = points x THIS leg's own lots (lot_size excluded — see
+                    # the MAE/MFE scaling note below at the row-write site, and
+                    # services/algotest_job.py for the same convention). Was left
+                    # at 1x while MAE/MFE on this same row were scaled by `lots`,
+                    # so a row carried 2x MAE against 1x P&L.
+                    pnl = round(((xp - ep) if pos == "BUY" else (ep - xp)) * lots, 2)
                     typ, strike, ce, pe, fut = "FUT", "", 0.0, 0.0, pnl
                     # DATA GUARD: if the chosen contract DID NOT TRADE on entry and/or
                     # exit (contracts=0 -> `close` is a stale carry-forward, e.g.
@@ -1452,7 +1461,9 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                         )
                     ep_raw, xp_raw = round(float(ep), 2), round(float(xp), 2)
                     ep, xp = _slip(ep_raw, xp_raw, pos)
-                    pnl = round((xp - ep) if pos == "BUY" else (ep - xp), 2)
+                    # P&L = points x THIS leg's own lots — same convention/reason
+                    # as the futures branch above.
+                    pnl = round(((xp - ep) if pos == "BUY" else (ep - xp)) * lots, 2)
                     typ = opt
                     # Straddle-width context for THIS index. The base leg gets these
                     # from engine_rust; an overlay leg on another index was left blank,
@@ -1510,6 +1521,7 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                         "Index": int(tid),
                         "Entry Date": entry_dt, "Exit Date": exit_dt, "Expiry": contract,
                         "Type": typ, "Strike": strike if not is_fut else "", "B/S": pos,
+                        "lots": lots,
                         "Qty": lots * lot_size, "Entry Price": None, "Exit Price": None,
                         "Entry Spot": round(es, 2), "Exit Spot": round(xs, 2),
                         "CE P&L": None, "PE P&L": None, "FUT P&L": None, "Net P&L": None,
@@ -1530,6 +1542,14 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     "Index": int(tid),
                     "Entry Date": entry_dt, "Exit Date": exit_dt, "Expiry": contract,
                     "Type": typ, "Strike": strike if not is_fut else "", "B/S": pos,
+                    # Explicit lots so downstream consumers (e.g. the charges
+                    # recalc fallback in routers/backtest.py) never have to
+                    # derive it from Qty/lot_size or misread "Index" — on THIS
+                    # row "Index" is the numeric trade id (see `int(tid)` above
+                    # and run_multi_index_feature's `combined["Index"] =
+                    # combined["Trade"]`), not a symbol, so a lot_size lookup
+                    # keyed off it would silently be bogus.
+                    "lots": lots,
                     "Qty": lots * lot_size, "Entry Price": ep, "Exit Price": xp,
                     "Raw Entry Price": ep_raw, "Raw Exit Price": xp_raw,
                     "Entry Spot": round(es, 2), "Exit Spot": round(xs, 2),
@@ -2015,7 +2035,10 @@ def run_sync_weekly_cadence(
     # Each leg row already carries its OWN "% P&L" = leg P&L / that leg's own-index
     # Entry Spot (CE ÷ NIFTY spot, FUT ÷ MIDCPNIFTY spot). The combined trade return
     # is the SUM of those per-leg %s (option %P&L + future %P&L), NOT Net points ÷ one
-    # index's spot. Net P&L stays the plain points sum (no lot multiplication).
+    # index's spot. Each per-leg CE/PE/FUT P&L fed into this sum (from base_df,
+    # the Rust engine, and from ov_rows, _overlay_legs_onto_base) is ALREADY
+    # lots-scaled per its own leg (points x that leg's lots) — Net P&L here is
+    # just their sum and must NOT be multiplied by lots again at this level.
     agg_spec = {"Entry Date": "first", "Exit Date": "first", "Entry Spot": "first",
                 "Exit Spot": "first", "Spot P&L": "first",
                 "CE P&L": "sum", "PE P&L": "sum", "FUT P&L": "sum", "% P&L": "sum"}
