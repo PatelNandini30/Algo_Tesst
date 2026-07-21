@@ -4403,8 +4403,20 @@ def run_rust_engine_pipeline(
     has_midcp_spot_adj = bool(_mn_sa_cfg_early.get("enabled")) and (
         (_maybe_float(_mn_sa_cfg_early.get("pct")) or 0) > 0
     )
+    # Per-leg spot adjustment also needs the risk/re-entry pass below. Without
+    # this a payload whose adjustment lives ONLY on the legs takes the no-risk
+    # early return and produces zero triggers — the same failure the MIDCPNIFTY
+    # clause above documents.
+    _has_leg_spot_adj_early = any(
+        isinstance(_l, dict)
+        and isinstance(_l.get("spot_adjustment"), dict)
+        and _l["spot_adjustment"].get("enabled")
+        and (_maybe_float(_l["spot_adjustment"].get("pct")) or 0) > 0
+        for _l in legs_src
+    )
     if (not any_risk and not has_overall_top and not has_spot_adj
-            and not has_midcap_spot_adj and not has_midcp_spot_adj):
+            and not has_midcap_spot_adj and not has_midcp_spot_adj
+            and not _has_leg_spot_adj_early):
         # No risk controls → priced output is the final answer. Tag the LAST
         # trade of each filter patch as FILTER_END (the user's rule), not just
         # the (entry,expiry)-clamped trade — so a boundary trade that expired
@@ -4458,6 +4470,39 @@ def run_rust_engine_pipeline(
     # Mirror Python's clamp: pct in [0.25, 5.0] when enabled.
     if spot_adj_enabled and spot_adj_pct > 0 and spot_adj_units == "percent":
         spot_adj_pct = max(0.25, min(5.0, spot_adj_pct))
+
+    # ── Per-leg spot adjustment (additive; gated on each leg's own config) ─────
+    # A leg carrying spot_adjustment={enabled,pct,direction,units} measures its
+    # OWN breach with those values; a leg without one falls back to the
+    # strategy-level values above. This ADDS a scope, it does not replace the
+    # strategy-level knob — a payload with no per-leg config resolves every leg
+    # to the strategy values and the trigger scan below is bit-for-bit the old
+    # one. Lets e.g. a weekly CE leg adjust on 2% while a yearly PE leg adjusts
+    # on 300 points.
+    def _resolve_leg_sa(_lg: Any) -> Optional[Dict[str, Any]]:
+        _c = (_lg or {}).get("spot_adjustment") if isinstance(_lg, dict) else None
+        if not isinstance(_c, dict) or not _c.get("enabled"):
+            return None
+        _p = _maybe_float(_c.get("pct")) or 0.0
+        if _p <= 0:
+            return None
+        _u = str(_c.get("units") or "percent").lower()
+        if _u not in ("percent", "points"):
+            _u = "percent"
+        _d = str(_c.get("direction") or "rise").lower()
+        if _d not in ("rise", "fall", "both"):
+            _d = "rise"
+        if _u == "percent":
+            _p = max(0.25, min(5.0, _p))  # same clamp as the strategy-level knob
+        return {"pct": _p, "units": _u, "direction": _d}
+
+    _per_leg_sa: Dict[int, Dict[str, Any]] = {}
+    for _li, _lg in enumerate(legs_src, start=1):
+        _r = _resolve_leg_sa(_lg)
+        if _r is not None:
+            _per_leg_sa[_li] = _r
+    # When empty, every code path below takes its original branch untouched.
+    _has_per_leg_sa = bool(_per_leg_sa)
 
     # ── Midcap cross-index spot adjustment (additive; gated on its own config) ──
     # Same exit-trigger + same-day re-entry logic as the NIFTY spot adjustment,
@@ -4612,13 +4657,87 @@ def run_rust_engine_pipeline(
                         if _new_base_sa and _new_base_sa > 0:
                             _seg_base_sa = _new_base_sa
 
+    # ── Per-leg spot-adj baseline ─────────────────────────────────────────────
+    # Each configured leg measures from ITS OWN contract cycle, not from every
+    # trade's entry:
+    #   · a YEARLY leg holds one pinned December/March contract across many
+    #     cadence trades, so its reference is the spot at that CYCLE's first
+    #     entry, carried through the cycle and re-based whenever the leg itself
+    #     breaches (a 300-point move is measured against where the contract was
+    #     opened, not against last week's re-book).
+    #   · any other leg re-books every cadence trade, so its reference is that
+    #     trade's own entry spot — today's behaviour.
+    # Mirrors the existing _trade_adj_baseline carry/re-base shape, with the
+    # window being the yearly cycle instead of the filter segment. Skipped
+    # entirely when no leg carries its own config.
+    _leg_adj_baseline: Dict[Tuple[int, int], float] = {}
+    if _has_per_leg_sa:
+        _tid_entry_pl: Dict[int, str] = {
+            tid: _normalize_iso(lg[0]["entry_date"])
+            for tid, lg in by_trade.items() if lg
+        }
+        _tids_pl = sorted(_tid_entry_pl, key=lambda t: _tid_entry_pl[t])
+
+        def _cycle_containing(_d: str) -> Optional[Dict[str, str]]:
+            for _c in (_yearly_cycles or []):
+                if str(_c.get("start")) <= _d < str(_c.get("end")):
+                    return _c
+            return None
+
+        for _leg_id, _lcfg in _per_leg_sa.items():
+            _lg_src = legs_src[_leg_id - 1] if 0 <= _leg_id - 1 < len(legs_src) else {}
+            _leg_yearly = str((_lg_src or {}).get("expiry") or "").upper() == "YEARLY"
+            _cyc_base: Dict[str, float] = {}
+            for _tid in _tids_pl:
+                _e_iso = _tid_entry_pl[_tid]
+                _own_spot = float(
+                    by_trade[_tid][0].get("entry_spot") or spot_by_date.get(_e_iso) or 0.0
+                )
+                if not (_leg_yearly and _yearly_cycles):
+                    _leg_adj_baseline[(_tid, _leg_id)] = _own_spot
+                    continue
+                _cyc = _cycle_containing(_e_iso)
+                _ckey = str((_cyc or {}).get("contract") or "")
+                _base = _cyc_base.get(_ckey)
+                if _base is None or _base <= 0:
+                    _base = _own_spot
+                _leg_adj_baseline[(_tid, _leg_id)] = _base
+                # If this leg breaches inside this trade, the rest of the cycle
+                # measures from the trigger spot (same rule as _trade_adj_baseline).
+                _sched_pl = _normalize_iso(by_trade[_tid][0].get("exit_date") or "")
+                if _sched_pl and _base > 0:
+                    _t_pl = _compute_spot_adjustment_trigger(
+                        _e_iso, _base, _sched_pl,
+                        _lcfg["direction"], _lcfg["pct"], _lcfg["units"],
+                        trading_days, spot_by_date,
+                    )
+                    if _t_pl:
+                        _nb = spot_by_date.get(_t_pl)
+                        if _nb and _nb > 0:
+                            _base = _nb
+                _cyc_base[_ckey] = _base
+
     spot_adj_overrides: Dict[int, str] = {}
     spot_adj_reasons: Dict[int, str] = {}
     _nifty_active = bool(spot_adj_enabled and spot_adj_pct > 0)
+    # The strategy-level scan still covers every leg that has NO config of its
+    # own. If every leg brought its own, the strategy-level knob no longer has a
+    # leg to speak for and must not fire. With no per-leg config at all this is
+    # exactly `_nifty_active`, so the existing path is untouched.
+    _legs_without_own_sa = [
+        _i for _i in range(1, len(legs_src) + 1) if _i not in _per_leg_sa
+    ]
+    _strategy_scope_active = bool(
+        _nifty_active and (not _has_per_leg_sa or _legs_without_own_sa)
+    )
     # Confirm mode only engages when BOTH adjustments are active AND the user chose
     # it. Otherwise everything below falls through to the existing earliest path.
     _confirm_mode = bool(_combine_mode == "confirm" and _nifty_active and _midcap_active)
-    if _nifty_active or _midcap_active or _midcp_active:
+    # `_has_per_leg_sa` admits a payload where ONLY legs carry a config and the
+    # strategy-level knob is off — without it the scan is skipped and per-leg
+    # breaches never compute. False when no leg has one, so this is a no-op for
+    # every existing payload.
+    if _nifty_active or _midcap_active or _midcp_active or _has_per_leg_sa:
         for trade_id, legs in by_trade.items():
             legs.sort(key=lambda r: r["leg_id"])
             first = legs[0]
@@ -4630,7 +4749,7 @@ def run_rust_engine_pipeline(
             # NIFTY-index breach (unchanged path).
             nifty_trig = None
             entry_spot = 0.0
-            if _nifty_active:
+            if _strategy_scope_active:
                 entry_spot = (
                     _trade_adj_baseline[trade_id]
                     if trade_id in _trade_adj_baseline
@@ -4642,6 +4761,22 @@ def run_rust_engine_pipeline(
                         spot_adj_direction, spot_adj_pct, spot_adj_units,
                         trading_days, spot_by_date,
                     )
+
+            # Per-leg breaches (additive). Each configured leg scans the SAME
+            # spot series with its own threshold/unit/direction, measured from
+            # its own baseline. Empty unless some leg carries a config.
+            _leg_trigs: List[Tuple[str, int]] = []
+            for _leg_id, _lcfg in _per_leg_sa.items():
+                _lbase = _leg_adj_baseline.get((trade_id, _leg_id), 0.0)
+                if _lbase <= 0:
+                    continue
+                _ltrig = _compute_spot_adjustment_trigger(
+                    entry_iso, _lbase, scheduled_exit,
+                    _lcfg["direction"], _lcfg["pct"], _lcfg["units"],
+                    trading_days, spot_by_date,
+                )
+                if _ltrig:
+                    _leg_trigs.append((_ltrig, _leg_id))
 
             # Midcap-index breach (additive — measured on NIFTYMIDCAP100, but it
             # truncates the SAME trade so the existing re-entry chain re-enters
@@ -4703,10 +4838,25 @@ def run_rust_engine_pipeline(
                     _cands.append((midcap_trig, "MIDCAP"))
                 if midcp_trig:
                     _cands.append((midcp_trig, "MIDCPNIFTY"))
+                # Per-leg breaches join the same earliest-wins compare. Appended
+                # last so an index source keeps the existing tie-break; the list
+                # is empty without per-leg config, leaving min() untouched.
+                for _lt, _lid in _leg_trigs:
+                    _cands.append((_lt, "LEG%d" % _lid))
                 if _cands:
                     _win_date, _win_src = min(_cands, key=lambda c: c[0])
                     spot_adj_overrides[trade_id] = _win_date
-                    if _win_src == "NIFTY":
+                    if _win_src.startswith("LEG"):
+                        _wl = int(_win_src[3:])
+                        _wcfg = _per_leg_sa.get(_wl) or {}
+                        spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
+                            _wcfg.get("direction") or "rise",
+                            _leg_adj_baseline.get((trade_id, _wl), 0.0),
+                            spot_by_date.get(_win_date),
+                            _wcfg.get("pct") or 0.0,
+                            _wcfg.get("units") or "percent",
+                        )
+                    elif _win_src == "NIFTY":
                         spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
                             spot_adj_direction, entry_spot, spot_by_date.get(_win_date),
                             spot_adj_pct, spot_adj_units,

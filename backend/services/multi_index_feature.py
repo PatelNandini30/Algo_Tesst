@@ -1215,6 +1215,7 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
         # the base leg's month, because doing so pushed legs off live contracts (the
         # MIDCP 30-Dec-2024 future and the NIFTY 28-Nov-2024 / 30-Apr-2025 weeklies).
         _floor_month = None
+        _sw_ctx_cache: Dict[tuple, Any] = {}   # memo for _atm_straddle_prices
         for sym, slegs in by_sym.items():
             cfg = get_index_config(sym)
             # This index's NATIVE listing step (NIFTY 50 / BANKNIFTY 100 /
@@ -1266,6 +1267,23 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                 if interval <= 0:
                     interval = _idx_interval
                 _mae = _mfe = 0.0
+                _sw_ctx: Dict[str, Any] = {}
+                # PER-LEG SLIPPAGE. The base engine applies each leg's own
+                # slippage_pct (_leg_slippage_pct / _apply_per_leg_slippage in
+                # engine_rust); the overlay path never did, so a MIDCPNIFTY leg
+                # traded at raw close regardless of what the user set. Same sign
+                # convention as the base: a SELL gets LESS on entry and pays MORE
+                # on exit; a BUY the reverse.
+                try:
+                    _leg_slip = max(0.0, float(leg.get("slippage_pct") or 0.0))
+                except (TypeError, ValueError):
+                    _leg_slip = 0.0
+                def _slip(_e, _x, _p, _s=_leg_slip):
+                    if _s <= 0:
+                        return _e, _x
+                    _ef = (1.0 - _s / 100.0) if _p == "SELL" else (1.0 + _s / 100.0)
+                    _xf = (1.0 + _s / 100.0) if _p == "SELL" else (1.0 - _s / 100.0)
+                    return (round(max(_e * _ef, 0.0), 2), round(max(_x * _xf, 0.0), 2))
                 _blank_reason = None      # set when a leg is priced off a non-trading bar
                 _shift_reason = ""        # set when the strike walk moved the strike
                 if is_fut:
@@ -1277,7 +1295,8 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     xp = rf.get_future_price(sym, exit_iso, contract)
                     if ep is None or xp is None:
                         continue
-                    ep, xp = round(float(ep), 2), round(float(xp), 2)
+                    ep_raw, xp_raw = round(float(ep), 2), round(float(xp), 2)
+                    ep, xp = _slip(ep_raw, xp_raw, pos)
                     pnl = round((xp - ep) if pos == "BUY" else (ep - xp), 2)
                     typ, strike, ce, pe, fut = "FUT", "", 0.0, 0.0, pnl
                     # DATA GUARD: if the chosen contract DID NOT TRADE on entry and/or
@@ -1431,9 +1450,31 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                             f"{_f(base_strike)}→{_f(strike)} "
                             f"({_cause}, {_steps} step{'s' if _steps != 1 else ''} {_dir})"
                         )
-                    ep, xp = round(float(ep), 2), round(float(xp), 2)
+                    ep_raw, xp_raw = round(float(ep), 2), round(float(xp), 2)
+                    ep, xp = _slip(ep_raw, xp_raw, pos)
                     pnl = round((xp - ep) if pos == "BUY" else (ep - xp), 2)
                     typ = opt
+                    # Straddle-width context for THIS index. The base leg gets these
+                    # from engine_rust; an overlay leg on another index was left blank,
+                    # so a MIDCPNIFTY straddle-width leg showed no ATM strike/CE/PE at
+                    # all. Same helper the base path uses, so the liquidity check and
+                    # gap-widening fallback are identical — it re-reads the very prices
+                    # the strike selection used, never a stale zero-turnover close.
+                    # Written on the leg's OWN row (not leg 1) because this is that
+                    # index's ATM, not the trade's.
+                    if _needs_chain and _sel_type == "straddle_width":
+                        try:
+                            import algotest_native as _an
+                            from services.engine_rust import _atm_straddle_prices as _asp
+                            _a = _asp(_an, _sw_ctx_cache, entry_iso, sym,
+                                      float(espot), float(interval), contract)
+                            if _a is not None:
+                                _sw_ctx = {"ATM Strike": _a[0], "ATM Call Price": _a[1],
+                                           "ATM Put Price": _a[2], "ATM Call+Put Price": _a[3]}
+                                if _a[4]:
+                                    _sw_ctx["ATM Straddle Price Source"] = _a[4]
+                        except Exception as _ax:
+                            logger.debug("[MULTI_INDEX] %s ATM straddle context skipped: %s", sym, _ax)
                     ce = pnl if opt == "CE" else 0.0
                     pe = pnl if opt == "PE" else 0.0
                     fut = 0.0
@@ -1490,9 +1531,17 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     "Entry Date": entry_dt, "Exit Date": exit_dt, "Expiry": contract,
                     "Type": typ, "Strike": strike if not is_fut else "", "B/S": pos,
                     "Qty": lots * lot_size, "Entry Price": ep, "Exit Price": xp,
+                    "Raw Entry Price": ep_raw, "Raw Exit Price": xp_raw,
                     "Entry Spot": round(es, 2), "Exit Spot": round(xs, 2),
+                    # This index's OWN spot move over the hold. Was blank on overlay
+                    # rows while the base leg showed it, so a MIDCPNIFTY leg gave no
+                    # indication of what its underlying did. "Spot P&L %" is NOT
+                    # stored — excel_builder derives it as Spot P&L / Entry Spot on
+                    # each row, which for this row is MIDCPNIFTY's own spot.
+                    "Spot P&L": round(xs - es, 2) if (es and xs) else 0.0,
                     "CE P&L": ce, "PE P&L": pe, "FUT P&L": fut, "Net P&L": pnl,
                     "% P&L": round(pnl / es * 100.0, 4) if es else 0.0,
+                    **_sw_ctx,
                     "Exit Reason": "OVERLAY", "MAE": _mae, "MFE": _mfe,
                     "Strike Shift Reason": _shift_reason,
                     "Group Index": sym,
@@ -2059,7 +2108,15 @@ def run_sync_weekly_cadence(
     for _, row in combined.iterrows():
         tid = int(row["Trade"])
         if tid in seen:
-            cc.append(None); pc.append(None); dc.append(None); pdc.append(None); sc.append(None)
+            cc.append(None); pc.append(None); dc.append(None); pdc.append(None)
+            # Spot P&L is normally a TRADE-level fact carried on leg 1 only, so
+            # leg 2+ is blanked. But a multi-index overlay leg trades a DIFFERENT
+            # underlying — its own spot move is its own fact, not a duplicate of
+            # leg 1's. Keep it for overlay rows; base-engine leg 2+ rows (same
+            # index, Spot P&L 0.0) stay blank exactly as before.
+            _ov = str(row.get("Exit Reason") or "").upper() == "OVERLAY"
+            _rs = row.get("Spot P&L")
+            sc.append(_rs if (_ov and _rs is not None and pd.notna(_rs)) else None)
             npc.append(row.get("Net P&L")); ppc.append(row.get("% P&L"))
             continue
         seen.add(tid)

@@ -979,6 +979,14 @@ const StrategyBuilder = () => {
     // Midcap100 cross-index overlay leg (segment === 'midcap100'):
     midcap_mode: 'hypothetical',     // 'spot' | 'hypothetical'
     cost_pct_per_month: 0.5,         // carry cost for hypothetical mode
+    // Per-leg spot adjustment. OFF by default, in which case the leg follows
+    // the strategy-level Spot Adjustment exactly as before. Switched on, this
+    // leg measures its own breach with its own threshold/unit/direction — so a
+    // weekly leg can adjust on 2% while a yearly leg adjusts on 300 points.
+    spot_adj_enabled: false,
+    spot_adj_value: 2,
+    spot_adj_units: 'percent',       // 'percent' | 'points'
+    spot_adj_direction: 'rise',      // 'rise' | 'fall' | 'both'
   });
 
   useEffect(() => {
@@ -2087,6 +2095,26 @@ const StrategyBuilder = () => {
           ? String(l.expiry || _legCfg.defaultOptionExpiry || 'monthly').toUpperCase()
           : (_legMonthlyOnly ? 'MONTHLY' : normalizeExpiryForIndex(l.expiry, _legIdx, 'options', expiryBasis).toUpperCase());
         leg.strike_interval = _legInterval;
+        // Per-leg spot adjustment. Emitted ONLY when the leg opts in, so a
+        // strategy that never touches this control sends a byte-identical
+        // payload and the backend resolves every leg to the strategy-level
+        // values exactly as before.
+        if (l.spot_adj_enabled) {
+          const _saUnits = l.spot_adj_units === 'points' ? 'points' : 'percent';
+          const _saRaw = Number(l.spot_adj_value) || 0;
+          leg.spot_adjustment = {
+            enabled: true,
+            // percent is clamped to the same [0.25, 5] band as the
+            // strategy-level knob; points is a free positive number.
+            pct: _saUnits === 'percent'
+              ? Math.min(5, Math.max(0.25, _saRaw))
+              : Math.max(0, _saRaw),
+            units: _saUnits,
+            direction: ['rise', 'fall', 'both'].includes(l.spot_adj_direction)
+              ? l.spot_adj_direction
+              : 'rise',
+          };
+        }
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
           strike_type: l.strike_type.toUpperCase(),
@@ -4340,6 +4368,56 @@ const StrategyBuilder = () => {
                                 ? 'Keep same strike across expiries'
                                 : 'Re-select strike each expiry'}
                             </span>
+                          </div>
+                        )}
+
+                        {/* Per-leg Spot Adjustment — only meaningful while the
+                            strategy-level Spot Adjustment section is in play.
+                            OFF leaves the leg on the strategy-level settings. */}
+                        {leg.segment === 'options' && (
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <Toggle
+                              enabled={Boolean(leg.spot_adj_enabled)}
+                              onToggle={(val) => updateLeg(leg.id, 'spot_adj_enabled', val !== undefined ? Boolean(val) : !leg.spot_adj_enabled)}
+                              size="sm"
+                            />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Own Spot Adj</span>
+                            {leg.spot_adj_enabled && (
+                              <>
+                                <input
+                                  type="number"
+                                  min={leg.spot_adj_units === 'points' ? 0 : 0.25}
+                                  step={leg.spot_adj_units === 'points' ? 25 : 0.25}
+                                  value={leg.spot_adj_value ?? 2}
+                                  onChange={e => updateLeg(leg.id, 'spot_adj_value', parseFloat(e.target.value) || 0)}
+                                  className="w-20 h-7 px-2 border border-default rounded text-xs text-center bg-surface"
+                                />
+                                <SegBtn
+                                  size="sm"
+                                  options={[{ value: 'percent', label: '%' }, { value: 'points', label: 'Points' }]}
+                                  value={leg.spot_adj_units || 'percent'}
+                                  onChange={v => updateLeg(leg.id, 'spot_adj_units', v)}
+                                />
+                                <SegBtn
+                                  size="sm"
+                                  options={[
+                                    { value: 'rise', label: 'Rise' },
+                                    { value: 'fall', label: 'Fall' },
+                                    { value: 'both', label: 'Both' },
+                                  ]}
+                                  value={leg.spot_adj_direction || 'rise'}
+                                  onChange={v => updateLeg(leg.id, 'spot_adj_direction', v)}
+                                />
+                                <span className="text-[10px] text-muted">
+                                  {String(leg.expiry || '').toLowerCase() === 'yearly'
+                                    ? 'measured from this contract cycle’s entry spot'
+                                    : 'measured from this trade’s entry spot'}
+                                </span>
+                              </>
+                            )}
+                            {!leg.spot_adj_enabled && (
+                              <span className="text-[10px] text-muted">Uses strategy-level Spot Adjustment</span>
+                            )}
                           </div>
                         )}
 
