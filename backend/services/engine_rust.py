@@ -1443,9 +1443,12 @@ def _build_futures_specs(
                 entry_price = round(float(entry_price_raw), 2)
                 exit_price = round(float(exit_price_raw), 2)
 
-            # P&L per unit — no lot_size multiplication (matches Python engine convention).
+            # P&L = POINTS x LOTS. lot_size is NOT a factor — it feeds only the
+            # display Qty column. Mirrors native/src/simulate.rs:1652.
+            _lots = float(leg.get("lots") or 1)
             net_pnl = round(
-                (entry_price - exit_price) if position == "SELL" else (exit_price - entry_price),
+                ((entry_price - exit_price) if position == "SELL" else (exit_price - entry_price))
+                * _lots,
                 4,
             )
 
@@ -2494,8 +2497,11 @@ def _build_fixed_entry_futures_specs(
                     entry_price = round(float(entry_price_raw), 2)
                     exit_price = round(float(exit_price_raw), 2)
 
+                # P&L = POINTS x LOTS (see native/src/simulate.rs:1652).
+                _lots = float(leg.get("lots") or 1)
                 net_pnl = round(
-                    (entry_price - exit_price) if position == "SELL" else (exit_price - entry_price),
+                    ((entry_price - exit_price) if position == "SELL" else (exit_price - entry_price))
+                    * _lots,
                     4,
                 )
 
@@ -3248,8 +3254,11 @@ def priced_to_tradesheet_records(
         entry_px = float(row.get("entry_price") or 0.0)
         exit_px = float(row.get("exit_price") or 0.0)
         is_fut = opt_type == "FUT"
+        # P&L = POINTS x LOTS (see native/src/simulate.rs:1652). Uses THIS leg's
+        # lots so ratio spreads (leg 1 = 2 lots, leg 2 = 1 lot) price correctly.
+        _leg_lots = float(row.get("lots") or 1)
         per_leg_pnl = round(
-            (entry_px - exit_px) if position == "SELL" else (exit_px - entry_px), 4
+            ((entry_px - exit_px) if position == "SELL" else (exit_px - entry_px)) * _leg_lots, 4
         )
         ce_pnl = per_leg_pnl if opt_type == "CE" else 0
         pe_pnl = per_leg_pnl if opt_type == "PE" else 0
@@ -3789,7 +3798,7 @@ def _build_mixed_futures_options(
         r["trade_id"] = _entry_to_tid[r["entry_date"]]
 
     # ── 5) Net-P&L convention (matches priced_to_tradesheet_records/simulate.rs) ─
-    # Per-leg P&L = (entry-exit) if SELL else (exit-entry), per UNIT (no lots/size).
+    # P&L is POINTS x LOTS (lot_size excluded — display Qty only).
     # The FIRST leg (lowest leg_id) of each trade carries the TRADE-TOTAL; other
     # legs carry their per-leg value. Recompute from PRICES so the merge is robust
     # to whatever net_pnl convention the recursive option rows arrived with.
@@ -6792,7 +6801,7 @@ def run_rust_engine_pipeline(
             adjusted_exit = round(adjusted_exit, 2)
             row["raw_exit_price"] = round(float(slb_price), 4)
             row["exit_price"] = round(float(adjusted_exit), 4)
-            # net_pnl is in PREMIUM POINTS, matching simulate_trades_batch (no qty multiply).
+            # P&L is POINTS x LOTS (lot_size excluded — display Qty only).
             per_leg_pnl_points = (entry_px - adjusted_exit) if position == "SELL" else (adjusted_exit - entry_px)
             row["net_pnl"] = round(float(per_leg_pnl_points), 4)
 

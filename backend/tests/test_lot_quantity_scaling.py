@@ -78,5 +78,59 @@ class TestRustNetPnlScalesWithLots(unittest.TestCase):
             self.assertEqual(b["exit_price"], a["exit_price"])
 
 
+class TestTradesheetRecordsScale(unittest.TestCase):
+    """priced_to_tradesheet_records must scale per-leg P&L by that leg's lots."""
+
+    def _rows(self, lots_leg1: int, lots_leg2: int) -> list:
+        return [
+            {
+                "trade_id": "1", "leg_id": 1, "index": "NIFTY",
+                "entry_date": "2024-01-01", "exit_date": "2024-01-04",
+                "expiry": "2024-01-04", "option_type": "CE", "strike": 21500.0,
+                "position": "SELL", "entry_price": 150.0, "exit_price": 90.0,
+                "entry_spot": 21500.0, "exit_spot": 21600.0,
+                "lots": lots_leg1, "lot_size": 65, "net_pnl": 60.0 * lots_leg1,
+            },
+            {
+                "trade_id": "1", "leg_id": 2, "index": "NIFTY",
+                "entry_date": "2024-01-01", "exit_date": "2024-01-04",
+                "expiry": "2024-01-04", "option_type": "PE", "strike": 21500.0,
+                "position": "SELL", "entry_price": 130.0, "exit_price": 145.0,
+                "entry_spot": 21500.0, "exit_spot": 21600.0,
+                "lots": lots_leg2, "lot_size": 65, "net_pnl": -15.0 * lots_leg2,
+            },
+        ]
+
+    def test_per_leg_pnl_scales_by_that_legs_lots(self):
+        from services.engine_rust import priced_to_tradesheet_records
+
+        recs = priced_to_tradesheet_records(self._rows(2, 1), {"index": "NIFTY"}, 65)
+
+        ce = next(r for r in recs if r["Type"] == "CE")
+        pe = next(r for r in recs if r["Type"] == "PE")
+
+        # CE: (150 - 90) x 2 lots = 120 ; PE: (130 - 145) x 1 lot = -15
+        self.assertAlmostEqual(ce["CE P&L"], 120.0, places=4)
+        self.assertAlmostEqual(pe["PE P&L"], -15.0, places=4)
+
+    def test_qty_is_lots_times_lot_size(self):
+        from services.engine_rust import priced_to_tradesheet_records
+
+        recs = priced_to_tradesheet_records(self._rows(2, 1), {"index": "NIFTY"}, 65)
+
+        ce = next(r for r in recs if r["Type"] == "CE")
+        pe = next(r for r in recs if r["Type"] == "PE")
+        self.assertEqual(ce["Qty"], 130)   # 2 lots x 65
+        self.assertEqual(pe["Qty"], 65)    # 1 lot  x 65
+
+    def test_prices_stay_per_unit(self):
+        from services.engine_rust import priced_to_tradesheet_records
+
+        recs = priced_to_tradesheet_records(self._rows(2, 1), {"index": "NIFTY"}, 65)
+        ce = next(r for r in recs if r["Type"] == "CE")
+        self.assertEqual(ce["Entry Price"], 150.0)
+        self.assertEqual(ce["Exit Price"], 90.0)
+
+
 if __name__ == "__main__":
     unittest.main()
