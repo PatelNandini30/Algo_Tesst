@@ -424,10 +424,19 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
                         exit_reason=rec.get("Exit Reason"),
                         exit_price=rec.get("Exit Price"),
                     )
+                # MAE/MFE must be commensurate with % P&L, which is now
+                # lots-scaled (points x lots). native/src/summary_metrics.rs:336
+                # compounds the NAV by % P&L while :362 applies MAE to that same
+                # NAV as prev_cum * (1 + mae/100) — leaving MAE unscaled would
+                # understate Live DD / Final MAE / Max DD by ~1/lots. Both
+                # branches above (FUT via _fut_leg_mae_mfe and CE/PE via
+                # _calculate_leg_mae_mfe) return a plain unscaled ratio, so
+                # scale once here by this record's own lots (lot_size excluded).
+                _rec_lots = int(rec.get("lots") or 1)
                 if mae_val is not None:
-                    rec["MAE"] = mae_val
+                    rec["MAE"] = mae_val * _rec_lots
                 if mfe_val is not None:
-                    rec["MFE"] = mfe_val
+                    rec["MFE"] = mfe_val * _rec_lots
         except Exception as _mae_exc:
             logger.warning("[MAE/MFE] Rust path computation failed (non-fatal): %s", _mae_exc)
 

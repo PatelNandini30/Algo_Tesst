@@ -423,5 +423,134 @@ class TestFuturesReentrySpecsScalesWithLots(unittest.TestCase):
         self.assertEqual(r2["exit_price"], r1["exit_price"])
 
 
+class TestTradesheetRecordCarriesLots(unittest.TestCase):
+    """Task 7a plumbing: priced_to_tradesheet_records must carry the row's own
+    lots in a "lots" key (beside "Qty"), so downstream MAE/MFE scaling sites
+    (algotest_job.py) can read it directly instead of re-deriving lots by
+    inverting Qty / lot_size. Also confirms the key cannot leak into Excel
+    output via excel_builder._build_key_order's explicit whitelist.
+    """
+
+    def _row(self, lots) -> dict:
+        row = {
+            "trade_id": "1", "leg_id": 1, "index": "NIFTY",
+            "entry_date": "2024-01-01", "exit_date": "2024-01-04",
+            "expiry": "2024-01-04", "option_type": "CE", "strike": 21500.0,
+            "position": "SELL", "entry_price": 150.0, "exit_price": 90.0,
+            "entry_spot": 21500.0, "exit_spot": 21600.0,
+            "lot_size": 65, "net_pnl": 60.0 * (lots or 1),
+        }
+        if lots is not None:
+            row["lots"] = lots
+        return row
+
+    def test_record_carries_lots_field(self):
+        from services.engine_rust import priced_to_tradesheet_records
+
+        recs = priced_to_tradesheet_records([self._row(3)], {"index": "NIFTY"}, 65)
+        self.assertEqual(recs[0]["lots"], 3)
+
+    def test_lots_defaults_to_1_when_missing(self):
+        from services.engine_rust import priced_to_tradesheet_records
+
+        recs = priced_to_tradesheet_records([self._row(None)], {"index": "NIFTY"}, 65)
+        self.assertEqual(recs[0]["lots"], 1)
+
+    def test_lots_key_cannot_leak_into_excel_key_order(self):
+        from services.engine_rust import priced_to_tradesheet_records
+        from services.optimizer.excel_builder import _build_key_order
+
+        recs = priced_to_tradesheet_records([self._row(2)], {"index": "NIFTY"}, 65)
+        self.assertIn("lots", recs[0])  # sanity: the key really is present
+
+        order, _has_calls, _has_puts, _has_futures = _build_key_order(recs, has_midcap=False)
+        self.assertNotIn("lots", order)
+
+
+class TestBacktestJobMaeMfeScalesByLots(unittest.TestCase):
+    """Task 7a: algotest_job.py's MAE/MFE write site (~:427-430) must scale
+    MAE/MFE by the record's own lots so they land in the same
+    leveraged-percentage unit as % P&L.
+
+    Why this matters: native/src/summary_metrics.rs:336 compounds the NAV by
+    % P&L (now lots-scaled) while :362 applies MAE to that same NAV as
+    prev_cum * (1 + mae/100). Leaving MAE unscaled understates Live DD /
+    Final MAE / Max DD by ~1/lots.
+
+    Drives the real backtest path (_try_rust_engine) against real NIFTY
+    Q1-2024 data, mirroring _EngineRustPipelineFixtureMixin's approach above —
+    the MAE/MFE scaling lives inside algotest_job.py's job orchestration, not
+    inside run_rust_engine_pipeline, so there is no lower-level seam to hook.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import algotest_native  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("algotest_native not installed in this environment")
+
+        snap_path = Path(__file__).parent / "parity" / "snapshots" / "single_leg_ce_atm_sell.json"
+        if not snap_path.exists():
+            raise unittest.SkipTest("snapshot single_leg_ce_atm_sell not captured yet")
+        cls._base_payload = json.loads(snap_path.read_text())["payload"]
+        cls._snap_trades = json.loads(snap_path.read_text())["trades"]
+
+        try:
+            from base import bulk_load_options
+            from services.algotest_job import _build_fast_lookup_from_bulk
+            bulk_load_options(
+                "NIFTY", cls._base_payload["from_date"], cls._base_payload["to_date"]
+            )
+            _build_fast_lookup_from_bulk(
+                "NIFTY", cls._base_payload["from_date"], cls._base_payload["to_date"]
+            )
+        except Exception as exc:
+            raise unittest.SkipTest(f"could not load market data: {exc}")
+
+    def _run(self, lots: int) -> list:
+        import unittest.mock as mock
+        from services.algotest_job import _try_rust_engine
+
+        payload = json.loads(json.dumps(self._base_payload))  # deep copy
+        payload["legs"][0]["lots"] = lots
+        with mock.patch.dict(os.environ, {"BACKTEST_INCLUDE_MAE_MFE": "1"}):
+            trades_df, _summary, _pivot = _try_rust_engine(
+                payload, "NIFTY", payload["from_date"], payload["to_date"],
+            )
+        self.assertIsNotNone(trades_df, "backtest path returned no trades — check market data")
+        self.assertFalse(trades_df.empty, "backtest path produced zero trades")
+        return trades_df.to_dict("records")
+
+    def test_mae_mfe_double_when_lots_double(self):
+        one = self._run(1)
+        two = self._run(2)
+        self.assertEqual(len(one), len(two))
+        for r1, r2 in zip(one, two):
+            with self.subTest(trade=r1.get("Trade"), leg=r1.get("Leg")):
+                self.assertAlmostEqual(float(r2["MAE"]), float(r1["MAE"]) * 2, places=3)
+                self.assertAlmostEqual(float(r2["MFE"]), float(r1["MFE"]) * 2, places=3)
+
+    def test_lots_1_mae_mfe_matches_pre_scaling_snapshot(self):
+        """lots=1 must stay byte-identical to the snapshot captured before
+        Task 7's scaling was applied."""
+        snap_by_trade_leg = {
+            (str(t["Trade"]), int(t["Leg"])): t for t in self._snap_trades
+        }
+
+        one = self._run(1)
+        matched = 0
+        for r in one:
+            key = (str(r.get("Trade")), int(r.get("Leg")))
+            snap_r = snap_by_trade_leg.get(key)
+            if snap_r is None:
+                continue
+            matched += 1
+            with self.subTest(trade=key):
+                self.assertAlmostEqual(float(r["MAE"]), float(snap_r["MAE"]), places=3)
+                self.assertAlmostEqual(float(r["MFE"]), float(snap_r["MFE"]), places=3)
+        self.assertGreater(matched, 0, "no rows matched the captured snapshot by (Trade, Leg)")
+
+
 if __name__ == "__main__":
     unittest.main()

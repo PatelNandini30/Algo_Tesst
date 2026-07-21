@@ -3268,7 +3268,8 @@ def priced_to_tradesheet_records(
         pe_pnl = per_leg_pnl if opt_type == "PE" else 0
         fut_pnl = per_leg_pnl if is_fut else 0
         pct_pnl = round(net_pnl / entry_spot * 100.0, 4) if entry_spot else 0.0
-        qty = int(row.get("lots") or 1) * int(row.get("lot_size") or lot_size or 1)
+        _row_lots_int = int(row.get("lots") or 1)
+        qty = _row_lots_int * int(row.get("lot_size") or lot_size or 1)
         # FUTURES: Strike = '' (matches Python engine convention); options: float.
         strike_val = "" if is_fut else float(row.get("strike") or 0.0)
         # Strike Shift Reason — populated whenever the engine moved the
@@ -3329,6 +3330,12 @@ def priced_to_tradesheet_records(
             "Strike": strike_val,
             "B/S": position,
             "Qty": qty,
+            # This row's own lots (lot_size excluded) — needed downstream to
+            # scale MAE/MFE into the same leveraged-percentage unit as % P&L
+            # (Task 7, see algotest_job.py MAE/MFE write site). Not part of
+            # excel_builder._build_key_order's explicit whitelist, so it never
+            # reaches Excel output.
+            "lots": _row_lots_int,
             "Entry Price": entry_px,
             "Exit Price": exit_px,
             "Raw Entry Price": float(row.get("raw_entry_price") or entry_px),

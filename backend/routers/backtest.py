@@ -317,22 +317,31 @@ def _recalculate_trade_prices(
             # ── Step 3: P&L = POINTS x LOTS ──────────────────────────────
             # Charges were already folded into the PER-UNIT prices above, so
             # the points difference is charge-correct; scale it by lots to
-            # match the engine (native/src/simulate.rs:1652). Qty is
-            # lots x lot_size, so lots = Qty / lot_size.
-            _row_index = row.get('Index')
-            if not _row_index:
-                # No Index on this row — rows from priced_to_tradesheet_records
-                # always carry one (set at engine_rust.py:3324), so this is a
-                # legacy/malformed-row guard. Don't guess NIFTY: a MIDCPNIFTY
-                # row (lot size 75) would silently divide by NIFTY's 65 and
-                # only "work" if rounding happens to land right. Fall back to
-                # lots=1 — a safe no-op that preserves pre-scaling behaviour.
-                _row_lots = 1
+            # match the engine (native/src/simulate.rs:1652). Rows from
+            # priced_to_tradesheet_records now carry an explicit "lots" key
+            # (engine_rust.py ~:3331) — read that directly rather than
+            # inverting the Qty display column (Qty = lots x lot_size, so
+            # dividing back out is lossy and, worse, guesses the wrong
+            # lot_size for any row whose Index is missing/blank). Only fall
+            # back to the Qty-derivation for legacy rows that predate the
+            # "lots" key.
+            _row_lots_val = row.get('lots')
+            if _row_lots_val is not None:
+                _row_lots = int(_row_lots_val) or 1
             else:
-                _row_lot_size = int(get_lot_size(_row_index, row.get('Entry Date')) or 1) or 1
-                _qty_raw = _normalize_recalc_numeric(row.get('Qty'))
-                _qty = float(_qty_raw) if _qty_raw and _qty_raw > 0 else float(_row_lot_size)
-                _row_lots = max(1, int(round(_qty / _row_lot_size)))
+                _row_index = row.get('Index')
+                if not _row_index:
+                    # No Index on this legacy row either — don't guess NIFTY: a
+                    # MIDCPNIFTY row (lot size 75) would silently divide by
+                    # NIFTY's 65 and only "work" if rounding happens to land
+                    # right. Fall back to lots=1 — a safe no-op that preserves
+                    # pre-scaling behaviour.
+                    _row_lots = 1
+                else:
+                    _row_lot_size = int(get_lot_size(_row_index, row.get('Entry Date')) or 1) or 1
+                    _qty_raw = _normalize_recalc_numeric(row.get('Qty'))
+                    _qty = float(_qty_raw) if _qty_raw and _qty_raw > 0 else float(_row_lot_size)
+                    _row_lots = max(1, int(round(_qty / _row_lot_size)))
             if position == 'BUY':
                 leg_pnl = (new_exit - new_entry) * _row_lots
             else:
