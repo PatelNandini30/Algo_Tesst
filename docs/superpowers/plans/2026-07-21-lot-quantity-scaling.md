@@ -1023,3 +1023,48 @@ git commit -m "test: add lot-quantity scaling and double-scaling gate"
 - [ ] Bump the engine cache-version hash if it did not pick up the changed files automatically (`backend/services/backtest_cache.py:58` lists the fingerprinted engine files). Stale Redis entries would otherwise serve pre-change tradesheets.
 - [ ] Restart Celery workers so they pick up the new `.py` files — **only after** confirming no jobs are running (`algotest:mem_gate` and the queues are empty).
 - [ ] Run `graphify update .` to refresh the knowledge graph.
+
+---
+
+## Task 7: Scale MAE/MFE by lots (added 2026-07-21 after review)
+
+**Why:** `summary_metrics.rs:336` compounds NAV by `% P&L` (now lots-scaled);
+`:362` applies `MAE` to that same NAV as `prev_cum * (1 + mae/100)`. With MAE
+unscaled, Live DD / Final MAE / Max DD understate drawdown by ~1/lots. Both are
+percentage multipliers on one equity curve and must be commensurate.
+
+**Rule:** `MAE` and `MFE` scale by the leg's own `lots`. `lot_size` excluded.
+
+**Design decision — scale at the COLUMN-WRITE sites, not inside the formulas.**
+Six functions compute MAE/MFE, but all of them land in the `MAE`/`MFE` columns,
+and every downstream metric (Net MAE 1/2, Final MAE, Live DD, Midcap MAE/MFE)
+derives from those columns. Scaling at the writes covers the Rust path without
+plumbing `lots` into `mae.rs`, and keeps the multiplier applied exactly once.
+
+**Plumbing:** add `"lots"` to the tradesheet record in
+`priced_to_tradesheet_records` (`engine_rust.py`, beside `"Qty"` at ~`:3331`).
+Verified safe: `excel_builder._build_key_order` (`:301`) is an explicit
+whitelist with no catch-all, so the key cannot leak into Excel output.
+
+**Sites to scale (all reachability-verified):**
+
+| # | Site | Reached via |
+|---|---|---|
+| A | `services/algotest_job.py:428-430` | live backtest job |
+| B | `services/optimizer/runner.py:1281-1282` (Rust batch pairs) | `routers/optimize.py:450` |
+| C | `services/optimizer/runner.py:1588-1589` (Python path) | `routers/optimize.py:436` |
+| D | `services/optimizer/runner.py:_apply_futures_mae_mfe` (`:1593`) | FUT rows overwrite |
+| E | `services/multi_index_feature.py:1545` | multi-index overlay |
+
+**Must NOT scale (would double-apply):**
+- `native/src/mae.rs` — stays a pure ratio; its output is scaled at site B
+- `native/src/summary_metrics.rs` Net MAE 1/2, Final MAE, Live DD — sums/derivations
+  of already-scaled MAE
+- Midcap workbook MAE/MFE — derives from scaled values
+
+**Also in scope:** replace the `Qty / lot_size` round-trip in
+`routers/backtest.py` (~`:322`) with the now-explicit `lots` key — resolves the
+reviewer's Important finding about inverting a display column.
+
+**Gate:** lots=1 byte-identical; lots=2 → MAE/MFE exactly 2×; Live DD and Max DD
+move correspondingly; three-way parity still passes.
