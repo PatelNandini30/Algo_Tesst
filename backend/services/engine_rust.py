@@ -4671,6 +4671,10 @@ def run_rust_engine_pipeline(
     # window being the yearly cycle instead of the filter segment. Skipped
     # entirely when no leg carries its own config.
     _leg_adj_baseline: Dict[Tuple[int, int], float] = {}
+    # NOTE: `_yearly_cycles` is a local of resolve_trade_specs_core, NOT of this
+    # function — read the cycles off the payload here, which is where this
+    # function gets them everywhere else (see the hard-fail guard at :3881).
+    _pl_cycles: List[Dict[str, str]] = list(payload.get("yearly_cycles") or [])
     if _has_per_leg_sa:
         _tid_entry_pl: Dict[int, str] = {
             tid: _normalize_iso(lg[0]["entry_date"])
@@ -4679,7 +4683,7 @@ def run_rust_engine_pipeline(
         _tids_pl = sorted(_tid_entry_pl, key=lambda t: _tid_entry_pl[t])
 
         def _cycle_containing(_d: str) -> Optional[Dict[str, str]]:
-            for _c in (_yearly_cycles or []):
+            for _c in (_pl_cycles or []):
                 if str(_c.get("start")) <= _d < str(_c.get("end")):
                     return _c
             return None
@@ -4693,7 +4697,7 @@ def run_rust_engine_pipeline(
                 _own_spot = float(
                     by_trade[_tid][0].get("entry_spot") or spot_by_date.get(_e_iso) or 0.0
                 )
-                if not (_leg_yearly and _yearly_cycles):
+                if not (_leg_yearly and _pl_cycles):
                     _leg_adj_baseline[(_tid, _leg_id)] = _own_spot
                     continue
                 _cyc = _cycle_containing(_e_iso)
