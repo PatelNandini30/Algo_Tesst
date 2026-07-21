@@ -63,3 +63,17 @@ Task 7 (MAE/MFE lot scaling): COMPLETE
   THREE-WAY PARITY GATE re-run after MAE change: PASS
   NOTE: original Task 6 gate asserted MAE/MFE were INVARIANT - it encoded the
   design error and passed. Corrected here.
+
+POST-FINAL-REVIEW FIXES + REBUILD #2 — ALL GATES GREEN
+  5db863a1 multi-index overlay P&L scaled (:1309/:1466; :221 dead-code also fixed)
+  b9361471 midcap_overlay.py (Python twin / parity ref) scaled
+  0a7c12b1 native/src/lib.rs compute_midcap_legs scaled  <-- THE LIVE MIDCAP PATH
+    (routers/backtest.py:990 is Rust-only, 503 not fallback; the Python fix alone
+     would NOT have reached production. 6th reachability miss of this branch.)
+  Gates after rebuild #2:
+    tests.test_lot_quantity_midcap_rust  6/6  (was 4/6 failing pre-rebuild)
+    all 4 lot-quantity suites            36/36
+    tools/mae_parity                     ALL PASS (82 rows, 0 diverging)
+    three-way summary parity gate        PASS
+    real-data NIFTY straddle 1v2 lot     PASS (P&L + MAE/MFE scale 2x, 2x1 spread
+                                         confirms x lots not lots^2)
