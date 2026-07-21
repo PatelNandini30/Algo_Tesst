@@ -1340,12 +1340,13 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
         tleg['exit_premium']    = adjusted_exit
         tleg['early_exit_date'] = leg_exit_date
         
-        # P&L in POINTS (no quantity multiplication)
+        # P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
+        _lots = int(tleg.get('lots', 1) or 1)
         if position == 'BUY':
-            tleg['pnl'] = adjusted_exit - ep
+            tleg['pnl'] = (adjusted_exit - ep) * _lots
         else:  # SELL
-            tleg['pnl'] = ep - adjusted_exit
-        
+            tleg['pnl'] = (ep - adjusted_exit) * _lots
+
         # Set CE P&L or PE P&L based on option type
         if tleg.get('option_type') in ('CE', 'CALL', 'C'):
             tleg['ce_pnl'] = tleg['pnl']
@@ -1369,12 +1370,13 @@ def _recalc_leg_pnl(tleg, leg_exit_date, index, expiry_date, lot_size, fallback_
         tleg['futures_expiry']  = check_expiry
         tleg['early_exit_date'] = leg_exit_date
         
-        # P&L in POINTS (no quantity multiplication)
+        # P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
+        _lots = int(tleg.get('lots', 1) or 1)
         if position == 'BUY':
-            tleg['pnl'] = adjusted_exit - ep
+            tleg['pnl'] = (adjusted_exit - ep) * _lots
         else:  # SELL
-            tleg['pnl'] = ep - adjusted_exit
-        
+            tleg['pnl'] = (ep - adjusted_exit) * _lots
+
         # No CE/PE for futures
         tleg['ce_pnl'] = 0
         tleg['pe_pnl'] = 0
@@ -1640,7 +1642,9 @@ def _execute_lazy_leg(
         fallback_spot = get_spot_price_from_db(exit_ts, index) or entry_spot
         raw_exit = calculate_intrinsic_value(spot=fallback_spot, strike=strike, option_type=option_type)
     exit_premium = _apply_slippage(raw_exit, position, 'exit', slippage_pct)
-    pnl = (exit_premium - entry_premium) if position == 'BUY' else (entry_premium - exit_premium)
+    # P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
+    pnl = ((exit_premium - entry_premium) if position == 'BUY'
+           else (entry_premium - exit_premium)) * lots
 
     lazy_leg = {
         'leg_number': 9000 + depth,
@@ -2136,7 +2140,10 @@ def _execute_per_leg_reentry(
             if raw_exit_fut is None:
                 raw_exit_fut = raw_entry_fut
             exit_price_fut = _apply_slippage(raw_exit_fut, position, 'exit', slippage_pct)
-            leg_pnl = (exit_price_fut - entry_price_fut) if position == 'BUY' else (entry_price_fut - exit_price_fut)
+            # P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
+            _lots = int(leg_config.get('lots', 1) or 1)
+            leg_pnl = ((exit_price_fut - entry_price_fut) if position == 'BUY'
+                       else (entry_price_fut - exit_price_fut)) * _lots
 
             re_leg = {
                 'leg_number': leg_config.get('leg_number', 1),
@@ -2263,7 +2270,10 @@ def _execute_per_leg_reentry(
                         f"on {actual_exit_date.strftime('%Y-%m-%d')} (spot={fallback_spot})"
                     )
             exit_premium = _apply_slippage(raw_exit, position, 'exit', slippage_pct)
-            leg_pnl = (exit_premium - entry_premium) if position == 'BUY' else (entry_premium - exit_premium)
+            # P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
+            _lots = int(leg_config.get('lots', 1) or 1)
+            leg_pnl = ((exit_premium - entry_premium) if position == 'BUY'
+                       else (entry_premium - exit_premium)) * _lots
 
             re_leg = {
                 'leg_number': leg_config.get('leg_number', 1),
@@ -4741,10 +4751,11 @@ def run_algotest_backtest(params):
                         entry_price = _apply_slippage(raw_entry_price, position, 'entry', slippage_pct)
                         exit_price = _apply_slippage(raw_exit_price, position, 'exit', slippage_pct)
 
+                        # P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
                         if position == 'BUY':
-                            leg_pnl = exit_price - entry_price
+                            leg_pnl = (exit_price - entry_price) * lots
                         else:  # SELL
-                            leg_pnl = entry_price - exit_price
+                            leg_pnl = (entry_price - exit_price) * lots
 
                         _log(f"      Lots: {lots}, P&L: {leg_pnl:,.2f}")
 
@@ -4963,13 +4974,13 @@ def run_algotest_backtest(params):
                         raw_exit_premium = market_exit_premium
                         exit_premium = _apply_slippage(raw_exit_premium, position, 'exit', slippage_pct)
 
-                        # Calculate P&L in POINTS (no quantity multiplication)
+                        # Calculate P&L = POINTS x LOTS (see native/src/simulate.rs:1652)
                         # CE P&L = Entry - Exit for CALL SELL, Exit - Entry for CALL BUY
                         # PE P&L = Entry - Exit for PUT SELL, Exit - Entry for PUT BUY
                         if position == 'BUY':
-                            leg_pnl = exit_premium - entry_premium
+                            leg_pnl = (exit_premium - entry_premium) * lots
                         else:  # SELL
-                            leg_pnl = entry_premium - exit_premium
+                            leg_pnl = (entry_premium - exit_premium) * lots
 
                         # Store CE P&L or PE P&L based on option type (in points, no qty)
                         if option_type in ('CE', 'CALL', 'C'):
@@ -5662,10 +5673,14 @@ def run_algotest_backtest(params):
                     raw_exit_price = leg.get('raw_exit_price', leg.get('market_exit_price', exit_price))
                     fut_entry_price = entry_price
                     fut_exit_price = exit_price
+                    # NOTE: leg['pnl'] is ALREADY scaled by lots (_recalc_leg_pnl
+                    # and the trade-build sites apply it). Do NOT scale it again.
+                    # Only the recompute fallback below needs the multiplier.
                     leg_pnl     = leg.get('pnl')
                     if leg_pnl is None:
                         direction = -1 if position == 'BUY' else 1
-                        leg_pnl = direction * (entry_price - exit_price)
+                        _lots = int(leg.get('lots', 1) or 1)
+                        leg_pnl = direction * (entry_price - exit_price) * _lots
                     ce_pnl_val  = 0
                     pe_pnl_val  = 0
                     fut_pnl_val = leg_pnl
