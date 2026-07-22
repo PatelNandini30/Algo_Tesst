@@ -1053,7 +1053,8 @@ def _reload_bulk_if_needed(symbol: str, from_date: str, to_date: str) -> None:
 def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from, effective_to,
                             exit_dte: int = 0,
                             sched_end_by_entry: Optional[List[Tuple[str, str]]] = None,
-                            yearly_roll_months: Optional[List[str]] = None):
+                            yearly_roll_months: Optional[List[str]] = None,
+                            yearly_cycles: Optional[List[Dict[str, str]]] = None):
     """Case A: for EACH base trade [entry,exit], price each overlay leg (other
     index) over that SAME window and return them as extra Leg rows sharing the
     trade's id/dates. Futures priced in Rust (get_future_price); options via the
@@ -1084,6 +1085,10 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
     _yr_roll_months = {
         str(m).zfill(2) for m in (yearly_roll_months or ["12"])
     } or {"12"}
+    # Engine-resolved {contract,start,end} windows for a YEARLY overlay leg. When
+    # present _pick_yearly reads the contract straight off them, so the roll date
+    # matches the base engine's yearly T-n exactly instead of being re-derived.
+    _yr_cycles = list(yearly_cycles or [])
     for leg in overlay_legs:
         by_sym.setdefault(_leg_index(leg, default_index), []).append(leg)
 
@@ -1181,6 +1186,18 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
         return None
 
     def _pick_yearly(exps, exit_iso, ok, limit=None, floor_month=None):
+        # Preferred path: use the engine's OWN resolved cycles, so the roll fires on
+        # exactly the same date the base yearly engine would. _holdable only knows
+        # the trade's exit DTE (1 trading day), NOT yearly_exit_months_before — so
+        # deriving the roll here made T-1 behave as T-0: the contract was held to
+        # its December expiry instead of rolling in November (observed 26-Dec-2024
+        # held until the 26-Dec-2024 entry, then straight to 30-Dec-2025).
+        if _yr_cycles:
+            for _c in _yr_cycles:
+                if str(_c.get("start")) <= exit_iso < str(_c.get("end")):
+                    _ct = str(_c.get("contract") or "")
+                    return _ct if (_ct and ok(_ct)) else None
+            return None
         # The YEARLY contract = the nearest LONG-DATED contract (a roll-month
         # expiry, December by default) still HOLDABLE at the exit. Unlike
         # _pick_monthly this deliberately SKIPS the near contract: a yearly leg
@@ -1970,6 +1987,38 @@ def run_sync_weekly_cadence(
         # this is the original behaviour untouched; with all, there is no non-yearly
         # base leg to drive the cadence and the existing path already handles it.
         _base_yearly = []
+    # Resolve the December cycles through the ENGINE's own resolver so a yearly
+    # overlay leg rolls on exactly the date the base yearly engine would (honouring
+    # yearly_exit_months_before). Best-effort: on failure _pick_yearly falls back to
+    # its own roll-month scan, which still picks December but rolls at T-0.
+    _yr_leg_cycles: List[Dict[str, str]] = []
+    if _base_yearly:
+        try:
+            import pandas as _pd
+            from base import get_trading_calendar as _gtc2
+            from services.engine_rust import resolve_expiry_inputs as _rei
+            _days2 = (
+                _pd.to_datetime(_gtc2(effective_from, effective_to)["date"])
+                .sort_values().dt.strftime("%Y-%m-%d").tolist()
+            )
+            _, _cyc2 = _rei(
+                cadence_index,
+                {
+                    "expiry_type": "YEARLY",
+                    "rollover_cadence": ("weekly" if cadence == "WEEKLY" else "monthly"),
+                    "yearly_exit_months_before": payload.get("yearly_exit_months_before") or 0,
+                    "yearly_roll_months": payload.get("yearly_roll_months"),
+                },
+                effective_from, effective_to, _days2,
+            )
+            _yr_leg_cycles = list(_cyc2 or [])
+            logger.info("[SYNC_CADENCE] yearly overlay cycles: %s",
+                        [(c["contract"], c["start"], c["end"]) for c in _yr_leg_cycles][:4])
+        except Exception as _yexc:
+            logger.warning("[SYNC_CADENCE] yearly cycle resolve failed (%s) — "
+                           "overlay falls back to its own roll-month scan", _yexc)
+            _yr_leg_cycles = []
+
     base_ids = {id(l) for l in base_legs}
     overlay_legs = [l for l in legs if id(l) not in base_ids]
 
@@ -2093,7 +2142,8 @@ def run_sync_weekly_cadence(
             ov_rows = _overlay_legs_onto_base(base_df, overlay_legs, cadence_index,
                                               effective_from, effective_to, _ov_exit_dte,
                                               sched_end_by_entry=_sched_end,
-                                              yearly_roll_months=payload.get("yearly_roll_months"))
+                                              yearly_roll_months=payload.get("yearly_roll_months"),
+                                              yearly_cycles=_yr_leg_cycles)
         except Exception as exc:
             logger.warning("[SYNC_CADENCE] overlay failed: %s", exc)
             ov_rows = []
