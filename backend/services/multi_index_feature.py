@@ -1052,7 +1052,8 @@ def _reload_bulk_if_needed(symbol: str, from_date: str, to_date: str) -> None:
 
 def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from, effective_to,
                             exit_dte: int = 0,
-                            sched_end_by_entry: Optional[List[Tuple[str, str]]] = None):
+                            sched_end_by_entry: Optional[List[Tuple[str, str]]] = None,
+                            yearly_roll_months: Optional[List[str]] = None):
     """Case A: for EACH base trade [entry,exit], price each overlay leg (other
     index) over that SAME window and return them as extra Leg rows sharing the
     trade's id/dates. Futures priced in Rust (get_future_price); options via the
@@ -1077,6 +1078,12 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
         _compute_strike_for_leg_python = None
 
     by_sym: Dict[str, List[dict]] = {}
+    # Roll months a YEARLY overlay leg may pin to (NSE lists long-dated contracts
+    # only in Mar/Jun/Sep/Dec). Defaults to December, matching the engine's own
+    # default, and is unused unless some leg is actually YEARLY.
+    _yr_roll_months = {
+        str(m).zfill(2) for m in (yearly_roll_months or ["12"])
+    } or {"12"}
     for leg in overlay_legs:
         by_sym.setdefault(_leg_index(leg, default_index), []).append(leg)
 
@@ -1171,6 +1178,41 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     return e
                 if cnt >= limit:
                     break
+        return None
+
+    def _pick_yearly(exps, exit_iso, ok, limit=None, floor_month=None):
+        # The YEARLY contract = the nearest LONG-DATED contract (a roll-month
+        # expiry, December by default) still HOLDABLE at the exit. Unlike
+        # _pick_monthly this deliberately SKIPS the near contract: a yearly leg
+        # pins one December and re-books against it every cadence, so the picker
+        # must look past every intervening monthly/weekly.
+        #
+        # Needed because a genuinely-yearly leg reaching this path previously fell
+        # through to _pick_monthly (`_pick = _pick_weekly if WEEK else _pick_monthly`)
+        # and silently took the near monthly — the leg then rolled monthly while the
+        # tradesheet still called it Yearly.
+        # Month-membership alone is NOT enough: NSE also lists ordinary weekly and
+        # monthly contracts inside March/December, and taking the first ascending
+        # match picked those (observed 2025-03-06 and 2025-12-02 — short-dated
+        # expiries that merely fall in a roll month). The long-dated contract is
+        # the LAST expiry of its roll month, so group by month and take the latest
+        # in each — the same "latest-in-month first" rule _pick_monthly uses.
+        _by_ym: Dict[str, List[str]] = {}
+        _yms: List[str] = []
+        for e in exps:  # ascending
+            if e[5:7] not in _yr_roll_months:
+                continue
+            if not _holdable(e, exit_iso, floor_month):
+                continue
+            ym = e[:7]
+            if ym not in _by_ym:
+                _by_ym[ym] = []
+                _yms.append(ym)
+            _by_ym[ym].append(e)
+        for ym in _yms:  # nearest roll month first
+            for e in sorted(_by_ym[ym], reverse=True):  # latest-in-month first
+                if ok(e):
+                    return e
         return None
 
     base = base_df.copy()
@@ -1343,7 +1385,11 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     # Expiry basis follows the leg: WEEKLY -> nearest weekly (where
                     # they exist, e.g. 2024), else the near MONTHLY.
                     leg_exp = str(leg.get("expiry") or leg.get("expiry_type") or "MONTHLY").upper()
-                    _pick = _pick_weekly if leg_exp.startswith("WEEK") else _pick_monthly
+                    _pick = (
+                        _pick_yearly if leg_exp.startswith("YEAR")
+                        else _pick_weekly if leg_exp.startswith("WEEK")
+                        else _pick_monthly
+                    )
 
                     # PREMIUM-BASED STRIKE MODES on an overlay (non-base) leg.
                     # _compute_strike_for_leg_python resolves straddle_width /
@@ -1899,6 +1945,31 @@ def run_sync_weekly_cadence(
         cadence = "MONTHLY"
         cadence_index = default_index
         base_legs = [l for l in legs if _leg_index(l, default_index) == cadence_index]
+    # A GENUINELY yearly base leg cannot stay in the base run. The sync mechanism
+    # below rewrites every base leg to expiry="YEARLY" purely as a marker so Rust
+    # hands it the merged CYCLE contract (simulate.rs:1223) — which makes a real
+    # yearly leg indistinguishable from a synced monthly one and rolls it monthly
+    # (observed: the PE leg's expiry tracking the CE leg's 26-Dec-2024 -> 30-Jan-2025
+    # -> 24-Apr-2025 instead of holding December). yearly_cycles carries ONE contract
+    # per cycle, so the base run has no room for a second one.
+    # Route it through the overlay path instead: overlay legs are priced over the
+    # SAME base cadence windows and share the base Trade#, so the leg stays in sync
+    # while _pick_yearly gives it its own December contract.
+    _base_yearly = [
+        l for l in base_legs
+        if str(l.get("expiry") or l.get("expiry_type") or "").upper().startswith("YEAR")
+        and str(l.get("segment") or "OPTIONS").upper() not in ("FUTURE", "FUTURES")
+    ]
+    if _base_yearly and len(_base_yearly) < len(base_legs):
+        _yr_ids = {id(l) for l in _base_yearly}
+        base_legs = [l for l in base_legs if id(l) not in _yr_ids]
+        logger.info("[SYNC_CADENCE] %d yearly base leg(s) routed to the overlay path "
+                    "so they hold their own long-dated contract", len(_base_yearly))
+    else:
+        # Every base leg is yearly (or none is): leave the split alone. With none,
+        # this is the original behaviour untouched; with all, there is no non-yearly
+        # base leg to drive the cadence and the existing path already handles it.
+        _base_yearly = []
     base_ids = {id(l) for l in base_legs}
     overlay_legs = [l for l in legs if id(l) not in base_ids]
 
@@ -1953,6 +2024,22 @@ def run_sync_weekly_cadence(
                                           _cadence_segment)
     if _cycles and _bounds:
         sub["expiry_type"] = "YEARLY"          # the explicit-cycle mechanism
+        # Mark the BASE legs as pinned so Rust hands them the cycle contract.
+        # simulate.rs:1223 does `if pinned && !leg.is_yearly { _orig_expiry }` —
+        # a non-YEARLY leg takes the CADENCE ELEMENT instead of the pinned
+        # contract. That mechanism was built for a December pin where the cadence
+        # element is always the same index's own expiry. Under the MERGED sync
+        # cadence it is whichever leg expires FIRST — so when the futures leg ends
+        # the cycle (MIDCPNIFTY 24-Nov-2023 / 22-Dec-2023) the NIFTY option leg was
+        # handed a date no NIFTY option expires on, could not resolve, and the
+        # WHOLE TRADE vanished with no warning. Measured: 2 of 5 cycles dropped in
+        # Sep-2023..Jan-2024; a cycle survived iff its contract happened to be in
+        # sync_cadence_expiries. is_yearly is read ONLY at that one call site
+        # (simulate.rs:1223), and only when yearly_cycles is present — i.e. only on
+        # this sync path — so genuine YEARLY and plain weekly/monthly runs are
+        # untouched. This states what the block above already intends: "the base
+        # engine run holds ONE contract per cycle".
+        sub["legs"] = [dict(_l, expiry="YEARLY") for _l in base_legs]
         sub["yearly_cycles"] = _cycles
         # The merged boundaries ARE the cadence: in Rust the cadence list drives
         # entry/exit while yearly_cycles only pins the contract (simulate.rs:477).
@@ -2005,7 +2092,8 @@ def run_sync_weekly_cadence(
             _sched_end = sorted((c["start"], c["end"]) for c in (_cycles or []))
             ov_rows = _overlay_legs_onto_base(base_df, overlay_legs, cadence_index,
                                               effective_from, effective_to, _ov_exit_dte,
-                                              sched_end_by_entry=_sched_end)
+                                              sched_end_by_entry=_sched_end,
+                                              yearly_roll_months=payload.get("yearly_roll_months"))
         except Exception as exc:
             logger.warning("[SYNC_CADENCE] overlay failed: %s", exc)
             ov_rows = []
