@@ -105,6 +105,19 @@ function _legSection(rows, leg, n) {
     }
   }
 
+  // Per-leg spot adjustment. Without this the sheet showed only the strategy-level
+  // "Spot Adjustment: No" while the leg quietly carried its own threshold, so a
+  // reader could not reconcile why trades adjusted.
+  const legSA = leg.spot_adjustment;
+  if (legSA && legSA.enabled && Number(legSA.pct) > 0) {
+    const dir = legSA.direction === 'fall' ? 'Fall'
+      : legSA.direction === 'both' ? 'Rise or Fall' : 'Rise';
+    const unit = legSA.units === 'points' ? ' pts' : '%';
+    push('Spot Adjustment', `Yes (${dir} ${_num(legSA.pct)}${unit})`);
+  } else {
+    push('Spot Adjustment', 'Uses strategy-level setting');
+  }
+
   // Per-leg slippage — buildPayload sends 0 when the leg's slippage is toggled off.
   const sl = Number(leg.slippage_pct) || 0;
   push('Slippage', sl > 0 ? `Yes (${_num(sl)}%)` : 'No');
@@ -197,6 +210,21 @@ export function buildRulesSheet(payload, filterName) {
       `Yes (${SA_DIR[payload.spot_adjustment_direction] || payload.spot_adjustment_direction || ''} ${_num(payload.spot_adjustment_pct)}${unit})`.replace(/\s+/g, ' ').trim());
   } else {
     push('Spot Adjustment', 'No');
+  }
+
+  // MIDCPNIFTY cross-index spot adjustment. Emitted ONLY when the strategy
+  // actually holds a MIDCPNIFTY leg — same convention as the Midcap100 row in
+  // _legSection: absent entirely rather than reported as 'No', so a plain NIFTY
+  // sheet is unchanged. Mirrors the NIFTY row above; the engine reads this from
+  // payload.midcpnifty_spot_adjustment.
+  const _mnsa = payload.midcpnifty_spot_adjustment;
+  const _hasMidcpLeg = (Array.isArray(payload.legs) ? payload.legs : []).some(
+    l => l && l.segment !== 'midcap100'
+      && String(l.index || payload.index || '').toUpperCase() === 'MIDCPNIFTY');
+  if (_hasMidcpLeg && _mnsa && _mnsa.enabled) {
+    const unit = _mnsa.units === 'percent' ? '%' : ' pts';
+    push('MIDCPNIFTY Spot Adjustment',
+      `Yes (${SA_DIR[_mnsa.direction] || _mnsa.direction || ''} ${_num(_mnsa.pct)}${unit})`.replace(/\s+/g, ' ').trim());
   }
 
   if (payload.buffer_strike_enabled) {

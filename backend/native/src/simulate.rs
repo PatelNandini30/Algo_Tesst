@@ -224,19 +224,44 @@ pub(crate) enum StrikeMode {
 }
 
 /// True when this entry must resolve a FRESH strike rather than carry the
-/// epoch's. Month rollover is a slice compare on ISO `YYYY-MM-DD` — no date
-/// parsing needed.
+/// epoch's. The reset trigger is PER LEG:
 ///
-/// This yields "Fresh re-strikes at month-end only, regardless of cadence"
-/// from one comparison: under MONTHLY cadence consecutive entries always land
-/// in different months, so Fresh re-strikes every entry (today's behaviour);
-/// under WEEKLY cadence the entries within a month share `[0..7]`, so only the
-/// first of each month re-strikes.
-fn opens_new_epoch(mode: StrikeMode, prev_entry: &str, entry: &str, new_cycle: bool) -> bool {
+///   * FIXED (any leg)      — never, except at a new yearly cycle.
+///   * FRESH, weekly/monthly leg — EVERY entry.
+///   * FRESH, yearly leg    — first entry of each calendar MONTH.
+///
+/// The two Fresh rules look inconsistent but describe two verified sheets that
+/// were previously in conflict, and both are right about their own leg:
+///
+///   * The short-dated leg tracks spot. NIFTY Oct-Nov 2022 (verified column):
+///     17300 → 17100 → 17300 → 17500 → 17700 → 18000 WITHIN October alone.
+///     One rule for both legs held it at 17300 for the whole month while ATM
+///     ran to 17700, i.e. selling a 300-point ITM call nobody configured.
+///   * The long-dated leg is month-wise. Mar-2019 sheet: 11000 held across
+///     every weekly roll in March, re-struck on the first roll of April.
+///     Re-striking it weekly would churn a contract that is deliberately
+///     coarse (1000-point gap) and long-dated.
+fn opens_new_epoch(
+    mode: StrikeMode,
+    prev_entry: &str,
+    entry: &str,
+    new_cycle: bool,
+    leg_is_yearly: bool,
+) -> bool {
     if new_cycle {
         return true;
     }
-    mode == StrikeMode::Fresh && entry.get(0..7) != prev_entry.get(0..7)
+    if mode != StrikeMode::Fresh {
+        return false; // FIXED holds its anchor for the whole cycle.
+    }
+    if leg_is_yearly {
+        // The long-dated leg re-strikes MONTH-WISE: one strike per calendar
+        // month, held across every roll inside it. `[0..7]` is the YYYY-MM
+        // prefix — no date parsing needed.
+        return entry.get(0..7) != prev_entry.get(0..7);
+    }
+    // A weekly/monthly leg re-strikes at EVERY entry.
+    true
 }
 
 fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
@@ -1239,7 +1264,9 @@ pub(crate) fn resolve_trade_specs_core(
                 } else {
                     let fresh = match prev_entry.as_deref() {
                         None => true, // first emitted trade always resolves fresh
-                        Some(prev) => opens_new_epoch(leg.rollover_strike_mode, prev, entry_date, *new_cycle),
+                        Some(prev) => opens_new_epoch(
+                            leg.rollover_strike_mode, prev, entry_date, *new_cycle, leg.is_yearly,
+                        ),
                     };
                     match (fresh, epoch_strike.get(&leg_id).copied()) {
                         (false, Some(carried)) => {
@@ -2278,30 +2305,49 @@ mod strike_epoch_tests {
     // at a yearly-cycle boundary. Both are the same mechanism with a different
     // reset trigger, so one predicate covers all four combos.
 
+    const WEEKLY_LEG: bool = false; // leg.is_yearly — a short-dated (weekly/monthly) leg
+    const YEARLY_LEG: bool = true;  // leg.is_yearly — the long-dated December leg
+
     #[test]
-    fn monthly_cadence_fresh_restrikes_every_entry() {
-        // Consecutive monthly entries are always in different months, so Fresh
-        // re-strikes every time — identical to today's default behaviour.
-        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-02-28", "2019-03-28", false));
-        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-03-28", "2019-04-25", false));
+    fn fresh_short_dated_leg_restrikes_every_entry() {
+        // Verified NIFTY Oct-Nov 2022 column: the weekly leg tracks spot on
+        // every entry, INCLUDING several inside the same month.
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2022-10-04", "2022-10-12", false, WEEKLY_LEG));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2022-10-12", "2022-10-17", false, WEEKLY_LEG));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2022-10-25", "2022-10-31", false, WEEKLY_LEG));
+        // …and across a month boundary, obviously.
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2022-10-31", "2022-11-02", false, WEEKLY_LEG));
     }
 
     #[test]
-    fn weekly_cadence_fresh_holds_strike_within_a_month() {
-        // The sheet: 11000 held across every weekly roll in March, re-struck on
-        // the first roll of the next month.
-        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-07", "2019-03-14", false));
-        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-14", "2019-03-21", false));
-        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-21", "2019-03-28", false));
-        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-03-28", "2019-04-04", false));
+    fn fresh_yearly_leg_holds_strike_within_a_month() {
+        // The Mar-2019 sheet: 11000 held across every weekly roll in March,
+        // re-struck on the first roll of April. That sheet describes the
+        // LONG-DATED leg, which stays month-wise.
+        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-07", "2019-03-14", false, YEARLY_LEG));
+        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-14", "2019-03-21", false, YEARLY_LEG));
+        assert!(!opens_new_epoch(StrikeMode::Fresh, "2019-03-21", "2019-03-28", false, YEARLY_LEG));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-03-28", "2019-04-04", false, YEARLY_LEG));
     }
 
     #[test]
-    fn fixed_never_restrikes_within_a_cycle_on_either_cadence() {
-        for (a, b) in [("2019-03-07", "2019-03-14"), ("2019-03-28", "2019-04-25"),
-                       ("2019-02-28", "2019-11-28")] {
-            assert!(!opens_new_epoch(StrikeMode::Fixed, a, b, false),
-                    "Fixed must hold its strike across {a} -> {b}");
+    fn monthly_cadence_fresh_restrikes_every_entry_on_both_legs() {
+        // Consecutive monthly entries land in different months, so BOTH legs
+        // re-strike — the two Fresh rules agree here.
+        for leg in [WEEKLY_LEG, YEARLY_LEG] {
+            assert!(opens_new_epoch(StrikeMode::Fresh, "2019-02-28", "2019-03-28", false, leg));
+            assert!(opens_new_epoch(StrikeMode::Fresh, "2019-03-28", "2019-04-25", false, leg));
+        }
+    }
+
+    #[test]
+    fn fixed_never_restrikes_within_a_cycle_on_either_leg() {
+        for leg in [WEEKLY_LEG, YEARLY_LEG] {
+            for (a, b) in [("2019-03-07", "2019-03-14"), ("2019-03-28", "2019-04-25"),
+                           ("2019-02-28", "2019-11-28")] {
+                assert!(!opens_new_epoch(StrikeMode::Fixed, a, b, false, leg),
+                        "Fixed must hold its strike across {a} -> {b}");
+            }
         }
     }
 
@@ -2309,14 +2355,14 @@ mod strike_epoch_tests {
     fn a_new_yearly_cycle_always_restrikes_even_for_fixed() {
         // Fixed means fixed WITHIN a yearly cycle: the roll into the next
         // December re-enters at a fresh strike from that day's spot.
-        assert!(opens_new_epoch(StrikeMode::Fixed, "2019-10-31", "2019-11-26", true));
-        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-10-31", "2019-11-26", true));
+        assert!(opens_new_epoch(StrikeMode::Fixed, "2019-10-31", "2019-11-26", true, YEARLY_LEG));
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-10-31", "2019-11-26", true, YEARLY_LEG));
         // ...even when the roll day is in the same month as the previous entry.
-        assert!(opens_new_epoch(StrikeMode::Fixed, "2019-11-05", "2019-11-26", true));
+        assert!(opens_new_epoch(StrikeMode::Fixed, "2019-11-05", "2019-11-26", true, YEARLY_LEG));
     }
 
     #[test]
-    fn year_boundary_is_a_month_change_for_fresh() {
-        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-12-26", "2020-01-02", false));
+    fn year_boundary_is_a_month_change_for_the_yearly_leg() {
+        assert!(opens_new_epoch(StrikeMode::Fresh, "2019-12-26", "2020-01-02", false, YEARLY_LEG));
     }
 }

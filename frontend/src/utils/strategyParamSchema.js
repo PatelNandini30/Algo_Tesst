@@ -234,6 +234,35 @@ export const OPTIM_PARAM_GROUPS = [
     ],
   },
   {
+    // Cross-index MIDCPNIFTY spot adjustment — only shown when the strategy
+    // actually holds a MIDCPNIFTY leg (filtered in OptimizePanel via
+    // midcpniftyOnly). Sweeps the MIDCPNIFTY breach threshold + direction,
+    // exactly like the NIFTY and Midcap100 axes above. MIDCPNIFTY is a TRADED
+    // index here (not the Midcap100 overlay), so this is gated on a real leg
+    // rather than on midcap_legs.
+    group: 'Global — MIDCPNIFTY Spot Adjustment',
+    forLeg: false,
+    midcpniftyOnly: true,
+    items: [
+      {
+        path: 'midcpnifty_spot_adjustment.pct',
+        label: 'MIDCPNIFTY Spot Adjustment',
+        unit: '%',
+        ...RANGE(0.5, 5, 0.5),
+        unitPayloadPath: 'midcpnifty_spot_adjustment.units',
+        unitOptions: [
+          { key: 'percent', unit: '%', ...RANGE(0.5, 5, 0.5) },
+          { key: 'points', unit: 'pts', ...RANGE(50, 500, 50) },
+        ],
+      },
+      {
+        path: 'midcpnifty_spot_adjustment.direction',
+        label: 'MIDCPNIFTY Spot Adjustment direction',
+        ...ENUM(['rise', 'fall', 'both']),
+      },
+    ],
+  },
+  {
     group: 'Global — Buffer Strike',
     forLeg: false,
     items: [
@@ -258,7 +287,8 @@ export function expandSchemaForLegs(nLegs) {
   for (const grp of OPTIM_PARAM_GROUPS) {
     if (!grp.forLeg) {
       for (const item of grp.items) {
-        out.push({ ...item, group: grp.group, midcapOnly: Boolean(grp.midcapOnly) });
+        out.push({ ...item, group: grp.group, midcapOnly: Boolean(grp.midcapOnly),
+                   midcpniftyOnly: Boolean(grp.midcpniftyOnly) });
       }
       continue;
     }

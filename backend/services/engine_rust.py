@@ -659,25 +659,40 @@ _NEXT_EXPIRY_TYPES: frozenset = frozenset({"NEXT_WEEKLY", "WEEKLY_T1", "NEXT_MON
 _YEARLY_CADENCES: frozenset = frozenset({"weekly", "monthly"})
 
 
-def _opens_new_epoch(mode: str, prev_entry: str, entry: str, new_cycle: bool) -> bool:
+def _opens_new_epoch(
+    mode: str, prev_entry: str, entry: str, new_cycle: bool, leg_is_yearly: bool = True
+) -> bool:
     """
     True when this entry must resolve a FRESH strike rather than carry the epoch's.
 
-    Python mirror of simulate.rs::opens_new_epoch. Fresh and Fixed are the same
-    mechanism — resolve once per epoch, reuse within — differing only in the reset:
-      * Fresh: a new yearly cycle OR a new month
-      * Fixed: a new yearly cycle only
-    Month rollover is a slice compare on ISO YYYY-MM-DD, no date parsing.
+    Python mirror of simulate.rs::opens_new_epoch — the two MUST agree. This one
+    serves the FIXED-ENTRY builder (_build_fixed_entry_specs); the Rust one serves
+    the DTE rollover schedule. A strategy hits exactly one of them depending on
+    filter_entry_mode, so a rule changed in only one place silently applies to
+    half the users — which is exactly what happened before this was made
+    leg-aware.
 
-    This yields "Fresh re-strikes at month-end only, regardless of cadence" from
-    one comparison: under MONTHLY cadence consecutive entries are always in
-    different months so Fresh re-strikes every entry (today's behaviour); under
-    WEEKLY cadence the entries within a month share [0:7], so only the first
-    re-strikes.
+    The reset trigger is PER LEG:
+      * FIXED (any leg)            — new yearly cycle only.
+      * FRESH, weekly/monthly leg  — EVERY entry.
+      * FRESH, yearly leg          — first entry of each calendar MONTH.
+
+    Previously the month-hold applied to every leg whenever the CADENCE was
+    weekly, so a weekly CE leg sat on one strike for a whole month while spot ran
+    away. Measured on NIFTY 2019 (yearly Dec contract, weekly cadence, fixed
+    entry): the CE leg held 11300 from 03-Oct to 31-Oct while ATM moved
+    11300 -> 11900, i.e. a 600-point ITM call nobody configured.
+
+    `leg_is_yearly` defaults to True so any caller that has not been updated keeps
+    the old month-hold rather than silently switching behaviour.
     """
     if new_cycle:
         return True
-    return str(mode or "fresh").lower() != "fixed" and entry[:7] != prev_entry[:7]
+    if str(mode or "fresh").lower() == "fixed":
+        return False
+    if leg_is_yearly:
+        return entry[:7] != prev_entry[:7]
+    return True
 
 
 def _cycle_for_exit(
@@ -2260,9 +2275,12 @@ def _build_fixed_entry_specs(
                 _carried = None
                 if _pin is not None and _epoch_prev_cadence is not None:
                     _new_cycle = _epoch_prev_contract != _pin["contract"]
+                    _leg_is_yearly = str(
+                        leg.get("expiry") or leg.get("expiry_type") or ""
+                    ).upper() == "YEARLY"
                     if not _opens_new_epoch(
                         leg.get("rollover_strike_mode"), _epoch_prev_cadence,
-                        _epoch_marker, _new_cycle,
+                        _epoch_marker, _new_cycle, _leg_is_yearly,
                     ):
                         _carried = _epoch_strike.get(leg_idx + 1)
 
@@ -3072,6 +3090,135 @@ def _apply_fixed_rollover_strike(
             s["requested_strike"] = strike_overrides[key]
         result.append(s)
     return result
+
+
+def _reanchor_yearly_fresh_on_segments(
+    specs: List[Dict[str, Any]],
+    payload: Dict[str, Any],
+    segments: Optional[List[Tuple[str, str]]],
+    spot_by_date: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """
+    Re-anchor YEARLY 'Fresh' option legs on the SURVIVING (segment-gated) trades.
+
+    Rust resolves the yearly month-epoch on the CONTINUOUS, pre-filter schedule
+    (simulate.rs::opens_new_epoch — one strike per calendar month, held across
+    every roll inside it). When a filter drops a month's early trades and the
+    strategy re-enters mid-month, the surviving trade inherits a strike anchored
+    on a trade that never made the tradesheet. Measured on this desk's
+    weekly-CE + yearly-PE run: NIFTY 30-Apr-2024 held the yearly PE at 22000 —
+    the epoch set by a 01-Apr phantom at spot ~22,450 — while 30-Apr's OWN ATM
+    was 23000 and the 23000 Dec PE was fully liquid (2,281 contracts). The
+    fixed-entry builder never hit this because it rebuilds the chain from each
+    segment's first SURVIVING entry (_build_fixed_entry_specs:2104); the DTE path
+    resolves the epoch before gating, so it needs this correction after.
+
+    Re-run the month-epoch over the gated specs, resetting the epoch at each
+    segment (patch) start as well as each calendar month and yearly-cycle change,
+    so the first surviving trade of each patch/month re-strikes to its own fresh
+    ATM and the rest of that month/patch hold it. Only YEARLY-expiry_type runs
+    with a live filter and a yearly Fresh option leg are touched; a row is
+    rewritten only when its strike actually changes, so every already-correct
+    trade is left byte-for-byte as Rust produced it.
+    """
+    if not segments:
+        return specs
+    if str(payload.get("expiry_type") or "").upper() != "YEARLY":
+        return specs
+    legs_src = payload.get("legs") or []
+    index_str = str(payload.get("index") or "NIFTY").upper()
+    default_iv = _STRIKE_INTERVALS.get(index_str, 50.0)
+
+    target_legs: Dict[int, Dict[str, Any]] = {}
+    for _idx, _leg in enumerate(legs_src):
+        if not isinstance(_leg, dict):
+            continue
+        if str(_leg.get("segment") or "OPTION").upper() in ("FUTURE", "FUTURES"):
+            continue
+        _exp = str(_leg.get("expiry") or _leg.get("expiry_type") or "").upper()
+        _mode = str(_leg.get("rollover_strike_mode") or "fresh").lower()
+        if _exp == "YEARLY" and _mode != "fixed":
+            target_legs[_idx + 1] = _leg
+    if not target_legs:
+        return specs
+
+    def _seg_index(entry_iso: str) -> Optional[int]:
+        for _i, (_s0, _s1) in enumerate(segments):
+            if _s0 <= entry_iso <= _s1:
+                return _i
+        return None
+
+    by_leg: Dict[int, List[Dict[str, Any]]] = {}
+    for _s in specs:
+        _lid = int(_s.get("leg_id", 1))
+        if _lid in target_legs:
+            by_leg.setdefault(_lid, []).append(_s)
+
+    for _lid, _leg in target_legs.items():
+        _rows = sorted(
+            by_leg.get(_lid, []),
+            key=lambda s: _normalize_iso(s.get("entry_date") or ""),
+        )
+        _iv_raw = _leg.get("strike_interval")
+        try:
+            _leg_iv = float(_iv_raw) if _iv_raw else default_iv
+        except (TypeError, ValueError):
+            _leg_iv = default_iv
+        _opt = str(_leg.get("option_type") or "CE").upper()
+        _is_ce = _opt in ("CE", "CALL", "C")
+        _prev_seg: Optional[int] = None
+        _prev_month: Optional[str] = None
+        _prev_contract: Optional[str] = None
+        _held: Optional[float] = None
+        for _s in _rows:
+            _entry = _normalize_iso(_s.get("entry_date") or "")
+            _expiry = _normalize_iso(_s.get("expiry") or "")
+            _seg = _seg_index(_entry)
+            _month = _entry[:7]
+            _entry_spot = float(
+                _s.get("entry_spot") or spot_by_date.get(_entry) or 0.0
+            )
+            if _entry_spot <= 0:
+                _prev_seg, _prev_month, _prev_contract = _seg, _month, _expiry
+                continue
+            _atm = round(_entry_spot / _leg_iv) * _leg_iv
+            _new_epoch = (
+                _held is None
+                or _seg != _prev_seg
+                or _month != _prev_month
+                or _expiry != _prev_contract
+            )
+            if _new_epoch:
+                _info: Dict[str, Any] = {}
+                _fresh = _compute_strike_for_leg_python(
+                    _leg, _entry_spot, _leg_iv,
+                    entry_date=_entry, expiry=_expiry, index=index_str,
+                    out_info=_info,
+                )
+                if _fresh is not None:
+                    _held = float(_fresh)
+                    _new_strike = float(_fresh)
+                    _new_req = float(_info.get("requested_strike") or _fresh)
+                else:
+                    _new_strike = None
+                    _new_req = None
+            elif _held is not None:
+                _validated = _validate_or_shift_strike_python(
+                    _held, _atm, _leg_iv, _is_ce, _entry, _expiry,
+                    index_str, _opt, 1,
+                )
+                _new_strike = float(_validated if _validated is not None else _held)
+                _new_req = float(_held)
+            else:
+                _new_strike = None
+                _new_req = None
+            if _new_strike is not None:
+                _cur = float(_s.get("strike") or 0.0)
+                if abs(_new_strike - _cur) > 1e-6:
+                    _s["strike"] = _new_strike
+                    _s["requested_strike"] = _new_req
+            _prev_seg, _prev_month, _prev_contract = _seg, _month, _expiry
+    return specs
 
 
 def _payload_uses_straddle_width(payload: Dict[str, Any]) -> bool:
@@ -4341,6 +4488,15 @@ def run_rust_engine_pipeline(
             if not specs:
                 return []
 
+            # YEARLY Fresh legs: the Rust epoch was resolved on the CONTINUOUS
+            # pre-filter schedule, so a patch that re-enters mid-month inherited a
+            # strike anchored on a dropped (phantom) trade. Re-anchor on the
+            # SURVIVING trades, per segment. No-op unless expiry_type=YEARLY with a
+            # yearly Fresh option leg; only genuinely-changed rows are rewritten.
+            specs = _reanchor_yearly_fresh_on_segments(
+                specs, payload, segments, spot_by_date,
+            )
+
     # ── Slice 6b: no_rollover post-processing ───────────────────────────────
     # Keep only the first trade per segment (or globally when no filter).
     # Mirrors generic_algotest_engine.py:4054-4072.
@@ -4531,6 +4687,19 @@ def run_rust_engine_pipeline(
     # When empty, every code path below takes its original branch untouched.
     _has_per_leg_sa = bool(_per_leg_sa)
 
+    def _sa_leg_label(_lid: int) -> str:
+        """'Leg 2 PE Yearly' — appended to a per-leg spot-adj Exit Reason so the
+        tradesheet says WHICH leg breached. The canonical token stays the prefix
+        (SPOT_ADJ_RISE ...), and the '+' combiner still splits cleanly, so the
+        downstream `"FILTER_END" in reason.split("+")` checks are unaffected."""
+        _s = legs_src[_lid - 1] if 0 <= _lid - 1 < len(legs_src) else {}
+        _bits = [
+            str((_s or {}).get("option_type") or "").upper(),
+            str((_s or {}).get("expiry") or "").title(),
+        ]
+        _bits = [b for b in _bits if b]
+        return "Leg %d%s" % (_lid, (" " + " ".join(_bits)) if _bits else "")
+
     # ── Midcap cross-index spot adjustment (additive; gated on its own config) ──
     # Same exit-trigger + same-day re-entry logic as the NIFTY spot adjustment,
     # but the breach is measured on the NIFTYMIDCAP100 index. Earliest breach
@@ -4641,20 +4810,36 @@ def run_rust_engine_pipeline(
         for leg in legs_src
         if str(leg.get("segment", "OPTIONS")).upper() not in ("FUTURES", "FUTURE")
     )
-    _trade_adj_baseline: Dict[int, float] = {}
-    if spot_adj_enabled and spot_adj_pct > 0 and _has_fixed_strike_opt_legs_sa:
-        _eff_segs_sa: List[Tuple[str, str]]
-        if original_segments is not None:
-            _eff_segs_sa = original_segments
-        else:
-            _from_sa = str(payload.get("from_date") or payload.get("date_from") or "")
-            _to_sa = str(payload.get("to_date") or payload.get("date_to") or "")
-            _eff_segs_sa = [(_from_sa, _to_sa)] if _from_sa and _to_sa else []
-        _tid_entry_iso_sa: Dict[int, str] = {
-            tid: _normalize_iso(legs[0]["entry_date"])
-            for tid, legs in by_trade.items()
-            if legs
-        }
+    # Segment anchor, shared by the trade-level ("overall") and per-leg ("own")
+    # paths so the two cannot drift. A fixed-strike leg holds ONE strike across
+    # the filter segment, so its adjustment is measured from the segment's first
+    # entry spot, carried forward and re-based whenever a breach fires. Fresh
+    # strikes get no anchor at all and fall back to each trade's own entry spot.
+    #
+    # This was previously inlined under `if spot_adj_enabled ...` — the TRADE-LEVEL
+    # toggle — so an own-adjustment run (trade level off) never built it and
+    # silently measured from the trade's own spot instead. Single leg, same
+    # threshold, Fixed strikes: overall gave 58 trades/10 adjustments, own gave
+    # 53/6, diverging at the 27-10-2022 trade (overall fired 07-11 off the
+    # 29-07-2022 segment anchor of 17,158.25; own ran to expiry off 17,736.95).
+    _eff_segs_sa: List[Tuple[str, str]]
+    if original_segments is not None:
+        _eff_segs_sa = original_segments
+    else:
+        _from_sa = str(payload.get("from_date") or payload.get("date_from") or "")
+        _to_sa = str(payload.get("to_date") or payload.get("date_to") or "")
+        _eff_segs_sa = [(_from_sa, _to_sa)] if _from_sa and _to_sa else []
+    _tid_entry_iso_sa: Dict[int, str] = {
+        tid: _normalize_iso(legs[0]["entry_date"])
+        for tid, legs in by_trade.items()
+        if legs
+    }
+
+    def _segment_carry_baseline(
+        _sc_direction: str, _sc_pct: float, _sc_units: str
+    ) -> Dict[int, float]:
+        """Per-segment anchor carried across trades, re-based on each breach."""
+        _out: Dict[int, float] = {}
         for _seg_s_sa, _seg_e_sa in _eff_segs_sa:
             _seg_tids_sa = sorted(
                 [t for t, e in _tid_entry_iso_sa.items() if e and _seg_s_sa <= e <= _seg_e_sa],
@@ -4670,19 +4855,26 @@ def run_rust_engine_pipeline(
                 )
                 if _seg_base_sa is None or _seg_base_sa <= 0:
                     _seg_base_sa = _tid_own_sa
-                _trade_adj_baseline[_tid_sa] = _seg_base_sa
+                _out[_tid_sa] = _seg_base_sa
                 # If adj fires with this baseline, next trade measures from trigger spot
                 _sched_sa = _normalize_iso(by_trade[_tid_sa][0].get("exit_date", ""))
                 if _sched_sa and _seg_base_sa > 0:
                     _trig_sa = _compute_spot_adjustment_trigger(
                         _tid_iso_sa, _seg_base_sa, _sched_sa,
-                        spot_adj_direction, spot_adj_pct, spot_adj_units,
+                        _sc_direction, _sc_pct, _sc_units,
                         trading_days, spot_by_date,
                     )
                     if _trig_sa:
                         _new_base_sa = spot_by_date.get(_trig_sa)
                         if _new_base_sa and _new_base_sa > 0:
                             _seg_base_sa = _new_base_sa
+        return _out
+
+    _trade_adj_baseline: Dict[int, float] = {}
+    if spot_adj_enabled and spot_adj_pct > 0 and _has_fixed_strike_opt_legs_sa:
+        _trade_adj_baseline = _segment_carry_baseline(
+            spot_adj_direction, spot_adj_pct, spot_adj_units
+        )
 
     # ── Per-leg spot-adj baseline ─────────────────────────────────────────────
     # Each configured leg measures from ITS OWN contract cycle, not from every
@@ -4697,17 +4889,43 @@ def run_rust_engine_pipeline(
     # Mirrors the existing _trade_adj_baseline carry/re-base shape, with the
     # window being the yearly cycle instead of the filter segment. Skipped
     # entirely when no leg carries its own config.
+    # Every leg — yearly included — measures from the SAME anchor the trade-level
+    # ("overall") knob uses, so `own` and `overall` at the same threshold produce
+    # identical triggers. Mirrors the trade-level read at the _trade_adj_baseline
+    # site below: use that baseline when one exists (fixed-strike legs get a
+    # segment anchor), otherwise the trade's own entry spot.
+    #
+    # A yearly leg previously anchored on the CONTRACT CYCLE's entry spot and
+    # ratcheted to the trigger spot after each breach, which made `own` a
+    # cycle-wide trailing rule while `overall` stayed per-trade. Same number in
+    # the box, different rule: measured on NIFTY BUY PE ATM YEARLY T0/T0 at
+    # "rise 1000 pts", the trade entering 2022-10-27 @17,736.95 ran to expiry
+    # under overall (needed 18,736.95, spot reached 18,484.10) but triggered on
+    # 2022-11-07 under own, because it was still measuring off the 2022-07-29
+    # cycle anchor of 17,158.25 (18,202.80 - 17,158.25 = 1,044.55 >= 1000).
+    # Whole runs diverged from that point: 53 trades/6 adjustments vs 57/9.
     _leg_adj_baseline: Dict[Tuple[int, int], float] = {}
-    # NOTE: `_yearly_cycles` is a local of resolve_trade_specs_core, NOT of this
-    # function — read the cycles off the payload here, which is where this
-    # function gets them everywhere else (see the hard-fail guard at :3881).
-    _pl_cycles: List[Dict[str, str]] = list(payload.get("yearly_cycles") or [])
+    # (trade_id, leg_id) -> cycle key, and (leg_id, cycle key) -> that cycle's seed
+    # anchor. Populated only for the multi-leg yearly branch; the compare loop uses
+    # them to carry a LIVE anchor that advances on a real win, not on a guess.
+    _leg_cycle_of: Dict[Tuple[int, int], str] = {}
+    _leg_cycle_seed: Dict[Tuple[int, str], float] = {}
     if _has_per_leg_sa:
-        _tid_entry_pl: Dict[int, str] = {
-            tid: _normalize_iso(lg[0]["entry_date"])
-            for tid, lg in by_trade.items() if lg
-        }
-        _tids_pl = sorted(_tid_entry_pl, key=lambda t: _tid_entry_pl[t])
+        # Anchor rule:
+        #   · SINGLE leg — use the same anchor `overall` uses, so selecting `own`
+        #     on the only leg reproduces the trade-level knob exactly (fixed-strike
+        #     legs get the segment carry, fresh strikes the trade's own entry spot).
+        #   · MULTI leg — a YEARLY leg is a long-held position sitting beside the
+        #     weekly/monthly legs, so its threshold measures from the CONTRACT
+        #     CYCLE's first entry spot, carried across the cycle and re-based
+        #     whenever the leg itself breaches. Verified against the desk sheet:
+        #     NIFTY weekly-CE + yearly-PE, the 02-11-2022 trade breaches on
+        #     07-11-2022 at 18,202.80 - 17,158.25 = 1,044.55 pts off the
+        #     29-07-2022 cycle anchor; a per-trade anchor yields only 119.95 and
+        #     never fires, which is exactly what the desk reported as "yearly
+        #     adjustment not working".
+        _pl_cycles: List[Dict[str, str]] = list(payload.get("yearly_cycles") or [])
+        _multi_leg = len(legs_src) > 1
 
         def _cycle_containing(_d: str) -> Optional[Dict[str, str]]:
             for _c in (_pl_cycles or []):
@@ -4715,41 +4933,70 @@ def run_rust_engine_pipeline(
                     return _c
             return None
 
+        _tids_pl = sorted(_tid_entry_iso_sa, key=lambda t: _tid_entry_iso_sa[t])
         for _leg_id, _lcfg in _per_leg_sa.items():
             _lg_src = legs_src[_leg_id - 1] if 0 <= _leg_id - 1 < len(legs_src) else {}
             _leg_yearly = str((_lg_src or {}).get("expiry") or "").upper() == "YEARLY"
-            _cyc_base: Dict[str, float] = {}
-            for _tid in _tids_pl:
-                _e_iso = _tid_entry_pl[_tid]
+            if _multi_leg and _leg_yearly and _pl_cycles:
+                # Seed the cycle anchor ONLY — no ratchet here. This pass used to
+                # ask "would this leg breach inside this trade?" and advance the
+                # anchor whenever the answer was yes. But the trade's ACTUAL exit
+                # is decided later by the earliest-wins compare, where the weekly
+                # leg's 1% is a far shorter distance than the yearly's 1000 pts
+                # and almost always triggers first. So the yearly was charged for
+                # breaches it never took: measured on NIFTY weekly-CE + yearly-PE,
+                # 8 yearly triggers were computed, 7 lost the compare to the CE,
+                # and all 8 moved the anchor — carrying it to 26,175.75 when it
+                # should have sat near 19,800, permanently out of reach. One
+                # yearly adjustment reached the tradesheet in a 7-year run.
+                # The anchor is now advanced in the compare loop below, and only
+                # when this leg actually wins. Cycle-boundary resets (a new
+                # contract re-anchors to its first entry spot) are unchanged —
+                # those were always correct.
+                for _tid in _tids_pl:
+                    _e_iso = _tid_entry_iso_sa[_tid]
+                    _own_spot = float(
+                        by_trade[_tid][0].get("entry_spot") or spot_by_date.get(_e_iso) or 0.0
+                    )
+                    # Mark the spot when THIS LEG'S EXPIRY CHANGES — the yearly
+                    # roll — and hold that mark for the whole contract. Keying on
+                    # the payload's yearly_cycles windows instead meant the mark
+                    # was taken whenever the cycle window turned over, which is not
+                    # the same date the leg actually rolls Dec-N -> Dec-N+1. On the
+                    # desk's file the leg rolls on 23-11-2022, 29-11-2023,
+                    # 27-11-2024 at spots 18,267.25 / 20,096.60 / 24,274.90; the
+                    # first 1000-pt crossings from those marks are 04-07-2023,
+                    # 14-12-2023 and 26-06-2025, while the engine reported
+                    # 20-07-2023, 16-02-2024 and 08-07-2025 — up to two months late.
+                    _lrow = next(
+                        (r for r in by_trade[_tid]
+                         if int(r.get("leg_id") or 0) == _leg_id),
+                        None,
+                    )
+                    _ckey = _normalize_iso((_lrow or {}).get("expiry") or "") or ""
+                    # First trade on a given expiry defines that contract's mark.
+                    _seed = _leg_cycle_seed.setdefault((_leg_id, _ckey), _own_spot)
+                    _leg_cycle_of[(_tid, _leg_id)] = _ckey
+                    _leg_adj_baseline[(_tid, _leg_id)] = _seed
+                continue
+            _leg_seg_base = (
+                _segment_carry_baseline(_lcfg["direction"], _lcfg["pct"], _lcfg["units"])
+                if _has_fixed_strike_opt_legs_sa
+                else {}
+            )
+            for _tid, _e_iso in _tid_entry_iso_sa.items():
                 _own_spot = float(
                     by_trade[_tid][0].get("entry_spot") or spot_by_date.get(_e_iso) or 0.0
                 )
-                if not (_leg_yearly and _pl_cycles):
-                    _leg_adj_baseline[(_tid, _leg_id)] = _own_spot
-                    continue
-                _cyc = _cycle_containing(_e_iso)
-                _ckey = str((_cyc or {}).get("contract") or "")
-                _base = _cyc_base.get(_ckey)
-                if _base is None or _base <= 0:
-                    _base = _own_spot
-                _leg_adj_baseline[(_tid, _leg_id)] = _base
-                # If this leg breaches inside this trade, the rest of the cycle
-                # measures from the trigger spot (same rule as _trade_adj_baseline).
-                _sched_pl = _normalize_iso(by_trade[_tid][0].get("exit_date") or "")
-                if _sched_pl and _base > 0:
-                    _t_pl = _compute_spot_adjustment_trigger(
-                        _e_iso, _base, _sched_pl,
-                        _lcfg["direction"], _lcfg["pct"], _lcfg["units"],
-                        trading_days, spot_by_date,
-                    )
-                    if _t_pl:
-                        _nb = spot_by_date.get(_t_pl)
-                        if _nb and _nb > 0:
-                            _base = _nb
-                _cyc_base[_ckey] = _base
+                _leg_adj_baseline[(_tid, _leg_id)] = _leg_seg_base.get(_tid) or _own_spot
 
     spot_adj_overrides: Dict[int, str] = {}
     spot_adj_reasons: Dict[int, str] = {}
+    # trade_id → leg_id that actually caused the breach, when a per-leg config won
+    # the earliest-wins compare. Drives the re-entry strike: ONLY the breaching leg
+    # re-strikes, the others hold. Absent for trade-level (NIFTY/MIDCAP/MIDCPNIFTY)
+    # breaches, where every leg re-strikes as before.
+    spot_adj_trigger_leg: Dict[int, int] = {}
     # Phase 3: breaches belonging to a leg that carries its own config, keyed by
     # (trade_id, leg_id). Only that leg's exit is clamped; the rest of the trade
     # runs to its own schedule. Empty without per-leg config, so every consumer
@@ -4757,6 +5004,96 @@ def run_rust_engine_pipeline(
     spot_adj_leg_overrides: Dict[Tuple[int, int], str] = {}
     spot_adj_leg_reasons: Dict[Tuple[int, int], str] = {}
     _nifty_active = bool(spot_adj_enabled and spot_adj_pct > 0)
+
+    # ── Mark timeline ────────────────────────────────────────────────────────
+    # ONE chronological simulation of every cycle leg's mark. The engine decides
+    # exits in one pass and builds re-entries in a second, but this mark has to
+    # move forward in date order across BOTH — so it was computed twice and kept
+    # falling through the seam: a reset inside a cascade never reached the next
+    # trade, and the yearly re-fired without the threshold being met (03-Jul reset
+    # to 19,322.55, then fired again on 06-Jul at 19,497.30, only +174.75).
+    # Simulating it once here needs nothing from the bridge, so both passes can
+    # simply read it.
+    #   · mark set at the leg's expiry roll
+    #   · rise past the threshold cuts the trade
+    #   · mark resets to the spot at every adjustment, trade-level or cascade hop
+    #   · resets again at the next roll
+    _leg_mark_at_trade: Dict[Tuple[int, int], float] = {}
+    _leg_mark_at_hop: Dict[Tuple[int, str, int], float] = {}
+    if _has_per_leg_sa and _leg_cycle_of:
+        _mark: Dict[Tuple[int, str], float] = dict(_leg_cycle_seed)
+        for _mt in sorted(_tid_entry_iso_sa, key=lambda t: (_tid_entry_iso_sa[t], t)):
+            _m_entry = _tid_entry_iso_sa[_mt]
+            _m_sched = _normalize_iso(by_trade[_mt][0].get("exit_date") or "")
+            if not _m_sched:
+                continue
+            _m_cur = _m_entry
+            _m_spot = float(
+                by_trade[_mt][0].get("entry_spot") or spot_by_date.get(_m_entry) or 0.0
+            )
+            _m_first = True
+            _m_depth = 0
+            while _m_depth < 250 and _m_cur < _m_sched:
+                _m_depth += 1
+                if not _m_spot:
+                    break
+                for _m_lg in _per_leg_sa:
+                    _m_ck = _leg_cycle_of.get((_mt, _m_lg))
+                    if _m_ck is None:
+                        continue
+                    _m_val = _mark.get((_m_lg, _m_ck), 0.0)
+                    if _m_first:
+                        _leg_mark_at_trade[(_mt, _m_lg)] = _m_val
+                    _leg_mark_at_hop[(_mt, _m_cur, _m_lg)] = _m_val
+                _m_first = False
+                _m_cands: List[Tuple[str, Optional[int]]] = []
+                if _nifty_active and _m_spot > 0:
+                    _m_t = _compute_spot_adjustment_trigger(
+                        _m_cur, _m_spot, _m_sched, spot_adj_direction,
+                        spot_adj_pct, spot_adj_units, trading_days, spot_by_date,
+                    )
+                    if _m_t:
+                        _m_cands.append((_m_t, None))
+                for _m_lg, _m_cfg in _per_leg_sa.items():
+                    _m_ck = _leg_cycle_of.get((_mt, _m_lg))
+                    _m_base = (
+                        _mark.get((_m_lg, _m_ck), 0.0) if _m_ck is not None else _m_spot
+                    )
+                    if not _m_base:
+                        continue
+                    _m_t = _compute_spot_adjustment_trigger(
+                        _m_cur, _m_base, _m_sched, _m_cfg["direction"],
+                        _m_cfg["pct"], _m_cfg["units"], trading_days, spot_by_date,
+                    )
+                    if _m_t:
+                        _m_cands.append((_m_t, _m_lg))
+                if not _m_cands:
+                    break
+                # Earliest wins; ties go to the trade-level source then leg order,
+                # matching the _cands ordering in the compare loop below.
+                _m_win_d, _m_win_lg = min(
+                    _m_cands, key=lambda c: (c[0], 0 if c[1] is None else c[1])
+                )
+                # Whole-trade cut on _m_win_d: EVERY cycle leg whose threshold was
+                # ALSO crossed on that same date is adjusted too, so reset all of
+                # them — not just the single earliest-wins winner. When the weekly
+                # (1%) and the yearly (1000pt) both cross the same day, the tie
+                # handed the exit to the weekly and left the yearly mark stale,
+                # which drifted its next reset to a later/higher spot (14-Dec
+                # 21,182.70 -> wrongly 18-Dec 21,418.65) and made the yearly
+                # under-fire for months. A leg whose trigger is LATER than the cut
+                # (it hadn't crossed yet) is left untouched.
+                _m_new = spot_by_date.get(_m_win_d)
+                if _m_new and _m_new > 0:
+                    for _m_cd, _m_cl in _m_cands:
+                        if _m_cd != _m_win_d or _m_cl is None:
+                            continue
+                        _m_ck = _leg_cycle_of.get((_mt, _m_cl))
+                        if _m_ck is not None:
+                            _mark[(_m_cl, _m_ck)] = float(_m_new)
+                _m_cur = _m_win_d
+                _m_spot = float(spot_by_date.get(_m_win_d) or 0.0)
+
     # The strategy-level scan still covers every leg that has NO config of its
     # own. If every leg brought its own, the strategy-level knob no longer has a
     # leg to speak for and must not fire. With no per-leg config at all this is
@@ -4775,7 +5112,15 @@ def run_rust_engine_pipeline(
     # breaches never compute. False when no leg has one, so this is a no-op for
     # every existing payload.
     if _nifty_active or _midcap_active or _midcp_active or _has_per_leg_sa:
-        for trade_id, legs in by_trade.items():
+        # Chronological: the live anchor carries forward, so the walk order is now
+        # part of the result. by_trade is normally insertion-ordered by trade_id,
+        # which is already chronological, but sort explicitly rather than rely on it.
+        for trade_id, legs in sorted(
+            by_trade.items(),
+            key=lambda kv: (
+                _normalize_iso(kv[1][0]["entry_date"]) if kv[1] else "", kv[0]
+            ),
+        ):
             legs.sort(key=lambda r: r["leg_id"])
             first = legs[0]
             entry_iso = _normalize_iso(first["entry_date"])
@@ -4805,6 +5150,9 @@ def run_rust_engine_pipeline(
             _leg_trigs: List[Tuple[str, int]] = []
             for _leg_id, _lcfg in _per_leg_sa.items():
                 _lbase = _leg_adj_baseline.get((trade_id, _leg_id), 0.0)
+                # Cycle-mode legs read the LIVE anchor, which only moves on a win.
+                if _leg_cycle_of.get((trade_id, _leg_id)) is not None:
+                    _lbase = _leg_mark_at_trade.get((trade_id, _leg_id), _lbase)
                 if _lbase <= 0:
                     continue
                 _ltrig = _compute_spot_adjustment_trigger(
@@ -4875,42 +5223,78 @@ def run_rust_engine_pipeline(
                     _cands.append((midcap_trig, "MIDCAP"))
                 if midcp_trig:
                     _cands.append((midcp_trig, "MIDCPNIFTY"))
-                # Phase 3: a leg carrying its own config exits on its OWN breach
-                # and does not drag the other legs out with it, so its trigger is
-                # recorded per (trade, leg) instead of joining the trade-level
-                # earliest-wins compare. Index sources (NIFTY/MIDCAP/MIDCPNIFTY)
-                # and legs WITHOUT their own config keep the whole-trade rule.
+                # A per-leg breach cuts the WHOLE TRADE, exactly like an index-level
+                # one: its trigger joins the earliest-wins compare below rather than
+                # being recorded per (trade, leg). Every leg then exits on that date
+                # and re-enters together, so no trade row is ever left holding one
+                # leg while the other runs on.
+                #
+                # What is per-leg is the STRIKE on the re-entry, not the exit: the
+                # breaching short-dated leg re-strikes to ATM while a long-dated leg
+                # keeps its month-wise epoch strike (see _opens_new_epoch).
+                #
+                # This deliberately replaces the per-leg-exit behaviour: that left
+                # single-leg rows in the sheet (a CE-only trade 11 whose put was
+                # still open on trade 10) which read as dropped legs. Appended after
+                # the index sources so a tie keeps the existing NIFTY-first
+                # tie-break.
                 for _lt, _lid in _leg_trigs:
-                    spot_adj_leg_overrides[(trade_id, _lid)] = _lt
-                    _lcfg_r = _per_leg_sa.get(_lid) or {}
-                    spot_adj_leg_reasons[(trade_id, _lid)] = _spot_adj_reason_tag(
-                        _lcfg_r.get("direction") or "rise",
-                        _leg_adj_baseline.get((trade_id, _lid), 0.0),
-                        spot_by_date.get(_lt),
-                        _lcfg_r.get("pct") or 0.0,
-                        _lcfg_r.get("units") or "percent",
-                    )
+                    _cands.append((_lt, "LEG%d" % _lid))
                 if _cands:
                     _win_date, _win_src = min(_cands, key=lambda c: c[0])
                     spot_adj_overrides[trade_id] = _win_date
-                    if _win_src == "NIFTY":
-                        spot_adj_reasons[trade_id] = _spot_adj_reason_tag(
-                            spot_adj_direction, entry_spot, spot_by_date.get(_win_date),
-                            spot_adj_pct, spot_adj_units,
-                        )
-                    elif _win_src == "MIDCAP":
-                        _mc_e = midcap_spot_by_date.get(entry_iso) or 0.0
-                        _mc_t = midcap_spot_by_date.get(_win_date) or 0.0
-                        spot_adj_reasons[trade_id] = (
-                            "MIDCAP_SPOT_ADJ_RISE" if _mc_t >= _mc_e else "MIDCAP_SPOT_ADJ_FALL"
-                        )
-                    else:
+
+                    def _src_reason(_src: str) -> str:
+                        if _src == "NIFTY":
+                            return _spot_adj_reason_tag(
+                                spot_adj_direction, entry_spot,
+                                spot_by_date.get(_win_date), spot_adj_pct, spot_adj_units,
+                            )
+                        if _src == "MIDCAP":
+                            _mc_e = midcap_spot_by_date.get(entry_iso) or 0.0
+                            _mc_t = midcap_spot_by_date.get(_win_date) or 0.0
+                            return ("MIDCAP_SPOT_ADJ_RISE" if _mc_t >= _mc_e
+                                    else "MIDCAP_SPOT_ADJ_FALL")
+                        if _src.startswith("LEG"):
+                            _wl = int(_src[3:])
+                            _wck = _leg_cycle_of.get((trade_id, _wl))
+                            _w_prebase = (
+                                _leg_mark_at_trade.get(
+                                    (trade_id, _wl),
+                                    _leg_adj_baseline.get((trade_id, _wl), 0.0),
+                                )
+                                if _wck is not None
+                                else _leg_adj_baseline.get((trade_id, _wl), 0.0)
+                            )
+                            _lcfg_r = _per_leg_sa.get(_wl) or {}
+                            return "%s (%s)" % (
+                                _spot_adj_reason_tag(
+                                    _lcfg_r.get("direction") or "rise",
+                                    _w_prebase, spot_by_date.get(_win_date),
+                                    _lcfg_r.get("pct") or 0.0,
+                                    _lcfg_r.get("units") or "percent",
+                                ),
+                                _sa_leg_label(_wl),
+                            )
                         _mn_e = midcp_spot_by_date.get(entry_iso) or 0.0
                         _mn_t = midcp_spot_by_date.get(_win_date) or 0.0
-                        spot_adj_reasons[trade_id] = (
-                            "MIDCPNIFTY_SPOT_ADJ_RISE" if _mn_t >= _mn_e
-                            else "MIDCPNIFTY_SPOT_ADJ_FALL"
-                        )
+                        return ("MIDCPNIFTY_SPOT_ADJ_RISE" if _mn_t >= _mn_e
+                                else "MIDCPNIFTY_SPOT_ADJ_FALL")
+
+                    # The winning leg drives the re-entry strike (unchanged).
+                    if _win_src.startswith("LEG"):
+                        spot_adj_trigger_leg[trade_id] = int(_win_src[3:])
+                    # Whole-trade cut: every source that ALSO crossed on the cut
+                    # date is adjusted too, so name them all — winner first, then
+                    # co-triggers in _cands order — joined with " + ". Single-source
+                    # trades are byte-identical to before.
+                    _reason_srcs = [_win_src] + [
+                        _cs for _cd, _cs in _cands
+                        if _cd == _win_date and _cs != _win_src
+                    ]
+                    spot_adj_reasons[trade_id] = " + ".join(
+                        _src_reason(_s) for _s in _reason_srcs
+                    )
 
     # Slice 5: Overall SL / Target detection.
     # Engine flow (engines/generic_algotest_engine.py:4553-4594):
@@ -6090,6 +6474,40 @@ def run_rust_engine_pipeline(
                         _tnat = _natural_spec_strikes.get((_tid, _tlid))
                         if _tnat:
                             _anchor_strike.setdefault(_tdate, {}).setdefault(_tlid, _tnat)
+            # (3) Per-leg ("own") adjustments re-enter through the Phase 3 cascade,
+            #     which is assembled AFTER this block runs — so neither (1) nor (2)
+            #     records an anchor for those triggers, and every FOLLOWING trade
+            #     fell back to the locked first-cycle strike while `overall`
+            #     propagated the re-anchor via its bridge. Measured on NIFTY BUY PE
+            #     ATM YEARLY T0/T0, Fixed strikes, rise 1000pts: the re-entries
+            #     themselves agreed (rows 18/21 = 19000/20000) but the trades after
+            #     them read 18000 under own vs 19000/20000 under overall.
+            #     Anchor every trigger date from the trigger-day ATM — the same
+            #     value the bridge would have produced — independent of which
+            #     builder created the re-entry. setdefault keeps (1)/(2) winning,
+            #     so this is a no-op wherever they already registered the date.
+            _cf_index = str(payload.get("symbol") or payload.get("index") or "NIFTY").upper()
+            _cf_iv_default = _STRIKE_INTERVALS.get(_cf_index, 50.0)
+            for _otid, _odate in spot_adj_overrides.items():
+                _ospot = float(spot_by_date.get(_odate) or 0.0)
+                if not _ospot:
+                    continue
+                for _orow in by_trade.get(_otid, []):
+                    _olid = int(_orow["leg_id"])
+                    _osrc = legs_src[_olid - 1] if 0 <= _olid - 1 < len(legs_src) else {}
+                    _oiv_raw = (_osrc or {}).get("strike_interval") or (_osrc or {}).get("strike_gap")
+                    try:
+                        _oiv = float(_oiv_raw) if _oiv_raw else _cf_iv_default
+                    except (TypeError, ValueError):
+                        _oiv = _cf_iv_default
+                    _onat = _compute_strike_for_leg_python(
+                        _osrc, _ospot, _oiv,
+                        entry_date=_odate,
+                        expiry=_normalize_iso(_orow.get("expiry") or ""),
+                        index=_cf_index,
+                    )
+                    if _onat:
+                        _anchor_strike.setdefault(_odate, {}).setdefault(_olid, float(_onat))
             _anchor_dates_sorted = sorted(_anchor_strike.keys())
             # Reprice each original trade to the most-recent re-anchor ≤ its entry.
             for _cf_s, _cf_e in _cf_segs:
@@ -6184,20 +6602,19 @@ def run_rust_engine_pipeline(
                 _reason_cands.append((overall_date, reason))
             # Slice 7a: Spot adjustment exit always clamps the final exit when
             # the SL/Overall date is later than the spot-adj trigger.
-            # Phase 3 — a leg that carries its own spot-adj config is clamped by
-            # ITS OWN breach and is NOT dragged out by the trade-level trigger
-            # (the strategy-level knob does not speak for a leg that opted out of
-            # it). A leg without its own config keeps reading the trade-level
-            # map, so with no per-leg config anywhere this is the original line.
-            _leg_id_sa = int(leg.get("leg_id") or (i + 1))
-            if _leg_id_sa in _per_leg_sa:
-                spot_adj_clamp = spot_adj_leg_overrides.get((trade_id, _leg_id_sa))
-                _sa_clamp_reason = spot_adj_leg_reasons.get(
-                    (trade_id, _leg_id_sa), "SPOT_ADJ_RISE"
-                )
-            else:
-                spot_adj_clamp = spot_adj_overrides.get(trade_id)
-                _sa_clamp_reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
+            # EVERY leg reads the TRADE-level map. A per-leg breach now joins the
+            # earliest-wins compare (see _leg_trigs -> _cands above), so one leg
+            # breaching clamps the whole trade and all legs exit together — that
+            # is the whole-trade cut the sheet requires.
+            #
+            # This previously routed a leg WITH its own config to
+            # spot_adj_leg_overrides. Once per-leg breaches were moved to the
+            # trade-level map that branch read an empty dict, so a strategy where
+            # EVERY leg carried its own config produced ZERO spot-adjustment
+            # exits — 197 trades, all SCHEDULED_EXIT. The two halves must move
+            # together: triggers and clamp read the same map.
+            spot_adj_clamp = spot_adj_overrides.get(trade_id)
+            _sa_clamp_reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
             if spot_adj_clamp and final_exit >= spot_adj_clamp:
                 final_exit = spot_adj_clamp
                 reason = _sa_clamp_reason
@@ -6331,7 +6748,25 @@ def run_rust_engine_pipeline(
         # run, matching the hard-fail contract at :3881.
         or (_sa_expiry_type == "YEARLY" and bool(payload.get("yearly_cycles")))
     )
-    if spot_adj_overrides and _sa_cascade_active and filter_entry_mode != "fixed":
+    # Fixed entry used to be excluded here on the assumption that the bridge
+    # (Slice 7b) re-enters those trades instead. That only holds when the bridge
+    # actually runs — its own gate at :5710 is
+    # `(_rollover_toggle and filter_entry_mode == "fixed") or _has_fixed_strike_opt_legs`
+    # — so every OTHER fixed-entry config exited on a breach and never re-entered.
+    # Measured on the NIFTY+MIDCPNIFTY sync-cadence run: 72 SPOT_ADJ exits, 0
+    # genuine same-day re-entries (the 10 that looked like re-entries were the
+    # weekly roll landing on the same Wednesday, reason=SCHEDULED_EXIT).
+    #
+    # This also became the ONLY re-entry path for per-leg breaches: the whole-trade
+    # cut routes leg triggers through _leg_trigs -> _cands into the trade-level
+    # spot_adj_overrides, so the per-leg block at :6616 — gated on the now
+    # never-written spot_adj_leg_overrides — is dead code and re-enters nothing.
+    #
+    # Admit fixed entry, and skip only the trades the bridge already re-entered,
+    # so bridge-served configs keep exactly the trades they have today and can
+    # never double-enter.
+    _sa_bridged_parents = set(_bt_bridge_by_new_tid.values())
+    if spot_adj_overrides and _sa_cascade_active:
         if True:  # legacy indentation
             _sa_index = str(payload.get("symbol") or payload.get("index") or "NIFTY").upper()
             _sa_interval = _STRIKE_INTERVALS.get(_sa_index, 50.0)
@@ -6340,6 +6775,8 @@ def run_rust_engine_pipeline(
             _sa_new_tid = _bt_new_tid
 
             for orig_tid in sorted(spot_adj_overrides.keys()):
+                if orig_tid in _sa_bridged_parents:
+                    continue  # bridge already re-entered this trade — don't double-enter
                 trigger_date = spot_adj_overrides[orig_tid]  # ISO string
                 orig_legs = by_trade.get(orig_tid)
                 if not orig_legs:
@@ -6367,6 +6804,9 @@ def run_rust_engine_pipeline(
                 _sa_cur_entry = trigger_date
                 _sa_cur_exit  = orig_exit_date
                 _sa_depth = 0
+                # Which leg caused the breach that opens THIS mini-trade. Seeded
+                # from the entry-side compare; re-pointed at each cascade hop.
+                _sa_trig_leg: Optional[int] = spot_adj_trigger_leg.get(orig_tid)
 
                 # Cap is a runaway-loop backstop only — far above any real
                 # cycle's trading-day count. The loop really terminates on
@@ -6394,6 +6834,55 @@ def run_rust_engine_pipeline(
                             trading_days,
                             spot_by_date,
                         )
+                    # Per-leg configs must cascade too. This continuation read ONLY
+                    # the trade-level knob (_nifty_active / spot_adj_*), so a strategy
+                    # whose adjustment lives entirely on the legs produced exactly ONE
+                    # mini-trade and then hit `else: break` — the re-entry was never
+                    # re-scanned, so a further breach inside it did nothing. Measured
+                    # on the NIFTY weekly-CE(1%) + yearly-PE(1000pt) run: 72 re-entries
+                    # of which only 2 ever adjusted again, leaving mid-window breaches
+                    # unactioned (e.g. entry 2025-04-11 @22828.55 crossed 1% on 04-15
+                    # at 23328.55 (+2.19%) yet exited SCHEDULED_EXIT on 04-16).
+                    # Baseline is _sa_spot — the mini-trade's own entry spot — for
+                    # every leg, matching the entry-side _leg_adj_baseline rule and
+                    # the trade-level cascade above. Earliest breach wins, mirroring
+                    # the entry-side _leg_trigs compare.
+                    _sa_casc_cfg: Optional[Dict[str, Any]] = None
+                    _sa_casc_leg: Optional[int] = None
+                    for _cl_lid, _cl_cfg in _per_leg_sa.items():
+                        # A cycle-anchored (yearly) leg keeps measuring from ITS
+                        # MARK — the spot at the expiry roll — not from this
+                        # mini-trade's entry. Using _sa_spot here threw the mark
+                        # away the moment any other leg cut the trade: measured on
+                        # NIFTY monthly-CE(1%) + yearly-PE(1000pt), the mark was a
+                        # correct 18,267.25 (target 19,267.25, crossed 03-07-2023)
+                        # but the CE breached first on ~30-06, and every re-entry
+                        # after that measured the yearly from 19,189.05 (target
+                        # 20,189.05). With the CE firing 134 times, nearly the whole
+                        # timeline is cascade re-entries, so the yearly almost never
+                        # got to fire — it only won the rare scheduled trade where
+                        # the CE happened not to breach first.
+                        _cl_base = _sa_spot
+                        if _leg_cycle_of.get((orig_tid, _cl_lid)) is not None:
+                            _cl_base = (
+                                _leg_mark_at_hop.get((orig_tid, _sa_cur_entry, _cl_lid))
+                                or _leg_mark_at_trade.get((orig_tid, _cl_lid))
+                                or _sa_spot
+                            )
+                        _cl_trig = _compute_spot_adjustment_trigger(
+                            _sa_cur_entry,
+                            _cl_base,
+                            _sa_cur_exit,
+                            _cl_cfg["direction"],
+                            _cl_cfg["pct"],
+                            _cl_cfg["units"],
+                            trading_days,
+                            spot_by_date,
+                        )
+                        if _cl_trig and (not _sa_casc or _cl_trig < _sa_casc):
+                            _sa_casc = _cl_trig
+                            _sa_casc_cfg = _cl_cfg
+                            _sa_casc_leg = _cl_lid
                     # Check for a further Midcap spot-adj trigger — only when
                     # Midcap SA is active. Earliest of NIFTY/Midcap wins.
                     _mc_casc = None
@@ -6491,12 +6980,103 @@ def run_rust_engine_pipeline(
                         # whitelist, and Rust likewise has no such clamp.
                         if _sa_leg_interval not in (25.0, 50.0, 100.0, 500.0, 1000.0):
                             _sa_leg_interval = _sa_interval
+                        # Each leg keeps its OWN contract. orig_expiry is leg 1's
+                        # expiry (see the sorted(...)[0] read above) and was being
+                        # stamped onto every leg of the re-entry, so a mixed
+                        # weekly-CE + yearly-PE strategy had the yearly leg
+                        # re-entered on the WEEKLY contract: measured on the
+                        # 2019-2026 NIFTY run, PE re-entries carried expiry
+                        # 2019-10-17 / 10-24 / 10-31 / 12-19 instead of 2019-12-26.
+                        # Only ever bites when legs differ in expiry, which is why
+                        # single-expiry strategies never showed it.
+                        _sa_leg_expiry = (
+                            _normalize_iso(_sa_leg.get("expiry") or "") or orig_expiry
+                        )
                         _sa_strike_info: Dict[str, Any] = {}
-                        _sa_strike = _compute_strike_for_leg_python(
-                            _sa_leg_src, _sa_spot, _sa_leg_interval,
-                            entry_date=_sa_cur_entry, expiry=orig_expiry, index=_sa_index,
-                            out_info=_sa_strike_info, resolved_strikes=_sa_resolved,
-                        ) or float(_sa_leg.get("strike") or 0.0)
+                        # A YEARLY leg holds one strike per calendar MONTH; only a
+                        # weekly/monthly leg re-strikes at every adjustment. This
+                        # builder recomputed a fresh ATM for EVERY leg on every hop,
+                        # so the yearly leg flip-flopped inside a single month —
+                        # measured on the weekly-CE + yearly-CE run, Oct-2019:
+                        # 11000 (scheduled) -> 12000 (re-entry) -> 11000 -> 12000,
+                        # four changes in one month, while the scheduled rows
+                        # correctly carried 11000. Mirrors the fixed-entry builder
+                        # at :2276 — carry the epoch strike, then re-validate it for
+                        # liquidity against THIS entry date rather than reuse blindly.
+                        _sa_carry = None
+                        _sa_leg_yearly = str(
+                            (_sa_leg_src or {}).get("expiry")
+                            or (_sa_leg_src or {}).get("expiry_type") or ""
+                        ).upper() == "YEARLY"
+                        _sa_prev_entry = _normalize_iso(_sa_leg.get("entry_date") or "")
+                        _sa_mode = str(
+                            (_sa_leg_src or {}).get("rollover_strike_mode") or "fresh"
+                        ).lower()
+                        # Strike follows the BREACHING leg. A per-leg breach cuts
+                        # the whole trade and re-enters every leg, but only the leg
+                        # that actually breached re-strikes — the others hold what
+                        # they had, because nothing happened to them.
+                        #   · weekly breach → weekly re-strikes, yearly holds
+                        #   · yearly breach → yearly re-strikes, weekly holds
+                        # This was previously keyed on leg TYPE rather than on who
+                        # breached, so a yearly breach moved the weekly leg and held
+                        # the yearly one — exactly inverted. Measured on NIFTY
+                        # weekly-CE + yearly-PE, the 07-11-2022 yearly breach:
+                        # CE 18100 -> 18200 (should hold) and PE 18000 -> 18000
+                        # (should move).
+                        # A non-breaching leg still respects its own epoch, so a
+                        # yearly leg re-strikes when the calendar MONTH turns.
+                        # FIXED strike mode is deliberately broken by a spot adj —
+                        # the lock ends and the leg re-anchors to natural ATM (see
+                        # _natural_spec_strikes at :4374) — so it never carries.
+                        # Trade-level breaches leave _sa_trig_leg None and keep the
+                        # original behaviour: every leg re-strikes.
+                        if _sa_trig_leg is not None and (_sa_lidx + 1) != _sa_trig_leg:
+                            # Non-breaching leg. A WEEKLY/MONTHLY leg still re-strikes
+                            # to its configured selection — holding it left the CE far
+                            # off ITM1 whenever spot ran between the original entry and
+                            # the breach: measured on the Jun-Dec roll strategy, trade
+                            # 164 was cut by the yearly PE on 27-06-2025 and the CE held
+                            # 25100 into a re-entry at spot 25,637.80, where ITM1 is
+                            # 25500 — 4 strikes deeper than configured, premium 575.85
+                            # against ~215 for a correct ITM1. Only a YEARLY leg holds
+                            # here, and only for its calendar-MONTH epoch.
+                            if (
+                                _sa_leg_yearly
+                                and _sa_mode != "fixed"
+                                and not _opens_new_epoch(
+                                    _sa_mode, _sa_prev_entry, _sa_cur_entry, False, True,
+                                )
+                            ):
+                                _sa_carry = float(_sa_leg.get("strike") or 0.0) or None
+                        elif (
+                            _sa_trig_leg is None
+                            and _sa_leg_yearly
+                            and _sa_prev_entry
+                            and _sa_mode != "fixed"
+                            and not _opens_new_epoch(
+                                _sa_mode, _sa_prev_entry, _sa_cur_entry, False, True,
+                            )
+                        ):
+                            _sa_carry = float(_sa_leg.get("strike") or 0.0) or None
+                        if _sa_carry is not None:
+                            _sa_is_ce = str(
+                                _sa_leg.get("option_type") or "CE"
+                            ).upper() in ("CE", "CALL", "C")
+                            _sa_atm = round(_sa_spot / _sa_leg_interval) * _sa_leg_interval
+                            _sa_strike = _validate_or_shift_strike_python(
+                                _sa_carry, _sa_atm, _sa_leg_interval, _sa_is_ce,
+                                _sa_cur_entry, _sa_leg_expiry, _sa_index,
+                                str(_sa_leg.get("option_type") or "CE").upper(), 1,
+                            ) or float(_sa_leg.get("strike") or 0.0)
+                            _sa_strike_info["requested_strike"] = float(_sa_carry)
+                        else:
+                            _sa_strike = _compute_strike_for_leg_python(
+                                _sa_leg_src, _sa_spot, _sa_leg_interval,
+                                entry_date=_sa_cur_entry, expiry=_sa_leg_expiry,
+                                index=_sa_index,
+                                out_info=_sa_strike_info, resolved_strikes=_sa_resolved,
+                            ) or float(_sa_leg.get("strike") or 0.0)
                         if not _sa_strike:
                             continue
                         _sa_lid = int(_sa_leg.get("leg_id") or 1)
@@ -6507,7 +7087,7 @@ def run_rust_engine_pipeline(
                             "index":        _sa_leg.get("index") or _sa_index,
                             "entry_date":   _sa_cur_entry,
                             "exit_date":    _sa_this_exit,
-                            "expiry":       orig_expiry,
+                            "expiry":       _sa_leg_expiry,
                             "strike":       _sa_strike,
                             "requested_strike": float(_sa_strike_info.get("requested_strike") or _sa_strike),
                             "strike_interval": float(_sa_leg_interval),
@@ -6537,13 +7117,22 @@ def run_rust_engine_pipeline(
                                     else "MIDCPNIFTY_SPOT_ADJ_FALL"
                                 )
                             else:
+                                # Tag from the config that actually won. Falling back
+                                # to the trade-level knob mislabels a per-leg cascade
+                                # when the trade level is off (its direction defaults
+                                # to "rise", so a fall-configured leg read as RISE).
                                 _sa_reason = _spot_adj_reason_tag(
-                                    spot_adj_direction,
+                                    (_sa_casc_cfg or {}).get("direction", spot_adj_direction),
                                     _sa_spot,
                                     spot_by_date.get(_sa_casc),
-                                    spot_adj_pct,
-                                    spot_adj_units,
+                                    (_sa_casc_cfg or {}).get("pct", spot_adj_pct),
+                                    (_sa_casc_cfg or {}).get("units", spot_adj_units),
                                 )
+                                # Name the breaching leg on cascade hops too.
+                                if _sa_casc_leg is not None:
+                                    _sa_reason = "%s (%s)" % (
+                                        _sa_reason, _sa_leg_label(_sa_casc_leg)
+                                    )
                         else:
                             _sa_reason = "EXPIRY"
                         _sa_reentry_reasons[(_sa_new_tid, _sa_lid, _sa_cur_entry)] = _sa_reason
@@ -6555,6 +7144,7 @@ def run_rust_engine_pipeline(
 
                     if _sa_casc and _sa_casc < _sa_cur_exit:
                         _sa_cur_entry = _sa_casc  # advance to cascade trigger for next mini-trade
+                        _sa_trig_leg = _sa_casc_leg  # next hop is attributed to the leg that won
                     else:
                         break
 
@@ -6572,7 +7162,19 @@ def run_rust_engine_pipeline(
     _sa_leg_reentry_specs: List[Dict[str, Any]] = []
     _sa_leg_reentry_by_new_tid: Dict[int, int] = {}
     _sa_leg_reentry_reasons: Dict[Tuple[int, int, str], str] = {}
-    if spot_adj_leg_overrides and _sa_cascade_active and filter_entry_mode != "fixed":
+    # FIXED ENTRY IS INCLUDED HERE, unlike the trade-level block above.
+    # That block excludes fixed because the bridge (Slice 7b) re-enters those
+    # trades instead — but the bridge only ever reads the TRADE-level
+    # spot_adj_overrides, so a leg with its own config got its exit clamped
+    # (see the per-leg branch at the spot_adj_clamp site) and then never
+    # re-entered. Measured on NIFTY 2019 with per-leg SA on the weekly leg:
+    # entry mode "dte" -> 22 leg-1 trades, 0 gaps; entry mode "fixed" -> 21
+    # trades, 4 breaches with NOTHING entering on the exit day (09-Oct, 16-Oct,
+    # 23-Oct, 11-Dec 2019). The two maps are disjoint by construction — a leg
+    # with its own config is recorded ONLY in spot_adj_leg_overrides and never
+    # joins the trade-level earliest-wins compare — so the bridge and this
+    # block can never both re-enter the same leg.
+    if spot_adj_leg_overrides and _sa_cascade_active:
         _pl_index = str(payload.get("symbol") or payload.get("index") or "NIFTY").upper()
         _pl_interval_default = _STRIKE_INTERVALS.get(_pl_index, 50.0)
         # Continue past every id already handed out so mini-trades never collide.

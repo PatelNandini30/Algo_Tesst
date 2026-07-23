@@ -353,9 +353,12 @@ const parseDisplayDateForLot = (tradeDate) => {
 const getLotSize = (index, tradeDate) => {
   const d = parseDisplayDateForLot(tradeDate);
   if (index === 'NIFTY') {
-    if (d < new Date('2010-10-01')) return 200;
-    if (d < new Date('2015-10-29')) return 50;
-    if (d < new Date('2019-11-01')) return 75;
+    // Flat 65 — MIRRORS backend services/index_metadata.py::get_lot_size_for_index,
+    // which returns 65 for NIFTY at every date. The UI previously carried a dated
+    // schedule (200 / 50 / 75 / 65) that the engine does not, so a pre-Nov-2019
+    // backtest displayed "75 units" while the tradesheet priced Qty 65. The two
+    // must agree: P&L is lot-scaled, so a mismatch here misreports the position.
+    // If NIFTY's historical tiers are ever restored, change BOTH sides together.
     return 65;
   }
   if (index === 'BANKNIFTY') {
@@ -4409,9 +4412,7 @@ const StrategyBuilder = () => {
                                   onChange={v => updateLeg(leg.id, 'spot_adj_direction', v)}
                                 />
                                 <span className="text-[10px] text-muted">
-                                  {String(leg.expiry || '').toLowerCase() === 'yearly'
-                                    ? 'measured from this contract cycle’s entry spot'
-                                    : 'measured from this trade’s entry spot'}
+                                  measured from this trade’s entry spot
                                 </span>
                               </>
                             )}

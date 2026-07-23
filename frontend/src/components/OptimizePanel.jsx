@@ -89,6 +89,12 @@ export default function OptimizePanel({
   // Midcap params (Global — Midcap Spot Adjustment) only appear when the
   // strategy actually has a Midcap leg.
   const _hasMidcapLeg = Array.isArray(basePayload?.midcap_legs) && basePayload.midcap_legs.length > 0;
+  // MIDCPNIFTY is a TRADED index leg (unlike the Midcap100 overlay, which lives
+  // in midcap_legs), so gate its spot-adjustment axes on a real leg carrying
+  // index === 'MIDCPNIFTY'. Absent that leg the group is hidden entirely.
+  const _hasMidcpniftyLeg = (Array.isArray(basePayload?.legs) ? basePayload.legs : []).some(
+    l => l && String(l.segment || '').toLowerCase() !== 'midcap100'
+      && String(l.index || basePayload?.index || '').toUpperCase() === 'MIDCPNIFTY');
   // Per-leg strike mode (STRIKE_TYPE / PCT_OF_ATM / STRADDLE_WIDTH / REL_LEG / …)
   // exactly as chosen in the backtest builder, so the optimizer only offers the
   // strike params that actually apply to each leg (hides the confusing rest).
@@ -107,6 +113,7 @@ export default function OptimizePanel({
   const allParams = useMemo(
     () => expandSchemaForLegs(nLegs || 1)
       .filter(p => !p.midcapOnly || _hasMidcapLeg)
+      .filter(p => !p.midcpniftyOnly || _hasMidcpniftyLeg)
       // Strike-mode gating: a param tagged with strikeModes only shows when the
       // leg's actual strike mode matches. If we can't resolve the leg's mode
       // (no basePayload legs yet), fall back to showing it rather than hiding.
@@ -118,7 +125,7 @@ export default function OptimizePanel({
         if (!mode) return true;
         return p.strikeModes.includes(mode);
       }),
-    [nLegs, _hasMidcapLeg, _legStrikeModes, _legIsFuture],
+    [nLegs, _hasMidcapLeg, _hasMidcpniftyLeg, _legStrikeModes, _legIsFuture],
   );
   const grouped = useMemo(() => {
     const m = new Map();

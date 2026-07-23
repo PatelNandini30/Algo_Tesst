@@ -295,6 +295,41 @@ def _midcap_spot_adjustment_label(payload: Dict[str, Any]) -> str:
     return f"MidcapAdjust{pct_str}"
 
 
+def _midcpnifty_spot_adjustment_label(payload: Dict[str, Any]) -> str:
+    """MIDCPNIFTY cross-index spot adjustment label, e.g. 'MidcpniftyRiseBy1%'.
+
+    Empty unless the strategy ACTUALLY HOLDS a MIDCPNIFTY leg and the adjustment
+    is enabled — so a plain NIFTY combo's label/filename is byte-identical to
+    before. Mirrors _midcap_spot_adjustment_label above.
+    """
+    mn = payload.get("midcpnifty_spot_adjustment") or {}
+    if not mn.get("enabled"):
+        return ""
+    _legs = payload.get("legs") or []
+    _has = any(
+        isinstance(l, dict)
+        and str(l.get("segment") or "").lower() != "midcap100"
+        and str(l.get("index") or payload.get("index") or "").upper() == "MIDCPNIFTY"
+        for l in _legs
+    )
+    if not _has:
+        return ""
+    direction = str(mn.get("direction") or "").lower()
+    try:
+        pct = float(mn.get("pct") or mn.get("value") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    units = str(mn.get("units") or "percent").lower()
+    pct_str = f"{pct:g}pts" if units == "points" else f"{pct:g}%"
+    if direction in ("up", "rise", "rises"):
+        return f"MidcpniftyRiseBy{pct_str}"
+    if direction in ("down", "fall", "falls"):
+        return f"MidcpniftyFallsBy{pct_str}"
+    if direction == "both":
+        return f"MidcpniftyMoveBy{pct_str}"
+    return ""
+
+
 def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     """
     Inspect a (combo-applied) payload and return the master-summary columns
@@ -364,6 +399,9 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     midcap_adj_seg = _midcap_spot_adjustment_label(payload)
     if midcap_adj_seg:
         parts.append(midcap_adj_seg)
+    midcp_adj_seg = _midcpnifty_spot_adjustment_label(payload)
+    if midcp_adj_seg:
+        parts.append(midcp_adj_seg)
     parts.append(spot_adj)
     parts.append(f"{expiry}_Expiry")
     parts.append(shift)
