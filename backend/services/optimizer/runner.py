@@ -1881,6 +1881,15 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
             "FUT P&L": "sum",
             "Exit Reason": "first",
         })
+        # A leg truncated by its own per-leg filter file (LEG_FILTER_END)
+        # exits before the trade does; "first" above would otherwise report
+        # the truncated leg's date as the trade's exit. Shared with the
+        # backtest path (services/algotest_job.py) so the optimizer's
+        # per-combo tradesheet stays exactly equal to a direct backtest, per
+        # this project's hard rule. Byte-identical when this feature is
+        # unused -- see apply_exit_anchor_exclusion's docstring.
+        from services.trade_anchor import apply_exit_anchor_exclusion
+        aggregated = apply_exit_anchor_exclusion(aggregated, df)
         aggregated["Net P&L"] = (aggregated["CE P&L"] + aggregated["PE P&L"] + aggregated["FUT P&L"]).round(4)
         es_series = aggregated["Entry Spot"].replace(0, float("nan"))
         aggregated["% P&L"] = (aggregated["Net P&L"] / es_series * 100.0).round(2).fillna(0)

@@ -47,9 +47,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import pandas as pd
+
 __all__ = [
     "anchor_row",
     "exit_anchor_row",
+    "apply_exit_anchor_exclusion",
     "trade_net_pnl",
     "trade_entry_spot",
     "trade_pct_pnl",
@@ -189,6 +192,68 @@ def exit_anchor_row(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if best_key is None or key > best_key:
             best, best_key = row, key
     return best
+
+
+def apply_exit_anchor_exclusion(aggregated: "pd.DataFrame", sorted_df: "pd.DataFrame") -> "pd.DataFrame":
+    """Overwrite `aggregated`'s Exit Date / Exit Reason columns so a leg
+    truncated by its own per-leg filter file (LEG_FILTER_END) can't hijack
+    the trade's reported exit.
+
+    SHARED by every site that aggregates a trade-level Exit Date/Exit Reason
+    from per-leg rows via groupby("Trade").agg({"Exit Date": "first", ...}) --
+    currently services/algotest_job.py's `_try_rust_engine` (backtest path)
+    and services/optimizer/runner.py's per-combo tradesheet builder (optimizer
+    path). The project's hard rule is that the optimizer's per-combo
+    tradesheet must equal a direct backtest exactly, so both callers must
+    apply this identical correction rather than duplicating the logic.
+
+    `aggregated` is the frame produced by the caller's own existing
+    `groupby("Trade").agg({..., "Exit Date": "first", "Exit Reason": "first",
+    ...})` call -- untouched by this function except for those two columns, so
+    every other column (Entry Date, Entry Spot, Exit Spot, Spot P&L, CE/PE/FUT
+    P&L) keeps the caller's exact pre-existing aggregation. `sorted_df` is the
+    per-leg row frame that fed that groupby (already in whatever order the
+    caller's own anchor rule expects -- e.g. `_anchor_sorted(...)` in
+    algotest_job.py).
+
+    For Exit Date/Exit Reason specifically: drop any row whose Exit Reason
+    contains "LEG_FILTER_END", then re-apply the SAME rule the caller already
+    used ("first" on `sorted_df`'s row order) to the rows that remain. If a
+    trade has no remaining rows (every leg truncated), fall back to that
+    trade's full row set so the value is never null.
+
+    When no row anywhere is tagged LEG_FILTER_END -- true for every run
+    before this feature and every run that doesn't use it -- the exclusion
+    removes nothing, so this reproduces the caller's original "first" value
+    exactly: unmasked runs are byte-identical by construction.
+
+    Deliberately NOT `exit_anchor_row` (latest EXIT date): that would change
+    Exit Date for strategies where legs already exit on different dates today
+    (e.g. a carried YEARLY leg vs. a weekly leg), which is the exact
+    regression this design avoids. See `exit_anchor_row`'s own docstring for
+    that helper's narrower contract.
+    """
+    if "Exit Reason" not in sorted_df.columns or "Trade" not in sorted_df.columns:
+        return aggregated
+    truncated = sorted_df["Exit Reason"].astype(str).str.contains("LEG_FILTER_END", na=False)
+    if not truncated.any():
+        return aggregated
+    candidates = sorted_df[~truncated]
+    exit_pick = candidates.groupby("Trade", as_index=False).agg({
+        "Exit Date": "first",
+        "Exit Reason": "first",
+    })
+    covered_trades = set(exit_pick["Trade"])
+    fallback_trades = set(sorted_df["Trade"].unique()) - covered_trades
+    if fallback_trades:
+        fallback = sorted_df[sorted_df["Trade"].isin(fallback_trades)].groupby(
+            "Trade", as_index=False
+        ).agg({"Exit Date": "first", "Exit Reason": "first"})
+        exit_pick = pd.concat([exit_pick, fallback], ignore_index=True)
+    exit_pick = exit_pick.set_index("Trade")
+    aggregated["Exit Date"] = aggregated["Trade"].map(exit_pick["Exit Date"]).fillna(aggregated["Exit Date"])
+    aggregated["Exit Reason"] = aggregated["Trade"].map(exit_pick["Exit Reason"]).fillna(aggregated["Exit Reason"])
+    return aggregated
 
 
 def trade_net_pnl(rows: Iterable[Dict[str, Any]]) -> float:

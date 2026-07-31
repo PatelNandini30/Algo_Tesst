@@ -2,8 +2,8 @@ import unittest
 
 import pandas as pd
 
-from backend.services.algotest_job import _apply_exit_anchor_exclusion, _anchor_sorted
-from backend.services.trade_anchor import anchor_row, exit_anchor_row
+from backend.services.algotest_job import _anchor_sorted
+from backend.services.trade_anchor import anchor_row, exit_anchor_row, apply_exit_anchor_exclusion
 
 
 class TestExitAnchorRow(unittest.TestCase):
@@ -111,7 +111,7 @@ class TestApplyExitAnchorExclusion(unittest.TestCase):
         self.assertEqual(aggregated.loc[0, "Exit Date"], expected_exit_date)
         self.assertEqual(aggregated.loc[0, "Exit Reason"], expected_exit_reason)
 
-        fixed = _apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
+        fixed = apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
         self.assertEqual(fixed.loc[0, "Exit Date"], expected_exit_date)
         self.assertEqual(fixed.loc[0, "Exit Reason"], expected_exit_reason)
 
@@ -136,7 +136,7 @@ class TestApplyExitAnchorExclusion(unittest.TestCase):
         # test is actually exercising the bug the task exists to fix.
         self.assertEqual(aggregated.loc[0, "Exit Reason"], "LEG_FILTER_END")
 
-        fixed = _apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
+        fixed = apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
         self.assertEqual(fixed.loc[0, "Exit Date"], pd.Timestamp("2025-01-10"))
         self.assertEqual(fixed.loc[0, "Exit Reason"], "EXPIRY")
         # Every other column must be untouched by the fix.
@@ -157,7 +157,7 @@ class TestApplyExitAnchorExclusion(unittest.TestCase):
             trades_df[c] = pd.to_datetime(trades_df[c])
 
         aggregated, sorted_df = self._aggregate(trades_df)
-        fixed = _apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
+        fixed = apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
         # Falls back to the full set's anchor pick (Leg 1, latest entry) --
         # never null.
         self.assertFalse(pd.isna(fixed.loc[0, "Exit Date"]))
@@ -179,7 +179,7 @@ class TestApplyExitAnchorExclusion(unittest.TestCase):
             trades_df[c] = pd.to_datetime(trades_df[c])
 
         aggregated, sorted_df = self._aggregate(trades_df)
-        fixed = _apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
+        fixed = apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
         self.assertEqual(fixed.loc[0, "Exit Reason"], "EXPIRY")
 
     def test_missing_columns_are_a_no_op(self):
@@ -189,8 +189,73 @@ class TestApplyExitAnchorExclusion(unittest.TestCase):
         aggregated = pd.DataFrame([{"Trade": 1, "Entry Date": pd.Timestamp("2025-01-01")}])
         sorted_df = _anchor_sorted(trades_df)
         # No "Exit Reason" column at all -- must not raise, must return as-is.
-        result = _apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
+        result = apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
         pd.testing.assert_frame_equal(result, aggregated)
+
+    def test_multi_trade_frame_no_cross_trade_leakage(self):
+        """3 trades in ONE frame, covering all three code paths at once, to
+        catch a multi-group indexing/merge/concat bug that single-trade
+        tests can't see:
+          Trade 1: no LEG_FILTER_END row anywhere -> untouched.
+          Trade 2: one truncated leg among several -> exit comes from survivors.
+          Trade 3: every leg truncated -> falls back to the full row set.
+        """
+        trades_df = pd.DataFrame([
+            # Trade 1 -- ordinary, no truncation.
+            {"Trade": 1, "Leg": 1, "Entry Date": "2025-02-01", "Exit Date": "2025-02-15",
+             "Entry Spot": 200.0, "Exit Spot": 210.0, "Spot P&L": 10.0,
+             "CE P&L": 4.0, "PE P&L": 0.0, "FUT P&L": 0.0, "Exit Reason": "EXPIRY"},
+            {"Trade": 1, "Leg": 2, "Entry Date": "2025-02-01", "Exit Date": "2025-02-15",
+             "Entry Spot": 200.0, "Exit Spot": 210.0, "Spot P&L": 10.0,
+             "CE P&L": 0.0, "PE P&L": 2.0, "FUT P&L": 0.0, "Exit Reason": "EXPIRY"},
+            # Trade 2 -- anchor leg (Leg 1, later entry) truncated; Leg 2 survives.
+            {"Trade": 2, "Leg": 1, "Entry Date": "2025-01-01", "Exit Date": "2025-01-03",
+             "Entry Spot": 100.0, "Exit Spot": 101.0, "Spot P&L": 1.0,
+             "CE P&L": 5.0, "PE P&L": 0.0, "FUT P&L": 0.0, "Exit Reason": "LEG_FILTER_END"},
+            {"Trade": 2, "Leg": 2, "Entry Date": "2024-12-20", "Exit Date": "2025-01-10",
+             "Entry Spot": 95.0, "Exit Spot": 108.0, "Spot P&L": 13.0,
+             "CE P&L": 0.0, "PE P&L": 3.0, "FUT P&L": 0.0, "Exit Reason": "EXPIRY"},
+            # Trade 3 -- every leg truncated -> fallback to full set (Leg 1 anchor).
+            {"Trade": 3, "Leg": 1, "Entry Date": "2025-03-01", "Exit Date": "2025-03-05",
+             "Entry Spot": 300.0, "Exit Spot": 301.0, "Spot P&L": 1.0,
+             "CE P&L": 6.0, "PE P&L": 0.0, "FUT P&L": 0.0, "Exit Reason": "LEG_FILTER_END"},
+            {"Trade": 3, "Leg": 2, "Entry Date": "2025-02-25", "Exit Date": "2025-03-02",
+             "Entry Spot": 295.0, "Exit Spot": 297.0, "Spot P&L": 2.0,
+             "CE P&L": 0.0, "PE P&L": 1.0, "FUT P&L": 0.0, "Exit Reason": "LEG_FILTER_END"},
+        ])
+        for c in ("Entry Date", "Exit Date"):
+            trades_df[c] = pd.to_datetime(trades_df[c])
+
+        aggregated, sorted_df = self._aggregate(trades_df)
+        input_row_count = len(aggregated)
+        input_columns = list(aggregated.columns)
+        input_trade_order = aggregated["Trade"].tolist()
+
+        fixed = apply_exit_anchor_exclusion(aggregated.copy(), sorted_df)
+
+        # Shape/order guarantees: no row lost/duplicated, no column reordered.
+        self.assertEqual(len(fixed), input_row_count)
+        self.assertEqual(list(fixed.columns), input_columns)
+        self.assertEqual(fixed["Trade"].tolist(), input_trade_order)
+
+        by_trade = fixed.set_index("Trade")
+
+        # Trade 1: no LEG_FILTER_END row -> untouched vs. the pre-fix value.
+        pre_fix_by_trade = aggregated.set_index("Trade")
+        self.assertEqual(by_trade.loc[1, "Exit Date"], pre_fix_by_trade.loc[1, "Exit Date"])
+        self.assertEqual(by_trade.loc[1, "Exit Reason"], pre_fix_by_trade.loc[1, "Exit Reason"])
+        self.assertEqual(by_trade.loc[1, "Exit Date"], pd.Timestamp("2025-02-15"))
+        self.assertEqual(by_trade.loc[1, "Exit Reason"], "EXPIRY")
+
+        # Trade 2: truncated anchor leg excluded -> surviving Leg 2's exit.
+        self.assertEqual(by_trade.loc[2, "Exit Date"], pd.Timestamp("2025-01-10"))
+        self.assertEqual(by_trade.loc[2, "Exit Reason"], "EXPIRY")
+
+        # Trade 3: every leg truncated -> fallback to full-set anchor (Leg 1,
+        # the later entry), never null.
+        self.assertFalse(pd.isna(by_trade.loc[3, "Exit Date"]))
+        self.assertEqual(by_trade.loc[3, "Exit Date"], pd.Timestamp("2025-03-05"))
+        self.assertEqual(by_trade.loc[3, "Exit Reason"], "LEG_FILTER_END")
 
 
 if __name__ == "__main__":

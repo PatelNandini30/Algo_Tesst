@@ -318,59 +318,6 @@ def _anchor_sorted(trades_df):
     return out.drop(columns=["_ta_re", "_ta_leg"])
 
 
-def _apply_exit_anchor_exclusion(aggregated, sorted_df):
-    """Overwrite `aggregated`'s Exit Date / Exit Reason columns so a leg
-    truncated by its own per-leg filter file (LEG_FILTER_END) can't hijack
-    the trade's reported exit.
-
-    `aggregated` is the frame produced by the existing
-    `_anchor_sorted(trades_df).groupby("Trade").agg({..., "Exit Date":
-    "first", "Exit Reason": "first", ...})` call -- untouched, so every other
-    column (Entry Date, Entry Spot, Exit Spot, Spot P&L, CE/PE/FUT P&L) keeps
-    today's exact aggregation. `sorted_df` is that same `_anchor_sorted(...)`
-    output (the per-leg rows, anchor-ordered).
-
-    For Exit Date/Exit Reason specifically: drop any row whose Exit Reason
-    contains "LEG_FILTER_END", then re-apply the SAME anchor rule ("first" on
-    the `_anchor_sorted` order, i.e. latest entry / lowest leg) to the rows
-    that remain. If a trade has no remaining rows (every leg truncated), fall
-    back to that trade's full row set so the value is never null.
-
-    When no row anywhere is tagged LEG_FILTER_END -- true for every run
-    before this feature and every run that doesn't use it -- the exclusion
-    removes nothing, so this reproduces the original "first" value exactly:
-    unmasked runs are byte-identical by construction.
-
-    Deliberately NOT `trade_anchor.exit_anchor_row` (latest EXIT date): that
-    would change Exit Date for strategies where legs already exit on
-    different dates today (e.g. a carried YEARLY leg vs. a weekly leg),
-    which is the exact regression this design avoids. See
-    services/trade_anchor.py::exit_anchor_row's docstring for that helper's
-    own (narrower) contract.
-    """
-    if "Exit Reason" not in sorted_df.columns or "Trade" not in sorted_df.columns:
-        return aggregated
-    truncated = sorted_df["Exit Reason"].astype(str).str.contains("LEG_FILTER_END", na=False)
-    if not truncated.any():
-        return aggregated
-    candidates = sorted_df[~truncated]
-    exit_pick = candidates.groupby("Trade", as_index=False).agg({
-        "Exit Date": "first",
-        "Exit Reason": "first",
-    })
-    covered_trades = set(exit_pick["Trade"])
-    fallback_trades = set(sorted_df["Trade"].unique()) - covered_trades
-    if fallback_trades:
-        fallback = sorted_df[sorted_df["Trade"].isin(fallback_trades)].groupby(
-            "Trade", as_index=False
-        ).agg({"Exit Date": "first", "Exit Reason": "first"})
-        exit_pick = pd.concat([exit_pick, fallback], ignore_index=True)
-    exit_pick = exit_pick.set_index("Trade")
-    aggregated["Exit Date"] = aggregated["Trade"].map(exit_pick["Exit Date"]).fillna(aggregated["Exit Date"])
-    aggregated["Exit Reason"] = aggregated["Trade"].map(exit_pick["Exit Reason"]).fillna(aggregated["Exit Reason"])
-    return aggregated
-
-
 def _try_rust_engine(payload, index, effective_from, effective_to):
     """
     Slice 11 — opt-in Rust orchestrator path.
@@ -567,9 +514,12 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     # A leg truncated by its own per-leg filter file (LEG_FILTER_END) exits
     # before the trade does; "first" above would otherwise report the
     # truncated leg's date as the trade's exit if it happens to be the
-    # anchor. See _apply_exit_anchor_exclusion's docstring for why this is
-    # NOT "latest exit wins" and why it's byte-identical when unused.
-    aggregated = _apply_exit_anchor_exclusion(aggregated, _sorted_for_agg)
+    # anchor. Shared with the optimizer's runner.py so the two paths can
+    # never diverge on this. See apply_exit_anchor_exclusion's docstring for
+    # why this is NOT "latest exit wins" and why it's byte-identical when
+    # this feature is unused.
+    from services.trade_anchor import apply_exit_anchor_exclusion
+    aggregated = apply_exit_anchor_exclusion(aggregated, _sorted_for_agg)
     aggregated["Net P&L"] = aggregated["CE P&L"] + aggregated["PE P&L"] + aggregated["FUT P&L"]
     entry_spot_series = aggregated["Entry Spot"].replace(0, float("nan"))
     aggregated["% P&L"] = (aggregated["Net P&L"] / entry_spot_series * 100.0).round(2).fillna(0)
