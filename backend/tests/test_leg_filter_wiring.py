@@ -144,7 +144,7 @@ class TestSpotAdjGuard(unittest.TestCase):
 
     def test_reentry_synthesis_skips_filter_ended_legs(self):
         src = _source()
-        i_guard = src.index("if _is_leg_filter_ended(_sa_leg):")
+        i_guard = src.index("if _leg_was_truncated(_sa_leg):")
         i_append = src.index("mini_specs.append(", i_guard)
         self.assertLess(i_guard, i_append,
                          "guard must precede the mini-trade append")
@@ -272,7 +272,61 @@ class TestKeysSurviveTradeIdRenumbering(unittest.TestCase):
     def test_every_consumer_goes_through_the_shared_predicate(self):
         src = _source()
         # Three consumers: the clamp guard, the re-entry guard and the tagger.
-        self.assertEqual(src.count("_is_leg_filter_ended("), 4)  # 1 def + 3 uses
+        # 1 def + 2 uses (clamp guard, tagger). The re-entry-synthesis guard
+        # deliberately uses the WIDER _leg_was_truncated -- see
+        # TestReentryGuardTestsPresenceNotExitEquality below.
+        self.assertEqual(src.count("_is_leg_filter_ended("), 3)
+        self.assertEqual(src.count("_leg_was_truncated("), 2)  # 1 def + 1 use
+
+
+class TestReentryGuardTestsPresenceNotExitEquality(unittest.TestCase):
+    """The spot-adj RE-ENTRY-SYNTHESIS guard is a safety guard, not a label.
+
+    Narrowing it to "the realised exit landed on the boundary" (correct for the
+    three TAG sites) lets a leg that was truncated but exited EARLIER on its own
+    SL/Target be resurrected into a spot-adjustment mini-trade. Mini-specs never
+    pass back through apply_leg_filters, so that re-entry can hold PAST the
+    leg's own window end -- the window violation this whole feature prevents.
+
+    The sibling CLAMP guard is correctly left on the narrow predicate: applying
+    or skipping the clamp only ever moves an exit earlier, so it cannot violate
+    a window.
+    """
+
+    def _reentry_guard_line(self):
+        src = _source()
+        # Anchor on the mini-spec synthesis loop, which is unique to this site
+        # and appears at neither the clamp guard nor any of the tag sites.
+        i_loop = src.index("for _sa_leg in sorted(orig_legs_s")
+        i_append = src.index("mini_specs.append(", i_loop)
+        return src[i_loop:i_append]
+
+    def test_guard_uses_the_wide_presence_predicate(self):
+        body = self._reentry_guard_line()
+        self.assertIn("if _leg_was_truncated(_sa_leg):", body)
+        self.assertIn("continue", body)
+
+    def test_guard_does_not_use_the_exit_equality_predicate(self):
+        # This is the regression itself: _is_leg_filter_ended here would let an
+        # SL-exited truncated leg through.
+        self.assertNotIn("_is_leg_filter_ended", self._reentry_guard_line())
+
+    def test_presence_predicate_ignores_the_rows_exit_date(self):
+        src = _source()
+        i = src.index("def _leg_was_truncated(")
+        body = src[i:src.index("if return_specs_only:", i)]
+        self.assertIn("return _leg_filter_bounds(row) is not None", body)
+        self.assertNotIn("exit_date", body)
+
+    def test_clamp_guard_keeps_the_narrow_predicate(self):
+        # Explicitly pinned: this site must NOT be widened along with the other.
+        self.assertIn("_sa_leg_filter_ended = _is_leg_filter_ended(leg, final_exit)",
+                      _source())
+
+    def test_the_two_predicates_are_distinct(self):
+        src = _source()
+        self.assertIn("def _is_leg_filter_ended(", src)
+        self.assertIn("def _leg_was_truncated(", src)
 
 
 if __name__ == "__main__":

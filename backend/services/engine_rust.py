@@ -5172,16 +5172,35 @@ def run_rust_engine_pipeline(
             _normalize_iso(_s.get("exit_date", ""))
         )
 
-    def _is_leg_filter_ended(row: Dict[str, Any], exit_override: str = "") -> bool:
-        """True when THIS row's realised exit landed on its own filter boundary."""
+    def _leg_filter_bounds(row: Dict[str, Any]) -> Optional[Set[str]]:
+        """The truncation boundaries configured for THIS row's leg + cycle."""
         if not _leg_filter_end_keys:
-            return False
-        _b = _leg_filter_end_keys.get(
+            return None
+        return _leg_filter_end_keys.get(
             (_normalize_iso(row.get("expiry") or ""), int(row.get("leg_id") or 1))
-        )
+        ) or None
+
+    def _is_leg_filter_ended(row: Dict[str, Any], exit_override: str = "") -> bool:
+        """True when THIS row's realised exit landed on its own filter boundary.
+
+        For LABELLING only. A row that exited EARLIER on its own SL/Target was
+        not bound by the filter and must keep its own reason.
+        """
+        _b = _leg_filter_bounds(row)
         if not _b:
             return False
         return _normalize_iso(exit_override or row.get("exit_date") or "") in _b
+
+    def _leg_was_truncated(row: Dict[str, Any]) -> bool:
+        """True when this row's leg is truncated in this cycle AT ALL.
+
+        For SAFETY GUARDS, deliberately WIDER than _is_leg_filter_ended: it
+        ignores where the row actually exited. A leg that was truncated but
+        exited early on SL/Target still must not be resurrected past its own
+        window end — mini-specs never pass back through apply_leg_filters, so
+        an exit-equality test here would let exactly that through.
+        """
+        return _leg_filter_bounds(row) is not None
 
     if return_specs_only:
         # The mask itself is applied above, but the LEG_FILTER_END tag is not:
@@ -8137,7 +8156,13 @@ def run_rust_engine_pipeline(
                         # that would place it outside the window its own filter
                         # file allows. Skips only this leg for this hop; the
                         # other legs in the same mini-trade are unaffected.
-                        if _is_leg_filter_ended(_sa_leg):
+                        # PRESENCE, not exit-equality: this is a window-violation
+                        # guard, not a label. A leg truncated by its file but
+                        # exited early on SL/Target must still never be revived
+                        # into a mini-trade — those specs never pass back through
+                        # apply_leg_filters, so the re-entry could hold PAST the
+                        # leg's own window end.
+                        if _leg_was_truncated(_sa_leg):
                             continue
                         _sa_lidx = int(_sa_leg.get("leg_id") or 1) - 1
                         _sa_leg_src = legs_src[_sa_lidx] if _sa_lidx < len(legs_src) else {}
