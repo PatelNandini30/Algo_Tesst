@@ -63,5 +63,29 @@ class TestLegFilterEndReason(unittest.TestCase):
         )
 
 
+class TestFuturesPathMasked(unittest.TestCase):
+    """Futures rows are priced inside their builders and never reach
+    apply_leg_filters, so the mask must appear in both futures builders."""
+
+    def _slice(self, src, fn_name):
+        start = src.index("def %s(" % fn_name)
+        nxt = src.index("\ndef ", start + 1)
+        return src[start:nxt]
+
+    def test_build_futures_specs_applies_the_mask(self):
+        body = self._slice(_source(), "_build_futures_specs")
+        self.assertIn("leg_segments(leg)", body)
+        self.assertIn("leg_window(", body)
+
+    def test_fixed_entry_futures_specs_applies_the_mask(self):
+        body = self._slice(_source(), "_build_fixed_entry_futures_specs")
+        self.assertIn("leg_segments(leg)", body)
+        self.assertIn("leg_window(", body)
+
+    def test_mask_precedes_pricing_in_build_futures_specs(self):
+        body = self._slice(_source(), "_build_futures_specs")
+        self.assertLess(body.index("leg_window("), body.index("_fut_price(index, entry_date"))
+
+
 if __name__ == "__main__":
     unittest.main()

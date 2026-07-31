@@ -1367,6 +1367,12 @@ def _build_futures_specs(
     sorted_exp = sorted(expiry_dates)
     _n_exp = len(sorted_exp)
 
+    # Per-leg individual filter file. Futures rows are priced INSIDE this
+    # builder and never pass through apply_leg_filters (the options post-pass),
+    # so the mask has to run here, before pricing, or a truncated exit would
+    # leave the P&L computed over the wrong window.
+    from services.leg_filter import LEG_FILTER_END, leg_segments, leg_window
+
     out: List[Dict[str, Any]] = []
     prev_sched_exit: Optional[str] = None  # overlap-prevention sentinel
 
@@ -1467,6 +1473,25 @@ def _build_futures_specs(
                 # the exit (the next-expiry contract) so the P&L is a clean
                 # single-contract move — no near/far basis mixing.
                 fut_exit_date = effective_exit
+
+                # Per-leg individual filter (same rule as the options path, but
+                # applied BEFORE pricing because futures rows are priced here and
+                # never pass through apply_leg_filters).
+                _lf_mask = leg_segments(leg)
+                _leg_filter_end_row = False
+                if _lf_mask is not None:
+                    _lf_taken, _lf_exit, _lf_trunc = leg_window(
+                        _lf_mask, entry_date, fut_exit_date
+                    )
+                    if not _lf_taken:
+                        continue
+                    if _lf_trunc:
+                        _lf_clamped = _last_trading_day_on_or_before(_lf_exit, sorted_td) or _lf_exit
+                        if _lf_clamped <= entry_date:
+                            continue
+                        fut_exit_date = _lf_clamped
+                        _leg_filter_end_row = True
+
                 # Resolve the rolled contract from the RE-ANCHORED next-cycle exit
                 # (exit_date), NOT the filter-clamped fut_exit_date. On a filter /
                 # patch boundary the clamp shortens the hold back into the current-
@@ -1490,6 +1515,24 @@ def _build_futures_specs(
             else:
                 fut_exit_trigger = _futures_get_exit_date(exp_str, exit_mode_raw, n_days, sorted_td)
                 fut_exit_date = min(fut_exit_trigger, effective_exit)
+
+                # Per-leg individual filter (same rule as the options path, but
+                # applied BEFORE pricing because futures rows are priced here and
+                # never pass through apply_leg_filters).
+                _lf_mask = leg_segments(leg)
+                _leg_filter_end_row = False
+                if _lf_mask is not None:
+                    _lf_taken, _lf_exit, _lf_trunc = leg_window(
+                        _lf_mask, entry_date, fut_exit_date
+                    )
+                    if not _lf_taken:
+                        continue
+                    if _lf_trunc:
+                        _lf_clamped = _last_trading_day_on_or_before(_lf_exit, sorted_td) or _lf_exit
+                        if _lf_clamped <= entry_date:
+                            continue
+                        fut_exit_date = _lf_clamped
+                        _leg_filter_end_row = True
 
                 entry_price_raw, exit_price_raw, fut_expiry = _resolve_futures_pnl_native(
                     entry_date=entry_date,
@@ -1515,6 +1558,15 @@ def _build_futures_specs(
                 fut_exit_date = _scan_exit_date
                 exit_price_raw = _scan_exit_raw
                 exit_spot = spot_by_date.get(fut_exit_date, exit_spot)
+
+            # Futures rows carry their exit reason directly on the row dict
+            # (unlike options rows, which are labelled later in the pipeline —
+            # see the _leg_filter_end_keys join at engine_rust.py:8736).
+            if _leg_filter_end_row:
+                if not _actual_exit_reason or _actual_exit_reason == "EXPIRY":
+                    _actual_exit_reason = LEG_FILTER_END
+                elif LEG_FILTER_END not in _actual_exit_reason:
+                    _actual_exit_reason = _actual_exit_reason + "+" + LEG_FILTER_END
 
             # Slippage — mirrors _apply_slippage in generic_algotest_engine.py
             if _leg_slip > 0:
@@ -2537,6 +2589,12 @@ def _build_fixed_entry_futures_specs(
     legs_src = payload.get("legs") or []
     index = str(payload.get("index") or "NIFTY").upper()
 
+    # Per-leg individual filter file. Futures rows are priced INSIDE this
+    # builder and never pass through apply_leg_filters (the options post-pass),
+    # so the mask has to run here, before pricing, or a truncated exit would
+    # leave the P&L computed over the wrong window.
+    from services.leg_filter import LEG_FILTER_END, leg_segments, leg_window
+
     sorted_td = sorted(trading_days)
     sorted_expiries = sorted(expiry_dates)
 
@@ -2634,9 +2692,28 @@ def _build_fixed_entry_futures_specs(
                 fut_pref = "next_monthly" if fut_pref_raw in ("next_monthly", "next_month", "mid_month") else "monthly"
                 _leg_slip = _leg_slippage_pct(leg)
 
+                # Per-leg individual filter (same rule as the options path, but
+                # applied BEFORE pricing because futures rows are priced here and
+                # never pass through apply_leg_filters).
+                _fe_exit_date = exit_date
+                _lf_mask = leg_segments(leg)
+                _leg_filter_end_row = False
+                if _lf_mask is not None:
+                    _lf_taken, _lf_exit, _lf_trunc = leg_window(
+                        _lf_mask, current_entry, _fe_exit_date
+                    )
+                    if not _lf_taken:
+                        continue
+                    if _lf_trunc:
+                        _lf_clamped = _last_trading_day_on_or_before(_lf_exit, sorted_td) or _lf_exit
+                        if _lf_clamped <= current_entry:
+                            continue
+                        _fe_exit_date = _lf_clamped
+                        _leg_filter_end_row = True
+
                 # Native-priced, exactly like _build_futures_specs (no Postgres).
                 entry_price_raw, exit_price_raw, fut_expiry = _resolve_futures_pnl_native(
-                    entry_date=current_entry, exit_date=exit_date,
+                    entry_date=current_entry, exit_date=_fe_exit_date,
                     symbol=index, position=position, preference=fut_pref,
                 )
                 if entry_price_raw is None:
@@ -2644,10 +2721,10 @@ def _build_fixed_entry_futures_specs(
                 if exit_price_raw is None:
                     exit_price_raw = entry_price_raw
 
-                fut_exit_date = exit_date
+                fut_exit_date = _fe_exit_date
                 _sc_date, _sc_raw, _reason = _scan_futures_sl_target(
                     current_entry, float(entry_price_raw), position, leg, sorted_td,
-                    exit_date, index, fut_expiry or "", _leg_slip,
+                    _fe_exit_date, index, fut_expiry or "", _leg_slip,
                 )
                 exit_reason = _reason
                 _exit_spot = exit_spot
@@ -2658,6 +2735,12 @@ def _build_fixed_entry_futures_specs(
                 elif clamped:
                     # Exit clamped to the segment/filter end (not a natural expiry).
                     exit_reason = "FILTER_END"
+
+                if _leg_filter_end_row:
+                    if not exit_reason or exit_reason == "EXPIRY":
+                        exit_reason = LEG_FILTER_END
+                    elif LEG_FILTER_END not in exit_reason:
+                        exit_reason = exit_reason + "+" + LEG_FILTER_END
 
                 if _leg_slip > 0:
                     _ef = (1.0 - _leg_slip / 100.0) if position == "SELL" else (1.0 + _leg_slip / 100.0)
