@@ -4982,6 +4982,19 @@ def run_rust_engine_pipeline(
     ) or _has_monthly_pinned_leg(payload):
         specs = _apply_fixed_rollover_strike(specs, payload, original_segments)
 
+    # ── Per-leg individual filter files ─────────────────────────────────────
+    # A leg may carry its own uploaded date file. It is purely SUBTRACTIVE: the
+    # strategy filter above already decided which trades exist; this only drops
+    # a leg from a trade or ends its hold early (earliest of window-end and
+    # trade-exit wins). No-op — same list object — when no leg has a file, so
+    # every existing strategy is byte-identical.
+    # See docs/superpowers/specs/2026-07-31-per-leg-filter-design.md.
+    from services.leg_filter import LEG_FILTER_END, apply_leg_filters
+
+    specs = apply_leg_filters(specs, payload.get("legs") or [])
+    if not specs:
+        return []
+
     # Step 2: price entries + scheduled exits.
     # Capture which specs were clamped to a segment/filter end BEFORE pricing
     # (simulate_trades_batch drops custom keys). Keyed by (trade_id, entry_date)
