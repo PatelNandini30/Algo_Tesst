@@ -120,5 +120,35 @@ class TestFuturesPathMasked(unittest.TestCase):
         self.assertGreaterEqual(i_mask, 0, "mask call not found before pricing")
 
 
+class TestSpotAdjGuard(unittest.TestCase):
+    """A leg already ended by its OWN filter file must not be resurrected by
+    the spot-adjustment cascade — neither given a later spot-adj exit date,
+    nor re-entered into a spot-adj mini-trade.
+
+    Two independent guards exist (exit-clamp site + re-entry synthesis
+    site). A single `.index()`/`.rindex()` on the bare literal
+    "in _leg_filter_end_keys:" is NOT enough to tell them apart from the
+    pre-existing Task-4 tagging block at the end of the function (which also
+    contains that literal and runs unconditionally) — so this asserts each
+    guard by its distinctive surrounding code instead.
+    """
+
+    def test_exit_clamp_site_checks_the_guard_before_applying(self):
+        src = _source()
+        i_clamp_reason = src.index("_sa_clamp_reason = spot_adj_reasons.get")
+        i_guard = src.index("_sa_leg_filter_ended", i_clamp_reason)
+        i_apply = src.index("final_exit = spot_adj_clamp", i_guard)
+        self.assertLess(i_clamp_reason, i_guard)
+        self.assertLess(i_guard, i_apply,
+                         "guard must be evaluated before the clamp is applied")
+
+    def test_reentry_synthesis_skips_filter_ended_legs(self):
+        src = _source()
+        i_guard = src.index("(orig_tid, _sa_lid) in _leg_filter_end_keys")
+        i_append = src.index("mini_specs.append(", i_guard)
+        self.assertLess(i_guard, i_append,
+                         "guard must precede the mini-trade append")
+
+
 if __name__ == "__main__":
     unittest.main()

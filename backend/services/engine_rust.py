@@ -7695,7 +7695,15 @@ def run_rust_engine_pipeline(
             # together: triggers and clamp read the same map.
             spot_adj_clamp = spot_adj_overrides.get(trade_id)
             _sa_clamp_reason = spot_adj_reasons.get(trade_id, "SPOT_ADJ_RISE")
-            if spot_adj_clamp and final_exit >= spot_adj_clamp:
+            # A leg already ended by its OWN filter file cannot be re-exited
+            # later by the spot-adjustment cascade — that would place it
+            # outside the window its file allows. Skip only the clamp for
+            # THIS row; the leg still gets appended below with its own
+            # (already-resolved) exit, it just doesn't get overwritten.
+            _sa_leg_filter_ended = (
+                int(leg["trade_id"]), int(leg["leg_id"])
+            ) in _leg_filter_end_keys
+            if spot_adj_clamp and final_exit >= spot_adj_clamp and not _sa_leg_filter_ended:
                 final_exit = spot_adj_clamp
                 reason = _sa_clamp_reason
                 _reason_cands.append((spot_adj_clamp, reason))
@@ -8052,6 +8060,13 @@ def run_rust_engine_pipeline(
                     _sa_resolved: Dict[int, float] = {}
                     for _sa_leg in sorted(orig_legs_s, key=lambda _l: int(_l.get("leg_id") or 1)):
                         _sa_lid = int(_sa_leg.get("leg_id") or 1)
+                        # This leg already ended at its own filter boundary —
+                        # do not resurrect it into a spot-adj re-entry mini-trade,
+                        # that would place it outside the window its own filter
+                        # file allows. Skips only this leg for this hop; the
+                        # other legs in the same mini-trade are unaffected.
+                        if (orig_tid, _sa_lid) in _leg_filter_end_keys:
+                            continue
                         _sa_lidx = int(_sa_leg.get("leg_id") or 1) - 1
                         _sa_leg_src = legs_src[_sa_lidx] if _sa_lidx < len(legs_src) else {}
                         _sa_prev_strike = (
