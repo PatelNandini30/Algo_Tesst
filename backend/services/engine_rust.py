@@ -513,6 +513,10 @@ def _next_trading_day_on_or_after(trading_days: List[str], date_str: str) -> Opt
 _FILTER_END_SKIP_REASONS: frozenset = frozenset({
     "STOP_LOSS", "SL_WITH_BUFFER", "SL_WITH_BUFFER_GAP",
     "STOP_LOSS_BUFFER", "STOP_LOSS_BUFFER_GAP",
+    # A leg truncated by its OWN filter file. _apply_filter_end_last_per_patch
+    # tags the last trade of each STRATEGY patch; without this it would strip
+    # this per-leg tag from every trade that is not that patch's last one.
+    "LEG_FILTER_END",
 })
 
 
@@ -5014,6 +5018,12 @@ def run_rust_engine_pipeline(
         if str(payload.get("super_trend_config") or "").strip() in ("5x1", "5x2")
         else "FILTER_END"
     )
+    # Keyed by (trade_id, leg_id): a per-leg truncation is a property of ONE leg
+    # row, unlike _seg_clamped which describes the whole trade.
+    _leg_filter_end_keys: set = {
+        (int(s.get("trade_id") or 0), int(s.get("leg_id") or 1))
+        for s in specs if s.get("_leg_filter_end")
+    }
 
     if return_specs_only:
         # Path B (multi-index FUSED): hand the fully-resolved, gated specs back
@@ -8719,6 +8729,20 @@ def run_rust_engine_pipeline(
     # overrides a genuine SL exit. Downstream patch / Live-DD resets follow the
     # corrected position.
     _apply_filter_end_last_per_patch(final_priced, original_segments, _clamp_reason)
+
+    # Per-leg filter truncation. Runs AFTER the strategy-patch tagger so it wins
+    # on the rows it owns, and joins any co-occurring reason with "+" to match
+    # the combined-exit-reason convention used elsewhere in this module.
+    if _leg_filter_end_keys:
+        for _row in final_priced:
+            _k = (int(_row.get("trade_id") or 0), int(_row.get("leg_id") or 1))
+            if _k not in _leg_filter_end_keys:
+                continue
+            _cur = str(_row.get("exit_reason") or "").strip()
+            if not _cur or _cur == "EXPIRY":
+                _row["exit_reason"] = LEG_FILTER_END
+            elif LEG_FILTER_END not in _cur:
+                _row["exit_reason"] = _cur + "+" + LEG_FILTER_END
 
     # T-n scheduled-exit label. When the run exits N>0 trading days before the
     # contract expiry (exit_dte > 0), a trade that rides to its scheduled exit

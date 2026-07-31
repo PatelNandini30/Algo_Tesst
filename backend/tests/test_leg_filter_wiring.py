@@ -41,5 +41,27 @@ class TestLegFilterWiring(unittest.TestCase):
         ast.parse(_source())
 
 
+class TestLegFilterEndReason(unittest.TestCase):
+    def test_reason_is_protected_from_the_patch_tagger(self):
+        self.assertIn("\"LEG_FILTER_END\",", _source())
+        src = _source()
+        i_set = src.index("_FILTER_END_SKIP_REASONS")
+        i_reason = src.index("\"LEG_FILTER_END\",")
+        self.assertLess(i_reason - i_set, 500,
+                        "LEG_FILTER_END must be inside _FILTER_END_SKIP_REASONS")
+
+    def test_keys_are_captured_before_pricing(self):
+        src = _source()
+        self.assertLess(src.index("_leg_filter_end_keys: set = {"),
+                        src.index("algotest_native.simulate_trades_batch(specs)"))
+
+    def test_stamped_after_the_patch_tagger(self):
+        src = _source()
+        self.assertLess(
+            src.index("_apply_filter_end_last_per_patch(final_priced"),
+            src.index("if _leg_filter_end_keys:"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
