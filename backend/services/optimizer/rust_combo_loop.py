@@ -127,6 +127,20 @@ def _leg_has_exit_scan(leg: Dict[str, Any]) -> bool:
     return False
 
 
+def _leg_has_spot_adjustment(leg: Dict[str, Any]) -> bool:
+    """True if the leg carries its OWN spot_adjustment (the per-leg breach/re-strike
+    feature). The pure-Rust batch does NOT implement the spot-adjustment mark-timeline
+    / earliest-wins cascade / re-anchor logic (that lives in the Python engine_rust
+    orchestration), so claiming such a combo would price it WITHOUT any adjustment —
+    silently wrong. The strategy-level knob is already excluded above via
+    `spot_adjustment_enabled`; this closes the per-leg case (leg['spot_adjustment'])."""
+    for k in ("spot_adjustment", "spotAdjustment"):
+        v = leg.get(k)
+        if isinstance(v, dict) and _truthy(v.get("enabled")):
+            return True
+    return False
+
+
 def _leg_is_futures(leg: Dict[str, Any]) -> bool:
     seg = str(leg.get("segment") or "").strip().lower()
     ot = str(leg.get("option_type") or "").strip().upper()
@@ -185,6 +199,22 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
         # unrecognised expiry kind fall through as "supported".
         if str(p.get("expiry_type") or "").upper() == "YEARLY":
             return "yearly_expiry"
+        # SAME-INDEX MIXED EXPIRY — identical hazard to YEARLY above. A MONTHLY
+        # leg under a WEEKLY cadence is pinned to its own monthly contract by
+        # _build_fixed_entry_specs; this batch loop builds its own expiry inputs
+        # and would silently trade the CADENCE (weekly) contract instead.
+        # Fail closed so mixed baskets fall back to the per-combo path that
+        # actually resolves the pin.
+        if str(p.get("expiry_type") or "").upper() in ("WEEKLY", "NEXT_WEEKLY", "WEEKLY_T1"):
+            for _l in p.get("legs") or []:
+                if (
+                    isinstance(_l, dict)
+                    and str(_l.get("expiry") or "").upper()
+                    in ("MONTHLY", "NEXT_MONTHLY", "MONTHLY_T1")
+                    and str(_l.get("segment", "OPTIONS")).upper()
+                    not in ("FUTURES", "FUTURE")
+                ):
+                    return "mixed_expiry"
 
         legs = p.get("legs") or []
         if not isinstance(legs, list) or len(legs) == 0:
@@ -193,6 +223,8 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
         for i, leg in enumerate(legs):
             if not isinstance(leg, dict):
                 return f"leg{i}-not-dict"
+            if _leg_has_spot_adjustment(leg):
+                return f"leg{i}-spot_adjustment"
             if _leg_is_futures(leg):
                 return f"leg{i}-futures"
             if _leg_is_lazy(leg):
@@ -201,8 +233,16 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
                 return f"leg{i}-next_expiry"
             if _leg_has_reentry(leg):
                 return f"leg{i}-reentry"
-            if _leg_has_exit_scan(leg):
-                return f"leg{i}-sl_target_trail"  # Phase 0b
+            # Phase 0b LIFTED (2026-07-20): SL / Target / Trail / buffer-strike.
+            # In mode-1 the trades still come from the per-combo Rust engine
+            # (_run_single_backtest) exactly as in mode 0 — only the SUMMARY is
+            # Rust-authoritative here — and the Rust summary was proven byte-identical
+            # to the Python summary across a 19-case SL/Target/Trail corpus (ATM/ITM/
+            # OTM/premium strikes, 1–4 legs, buffer-strike, tight-SL, 2y + COVID-2020
+            # ranges): tools/phase0b_sl_parity.py. So this shape no longer hard-fails.
+            # (The remaining rejects below are still Python-orchestrated.)
+            # if _leg_has_exit_scan(leg):
+            #     return f"leg{i}-sl_target_trail"
             sel = leg.get("strike_selection") or {}
             sel_type = str((sel.get("type") if isinstance(sel, dict) else "") or "").strip().lower()
             recognized = (sel_type in _RUST_STRIKE_TYPES

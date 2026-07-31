@@ -230,6 +230,83 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
   const optionTypes = [...new Set(legs.map(l => (l.option_type || '').toUpperCase()).filter(Boolean))];
   if (legs.some(_isFut)) optionTypes.push('FUT');
 
+  // Per-leg breakdown so the Rules block can say exactly which leg carries which
+  // strike / gap / own spot-adjustment — the flat "Legs" line alone can't (e.g.
+  // "Strike Gap: per-leg (100, 1000)" doesn't say which leg is 100 vs 1000).
+  // Find a leg's swept spec and render it the way the optimizer writes ranges:
+  // "0.5 to 2%" for a range, "rise/fall/both" (or "Off/On") for an enum, so a
+  // swept per-leg setting shows its actual from→to instead of a bare "swept".
+  const _specFor = (path) => (selectedList || []).find(s => String(s.path || '') === path);
+  const _specRange = (spec, unit) => {
+    if (!spec) return null;
+    const u = unit || '';
+    if (spec.kind === 'range') {
+      return spec.min === spec.max
+        ? `${spec.min}${u}`
+        : `${spec.min} to ${spec.max}${u}${spec.step ? ` (step ${spec.step})` : ''}`;
+    }
+    if (spec.kind === 'enum') {
+      return (spec.values || []).map(v => v === true ? 'On' : v === false ? 'Off' : v).join('/');
+    }
+    return null;
+  };
+  const _slUnit = (mode) => {
+    const m = String(mode || '').toUpperCase();
+    return (m.includes('PERCENT') || m.includes('PCT') || m === '%') ? '%' : ' pts';
+  };
+  const _legOwnAdj = (leg, i) => {
+    const sa = leg.spot_adjustment || {};
+    const unit = sa.units === 'points' ? ' pts' : '%';
+    const pctSpec = _specFor(`legs[${i}].spot_adjustment.pct`);
+    const dirSpec = _specFor(`legs[${i}].spot_adjustment.direction`);
+    const enSpec = _specFor(`legs[${i}].spot_adjustment.enabled`);
+    if (pctSpec || dirSpec || enSpec) {
+      const bits = [];
+      if (pctSpec) bits.push(_specRange(pctSpec, unit));
+      else if (sa.pct != null) bits.push(`${sa.pct}${unit}`);
+      if (dirSpec) bits.push(_specRange(dirSpec));
+      else if (sa.direction) bits.push(sa.direction);
+      if (enSpec) bits.push(_specRange(enSpec));
+      return bits.filter(Boolean).join(', ');
+    }
+    if (sa.enabled && Number(sa.pct) > 0) {
+      const dir = sa.direction === 'fall' ? 'Fall' : sa.direction === 'both' ? 'Rise or Fall' : 'Rise';
+      return `${dir} ${sa.pct}${unit}`;
+    }
+    return null;
+  };
+  const legDetails = legs.map((leg, i) => {
+    const seg = String(leg.segment || 'OPTIONS').toUpperCase();
+    const side = _side(leg.position);
+    const parts = [];
+    let head;
+    if (seg === 'FUTURES') {
+      head = `FUT ${side}`;
+      const exp = _FUT_EXP[String(leg.expiry || '').toUpperCase()] || leg.expiry || '';
+      if (exp) parts.push(exp);
+    } else {
+      head = `${(leg.option_type || '').toUpperCase()} ${side}`;
+      // legStrikeLabel already renders a swept strike as its range / value list.
+      const strike = legStrikeLabel(leg, i);
+      if (strike) parts.push(`Strike ${strike}`);
+      const gap = Number(leg.strike_interval ?? (leg.strike_selection || {}).strike_interval) || 0;
+      if (gap > 0) parts.push(`Gap ${gap}`);
+    }
+    // Whatever risk settings the leg carries — SL / buffer / trail / target /
+    // re-entry / slippage — so the reader sees the full per-leg configuration.
+    if (leg.stopLoss) parts.push(`SL ${Number(leg.stopLoss.value)}${_slUnit(leg.stopLoss.mode)}`);
+    if (leg.slWithBuffer) parts.push(`SL Buf ${Number(leg.slWithBuffer.value)}${_slUnit(leg.slWithBuffer.mode)}/${Number(leg.slWithBuffer.buffer_pct)}%`);
+    if (leg.trailSL) parts.push(`Trail ${Number(leg.trailSL.trigger)}→${Number(leg.trailSL.move)}${_slUnit(leg.trailSL.mode)}`);
+    if (leg.targetProfit) parts.push(`Target ${Number(leg.targetProfit.value)}${_slUnit(leg.targetProfit.mode)}`);
+    if (leg.reEntryOnSL) parts.push(`RE-SL ${leg.reEntryOnSL.mode}×${leg.reEntryOnSL.count}`);
+    if (leg.reEntryOnTarget) parts.push(`RE-Tgt ${leg.reEntryOnTarget.mode}×${leg.reEntryOnTarget.count}`);
+    const _slp = Number(leg.slippage_pct) || 0;
+    if (_slp > 0) parts.push(`Slippage ${_slp}%`);
+    const own = _legOwnAdj(leg, i);
+    if (own) parts.push(`Own Adj ${own}`);
+    return { label: `Leg ${i + 1}`, value: parts.length ? `${head} — ${parts.join(', ')}` : head };
+  });
+
   const EXPIRY_LABELS = {
     WEEKLY: 'Weekly',
     MONTHLY: 'Monthly',
@@ -277,6 +354,7 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
     index: basePayload.index || basePayload.underlying || '—',
     optionTypes: optionTypes.length ? optionTypes.join(' & ') : '—',
     legs: legLines.length ? legLines.join(', ') : '—',
+    legDetails,
     expiry: expiryLabel,
     entryDte: Number(basePayload.entry_dte || 0),
     exitDte: Number(basePayload.exit_dte || 0),

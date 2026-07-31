@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+from services.trade_anchor import anchor_row as _anchor_row
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -2038,6 +2039,24 @@ def compute_xlsx_summary_metrics(
                 "Rust compute_summary_metrics returned a non-dict "
                 f"({type(_rust_sm).__name__}) — no Python fallback per policy"
             )
+        # The Rust summary engine emits CE/PE totals but not FUT. Add fut_pnl_total /
+        # fut_pnl_pct here (same formula as _write_summary_sheet: Σ FUT P&L; pct =
+        # Σ FUT P&L / Entry Spot * 100) so the MASTER summary's per-type breakdown
+        # includes a real futures leg identically to the per-combo Summary sheet.
+        # A pure additive supplement — no existing Rust value is touched.
+        if "fut_pnl_total" not in _rust_sm:
+            _ft = 0.0
+            _fp = 0.0
+            for _r in rows:
+                _fu = _to_num(_r.get("FUT P&L"))
+                if _fu is None:
+                    continue
+                _ft += _fu
+                _es = _to_num(_r.get("Entry Spot"))
+                if _es not in (None, 0):
+                    _fp += _fu / _es
+            _rust_sm["fut_pnl_total"] = round(_ft, 2)
+            _rust_sm["fut_pnl_pct"] = round(_fp * 100, 4)
         return _rust_sm
 
     tm, _grouped, _sorted_keys = _aggregate_trades(
@@ -2101,7 +2120,7 @@ def compute_xlsx_summary_metrics(
     min_entry_ms = None; max_exit_ms = None
     spot_sum_gated = 0.0
     ce_sum = 0.0; pe_sum = 0.0; fut_sum = 0.0
-    ce_pct_sum = 0.0; pe_pct_sum = 0.0; spot_pct_sum = 0.0
+    ce_pct_sum = 0.0; pe_pct_sum = 0.0; fut_pct_sum = 0.0; spot_pct_sum = 0.0
 
     def _parse_date_ms(v):
         d = _parse_date(v)
@@ -2123,6 +2142,10 @@ def compute_xlsx_summary_metrics(
         if pep is None and pe is not None and es and es != 0:
             pep = pe / es
         pe_pct_sum += pep if pep is not None else 0
+        # FUT P&L % is not a stored column — derive it FUT P&L / Entry Spot (same as
+        # _write_summary_sheet) so the master's futures % matches the per-combo Summary.
+        if fu is not None and es and es != 0:
+            fut_pct_sum += fu / es
         spp = _to_num(t.get("Spot P&L %"))
         sp = _to_num(t.get("Spot P&L"))
         if spp is None and sp is not None and es and es != 0:
@@ -2397,6 +2420,8 @@ def compute_xlsx_summary_metrics(
         "ce_pnl_pct":                            round(ce_pct_sum * 100, 4),
         "pe_pnl_total":                          round(pe_sum, 2),
         "pe_pnl_pct":                            round(pe_pct_sum * 100, 4),
+        "fut_pnl_total":                         round(fut_sum, 2),
+        "fut_pnl_pct":                           round(fut_pct_sum * 100, 4),
         "long_spot_pnl":                         _spot_chg,
         "long_spot_pnl_pct":                     _spot_chg_pct,
         "actual_live_dd_max":                    live_dd_min,
@@ -2465,10 +2490,22 @@ def _project_rows_for_midcap(rows: List[Dict]) -> List[Dict]:
         grouped.setdefault(k, []).append(r)
     out: List[Dict] = []
     for k, legs in grouped.items():
-        main = next((l for l in legs
-                     if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
-                     and not l.get("ReEntryMode") and not _is_lazy(l)), legs[0])
-        net = _to_num(main.get("Net P&L"))
+        mains = [l for l in legs
+                 if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
+                 and not l.get("ReEntryMode") and not _is_lazy(l)] or list(legs)
+        # PARENT row = LOWEST Leg number, which is where simulate.rs:1794-1806
+        # writes the trade total. Selecting it by list position instead made the
+        # total depend on how the rows happened to be ordered.
+        parent = min(mains, key=lambda l: (_to_num(l.get("Leg")) or 0))
+        # WINDOW row = the ANCHOR (latest leg entry, ties -> lowest Leg). A
+        # CARRIED yearly leg holds an older entry date than the weekly leg that
+        # re-enters each cycle; reading the window off "the first row" therefore
+        # priced the Midcap overlay from the carried leg's anchor whenever the
+        # user configured the yearly leg first, which drove every trade to
+        # available=False and stripped the whole Midcap column block from the
+        # Trade Sheet. See services/trade_anchor.py.
+        main = _anchor_row(mains) or parent
+        net = _to_num(parent.get("Net P&L"))
         if net is None:
             net = sum(
                 (_to_num(l.get("CE P&L"))  or 0) +
@@ -2527,7 +2564,16 @@ def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustmen
     except Exception as _exc:
         logger.warning("[OPTIM_MIDCAP] rust compute_midcap_legs failed: %s", _exc)
         result = None
+    # A CONFIGURED Midcap leg that prices nothing must never vanish quietly: the
+    # whole _MIDCAP_COLS block is gated on the has_midcap flag returned here, so
+    # a False slips 21 columns out of the Trade Sheet with no other symptom.
     if not result or not result.get("available"):
+        logger.warning(
+            "[OPTIM_MIDCAP] %d Midcap leg(s) configured but the overlay returned "
+            "nothing for any of %d trades — the Midcap/Combined columns will be "
+            "ABSENT from the Trade Sheet. First projected window: %s",
+            len(midcap_legs), len(proj), (proj[0] if proj else None),
+        )
         return {}, None, False
     by_trade = {
         str(rr.get("trade_id")): rr
@@ -2535,7 +2581,20 @@ def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustmen
         if rr.get("available")
     }
     if not by_trade:
+        _unpriced = [rr for rr in (result.get("results") or []) if not rr.get("available")]
+        logger.warning(
+            "[OPTIM_MIDCAP] %d Midcap leg(s) configured but NO trade could be "
+            "priced (%d unpriced of %d projected) — the Midcap/Combined columns "
+            "will be ABSENT from the Trade Sheet. First projected window: %s",
+            len(midcap_legs), len(_unpriced), len(proj), (proj[0] if proj else None),
+        )
         return {}, None, False
+    _missing = len(proj) - len(by_trade)
+    if _missing > 0:
+        logger.warning(
+            "[OPTIM_MIDCAP] %d of %d trades could not be priced on the Midcap "
+            "overlay and will show blank Combined values.", _missing, len(proj),
+        )
     summ = dict(result.get("summary") or {})
     is_hypo = any(
         str((l or {}).get("midcap_mode") or (l or {}).get("mode") or "").lower() == "hypothetical"

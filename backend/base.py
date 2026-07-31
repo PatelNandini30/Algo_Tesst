@@ -1622,13 +1622,21 @@ def _invalidate_stale_bulk_lookup(sym_upper: str) -> None:
         algotest_native.clear_cache()
     except Exception:
         pass
-    # On-disk feathers for this symbol (the worker runs as root → deletable). The
-    # next load finds no covering feather and rebuilds from the DB, overwriting it.
+    # On-disk feathers for this symbol. Range-scoped caches are safe to drop, but
+    # NEVER delete the authoritative ":full" feather: deleting it and letting the
+    # next (possibly narrow-range) load rebuild it is exactly what TRUNCATES the
+    # spot/options coverage — the recurring spot-wipe. The ":full" feather only
+    # ever GROWS (build_cache regenerates it when a wider load arrives, and the
+    # narrow-load guard blocks any shrink), so keeping it is safe; the in-memory
+    # clear above already forces a fresh read, and dates added by an import are
+    # picked up by the regen path when a load requests the new range.
     try:
         import shutil
         from services import rust_fast_path as _rf
         _root = _rf._cache_root()
         for _d in list(_root.glob(f"arrow-v2:bulk:{sym_upper}:*")):
+            if _d.name.endswith(":full"):
+                continue
             shutil.rmtree(_d, ignore_errors=True)
     except Exception as _e:
         logger.debug("[BULK] feather cleanup skipped: %s", _e)
@@ -3772,7 +3780,7 @@ def bulk_load_options(symbol: str, from_date: str, to_date: str) -> dict:
                     """Activate Rust feather shortcut for the given cache key. Returns True on success."""
                     global _rust_lookup_active, _bhav_by_date_symbol, _bhav_by_date_from
                     global _bhav_by_date_to, _bulk_loaded, _bulk_date_range
-                    if not _rf.build_cache(None, None, cache_key=ck):
+                    if not _rf.build_cache(None, None, cache_key=ck, symbol=sym_upper):
                         return False
                     logger.info("[BULK] Rust feather shortcut: activated %s — skipping DB/Parquet for %s", ck, sym_upper)
                     _rust_lookup_active = True

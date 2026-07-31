@@ -16,7 +16,9 @@ numbers to the JS formula results.
 """
 from __future__ import annotations
 
+import json
 import math
+import re
 from datetime import datetime
 from statistics import mode
 from typing import Any, Dict, List, Optional, Tuple
@@ -178,10 +180,27 @@ def _to_num(v) -> Optional[float]:
 
 def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
                   dd_is_percent: bool, live_field: Optional[str] = None,
-                  yearly: bool = False) -> Dict[str, Any]:
+                  yearly: bool = False, mae_field: Optional[str] = None) -> Dict[str, Any]:
     wow: Dict[int, Dict[int, float]] = {}
     mom_monthly: Dict[int, Dict[int, float]] = {}
     mom_dd: Dict[int, List[float]] = {}
+    # MIN-of-Final-MAE / MIN-of-Actual-Live-DD grids rendered below each block.
+    # Same bucketing as the block above them (WOW by Expiry week, MOM by Exit
+    # month) so the columns line up, but aggregated with MIN and kept in RAW
+    # percent points — these fields are already percent points, and the source
+    # workbook shows them unscaled (e.g. -1.7526), unlike the Live DD % column
+    # in the block header which divides by 100.
+    wow_mae: Dict[int, Dict[int, float]] = {}
+    wow_ldd: Dict[int, Dict[int, float]] = {}
+    mom_mae: Dict[int, Dict[int, float]] = {}
+    mom_ldd: Dict[int, Dict[int, float]] = {}
+
+    def _keep_min(store: Dict[int, Dict[int, float]], y: int, k: int, v: Optional[float]) -> None:
+        if v is None:
+            return
+        cur = store.setdefault(y, {}).get(k)
+        if cur is None or v < cur:
+            store[y][k] = v
     # Live DD % — MIN of "Actual Live DD" (percent points → /100) per year.
     # WOW is bucketed by Expiry year, MOM by Exit year (to match each block's
     # year rows). Written between Max DD and R/MDD; R/MDD still uses Max DD.
@@ -200,10 +219,13 @@ def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
         dec = ret / 100.0
 
         live_dec = None
+        live_raw = None
         if live_field:
             live_num = _to_num(t.get(live_field))
             if live_num is not None:
                 live_dec = live_num / 100.0
+                live_raw = live_num
+        mae_raw = _to_num(t.get(mae_field)) if mae_field else None
 
         # WOW week identity.
         #
@@ -217,7 +239,16 @@ def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
         # into a single cell (2019-12-26 → ISO week 52; 2020-12-31 → week 53).
         # There the roll segment is the week, so the week identity comes from the
         # Exit Date — mirroring what MOM already does below.
-        _wk_src = t.get("Exit Date") if yearly else t.get("Expiry")
+        # SAME-INDEX MIXED EXPIRY: with a weekly cadence and a pinned monthly leg,
+        # the two legs of ONE trade carry different Expiry values, so bucketing on
+        # Expiry splits a single trade across weeks (and which week wins depends on
+        # leg order). "Cadence Expiry" is the trade's shared weekly contract, so
+        # both legs land together. It is emitted for every row and equals Expiry
+        # unless a leg is genuinely pinned, so non-mixed WOW output is unchanged.
+        _wk_src = (
+            t.get("Exit Date") if yearly
+            else (t.get("Cadence Expiry") or t.get("Expiry"))
+        )
         e = _parse_date(_wk_src)
         if e is not None:
             y, w = _iso_year_week(e)
@@ -225,6 +256,8 @@ def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
             wow[y][w] = wow[y].get(w, 0.0) + dec
             if live_dec is not None:
                 wow_live.setdefault(y, []).append(live_dec)
+            _keep_min(wow_mae, y, w, mae_raw)
+            _keep_min(wow_ldd, y, w, live_raw)
 
         x = _parse_date(t.get("Exit Date"))
         if x is not None:
@@ -239,6 +272,8 @@ def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
                 mom_dd.setdefault(y, []).append(dd_dec)
             if live_dec is not None:
                 mom_live.setdefault(y, []).append(live_dec)
+            _keep_min(mom_mae, y, mi, mae_raw)
+            _keep_min(mom_ldd, y, mi, live_raw)
 
     for y in list(wow.keys()):
         for w in list(wow[y].keys()):
@@ -279,7 +314,9 @@ def build_wow_mom(cleaned: List[Dict], ret_field: str, dd_field: str,
     mom_years = sorted(mom.keys())
     return {"wow": wow, "mom": mom, "wow_years": wow_years,
             "mom_years": mom_years, "n_weeks": 53, "n_trades": n_trades,
-            "wow_live": wow_live_min}
+            "wow_live": wow_live_min,
+            "wow_mae": wow_mae, "wow_ldd": wow_ldd,
+            "mom_mae": mom_mae, "mom_ldd": mom_ldd}
 
 
 def flat_weekly(wow: Dict[int, Dict[int, float]]) -> List[float]:
@@ -579,12 +616,329 @@ def _write_mom_block(S, wm, title, base_row: int, base_col: int = 1) -> int:
     return r
 
 
+def _min_grid_fields(cleaned: List[Dict]) -> Tuple[str, str, str, str]:
+    """(mae_field, live_field, mae_title, live_title) for the MIN grids.
+
+    Resolved by PRESENCE, not by the has_midcap flag: a run can carry Combined
+    columns from a Midcap overlay, a MIDCPNIFTY overlay, both, or neither, and
+    the grids must work in all four cases. Falling back to the plain column when
+    no Combined one exists also keeps the title honest about which it summed.
+    """
+    keys: set = set()
+    for t in cleaned:
+        if t:
+            keys = set(t.keys())
+            break
+    mae = "Combined Final MAE" if "Combined Final MAE" in keys else "Final MAE"
+    live = ("Combined Actual Live DD" if "Combined Actual Live DD" in keys
+            else "Actual Live DD")
+    return mae, live, f"Min of {mae}", f"Min of {live}"
+
+
 def _wm_from_cleaned(cleaned: List[Dict], has_midcap: bool, yearly: bool = False) -> Dict[str, Any]:
     ret_field = "Combined Net P&L %" if has_midcap else "% P&L"
     dd_field = "Combined %DD" if has_midcap else "%DD"
     live_field = "Combined Actual Live DD" if has_midcap else "Actual Live DD"
-    return build_wow_mom(cleaned, ret_field, dd_field, has_midcap,
-                         live_field=live_field, yearly=yearly)
+    mae_field, min_live_field, mae_title, live_title = _min_grid_fields(cleaned)
+    wm = build_wow_mom(cleaned, ret_field, dd_field, has_midcap,
+                       live_field=live_field, yearly=yearly, mae_field=mae_field)
+    # The MIN grids read Live DD from the same column the block header does, but
+    # unscaled — resolve it independently so a run with no Combined columns still
+    # gets a grid instead of a blank one.
+    if min_live_field != live_field:
+        wm2 = build_wow_mom(cleaned, ret_field, dd_field, has_midcap,
+                            live_field=min_live_field, yearly=yearly,
+                            mae_field=mae_field)
+        wm["wow_ldd"], wm["mom_ldd"] = wm2["wow_ldd"], wm2["mom_ldd"]
+    wm["mae_title"], wm["live_title"] = mae_title, live_title
+    return wm
+
+
+# ── MIN-of-MAE / MIN-of-Live-DD grids ──────────────────────────────────────
+# Two per axis, written directly beneath their own block so the columns line up
+# with the block above. Values are RAW percent points (the source columns
+# already are), aggregated with MIN — never summed or averaged.
+# Display 2dp, store the FULL float — a formula on the cell must see every digit,
+# so the precision lives in the value and only the number_format is truncated.
+MIN_GRID_FMT = "0.00"
+MIN_GRID_GAP = 4          # => 3 blank rows of margin after EVERY table, incl.
+                          #    before the next block (was uneven: 2 then 1)
+MIN_WEEKLY_ROWS = 4       # title + Month band + Year header + Grand Total
+MIN_MONTHLY_ROWS = 3      # title + column header + Grand Total
+
+# Everything below reuses the sheet's OWN theme constants — the grids sat next to
+# the WOW/MOM blocks in a separate invented blue/pink palette and clashed. Header
+# rows mirror the blocks exactly: _HEADER_BG title, _SUB_BG column header,
+# _LABEL_BG row labels.
+_GRID_TITLE_BG, _GRID_TITLE_TX = _HEADER_BG, _HEADER_TX
+_GRID_BAND_BG, _GRID_BAND_TX = _SUB_BG, _SUB_TX
+_GRID_HDR_BG, _GRID_HDR_TX = _SUB_BG, _SUB_TX
+_GRID_YEAR_BG = _LABEL_BG
+
+
+def _blend(light: str, dark: str, t: float) -> str:
+    """Mix two ARGB theme colours; t=0 -> light, t=1 -> dark."""
+    lr, lg, lb = int(light[2:4], 16), int(light[4:6], 16), int(light[6:8], 16)
+    dr, dg, db = int(dark[2:4], 16), int(dark[4:6], 16), int(dark[6:8], 16)
+    mix = tuple(round(l + (d - l) * t) for l, d in ((lr, dr), (lg, dg), (lb, db)))
+    return "FF" + "".join(f"{v:02X}" for v in mix)
+
+
+# Value ramp — design notes, because the obvious choice reads badly here:
+#
+# MAE and Live DD are almost always negative, so SIGN carries no information;
+# magnitude does. A saturated red on every cell therefore just shouts, and
+# blending toward the theme's brick red (_RED_TX, an orange-leaning FFC0392B)
+# produced a salmon that fought the cool slate/blue headers.
+#
+# So: one sequential ramp in a COOL rose/crimson, which sits in the same visual
+# family as the slate navy header, and stays light for typical values so only a
+# genuinely large drawdown darkens. Positives are rare here, so their ramp is
+# deliberately muted — they should register without grabbing the eye.
+_RAMP_NEG_LIGHT, _RAMP_NEG_DARK = "FFFEF6F7", "FF9B2242"   # near-white -> crimson
+_RAMP_POS_LIGHT, _RAMP_POS_DARK = "FFF7FBF8", "FF2C6E4A"    # near-white -> forest
+# Kept in the LIGHTEST band of the hue: the whole ramp travels only ~a third of
+# the way toward the deep tone, so even the worst cell stays a pale tint. With
+# almost every value negative, a scale that reaches saturated red turns the
+# sheet into a wall of alarm — magnitude still reads, just gently.
+_RAMP_STEPS = (0.0, 0.10, 0.20, 0.32)
+_RAMP_NEG = tuple(_blend(_RAMP_NEG_LIGHT, _RAMP_NEG_DARK, t) for t in _RAMP_STEPS)
+_RAMP_POS = tuple(_blend(_RAMP_POS_LIGHT, _RAMP_POS_DARK, t) for t in _RAMP_STEPS)
+_RAMP_NEG_TX, _RAMP_POS_TX = "FF8E2A3F", "FF2C6E4A"
+# Every step stays pale, so dark text reads on all of them — never invert.
+_RAMP_INVERT_FROM = len(_RAMP_STEPS)
+
+
+def _ramp_step(v, worst_neg, best_pos):
+    """(band, index) for `v`, scaled against this grid's own extremes."""
+    if v is None or v == "":
+        return None, 0
+    if v < 0:
+        span, band = abs(worst_neg or 0), _RAMP_NEG
+    elif v > 0:
+        span, band = abs(best_pos or 0), _RAMP_POS
+    else:
+        return _RAMP_NEG, 0
+    frac = (abs(v) / span) if span else 1.0
+    return band, min(int(frac * len(band)), len(band) - 1)
+
+
+def _ramp_fill(v, worst_neg, best_pos):
+    band, idx = _ramp_step(v, worst_neg, best_pos)
+    return band[idx] if band else None
+
+
+def _ramp_tx(v, worst_neg=None, best_pos=None):
+    """Theme text colour, flipped to white once the fill goes too dark to read."""
+    if v is None or v == "":
+        return _BLACK
+    band, idx = _ramp_step(v, worst_neg, best_pos)
+    if band and idx >= _RAMP_INVERT_FROM:
+        return "FFFFFFFF"
+    return _RAMP_NEG_TX if v < 0 else (_RAMP_POS_TX if v > 0 else _BLACK)
+
+
+def _grid_extremes(data, years):
+    """(most negative, most positive) across the whole grid, for the ramp scale."""
+    vals = [v for y in years for v in (data.get(y) or {}).values()
+            if isinstance(v, (int, float))]
+    if not vals:
+        return None, None
+    return min(vals), max(vals)
+
+
+def _grid_title(S, row, col, span, text):
+    """Merged full-width title band so long names aren't clipped by column A."""
+    cell = S.h(row, col, text, tx=_GRID_TITLE_TX, bg=_GRID_TITLE_BG,
+               align=Alignment(horizontal="left", vertical="center", indent=1))
+    for c in range(col + 1, col + span):
+        S.h(row, c, "", tx=_GRID_TITLE_TX, bg=_GRID_TITLE_BG)
+    S.ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + span - 1)
+    return cell
+
+
+def _min_grid_weekly_height(n_years: int) -> int:
+    """Rows one weekly MIN grid occupies, including its leading gap."""
+    return MIN_GRID_GAP + MIN_WEEKLY_ROWS + n_years
+
+
+def _min_grid_monthly_height(n_years: int) -> int:
+    return MIN_GRID_GAP + MIN_MONTHLY_ROWS + n_years
+
+
+def _write_min_weekly_grid(S, wm, title: str, key: str,
+                           base_row: int, base_col: int = 1) -> int:
+    """Year x W1..Wn MIN grid, sharing the WOW block's week columns + Month band.
+
+    Returns the Grand-Total row index.
+    """
+    cc = base_col - 1
+    nw = wm["n_weeks"]
+    years = wm["wow_years"]
+    data = wm.get(key) or {}
+    gt_col = 2 + nw
+    sw, ew = get_month_maps(years, nw)
+    month_ends = set(ew.values())
+    blk = Side(style="medium", color=_BLACK)
+
+    def month_edge(cell, w):
+        if w in month_ends:
+            cell.border = Border(top=cell.border.top, left=cell.border.left,
+                                 bottom=cell.border.bottom, right=blk)
+
+    lo, hi = _grid_extremes(data, years)
+    _grid_title(S, base_row, cc + 1, gt_col, title)
+
+    r_month, r_hdr = base_row + 1, base_row + 2
+    S.h(r_month, cc + 1, "Month", size=8, tx=_GRID_BAND_TX, bg=_GRID_BAND_BG)
+    for w in range(1, nw + 1):
+        month_edge(S.h(r_month, cc + 1 + w, "", tx=_GRID_BAND_TX, bg=_GRID_BAND_BG), w)
+    S.h(r_month, cc + gt_col, "", tx=_GRID_BAND_TX, bg=_GRID_BAND_BG)
+    for mi, mn in enumerate(MONTHS):
+        start_w = sw.get(mi + 1, 1)
+        if 1 <= start_w <= nw:
+            cell = S.ws.cell(r_month, cc + 1 + start_w, mn)
+            cell.font = Font(bold=True, size=8, color=_GRID_BAND_TX, name="Calibri")
+            cell.alignment = _CENTER
+
+    S.h(r_hdr, cc + 1, "Year", size=8, tx=_GRID_HDR_TX, bg=_GRID_HDR_BG)
+    for w in range(1, nw + 1):
+        month_edge(S.h(r_hdr, cc + 1 + w, f"W{w}", size=7,
+                       tx=_GRID_HDR_TX, bg=_GRID_HDR_BG), w)
+    S.h(r_hdr, cc + gt_col, "Grand Total", size=8, tx=_GRID_HDR_TX, bg=_GRID_HDR_BG)
+
+    r = r_hdr + 1
+    for yr in years:
+        S.h(r, cc + 1, yr, size=8, tx=_GRID_HDR_TX, bg=_GRID_YEAR_BG)
+        yd = data.get(yr) or {}
+        for w in range(1, nw + 1):
+            v = yd.get(w)
+            cell = S.v(r, cc + 1 + w, v if v is not None else "", MIN_GRID_FMT,
+                       size=7, bg=_ramp_fill(v, lo, hi), tx=_ramp_tx(v, lo, hi))
+            month_edge(cell, w)
+        row_min = min(yd.values()) if yd else None
+        S.v(r, cc + gt_col, row_min if row_min is not None else "", MIN_GRID_FMT,
+            bg=_ramp_fill(row_min, lo, hi), tx=_ramp_tx(row_min, lo, hi))
+        r += 1
+
+    S.h(r, cc + 1, "Grand Total", size=8, tx=_GRID_HDR_TX, bg=_GRID_HDR_BG)
+    all_vals = []
+    for w in range(1, nw + 1):
+        col_vals = [data[y][w] for y in years if w in (data.get(y) or {})]
+        cv = min(col_vals) if col_vals else None
+        month_edge(S.v(r, cc + 1 + w, cv if cv is not None else "", MIN_GRID_FMT,
+                       size=7, bg=_ramp_fill(cv, lo, hi), tx=_ramp_tx(cv, lo, hi)), w)
+        all_vals.extend(col_vals)
+    gv = min(all_vals) if all_vals else None
+    S.v(r, cc + gt_col, gv if gv is not None else "", MIN_GRID_FMT,
+        bg=_ramp_fill(gv, lo, hi), tx=_ramp_tx(gv, lo, hi))
+    return r
+
+
+def _write_min_monthly_grid(S, wm, title: str, key: str,
+                            base_row: int, base_col: int = 1) -> int:
+    """Row Labels x Jan..Dec + Grand Total MIN grid, under the MOM block."""
+    cc = base_col - 1
+    years = wm["mom_years"]
+    data = wm.get(key) or {}
+    gt_col = 14                       # Year + 12 months + Grand Total
+
+    lo, hi = _grid_extremes(data, years)
+    # Title spans the grid: column A alone clipped "Min of Combined Actual Live
+    # DD", and the old "Column Labels" cell next to it just added noise.
+    _grid_title(S, base_row, cc + 1, gt_col, title)
+
+    r_hdr = base_row + 1
+    S.h(r_hdr, cc + 1, "Year", size=8, tx=_GRID_BAND_TX, bg=_GRID_BAND_BG)
+    for mi, mn in enumerate(MONTHS):
+        S.h(r_hdr, cc + 2 + mi, mn, size=8, tx=_GRID_BAND_TX, bg=_GRID_BAND_BG)
+    S.h(r_hdr, cc + gt_col, "Grand Total", size=8,
+        tx=_GRID_BAND_TX, bg=_GRID_BAND_BG)
+
+    r = r_hdr + 1
+    for yr in years:
+        S.h(r, cc + 1, yr, size=8, tx=_GRID_HDR_TX, bg=_GRID_YEAR_BG)
+        yd = data.get(yr) or {}
+        for mi in range(12):
+            v = yd.get(mi)
+            S.v(r, cc + 2 + mi, v if v is not None else "", MIN_GRID_FMT,
+                bg=_ramp_fill(v, lo, hi), tx=_ramp_tx(v, lo, hi))
+        row_min = min(yd.values()) if yd else None
+        S.v(r, cc + gt_col, row_min if row_min is not None else "", MIN_GRID_FMT,
+            bg=_ramp_fill(row_min, lo, hi), tx=_ramp_tx(row_min, lo, hi))
+        r += 1
+
+    S.h(r, cc + 1, "Grand Total", size=8, tx=_GRID_HDR_TX, bg=_GRID_HDR_BG)
+    all_vals = []
+    for mi in range(12):
+        col_vals = [data[y][mi] for y in years if mi in (data.get(y) or {})]
+        cv = min(col_vals) if col_vals else None
+        S.v(r, cc + 2 + mi, cv if cv is not None else "", MIN_GRID_FMT,
+            bg=_ramp_fill(cv, lo, hi), tx=_ramp_tx(cv, lo, hi))
+        all_vals.extend(col_vals)
+    gv = min(all_vals) if all_vals else None
+    S.v(r, cc + gt_col, gv if gv is not None else "", MIN_GRID_FMT,
+        bg=_ramp_fill(gv, lo, hi), tx=_ramp_tx(gv, lo, hi))
+    return r
+
+
+def _write_min_grids(S, wm, axis: str, after_row: int, base_col: int = 1) -> int:
+    """Both MIN grids for one axis, stacked under `after_row`. Returns last row."""
+    mae_title = wm.get("mae_title") or "Min of Final MAE"
+    live_title = wm.get("live_title") or "Min of Actual Live DD"
+    write = _write_min_weekly_grid if axis == "wow" else _write_min_monthly_grid
+    mae_key, ldd_key = (("wow_mae", "wow_ldd") if axis == "wow"
+                        else ("mom_mae", "mom_ldd"))
+    r = write(S, wm, mae_title, mae_key, after_row + MIN_GRID_GAP, base_col)
+    r = write(S, wm, live_title, ldd_key, r + MIN_GRID_GAP, base_col)
+    return r
+
+
+MIN_PIVOTS_PER_LINE = 3   # captioned units across before wrapping to a new band
+
+
+def _write_min_pivot_sheet(wb: Workbook, items: List[Dict], axis: str,
+                           sheet_name: str) -> None:
+    """MIN pivots laid out 3-across then stacked, each captioned by combination.
+
+    Kept OFF the WOW/MOM Summary sheets on purpose: those are cross-combo
+    comparison grids and two extra tables under all 24+ blocks made them
+    unreadable. Here a "unit" is caption + Min-of-MAE + Min-of-Live-DD; units
+    flow left to right, wrap after MIN_PIVOTS_PER_LINE, and every band is a
+    fixed height so the columns stay aligned all the way down.
+    """
+    ws = wb.create_sheet(sheet_name)
+    ws.freeze_panes = "B1"
+    S = _Sheet(ws)
+    nw = items[0]["wm"]["n_weeks"] if items else 53
+    ny = len(items[0]["wm"]["wow_years" if axis == "wow" else "mom_years"]) if items else 0
+
+    span = (2 + nw) if axis == "wow" else 14        # columns one unit occupies
+    grid_h = (MIN_WEEKLY_ROWS if axis == "wow" else MIN_MONTHLY_ROWS) + ny
+    unit_h = 2 * MIN_GRID_GAP + 2 * grid_h - 1      # caption row through last grid row
+    col_stride = span + 2                            # 2-column gutter, as the summary uses
+    row_stride = unit_h + (MIN_GRID_GAP - 1)         # 3 blank rows under each band
+
+    for i, it in enumerate(items):
+        band, slot = divmod(i, MIN_PIVOTS_PER_LINE)
+        row = 1 + band * row_stride
+        col = 1 + slot * col_stride
+        # Combination caption — the whole point of the separate sheet.
+        S.h(row, col, it["title"], size=11, tx=_HEADER_TX, bg=_HEADER_BG,
+            align=Alignment(horizontal="left", vertical="center", indent=1))
+        for c in range(col + 1, col + span):
+            S.h(row, c, "", tx=_HEADER_TX, bg=_HEADER_BG)
+        ws.merge_cells(start_row=row, start_column=col,
+                       end_row=row, end_column=col + span - 1)
+        ws.row_dimensions[row].height = 18
+        _write_min_grids(S, it["wm"], axis, row, col)
+
+    for slot in range(min(MIN_PIVOTS_PER_LINE, len(items))):
+        base = 1 + slot * col_stride
+        if axis == "wow":
+            _set_wow_widths(ws, nw, base)
+        else:
+            _set_mom_widths(ws, base)
 
 
 def _set_wow_widths(ws, nw, base_col: int = 1):
@@ -614,7 +968,13 @@ def write_wow_mom_combined(wb: Workbook, cleaned: List[Dict], has_midcap: bool,
     ws.freeze_panes = "B1"
     S = _Sheet(ws)
     wow_total = _write_wow_block(S, wm, title, 1)
-    _write_mom_block(S, wm, title, wow_total + 2)
+    # MIN grids sit under their OWN block: weekly pair below WOW, monthly pair
+    # below MOM. The MOM block therefore starts after the weekly grids.
+    wow_end = _write_min_grids(S, wm, "wow", wow_total)
+    # Same MIN_GRID_GAP as between the grids, so the spacing is uniform down the
+    # whole sheet instead of 3 rows before a grid and 1 before the next block.
+    mom_total = _write_mom_block(S, wm, title, wow_end + MIN_GRID_GAP)
+    _write_min_grids(S, wm, "mom", mom_total)
     _set_wow_widths(ws, wm["n_weeks"])
     return True
 
@@ -748,13 +1108,125 @@ def _adj_sort_key(adj_label: str) -> Tuple[int, float]:
     return (grp, mag)
 
 
+# ── Variant axis ────────────────────────────────────────────────────────────
+# A sweep can vary parameters the combo LABEL never encodes (SL, target, trail,
+# DTE, overall SL/target, lots…): `combo_labeler.label_combo` only emits
+# strikes, futures, midcap, adjustment, expiry and shift. Those combos landed on
+# an identical (strike, adjustment) grid cell and used to be pushed DOWNWARD as
+# "(2)/(3)/(4)". They now get their own sub-column, titled by what differs.
+
+# Params already shown by the strike / expiry / shift / adjustment parts of a
+# block title — naming them again in the variant suffix is pure duplication.
+_VARIANT_SKIP = re.compile(r"strike_selection|\.expiry$|^expiry|shift|spot_adjustment",
+                           re.IGNORECASE)
+
+_VARIANT_NAMES = {
+    "stopLoss.value": "SL",
+    "targetProfit.value": "TGT",
+    "slWithBuffer.value": "SLB",
+    "slWithBuffer.buffer_pct": "SLB buf",
+    "trailSL.trigger": "Trail trig",
+    "trailSL.move": "Trail move",
+    "entry_dte": "Entry DTE",
+    "exit_dte": "Exit DTE",
+    "min_days_to_entry": "Min days",
+    "overall_sl_value": "Overall SL",
+    "overall_target_value": "Overall TGT",
+    "buffer_strike_value": "Buffer strike",
+}
+
+
+def _variant_param_name(path: str) -> str:
+    """'legs[1].stopLoss.value' → 'L2 SL'; unknown paths fall back to a
+    de-camel-cased last segment so a new sweepable param still reads sanely."""
+    m = re.match(r"legs\[(\d+)\]\.(.+)$", path)
+    prefix, tail = "", path
+    if m:
+        prefix, tail = f"L{int(m.group(1)) + 1} ", m.group(2)
+    name = _VARIANT_NAMES.get(tail)
+    if name is None:
+        name = tail.split(".")[-1].replace("_", " ")
+        name = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", name).strip()
+        name = name[:1].upper() + name[1:]
+    return prefix + name
+
+
+def _fmt_variant_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, (int, float)):
+        return f"{v:g}"
+    return str(v)
+
+
+def variant_labels(combo_by_safe: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    """combo_label_safe → short label naming the swept params that DIFFER across
+    the job and aren't already in the block title.
+
+    Constant params are dropped (they'd be noise on every block). A sweep where
+    nothing extra varies returns {} — every label is empty and the grid layout
+    is byte-for-byte what it was before.
+    """
+    values: Dict[str, set] = {}
+    for combo in combo_by_safe.values():
+        for path, val in (combo or {}).items():
+            values.setdefault(path, set()).add(_fmt_variant_value(val))
+    varying = sorted(p for p, vs in values.items()
+                     if len(vs) > 1 and not _VARIANT_SKIP.search(p))
+    if not varying:
+        return {}
+    out: Dict[str, str] = {}
+    for safe, combo in combo_by_safe.items():
+        combo = combo or {}
+        parts = [f"{_variant_param_name(p)} {_fmt_variant_value(combo[p])}"
+                 for p in varying if p in combo]
+        out[safe] = ", ".join(parts)
+    return out
+
+
+_PER_LEG_ADJ = re.compile(
+    r"L(\d+)(RiseBy|FallsBy|RisesOrFallsBy|MoveBy|AdjustBy)([\d.]+)(pts|%)",
+    re.IGNORECASE)
+
+_PER_LEG_ADJ_WORD = {
+    "riseby": "Rise", "fallsby": "Fall", "risesorfallsby": "Rise or Fall",
+    "moveby": "Rise or Fall", "adjustby": "Adjust",
+}
+
+
+def adj_label_from_combo_label(combo_label: str) -> str:
+    """'..._L1RiseBy1%_NoAdjustment_...' → 'Rise 1% (L1)'; '' when there is none.
+
+    `combo_columns.spot_adjustment` only carries the STRATEGY-level knob, so a
+    sweep that adjusts spot PER LEG reports "NoAdjustment" for every combo and
+    the whole grid collapses into a single column. The per-leg segment IS in the
+    combo label (combo_labeler._per_leg_spot_adjustment_label), so read it back
+    from there. Only consulted when the strategy-level knob is off.
+    """
+    segs = []
+    for leg, word, mag, unit in _PER_LEG_ADJ.findall(combo_label or ""):
+        pretty = _PER_LEG_ADJ_WORD.get(word.lower(), word)
+        segs.append(f"{pretty} {mag}{'pts' if unit.lower() == 'pts' else '%'} (L{leg})")
+    return " + ".join(segs)
+
+
 def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     """
     Two sheets ('WOW Summary' + 'MOM Summary') laid out as a 2D grid:
-      • columns  = spot-adjustment (No Adj, Rise, Fall, Rise or Fall) left→right
-      • rows     = each distinct strike / expiry / shift signature top→bottom
+      • columns  = spot-adjustment (No Adj, Rise, Fall, Rise or Fall) left→right,
+                   then any remaining swept variant, wrapping 4-across
+      • rows     = each distinct strike / expiry / shift signature top→bottom,
+                   each occupying as many stacked bands as it has variants
 
-    combos: [{title, cleaned, has_midcap, adj_key, adj_label, row_key, row_sort}, ...].
+    Blocks ALWAYS flow horizontally first — a job with one adjustment and six
+    variants gets 4 across + 2 on the band below, not a six-deep vertical stack.
+
+    Deliberately carries NO Min-of-MAE / Min-of-Live-DD grids: those are per-combo
+    detail and live in the tradesheet's own 'WOW & MOM Summary' sheet. This sheet
+    exists to compare combos side by side.
+
+    combos: [{title, cleaned, has_midcap, adj_key, adj_label, row_key, row_sort,
+              variant_label}, ...].
     adj_key/adj_label/row_key are optional — when absent they are derived from the
     'strike | adjustment' title so the layout still works. Per-block content and
     calculations are byte-identical to the per-combo tradesheet; only positioning
@@ -779,6 +1251,12 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
         _pre = c.get("wm")
         wm = _intkeys(_pre) if _pre else _wm_from_cleaned(
             c["cleaned"], c.get("has_midcap", False), yearly=bool(c.get("yearly", False)))
+        # A wm stored in Redis BEFORE the MIN grids existed has no wow_mae/etc, so
+        # the grids would render empty. Recompute from the cleaned rows when we
+        # still have them rather than shipping four blank tables.
+        if "wow_mae" not in wm and c.get("cleaned"):
+            wm = _wm_from_cleaned(c["cleaned"], c.get("has_midcap", False),
+                                  yearly=bool(c.get("yearly", False)))
         if not (wm["n_trades"] > 0):
             continue
         title = c.get("title") or "Strategy"
@@ -791,34 +1269,74 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
             "wm": wm, "title": title,
             "adj_key": adj_key, "adj_label": adj_label,
             "row_key": row_key, "row_sort": row_sort,
+            "variant_label": (c.get("variant_label") or "").strip(),
         })
     if not items:
         return False
 
-    # Disambiguate combos that collapse to the SAME (row_key, adj_key) grid cell.
-    # This happens for a spread whose two legs are the same option type (e.g.
-    # PE Sell + PE Buy): the strike display can only show one leg, so several
-    # combos that differ only by the other leg's strike share an identical
-    # (row, adjustment) position. Without this they would all write into the same
-    # block and the 2nd+ would hit an already-merged header cell → crash
-    # ("'MergedCell' object attribute 'value' is read-only"). Each extra combo at
-    # an already-taken cell is pushed to its own stacked sub-row (and its title
-    # tagged) so no two blocks overlap. Jobs with NO collisions are untouched —
-    # the loop makes zero changes, so their output is byte-for-byte identical.
+    # Collapse combos that are genuinely the SAME run. A gated sweep emits these
+    # routinely: `legs[1].spot_adjustment.direction` still varies rise/fall/both
+    # while `.enabled` is false, so three combos produce one identical result.
+    # They land on one cell with nothing to tell them apart, and stacking them
+    # is just the same block three times. Identical wm ⇒ identical block, so
+    # this only ever removes exact repeats — the same intent as
+    # result_store._combo_fingerprint (same label + same P&L = duplicate),
+    # applied at layout time instead of by discarding the combo's metadata.
+    _seen_blocks: set = set()
+    _unique = []
+    for it in items:
+        # sort_keys: within one workbook some wm come back from Redis and some
+        # are rebuilt, so raw dict order is not comparable.
+        sig = (it["row_key"], it["adj_key"], it["variant_label"],
+               json.dumps(it["wm"], sort_keys=True, default=str))
+        if sig in _seen_blocks:
+            continue
+        _seen_blocks.add(sig)
+        _unique.append(it)
+    items = _unique
+
+    # Combos that collapse to the SAME (row_key, adj_key) grid cell get their own
+    # HORIZONTAL sub-column instead of being stacked downward.
+    #
+    # This happens whenever the sweep varies something the grid has no axis for:
+    # a spread whose two legs are the same option type (the strike display can
+    # only show one leg), or — far more commonly — any param the combo label
+    # never encodes at all (SL, target, trail, DTE…). Two combos writing into one
+    # block would crash on an already-merged header cell ("'MergedCell' object
+    # attribute 'value' is read-only"), so each extra one is given the next
+    # variant slot; `variant_label` (built by `variant_labels`) names what
+    # actually differs. Jobs with NO collisions get variant 0 for every item →
+    # the layout math below reduces to the original grid, byte-for-byte.
     _cell_count: Dict[Tuple[str, str], int] = {}
     for it in items:
         cell = (it["row_key"], it["adj_key"])
         n = _cell_count.get(cell, 0)
         _cell_count[cell] = n + 1
-        if n > 0:
-            it["row_key"] = f'{it["row_key"]} ({n + 1})'
+        it["variant"] = n
+        if it["variant_label"]:
+            it["title"] = f'{it["title"]} | {it["variant_label"]}'
+        elif n > 0:
+            # Nothing distinguishable to name (e.g. a same-option-type spread) —
+            # keep the old positional tag so the blocks stay tellable apart.
             it["title"] = f'{it["title"]} ({n + 1})'
 
     # Column axis: unique adjustments, ordered No Adj → Rise → Fall → Rise or Fall.
+    #
+    # Sort on the segments that DIFFER, not the whole label: when every combo
+    # carries the same constant leg adjustment (e.g. "Rise 1% (L1)") and only a
+    # second leg is swept, every label starts with "Rise …" and the ordering
+    # collapses to a tie broken alphabetically — putting Fall before Rise. The
+    # column that adds nothing beyond the shared part is the "No Adj" one.
     adj_seen: Dict[str, str] = {}   # adj_key → adj_label
     for it in items:
         adj_seen.setdefault(it["adj_key"], it["adj_label"])
-    adj_keys = sorted(adj_seen.keys(), key=lambda k: (_adj_sort_key(adj_seen[k]), k))
+    _seg_sets = [set(lbl.split(" + ")) for lbl in adj_seen.values()]
+    _common = set.intersection(*_seg_sets) if len(_seg_sets) > 1 else set()
+    _distinct = {
+        k: (" + ".join([s for s in lbl.split(" + ") if s not in _common]) or "No Adj")
+        for k, lbl in adj_seen.items()
+    }
+    adj_keys = sorted(adj_seen.keys(), key=lambda k: (_adj_sort_key(_distinct[k]), k))
     adj_index = {k: i for i, k in enumerate(adj_keys)}
 
     # Row axis: unique row signatures, first-seen order (optionally by row_sort).
@@ -848,6 +1366,30 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     ny_w = len(all_wow_years)
     ny_m = len(all_mom_years)
 
+    # ── Horizontal slotting ─────────────────────────────────────────────────
+    # Every block goes ACROSS first, then wraps to a band below WITHIN its own
+    # strike group; the next strike starts under the last band of the previous.
+    #
+    #   slot        = adj_index + variant * n_adj   (adjustments stay adjacent)
+    #   per_band    = n_adj when the sweep varies the adjustment — so No Adj /
+    #                 Rise / Fall / Rise or Fall keep a fixed column each and
+    #                 every band lines up under the one above it;
+    #               = WRAP otherwise — one adjustment and N variants pack WRAP
+    #                 to a line before wrapping.
+    #   col_in_band = slot % per_band, band = slot // per_band
+    #
+    # n_bands is global (not per strike) so all strike groups start at the same
+    # column offsets and the sheet reads as one grid.
+    WRAP = 4
+    per_band = n_adj if n_adj > 1 else WRAP
+    n_variants = max(it["variant"] for it in items) + 1
+    n_bands = -(-(n_adj * n_variants) // per_band)   # ceil
+    n_cols = min(per_band, n_adj * n_variants)
+
+    def _slot(it: Dict[str, Any]) -> Tuple[int, int]:
+        s = adj_index[it["adj_key"]] + it["variant"] * n_adj
+        return s // per_band, s % per_band
+
     # ── WOW Summary grid ────────────────────────────────────────────────────
     Wb = 5 + nw                # block width (Year + weeks + Total+MaxDD+Live+RMDD)
     Gw = 2                     # column gap between adjustment sections
@@ -857,13 +1399,16 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     ws_w.freeze_panes = "B1"
     Sw = _Sheet(ws_w)
     for it in items:
-        ri = row_index[it["row_key"]]
-        ai = adj_index[it["adj_key"]]
+        band, ci = _slot(it)
+        ri = row_index[it["row_key"]] * n_bands + band
         base_row = 1 + ri * (Hw + Gr)
-        base_col = 1 + ai * (Wb + Gw)
+        base_col = 1 + ci * (Wb + Gw)
+        # NOTE: no MIN grids here — they belong to the per-combo tradesheet only.
+        # The merged summary is a cross-combo comparison grid; stacking two extra
+        # tables under all 24+ blocks made it unreadable.
         _write_wow_block(Sw, it["wm"], it["title"], base_row, base_col)
-    for ai in range(n_adj):
-        _set_wow_widths(ws_w, nw, 1 + ai * (Wb + Gw))
+    for ci in range(n_cols):
+        _set_wow_widths(ws_w, nw, 1 + ci * (Wb + Gw))
 
     # ── MOM Summary grid ────────────────────────────────────────────────────
     Mb = 18                    # block width (Year + 12 months + Total+MaxDD+Live+RMDD, stats to col 18)
@@ -873,11 +1418,19 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     ws_m.freeze_panes = "B1"
     Sm = _Sheet(ws_m)
     for it in items:
-        ri = row_index[it["row_key"]]
-        ai = adj_index[it["adj_key"]]
+        band, ci = _slot(it)
+        ri = row_index[it["row_key"]] * n_bands + band
         base_row = 1 + ri * (Hm + Gr)
-        base_col = 1 + ai * (Mb + Gm)
+        base_col = 1 + ci * (Mb + Gm)
         _write_mom_block(Sm, it["wm"], it["title"], base_row, base_col)
-    for ai in range(n_adj):
-        _set_mom_widths(ws_m, 1 + ai * (Mb + Gm))
+    for ci in range(n_cols):
+        _set_mom_widths(ws_m, 1 + ci * (Mb + Gm))
+
+    # ── MIN pivots, one sheet per axis ──────────────────────────────────────
+    # Same tables the per-combo tradesheet carries, but every combination that
+    # ran gets its own captioned pair here, ordered exactly as the summary grid
+    # above reads (strike group, then left-to-right across the band).
+    ordered = sorted(items, key=lambda it: (row_index[it["row_key"]],) + _slot(it))
+    _write_min_pivot_sheet(wb, ordered, "wow", "WOW Min Pivots")
+    _write_min_pivot_sheet(wb, ordered, "mom", "MOM Min Pivots")
     return True

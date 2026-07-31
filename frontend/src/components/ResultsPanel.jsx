@@ -236,16 +236,49 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
   const groupedTrades = useMemo(() => {
     if (!tradesWithFormattedDates || tradesWithFormattedDates.length === 0) return [];
 
-    // Pass 1: canonical entry date per Trade number
-    const canonicalEntryByTrade = new Map();
+    // Pass 1: canonical entry date per Trade number.
+    //
+    // This used to be "the first non-re-entry row we happen to see", i.e. the
+    // user's configured Leg 1 — and Pass 2 below DROPS every row whose entry
+    // date differs from it. With a CARRIED long-dated leg (a YEARLY leg holding
+    // its December contract while a weekly leg re-enters each cycle) the two
+    // legs have different entry dates, so which leg survived depended on which
+    // one was configured first. Reordering the legs silently emptied the group,
+    // taking the Midcap/Combined columns with it.
+    //
+    // The canonical date is now the ANCHOR: the LATEST leg entry, ties broken by
+    // the lowest Leg number. Legs that enter together all share one date, so the
+    // anchor IS Leg 1 and existing tradesheets render identically; a carried leg
+    // can no longer hijack the group. Mirrors backend/services/trade_anchor.py.
+    const _cmpDate = (d) => {
+      const s = String(d || '').trim();
+      let m = s.match(/^(\d{2})-(\d{2})-(\d{4})/);
+      if (m) return `${m[3]}${m[2]}${m[1]}`;
+      m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) return `${m[1]}${m[2]}${m[3]}`;
+      return s;
+    };
+    const _legNo = (t) => {
+      const n = Number(t.Leg ?? t.leg);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const canonicalRowByTrade = new Map();
     tradesWithFormattedDates.forEach(trade => {
       const tradeNum = String(trade.Trade || trade.trade || 1);
-      const entryDate = trade['Entry Date'] || '';
       const isReEntryRow = Boolean(trade['ReEntryIndex'] || trade['ReEntryTrigger'] || trade['ReEntryMode'] || isLazyLegRow(trade));
-      if (!isReEntryRow && !canonicalEntryByTrade.has(tradeNum)) {
-        canonicalEntryByTrade.set(tradeNum, entryDate);
+      if (isReEntryRow) return;
+      if (!_cmpDate(trade['Entry Date'])) return;
+      const best = canonicalRowByTrade.get(tradeNum);
+      if (!best) { canonicalRowByTrade.set(tradeNum, trade); return; }
+      const a = _cmpDate(trade['Entry Date']);
+      const b = _cmpDate(best['Entry Date']);
+      if (a > b || (a === b && _legNo(trade) < _legNo(best))) {
+        canonicalRowByTrade.set(tradeNum, trade);
       }
     });
+    const canonicalEntryByTrade = new Map(
+      [...canonicalRowByTrade].map(([k, r]) => [k, r['Entry Date'] || ''])
+    );
 
     const parseRowNetPnl = (row) => {
       const rawNet = row?.['Net P&L'];
@@ -524,23 +557,21 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
 
   // Calculate stats
   const stats = useMemo(() => {
-    // Total P&L = arithmetic SUM of each trade's % P&L, to match the tradesheet
-    // "Overall Profit" (Excel _sumPctJS = Σ Net P&L / Entry Spot per trade).
-    // Previously this was the compounded final-cumulative NAV (finalCumulative - 100),
-    // which differed from the tradesheet for any mix of wins/losses.
-    const totalPnLPct = groupedTrades.reduce((sum, g) => {
-      // READ the engine's "% P&L" (see `pctPnl` above). Re-deriving it as
-      // totalPnl / entrySpot understates any multi-index run, because totalPnl spans
-      // both legs while entrySpot is one index's.
-      if (Number.isFinite(g.pctPnl)) return sum + g.pctPnl;
-      const net = Number(g.totalPnl);
-      return sum + (g.entrySpot > 1000 && Number.isFinite(net) ? (net / g.entrySpot) * 100 : 0);
-    }, 0);
-    const totalTrades = groupedTrades.length;
-
+    // SINGLE SOURCE: every headline stat is read from the backend `summary`
+    // (base.compute_analytics) — the same computation the tradesheet and the
+    // Excel export are built from. These were previously re-derived here in JS
+    // (Total P&L as a Σ over groupedTrades, Trades as groupedTrades.length, and
+    // Max DD recomputed a second time below), so the header could drift from the
+    // tradesheet whenever the two implementations disagreed — and groupedTrades
+    // drops rows, which the backend does not. Do NOT reintroduce a client-side
+    // recomputation: fix base.compute_analytics instead.
+    //
+    // NOTE `summary.count`, not `summary.total_trades` — the latter has never
+    // existed in the payload, so the Trades tile always fell through to the JS
+    // count (verified against a 79-trade run: summary.count === 79).
     const out = {
-      totalPnLPct,
-      totalTrades,
+      totalPnLPct: summary.total_pnl_pct ?? 0,
+      totalTrades: summary.count ?? groupedTrades.length,
       winRate: summary.win_pct || 0,
       lossPct: summary.loss_pct || 0,
       cagr: summary.cagr_options || 0,
@@ -641,42 +672,11 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
       out.maxWinStreak = maxWinStk;
       out.maxLossStreak = maxLossStk;
       out.mddDuration = mddDuration;
-    } else {
-      // No Midcap: override Max DD with min %DD on the NIFTY equity (compound the
-      // per-trade %), so the on-screen Max DD == the tradesheet %DD column (overall),
-      // identical to the download/optim. Mirrors algotest_job's pct = Net P&L/Entry Spot.
-      const _pd = (s) => {
-        if (typeof s !== 'string' || !s) return null;
-        const p = s.includes('/') ? s.split('/') : s.split('-');
-        if (p.length !== 3) return null;
-        let y, m, d;
-        if (p[0].length === 4) { y = +p[0]; m = +p[1] - 1; d = +p[2]; }
-        else { d = +p[0]; m = +p[1] - 1; y = +p[2]; }
-        const t = Date.UTC(y, m, d);
-        return Number.isFinite(t) ? t : null;
-      };
-      let nav = 100, peak = 100, worstDD = 0, peakMs = null, wPeak = null, wTrough = null;
-      for (const g of groupedTrades) {
-        const net = Number(g.totalPnl); const es = Number(g.entrySpot);
-        // Same rule as the Total P&L tile — read the engine's % P&L so the equity /
-        // drawdown chain matches the tradesheet on multi-index runs.
-        const pct = Number.isFinite(g.pctPnl)
-          ? g.pctPnl
-          : ((es > 1000 && Number.isFinite(net)) ? (net / es) * 100 : NaN);
-        const xD = _pd(g.exitDate);
-        if (Number.isFinite(pct)) {
-          nav = nav * (1 + pct / 100);
-          if (nav >= peak) { peak = nav; peakMs = xD; }
-          else { const dd = (nav / peak - 1) * 100; if (dd < worstDD) { worstDD = dd; wPeak = peakMs; wTrough = xD; } }
-        }
-      }
-      out.maxDDPct = worstDD;
-      const _fmtMs = (ms) => { const d = new Date(ms); return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`; };
-      if (wPeak != null && wTrough != null) {
-        out.mddDuration = Math.round((wTrough - wPeak) / 86400000);
-        out.mddStartDate = _fmtMs(wPeak); out.mddEndDate = _fmtMs(wTrough);
-      }
     }
+    // No `else` branch: without a Midcap leg every stat above already comes
+    // straight from the backend summary. Max DD used to be recomputed here from
+    // groupedTrades, which is a SECOND implementation of base.compute_analytics
+    // and drifted from the tradesheet whenever the two disagreed.
 
     return out;
   }, [summary, groupedTrades, results]);

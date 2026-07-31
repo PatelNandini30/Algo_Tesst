@@ -532,6 +532,11 @@ def _worker_entrypoint(
                 if not _skip_ts and not trades_df.empty:
                     result_store.write_combo_tradesheet(job_id, combo_label_safe, trades_df)
                     _tdays = (_runner_mod._RUST_CONTEXT or {}).get("trading_days") or []
+                    # Leg-wise "Rules" first sheet — identical to the backtest
+                    # (build_rules_sheet is the Python mirror of the JS buildRulesSheet;
+                    # _write_rules_sheet renders it). merged = this combo's payload.
+                    from services.optimizer.rules_sheet import build_rules_sheet as _brs
+                    _rules_sheet = _brs(merged, _filter_name)
                     result_store.write_combo_xlsx(
                         job_id,
                         combo_label_safe,
@@ -547,6 +552,7 @@ def _worker_entrypoint(
                         midcap_symbol=_mc_sym,
                         filter_segments=_filter_segments,
                         yearly=_is_yearly,
+                        rules_sheet=_rules_sheet,
                     )
                     # Also build the PATCHWISE variant directly from the same
                     # in-memory trades_df — ONLY when inline finalization is on.
@@ -571,6 +577,7 @@ def _worker_entrypoint(
                             filter_name=_filter_name,
                             filter_segments=_filter_segments,
                             yearly=_is_yearly,
+                            rules_sheet=_rules_sheet,
                         )
                 done += 1
                 logger.info(

@@ -23,6 +23,16 @@ if odf is None or odf.is_empty():
 ok = build_cache(odf, sdf, cache_key=f'bulk:{sym.upper()}:full')
 print('build_cache:', ok, flush=True)
 
+# An explicit rebuild fixes the feather's DATA (e.g. un-truncates spot), so any
+# result cached against the old (wrong) feather must be invalidated. This is the
+# correct place for the bump — a one-off operator action, not every feather write.
+try:
+    from services.backtest_cache import bump_data_version
+    v = bump_data_version()
+    print('bumped data_version ->', v, flush=True)
+except Exception as e:
+    print('data_version bump skipped:', e, flush=True)
+
 o = pl.read_ipc(f'/data/cache/arrow/arrow-v2:bulk:{sym.upper()}:full/options.feather')
 print(f'VERIFY options.feather: {o.height} rows, {str(o["Date"].min())[:10]} -> {str(o["Date"].max())[:10]}', flush=True)
 sp = pl.read_ipc(f'/data/cache/arrow/arrow-v2:bulk:{sym.upper()}:full/spot.feather')

@@ -277,6 +277,47 @@ def _build_fast_lookup_from_bulk(index: str = None, from_date: str = None, to_da
         logger.warning("[FAST_LOOKUP] Build failed (non-fatal): %s", exc)
 
 
+def _anchor_sorted(trades_df):
+    """Re-order the per-leg rows WITHIN each trade so the trade's ANCHOR leg
+    leads, making every downstream `.agg("first")` order-invariant.
+
+    Ordering key: (Trade, is_re-entry ASC, Entry Date DESC, Leg ASC) — main legs
+    before re-entry sub-rows, then the LATEST leg entry, ties broken by the
+    lowest Leg number. This is the pandas expression of
+    services.trade_anchor.anchor_row(); see that module for why "latest entry"
+    is the right anchor (a CARRIED yearly leg keeps an older entry date than the
+    weekly leg that re-enters each cycle).
+
+    Rows are NOT mutated and the caller's frame is left untouched — the returned
+    frame is a re-sorted copy used only to feed the groupby. Blank/NaT entry
+    dates sort last, so a row with no entry date can never become the anchor.
+    """
+    if trades_df is None or "Trade" not in getattr(trades_df, "columns", ()):
+        return trades_df
+    if "Entry Date" not in trades_df.columns:
+        return trades_df
+
+    out = trades_df.copy()
+    # Re-entry / lazy-leg sub-rows must never define the parent trade's window.
+    _re = pd.Series(0, index=out.index, dtype="int8")
+    for _c in ("ReEntryIndex", "ReEntryTrigger", "ReEntryMode"):
+        if _c in out.columns:
+            _col = out[_c].astype(str).str.strip()
+            _re = _re | (_col.notna() & ~_col.isin(("", "0", "nan", "None", "NaT"))).astype("int8")
+    out["_ta_re"] = _re
+    out["_ta_leg"] = (
+        pd.to_numeric(out["Leg"], errors="coerce").fillna(0)
+        if "Leg" in out.columns else 0
+    )
+    out = out.sort_values(
+        ["Trade", "_ta_re", "Entry Date", "_ta_leg"],
+        ascending=[True, True, False, True],
+        kind="stable",
+        na_position="last",
+    )
+    return out.drop(columns=["_ta_re", "_ta_leg"])
+
+
 def _try_rust_engine(payload, index, effective_from, effective_to):
     """
     Slice 11 — opt-in Rust orchestrator path.
@@ -355,13 +396,11 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     from services import rust_fast_path as rf
     from services.data_loader import get_loader as _get_loader
     _loader = _get_loader()
-    spots = {}
-    for d in days:
-        v = rf.get_spot_price(d, index)
-        if v is None:
-            v = _loader.get_spot_price(index, d)
-        if v is not None:
-            spots[d] = float(v)
+    # Memoized per (symbol, date-range): the spot series is invariant to a combo's
+    # strike / spot-adjustment / gap sweep, so an optimizer builds it once per
+    # symbol rather than once per combo. Same native-first, DB-fallback values as
+    # before — pure perf, byte-identical output.
+    spots = rf.spot_series(index, days, _loader)
     if not spots:
         return (None, None, None)
 
@@ -450,7 +489,17 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     # parent rows hold trade-total Net P&L (slice 6 convention); aggregating
     # would double-count. So we sum CE/PE/FUT P&L per leg (each correctly
     # per-leg) and recompute trade-level Net P&L = CE+PE+FUT.
-    aggregated = trades_df.groupby("Trade", as_index=False).agg({
+    #
+    # The "first" aggregations below take the trade's ANCHOR leg, not whichever
+    # row happens to be first. `_anchor_sorted` re-orders the rows WITHIN each
+    # trade so the anchor leads: main legs before re-entries, then the LATEST
+    # Entry Date, ties broken by the lowest Leg number. A CARRIED yearly leg
+    # holds an older entry date than the weekly leg that re-enters each cycle,
+    # so plain "first" made Entry Spot -- and therefore % P&L, the base-100 NAV,
+    # Max DD and CAGR -- depend on the user's configured leg order. Legs that
+    # enter together all share one Entry Date, so the anchor IS Leg 1 and every
+    # such strategy aggregates exactly as before. See services/trade_anchor.py.
+    aggregated = _anchor_sorted(trades_df).groupby("Trade", as_index=False).agg({
         "Entry Date": "first",
         "Exit Date": "first",
         "Entry Spot": "first",
@@ -580,6 +629,32 @@ def _safe_clear_fast_lookup() -> None:
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     job_t0 = time.perf_counter()
     payload = _normalize_request(request)
+
+    # SINGLE-INDEX YEARLY + FUTURES auto-route. The single-index engine blocks a
+    # FUTURES leg under a yearly (December) strategy — a future has no long-dated
+    # December contract to pin to, so run_rust_engine_pipeline hard-errors rather
+    # than mis-roll it. The unified-cadence sync path ALREADY prices a futures leg
+    # on its real monthly FUTIDX contract alongside yearly/weekly/monthly options
+    # (that support was built for the multi-index case and is index-count-agnostic).
+    # So route exactly this otherwise-erroring case there. GATE is tight — fires
+    # ONLY when: not already multi-index, a FUTURES leg is present, a yearly option
+    # leg (or yearly strategy) is present, AND there is at least one option leg for
+    # the future to co-enter/co-exit with. Every config that does NOT hit the yearly+
+    # futures blocker (yearly option-only, non-yearly + futures, already multi-index)
+    # fails this gate and runs completely unchanged.
+    if not payload.get("multi_index_mode"):
+        _yfr_legs = payload.get("legs") or []
+        def _yfr_isfut(_l):
+            return str((_l or {}).get("segment") or "").upper() in ("FUTURE", "FUTURES")
+        def _yfr_isyear(_l):
+            return str((_l or {}).get("expiry") or (_l or {}).get("expiry_type") or "").upper().startswith("YEAR")
+        _yfr_has_fut = any(_yfr_isfut(_l) for _l in _yfr_legs)
+        _yfr_has_opt = any(not _yfr_isfut(_l) for _l in _yfr_legs)
+        _yfr_yearly = str(payload.get("expiry_type") or "").upper().startswith("YEAR") or any(
+            _yfr_isyear(_l) and not _yfr_isfut(_l) for _l in _yfr_legs)
+        if _yfr_has_fut and _yfr_has_opt and _yfr_yearly:
+            logger.info("[YEARLY_FUT] single-index yearly+futures → routing to unified-cadence sync path")
+            payload = dict(payload, multi_index_mode=True, sync_weekly_roll=True)
 
     # NEW FEATURE (opt-in, isolated): multi-index / multi-expiry legs.
     # Reached ONLY when the new builder set this flag. Routes to a separate
@@ -777,10 +852,33 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         _leg_sort_cols, kind='stable'
                     ).reset_index(drop=True)
 
-                    _first_mask = trades_aggregated.groupby('Trade', sort=False).cumcount() == 0
-                    _leg1 = trades_aggregated[_first_mask][
-                        ['Trade', 'Net P&L', 'Entry Spot', 'Entry Date']
-                    ].copy().sort_values('Entry Date').reset_index(drop=True)
+                    # The compound NAV needs TWO different rows per trade, and
+                    # picking either by position made the series depend on leg
+                    # order (see services/trade_anchor.py):
+                    #   * Net P&L  -> the PARENT row (lowest Leg), which is where
+                    #     simulate.rs:1794-1806 writes the trade total.
+                    #   * Entry Spot / Entry Date -> the ANCHOR row (latest leg
+                    #     entry). A CARRIED yearly leg keeps an older entry date
+                    #     than the weekly leg re-entering this cycle, so the
+                    #     earliest-row pick divided the trade's P&L by a spot
+                    #     from a different point in time.
+                    # Legs that enter together make both picks Leg 1, so ordinary
+                    # strategies produce the identical series to before.
+                    _anchor_rows = (
+                        _anchor_sorted(trades_aggregated)
+                        .groupby('Trade', sort=False).head(1)
+                        [['Trade', 'Entry Spot', 'Entry Date']]
+                    )
+                    _parent_sort = ['Trade', 'Leg'] if 'Leg' in trades_aggregated.columns else ['Trade']
+                    _parent_rows = (
+                        trades_aggregated.sort_values(_parent_sort, kind='stable')
+                        .groupby('Trade', sort=False).head(1)
+                        [['Trade', 'Net P&L']]
+                    )
+                    _leg1 = (
+                        _anchor_rows.merge(_parent_rows, on='Trade', how='left')
+                        .sort_values('Entry Date').reset_index(drop=True)
+                    )
 
                     _pnl_s  = pd.to_numeric(_leg1['Net P&L'],   errors='coerce').fillna(0.0)
                     _spot_s = pd.to_numeric(_leg1['Entry Spot'], errors='coerce').replace(0.0, np.nan)

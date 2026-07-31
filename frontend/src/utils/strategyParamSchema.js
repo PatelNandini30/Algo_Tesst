@@ -207,6 +207,46 @@ export const OPTIM_PARAM_GROUPS = [
     ],
   },
   {
+    // Per-leg ("own") spot adjustment — sweeps EACH leg's own breach threshold,
+    // direction, and %/pts unit independently. Templated per leg
+    // (legs[I].spot_adjustment.*) — the exact shape the engine reads
+    // (engine_rust.py::_resolve_leg_sa). `optionOnly` hides it on a futures leg.
+    // apply_combo_for_optim forces spot_adjustment.enabled=True on any leg the
+    // sweep touches (unless the `enabled` axis is itself swept, e.g. an on/off run).
+    group: 'Per-Leg — Spot Adjustment',
+    forLeg: true,
+    optionOnly: true,
+    // Only shown for a leg whose OWN spot adjustment is already turned on in the
+    // Strategy Builder (leg.spot_adjustment.enabled). You opt the leg in there,
+    // then sweep its threshold / direction / unit here — mirroring how the Strike
+    // group only shows the axes valid for the leg's chosen strike mode.
+    requiresLegSpotAdj: true,
+    items: [
+      {
+        path: 'legs[I].spot_adjustment.pct',
+        label: 'Own Spot Adjustment',
+        unit: '%',
+        ...RANGE(0.5, 5, 0.5),
+        unitPayloadPath: 'legs[I].spot_adjustment.units',
+        unitOptions: [
+          { key: 'percent', unit: '%', ...RANGE(0.5, 5, 0.5) },
+          { key: 'points', unit: 'pts', ...RANGE(100, 2000, 100) },
+        ],
+      },
+      {
+        path: 'legs[I].spot_adjustment.direction',
+        label: 'Own Spot Adjustment direction',
+        ...ENUM(['rise', 'fall', 'both']),
+      },
+      {
+        path: 'legs[I].spot_adjustment.enabled',
+        label: 'Own Spot Adjustment on/off',
+        ...ENUM([false, true]),
+        valueLabels: { false: 'No Adj', true: 'With Adj' },
+      },
+    ],
+  },
+  {
     // Cross-index Midcap spot adjustment — only shown when a Midcap leg is in
     // the strategy (filtered in OptimizePanel via midcapOnly). Sweeps the
     // NIFTYMIDCAP100 breach threshold + direction, like the NIFTY one.
@@ -297,8 +337,15 @@ export function expandSchemaForLegs(nLegs) {
         out.push({
           ...item,
           path: item.path.replace('[I]', `[${i}]`),
+          // Resolve the per-leg unit toggle path too (e.g. the %/pts toggle on the
+          // per-leg spot-adjustment axis writes legs[i].spot_adjustment.units).
+          ...(item.unitPayloadPath
+            ? { unitPayloadPath: item.unitPayloadPath.replace('[I]', `[${i}]`) }
+            : {}),
           label: `${item.label} (Leg ${i + 1})`,
           group: grp.group,
+          optionOnly: Boolean(grp.optionOnly),
+          requiresLegSpotAdj: Boolean(grp.requiresLegSpotAdj),
           legIndex: i,
         });
       }

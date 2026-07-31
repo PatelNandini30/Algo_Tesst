@@ -500,7 +500,8 @@ def _build_one_xlsx(args: tuple) -> tuple:
     Top-level so it's picklable.
     """
     (fpath, label_safe, combo_summary, combo_label, from_date, to_date,
-     midcap_legs, midcap_sa, midcap_sym, filter_name, patchwise, filter_segments) = args
+     midcap_legs, midcap_sa, midcap_sym, filter_name, patchwise, filter_segments,
+     yearly, rules_sheet) = args
     try:
         import pandas as _pd
         from services.optimizer.excel_builder import build_combo_xlsx as _build
@@ -515,6 +516,12 @@ def _build_one_xlsx(args: tuple) -> tuple:
             filter_name=filter_name,
             patchwise=patchwise,
             filter_segments=filter_segments,
+            # Without this WOW buckets by Expiry, and a YEARLY leg has ONE
+            # expiry — the whole run collapses into that contract's ISO week
+            # while MOM (by Exit Date) still spans every year.
+            yearly=yearly,
+            # Leg-wise "Rules" first sheet for this combo (identical to backtest).
+            rules_sheet=rules_sheet,
         )
         return (label_safe, xlsx_bytes, None)
     except Exception as exc:
@@ -594,11 +601,23 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
         # Filter segment windows (from the run's base payload) — patch-wise sheet
         # resets the equity at each segment START instead of guessing via gaps.
         _filter_segments = base_payload.get("filter_segments") or None
+        _is_yearly = str(base_payload.get("expiry_type") or "").upper() == "YEARLY"
 
+        # Per-combo leg-wise "Rules" sheet — rebuild each combo's merged payload
+        # from base_payload + that combo's swept values, then the SAME rows the
+        # backtest download shows. Reconstructed here (rather than reusing the
+        # run-time file) because the ZIP builds each combo xlsx fresh from the CSV.
+        from services.optimizer.param_expander import apply_combo_for_optim as _apply_combo
+        from services.optimizer.rules_sheet import build_rules_sheet as _brs
         build_args = []
         for fname in combo_csvs:
             label_safe = fname[:-4]
             row = summary_by_label.get(label_safe, {})
+            try:
+                _merged = _apply_combo(base_payload, row.get("combo") or {})
+                _rs = _brs(_merged, _filter_name)
+            except Exception:
+                _rs = None
             build_args.append((
                 os.path.join(trades_dir, fname),
                 label_safe,
@@ -609,6 +628,8 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
                 _filter_name,
                 patchwise,
                 _filter_segments,
+                _is_yearly,
+                _rs,
             ))
 
         # Write directly to disk — atomic move at end so partial files never
@@ -862,8 +883,9 @@ async def download_optimization_summary(job_id: str, request: Request):
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=400, detail="`rows` must be a non-empty list")
     rule_rows = payload.get("rule_rows") or []
+    rules_sheet = payload.get("rules_sheet") or None
     try:
-        xlsx = build_summary_workbook(rows, rule_rows)
+        xlsx = build_summary_workbook(rows, rule_rows, rules_sheet=rules_sheet)
     except Exception as exc:
         logger.exception("[OPTIM] summary workbook build failed for %s", job_id)
         raise HTTPException(status_code=500, detail=f"summary build failed: {exc}")
@@ -886,7 +908,9 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
     import pandas as pd
     from openpyxl import Workbook
     from services.optimizer.excel_builder import build_cleaned_for_combo
-    from services.optimizer.wow_mom import write_merged_wow_mom
+    from services.optimizer.wow_mom import (
+        write_merged_wow_mom, variant_labels, adj_label_from_combo_label,
+    )
 
     meta = result_store.get_meta(job_id)
     if not meta:
@@ -922,14 +946,22 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
         or "NIFTYMIDCAP100"
     )
     filter_segments = base_payload.get("filter_segments") or None
+    _wm_yearly = str(base_payload.get("expiry_type") or "").upper() == "YEARLY"
 
     label_by_safe: Dict[str, str] = {}
     cols_by_safe: Dict[str, Dict[str, Any]] = {}
-    for row in result_store.get_all_results(job_id):
+    combo_by_safe: Dict[str, Dict[str, Any]] = {}
+    # RAW (un-deduped) — see result_store.get_all_results_raw. A deduped read
+    # drops rows whose (combo_label, total_pnl) matched an earlier combo, but
+    # their tradesheet CSVs are still on disk, so those combos lost their
+    # metadata and fell into a second, misaligned column group.
+    for row in result_store.get_all_results_raw(job_id):
         cls = row.get("combo_label_safe")
         if cls:
             label_by_safe[cls] = row.get("combo_label") or cls
             cols_by_safe[cls] = row.get("combo_columns") or {}
+            combo_by_safe[cls] = row.get("combo") or {}
+    variant_by_safe = variant_labels(combo_by_safe)
 
     files = sorted(os.listdir(trades_dir))
     combo_csvs = [f for f in files if f.endswith(".csv") and f not in ("summary.csv", "run_config.csv")]
@@ -956,15 +988,24 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
         cc = cols_by_safe.get(label_safe) or {}
         strike_disp = _wm_strike_display(cc)
         adj_label = _wm_adj_display(cc.get("spot_adjustment"))
+        # Strategy-level knob off → fall back to the PER-LEG adjustment, which
+        # label_combo writes into combo_label but not into combo_columns.
+        if adj_label == "No Adj":
+            adj_label = (adj_label_from_combo_label(label_by_safe.get(label_safe, ""))
+                         or adj_label)
         row_key = "|".join([strike_disp, str(cc.get("expiry") or ""), str(cc.get("shifting") or "")])
         combos.append({
             "title": f"{strike_disp} | {adj_label}" if cc else label_by_safe.get(label_safe, label_safe),
             "cleaned": cleaned,
             "has_midcap": has_midcap,
-            "adj_key": str(cc.get("spot_adjustment") or adj_label),
+            # Key on the DISPLAY label, never the raw value: "NoAdjustment" and
+            # "No Adj" mean the same thing and must share one column.
+            "adj_key": adj_label,
             "adj_label": adj_label,
             "row_key": row_key,
             "row_sort": _wm_strike_sort(cc),
+            "variant_label": variant_by_safe.get(label_safe, ""),
+            "yearly": _wm_yearly,
         })
 
     wb = Workbook()
@@ -1077,6 +1118,9 @@ async def download_combo_tradesheet_xlsx(
         raise HTTPException(status_code=404, detail="Tradesheet not available for this combo")
 
     trades_dir = result_store.get_trades_dir(job_id)
+    # Discard per-combo XLSX built by an older builder before deciding whether to
+    # serve from disk — otherwise a formatting change never reaches the user.
+    result_store.ensure_xlsx_version(job_id)
     if patchwise:
         xlsx_path = os.path.join(trades_dir, "patchwise", f"{combo_label_safe}.xlsx")
     else:
@@ -1124,6 +1168,17 @@ async def download_combo_tradesheet_xlsx(
                 _ohlc_pd, trading_days = _get_ohlc_pandas_for_index(index_str)
             except Exception:
                 trading_days = None
+            # Leg-wise "Rules" first sheet for this combo — rebuild the combo's
+            # merged payload and render the SAME rows the backtest download shows.
+            try:
+                from services.optimizer.param_expander import apply_combo_for_optim as _apply
+                from services.optimizer.rules_sheet import build_rules_sheet as _brs
+                _merged = _apply(base_payload, row.get("combo") or {})
+                _dl_filter_name = (meta.get("zip_naming") or {}).get("level1") or ""
+                _dl_rules_sheet = _brs(_merged, _dl_filter_name)
+            except Exception:
+                _dl_rules_sheet = None
+            _dl_yearly = str(base_payload.get("expiry_type") or "").upper() == "YEARLY"
             if patchwise:
                 zip_naming = meta.get("zip_naming") or {}
                 filter_name = (zip_naming.get("level1") or "") if zip_naming else ""
@@ -1134,6 +1189,8 @@ async def download_combo_tradesheet_xlsx(
                     midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
                     midcap_symbol=midcap_sym, filter_name=filter_name,
                     filter_segments=filter_segments,
+                    yearly=_dl_yearly,
+                    rules_sheet=_dl_rules_sheet,
                 )
             else:
                 result_store.write_combo_xlsx(
@@ -1142,6 +1199,8 @@ async def download_combo_tradesheet_xlsx(
                     index_str=index_str, trading_days=trading_days,
                     midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
                     midcap_symbol=midcap_sym, filter_segments=filter_segments,
+                    yearly=_dl_yearly,
+                    rules_sheet=_dl_rules_sheet,
                 )
 
         await asyncio.get_event_loop().run_in_executor(None, _build)

@@ -1062,7 +1062,7 @@ const StrategyBuilder = () => {
     filterName: '',
     summary: null,
     segments: [],
-    entryMode: 'dte',
+    entryMode: 'fixed',
   });
   const [strSegments, setStrSegments] = useState({ '5x1': [], '5x2': [] });
   const [startDate, setStartDate] = useState('01/08/2024');
@@ -1310,26 +1310,72 @@ const StrategyBuilder = () => {
       if (m) return `${m[1]}${m[2]}${m[3]}`;
       return s;
     };
-    const byKey = new Map();
+    // Group the per-leg rows, then derive the trade-level values with the SAME
+    // anchor rule the backend uses (backend/services/trade_anchor.py and
+    // optimizer/excel_builder.py::_project_rows_for_midcap) so a direct backtest
+    // and an optimizer combo produce identical Combined numbers.
+    const rowsByKey = new Map();
     for (const t of trades || []) {
       const tid = t['Trade'] ?? t.trade;
       if (tid === undefined || tid === null || tid === '') continue;
       const key = String(tid);
-      const entry = t['Entry Date'] ?? t.entry_date;
-      const exit = t['Exit Date'] ?? t['Leg Exit Date'] ?? t.exit_date;
-      if (!entry || !exit) continue;
-      const pnl = _midcapNum(t['Net P&L'] ?? t.net_pnl);
-      const pct = _midcapNum(t['% P&L'] ?? t.pnl_pct);
-      if (!byKey.has(key)) {
-        byKey.set(key, { trade_id: key, entry_date: entry, exit_date: exit, nifty_pnl: 0, nifty_pnl_pct: 0 });
-      }
-      const agg = byKey.get(key);
-      if (cmp(entry) < cmp(agg.entry_date)) agg.entry_date = entry;
-      if (cmp(exit) > cmp(agg.exit_date)) agg.exit_date = exit;
-      if (pnl != null) agg.nifty_pnl += pnl;
-      if (pct != null) agg.nifty_pnl_pct += pct;
+      if (!rowsByKey.has(key)) rowsByKey.set(key, []);
+      rowsByKey.get(key).push(t);
     }
-    return [...byKey.values()];
+
+    const isReEntry = (t) => Boolean(
+      t['ReEntryIndex'] || t['ReEntryTrigger'] || t['ReEntryMode'] ||
+      String(t['Leg'] ?? '').includes('.') || String(t['Index'] ?? '').includes('.')
+    );
+    const legNo = (t) => {
+      const n = Number(t['Leg'] ?? t.leg);
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    const out = [];
+    for (const [key, all] of rowsByKey) {
+      const mains = all.filter(t => !isReEntry(t));
+      const rows = mains.length ? mains : all;
+
+      // ANCHOR row = LATEST Entry Date, ties broken by the LOWEST Leg number.
+      // A CARRIED yearly leg holds an older entry date than the weekly leg that
+      // re-enters each cycle, so taking "the first row" made the overlay window
+      // and the % P&L denominator depend on the user's configured leg order.
+      // Legs that enter together share one date, so the anchor is Leg 1 and
+      // ordinary strategies are unchanged.
+      let anchor = null;
+      for (const t of rows) {
+        const e = cmp(t['Entry Date'] ?? t.entry_date ?? '');
+        if (!e) continue;
+        if (anchor === null) { anchor = t; continue; }
+        const ae = cmp(anchor['Entry Date'] ?? anchor.entry_date ?? '');
+        if (e > ae || (e === ae && legNo(t) < legNo(anchor))) anchor = t;
+      }
+      if (!anchor) continue;
+
+      const entry = anchor['Entry Date'] ?? anchor.entry_date;
+      const exit = anchor['Exit Date'] ?? anchor['Leg Exit Date'] ?? anchor.exit_date;
+      if (!entry || !exit) continue;
+
+      // PARENT row = LOWEST Leg number — where the engine writes the trade
+      // total (native/src/simulate.rs:1794-1806). Summing the Net P&L column
+      // across rows double-counts, because non-parent rows carry their OWN
+      // per-leg P&L (see backend/services/algotest_job.py:446-450).
+      let parent = rows[0];
+      for (const t of rows) if (legNo(t) < legNo(parent)) parent = t;
+      let net = _midcapNum(parent['Net P&L'] ?? parent.net_pnl);
+      if (net == null) {
+        net = all.reduce((sum, t) => sum
+          + (_midcapNum(t['CE P&L']) || 0)
+          + (_midcapNum(t['PE P&L']) || 0)
+          + (_midcapNum(t['FUT P&L']) || 0), 0);
+      }
+      const es = _midcapNum(anchor['Entry Spot'] ?? anchor.entry_spot) || 0;
+      const pct = es ? Math.round((net / es) * 100.0 * 1e4) / 1e4 : 0;
+
+      out.push({ trade_id: key, entry_date: entry, exit_date: exit, nifty_pnl: net, nifty_pnl_pct: pct });
+    }
+    return out;
   }, []);
 
   const applyMidcapOverlay = useCallback(async (payload) => {
@@ -1671,27 +1717,37 @@ const StrategyBuilder = () => {
     // expiries (each leg runs on its own cadence), so skip the basis-match checks.
     const _stratIdx = String(instrument || 'NIFTY').toUpperCase();
     const _isMultiIndex = legs.some(l => String(l.index || _stratIdx).toUpperCase() !== _stratIdx);
+    // Derived cadence: finest leg wins. Only options legs carry a real
+    // weekly/monthly expiry — futures and Midcap100 legs do not (Midcap follows
+    // the NIFTY trade's dates), so they never set or contradict the cadence.
+    const _optLegs = legs.map((l, i) => ({ l, i })).filter(({ l }) => l.segment === 'options');
+    const _cadenceIsWeekly =
+      indexConfig.expiryBases.includes('weekly') &&
+      _optLegs.some(({ l }) => ['weekly', 'next_weekly'].includes(l.expiry));
+    // Legs coarser than the derived cadence — these get pinned to their own contract.
+    const _mixedExpiryLegs = _cadenceIsWeekly
+      ? _optLegs.filter(({ l }) => ['monthly', 'next_monthly'].includes(l.expiry))
+      : [];
+    const _isFixedEntryMode = strFilter.enabled && (strFilter.entryMode || 'fixed') === 'fixed';
     // Only options legs carry a real weekly/monthly expiry. Futures and Midcap100
     // legs do not (Midcap follows the NIFTY trade's dates), so exclude them here.
-    if (!_isMultiIndex && expiryBasis === 'monthly') {
-      const weeklyLegs = legs
-        .map((l, i) => ({ l, i }))
-        .filter(({ l }) => l.segment === 'options' && ['weekly', 'next_weekly'].includes(l.expiry));
-      if (weeklyLegs.length > 0) {
-        const legNumbers = weeklyLegs.map(({ i }) => i + 1).join(', ');
-        showValidationError(`Monthly expiry basis selected — Leg(s) ${legNumbers} have weekly expiry. Change leg expiry to Monthly or Next Monthly.`);
-        return false;
-      }
-    }
-    if (!_isMultiIndex && expiryBasis === 'weekly') {
-      const monthlyLegs = legs
-        .map((l, i) => ({ l, i }))
-        .filter(({ l }) => l.segment === 'options' && ['monthly', 'next_monthly'].includes(l.expiry));
-      if (monthlyLegs.length > 0) {
-        const legNumbers = monthlyLegs.map(({ i }) => i + 1).join(', ');
-        showValidationError(`Weekly expiry basis selected — Leg(s) ${legNumbers} have monthly expiry. Change leg expiry to Weekly or Next Weekly.`);
-        return false;
-      }
+    // SAME-INDEX MIXED EXPIRY. Weekly + monthly legs on one index are now
+    // supported: the cadence is DERIVED from the legs (finest wins) and any
+    // coarser leg is pinned to its own contract, exactly as a YEARLY leg is.
+    // The old basis-vs-leg blocks are gone — the basis no longer has to agree
+    // with the legs, because the legs decide it.
+    //
+    // One hard requirement remains: only the fixed-entry scheduler resolves the
+    // pin. The DTE / min-days schedulers pick every leg's contract out of the
+    // cadence list, so a monthly leg there would silently get a WEEKLY contract.
+    // The engine hard-fails on that; surface it here as a readable message.
+    if (!_isMultiIndex && _mixedExpiryLegs.length > 0 && !_isFixedEntryMode) {
+      const legNumbers = _mixedExpiryLegs.map(({ i }) => i + 1).join(', ');
+      showValidationError(
+        `Mixed expiry — Leg(s) ${legNumbers} are monthly while the strategy runs on a weekly cadence. ` +
+        `This requires Fixed Entry: enable the Filter and set Entry Mode to "Fixed Entry — Pinned to segment start".`
+      );
+      return false;
     }
     setValidationError(null);
     return true;
@@ -2262,7 +2318,22 @@ const StrategyBuilder = () => {
       engineLegs.every(l => String(l.segment || '').toUpperCase() === 'FUTURES') &&
       engineLegs.some(l => String(l.expiry || '').toLowerCase() === 'next_monthly')
     );
-    const effectiveExpiryType = allFuturesNextMonthly ? 'NEXT_MONTHLY' : expiryBasis.toUpperCase();
+    // SAME-INDEX MIXED EXPIRY: the cadence is DERIVED from the legs (finest
+    // wins), not taken from the dropdown. A weekly leg beside a monthly leg
+    // forces a WEEKLY cadence; the monthly leg is then pinned to its own
+    // contract by the engine. Only fires when the basis and the legs actually
+    // disagree AND a weekly leg is present, so every strategy whose legs match
+    // its basis keeps sending exactly the same expiry_type as before.
+    const _derivedWeeklyCadence = (
+      expiryBasis === 'monthly' &&
+      indexConfig.expiryBases.includes('weekly') &&
+      engineLegs.some(l =>
+        String(l.segment || '').toUpperCase() === 'OPTIONS' &&
+        ['WEEKLY', 'NEXT_WEEKLY'].includes(String(l.expiry || '').toUpperCase()))
+    );
+    const effectiveExpiryType = allFuturesNextMonthly
+      ? 'NEXT_MONTHLY'
+      : (_derivedWeeklyCadence ? 'WEEKLY' : expiryBasis.toUpperCase());
 
     // Multi-index feature trigger (opt-in, conservative): ONLY when legs span
     // more than one index, or a leg's index differs from the strategy index.
@@ -2375,7 +2446,10 @@ const StrategyBuilder = () => {
       filter_config: strFilter.enabled ? strFilter.configId : null,
       filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
       super_trend_config: 'None',
-      filter_entry_mode: strFilter.enabled ? (strFilter.entryMode || 'dte') : 'dte',
+      // Filter ON  → only 'fixed' is offered in the UI (DTE / Min-Days options removed).
+      // Filter OFF → still 'dte': that is the engine's default entry schedule for every
+      //              non-filter strategy and must not change. Backend keeps all 3 branches.
+      filter_entry_mode: strFilter.enabled ? (strFilter.entryMode || 'fixed') : 'dte',
       fixed_late_entry: strFilter.enabled && strFilter.entryMode === 'fixed' ? Boolean(strFilter.lateEntry) : false,
       min_days_to_entry: strFilter.enabled && strFilter.entryMode === 'min_days'
         ? (parseInt(strFilter.minDaysToEntry) || 3)

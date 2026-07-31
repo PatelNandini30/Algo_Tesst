@@ -446,7 +446,7 @@ def _build_combo_xlsx_worker(args: tuple) -> Tuple[str, Optional[bytes], Optiona
     """
     (csv_path, label_safe, summary, combo_label, from_date, to_date,
      midcap_legs, midcap_spot_adjustment, midcap_symbol, filter_name,
-     filter_segments, patchwise) = args
+     filter_segments, patchwise, yearly) = args
     try:
         import pandas as _pd_w
         from services.optimizer.excel_builder import build_combo_xlsx as _build_xlsx_w
@@ -463,6 +463,9 @@ def _build_combo_xlsx_worker(args: tuple) -> Tuple[str, Optional[bytes], Optiona
             filter_name=filter_name,
             filter_segments=filter_segments,
             patchwise=patchwise,
+            # WOW buckets by Expiry unless YEARLY, where the leg holds ONE
+            # contract and the whole run collapses into its ISO week.
+            yearly=yearly,
         )
         return label_safe, xlsx_bytes, None
     except Exception as exc:
@@ -684,6 +687,10 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
     #   • patchwise → trades_dir/patchwise/{label}.xlsx (patch-reset equity)
     # The ZIP is Excel-only (summary.csv / run_config.csv are intentionally NOT
     # included — the master summary is a separate Export-XLSX download).
+    # Never assemble a ZIP out of XLSX built by an older builder: drop those
+    # first so the fast path falls through to a rebuild instead of shipping the
+    # previous formatting.
+    result_store.ensure_xlsx_version(job_id)
     if patchwise:
         _xlsx_src_dir = os.path.join(trades_dir, "patchwise")
         _xlsx_files_disk = sorted(
@@ -784,6 +791,7 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
                 row.get("summary") or {}, row.get("combo_label") or label_safe,
                 from_date, to_date, _mc_legs, _mc_sa, _mc_sym,
                 _filter_name, _filter_segments, patchwise,
+                str(base_payload.get("expiry_type") or "").upper() == "YEARLY",
             )
             futs[_ex.submit(_build_combo_xlsx_worker, args)] = fname
         for fut in _as_completed(futs):
@@ -839,7 +847,9 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
     time. It still builds on-demand later (slower path) if ever requested.
     """
     from openpyxl import Workbook
-    from services.optimizer.wow_mom import write_merged_wow_mom
+    from services.optimizer.wow_mom import (
+        write_merged_wow_mom, variant_labels, adj_label_from_combo_label,
+    )
     import re as _re
 
     meta = result_store.get_meta(job_id)
@@ -857,16 +867,25 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
         or "NIFTYMIDCAP100"
     )
     filter_segments = base_payload.get("filter_segments") or None
+    _is_yearly = str(base_payload.get("expiry_type") or "").upper() == "YEARLY"
 
     label_by_safe: dict = {}
     cols_by_safe: dict = {}
     rows_by_safe: dict = {}
-    for row in result_store.get_all_results(job_id):
+    combo_by_safe: dict = {}
+    # RAW (un-deduped) read: `get_all_results` collapses rows that share a
+    # (combo_label, total_pnl) fingerprint, but their tradesheet CSVs are all
+    # still on disk. Reading deduped left those combos with no combo_columns →
+    # raw-filename titles, row_key "Strategy||" and adj_key "No Adj" instead of
+    # "NoAdjustment", which forked the sheet into two misaligned column groups.
+    for row in result_store.get_all_results_raw(job_id):
         cls = row.get("combo_label_safe")
         if cls:
             label_by_safe[cls] = row.get("combo_label") or cls
             cols_by_safe[cls] = row.get("combo_columns") or {}
             rows_by_safe[cls] = row
+            combo_by_safe[cls] = row.get("combo") or {}
+    variant_by_safe = variant_labels(combo_by_safe)
 
     files = sorted(os.listdir(trades_dir))
     combo_csvs = [f for f in files if f.endswith(".csv") and f not in ("summary.csv", "run_config.csv")]
@@ -938,15 +957,24 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
             cc = cols_by_safe.get(label_safe) or {}
             strike_disp = _strike_display(cc)
             adj_label   = _adj_display(cc.get("spot_adjustment"))
+            # Strategy-level knob off → fall back to the PER-LEG adjustment,
+            # which label_combo writes into combo_label but not combo_columns.
+            if adj_label == "No Adj":
+                adj_label = (adj_label_from_combo_label(label_by_safe.get(label_safe, ""))
+                             or adj_label)
             row_key = "|".join([strike_disp, str(cc.get("expiry") or ""), str(cc.get("shifting") or "")])
             combos.append({
                 "title": f"{strike_disp} | {adj_label}" if cc else label_by_safe.get(label_safe, label_safe),
                 "cleaned": cleaned,
                 "wm": _wm,
                 "has_midcap": has_midcap,
-                "adj_key": str(cc.get("spot_adjustment") or adj_label),
+                # Key on the DISPLAY label, never the raw value: "NoAdjustment"
+                # and "No Adj" mean the same thing and must share one column.
+                "adj_key": adj_label,
                 "adj_label": adj_label,
                 "row_key": row_key,
+                "variant_label": variant_by_safe.get(label_safe, ""),
+                "yearly": _is_yearly,
             })
         return combos
 
@@ -2357,6 +2385,12 @@ def run_optimization(
         or "NIFTYMIDCAP100"
     )
     _seq_filter_segments = base_payload.get("filter_segments") or None
+    # Filter display name for the per-combo "Rules" sheet's Filter row.
+    try:
+        _seq_filter_name = ((result_store.get_meta(job_id) or {}).get("zip_naming") or {}).get("level1") or ""
+    except Exception:
+        _seq_filter_name = ""
+    from services.optimizer.rules_sheet import build_rules_sheet as _seq_brs
 
     done = 0
     failures = 0
@@ -2476,6 +2510,7 @@ def run_optimization(
                     midcap_spot_adjustment=_seq_mc_sa,
                     midcap_symbol=_seq_mc_sym,
                     filter_segments=_seq_filter_segments,
+                    rules_sheet=_seq_brs(merged, _seq_filter_name),
                     # YEARLY: WOW keys on Exit Date, not the (single) December
                     # Expiry — see build_wow_mom. Combos never vary expiry_type,
                     # so the run's base payload is the right source.

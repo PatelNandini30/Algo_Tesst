@@ -110,10 +110,21 @@ export default function OptimizePanel({
     const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
     return legs.map(l => String(l?.segment || '').toUpperCase() === 'FUTURES');
   }, [basePayload]);
+  // Per-leg "own" spot adjustment is only sweepable for a leg that has its OWN
+  // adjustment turned on in the Strategy Builder (leg.spot_adjustment.enabled).
+  // Otherwise the per-leg SA axes are hidden — you opt the leg in first, then
+  // sweep its threshold/direction/unit here.
+  const _legHasOwnSA = useMemo(() => {
+    const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
+    return legs.map(l => Boolean(l?.spot_adjustment?.enabled));
+  }, [basePayload]);
   const allParams = useMemo(
     () => expandSchemaForLegs(nLegs || 1)
       .filter(p => !p.midcapOnly || _hasMidcapLeg)
       .filter(p => !p.midcpniftyOnly || _hasMidcpniftyLeg)
+      // Per-leg spot-adjustment axes show ONLY when the leg's own adjustment is
+      // enabled in the strategy (mirrors strike-mode gating below).
+      .filter(p => !p.requiresLegSpotAdj || _legHasOwnSA[p.legIndex])
       // Strike-mode gating: a param tagged with strikeModes only shows when the
       // leg's actual strike mode matches. If we can't resolve the leg's mode
       // (no basePayload legs yet), fall back to showing it rather than hiding.
@@ -124,8 +135,11 @@ export default function OptimizePanel({
         const mode = _legStrikeModes[p.legIndex];
         if (!mode) return true;
         return p.strikeModes.includes(mode);
-      }),
-    [nLegs, _hasMidcapLeg, _hasMidcpniftyLeg, _legStrikeModes, _legIsFuture],
+      })
+      // Option-only per-leg axes (e.g. per-leg spot adjustment) are hidden for a
+      // futures leg, which has no per-leg spot-adjustment of its own.
+      .filter(p => !(p.optionOnly && _legIsFuture[p.legIndex])),
+    [nLegs, _hasMidcapLeg, _hasMidcpniftyLeg, _legStrikeModes, _legIsFuture, _legHasOwnSA],
   );
   const grouped = useMemo(() => {
     const m = new Map();

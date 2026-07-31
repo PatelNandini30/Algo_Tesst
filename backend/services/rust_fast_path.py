@@ -43,6 +43,22 @@ _loaded_cache_signature: Optional[tuple] = None
 # parent can hand the path to child workers (skip DB reload entirely).
 _loaded_feather_root: Optional[str] = None
 
+# Cap on how many DISTINCT symbols _activate_feather() will keep additively
+# resident at once (see below). The live index universe (index_metadata.py's
+# INDEX_CONFIGS) is NIFTY/BANKNIFTY/MIDCPNIFTY/SENSEX/FINNIFTY — 5 today — so
+# 6 gives one symbol of headroom without letting a long-lived worker process
+# accumulate an unbounded number of resident feathers over its lifetime.
+_RESIDENT_SYMBOL_CAP = int(os.environ.get("RUST_CACHE_MAX_SYMBOLS", "6"))
+
+# Per cache_key (not just the single most-recent one) — lets _activate_feather
+# recognize "this exact symbol+data is already resident" even after a
+# DIFFERENT symbol was merged in afterward, which the single-slot
+# _loaded_cache_key/_loaded_cache_signature above cannot express. Only
+# trustworthy in combination with a live native.cache_symbols() check, since
+# a later load_cache() replace invalidates everything except what it just
+# loaded (cleared there) without this dict knowing on its own.
+_loaded_signatures: Dict[str, tuple] = {}
+
 
 def _load_native():
     global _native, _native_error
@@ -88,6 +104,20 @@ def ensure_symbol_merged(symbol: str) -> bool:
         return False
     if sym in _merged_symbols:
         return True
+    # _merged_symbols only ever tracked symbols added via THIS function (or
+    # _activate_feather's own merge branch) — not a symbol that became
+    # resident as the "primary" load_cache() load (that branch clears this
+    # set rather than adding to it, by the original single-primary-symbol
+    # design). Falling back to the ground truth here means a symbol loaded
+    # either way is correctly recognized as already resident, instead of
+    # being redundantly re-read from disk and re-merged every time a
+    # multi-group backtest re-processes it in a later request.
+    try:
+        if sym in set(native.cache_symbols() or []):
+            _merged_symbols.add(sym)
+            return True
+    except Exception:
+        pass
     root = _cache_root() / f"{_cache_version()}:bulk:{sym}:full"
     options_path = root / "options.feather"
     spot_path = root / "spot.feather"
@@ -111,6 +141,7 @@ def clear_cache() -> None:
     _calendar_cache.clear()
     _loaded_cache_key = None
     _merged_symbols.clear()
+    _SPOT_SERIES_MEMO.clear()
     if native is None:
         return
     try:
@@ -245,7 +276,69 @@ def _file_signature(p: Path) -> tuple:
         return (str(p), 0.0, 0)
 
 
-def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
+def _activate_feather(native, options_path: Path, spot_path: Path, symbol: Optional[str],
+                      key: str, current_sig: tuple) -> None:
+    """Load `options_path`/`spot_path` into the native cache.
+
+    First checks whether `key` (e.g. "arrow-v2:bulk:NIFTY:full") was already
+    activated with this exact `current_sig` (options+spot file mtime/size) AND
+    is still genuinely resident — if so, this is a true no-op: no disk read, no
+    merge, nothing. This matters because merge_cache still re-reads the
+    feather from disk and re-inserts every row into the existing hashmap —
+    for NIFTY's multi-year history that is SLOWER than a fresh load_cache, so
+    without this check, switching A -> B -> A would make A's second load
+    slower than its first, not faster.
+
+    Otherwise, if `symbol` is given and the cache already has something
+    resident, merges additively (native.merge_cache) instead of replacing
+    (native.load_cache) — so switching between a small set of indices (NIFTY,
+    MIDCPNIFTY, ...) within one long-lived worker process doesn't evict
+    everything else. This is what let a direct backtest's second request for
+    the same multi-index combo pay the ~20s cold-start cost again just because
+    an unrelated single-index backtest ran on the same worker in between and
+    replaced the whole cache.
+
+    Falls back to the original replace behaviour (native.load_cache) when:
+      - `symbol` is omitted — existing callers (rebuild_feather.py,
+        verify_feathers.py, tests) are untouched, zero behaviour change.
+      - nothing is resident yet (first load in a fresh process) — merging
+        into empty and loading fresh produce an identical result, so there's
+        no reason to prefer one, and load_cache is the simpler/original path.
+      - the resident-symbol count is already at _RESIDENT_SYMBOL_CAP and this
+        would introduce a NEW symbol — bounds worst-case memory growth over a
+        worker's lifetime instead of accumulating every symbol ever touched.
+
+    Verified safe to merge repeatedly, including re-merging the SAME symbol
+    with fresh/wider data: intern_symbol() reuses an existing symbol's id
+    rather than creating a duplicate, and merge_into() uses insert-or-update
+    semantics per entry — so this never loses or duplicates data, only ever
+    adds/updates it. (See native/src/lib.rs: intern_symbol, merge_into.)
+    """
+    sym_upper = symbol.strip().upper() if symbol else ""
+    if sym_upper and _loaded_signatures.get(key) == current_sig:
+        try:
+            if sym_upper in set(native.cache_symbols() or []):
+                return  # already correctly loaded AND still resident — true no-op
+        except Exception:
+            pass
+    if sym_upper:
+        try:
+            resident = set(native.cache_symbols() or [])
+        except Exception:
+            resident = set()
+        if resident and (sym_upper in resident or len(resident) < _RESIDENT_SYMBOL_CAP):
+            native.merge_cache(sym_upper, str(options_path), str(spot_path))
+            _merged_symbols.add(sym_upper)
+            _loaded_signatures[key] = current_sig
+            return
+    native.load_cache(str(options_path), str(spot_path))
+    # load_cache REPLACES the cache — anything merged/tracked before it is gone.
+    _merged_symbols.clear()
+    _loaded_signatures.clear()
+    _loaded_signatures[key] = current_sig
+
+
+def build_cache(options_df, spot_df, cache_key: Optional[str] = None, symbol: Optional[str] = None) -> bool:
     global _loaded_cache_key, _loaded_cache_signature, _loaded_feather_root
     native = _load_native()
     if native is None:
@@ -320,9 +413,7 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                 if _keep:
                     _sig = (_file_signature(options_path), _file_signature(spot_path))
                     if not (_loaded_cache_key == key and _loaded_cache_signature == _sig):
-                        native.load_cache(str(options_path), str(spot_path))
-                        # load_cache REPLACES the cache — anything merged before it is gone.
-                        _merged_symbols.clear()
+                        _activate_feather(native, options_path, spot_path, symbol, key, _sig)
                         _loaded_cache_key = key
                         _loaded_cache_signature = _sig
                         _loaded_feather_root = str(root)
@@ -450,6 +541,13 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
             # for backwards compatibility.
             _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close", "Contracts", "SettledPrice"])
             _write_feather(spot_df, spot_path, ["Date", "Symbol", "Close"] if "Symbol" in getattr(spot_df, "columns", []) else ["Date", "Close"])
+            # NOTE: deliberately NO data_version bump here. Bumping on every feather
+            # write made bulk_load_options see the token change on the NEXT load and
+            # run _invalidate_stale_bulk_lookup(), which rmtree's the whole symbol
+            # feather; a following narrow-range warm then rebuilt it truncated (the
+            # spot-wipe bug). Genuine data changes (imports) bump data_version in
+            # migrate_data.py / the warm task, and explicit rebuilds bump in
+            # rebuild_feather.py — those are the correct invalidation points.
         # Memory guard: Rust AHashMaps use ~5× the feather file size at runtime
         # (uncompressed IPC + AHashMap key/value storage + alignment overhead).
         # Skip the load if that would leave less than 1 GB for the OS/other processes.
@@ -494,11 +592,10 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None) -> bool:
                     _feather_bytes / (1024 ** 2), _estimated_mb, reason,
                 )
                 return False
-        native.load_cache(str(options_path), str(spot_path))
-        # load_cache REPLACES the cache — anything merged before it is gone.
-        _merged_symbols.clear()
+        current_sig = (_file_signature(options_path), _file_signature(spot_path))
+        _activate_feather(native, options_path, spot_path, symbol, key, current_sig)
         _loaded_cache_key = key
-        _loaded_cache_signature = (_file_signature(options_path), _file_signature(spot_path))
+        _loaded_cache_signature = current_sig
         _loaded_feather_root = str(root)
         logger.info("[RUST_FAST] cache loaded from %s", root)
         return True
@@ -624,6 +721,51 @@ def get_spot_price(date, index: str) -> Optional[float]:
     except Exception as exc:
         logger.debug("[RUST_FAST] get_spot_price failed: %s", exc)
         return None
+
+
+# ── Memoized per-symbol spot series (optimizer fast path) ───────────────────
+# Building {date: spot} for a symbol over the full backtest range is one of the
+# heaviest per-combo steps on the multi-index / fused optim path (profiled ~40%
+# of a fused combo), yet it is INVARIANT across combos that only sweep strike /
+# spot-adjustment / gap params — the spot data for a (symbol, date-range) never
+# depends on those. Memoize it so every combo after the first reuses it.
+#
+# Safety: purely reference data (same values), so it never changes calc output —
+# the parity test must be byte-identical. Keyed with `_cache_version()` so a
+# cache-version bump (feather rebuild / reload) invalidates it. Bounded: a run
+# touches only a couple of (symbol, range) keys; we cap the dict anyway. Each
+# forked optim worker has its own copy, populated once.
+_SPOT_SERIES_MEMO: "Dict[tuple, Dict[str, float]]" = {}
+_SPOT_SERIES_MEMO_MAX = 16
+
+
+def spot_series(symbol: str, days: List[str], loader=None) -> Dict[str, float]:
+    """Return {iso_date: spot} for `symbol` across `days`, memoized per
+    (cache_version, symbol, first_day, last_day, n_days). `loader` (a
+    data_loader) is the per-symbol DB fallback used when the native cache has
+    no spot for a date — same fallback the direct engine path uses."""
+    sym = str(symbol or "").strip().upper()
+    if not days:
+        return {}
+    key = (_cache_version(), sym, days[0], days[-1], len(days))
+    cached = _SPOT_SERIES_MEMO.get(key)
+    if cached is not None:
+        return cached
+    out: Dict[str, float] = {}
+    for d in days:
+        v = get_spot_price(d, sym)
+        if v is None and loader is not None:
+            v = loader.get_spot_price(sym, d)
+        if v is not None:
+            out[d] = float(v)
+    if len(_SPOT_SERIES_MEMO) >= _SPOT_SERIES_MEMO_MAX:
+        _SPOT_SERIES_MEMO.pop(next(iter(_SPOT_SERIES_MEMO)))
+    _SPOT_SERIES_MEMO[key] = out
+    return out
+
+
+def clear_spot_series_memo() -> None:
+    _SPOT_SERIES_MEMO.clear()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -76,6 +76,8 @@ MASTER_SUMMARY_COLUMNS: List[Dict[str, str]] = [
     {"key": "ce_pnl_pct", "label": "CE P&L %", "conditional": "hasCE"},
     {"key": "pe_pnl_total", "label": "PE P&L", "conditional": "hasPE"},
     {"key": "pe_pnl_pct", "label": "PE P&L %", "conditional": "hasPE"},
+    {"key": "fut_pnl_total", "label": "FUT P&L", "conditional": "hasFUT"},
+    {"key": "fut_pnl_pct", "label": "FUT P&L %", "conditional": "hasFUT"},
     {"key": "long_spot_pnl", "label": "Long Spot P&L", "conditional": "hasSpot"},
     {"key": "long_spot_pnl_pct", "label": "Long Spot P&L %", "conditional": "hasSpot"},
     {"key": "midcap_leg_pnl_sum", "label": "Midcap Leg P&L", "conditional": "hasMidcap"},
@@ -90,7 +92,7 @@ _HEADER_FONT = Font(bold=True, color="FFFFFFFF")
 
 def compute_leg_presence(rows: List[Dict[str, Any]]) -> Dict[str, bool]:
     """Which leg types appear, for hiding conditional columns (mirrors computeLegPresence)."""
-    has_ce = has_pe = has_spot = has_midcap = False
+    has_ce = has_pe = has_fut = has_spot = has_midcap = False
     for r in rows:
         s = r.get("summary") or {}
         def _nz(key):
@@ -101,11 +103,12 @@ def compute_leg_presence(rows: List[Dict[str, Any]]) -> Dict[str, bool]:
                 return False
         has_ce = has_ce or _nz("ce_pnl_total")
         has_pe = has_pe or _nz("pe_pnl_total")
+        has_fut = has_fut or _nz("fut_pnl_total")
         has_spot = has_spot or _nz("long_spot_pnl")
         has_midcap = has_midcap or bool(s.get("has_midcap"))
-        if has_ce and has_pe and has_spot and has_midcap:
+        if has_ce and has_pe and has_fut and has_spot and has_midcap:
             break
-    return {"hasCE": has_ce, "hasPE": has_pe, "hasSpot": has_spot,
+    return {"hasCE": has_ce, "hasPE": has_pe, "hasFUT": has_fut, "hasSpot": has_spot,
             "hasMidcap": has_midcap, "notMidcap": not has_midcap}
 
 
@@ -116,26 +119,27 @@ def visible_columns_for(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
 
 
 def build_summary_workbook(rows: List[Dict[str, Any]],
-                           rule_rows: Optional[List[List[Any]]] = None) -> bytes:
+                           rule_rows: Optional[List[List[Any]]] = None,
+                           rules_sheet: Optional[List[List[Any]]] = None) -> bytes:
     """Build the Optimization Summary workbook.
 
-    rows       — one per combo: {"summary": {...}, "combo_columns": {...}}
-    rule_rows  — [[label, value], ...] for the Rules block (frontend-derived).
+    rows        — one per combo: {"summary": {...}, "combo_columns": {...}}
+    rule_rows   — [[label, value], ...] for the flat Rules block (frontend-derived).
+    rules_sheet — typed rows (title/section/kv/spacer) for the leg-wise "Rules"
+                  sheet, built by the SAME frontend buildRulesSheet the backtest
+                  uses and rendered by the SAME _write_rules_sheet — so the optim
+                  master summary's Rules sheet is identical to the backtest's.
     """
     visible = visible_columns_for(rows)
     wb = Workbook()
     ws = wb.active
     ws.title = "Optimization Summary"
 
-    rule_rows = rule_rows or []
-    for i, pair in enumerate(rule_rows):
-        label = pair[0] if len(pair) > 0 else ""
-        value = pair[1] if len(pair) > 1 else ""
-        ws.append([f"Rules: {label}" if i == 0 else label, value])
-        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
-    if rule_rows:
-        ws.append([])
-    header_row_idx = len(rule_rows) + (1 if rule_rows else 0) + 1
+    # The Rules block no longer sits at the top of this sheet — the full leg-wise
+    # config lives in a dedicated "Rules" sheet (rules_sheet below), so the
+    # Optimization Summary sheet starts straight at the combos table. rule_rows is
+    # accepted for API compatibility but intentionally not rendered here.
+    header_row_idx = 1
 
     data_cols = [c for c in visible if c["key"] != "sr_no"]
     ws.append(["Sr. No."] + [c["label"] for c in data_cols])
@@ -161,6 +165,16 @@ def build_summary_workbook(rows: List[Dict[str, Any]],
 
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 16
+
+    # Leg-wise "Rules" sheet as the FIRST tab — identical to the backtest download
+    # (same buildRulesSheet rows, same _write_rules_sheet renderer).
+    if rules_sheet:
+        try:
+            from services.optimizer.excel_builder import _write_rules_sheet
+            _write_rules_sheet(wb, rules_sheet)
+        except Exception as _rs_exc:
+            import logging
+            logging.getLogger(__name__).warning("[OPTIM] summary Rules sheet skipped: %s", _rs_exc)
 
     buf = BytesIO()
     wb.save(buf)

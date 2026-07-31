@@ -39,7 +39,7 @@ _last_bulk_load_key: Optional[Tuple[str, str, str]] = None
 _bulk_engine_activated = False
 
 
-def _ensure_group_symbol_loaded(symbol: str, from_date: str, to_date: str) -> None:
+def _ensure_group_symbol_loaded(symbol: str, from_date: str, to_date: str, force_full: bool = False) -> None:
     """Make `symbol` available to a group's engine run WITHOUT evicting any
     other symbol already resident — unlike bulk_load_options, whose Rust
     feather shortcut calls native.load_cache(), which REPLACES the whole
@@ -64,7 +64,10 @@ def _ensure_group_symbol_loaded(symbol: str, from_date: str, to_date: str) -> No
     bulk_load_options' other bookkeeping (_bhav_by_date_symbol, _bulk_loaded)."""
     global _bulk_engine_activated
     from services import rust_fast_path as rf
-    if not _bulk_engine_activated:
+    if force_full or not _bulk_engine_activated:
+        # Full bulk load (replaces the native cache with THIS symbol). Used on the
+        # first call of a process (perf activation) and as the recovery path when a
+        # group's additive merge left its symbol not fully resident.
         from base import bulk_load_options
         from services.algotest_job import _build_fast_lookup_from_bulk
         bulk_load_options(symbol, from_date, to_date)
@@ -88,6 +91,44 @@ def _leg_segment(leg: dict) -> str:
     so a leg must roll on its OWN segment's expiries. Mirrors the is_fut test used
     throughout the overlay."""
     return "FUT" if str(leg.get("segment") or "").upper() in ("FUTURE", "FUTURES") else "OPT"
+
+
+def _canonical_cadence(cands: List[dict], default_index: str) -> Tuple[str, str]:
+    """The (index, segment) whose calendar drives the merged roll schedule,
+    chosen from the DATA rather than from leg order.
+
+    This used to be `cands[0]` — the leg the user happened to drag to the top of
+    the builder. Reordering the same legs therefore rebuilt the whole cycle
+    schedule off a different index's expiry calendar (and, for a mixed FUT+OPT
+    group, off a different SEGMENT calendar — futures and options do not share a
+    monthly expiry: MIDCPNIFTY 2023-09 is 25-Sep for the future and 29-Sep for
+    the option). Different windows means different trades, so leg order changed
+    every statistic.
+
+    Rules, both total and order-free:
+      index   = the STRATEGY index when any candidate leg sits on it, else the
+                alphabetically first index present. This matches the group
+                ordering convention already used below (`groups[default_index]`
+                is always group 0), so for a NIFTY strategy the schedule is the
+                one you already get when a NIFTY leg is configured first.
+      segment = "OPT" when that index has any option candidate, else "FUT".
+                Options define the cadence in every mixed group; a futures-only
+                group still rolls on FUT%.
+    """
+    idxs = {_leg_index(l, default_index) for l in cands}
+    if not idxs:
+        return default_index, "OPT"
+    sym = default_index if default_index in idxs else min(idxs)
+    segs = {_leg_segment(l) for l in cands if _leg_index(l, default_index) == sym}
+    return sym, ("OPT" if "OPT" in segs or not segs else "FUT")
+
+
+def _canonical_group_segment(glegs: List[dict]) -> str:
+    """A group's roll segment: OPT when the group holds any option leg, else
+    FUT. Was `glegs[0]`, which flipped an OPT+FUT group between the two expiry
+    calendars purely on which leg the user configured first."""
+    segs = {_leg_segment(l) for l in (glegs or [])}
+    return "OPT" if "OPT" in segs or not segs else "FUT"
 
 
 def _segment_like(segment: str) -> str:
@@ -514,6 +555,18 @@ def _sync_tracks(legs: List[dict], default_index: str, default_expiry: str) -> L
         t = (_leg_index(leg, default_index), _leg_freq(leg, default_expiry), _leg_segment(leg))
         if t not in out:
             out.append(t)
+    # CANONICAL ORDER, not leg order. _build_sync_cycles breaks a boundary TIE
+    # -- two tracks whose T-n roll lands on the SAME day -- with `_trig[0]`,
+    # taking that cycle's contract off whichever track comes first. Returning
+    # these in leg order therefore let the user's builder ordering pick a
+    # different expiry as the cadence boundary. Sort strategy-index first, then
+    # alphabetically, then OPT before FUT, matching _canonical_cadence.
+    out.sort(key=lambda t: (
+        0 if t[0] == default_index else 1,
+        t[0],
+        t[1],
+        0 if t[2] == "OPT" else 1,
+    ))
     return out
 
 
@@ -1675,7 +1728,16 @@ def run_multi_index_feature(
         groups.setdefault(_leg_index(l, default_index), [])
     for l in legs:
         groups[_leg_index(l, default_index)].append(l)
-    groups = _OrderedDict((k, v) for k, v in groups.items() if v)  # drop empty
+    # CANONICAL group order: strategy index first, then alphabetical. Insertion
+    # order followed the legs, so with 3+ indices the `agg(... "first")` picks
+    # below (Entry Spot / Exit Spot / Spot P&L / Exit Reason) moved with leg
+    # order. With 2 indices this is already what insertion order produced.
+    groups = _OrderedDict(
+        (k, groups[k]) for k in sorted(
+            (k for k, v in groups.items() if v),
+            key=lambda k: (0 if k == default_index else 1, k),
+        )
+    )  # drop empty
     base_index = next(iter(groups), default_index)
 
     group_frames: List["pd.DataFrame"] = []
@@ -1690,14 +1752,36 @@ def run_multi_index_feature(
         sub["expiry_type"] = grp_expiry
         sub["expiry_window"] = "weekly_expiry" if grp_expiry == "WEEKLY" else "monthly_expiry"
         sub.pop("multi_index_mode", None)  # never recurse
+        # A whole index group must never drop out silently: this returned
+        # status="success" with that index simply missing from the sheet. Retry
+        # once with a FULL symbol reload (an additive merge can leave a symbol
+        # not fully resident), then fail loudly -- mirroring the guard already
+        # in _run_sync_per_index_groups:2174.
         gdf = None
-        try:
-            _ensure_group_symbol_loaded(sym, effective_from, effective_to)
-            gdf, _s, _p = _try_rust_engine(sub, sym, effective_from, effective_to)
-        except Exception as exc:
-            logger.warning("[MULTI_INDEX] group %s failed: %s", sym, exc)
-            gdf = None
+        _last_exc = None
+        for _attempt in range(2):
+            try:
+                _ensure_group_symbol_loaded(
+                    sym, effective_from, effective_to, force_full=(_attempt > 0)
+                )
+                gdf, _s, _p = _try_rust_engine(sub, sym, effective_from, effective_to)
+            except Exception as exc:
+                _last_exc = exc
+                logger.warning("[MULTI_INDEX] group %s engine attempt %d failed: %s",
+                               sym, _attempt + 1, exc)
+                gdf = None
+            if gdf is not None and not getattr(gdf, "empty", True):
+                break
+            if _attempt == 0:
+                logger.warning("[MULTI_INDEX] group %s empty on attempt 1 — forcing "
+                               "full reload and retrying", sym)
         avail = gdf is not None and not getattr(gdf, "empty", True)
+        if not avail and _last_exc is not None:
+            raise RuntimeError(
+                "[MULTI_INDEX] group %s (%d leg(s)) produced NO trades: %s. "
+                "Refusing to return a tradesheet missing an entire index."
+                % (sym, len(glegs), _last_exc)
+            ) from _last_exc
         if avail:
             gdf = gdf.copy()
             gdf["_grp"] = gid
@@ -1910,6 +1994,1473 @@ def run_multi_index_feature(
     }
 
 
+def _run_sync_per_index_groups(
+    payload: Dict[str, Any],
+    effective_from: Optional[str],
+    effective_to: Optional[str],
+    legs: List[dict],
+    default_index: str,
+    default_expiry: str,
+) -> Dict[str, Any]:
+    """SYNC cadence for a YEARLY-option + real-monthly/weekly strategy.
+
+    Runs EACH index-group as a FULL engine sub-run (so every group keeps its own
+    spot-adjustment / SL / target / re-entry — fixing BUG B), while all groups share
+    ONE set of merged roll boundaries so they enter/exit together each cycle. The
+    boundaries are driven by the NON-YEARLY (real monthly/weekly) legs only — the
+    yearly leg holds its December contract and merely RE-BOOKS on those boundaries,
+    contributing none of its own (fixing BUG A). Contract per group:
+
+      * yearly group  -> the December contract active at each window's start, from
+        the engine's own resolver (resolve_expiry_inputs), so the roll timing (incl.
+        yearly_exit_months_before) matches a standalone yearly run.
+      * monthly/weekly group -> its OWN near/holdable contract per merged window.
+
+    All groups run with expiry_type=YEARLY + yearly_cycles (the contract pin) +
+    sync_cadence_expiries=_bounds (the cadence that drives entry/exit), exactly the
+    mechanism the engine sync carve-outs already expect (resolve_expiry_inputs:844,
+    YEARLY blocker:4090, spot-adj gate:6951). Groups are then stitched by shared
+    entry date into one unified cadence tradesheet.
+    """
+    t0 = time.perf_counter()
+    import pandas as pd
+    import numpy as np
+    from collections import OrderedDict as _OrderedDict
+    from base import compute_analytics, build_pivot, get_trading_calendar
+    from services.algotest_job import _try_rust_engine, _convert_numpy, _format_dates
+    from services.engine_rust import resolve_expiry_inputs
+
+    def _is_yearly_opt(l):
+        return (
+            str(l.get("expiry") or l.get("expiry_type") or "").upper().startswith("YEAR")
+            and str(l.get("segment") or "OPTIONS").upper() not in ("FUTURE", "FUTURES")
+        )
+
+    # Preserve the user's configured leg order for the parent-row convention.
+    for _i, _l in enumerate(legs):
+        _l["_orig_leg_no"] = _i + 1
+
+    non_yearly = [l for l in legs if not _is_yearly_opt(l)]
+
+    # Cadence from the NON-YEARLY legs only (weekly if any, else monthly). The
+    # yearly leg never sets the cadence. The FREQUENCY was already order-free;
+    # the driving index/segment now is too — see _canonical_cadence.
+    weekly_ny = [l for l in non_yearly if _leg_expiry(l, default_expiry).startswith("WEEK")]
+    if weekly_ny:
+        cadence = "WEEKLY"
+        cadence_index, cadence_segment = _canonical_cadence(weekly_ny, default_index)
+    else:
+        cadence = "MONTHLY"
+        cadence_index, cadence_segment = _canonical_cadence(non_yearly, default_index)
+
+    # Group legs by index (strategy index first), like run_multi_index_feature.
+    groups: "OrderedDict[str, List[dict]]" = _OrderedDict()
+    groups[default_index] = []
+    for l in legs:
+        groups.setdefault(_leg_index(l, default_index), [])
+    for l in legs:
+        groups[_leg_index(l, default_index)].append(l)
+    # CANONICAL group order: strategy index first, then alphabetical. Insertion
+    # order followed the legs, so with 3+ indices the `agg(... "first")` picks
+    # below (Entry Spot / Exit Spot / Spot P&L / Exit Reason) moved with leg
+    # order. With 2 indices this is already what insertion order produced.
+    groups = _OrderedDict(
+        (k, groups[k]) for k in sorted(
+            (k for k, v in groups.items() if v),
+            key=lambda k: (0 if k == default_index else 1, k),
+        )
+    )
+
+    meta = {
+        "multi_index": True, "sync_weekly_roll": True,
+        "cadence": cadence, "cadence_index": cadence_index,
+        "indices": sorted({_leg_index(l, default_index) for l in legs}),
+        "index": default_index,
+        "from_date": payload.get("from_date"), "to_date": payload.get("to_date"),
+        "slippage_pct": payload.get("slippage_pct", 0),
+    }
+    try:
+        from services.multi_index_tradesheet import build_export_filename
+        meta["export_filename"] = build_export_filename(payload)
+    except Exception:
+        meta["export_filename"] = "multi_index_backtest"
+    try:
+        from services.engine_rust import _load_filter_segments as _lfs
+        _segs = _lfs(payload) or []
+        meta["filter_segments"] = [{"start": s, "end": e} for (s, e) in _segs]
+    except Exception:
+        meta["filter_segments"] = payload.get("filter_segments") or []
+
+    def _empty():
+        return {"status": "success", "trades": [], "summary": {},
+                "pivot": {"headers": [], "rows": []}, "meta": _convert_numpy(meta), "cached": False}
+
+    # ---- 1. Merged cadence from the NON-YEARLY legs (yearly injects no boundary) ----
+    _cycles, _bounds = _build_sync_cycles(
+        non_yearly, cadence, cadence_index, default_index, cadence,
+        effective_from, effective_to, payload, cadence_segment,
+    )
+    if not (_cycles and _bounds):
+        logger.warning("[SYNC_PERIDX] could not build merged cadence boundaries")
+        return _empty()
+    windows = [(c["start"], c["end"]) for c in _cycles]
+    logger.info("[SYNC_PERIDX] cadence=%s driven by %s: %d windows (%s..%s)",
+                cadence, cadence_index, len(windows), windows[0][0], windows[-1][1])
+
+    try:
+        exit_dte = max(0, int(payload.get("exit_dte") or 0))
+    except (TypeError, ValueError):
+        exit_dte = 0
+    try:
+        tdays = sorted(
+            pd.to_datetime(get_trading_calendar(effective_from, effective_to)["date"])
+            .dt.strftime("%Y-%m-%d").tolist()
+        )
+    except Exception:
+        tdays = []
+    wide_to = (pd.Timestamp(effective_to) + pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+
+    def _dec_cycles_for(sym: str) -> List[Dict[str, str]]:
+        """December contract active at each merged window's START, resolved by the
+        engine's OWN yearly resolver so roll timing matches a standalone run."""
+        try:
+            _, yc = resolve_expiry_inputs(
+                sym,
+                {
+                    "expiry_type": "YEARLY",
+                    "rollover_cadence": ("weekly" if cadence == "WEEKLY" else "monthly"),
+                    "yearly_exit_months_before": payload.get("yearly_exit_months_before") or 0,
+                    "yearly_roll_months": payload.get("yearly_roll_months"),
+                },
+                effective_from, effective_to, tdays,
+            )
+            yc = list(yc or [])
+        except Exception as exc:
+            logger.warning("[SYNC_PERIDX] yearly resolve failed for %s: %s", sym, exc)
+            yc = []
+        if not yc:
+            return []
+        yc_sorted = sorted(yc, key=lambda c: c["start"])
+        # Roll each December at the cadence boundary CLOSEST to its own T-1 roll date
+        # (cycle "end" from resolve_expiry_inputs = expiry minus yearly_exit_months_before).
+        # The shared cadence (the OTHER index's monthly expiry) has no boundary exactly at
+        # the yearly roll, so we SNAP the roll to the nearest boundary where BOTH legs
+        # re-enter — sync preserved. This fixes two failure modes the old raw-expiry guard
+        # got wrong:
+        #   • roll-too-LATE: a window straddling the T-1 held the OLD December to ~1 day
+        #     before expiry (NIFTY Dec-2025 held 24-Nov→29-Dec instead of rolling to
+        #     Dec-2026 at the 25-Nov T-1) — now rolls at the boundary nearest 25-Nov.
+        #   • roll-too-EARLY: a WIDE sparse window whose start sits weeks before the T-1
+        #     must NOT roll at its start; the nearest boundary may be its END (a naive
+        #     "roll at the crossing window's start" over-rolled the 2022→2023 Dec by 5 wks).
+        # For yearly_exit_months_before=0 the cycle end == the December expiry, so a window
+        # whose exit passes the expiry still snaps-rolls at the nearest boundary — the old
+        # leg-desync fix (cadence end a few days past this index's Dec expiry → unpriceable
+        # exit → silently dropped trade → desync) is subsumed. Pre-MIDCP giant windows are
+        # unchanged (their start December's roll boundary is far in the future → they hold
+        # it, exit filter-clamped back inside the start December as before).
+        _bounds = sorted(set([w[0] for w in windows] + [w[1] for w in windows]))
+        _bts = [(pd.Timestamp(str(b)[:10]), b) for b in _bounds]
+
+        def _roll_boundary(end_s: str) -> str:
+            if not _bts:
+                return end_s
+            et = pd.Timestamp(str(end_s)[:10])
+            return min(_bts, key=lambda bt: abs((bt[0] - et).days))[1]
+
+        _roll_out = {c["contract"]: _roll_boundary(c.get("end") or c["contract"])
+                     for c in yc_sorted}
+        out: List[Dict[str, str]] = []
+        for (ws, we) in windows:
+            chosen = yc_sorted[-1]["contract"]
+            for c in yc_sorted:
+                if ws < _roll_out[c["contract"]]:
+                    chosen = c["contract"]
+                    break
+            out.append({"contract": chosen, "start": ws, "end": we})
+        return out
+
+    def _monthly_cycles_for(sym: str, grp_expiry: str, seg: str) -> List[Dict[str, str]]:
+        """This group's OWN near/holdable contract per merged window."""
+        if sym == cadence_index and grp_expiry.upper() == cadence and seg == cadence_segment:
+            return list(_cycles)  # exact contracts the boundary walk already chose
+        series = _roll_series(sym, grp_expiry, effective_from, wide_to, seg)
+        if not series:
+            return []
+        out: List[Dict[str, str]] = []
+        for (ws, we) in windows:
+            contract = _holdable_contract(series, we, exit_dte, tdays) or _near_contract_on(
+                sym, grp_expiry, we, series)
+            if not contract:
+                return []
+            out.append({"contract": contract, "start": ws, "end": we})
+        return out
+
+    # ---- 2. Run each index-group through the real engine on the shared cadence ----
+    group_frames: List["pd.DataFrame"] = []
+    group_meta: List[dict] = []
+    for gid, (sym, glegs) in enumerate(groups.items()):
+        grp_is_yearly = any(_is_yearly_opt(l) for l in glegs)
+        grp_expiry = _group_expiry_type(sym, glegs, payload, default_index)
+        # OPT when the group holds any option leg, else FUT (was glegs[0],
+        # which flipped a mixed group between the two expiry calendars on
+        # leg order alone).
+        grp_seg = _canonical_group_segment(glegs)
+        if grp_is_yearly:
+            gcycles = _dec_cycles_for(sym)
+        else:
+            gcycles = _monthly_cycles_for(sym, grp_expiry, grp_seg)
+        if not gcycles:
+            logger.warning("[SYNC_PERIDX] no cycles for group %s — skipped", sym)
+            group_meta.append({"index": sym, "legs": len(glegs), "trades": 0, "available": False})
+            continue
+
+        sub = copy.deepcopy(payload)
+        sub["index"] = sym
+        # Mark every leg YEARLY so Rust pins it to the per-cycle contract; the merged
+        # boundaries drive entry/exit via sync_cadence_expiries. Each leg carries its
+        # OWN spot_adjustment / SL / target unchanged (dict copy preserves them).
+        sub["legs"] = [dict(_l, expiry="YEARLY", _sa_label_expiry=str(_l.get("expiry") or _l.get("expiry_type") or "").upper()) for _l in glegs]
+        sub["expiry_type"] = "YEARLY"
+        sub["expiry_window"] = "weekly_expiry" if cadence == "WEEKLY" else "monthly_expiry"
+        sub["yearly_cycles"] = gcycles
+        sub["sync_cadence_expiries"] = _bounds
+        sub["sync_cadence_expiry_type"] = "weekly" if cadence == "WEEKLY" else "monthly"
+        sub["rollover_min_days_to_expiry"] = 0  # YEARLY + min-days is rejected
+        sub.pop("multi_index_mode", None)
+        sub.pop("sync_weekly_roll", None)
+
+        # A group with valid cycles MUST produce trades. A transient data-load miss
+        # (e.g. a cold feather build, or the additive merge leaving the symbol not
+        # fully resident) once made _try_rust_engine return an empty frame, and the
+        # leg was then SILENTLY dropped (a run gave 68 rows / no NIFTY instead of
+        # 118). A leg must never silently vanish from a backtest. So: run; if the
+        # group comes back empty/failed, force a FULL reload of THIS symbol and retry
+        # once; if still empty, RAISE — never emit a sheet missing an entire index.
+        gdf = None
+        _last_exc = None
+        for _attempt in range(2):
+            try:
+                _ensure_group_symbol_loaded(
+                    sym, effective_from, effective_to, force_full=(_attempt > 0)
+                )
+                r = _try_rust_engine(sub, sym, effective_from, effective_to)
+                gdf = r[0] if isinstance(r, tuple) else r
+            except Exception as exc:
+                _last_exc = exc
+                logger.warning(
+                    "[SYNC_PERIDX] group %s engine attempt %d failed: %s",
+                    sym, _attempt + 1, exc,
+                )
+                gdf = None
+            if gdf is not None and not getattr(gdf, "empty", True):
+                break  # got trades — done
+            if _attempt == 0:
+                logger.warning(
+                    "[SYNC_PERIDX] group %s empty on attempt 1 — forcing full reload "
+                    "and retrying", sym,
+                )
+        avail = gdf is not None and not getattr(gdf, "empty", True)
+        if not avail:
+            raise RuntimeError(
+                "[SYNC_PERIDX] group %s produced NO trades despite %d valid cadence "
+                "cycles (last error: %s). Refusing to return a tradesheet missing an "
+                "entire index." % (sym, len(gcycles), _last_exc)
+            )
+        if avail:
+            gdf = gdf.copy()
+            gdf["Group Index"] = sym
+            # Map engine leg numbers (1..N over glegs) back to configured position.
+            _leg_map = {i + 1: int(l.get("_orig_leg_no") or (i + 1)) for i, l in enumerate(glegs)}
+            if "Leg" in gdf.columns:
+                gdf["Leg"] = (
+                    pd.to_numeric(gdf["Leg"], errors="coerce").fillna(1).astype(int)
+                    .map(lambda k: _leg_map.get(k, k))
+                )
+            group_frames.append(gdf)
+        group_meta.append({
+            "index": sym, "role": ("base" if gid == 0 else "leg"), "legs": len(glegs),
+            "expiry": ("YEARLY" if grp_is_yearly else grp_expiry),
+            "trades": int(gdf["Trade"].nunique()) if avail else 0, "available": bool(avail),
+        })
+    meta["groups"] = group_meta
+
+    if not group_frames:
+        logger.info("[SYNC_PERIDX] no trades (%.2fs)", time.perf_counter() - t0)
+        return _empty()
+
+    # ---- 3. Stitch groups by SHARED entry date => one unified cadence trade ----
+    combined = pd.concat(group_frames, ignore_index=True)
+    for c in ("Entry Date", "Exit Date"):
+        if c in combined.columns:
+            combined[c] = pd.to_datetime(combined[c], errors="coerce")
+    if "Leg" not in combined.columns:
+        combined["Leg"] = 1
+    for col in ("CE P&L", "PE P&L", "FUT P&L", "Spot P&L", "Entry Spot", "Exit Spot"):
+        if col not in combined.columns:
+            combined[col] = 0.0
+    # Every group ran on the SAME _bounds, so a cadence cycle's legs share an entry
+    # date across indices. Assigning Trade# by chronological entry date fuses those
+    # legs into one trade — robust to a cycle being filtered out of one group (unlike
+    # a positional 1..N ordinal), and it keeps any per-leg spot-adj re-entry (its own
+    # entry date) as its own chronological trade.
+    combined["_ekey"] = combined["Entry Date"].dt.strftime("%Y-%m-%d").fillna("")
+    _order = sorted(k for k in combined["_ekey"].unique() if k)
+    _ekey_to_trade = {k: i + 1 for i, k in enumerate(_order)}
+    combined["Trade"] = combined["_ekey"].map(_ekey_to_trade).fillna(0).astype(int)
+    combined["Leg"] = pd.to_numeric(combined["Leg"], errors="coerce").fillna(1).astype(int)
+    combined["Index"] = combined["Trade"]
+
+    # PER-LEG P&L, computed from prices. The engine's CE/PE/FUT P&L columns are the
+    # right per-leg field for weekly/monthly runs, but on the YEARLY sync path the
+    # option Type comes through as PUT/CALL (not CE/PE), so those columns are ALL
+    # zero and the trade-total `Net P&L` lands only on the parent row (simulate.rs
+    # convention). Recompute each row's OWN P&L = points x that row's lots (same
+    # formula as priced_to_tradesheet_records), so summing across a fused trade's
+    # legs is correct regardless of Type or the parent-total convention.
+    def _row_leg_pnl(r):
+        try:
+            ep = float(r.get("Entry Price") or 0.0)
+            xp = float(r.get("Exit Price") or 0.0)
+            lots = float(r.get("lots") or 1)
+            pos = str(r.get("B/S") or "SELL").upper()
+            return round(((ep - xp) if pos.startswith("S") else (xp - ep)) * lots, 4)
+        except (TypeError, ValueError):
+            return 0.0
+    combined["_legpnl"] = combined.apply(_row_leg_pnl, axis=1)
+    _es_row = pd.to_numeric(combined["Entry Spot"], errors="coerce").replace(0, np.nan)
+    combined["_legpct"] = (combined["_legpnl"] / _es_row * 100.0).fillna(0.0)
+    # Publish the per-leg values onto the standard columns so non-parent leg rows
+    # in the final sheet carry their OWN P&L (parent rows are overwritten with the
+    # trade total in step 5).
+    combined["Net P&L"] = combined["_legpnl"]
+    combined["% P&L"] = combined["_legpct"]
+
+    # ---- 4. Aggregate per cadence trade + combined base-100 compound equity ----
+    # Combined trade return = SUM of each leg's OWN "% P&L" (leg P&L / its own index
+    # spot), same convention as the existing sync path. Net P&L = sum of per-leg
+    # points (already lots-scaled).
+    # Entry is the shared cadence re-book (fused legs share it); Exit spans to the
+    # LATEST leg exit — so when one leg self-spot-adjusts mid-cycle (truncating early)
+    # while the other holds to the cadence boundary, the trade's window still shows
+    # the full cadence-cycle close. Per-leg exits are preserved on each row.
+    agg_spec = {"Entry Date": "min", "Exit Date": "max", "Entry Spot": "first",
+                "Exit Spot": "first", "Spot P&L": "first",
+                "CE P&L": "sum", "PE P&L": "sum", "FUT P&L": "sum",
+                "_legpnl": "sum", "_legpct": "sum"}
+    if "Exit Reason" in combined.columns:
+        agg_spec["Exit Reason"] = "first"
+    agg = combined.groupby("Trade", as_index=False).agg(agg_spec)
+    agg["Net P&L"] = agg["_legpnl"].round(2)
+    agg["% P&L"] = agg["_legpct"].round(4).fillna(0)
+    agg = agg.sort_values("Entry Date").reset_index(drop=True)
+
+    cum = peak = 100.0
+    cs, ps, ds, pds = [], [], [], []
+    for _, r in agg.iterrows():
+        pct = float(r["% P&L"]) if r["% P&L"] else 0.0
+        cum = cum * (1.0 + pct / 100.0)
+        peak = max(cum, peak)
+        dd = cum - peak
+        pct_dd = (dd / peak) if peak != 0 else 0.0
+        cs.append(cum); ps.append(peak); ds.append(dd); pds.append(pct_dd)
+    agg["Cumulative"], agg["Peak"], agg["DD"], agg["%DD"] = cs, ps, ds, pds
+
+    try:
+        _mini = pd.DataFrame({
+            "Trade": agg["Trade"].values,
+            "Entry Date": pd.to_datetime(agg["Entry Date"]).dt.strftime("%d-%m-%Y").values,
+            "Exit Date": pd.to_datetime(agg["Exit Date"]).dt.strftime("%d-%m-%Y").values,
+            "Entry Spot": [100.0] * len(agg),
+            "Net P&L": agg["% P&L"].values,
+            "% P&L": agg["% P&L"].values,
+        })
+        _out, summary = compute_analytics(_mini)
+    except Exception as exc:
+        logger.warning("[SYNC_PERIDX] compute_analytics failed: %s", exc)
+        summary = {}
+    # Restate the four POINT metrics from real points (see the sync-path note).
+    try:
+        _net_pts = pd.to_numeric(agg["Net P&L"], errors="coerce").dropna()
+        if len(_net_pts):
+            summary["total_pnl"] = round(float(_net_pts.sum()), 2)
+            summary["max_win"] = round(float(_net_pts.max()), 2)
+            summary["max_loss"] = round(float(_net_pts.min()), 2)
+            summary["avg_profit_per_trade"] = round(float(_net_pts.mean()), 2)
+    except Exception as exc:
+        logger.warning("[SYNC_PERIDX] point-metric restatement failed: %s", exc)
+    # cagr_spot from the REAL spots on the OPTIONS leg (never the futures leg).
+    try:
+        _sp = combined
+        if "Type" in _sp.columns:
+            _opt_rows = _sp[_sp["Type"].astype(str).str.upper().isin(("CE", "PE"))]
+            if not _opt_rows.empty:
+                _sp = _opt_rows
+        _sp = _sp.sort_values(["Entry Date", "Trade", "Leg"], kind="stable")
+        _es = pd.to_numeric(_sp["Entry Spot"], errors="coerce").replace(0, np.nan).dropna()
+        _xs = pd.to_numeric(_sp["Exit Spot"], errors="coerce").replace(0, np.nan).dropna()
+        if len(_es) and len(_xs):
+            _i, _f = float(_es.iloc[0]), float(_xs.iloc[-1])
+            _days = (pd.to_datetime(agg["Exit Date"]).max()
+                     - pd.to_datetime(agg["Entry Date"]).min()).days
+            _ny = max(_days / 365.0, 0.01)
+            if _i > 0 and _f > 0:
+                summary["cagr_spot"] = round(100 * ((_f / _i) ** (1.0 / _ny) - 1), 2)
+    except Exception as exc:
+        logger.warning("[SYNC_PERIDX] cagr_spot recovery failed: %s", exc)
+    try:
+        pivot = build_pivot(agg, "Exit Date")
+    except Exception:
+        pivot = {"headers": [], "rows": []}
+
+    # ---- 5. Propagate trade-level values onto the parent (first-leg) row ----
+    t2c = {int(r["Trade"]): {k: r.get(k) for k in
+                             ("Cumulative", "Peak", "DD", "%DD", "Spot P&L", "Net P&L", "% P&L")}
+           for _, r in agg.iterrows()}
+    combined = combined.sort_values(["Entry Date", "Trade", "Leg"], kind="stable").reset_index(drop=True)
+    seen = set()
+    parent_gi: Dict[int, str] = {}
+    cc, pc, dc, pdc, sc, npc, ppc = [], [], [], [], [], [], []
+    for _, row in combined.iterrows():
+        tid = int(row["Trade"])
+        if tid in seen:
+            cc.append(None); pc.append(None); dc.append(None); pdc.append(None)
+            # A non-parent leg on a DIFFERENT index trades its own underlying, so its
+            # own spot move is its own fact (not a duplicate of the parent's) — keep
+            # it. Same-index non-parent rows stay blank (engine convention).
+            _diff_idx = str(row.get("Group Index") or "") != parent_gi.get(tid, "")
+            _rs = row.get("Spot P&L")
+            sc.append(_rs if (_diff_idx and _rs is not None and pd.notna(_rs)) else None)
+            npc.append(row.get("Net P&L")); ppc.append(row.get("% P&L"))
+            continue
+        seen.add(tid)
+        parent_gi[tid] = str(row.get("Group Index") or "")
+        v = t2c.get(tid, {})
+        cc.append(v.get("Cumulative")); pc.append(v.get("Peak")); dc.append(v.get("DD"))
+        pdc.append(v.get("%DD")); sc.append(v.get("Spot P&L"))
+        npc.append(v.get("Net P&L")); ppc.append(v.get("% P&L"))
+    combined["Cumulative"], combined["Peak"], combined["DD"], combined["%DD"] = cc, pc, dc, pdc
+    combined["Spot P&L"] = sc
+    combined["Net P&L"] = npc
+    combined["% P&L"] = ppc
+    combined = combined.drop(columns=[c for c in ("_ekey", "_legpnl", "_legpct") if c in combined.columns])
+
+    records = combined.to_dict("records")
+    _nan_cols = ("Cumulative", "Peak", "DD", "%DD", "Entry Price", "Exit Price",
+                 "Raw Entry Price", "Raw Exit Price", "CE P&L", "PE P&L", "FUT P&L",
+                 "Net P&L", "% P&L", "MAE", "MFE")
+    for row in records:
+        for k in _nan_cols:
+            v = row.get(k)
+            if v is not None:
+                try:
+                    if float(v) != float(v):  # NaN
+                        row[k] = None
+                except (TypeError, ValueError):
+                    row[k] = None
+    records = _convert_numpy(_format_dates(records))
+    try:
+        from services.multi_index_tradesheet import per_index_summary
+        meta["per_index_summary"] = per_index_summary(records)
+    except Exception:
+        meta["per_index_summary"] = []
+    meta["trades"] = int(agg["Trade"].nunique())
+    logger.info("[SYNC_PERIDX] %s cadence, %d cycles, %d groups (%.2fs)",
+                cadence, len(agg), len(group_frames), time.perf_counter() - t0)
+    return {
+        "status": "success",
+        "trades": records,
+        "summary": _convert_numpy(summary),
+        "pivot": _convert_numpy(pivot),
+        "meta": _convert_numpy(meta),
+        "cached": False,
+    }
+
+
+def _run_sync_fused_groups(
+    payload: Dict[str, Any],
+    effective_from: Optional[str],
+    effective_to: Optional[str],
+    legs: List[dict],
+    default_index: str,
+    default_expiry: str,
+) -> Dict[str, Any]:
+    """Path B (FUSED) — TRUE cross-index-capable co-entry/co-exit.
+
+    Same YEARLY-option + real-monthly/weekly strategy as _run_sync_per_index_groups
+    (Path A), but instead of pricing each index group in a SEPARATE engine sub-run,
+    every group's fully-resolved trade specs are MERGED into ONE
+    `algotest_native.simulate_trades_batch` call — both symbols priced together,
+    each leg on its OWN index (Rust `simulate_one` already prices each spec against
+    `spec.index`). This is the foundation for a later cross-index cut (Phase 2/3):
+    the machinery that holds both symbols in one simulate is what lets either leg's
+    breach truncate BOTH.
+
+    PHASE 1 ONLY: NO cross-index spot-adjustment, NO SL/Target/re-entry. The specs
+    are returned by run_rust_engine_pipeline(return_specs_only=True) right before its
+    pricing/SL post-processing, so this produces a clean co-entry/co-exit baseline.
+    A leg carrying spot_adjustment or a risk control raises loudly (those belong to
+    Phase 2/3) rather than silently ignoring it.
+
+    Contract per group is IDENTICAL to Path A (December pin for the yearly group,
+    own near/holdable contract for the monthly/weekly group), over the SAME merged
+    cadence windows, so both legs share each cycle's entry/exit. Stitching (steps
+    3-5) is the same shared-entry-date fusion Path A uses.
+    """
+    t0 = time.perf_counter()
+    import os
+    import pandas as pd
+    import numpy as np
+    from collections import OrderedDict as _OrderedDict
+    from base import compute_analytics, build_pivot, get_trading_calendar
+    from engines.generic_algotest_engine import get_lot_size
+    from services.algotest_job import _convert_numpy, _format_dates
+    from services.engine_rust import (
+        resolve_expiry_inputs, run_rust_engine_pipeline, priced_to_tradesheet_records,
+    )
+    from services import rust_fast_path as rf
+
+    def _is_yearly_opt(l):
+        return (
+            str(l.get("expiry") or l.get("expiry_type") or "").upper().startswith("YEAR")
+            and str(l.get("segment") or "OPTIONS").upper() not in ("FUTURE", "FUTURES")
+        )
+
+    def _has_phase23_feature(l):
+        """A leg risk control the fused path does NOT yet price (post-simulate,
+        skipped by return_specs_only). Cross-index spot_adjustment IS handled
+        (Phase 2, cascade below). Fail loudly on the rest rather than drop it."""
+        for _k in ("stopLoss", "targetProfit", "trailSL", "slWithBuffer"):
+            _v = l.get(_k)
+            if isinstance(_v, dict) and _v:
+                return _k
+        return ""
+
+    # Preserve the user's configured leg order for the parent-row convention.
+    for _i, _l in enumerate(legs):
+        _l["_orig_leg_no"] = _i + 1
+        _blk = _has_phase23_feature(_l)
+        if _blk:
+            raise NotImplementedError(
+                "[SYNC_FUSED] leg %d carries %r, which the fused path does not price "
+                "yet (per-leg SL/Target/Trail/Buffer runs post-simulate and is skipped "
+                "by return_specs_only). Cross-index spot_adjustment IS handled. Use Path "
+                "A (drop multi_index_sync_fused) for SL/Target/Trail/Buffer for now."
+                % (_i + 1, _blk)
+            )
+
+    non_yearly = [l for l in legs if not _is_yearly_opt(l)]
+
+    # ---- Cadence from the NON-YEARLY legs only (identical to Path A) ----
+    weekly_ny = [l for l in non_yearly if _leg_expiry(l, default_expiry).startswith("WEEK")]
+    if weekly_ny:
+        cadence = "WEEKLY"
+        cadence_index, cadence_segment = _canonical_cadence(weekly_ny, default_index)
+    else:
+        cadence = "MONTHLY"
+        cadence_index, cadence_segment = _canonical_cadence(non_yearly, default_index)
+
+    # SAME-INDEX MIXED EXPIRY: group by (index, expiry-class) so an index carrying
+    # BOTH a monthly/weekly leg AND a yearly leg (e.g. NIFTY monthly CE + NIFTY yearly
+    # PE) splits into a monthly sub-group and a yearly sub-group. Each sub-group then
+    # has a SINGLE expiry class, so the per-group contract logic below (December pin
+    # for yearly via _dec_cycles_for, own near-month for monthly via
+    # _monthly_cycles_for) applies to the RIGHT legs — instead of the old
+    # `grp_is_yearly = any(...)` forcing the whole index onto December (which pinned
+    # the monthly CE to the December contract and dropped almost every monthly trade).
+    # A pure single-expiry index yields exactly ONE sub-group (same legs as grouping
+    # by index alone), so every existing multi-index run is byte-for-byte unchanged;
+    # only a genuinely mixed index splits. Rows are tagged Group Index = the INDEX
+    # (not the sub-key) and the tradesheet re-keys Trade# by entry date, so both NIFTY
+    # sub-groups fuse back into one NIFTY leg-set per shared cadence date.
+    def _grp_class(l):
+        return "Y" if _is_yearly_opt(l) else "M"
+    groups: "OrderedDict[tuple, List[dict]]" = _OrderedDict()
+    for l in legs:
+        groups.setdefault((_leg_index(l, default_index), _grp_class(l)), []).append(l)
+    # Indices carrying BOTH a yearly and a non-yearly OPTION leg (drives the grp_expiry
+    # override below so a mixed index's monthly sub-group rolls monthly, not yearly).
+    _mixed_indices = {
+        _ix for _ix in {_leg_index(l, default_index) for l in legs}
+        if any(_is_yearly_opt(l) and _leg_index(l, default_index) == _ix for l in legs)
+        and any((not _is_yearly_opt(l)) and _leg_segment(l) != "FUT"
+                and _leg_index(l, default_index) == _ix for l in legs)
+    }
+    # CANONICAL group order: strategy index first, then alphabetical by index; within
+    # a mixed index, yearly sub-group before monthly (deterministic). For a pure index
+    # this is exactly one sub-group in the old strategy-first order, so the downstream
+    # `agg(... "first")` picks are unchanged.
+    groups = _OrderedDict(
+        (k, groups[k]) for k in sorted(
+            (k for k, v in groups.items() if v),
+            key=lambda k: (0 if k[0] == default_index else 1, k[0], 0 if k[1] == "Y" else 1),
+        )
+    )
+
+    meta = {
+        "multi_index": True, "sync_weekly_roll": True, "fused": True,
+        "cadence": cadence, "cadence_index": cadence_index,
+        "indices": sorted({_leg_index(l, default_index) for l in legs}),
+        "index": default_index,
+        "from_date": payload.get("from_date"), "to_date": payload.get("to_date"),
+        "slippage_pct": payload.get("slippage_pct", 0),
+    }
+    try:
+        from services.multi_index_tradesheet import build_export_filename
+        meta["export_filename"] = build_export_filename(payload)
+    except Exception:
+        meta["export_filename"] = "multi_index_backtest"
+    try:
+        from services.engine_rust import _load_filter_segments as _lfs
+        _segs = _lfs(payload) or []
+        meta["filter_segments"] = [{"start": s, "end": e} for (s, e) in _segs]
+    except Exception:
+        meta["filter_segments"] = payload.get("filter_segments") or []
+
+    def _empty():
+        return {"status": "success", "trades": [], "summary": {},
+                "pivot": {"headers": [], "rows": []}, "meta": _convert_numpy(meta), "cached": False}
+
+    # ---- 1. Merged cadence from the NON-YEARLY legs (identical to Path A) ----
+    _cycles, _bounds = _build_sync_cycles(
+        non_yearly, cadence, cadence_index, default_index, cadence,
+        effective_from, effective_to, payload, cadence_segment,
+    )
+    if not (_cycles and _bounds):
+        logger.warning("[SYNC_FUSED] could not build merged cadence boundaries")
+        return _empty()
+    windows = [(c["start"], c["end"]) for c in _cycles]
+    logger.info("[SYNC_FUSED] cadence=%s driven by %s: %d windows (%s..%s)",
+                cadence, cadence_index, len(windows), windows[0][0], windows[-1][1])
+
+    try:
+        exit_dte = max(0, int(payload.get("exit_dte") or 0))
+    except (TypeError, ValueError):
+        exit_dte = 0
+    try:
+        tdays = sorted(
+            pd.to_datetime(get_trading_calendar(effective_from, effective_to)["date"])
+            .dt.strftime("%Y-%m-%d").tolist()
+        )
+    except Exception:
+        tdays = []
+    wide_to = (pd.Timestamp(effective_to) + pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+
+    def _dec_cycles_for(sym: str) -> List[Dict[str, str]]:
+        """December contract active at each merged window's START (Path A verbatim)."""
+        try:
+            _, yc = resolve_expiry_inputs(
+                sym,
+                {
+                    "expiry_type": "YEARLY",
+                    "rollover_cadence": ("weekly" if cadence == "WEEKLY" else "monthly"),
+                    "yearly_exit_months_before": payload.get("yearly_exit_months_before") or 0,
+                    "yearly_roll_months": payload.get("yearly_roll_months"),
+                },
+                effective_from, effective_to, tdays,
+            )
+            yc = list(yc or [])
+        except Exception as exc:
+            logger.warning("[SYNC_FUSED] yearly resolve failed for %s: %s", sym, exc)
+            yc = []
+        if not yc:
+            return []
+        yc_sorted = sorted(yc, key=lambda c: c["start"])
+        # Roll each December at the cadence boundary CLOSEST to its own T-1 roll date
+        # (Path A verbatim — see the Path A copy for the full rationale). Snaps the yearly
+        # roll to the nearest shared-cadence boundary (both legs re-enter → sync). Fixes
+        # roll-too-late (held old December to ~1 day before expiry) AND roll-too-early
+        # (wide sparse window rolling at its start); subsumes the exit_months_before=0
+        # leg-desync guard; leaves pre-MIDCP giant windows unchanged.
+        _bounds = sorted(set([w[0] for w in windows] + [w[1] for w in windows]))
+        _bts = [(pd.Timestamp(str(b)[:10]), b) for b in _bounds]
+
+        def _roll_boundary(end_s: str) -> str:
+            if not _bts:
+                return end_s
+            et = pd.Timestamp(str(end_s)[:10])
+            return min(_bts, key=lambda bt: abs((bt[0] - et).days))[1]
+
+        _roll_out = {c["contract"]: _roll_boundary(c.get("end") or c["contract"])
+                     for c in yc_sorted}
+        out: List[Dict[str, str]] = []
+        for (ws, we) in windows:
+            chosen = yc_sorted[-1]["contract"]
+            for c in yc_sorted:
+                if ws < _roll_out[c["contract"]]:
+                    chosen = c["contract"]
+                    break
+            out.append({"contract": chosen, "start": ws, "end": we})
+        return out
+
+    def _monthly_cycles_for(sym: str, grp_expiry: str, seg: str) -> List[Dict[str, str]]:
+        """This group's OWN near/holdable contract per merged window (Path A verbatim)."""
+        if sym == cadence_index and grp_expiry.upper() == cadence and seg == cadence_segment:
+            return list(_cycles)
+        series = _roll_series(sym, grp_expiry, effective_from, wide_to, seg)
+        if not series:
+            return []
+        out: List[Dict[str, str]] = []
+        for (ws, we) in windows:
+            contract = _holdable_contract(series, we, exit_dte, tdays) or _near_contract_on(
+                sym, grp_expiry, we, series)
+            if not contract:
+                return []
+            out.append({"contract": contract, "start": ws, "end": we})
+        return out
+
+    # ---- Phase 0 residency: BOTH symbols' options+named-spot resident together ----
+    # Guards the spot-leak: without both symbols in the native cache the fused
+    # simulate would silently misprice (or zero) one leg. Fail loudly if not.
+    try:
+        import algotest_native  # type: ignore
+    except ImportError as _exc:
+        raise RuntimeError("[SYNC_FUSED] algotest_native unavailable: %s" % _exc)
+    # groups keys are (index, expiry-class) tuples now — residency is per INDEX,
+    # so dedupe to the index symbol (a mixed index has two sub-groups, one symbol).
+    _grp_syms = sorted({k[0] for k in groups.keys()})
+    for sym in _grp_syms:
+        _ensure_group_symbol_loaded(sym, effective_from, effective_to)
+    _resident = set(algotest_native.cache_symbols() or [])
+    _missing = [s for s in _grp_syms if s not in _resident]
+    if _missing:
+        raise RuntimeError(
+            "[SYNC_FUSED] symbols %s not resident after merge (resident: %s). Refusing "
+            "to price a fused run with a leaked/absent symbol." % (_missing, sorted(_resident))
+        )
+
+    # ---- 2. FUSED: build each group's specs, merge, price in ONE simulate call ----
+    # When filter segments run past effective_to, load through the latest segment end
+    # (mirrors services.algotest_job._try_rust_engine) so the last window can price.
+    _data_to = effective_to
+    try:
+        _custom_segs = payload.get("filter_segments") or []
+        _seg_ends = [
+            pd.Timestamp(s["end"]).strftime("%Y-%m-%d")
+            for s in _custom_segs if isinstance(s, dict) and s.get("end")
+        ]
+        if _seg_ends:
+            _data_to = max(_data_to, max(_seg_ends))
+    except Exception:
+        pass
+    _days = pd.to_datetime(
+        get_trading_calendar(effective_from, _data_to)["date"]
+    ).sort_values().dt.strftime("%Y-%m-%d").tolist()
+    if not _days:
+        return _empty()
+
+    from services.data_loader import get_loader as _get_loader
+    _loader = _get_loader()
+
+    def _spots_for(sym: str) -> Dict[str, float]:
+        # Memoized across combos: the spot series for a (symbol, date-range) is
+        # invariant to strike / spot-adjustment / gap sweeps, so an optimizer
+        # rebuilds it once per symbol instead of once per combo (profiled ~40%
+        # of a fused combo). Byte-identical values — pure perf.
+        return rf.spot_series(sym, _days, _loader)
+
+    # Global trade-id offset per group keeps merged specs unique so
+    # simulate_trades_batch never conflates a NIFTY trade with a MIDCP one, and
+    # lets us split priced rows back per group after the single simulate.
+    _GROUP_STRIDE = 1_000_000
+    group_expiry_by_gid: Dict[int, str] = {}
+    group_isyearly_by_gid: Dict[int, bool] = {}
+    group_lot_by_gid: Dict[int, int] = {}
+    group_ncycles_by_gid: Dict[int, int] = {}
+    group_sym_by_gid: Dict[int, str] = {}
+    group_glegs_by_gid: Dict[int, List[dict]] = {}
+    group_specs_by_gid: Dict[int, List[Dict[str, Any]]] = {}
+    group_spots_by_gid: Dict[int, Dict[str, float]] = {}
+
+    # ── REAL FUTURES leg support (gated: only when a FUTURES leg is present) ──────
+    # A FUTURES leg (segment=FUTURES) rides the SHARED cadence in lockstep with the
+    # option legs but is priced on the REAL monthly FUTIDX contract (rf.get_future_price),
+    # NOT through the YEARLY option-spec pipeline (which the engine's YEARLY+FUTURES
+    # blocker rejects). We split each group into its OPTION legs (simulated as before)
+    # and its FUTURES legs (priced separately, further below, over the SAME sub-trade
+    # windows the option legs produced). With no futures leg present every dict below is
+    # empty and the whole path is byte-identical to the option-only fused run.
+    group_optlegs_by_gid: Dict[int, List[dict]] = {}
+    group_futlegs_by_gid: Dict[int, List[dict]] = {}
+    for _gid, (_gk, _glegs) in enumerate(groups.items()):
+        group_optlegs_by_gid[_gid] = [l for l in _glegs if _leg_segment(l) != "FUT"]
+        group_futlegs_by_gid[_gid] = [l for l in _glegs if _leg_segment(l) == "FUT"]
+    _any_fut = any(v for v in group_futlegs_by_gid.values())
+
+    for gid, (_gkey, glegs) in enumerate(groups.items()):
+        sym = _gkey[0]  # (index, expiry-class) key → the index
+        _opt_glegs = group_optlegs_by_gid[gid]
+        grp_is_yearly = any(_is_yearly_opt(l) for l in glegs)
+        # For the MONTHLY sub-group of a MIXED index (same-index mixed expiry), the
+        # cadence is this sub-group's OWN shortest expiry (monthly/weekly) — NOT the
+        # strategy-level yearly _group_expiry_type would return for the strategy index.
+        # Pure indices (not in _mixed_indices) keep _group_expiry_type verbatim, so
+        # existing runs are byte-identical.
+        if sym in _mixed_indices and not grp_is_yearly:
+            _sg_exps = [str(l.get("expiry") or l.get("expiry_type") or "").upper() for l in glegs]
+            grp_expiry = "WEEKLY" if any(e.startswith("WEEK") for e in _sg_exps) else "MONTHLY"
+        else:
+            grp_expiry = _group_expiry_type(sym, glegs, payload, default_index)
+        grp_seg = _canonical_group_segment(_opt_glegs or glegs)
+        gcycles = _dec_cycles_for(sym) if grp_is_yearly else _monthly_cycles_for(sym, grp_expiry, grp_seg)
+        group_expiry_by_gid[gid] = grp_expiry
+        group_isyearly_by_gid[gid] = grp_is_yearly
+        group_ncycles_by_gid[gid] = len(gcycles or [])
+        group_sym_by_gid[gid] = sym
+        group_glegs_by_gid[gid] = glegs
+        # Lot size + spot series are needed by the futures pricing path too, so
+        # resolve them for EVERY group (including a futures-only group that builds
+        # no option specs below).
+        _lot = int(get_lot_size(sym, _days[0]))
+        group_lot_by_gid[gid] = _lot
+        _spots = _spots_for(sym)
+        if not _spots:
+            raise RuntimeError("[SYNC_FUSED] no spot data for %s" % sym)
+        group_spots_by_gid[gid] = _spots
+        if not _opt_glegs:
+            # Futures-only group: nothing to simulate through the option pipeline;
+            # priced entirely in the futures phase below. Never raise "no cycles"
+            # here — the future rolls on its own monthly contract per shared window.
+            group_specs_by_gid[gid] = []
+            continue
+        if not gcycles:
+            raise RuntimeError(
+                "[SYNC_FUSED] no cadence cycles for group %s — refusing to drop an "
+                "entire index from a fused run." % sym
+            )
+
+        sub = copy.deepcopy(payload)
+        sub["index"] = sym
+        # Same YEARLY-pin mechanism as Path A: every leg marked YEARLY so Rust
+        # pins it to the per-cycle contract; sync_cadence_expiries drives the
+        # shared entry/exit; each leg keeps its own strike_interval / lots.
+        # OPTION legs only — a FUTURES leg would trip engine_rust's YEARLY+FUTURES
+        # blocker here; it is priced separately on its real monthly contract below.
+        sub["legs"] = [dict(_l, expiry="YEARLY", _sa_label_expiry=str(_l.get("expiry") or _l.get("expiry_type") or "").upper()) for _l in _opt_glegs]
+        sub["expiry_type"] = "YEARLY"
+        sub["expiry_window"] = "weekly_expiry" if cadence == "WEEKLY" else "monthly_expiry"
+        sub["yearly_cycles"] = gcycles
+        sub["sync_cadence_expiries"] = _bounds
+        sub["sync_cadence_expiry_type"] = "weekly" if cadence == "WEEKLY" else "monthly"
+        sub["rollover_min_days_to_expiry"] = 0
+        sub.pop("multi_index_mode", None)
+        sub.pop("sync_weekly_roll", None)
+        sub.pop("multi_index_sync_fused", None)
+        sub.pop("cross_index_cut", None)
+        # Phase 2: the cross-index spot-adj cascade below is computed in THIS
+        # builder (per-leg-index), so strip per-leg spot_adjustment out of the
+        # spec-build sub-run — otherwise run_rust_engine_pipeline would ALSO try
+        # to run its own single-index spot-adj (which return_specs_only skips
+        # anyway, but this keeps the built specs a clean pre-adjustment baseline).
+        for _sl in sub["legs"]:
+            _sl.pop("spot_adjustment", None)
+            _sl.pop("spotAdjustment", None)
+
+        try:
+            _expiries, _cyc = resolve_expiry_inputs(sym, sub, effective_from, _data_to, _days)
+        except Exception as exc:
+            raise RuntimeError("[SYNC_FUSED] expiry resolve failed for %s: %s" % (sym, exc))
+        if _cyc is not None:
+            sub["yearly_cycles"] = _cyc
+
+        _specs = run_rust_engine_pipeline(
+            sub,
+            expiry_dates=_expiries,
+            trading_days=_days,
+            lot_size=_lot,
+            spot_by_date=_spots,
+            square_off_mode=payload.get("square_off_mode", "partial"),
+            return_specs_only=True,
+        )
+        if not _specs:
+            raise RuntimeError(
+                "[SYNC_FUSED] group %s built NO specs despite %d valid cadence cycles."
+                % (sym, len(gcycles))
+            )
+        group_specs_by_gid[gid] = _specs
+
+    # ── Phase 2: cross-index spot-adjustment cascade ────────────────────────────
+    # Each leg carrying spot_adjustment measures its OWN breach on its OWN index
+    # spot from its OWN baseline (yearly-fixed: contract/patch anchor with roll +
+    # own-breach rebase; monthly-fresh: per-trade entry spot). The EARLIEST breach
+    # across BOTH legs (+ the shared cadence boundary) cuts BOTH legs the same day
+    # and re-enters them; ONLY the breaching leg(s) re-strike to fresh ATM (others
+    # hold). Mirrors engine_rust's earliest-wins / breach-set / only-breacher-
+    # re-strike semantics, generalized to per-leg-index spot. When no leg carries a
+    # spot_adjustment config the cascade is a no-op and each window emits exactly
+    # one sub-trade (byte-identical to Phase 1).
+    from services.engine_rust import _compute_spot_adjustment_trigger, _compute_strike_for_leg_python
+
+    def _leg_sa_cfg(l: dict) -> Optional[Dict[str, Any]]:
+        c = l.get("spot_adjustment") or l.get("spotAdjustment")
+        if not isinstance(c, dict) or not c.get("enabled"):
+            return None
+        try:
+            p = float(c.get("pct") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if p <= 0:
+            return None
+        u = str(c.get("units") or "percent").lower()
+        if u not in ("percent", "points"):
+            u = "percent"
+        d = str(c.get("direction") or "rise").lower()
+        if d not in ("rise", "fall", "both"):
+            d = "rise"
+        if u == "percent":
+            p = max(0.25, min(5.0, p))
+        return {"pct": p, "units": u, "direction": d}
+
+    # (gid, group-leg-id) -> its SA config (or None), index, interval, leg cfg,
+    # fixed-strike flag, and a human label for exit reasons.
+    _leg_sa: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    _any_sa = False
+    for gid, glegs in group_glegs_by_gid.items():
+        sym = group_sym_by_gid[gid]
+        # Enumerate the OPTION legs only — leg_id here must line up with the option
+        # spec leg_ids (1..N over the option legs), which is what the cascade keys on.
+        # A FUTURES leg carries no spot_adjustment and never enters the cascade.
+        for _li, _lg in enumerate(group_optlegs_by_gid[gid], start=1):
+            cfg = _leg_sa_cfg(_lg)
+            if cfg:
+                _any_sa = True
+            _fixed = str(_lg.get("rollover_strike_mode") or "fresh").lower() == "fixed"
+            _label = "%s %s %s" % (
+                sym, str(_lg.get("option_type") or "").upper(),
+                str(_lg.get("expiry") or _lg.get("expiry_type") or "").title(),
+            )
+            _leg_sa[(gid, _li)] = {"cfg": cfg, "index": sym, "fixed": _fixed,
+                                   "leg": _lg, "label": _label.strip()}
+
+    def _sa_tag(direction: str, base: float, now: float) -> str:
+        _up = (now or 0.0) >= (base or 0.0)
+        return "SPOT_ADJ_RISE" if _up else "SPOT_ADJ_FALL"
+
+    # First cadence entry within each filter segment = patch start (re-anchor).
+    _seg_starts: set = set()
+    try:
+        from services.engine_rust import _load_filter_segments as _lfs0
+        _segs0 = _lfs0(payload) or []
+    except Exception:
+        _segs0 = []
+    _all_entries = sorted({
+        str(s.get("entry_date")) for specs in group_specs_by_gid.values() for s in specs
+    })
+    for (_ss, _se) in _segs0:
+        _in = [e for e in _all_entries if _ss <= e <= _se]
+        if _in:
+            _seg_starts.add(min(_in))
+
+    reason_by_tid: Dict[int, str] = {}
+    merged_specs: List[Dict[str, Any]] = []
+
+    if not _any_sa:
+        # Phase 1 path: one sub-trade per window, base strikes, no cascade.
+        for gid, _specs in group_specs_by_gid.items():
+            _base = (gid + 1) * _GROUP_STRIDE
+            for _s in _specs:
+                _s2 = dict(_s)
+                _s2["trade_id"] = _base + int(_s.get("trade_id") or 0)
+                merged_specs.append(_s2)
+    else:
+        # Build cadence positions keyed by shared entry date; each holds every
+        # present leg's base spec keyed by (gid, group-leg-id).
+        positions: "OrderedDict[str, Dict[Tuple[int, int], Dict[str, Any]]]" = _OrderedDict()
+        for gid, _specs in group_specs_by_gid.items():
+            for _s in _specs:
+                _e = str(_s.get("entry_date"))
+                positions.setdefault(_e, {})[(gid, int(_s.get("leg_id") or 1))] = _s
+        # Chronological live state per leg: strike, mark (on own index), expiry.
+        _state: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        _sub_seq = 0
+
+        def _idx_spot(gid: int, d: str) -> float:
+            return float(group_spots_by_gid.get(gid, {}).get(d) or 0.0)
+
+        for _entry in sorted(positions.keys()):
+            wlegs = positions[_entry]
+            _sched = max(str(sp.get("exit_date")) for sp in wlegs.values())
+            _is_patch = _entry in _seg_starts
+            # Anchor reset per present leg.
+            for key, sp in wlegs.items():
+                meta_l = _leg_sa[key]
+                _exp = str(sp.get("expiry") or "")
+                _espot = _idx_spot(key[0], _entry)
+                st = _state.get(key)
+                _is_roll = (st is None) or (st.get("expiry") != _exp)
+                if (not meta_l["fixed"]) or _is_roll or _is_patch or st is None:
+                    _state[key] = {"strike": float(sp.get("strike") or 0.0),
+                                   "mark": _espot, "expiry": _exp}
+                else:
+                    st["expiry"] = _exp  # carry strike+mark
+            # Intra-window day-walk cascade (earliest cross-index breach cuts all).
+            _cur = _entry
+            _guard = 0
+            while _guard < 250:
+                _guard += 1
+                _cands: List[Tuple[str, Tuple[int, int]]] = []
+                for key, sp in wlegs.items():
+                    cfg = _leg_sa[key]["cfg"]
+                    st = _state[key]
+                    if not cfg or st["mark"] <= 0:
+                        continue
+                    _trig = _compute_spot_adjustment_trigger(
+                        _cur, st["mark"], _sched, cfg["direction"], cfg["pct"],
+                        cfg["units"], _days, group_spots_by_gid[key[0]],
+                    )
+                    if _trig:
+                        _cands.append((_trig, key))
+                if not _cands:
+                    _sub_seq += 1  # final (boundary) sub-trade
+                    for key, sp in wlegs.items():
+                        _tid = (key[0] + 1) * _GROUP_STRIDE + _sub_seq
+                        merged_specs.append(dict(
+                            sp, trade_id=_tid, leg_id=key[1], entry_date=_cur,
+                            exit_date=_sched, strike=float(_state[key]["strike"]),
+                        ))
+                    break
+                # Deterministic earliest-wins (tie → (gid, leg_id) order).
+                _win_date = min(d for d, _ in _cands)
+                _breachers = {k for d, k in _cands if d == _win_date}
+                _sub_seq += 1
+                # Reason names EVERY leg that breached on the cut date.
+                _reason = " + ".join(
+                    "%s (%s)" % (
+                        _sa_tag(_leg_sa[k]["cfg"]["direction"], _state[k]["mark"],
+                                _idx_spot(k[0], _win_date)),
+                        _leg_sa[k]["label"],
+                    )
+                    for k in sorted(_breachers)
+                )
+                for key, sp in wlegs.items():
+                    _tid = (key[0] + 1) * _GROUP_STRIDE + _sub_seq
+                    merged_specs.append(dict(
+                        sp, trade_id=_tid, leg_id=key[1], entry_date=_cur,
+                        exit_date=_win_date, strike=float(_state[key]["strike"]),
+                    ))
+                    reason_by_tid[_tid] = _reason
+                # Re-strike ONLY breaching legs to fresh ATM on their own index.
+                for key in _breachers:
+                    sym_k = _leg_sa[key]["index"]
+                    _sp = _idx_spot(key[0], _win_date)
+                    _iv = float(wlegs[key].get("strike_interval") or 50.0) or 50.0
+                    _new = _compute_strike_for_leg_python(
+                        _leg_sa[key]["leg"], _sp, _iv, entry_date=_win_date,
+                        expiry=_state[key]["expiry"], index=sym_k,
+                    )
+                    if _new is None:
+                        _new = round(_sp / _iv) * _iv
+                    _state[key]["strike"] = float(_new)
+                    _state[key]["mark"] = _sp  # rebase only the breacher(s)
+                _cur = _win_date
+                if _cur >= _sched:
+                    break
+
+    if not merged_specs:
+        return _empty()
+
+    # ONE simulate_trades_batch holding BOTH symbols — each spec priced on its
+    # own index (native/src/simulate.rs simulate_one uses spec.index).
+    priced_all = list(algotest_native.simulate_trades_batch(merged_specs))
+    if not priced_all:
+        return _empty()
+    # Stamp cross-index-cut exit reasons onto the breach sub-trades (boundary
+    # sub-trades keep simulate's EXPIRY→SCHEDULED_EXIT / FILTER_END from the tail).
+    if reason_by_tid:
+        for r in priced_all:
+            _rn = reason_by_tid.get(int(r.get("trade_id") or 0))
+            if _rn:
+                r["exit_reason"] = _rn
+
+    # ---- Split priced rows back per group and build per-group tradesheets ----
+    # Each group's split priced rows are post-processed with the SAME no-risk tail
+    # a standalone engine run uses (FILTER_END patch tagging + MAE/MFE), so a fused
+    # tradesheet is byte-identical to Path A's for a config with no risk controls.
+    from services.engine_rust import _apply_filter_end_last_per_patch, _load_filter_segments
+    _orig_segs = _load_filter_segments(payload)
+    _clamp_reason = (
+        "STR_Exit"
+        if str(payload.get("super_trend_config") or "").strip() in ("5x1", "5x2")
+        else "FILTER_END"
+    )
+    _mae_on = os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+    _trading_cal_df = get_trading_calendar(effective_from, _data_to)
+    _sorted_td_mae = sorted(_days)
+    if _mae_on:
+        from engines.generic_algotest_engine import _calculate_leg_mae_mfe
+        from services.engine_rust import _fut_leg_mae_mfe
+
+    group_frames: List["pd.DataFrame"] = []
+    group_meta: List[dict] = []
+    # Canonical sub-trade windows (shared across ALL legs by construction of the
+    # cascade) → their exit reason. Collected from the OPTION rows here (after the
+    # FILTER_END tail + SCHEDULED_EXIT/SPOT_ADJ reasons are stamped) and replayed onto
+    # every FUTURES leg below so a future co-enters/co-exits in lockstep, inheriting
+    # the trade's reason (SCHEDULED_EXIT / SPOT_ADJ_* / FILTER_END). First-writer-wins
+    # over groups in gid order so the base (yearly) group's reasons win deterministically.
+    _canon_windows: "OrderedDict[Tuple[str, str], str]" = _OrderedDict()
+    for gid in range(len(groups)):
+        sym = group_sym_by_gid[gid]
+        glegs = group_glegs_by_gid[gid]
+        _opt_glegs = group_optlegs_by_gid[gid]
+        if not _opt_glegs:
+            # Futures-only group: no option rows to build here; priced in the
+            # futures phase below. Its meta entry is added there too.
+            continue
+        _base = (gid + 1) * _GROUP_STRIDE
+        _grp_priced = [
+            r for r in priced_all
+            if _base <= int(r.get("trade_id") or 0) < _base + _GROUP_STRIDE
+        ]
+        # Restore per-group local trade_id so priced_to_tradesheet_records numbers
+        # cleanly; the final Trade# is re-keyed by entry date in step 3 regardless.
+        for r in _grp_priced:
+            r["trade_id"] = int(r.get("trade_id") or 0) - _base
+        # No-risk tail: tag the last trade of each filter patch FILTER_END (the
+        # relabel run_rust_engine_pipeline does after simulate — skipped by
+        # return_specs_only). Mutates exit_reason in place.
+        if _orig_segs:
+            _apply_filter_end_last_per_patch(_grp_priced, _orig_segs, _clamp_reason)
+        _grp_payload = {**payload, "index": sym,
+                        "legs": [dict(_l, expiry="YEARLY", _sa_label_expiry=str(_l.get("expiry") or _l.get("expiry_type") or "").upper()) for _l in _opt_glegs],
+                        "expiry_type": "YEARLY"}
+        _recs = priced_to_tradesheet_records(_grp_priced, _grp_payload, group_lot_by_gid[gid])
+        # Record this group's option sub-trade windows for the futures replay.
+        if _any_fut:
+            for _r in _recs:
+                _ek = (str(_r.get("Entry Date") or "")[:10], str(_r.get("Exit Date") or "")[:10])
+                if _ek[0] and _ek[1]:
+                    _canon_windows.setdefault(_ek, str(_r.get("Exit Reason") or "EXPIRY"))
+        # MAE/MFE per leg on THIS group's index (same as _try_rust_engine).
+        if _mae_on and _recs:
+            try:
+                for rec in _recs:
+                    _ot = rec.get("Type", "")
+                    _is_fut = _ot == "FUT"
+                    if _ot not in ("CE", "PE") and not _is_fut:
+                        continue
+                    if _is_fut:
+                        mae_val, mfe_val = _fut_leg_mae_mfe(
+                            symbol=sym, entry_date=rec.get("Entry Date"),
+                            exit_date=rec.get("Exit Date"), expiry=rec.get("Expiry"),
+                            entry_price=rec.get("Entry Price"), position=rec.get("B/S", "SELL"),
+                            entry_spot=rec.get("Entry Spot"), sorted_td=_sorted_td_mae,
+                            exit_reason=rec.get("Exit Reason"), exit_price=rec.get("Exit Price"),
+                        )
+                    else:
+                        mae_val, mfe_val = _calculate_leg_mae_mfe(
+                            index=sym, entry_date=rec.get("Entry Date"),
+                            exit_date=rec.get("Exit Date"),
+                            leg={"option_type": _ot, "strike": rec.get("Strike"),
+                                 "expiry": rec.get("Expiry")},
+                            entry_price=rec.get("Entry Price"), position=rec.get("B/S", "SELL"),
+                            entry_spot=rec.get("Entry Spot"), trading_calendar_df=_trading_cal_df,
+                            exit_reason=rec.get("Exit Reason"), exit_price=rec.get("Exit Price"),
+                        )
+                    _rl = int(rec.get("lots") or 1)
+                    if mae_val is not None:
+                        rec["MAE"] = mae_val * _rl
+                    if mfe_val is not None:
+                        rec["MFE"] = mfe_val * _rl
+            except Exception as _mexc:
+                logger.warning("[SYNC_FUSED] MAE/MFE failed (non-fatal): %s", _mexc)
+        avail = bool(_recs)
+        # 3b: a group with valid cycles MUST emit trades — never silently drop a leg.
+        if not avail:
+            raise RuntimeError(
+                "[SYNC_FUSED] group %s priced to ZERO rows despite %d valid cadence "
+                "cycles. Refusing a tradesheet missing an entire index."
+                % (sym, group_ncycles_by_gid[gid])
+            )
+        gdf = pd.DataFrame(_recs)
+        gdf["Group Index"] = sym
+        # Map engine leg_ids (1..N over the OPTION legs) back to configured position.
+        _leg_map = {i + 1: int(l.get("_orig_leg_no") or (i + 1)) for i, l in enumerate(_opt_glegs)}
+        if "Leg" in gdf.columns:
+            gdf["Leg"] = (
+                pd.to_numeric(gdf["Leg"], errors="coerce").fillna(1).astype(int)
+                .map(lambda k: _leg_map.get(k, k))
+            )
+        group_frames.append(gdf)
+        group_meta.append({
+            "index": sym, "role": ("base" if gid == 0 else "leg"), "legs": len(glegs),
+            "expiry": ("YEARLY" if group_isyearly_by_gid[gid] else group_expiry_by_gid[gid]),
+            "trades": int(gdf["Trade"].nunique()), "available": True,
+        })
+
+    # ── FUTURES phase: price every FUTURES leg on its REAL monthly contract over the
+    # SHARED sub-trade windows (co-entry/co-exit + shared reason with the option legs).
+    # Gated on _any_fut — a no-futures run never enters here (byte-identical). ──────
+    if _any_fut:
+        from services.futures_cache_store import ensure_futures_loaded
+        if not _canon_windows:
+            raise RuntimeError(
+                "[SYNC_FUSED] futures legs present but NO option sub-trade windows to "
+                "co-enter with — refusing to emit an orphan futures sheet."
+            )
+        for gid in range(len(groups)):
+            _fut_legs = group_futlegs_by_gid[gid]
+            if not _fut_legs:
+                continue
+            sym = group_sym_by_gid[gid]
+            glegs = group_glegs_by_gid[gid]
+            if not ensure_futures_loaded(sym):
+                raise RuntimeError("[SYNC_FUSED] futures cache unavailable for %s" % sym)
+            # This index's monthly FUTURES contract per window (futures calendar,
+            # NOT the option calendar — MIDCPNIFTY option vs future monthlies differ).
+            _fut_series = _roll_series(sym, "MONTHLY", effective_from, wide_to, "FUT")
+            _fspots = group_spots_by_gid[gid]
+            _fut_lot = group_lot_by_gid[gid]
+            _frecs: List[dict] = []
+            for (_edate, _xdate), _reason in _canon_windows.items():
+                _contract = _holdable_contract(_fut_series, _xdate, exit_dte, tdays) or \
+                    _near_contract_on(sym, "MONTHLY", _xdate, _fut_series)
+                if not _contract:
+                    continue
+                _ep = rf.get_future_price(sym, _edate, _contract)
+                _xp = rf.get_future_price(sym, _xdate, _contract)
+                if _ep is None or _xp is None:
+                    # Holiday-shift label mismatch: the roll calendar (_data_expiries)
+                    # labels a monthly by its last TRADED day (NIFTY Jun-2023 = 28-Jun,
+                    # since the 29-Jun scheduled expiry was Bakri Id), but the futures
+                    # PRICE cache keeps the ORIGINAL scheduled label (29-Jun). The exact
+                    # label then misses and the whole June window loses its FUT leg.
+                    # Snap to the cache's real label within ±3 days (monthlies are ~30d
+                    # apart, so this can't reach a neighbouring month) — only accept a
+                    # label that prices on BOTH ends, so a genuine data gap still drops.
+                    for _k in (1, 2, 3, -1, -2, -3):
+                        _cand = (pd.Timestamp(_contract) + pd.Timedelta(days=_k)).strftime("%Y-%m-%d")
+                        _e2 = rf.get_future_price(sym, _edate, _cand)
+                        _x2 = rf.get_future_price(sym, _xdate, _cand)
+                        if _e2 is not None and _x2 is not None:
+                            _contract, _ep, _xp = _cand, _e2, _x2
+                            break
+                    if _ep is None or _xp is None:
+                        continue  # genuinely missing contract on this window → skip
+                _ep = round(float(_ep), 2)
+                _xp = round(float(_xp), 2)
+                _es = round(float(_fspots.get(_edate) or 0.0), 2)
+                _xs = round(float(_fspots.get(_xdate) or 0.0), 2)
+                for _fl in _fut_legs:
+                    _pos = "BUY" if str(_fl.get("position") or "BUY").upper().startswith("B") else "SELL"
+                    _lots = int(_fl.get("lots") or _fl.get("lot") or 1)
+                    _per = round(((_xp - _ep) if _pos == "BUY" else (_ep - _xp)) * _lots, 4)
+                    _pct = round(_per / _es * 100.0, 4) if _es else 0.0
+                    _rec = {
+                        "Trade": "", "Leg": int(_fl.get("_orig_leg_no") or 1),
+                        "Index": sym, "Entry Date": _edate, "Exit Date": _xdate,
+                        "Leg Exit Date": _xdate, "Type": "FUT", "Strike": "",
+                        "B/S": _pos, "Qty": _lots * int(_fut_lot or 1), "lots": _lots,
+                        "Entry Price": _ep, "Exit Price": _xp,
+                        "Raw Entry Price": _ep, "Raw Exit Price": _xp,
+                        "MAE": 0.0, "MFE": 0.0,
+                        "Entry Spot": _es, "Exit Spot": _xs, "Spot P&L": "",
+                        "Expiry": _contract, "Cadence Expiry": _contract,
+                        "CE P&L": 0.0, "PE P&L": 0.0, "FUT P&L": _per,
+                        "FUT Entry Price": _ep, "FUT Exit Price": _xp,
+                        "Net P&L": _per, "% P&L": _pct, "Exit Reason": _reason,
+                    }
+                    if _mae_on:
+                        try:
+                            _mae_v, _mfe_v = _fut_leg_mae_mfe(
+                                symbol=sym, entry_date=_edate, exit_date=_xdate,
+                                expiry=_contract, entry_price=_ep, position=_pos,
+                                entry_spot=_es, sorted_td=_sorted_td_mae,
+                                exit_reason=_reason, exit_price=_xp,
+                            )
+                            if _mae_v is not None:
+                                _rec["MAE"] = _mae_v * _lots
+                            if _mfe_v is not None:
+                                _rec["MFE"] = _mfe_v * _lots
+                        except Exception as _fmexc:
+                            logger.warning("[SYNC_FUSED] futures MAE/MFE failed (non-fatal): %s", _fmexc)
+                    _frecs.append(_rec)
+            if not _frecs:
+                raise RuntimeError(
+                    "[SYNC_FUSED] futures group %s priced to ZERO rows over %d shared "
+                    "windows — refusing a sheet missing a configured futures leg."
+                    % (sym, len(_canon_windows))
+                )
+            _fdf = pd.DataFrame(_frecs)
+            _fdf["Group Index"] = sym
+            group_frames.append(_fdf)
+            # Add / augment this group's meta. A futures-only group had no meta yet;
+            # an opt+fut group already has one (its option-leg count) — leave it.
+            if not any(m.get("index") == sym for m in group_meta):
+                group_meta.append({
+                    "index": sym, "role": ("base" if gid == 0 else "leg"),
+                    "legs": len(glegs), "expiry": group_expiry_by_gid[gid],
+                    "trades": int(_fdf["Trade"].nunique()) if "Trade" in _fdf else 0,
+                    "available": True,
+                })
+    meta["groups"] = group_meta
+
+    if not group_frames:
+        return _empty()
+
+    # ---- 3. Stitch groups by SHARED entry date => one unified cadence trade ----
+    # (Identical fusion + aggregation + parent-row propagation as Path A.)
+    combined = pd.concat(group_frames, ignore_index=True)
+    for c in ("Entry Date", "Exit Date"):
+        if c in combined.columns:
+            combined[c] = pd.to_datetime(combined[c], errors="coerce")
+    if "Leg" not in combined.columns:
+        combined["Leg"] = 1
+    for col in ("CE P&L", "PE P&L", "FUT P&L", "Spot P&L", "Entry Spot", "Exit Spot"):
+        if col not in combined.columns:
+            combined[col] = 0.0
+    combined["_ekey"] = combined["Entry Date"].dt.strftime("%Y-%m-%d").fillna("")
+    _order = sorted(k for k in combined["_ekey"].unique() if k)
+    _ekey_to_trade = {k: i + 1 for i, k in enumerate(_order)}
+    combined["Trade"] = combined["_ekey"].map(_ekey_to_trade).fillna(0).astype(int)
+    combined["Leg"] = pd.to_numeric(combined["Leg"], errors="coerce").fillna(1).astype(int)
+    combined["Index"] = combined["Trade"]
+
+    def _row_leg_pnl(r):
+        try:
+            ep = float(r.get("Entry Price") or 0.0)
+            xp = float(r.get("Exit Price") or 0.0)
+            lots = float(r.get("lots") or 1)
+            pos = str(r.get("B/S") or "SELL").upper()
+            return round(((ep - xp) if pos.startswith("S") else (xp - ep)) * lots, 4)
+        except (TypeError, ValueError):
+            return 0.0
+    combined["_legpnl"] = combined.apply(_row_leg_pnl, axis=1)
+    _es_row = pd.to_numeric(combined["Entry Spot"], errors="coerce").replace(0, np.nan)
+    combined["_legpct"] = (combined["_legpnl"] / _es_row * 100.0).fillna(0.0)
+    combined["Net P&L"] = combined["_legpnl"]
+    combined["% P&L"] = combined["_legpct"]
+
+    # ---- 4. Aggregate per cadence trade + combined base-100 compound equity ----
+    agg_spec = {"Entry Date": "min", "Exit Date": "max", "Entry Spot": "first",
+                "Exit Spot": "first", "Spot P&L": "first",
+                "CE P&L": "sum", "PE P&L": "sum", "FUT P&L": "sum",
+                "_legpnl": "sum", "_legpct": "sum"}
+    if "Exit Reason" in combined.columns:
+        agg_spec["Exit Reason"] = "first"
+    agg = combined.groupby("Trade", as_index=False).agg(agg_spec)
+    agg["Net P&L"] = agg["_legpnl"].round(2)
+    agg["% P&L"] = agg["_legpct"].round(4).fillna(0)
+    agg = agg.sort_values("Entry Date").reset_index(drop=True)
+
+    cum = peak = 100.0
+    cs, ps, ds, pds = [], [], [], []
+    for _, r in agg.iterrows():
+        pct = float(r["% P&L"]) if r["% P&L"] else 0.0
+        cum = cum * (1.0 + pct / 100.0)
+        peak = max(cum, peak)
+        dd = cum - peak
+        pct_dd = (dd / peak) if peak != 0 else 0.0
+        cs.append(cum); ps.append(peak); ds.append(dd); pds.append(pct_dd)
+    agg["Cumulative"], agg["Peak"], agg["DD"], agg["%DD"] = cs, ps, ds, pds
+
+    try:
+        _mini = pd.DataFrame({
+            "Trade": agg["Trade"].values,
+            "Entry Date": pd.to_datetime(agg["Entry Date"]).dt.strftime("%d-%m-%Y").values,
+            "Exit Date": pd.to_datetime(agg["Exit Date"]).dt.strftime("%d-%m-%Y").values,
+            "Entry Spot": [100.0] * len(agg),
+            "Net P&L": agg["% P&L"].values,
+            "% P&L": agg["% P&L"].values,
+        })
+        _out, summary = compute_analytics(_mini)
+    except Exception as exc:
+        logger.warning("[SYNC_FUSED] compute_analytics failed: %s", exc)
+        summary = {}
+    try:
+        _net_pts = pd.to_numeric(agg["Net P&L"], errors="coerce").dropna()
+        if len(_net_pts):
+            summary["total_pnl"] = round(float(_net_pts.sum()), 2)
+            summary["max_win"] = round(float(_net_pts.max()), 2)
+            summary["max_loss"] = round(float(_net_pts.min()), 2)
+            summary["avg_profit_per_trade"] = round(float(_net_pts.mean()), 2)
+    except Exception as exc:
+        logger.warning("[SYNC_FUSED] point-metric restatement failed: %s", exc)
+    try:
+        _sp = combined
+        if "Type" in _sp.columns:
+            _opt_rows = _sp[_sp["Type"].astype(str).str.upper().isin(("CE", "PE"))]
+            if not _opt_rows.empty:
+                _sp = _opt_rows
+        _sp = _sp.sort_values(["Entry Date", "Trade", "Leg"], kind="stable")
+        _es = pd.to_numeric(_sp["Entry Spot"], errors="coerce").replace(0, np.nan).dropna()
+        _xs = pd.to_numeric(_sp["Exit Spot"], errors="coerce").replace(0, np.nan).dropna()
+        if len(_es) and len(_xs):
+            _i, _f = float(_es.iloc[0]), float(_xs.iloc[-1])
+            _days_n = (pd.to_datetime(agg["Exit Date"]).max()
+                       - pd.to_datetime(agg["Entry Date"]).min()).days
+            _ny = max(_days_n / 365.0, 0.01)
+            if _i > 0 and _f > 0:
+                summary["cagr_spot"] = round(100 * ((_f / _i) ** (1.0 / _ny) - 1), 2)
+    except Exception as exc:
+        logger.warning("[SYNC_FUSED] cagr_spot recovery failed: %s", exc)
+    try:
+        pivot = build_pivot(agg, "Exit Date")
+    except Exception:
+        pivot = {"headers": [], "rows": []}
+
+    # ---- 5. Propagate trade-level values onto the parent (first-leg) row ----
+    t2c = {int(r["Trade"]): {k: r.get(k) for k in
+                             ("Cumulative", "Peak", "DD", "%DD", "Spot P&L", "Net P&L", "% P&L")}
+           for _, r in agg.iterrows()}
+    combined = combined.sort_values(["Entry Date", "Trade", "Leg"], kind="stable").reset_index(drop=True)
+    seen = set()
+    parent_gi: Dict[int, str] = {}
+    cc, pc, dc, pdc, sc, npc, ppc = [], [], [], [], [], [], []
+    for _, row in combined.iterrows():
+        tid = int(row["Trade"])
+        if tid in seen:
+            cc.append(None); pc.append(None); dc.append(None); pdc.append(None)
+            _diff_idx = str(row.get("Group Index") or "") != parent_gi.get(tid, "")
+            _rs = row.get("Spot P&L")
+            sc.append(_rs if (_diff_idx and _rs is not None and pd.notna(_rs)) else None)
+            npc.append(row.get("Net P&L")); ppc.append(row.get("% P&L"))
+            continue
+        seen.add(tid)
+        parent_gi[tid] = str(row.get("Group Index") or "")
+        v = t2c.get(tid, {})
+        cc.append(v.get("Cumulative")); pc.append(v.get("Peak")); dc.append(v.get("DD"))
+        pdc.append(v.get("%DD")); sc.append(v.get("Spot P&L"))
+        npc.append(v.get("Net P&L")); ppc.append(v.get("% P&L"))
+    combined["Cumulative"], combined["Peak"], combined["DD"], combined["%DD"] = cc, pc, dc, pdc
+    combined["Spot P&L"] = sc
+    combined["Net P&L"] = npc
+    combined["% P&L"] = ppc
+    combined = combined.drop(columns=[c for c in ("_ekey", "_legpnl", "_legpct") if c in combined.columns])
+
+    records = combined.to_dict("records")
+    _nan_cols = ("Cumulative", "Peak", "DD", "%DD", "Entry Price", "Exit Price",
+                 "Raw Entry Price", "Raw Exit Price", "CE P&L", "PE P&L", "FUT P&L",
+                 "Net P&L", "% P&L", "MAE", "MFE")
+    for row in records:
+        for k in _nan_cols:
+            v = row.get(k)
+            if v is not None:
+                try:
+                    if float(v) != float(v):
+                        row[k] = None
+                except (TypeError, ValueError):
+                    row[k] = None
+    records = _convert_numpy(_format_dates(records))
+    try:
+        from services.multi_index_tradesheet import per_index_summary
+        meta["per_index_summary"] = per_index_summary(records)
+    except Exception:
+        meta["per_index_summary"] = []
+    meta["trades"] = int(agg["Trade"].nunique())
+    logger.info("[SYNC_FUSED] %s cadence, %d cycles, %d groups, 1 fused simulate (%.2fs)",
+                cadence, len(agg), len(group_frames), time.perf_counter() - t0)
+    return {
+        "status": "success",
+        "trades": records,
+        "summary": _convert_numpy(summary),
+        "pivot": _convert_numpy(pivot),
+        "meta": _convert_numpy(meta),
+        "cached": False,
+    }
+
+
 def run_sync_weekly_cadence(
     payload: Dict[str, Any],
     effective_from: Optional[str],
@@ -1952,11 +3503,78 @@ def run_sync_weekly_cadence(
     def _is_weekly(l):
         return _leg_expiry(l, default_expiry).startswith("WEEK")
 
+    def _is_yearly_opt(l):
+        # A genuinely long-dated (YEARLY) OPTION leg. Futures never take this path.
+        return (
+            str(l.get("expiry") or l.get("expiry_type") or "").upper().startswith("YEAR")
+            and str(l.get("segment") or "OPTIONS").upper() not in ("FUTURE", "FUTURES")
+        )
+
+    # NEW per-index synced-engine path (opt-in within this opt-in path): reached
+    # ONLY when the strategy mixes a genuinely YEARLY option leg with at least one
+    # real non-yearly (monthly/weekly) leg. The old "one base engine run + overlay
+    # re-pricing" core below cannot express this (a yearly leg pinned to the merged
+    # near-month contract loses December — BUG A — and an overlay leg can never fire
+    # its own spot-adjustment — BUG B). Every config WITHOUT a yearly option leg
+    # (single-index never reaches here; the same-frequency monthly+monthly and mixed
+    # weekly+monthly shapes) falls straight through to the untouched original code,
+    # so Shape A and every previously-verified behaviour is byte-identical.
+    _yearly_here = [l for l in legs if _is_yearly_opt(l)]
+    _nonyearly_here = [l for l in legs if not _is_yearly_opt(l)]
+    if _yearly_here and _nonyearly_here:
+        # Path B (FUSED): price BOTH index groups' legs together in ONE
+        # simulate_trades_batch so a breach in either leg cuts BOTH (true
+        # cross-index synchronized cut). AUTO-ROUTED when the config can use it —
+        # i.e. at least one leg has active spot_adjustment AND no leg carries
+        # SL/Target/Trail/Buffer (the fused path does not price those yet; they run
+        # post-simulate and are skipped by return_specs_only). Configs with
+        # SL/Target/Trail/Buffer, or with NO spot_adjustment, fall back to Path A
+        # (per-index) — which for a no-spot-adj config is byte-identical to fused.
+        # The explicit flag still forces fused (opt-in override).
+        def _sa_active(l):
+            _sa = l.get("spot_adjustment")
+            return isinstance(_sa, dict) and bool(_sa.get("enabled"))
+
+        def _has_sltp(l):
+            for _k in ("stopLoss", "targetProfit", "trailSL", "slWithBuffer"):
+                _v = l.get(_k)
+                if isinstance(_v, dict) and _v:
+                    return True
+            return False
+
+        # A real FUTURES leg is ONLY supported by the fused path (Path A hits the
+        # engine's YEARLY+FUTURES blocker and errors). So a futures leg forces fused
+        # too — not just active spot_adjustment. Path A never traded a futures config
+        # (it raised), so nothing existing is changed by routing it to fused.
+        _has_fut = any(
+            str(l.get("segment") or "").upper() in ("FUTURE", "FUTURES") for l in legs
+        )
+        _explicit_fused = bool(
+            payload.get("multi_index_sync_fused") or payload.get("cross_index_cut")
+        )
+        _auto_fused = (
+            (any(_sa_active(l) for l in legs) or _has_fut)
+            and not any(_has_sltp(l) for l in legs)
+        )
+        if _explicit_fused or _auto_fused:
+            return _run_sync_fused_groups(
+                payload, effective_from, effective_to, legs,
+                default_index, default_expiry,
+            )
+        return _run_sync_per_index_groups(
+            payload, effective_from, effective_to, legs,
+            default_index, default_expiry,
+        )
+
     # Cadence = shortest expiry. cadence_index = index of the first shortest leg.
     weekly_legs = [l for l in legs if _is_weekly(l)]
     if weekly_legs:
         cadence = "WEEKLY"
-        cadence_index = _leg_index(weekly_legs[0], default_index)
+        # Driving index chosen from the data, not from leg position — this
+        # also decides which legs run through the FULL engine (base) and
+        # which get the thinner overlay re-pricing, so leg order used to
+        # decide which legs were second-class. See _canonical_cadence.
+        cadence_index = _canonical_cadence(weekly_legs, default_index)[0]
         base_legs = [l for l in legs if _is_weekly(l) and _leg_index(l, default_index) == cadence_index]
     else:
         cadence = "MONTHLY"
@@ -2067,7 +3685,7 @@ def run_sync_weekly_cadence(
     # built, so behaviour is never worse than before.
     # The base engine run holds ONE contract per cycle, so the cycle contract must come
     # from the base legs' OWN segment calendar — a futures-first base rolls on FUT%.
-    _cadence_segment = _leg_segment(base_legs[0])
+    _cadence_segment = _canonical_group_segment(base_legs)
     _cycles, _bounds = _build_sync_cycles(legs, cadence, cadence_index, default_index,
                                           default_expiry, effective_from, effective_to, payload,
                                           _cadence_segment)
@@ -2088,7 +3706,7 @@ def run_sync_weekly_cadence(
         # this sync path — so genuine YEARLY and plain weekly/monthly runs are
         # untouched. This states what the block above already intends: "the base
         # engine run holds ONE contract per cycle".
-        sub["legs"] = [dict(_l, expiry="YEARLY") for _l in base_legs]
+        sub["legs"] = [dict(_l, expiry="YEARLY", _sa_label_expiry=str(_l.get("expiry") or _l.get("expiry_type") or "").upper()) for _l in base_legs]
         sub["yearly_cycles"] = _cycles
         # The merged boundaries ARE the cadence: in Rust the cadence list drives
         # entry/exit while yearly_cycles only pins the contract (simulate.rs:477).
@@ -2145,8 +3763,19 @@ def run_sync_weekly_cadence(
                                               yearly_roll_months=payload.get("yearly_roll_months"),
                                               yearly_cycles=_yr_leg_cycles)
         except Exception as exc:
-            logger.warning("[SYNC_CADENCE] overlay failed: %s", exc)
-            ov_rows = []
+            # A configured leg must NEVER disappear from a tradesheet quietly.
+            # This used to swallow the failure and return status="success" with
+            # the overlay legs simply absent -- and which legs are "overlay" is
+            # decided by the cadence index, so leg order decided which legs
+            # could silently vanish. Path A (_run_sync_per_index_groups:2174)
+            # and the fused path already raise here; this now matches them.
+            raise RuntimeError(
+                "[SYNC_CADENCE] overlay pricing failed for %d leg(s) on %s: %s. "
+                "Refusing to return a tradesheet missing configured legs."
+                % (len(overlay_legs),
+                   sorted({_leg_index(l, default_index) for l in overlay_legs}),
+                   exc)
+            ) from exc
 
     # ---- 3. Combine: base + overlay share the base Trade#s => unified cadence ----
     for col in ("CE P&L", "PE P&L", "FUT P&L", "Spot P&L", "Entry Spot", "Exit Spot"):

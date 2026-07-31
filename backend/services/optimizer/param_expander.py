@@ -220,6 +220,12 @@ _STRADDLE_WIDTH_RE = re.compile(
 )
 # _SPOT_ADJ_KEYS is defined above (near _GATED_PARAMS) so the gating rule can
 # reference it at module load.
+# Per-leg ("own") spot adjustment sweep keys: legs[N].spot_adjustment.{pct,
+# direction,units,enabled}. Matched so apply_combo_for_optim can enable the leg's
+# own adjustment when the sweep touches it (see below).
+_PER_LEG_SA_RE = re.compile(
+    r"^legs\[(\d+)\]\.spot_adjustment\.(pct|direction|units|enabled)$"
+)
 
 
 def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dict[str, Any]:
@@ -272,6 +278,29 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
             new_payload["midcap_spot_adjustment"] = msa
         msa["enabled"] = True
         msa.setdefault("units", "percent")
+
+    # Per-leg ("own") spot adjustment: when a combo sweeps legs[N].spot_adjustment.*,
+    # ensure that leg's dict is enabled with sane defaults so the swept value takes
+    # effect — mirroring the strategy-level (spot_adj_implied) and midcap logic above.
+    # The engine reads leg.spot_adjustment={enabled,pct,units,direction}
+    # (engine_rust.py::_resolve_leg_sa). apply_combo's _set_by_path already created
+    # the nested dict when it applied the swept pct/direction/units; this only forces
+    # enabled and fills unit/direction defaults. An explicit `enabled` sweep (the
+    # "No Adj" combo) is respected — it is NOT overridden.
+    _pl_sa_idxs = set()
+    for _k in combo:
+        _mm = _PER_LEG_SA_RE.match(str(_k))
+        if _mm:
+            _pl_sa_idxs.add(int(_mm.group(1)))
+    for _li in _pl_sa_idxs:
+        _sa = get_by_path(new_payload, f"legs[{_li}].spot_adjustment", None)
+        if not isinstance(_sa, dict):
+            _sa = {}
+            _set_by_path(new_payload, f"legs[{_li}].spot_adjustment", _sa)
+        if f"legs[{_li}].spot_adjustment.enabled" not in combo:
+            _sa["enabled"] = True
+        _sa.setdefault("units", "percent")
+        _sa.setdefault("direction", "rise")
 
     for path in combo:
         m = _STRIKE_VALUE_RE.match(path)

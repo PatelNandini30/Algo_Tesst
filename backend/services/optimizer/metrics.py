@@ -63,6 +63,12 @@ def per_leg_pnl(trades: pd.DataFrame) -> Dict[str, float]:
     """
     ce_col = next((c for c in ("Call P&L", "CE P&L", "call_pnl") if c in trades.columns), None)
     pe_col = next((c for c in ("Put P&L", "PE P&L", "put_pnl") if c in trades.columns), None)
+    # FUT P&L — a real tradeable futures leg (multi-index sync / futures strategies).
+    # _write_summary_sheet already renders a FUT P&L row in the per-combo Summary sheet;
+    # emit the matching total/pct here so the MASTER summary's per-type breakdown includes
+    # the futures leg too (otherwise a 3-leg NIFTY-PE + MIDCP-CE + MIDCP-FUT combo shows
+    # CE+PE in the final summary but silently drops the dominant FUT P&L).
+    fut_col = next((c for c in ("FUT P&L", "Fut P&L", "fut_pnl") if c in trades.columns), None)
     spot_col = next((c for c in ("Spot P&L", "spot_pnl") if c in trades.columns), None)
 
     def _s(col):
@@ -72,20 +78,24 @@ def per_leg_pnl(trades: pd.DataFrame) -> Dict[str, float]:
 
     ce_s = _s(ce_col)
     pe_s = _s(pe_col)
+    fut_s = _s(fut_col)
     spot_s = _s(spot_col)
 
     ce_total = float(ce_s.sum())
     pe_total = float(pe_s.sum())
+    fut_total = float(fut_s.sum())
     spot_total = float(spot_s.sum())
 
     if "Entry Spot" in trades.columns:
         es = pd.to_numeric(trades["Entry Spot"].replace("", np.nan), errors="coerce").replace(0, np.nan)
         ce_pnl_pct = round(float((ce_s / es).fillna(0).sum() * 100), 4)
         pe_pnl_pct = round(float((pe_s / es).fillna(0).sum() * 100), 4)
+        fut_pnl_pct = round(float((fut_s / es).fillna(0).sum() * 100), 4)
         long_spot_pnl_pct = round(float((spot_s / es).fillna(0).sum() * 100), 4)
     else:
         ce_pnl_pct = 0.0
         pe_pnl_pct = 0.0
+        fut_pnl_pct = 0.0
         long_spot_pnl_pct = 0.0
 
     return {
@@ -93,6 +103,8 @@ def per_leg_pnl(trades: pd.DataFrame) -> Dict[str, float]:
         "ce_pnl_pct": ce_pnl_pct,
         "pe_pnl_total": round(pe_total, 2),
         "pe_pnl_pct": pe_pnl_pct,
+        "fut_pnl_total": round(fut_total, 2),
+        "fut_pnl_pct": fut_pnl_pct,
         "long_spot_pnl": round(spot_total, 2),
         "long_spot_pnl_pct": long_spot_pnl_pct,
     }

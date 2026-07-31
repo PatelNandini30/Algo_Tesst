@@ -61,7 +61,19 @@ OPTIM_PARQUET_DIR = os.getenv("OPTIMIZE_PARQUET_DIR", "/data/cache/optim_results
 # always agree on the filename. Bump ZIP_BUILDER_VERSION when the XLSX format
 # changes and old ZIPs must be invalidated.
 ZIP_CACHE_DIR = os.getenv("OPTIMIZE_ZIP_DIR", "/data/cache/optim_zips")
-ZIP_BUILDER_VERSION = "v16"
+ZIP_BUILDER_VERSION = "v22"  # v22: value ramp compressed into the palest
+                             #      band of the hue (mostly-negative data)
+                             # v21: cool-rose sequential value ramp +
+                             #      uniform 3-row margin after every table
+                             # v20: MIN grids REMOVED from the merged WOW/MOM
+                             #      summary (per-combo tradesheets keep them);
+                             #      grid colours now reuse the sheet's theme
+                             # v19: MIN-grid formatting — 2dp display (full value
+                             #      kept for formulas), light->dark value ramp,
+                             #      ramped headers, 2-row margins
+                             # v18: Min-of-Final-MAE / Min-of-Actual-Live-DD grids
+                             #      under each WOW & MOM block
+                             # v17: per-combo leg-wise "Rules" first sheet added
 
 
 def zip_cache_path(job_id: str, patchwise: bool = False) -> str:
@@ -71,11 +83,63 @@ def zip_cache_path(job_id: str, patchwise: bool = False) -> str:
     return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ver}.zip")
 
 
+# Bumped on its own when only the WOW/MOM grid LAYOUT changes, so those
+# workbooks rebuild without invalidating (and re-running) every cached ZIP.
+#   wm2 — blocks flow horizontally and wrap into bands instead of stacking.
+WOW_MOM_LAYOUT_VERSION = "wm4"   # wm4: pivot sheets tile 3-across then stack
+                                # wm3: MIN pivots moved to their own
+                                #      captioned per-combo sheets
+
+
 def wow_mom_cache_path(job_id: str, patchwise: bool = False) -> str:
     """Canonical path for a job's pre-built WOW/MOM XLSX file."""
     os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
     suffix = "-pw" if patchwise else ""
-    return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ZIP_BUILDER_VERSION}-wm{suffix}.xlsx")
+    return os.path.join(
+        ZIP_CACHE_DIR,
+        f"{job_id}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.xlsx",
+    )
+
+
+def ensure_xlsx_version(job_id: str) -> int:
+    """Drop a job's per-combo XLSX when they were built by an older builder.
+
+    Unlike the ZIP and WOW/MOM caches, these live at a bare
+    `trades_dir/[patchwise/]{label}.xlsx` with NO version in the path — the ZIP
+    fast-path matches them by label, so the filename can't carry one. Result: a
+    formatting change shipped fine but every download kept serving the old
+    workbook off disk, twice in a row. A version marker beside them gives the
+    same invalidation without touching the names. Returns the count removed.
+    """
+    import glob
+    try:
+        trades_dir = get_trades_dir(job_id)
+        if not os.path.isdir(trades_dir):
+            return 0
+        marker = os.path.join(trades_dir, ".xlsx_builder_version")
+        current = f"{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}"
+        try:
+            with open(marker) as fh:
+                if fh.read().strip() == current:
+                    return 0
+        except OSError:
+            pass          # no marker yet → pre-versioning build, treat as stale
+        removed = 0
+        for path in glob.glob(os.path.join(trades_dir, "**", "*.xlsx"), recursive=True):
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+        with open(marker, "w") as fh:
+            fh.write(current)
+        if removed:
+            logger.info("[OPTIM_STORE] cleared %d stale per-combo XLSX for %s (builder %s)",
+                        removed, job_id[:8], current)
+        return removed
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] xlsx version check failed (%s): %s", job_id[:8], exc)
+        return 0
 
 
 def patchwise_summary_cache_path(job_id: str) -> str:
@@ -362,6 +426,24 @@ def get_all_results(job_id: str) -> List[Dict[str, Any]]:
     return _dedupe_by_label([json.loads(x) for x in raw])
 
 
+def get_all_results_raw(job_id: str) -> List[Dict[str, Any]]:
+    """Every result row, in insertion order, WITHOUT `_dedupe_by_label`.
+
+    Collapsing (combo_label, total_pnl) duplicates is right for the results
+    table, but wrong for anything that has to line up against the per-combo
+    artifacts on disk: the sweep wrote a tradesheet CSV for EVERY combo, so a
+    deduped read leaves the dropped combos' CSVs with no metadata at all. The
+    WOW/MOM grid then fell back to raw filenames for those, which also flipped
+    their adj_key from "NoAdjustment" to "No Adj" — splitting one adjustment
+    into two misaligned column groups. Use this wherever combo_label_safe is
+    the join key.
+    """
+    r = _redis()
+    if r is None:
+        return []
+    return [json.loads(x) for x in r.lrange(_results_key(job_id), 0, -1)]
+
+
 def get_combo_by_id(job_id: str, combo_id: int) -> Optional[Dict[str, Any]]:
     """
     Return the result row for a specific combo_id (1-indexed integer).
@@ -494,6 +576,7 @@ def write_combo_xlsx(
     midcap_symbol: str = "NIFTYMIDCAP100",
     filter_segments=None,
     yearly: bool = False,
+    rules_sheet=None,
 ) -> None:
     """Write a single combo's XLSX tradesheet to disk (called per-combo during execution).
 
@@ -541,6 +624,7 @@ def write_combo_xlsx(
             midcap_symbol=midcap_symbol,
             filter_segments=filter_segments,
             yearly=yearly,
+            rules_sheet=rules_sheet,
         )
         dirpath = get_trades_dir(job_id)
         os.makedirs(dirpath, exist_ok=True)
@@ -567,6 +651,7 @@ def write_combo_xlsx_patchwise(
     filter_name: str = "",
     filter_segments=None,
     yearly: bool = False,
+    rules_sheet=None,
 ) -> None:
     """Write a combo's PATCHWISE XLSX tradesheet directly from trades_df during
     the run — same builder the finalization/download uses, just fed the in-memory
@@ -612,6 +697,7 @@ def write_combo_xlsx_patchwise(
             patchwise=True,
             filter_segments=filter_segments,
             yearly=yearly,
+            rules_sheet=rules_sheet,
         )
         dirpath = os.path.join(get_trades_dir(job_id), "patchwise")
         os.makedirs(dirpath, exist_ok=True)

@@ -253,8 +253,19 @@ export default function OptimizationResults({
         fetch(`/api/optimize/jobs/${jobId}?only_if_active=true`, { method: 'DELETE', keepalive: true });
       } catch {}
     };
-    window.addEventListener('pagehide', cancelOnExit);
-    return () => window.removeEventListener('pagehide', cancelOnExit);
+    // Only cancel on a REAL exit. `pagehide` also fires on reload/navigation, so
+    // a plain F5 was killing running optims (and leaking their memory-gate
+    // reservation, which then blocked every later job). Reload/back-forward set
+    // persisted=true or report a "reload"/"back_forward" navigation type — skip
+    // those; a genuine tab/window close reports "navigate" with persisted=false.
+    const onPageHide = (e) => {
+      if (e.persisted) return;
+      const nav = performance.getEntriesByType?.('navigation')?.[0]?.type;
+      if (nav === 'reload' || nav === 'back_forward') return;
+      cancelOnExit();
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => window.removeEventListener('pagehide', onPageHide);
   }, [jobId, status]);
 
   // Pre-build the ZIP silently as soon as the job succeeds so it's ready
@@ -362,7 +373,7 @@ export default function OptimizationResults({
     // Shared builder (utils/optimSummaryExport.js) — identical logic path
     // used by the auto-download queue, so a manual export and an
     // auto-downloaded one are always byte-for-byte the same.
-    const blob = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId);
+    const blob = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId, meta?.base_payload);
     triggerBlobDownload(blob, rulesFilename(ruleConfig, jobId, jobDownloadIsPatchwise ? '_patchwise' : '_overall'));
   }
 

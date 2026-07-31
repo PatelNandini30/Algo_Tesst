@@ -3,6 +3,11 @@ import StrategyBuilder from './components/StrategyBuilder';
 
 const HEALTH_POLL_MS = 2000;
 const HEALTH_CHECK_TIMEOUT_MS = 4000;
+// Show the "backend unavailable" overlay only after this many CONSECUTIVE failed
+// health polls, so a quick backend restart/redeploy (a few seconds of downtime)
+// no longer flashes the overlay. A single successful poll clears it immediately.
+// At a 2s poll interval, 3 failures ≈ 4-6s of sustained downtime before it shows.
+const HEALTH_FAIL_THRESHOLD = 3;
 
 function App() {
   const [resetKey, setResetKey] = useState(0);
@@ -14,6 +19,7 @@ function App() {
   // a normal page load doesn't flash the overlay before the first check.
   const [backendUp, setBackendUp] = useState(true);
   const pollRef = useRef(null);
+  const failCountRef = useRef(0);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -33,9 +39,18 @@ function App() {
       const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
       try {
         const r = await fetch('/health', { signal: controller.signal, cache: 'no-store' });
-        if (!cancelled) setBackendUp(r.ok);
+        if (cancelled) return;
+        if (r.ok) {
+          failCountRef.current = 0;      // recovered — clear immediately
+          setBackendUp(true);
+        } else {
+          failCountRef.current += 1;
+          if (failCountRef.current >= HEALTH_FAIL_THRESHOLD) setBackendUp(false);
+        }
       } catch {
-        if (!cancelled) setBackendUp(false);
+        if (cancelled) return;
+        failCountRef.current += 1;       // network error / timeout counts as a failure
+        if (failCountRef.current >= HEALTH_FAIL_THRESHOLD) setBackendUp(false);
       } finally {
         clearTimeout(timer);
       }

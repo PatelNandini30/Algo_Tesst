@@ -128,6 +128,15 @@ def _spot_adjustment_label(payload: Dict[str, Any]) -> str:
 
 
 def _expiry_label(payload: Dict[str, Any]) -> str:
+    # YEARLY holds the long-dated December contract while re-booking on a separate
+    # weekly/monthly cadence. It has no weekly/monthly "expiry_window", so the
+    # fall-through below mislabelled it "Monthly". Surface it (with the roll
+    # cadence) instead.
+    if str(payload.get("expiry_type") or "").upper() == "YEARLY":
+        cadence = str(payload.get("rollover_cadence") or "").lower()
+        if cadence in ("weekly", "monthly"):
+            return "Yearly_" + cadence[:1].upper() + cadence[1:]
+        return "Yearly"
     legs = payload.get("legs") or []
     leg_expiries = {
         (leg.get("expiry") or "").lower()
@@ -330,6 +339,40 @@ def _midcpnifty_spot_adjustment_label(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _per_leg_spot_adjustment_label(payload: Dict[str, Any]) -> str:
+    """Per-leg ("own") spot adjustment label, e.g. 'L1RiseBy1%_L2RiseBy1000pts'.
+
+    Empty unless at least one leg carries its OWN enabled spot_adjustment dict, so
+    a strategy that uses only the strategy-level knob (or none) gets a byte-identical
+    label/filename to before. Distinguishes combos that sweep a leg's own threshold
+    / direction / units. Mirrors _spot_adjustment_label's Rise/Falls/Move wording.
+    """
+    segs: List[str] = []
+    for _i, leg in enumerate(payload.get("legs") or [], start=1):
+        if not isinstance(leg, dict):
+            continue
+        sa = leg.get("spot_adjustment")
+        if not isinstance(sa, dict) or not sa.get("enabled"):
+            continue
+        try:
+            pct = float(sa.get("pct") or sa.get("value") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        units = str(sa.get("units") or "percent").lower()
+        pct_str = f"{pct:g}pts" if units == "points" else f"{pct:g}%"
+        direction = str(sa.get("direction") or "").lower()
+        if direction in ("up", "rise", "rises"):
+            word = f"RiseBy{pct_str}"
+        elif direction in ("down", "fall", "falls"):
+            word = f"FallsBy{pct_str}"
+        elif direction in ("both", "either", "any"):
+            word = f"MoveBy{pct_str}"
+        else:
+            word = f"AdjustBy{pct_str}"
+        segs.append(f"L{_i}{word}")
+    return "_".join(segs)
+
+
 def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     """
     Inspect a (combo-applied) payload and return the master-summary columns
@@ -402,17 +445,45 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     midcp_adj_seg = _midcpnifty_spot_adjustment_label(payload)
     if midcp_adj_seg:
         parts.append(midcp_adj_seg)
-    parts.append(spot_adj)
+    per_leg_adj_seg = _per_leg_spot_adjustment_label(payload)
+    if per_leg_adj_seg:
+        parts.append(per_leg_adj_seg)
+    # Strategy-level token in the FILENAME: only when it's a REAL strategy-level
+    # adjustment, OR when no other adjustment token exists (so a genuinely-unadjusted
+    # combo still reads "NoAdjustment"). Without this, a combo that sweeps a leg's OWN
+    # spot_adjustment (or the midcap/midcpnifty overlay) also carried a redundant
+    # "NoAdjustment" — filing an adjusted combo under the "No Adjustment" folder.
+    # Mirrors the spot_adjustment_col logic below so filename == column.
+    if payload.get("spot_adjustment_enabled") or not (
+        per_leg_adj_seg or midcap_adj_seg or midcp_adj_seg
+    ):
+        parts.append(spot_adj)
     parts.append(f"{expiry}_Expiry")
     parts.append(shift)
     combo_label = "_".join(parts)
+
+    # The master-summary "Spot Adjustment" column must reflect ANY active
+    # adjustment, not just the strategy-level knob. A run that sweeps a leg's OWN
+    # spot_adjustment (legs[N].spot_adjustment.*) or the midcap/midcpnifty overlay
+    # otherwise shows "NoAdjustment" on every row even though the combos differ.
+    # Combine the active labels in the same order as combo_label.
+    _adj = []
+    if payload.get("spot_adjustment_enabled"):
+        _adj.append(spot_adj)          # strategy-level RiseBy.. / FallsBy.. etc.
+    if midcap_adj_seg:
+        _adj.append(midcap_adj_seg)
+    if midcp_adj_seg:
+        _adj.append(midcp_adj_seg)
+    if per_leg_adj_seg:
+        _adj.append(per_leg_adj_seg)   # e.g. L2RiseBy1000pts
+    spot_adjustment_col = "_".join(_adj) if _adj else "NoAdjustment"
 
     return {
         "expiry": expiry,
         "shifting": shift,
         "put_strike_label": put_strike,
         "call_strike_label": call_strike,
-        "spot_adjustment": spot_adj,
+        "spot_adjustment": spot_adjustment_col,
         "combo_label": combo_label,
     }
 

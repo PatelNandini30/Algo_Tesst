@@ -6,6 +6,7 @@
  */
 import { resolveDownloadBase } from './downloadBase';
 import { MASTER_SUMMARY_COLUMNS } from './strategyParamSchema';
+import { buildRulesSheet } from './backtestRulesSheet';
 
 const VARIES = 'Varies — see column below';
 
@@ -63,6 +64,8 @@ export function buildRuleRows(ruleConfig) {
   push('Index', ruleConfig.index);
   pushOrVaries('Option Type(s)', ruleConfig.optionTypes, swept.legs);
   pushOrVaries('Legs', ruleConfig.legs, swept.legs);
+  // Per-leg breakdown — which leg carries which strike / gap / own adjustment.
+  (ruleConfig.legDetails || []).forEach(({ label, value }) => push(label, value));
   // Per-leg, options-only; omitted when unknown (e.g. a futures-only strategy).
   if (ruleConfig.strikeGap && ruleConfig.strikeGap !== '—') push('Strike Gap', ruleConfig.strikeGap);
   pushOrVaries('Expiry', ruleConfig.expiry, swept.expiry);
@@ -89,7 +92,82 @@ export function buildRuleRows(ruleConfig) {
  * patchwise-recomputed metrics (from GET .../summary?patchwise=true) to match
  * the patchwise ZIP; omit it to use each row's own (overall) summary.
  */
-export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId) {
+// ── "Optimized Parameters" section for the master-summary Rules sheet ────────
+// Turns the sweep specs (param_specs) into readable rows: which axis was
+// optimized, its values/range, and how many. So the master summary shows the
+// COMBINATION space the run explored (the per-combo tradesheets show concretes).
+function _humanParamLabel(path) {
+  const p = String(path || '');
+  const m = p.match(/^legs\[(\d+)\]\.(.+)$/);
+  const legPrefix = m ? `Leg ${Number(m[1]) + 1} ` : '';
+  const key = m ? m[2] : p;
+  const LEG = {
+    'strike_selection.strike_type': 'Strike Type',
+    'strike_selection.value': 'Strike %',
+    'strike_selection.offset': 'Strike Offset (gaps)',
+    'strike_selection.straddle_multiplier': 'Straddle Width',
+    'strike_selection.straddle_direction': 'Straddle Direction',
+    'spot_adjustment.pct': 'Own Spot Adjustment',
+    'spot_adjustment.direction': 'Own Spot Adj Direction',
+    'spot_adjustment.enabled': 'Own Spot Adj On/Off',
+    'spot_adjustment.units': 'Own Spot Adj Unit',
+    'stopLoss.value': 'Stop Loss',
+    'slWithBuffer.value': 'SL Buffer',
+    'trailSL.trigger': 'Trail SL Trigger',
+    'trailSL.move': 'Trail SL Move',
+    'targetProfit.value': 'Target',
+    'slippage_pct': 'Slippage %',
+    'expiry': 'Expiry',
+  };
+  const TOP = {
+    'spot_adjustment_pct': 'Spot Adjustment',
+    'spot_adjustment_direction': 'Spot Adjustment Direction',
+    'spot_adjustment_enabled': 'Spot Adjustment On/Off',
+    'expiry_type': 'Expiry',
+    'rollover_toggle': 'Rollover On/Off',
+    'no_rollover': 'No-Rollover On/Off',
+    'slippage_pct': 'Slippage %',
+    'charges_enabled': 'Cost / Charges',
+    'entry_dte': 'Entry DTE',
+    'exit_dte': 'Exit DTE',
+  };
+  return m ? legPrefix + (LEG[key] || key) : (TOP[key] || key);
+}
+
+function _specValuesLabel(spec) {
+  if (!spec) return '';
+  if (spec.kind === 'enum') {
+    const vals = (spec.values || []).map(v => v === true ? 'On' : v === false ? 'Off' : String(v));
+    return { text: vals.join(', '), count: vals.length };
+  }
+  if (spec.kind === 'range') {
+    const { min, max, step } = spec;
+    const nums = [];
+    if ([min, max, step].every(Number.isFinite) && step > 0 && max >= min) {
+      for (let v = min; v <= max + 1e-9 && nums.length <= 64; v += step) nums.push(Math.round(v * 1000) / 1000);
+    }
+    if (min === max) return { text: String(min), count: 1 };
+    const text = (nums.length && nums.length <= 8)
+      ? nums.join(', ')
+      : `${min} to ${max}${step ? ` (step ${step})` : ''}`;
+    return { text, count: nums.length || null };
+  }
+  return { text: '', count: null };
+}
+
+export function buildOptimizedParamsRows(paramSpecs, comboCount) {
+  const specs = Array.isArray(paramSpecs) ? paramSpecs.filter(s => s && s.path) : [];
+  if (!specs.length) return [];
+  const rows = [['section', `OPTIMIZED PARAMETERS${comboCount ? `  (${comboCount} combinations)` : ''}`]];
+  for (const spec of specs) {
+    const { text, count } = _specValuesLabel(spec);
+    const value = count ? `${text}  (${count})` : text;
+    rows.push(['kv', _humanParamLabel(spec.path), value || '—']);
+  }
+  return rows;
+}
+
+export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId, basePayload) {
   // The WORKBOOK is built on the backend (services/optimizer/summary_workbook.py), so
   // every .xlsx this product emits comes from one builder — openpyxl, server-side:
   //   tradesheet -> excel_builder.build_combo_xlsx
@@ -107,10 +185,42 @@ export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo,
     combo_columns: row.combo_columns || {},
   }));
   const base = await resolveDownloadBase(jobId);
+
+  // Leg-wise "Rules" sheet — the SAME buildRulesSheet the backtest download uses,
+  // so the optim master summary gets an identical first "Rules" sheet (per-leg
+  // strike/gap/own-adjustment, Midcap leg, per-leg slippage, fresh/fixed). Needs
+  // the raw base_payload; the caller passes it, else fetch it from the job meta.
+  let bp = basePayload;
+  let paramSpecs = [];
+  if (jobId) {
+    // Always fetch the meta so we have param_specs (the sweep axes) for the
+    // "Optimized Parameters" section — and use its base_payload when the caller
+    // didn't pass one.
+    try {
+      const mr = await fetch(`${base}/api/optimize/jobs/${jobId}`);
+      if (mr.ok) {
+        const md = await mr.json();
+        const meta = md?.meta || md || {};
+        if (!bp) bp = meta.base_payload || md?.base_payload || null;
+        paramSpecs = meta.param_specs || md?.param_specs || [];
+      }
+    } catch { /* fall back to no Rules sheet / no optimized-params section */ }
+  }
+  const filterName = (ruleConfig?.filter && ruleConfig.filter !== 'No Filter') ? ruleConfig.filter : null;
+  let rulesSheet = null;
+  try { if (bp) rulesSheet = buildRulesSheet(bp, filterName); } catch { rulesSheet = null; }
+  // Append the swept combination space (which axes were optimized + their values).
+  try {
+    if (rulesSheet && paramSpecs && paramSpecs.length) {
+      const optRows = buildOptimizedParamsRows(paramSpecs, Array.isArray(rows) ? rows.length : 0);
+      if (optRows.length) rulesSheet = [...rulesSheet, ['spacer'], ...optRows];
+    }
+  } catch { /* optimized-params section is best-effort */ }
+
   const res = await fetch(`${base}/api/optimize/jobs/${jobId}/summary.xlsx`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rows: payloadRows, rule_rows: buildRuleRows(ruleConfig) }),
+    body: JSON.stringify({ rows: payloadRows, rule_rows: buildRuleRows(ruleConfig), rules_sheet: rulesSheet }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
