@@ -123,6 +123,26 @@ class TestWhitelistFailsClosed(unittest.TestCase):
         self.assertIsNotNone(rust_batch_unsupported(None))
         self.assertIsNotNone(rust_batch_unsupported({"legs": [42]}))
 
+    def test_per_leg_filter_is_unsupported(self):
+        leg = {"option_type": "CE", "position": "SELL",
+               "filter_segments": [{"start": "2025-04-05", "end": "2025-06-05"}]}
+        self.assertEqual(rust_batch_unsupported({"legs": [leg]}), "leg_filter")
+
+    def test_empty_per_leg_filter_is_still_supported(self):
+        # Uploaded-then-cleared must not push the combo off the Rust batch.
+        leg = {"option_type": "CE", "position": "SELL", "filter_segments": []}
+        self.assertIsNone(rust_batch_unsupported({"legs": [leg]}))
+
+
+class TestParamExpanderPreservesPerLegFilter(unittest.TestCase):
+    def test_param_expander_preserves_per_leg_filter_segments(self):
+        from services.optimizer.param_expander import apply_combo_for_optim
+        base = {"legs": [{"option_type": "CE", "position": "SELL",
+                          "filter_segments": [{"start": "2025-04-05",
+                                               "end": "2025-06-05"}]}]}
+        out = apply_combo_for_optim(base, {"legs[0].stopLoss.value": 30})
+        self.assertEqual(len(out["legs"][0]["filter_segments"]), 1)
+
 
 class TestHardFailNoFallback(unittest.TestCase):
     """Authoritative mode must HARD-FAIL on unsupported combos — never fall back."""

@@ -190,6 +190,12 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
             return "midcap"
         if _truthy(p.get("filter_segments")) or _truthy(p.get("filter_config")):
             return "filter"
+        # Per-leg individual filter files are applied by the Python spec
+        # post-pass (services/leg_filter.py); the Rust batch has no notion of
+        # them and would price the masked leg over its full window.
+        for _leg in (p.get("legs") or []):
+            if isinstance(_leg, dict) and _truthy(_leg.get("filter_segments")):
+                return "leg_filter"
         if _truthy(p.get("overall_sl_value")) or _truthy(p.get("overall_target_value")):
             return "overall_sl_target"  # Phase 0b (SL scan) not yet extracted
         # YEARLY pins the contract to a December expiry while the cadence list
