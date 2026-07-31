@@ -49,6 +49,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "anchor_row",
+    "exit_anchor_row",
     "trade_net_pnl",
     "trade_entry_spot",
     "trade_pct_pnl",
@@ -155,6 +156,35 @@ def anchor_row(
         date_key = _date_sort_key(_first_present(row, _DATE_KEYS))
         leg_no = _num(_first_present(row, _LEG_KEYS))
         # Maximise (date, -leg) => latest date, then lowest leg number.
+        key = (date_key, -(leg_no if leg_no is not None else 0.0))
+        if best_key is None or key > best_key:
+            best, best_key = row, key
+    return best
+
+
+def exit_anchor_row(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The row that fixes this trade's Exit Date / Exit Reason.
+
+    Among the rows GIVEN, the one with the LATEST Exit Date wins; ties broken
+    by the LOWEST Leg number (same tie-break shape as anchor_row(), but on
+    exit rather than entry). Returns None for an empty input.
+
+    SPLIT OF RESPONSIBILITY -- read before reusing this: this function does
+    NOT know about LEG_FILTER_END. A leg truncated by its own per-leg filter
+    file exits before the trade actually ends, so a row like that must not be
+    allowed to define the trade's exit. It is the CALLER's job to drop any row
+    whose Exit Reason contains "LEG_FILTER_END" before calling this helper --
+    and, if every row of a trade was truncated (so the filtered set is empty),
+    to fall back to passing the full, unfiltered row set so the trade never
+    ends up with no Exit Date at all. See the exclusion + fallback in
+    services/algotest_job.py's per-trade aggregation for the reference caller.
+    """
+    best: Optional[Dict[str, Any]] = None
+    best_key: Optional[Tuple[str, float]] = None
+    for row in rows or []:
+        date_key = _date_sort_key(row.get("Exit Date"))
+        leg_no = _num(row.get("Leg"))
+        # Maximise (date, -leg) => latest exit date, then lowest leg number.
         key = (date_key, -(leg_no if leg_no is not None else 0.0))
         if best_key is None or key > best_key:
             best, best_key = row, key
