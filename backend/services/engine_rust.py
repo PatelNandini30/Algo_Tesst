@@ -465,6 +465,7 @@ def _load_filter_segments(payload: Dict[str, Any]) -> Optional[List[Tuple[str, s
         return None
 
     import pandas as pd
+    from services.leg_filter import seg_iso as _seg_iso
     segs: List[Tuple[str, str]] = []
     try:
         if str_enabled:
@@ -478,30 +479,6 @@ def _load_filter_segments(payload: Dict[str, Any]) -> Optional[List[Tuple[str, s
     except Exception as exc:
         logger.warning("[ENGINE_RUST] filter segment load failed: %s", exc)
         return None
-
-    def _seg_iso(v) -> str:
-        # Normalize a segment boundary to ISO YYYY-MM-DD.
-        #
-        # A datetime / date / Timestamp is ALREADY unambiguous — format it
-        # directly and NEVER reparse. This is the DB filter path (named filters
-        # from get_filter_segments hand us datetime objects): str(datetime) is
-        # "2019-05-10 00:00:00", whose " 00:00:00" defeats the year-first
-        # strptime formats below, after which dayfirst=True FLIPS every date
-        # with day<=12 & month<=12 (10-May -> 05-Oct), inverting segments.
-        if not isinstance(v, str) and hasattr(v, "strftime"):
-            return pd.Timestamp(v).strftime("%Y-%m-%d")
-        text = str(v).strip()
-        # Strings: try unambiguous year-first formats first (no warning, no flip),
-        # then fall back to dayfirst=True for genuine DD/MM-style inputs so
-        # "10/05/2019" (=10-May) is never misread as MM/DD (5-Oct). Keeps this
-        # loader consistent with parse_filter_csv (base.py), which parses uploads
-        # day-first.
-        for _fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y%m%d"):
-            try:
-                return pd.to_datetime(text, format=_fmt).strftime("%Y-%m-%d")
-            except (ValueError, TypeError):
-                continue
-        return pd.to_datetime(text, dayfirst=True).strftime("%Y-%m-%d")
 
     for s in raw or []:
         try:
