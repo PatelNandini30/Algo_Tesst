@@ -258,5 +258,110 @@ class TestApplyExitAnchorExclusion(unittest.TestCase):
         self.assertEqual(by_trade.loc[3, "Exit Reason"], "LEG_FILTER_END")
 
 
+class TestKeyMismatchFailsLoud(unittest.TestCase):
+    """Deferred-5: `.map(...).fillna(...)` silently reverted to the un-fixed
+    value when a Trade key did not match -- hiding exactly the class of
+    trade-id renumbering bug this correction exists to survive.
+    """
+
+    def test_trade_missing_from_sorted_df_raises(self):
+        sorted_df = pd.DataFrame([
+            {"Trade": 1, "Leg": 1, "Entry Date": "2025-06-02",
+             "Exit Date": "2025-06-05", "Exit Reason": "LEG_FILTER_END"},
+            {"Trade": 1, "Leg": 2, "Entry Date": "2025-06-02",
+             "Exit Date": "2025-06-26", "Exit Reason": "EXPIRY"},
+        ])
+        # Trade 2 exists only in the aggregated frame -- the keys diverge.
+        aggregated = pd.DataFrame([
+            {"Trade": 1, "Exit Date": "2025-06-05", "Exit Reason": "LEG_FILTER_END"},
+            {"Trade": 2, "Exit Date": "2025-06-30", "Exit Reason": "EXPIRY"},
+        ])
+        with self.assertRaises(RuntimeError) as ctx:
+            apply_exit_anchor_exclusion(aggregated, sorted_df)
+        self.assertIn("Trade keys diverge", str(ctx.exception))
+
+    def test_matching_keys_still_pass(self):
+        sorted_df = pd.DataFrame([
+            {"Trade": 1, "Leg": 1, "Entry Date": "2025-06-02",
+             "Exit Date": "2025-06-05", "Exit Reason": "LEG_FILTER_END"},
+            {"Trade": 1, "Leg": 2, "Entry Date": "2025-06-02",
+             "Exit Date": "2025-06-26", "Exit Reason": "EXPIRY"},
+        ])
+        aggregated = pd.DataFrame([
+            {"Trade": 1, "Exit Date": "2025-06-05", "Exit Reason": "LEG_FILTER_END"},
+        ])
+        out = apply_exit_anchor_exclusion(aggregated, sorted_df)
+        self.assertEqual(out.loc[0, "Exit Date"], "2025-06-26")
+
+
+class TestOptimBacktestRowOrderParity(unittest.TestCase):
+    """I3: apply_exit_anchor_exclusion re-applies "first" on whatever row order
+    it is given, so the optimizer must feed it the SAME order the backtest does
+    or the two can report a different Exit Date on a truncated trade.
+    """
+
+    # Leg 2 enters LATER (it is the anchor) but is listed second; leg 1 is the
+    # carried leg. Raw order and anchor_sorted order disagree, so a caller that
+    # passes RAW picks leg 1's exit and a caller that sorts picks leg 2's.
+    ROWS = [
+        {"Trade": 1, "Leg": 1, "Entry Date": "2025-06-02",
+         "Exit Date": "2025-06-20", "Exit Reason": "EXPIRY"},
+        {"Trade": 1, "Leg": 2, "Entry Date": "2025-06-10",
+         "Exit Date": "2025-06-26", "Exit Reason": "EXPIRY"},
+        {"Trade": 1, "Leg": 3, "Entry Date": "2025-06-10",
+         "Exit Date": "2025-06-12", "Exit Reason": "LEG_FILTER_END"},
+    ]
+
+    def test_raw_and_anchor_sorted_orders_would_disagree(self):
+        # Guards the premise: if these ever stop differing the test below is
+        # vacuous and this one fails, saying so.
+        df = pd.DataFrame(self.ROWS)
+        agg = pd.DataFrame([{"Trade": 1, "Exit Date": "x", "Exit Reason": "y"}])
+        raw = apply_exit_anchor_exclusion(agg.copy(), df)
+        srt = apply_exit_anchor_exclusion(agg.copy(), _anchor_sorted(df))
+        self.assertNotEqual(raw.loc[0, "Exit Date"], srt.loc[0, "Exit Date"])
+
+    def test_optimizer_runner_passes_anchor_sorted(self):
+        # Source-text assertion: running the optimizer needs market data, which
+        # this suite must never touch (it narrows the shared feather).
+        import os
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "services", "optimizer", "runner.py",
+        )
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("apply_exit_anchor_exclusion(aggregated, anchor_sorted(df))", src)
+        self.assertNotIn("apply_exit_anchor_exclusion(aggregated, df)", src)
+
+    def test_anchor_sorted_is_shared_not_duplicated(self):
+        # Not assertIs: this repo imports services.* under two module paths
+        # ("services.X" inside backend, "backend.services.X" in tests), so the
+        # same source function is two objects. Identity of ORIGIN is the point.
+        from backend.services.trade_anchor import anchor_sorted
+        self.assertEqual(_anchor_sorted.__name__, "anchor_sorted")
+        self.assertTrue(_anchor_sorted.__module__.endswith("services.trade_anchor"))
+        self.assertEqual(_anchor_sorted.__doc__, anchor_sorted.__doc__)
+
+
+class TestCacheVersionCoversTheNewModules(unittest.TestCase):
+    """I4: a fix confined to leg_filter.py or trade_anchor.py must invalidate
+    the Redis result cache, or stale tradesheets are served.
+    """
+
+    def test_both_modules_are_hashed(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "services", "backtest_cache.py",
+        )
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        i_start = src.index("hash_paths = [")
+        block = src[i_start:src.index("]", i_start)]
+        self.assertIn("'leg_filter.py'", block)
+        self.assertIn("'trade_anchor.py'", block)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1888,8 +1888,13 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         # per-combo tradesheet stays exactly equal to a direct backtest, per
         # this project's hard rule. Byte-identical when this feature is
         # unused -- see apply_exit_anchor_exclusion's docstring.
-        from services.trade_anchor import apply_exit_anchor_exclusion
-        aggregated = apply_exit_anchor_exclusion(aggregated, df)
+        # Feed it `anchor_sorted(df)`, exactly like the backtest path does
+        # (services/algotest_job.py) -- apply_exit_anchor_exclusion re-applies
+        # "first" on whatever row order it is given, so passing RAW `df` here
+        # could pick a different Exit Date/Reason than a direct backtest on the
+        # same truncated trade. Same order in, same answer out.
+        from services.trade_anchor import anchor_sorted, apply_exit_anchor_exclusion
+        aggregated = apply_exit_anchor_exclusion(aggregated, anchor_sorted(df))
         aggregated["Net P&L"] = (aggregated["CE P&L"] + aggregated["PE P&L"] + aggregated["FUT P&L"]).round(4)
         es_series = aggregated["Entry Spot"].replace(0, float("nan"))
         aggregated["% P&L"] = (aggregated["Net P&L"] / es_series * 100.0).round(2).fillna(0)

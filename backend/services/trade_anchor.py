@@ -52,6 +52,7 @@ import pandas as pd
 __all__ = [
     "anchor_row",
     "exit_anchor_row",
+    "anchor_sorted",
     "apply_exit_anchor_exclusion",
     "trade_net_pnl",
     "trade_entry_spot",
@@ -194,6 +195,47 @@ def exit_anchor_row(rows: Iterable[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return best
 
 
+def anchor_sorted(trades_df: "pd.DataFrame") -> "pd.DataFrame":
+    """Re-order the per-leg rows WITHIN each trade so the trade's ANCHOR leg
+    leads, making every downstream `.agg("first")` order-invariant.
+
+    Ordering key: (Trade, is_re-entry ASC, Entry Date DESC, Leg ASC) — main legs
+    before re-entry sub-rows, then the LATEST leg entry, ties broken by the
+    lowest Leg number. This is the pandas expression of
+    anchor_row() in this module; see this module's header for why "latest entry"
+    is the right anchor (a CARRIED yearly leg keeps an older entry date than the
+    weekly leg that re-enters each cycle).
+
+    Rows are NOT mutated and the caller's frame is left untouched — the returned
+    frame is a re-sorted copy used only to feed the groupby. Blank/NaT entry
+    dates sort last, so a row with no entry date can never become the anchor.
+    """
+    if trades_df is None or "Trade" not in getattr(trades_df, "columns", ()):
+        return trades_df
+    if "Entry Date" not in trades_df.columns:
+        return trades_df
+
+    out = trades_df.copy()
+    # Re-entry / lazy-leg sub-rows must never define the parent trade's window.
+    _re = pd.Series(0, index=out.index, dtype="int8")
+    for _c in ("ReEntryIndex", "ReEntryTrigger", "ReEntryMode"):
+        if _c in out.columns:
+            _col = out[_c].astype(str).str.strip()
+            _re = _re | (_col.notna() & ~_col.isin(("", "0", "nan", "None", "NaT"))).astype("int8")
+    out["_ta_re"] = _re
+    out["_ta_leg"] = (
+        pd.to_numeric(out["Leg"], errors="coerce").fillna(0)
+        if "Leg" in out.columns else 0
+    )
+    out = out.sort_values(
+        ["Trade", "_ta_re", "Entry Date", "_ta_leg"],
+        ascending=[True, True, False, True],
+        kind="stable",
+        na_position="last",
+    )
+    return out.drop(columns=["_ta_re", "_ta_leg"])
+
+
 def apply_exit_anchor_exclusion(aggregated: "pd.DataFrame", sorted_df: "pd.DataFrame") -> "pd.DataFrame":
     """Overwrite `aggregated`'s Exit Date / Exit Reason columns so a leg
     truncated by its own per-leg filter file (LEG_FILTER_END) can't hijack
@@ -251,8 +293,22 @@ def apply_exit_anchor_exclusion(aggregated: "pd.DataFrame", sorted_df: "pd.DataF
         ).agg({"Exit Date": "first", "Exit Reason": "first"})
         exit_pick = pd.concat([exit_pick, fallback], ignore_index=True)
     exit_pick = exit_pick.set_index("Trade")
-    aggregated["Exit Date"] = aggregated["Trade"].map(exit_pick["Exit Date"]).fillna(aggregated["Exit Date"])
-    aggregated["Exit Reason"] = aggregated["Trade"].map(exit_pick["Exit Reason"]).fillna(aggregated["Exit Reason"])
+    # Every Trade in `aggregated` came from `sorted_df`, so every one of them
+    # MUST be covered by exit_pick (the fallback above guarantees it). A miss
+    # means the two frames disagree on the Trade key -- which is precisely how
+    # a trade-id renumbering bug hides. A silent .fillna() here would revert to
+    # the un-fixed value and ship wrong Exit Dates with no signal, so fail loud.
+    # Membership, not NaN: a genuinely blank Exit Date is not a key mismatch.
+    missing = sorted(set(aggregated["Trade"]) - set(exit_pick.index))
+    if missing:
+        raise RuntimeError(
+            "apply_exit_anchor_exclusion: %d trade(s) in the aggregated frame "
+            "have no matching row in sorted_df -- the Trade keys diverge, so "
+            "the LEG_FILTER_END exit correction cannot be applied: %s"
+            % (len(missing), missing[:10])
+        )
+    aggregated["Exit Date"] = aggregated["Trade"].map(exit_pick["Exit Date"])
+    aggregated["Exit Reason"] = aggregated["Trade"].map(exit_pick["Exit Reason"])
     return aggregated
 
 

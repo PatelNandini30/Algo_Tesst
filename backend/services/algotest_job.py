@@ -277,45 +277,10 @@ def _build_fast_lookup_from_bulk(index: str = None, from_date: str = None, to_da
         logger.warning("[FAST_LOOKUP] Build failed (non-fatal): %s", exc)
 
 
-def _anchor_sorted(trades_df):
-    """Re-order the per-leg rows WITHIN each trade so the trade's ANCHOR leg
-    leads, making every downstream `.agg("first")` order-invariant.
-
-    Ordering key: (Trade, is_re-entry ASC, Entry Date DESC, Leg ASC) — main legs
-    before re-entry sub-rows, then the LATEST leg entry, ties broken by the
-    lowest Leg number. This is the pandas expression of
-    services.trade_anchor.anchor_row(); see that module for why "latest entry"
-    is the right anchor (a CARRIED yearly leg keeps an older entry date than the
-    weekly leg that re-enters each cycle).
-
-    Rows are NOT mutated and the caller's frame is left untouched — the returned
-    frame is a re-sorted copy used only to feed the groupby. Blank/NaT entry
-    dates sort last, so a row with no entry date can never become the anchor.
-    """
-    if trades_df is None or "Trade" not in getattr(trades_df, "columns", ()):
-        return trades_df
-    if "Entry Date" not in trades_df.columns:
-        return trades_df
-
-    out = trades_df.copy()
-    # Re-entry / lazy-leg sub-rows must never define the parent trade's window.
-    _re = pd.Series(0, index=out.index, dtype="int8")
-    for _c in ("ReEntryIndex", "ReEntryTrigger", "ReEntryMode"):
-        if _c in out.columns:
-            _col = out[_c].astype(str).str.strip()
-            _re = _re | (_col.notna() & ~_col.isin(("", "0", "nan", "None", "NaT"))).astype("int8")
-    out["_ta_re"] = _re
-    out["_ta_leg"] = (
-        pd.to_numeric(out["Leg"], errors="coerce").fillna(0)
-        if "Leg" in out.columns else 0
-    )
-    out = out.sort_values(
-        ["Trade", "_ta_re", "Entry Date", "_ta_leg"],
-        ascending=[True, True, False, True],
-        kind="stable",
-        na_position="last",
-    )
-    return out.drop(columns=["_ta_re", "_ta_leg"])
+# The trade-anchor row ordering lives with the rest of the anchor rule in
+# services/trade_anchor.py so the optimizer can feed apply_exit_anchor_exclusion
+# the SAME row order this path does (optim == backtest, per the project rule).
+from services.trade_anchor import anchor_sorted as _anchor_sorted
 
 
 def _try_rust_engine(payload, index, effective_from, effective_to):

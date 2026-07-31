@@ -63,6 +63,8 @@ def _compute_engine_version() -> str:
         os.path.join(root, 'services', 'engine_rust.py'),
         os.path.join(root, 'services', 'midcap_overlay.py'),
         os.path.join(root, 'services', 'multi_index_feature.py'),
+        os.path.join(root, 'services', 'leg_filter.py'),
+        os.path.join(root, 'services', 'trade_anchor.py'),
         os.path.join(root, 'native', 'src', 'lib.rs'),
     ]
     try:
