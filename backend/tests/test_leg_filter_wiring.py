@@ -65,7 +65,13 @@ class TestLegFilterEndReason(unittest.TestCase):
 
 class TestFuturesPathMasked(unittest.TestCase):
     """Futures rows are priced inside their builders and never reach
-    apply_leg_filters, so the mask must appear in both futures builders."""
+    apply_leg_filters, so the mask must appear in both futures builders.
+
+    Both builders funnel through the shared _apply_leg_filter_mask helper
+    (extracted so the two call sites can't drift apart) — these tests key on
+    that call, not on leg_segments/leg_window directly, since the helper is
+    now the only place those two names appear in either builder.
+    """
 
     def _slice(self, src, fn_name):
         start = src.index("def %s(" % fn_name)
@@ -74,17 +80,44 @@ class TestFuturesPathMasked(unittest.TestCase):
 
     def test_build_futures_specs_applies_the_mask(self):
         body = self._slice(_source(), "_build_futures_specs")
-        self.assertIn("leg_segments(leg)", body)
-        self.assertIn("leg_window(", body)
+        self.assertIn("_apply_leg_filter_mask(", body)
 
     def test_fixed_entry_futures_specs_applies_the_mask(self):
         body = self._slice(_source(), "_build_fixed_entry_futures_specs")
-        self.assertIn("leg_segments(leg)", body)
-        self.assertIn("leg_window(", body)
+        self.assertIn("_apply_leg_filter_mask(", body)
 
-    def test_mask_precedes_pricing_in_build_futures_specs(self):
+    def test_mask_precedes_pricing_in_build_futures_specs_rolled_branch(self):
+        # The rolled-hold branch prices via _fut_price(index, entry_date, ...).
+        # This literal is unique inside _build_futures_specs's own body (a
+        # second, unrelated occurrence lives in a different function further
+        # down the file, outside this slice).
         body = self._slice(_source(), "_build_futures_specs")
-        self.assertLess(body.index("leg_window("), body.index("_fut_price(index, entry_date"))
+        i_price = body.index("_fut_price(index, entry_date")
+        i_mask = body.rindex("_apply_leg_filter_mask(", 0, i_price)
+        self.assertGreaterEqual(i_mask, 0, "mask call not found before rolled-branch pricing")
+
+    def test_mask_precedes_pricing_in_build_futures_specs_nonrolled_branch(self):
+        # The non-rolled branch prices via _resolve_futures_pnl_native(...).
+        # Its FIRST occurrence in the function body is this branch's call (a
+        # second occurrence, in the re-entry loop further down, is out of
+        # scope for this assertion).
+        body = self._slice(_source(), "_build_futures_specs")
+        i_price_rolled = body.index("_fut_price(index, entry_date")
+        i_price_nonrolled = body.index("_resolve_futures_pnl_native(")
+        i_mask_nonrolled = body.rindex("_apply_leg_filter_mask(", 0, i_price_nonrolled)
+        # Must be the SECOND mask call (after the rolled branch's), not a
+        # false-positive match on the rolled branch's own mask call — this is
+        # exactly the gap the old single-`.index()` test missed.
+        self.assertGreater(i_mask_nonrolled, i_price_rolled,
+                            "non-rolled branch's own mask call not found — "
+                            "test would pass even if this branch's mask were "
+                            "moved after its pricing call")
+
+    def test_mask_precedes_pricing_in_build_fixed_entry_futures_specs(self):
+        body = self._slice(_source(), "_build_fixed_entry_futures_specs")
+        i_price = body.index("_resolve_futures_pnl_native(")
+        i_mask = body.rindex("_apply_leg_filter_mask(", 0, i_price)
+        self.assertGreaterEqual(i_mask, 0, "mask call not found before pricing")
 
 
 if __name__ == "__main__":
