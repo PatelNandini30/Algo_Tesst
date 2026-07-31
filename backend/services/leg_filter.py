@@ -135,3 +135,54 @@ def leg_window(
             return (False, exit_, False)
         return (True, seg_end, True)
     return (True, exit_, False)
+
+
+def apply_leg_filters(
+    specs: List[Dict[str, Any]],
+    legs: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Apply every leg's individual filter to a resolved spec list, IN ORDER.
+
+    Runs as a post-pass rather than inside each spec builder because there are
+    six builders (_build_fixed_entry_specs, _build_next_expiry_specs, the two
+    futures ones and the two mixed ones) and they all converge on one spec list.
+    Post-processing also leaves the STRIKE epochs alone: a masked-out leg still
+    anchored its Fixed/pinned epoch when the schedule was built, which is what
+    we want — a mask must not silently re-strike the legs that remain.
+
+    Returns a NEW list; `specs` is not mutated.
+    """
+    masks: Dict[int, List[Tuple[str, str]]] = {}
+    for i, leg in enumerate(legs or []):
+        m = leg_segments(leg)
+        if m:
+            masks[i + 1] = m
+    if not masks:
+        return specs  # nothing configured — identical object, zero cost
+
+    kept: List[Dict[str, Any]] = []
+    for s in specs:
+        try:
+            leg_id = int(s.get("leg_id") or 1)
+        except (TypeError, ValueError):
+            kept.append(s)
+            continue
+        mask = masks.get(leg_id)
+        if mask is None:
+            kept.append(s)
+            continue
+        taken, leg_exit, truncated = leg_window(
+            mask, str(s.get("entry_date") or ""), str(s.get("exit_date") or "")
+        )
+        if not taken:
+            continue
+        row = dict(s)
+        if truncated:
+            row["exit_date"] = leg_exit
+            row["_leg_filter_end"] = True
+        kept.append(row)
+
+    # A trade every one of whose legs was masked out must vanish completely
+    # rather than survive as an empty trade id.
+    live = {s.get("trade_id") for s in kept}
+    return [s for s in kept if s.get("trade_id") in live]
