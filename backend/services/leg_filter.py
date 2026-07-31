@@ -21,6 +21,8 @@ __all__ = [
     "normalize_segments",
     "leg_segments",
     "leg_window",
+    "last_trading_day_on_or_before",
+    "resolve_leg_window",
     "apply_leg_filters",
     "LEG_FILTER_END",
 ]
@@ -137,9 +139,67 @@ def leg_window(
     return (True, exit_, False)
 
 
+def last_trading_day_on_or_before(
+    target: str, trading_days: Sequence[str]
+) -> Optional[str]:
+    """Latest trading day <= target, or None.
+
+    THE single implementation: engine_rust._last_trading_day_on_or_before
+    delegates here so a boundary can never be snapped two different ways.
+    `trading_days` must be sorted ascending ISO strings.
+    """
+    if not trading_days or not target:
+        return None
+    idx = bisect.bisect_right(trading_days, target) - 1
+    if idx < 0:
+        return None
+    return trading_days[idx]
+
+
+def resolve_leg_window(
+    leg: Dict[str, Any],
+    entry_date: str,
+    exit_date: str,
+    trading_days: Sequence[str],
+) -> Tuple[bool, str, bool]:
+    """THE per-leg filter rule, shared by EVERY path that applies a leg mask.
+
+    Options specs go through apply_leg_filters (a post-pass); futures rows are
+    priced inside their own builders and call this directly via
+    engine_rust._apply_leg_filter_mask. Both must behave identically on the same
+    uploaded file, so both land here.
+
+    Returns (taken, exit_date, truncated):
+      * taken=False    -> the leg is ABSENT from this trade.
+      * exit_date      -> unchanged, or the truncated boundary SNAPPED BACK to
+                          the last trading day on/before the window end. Uploaded
+                          files routinely end on month/quarter ends that fall on a
+                          weekend; an unsnapped exit has no price and books a
+                          zero-P&L phantom row.
+      * truncated=True -> exit came from the leg's own file; caller tags
+                          LEG_FILTER_END *if the realised exit actually landed on
+                          this boundary*.
+    """
+    mask = leg_segments(leg)
+    if mask is None:
+        return True, exit_date, False
+    taken, leg_exit, truncated = leg_window(mask, entry_date, exit_date)
+    if not taken:
+        return False, exit_date, False
+    if not truncated:
+        return True, exit_date, False
+    snapped = last_trading_day_on_or_before(leg_exit, trading_days) or leg_exit
+    if snapped <= entry_date:
+        # The snap swallowed the whole hold — drop the leg rather than emit a
+        # zero/negative-length row (mirrors leg_window's degenerate-window rule).
+        return False, exit_date, False
+    return True, snapped, True
+
+
 def apply_leg_filters(
     specs: List[Dict[str, Any]],
     legs: Sequence[Dict[str, Any]],
+    trading_days: Sequence[str],
 ) -> List[Dict[str, Any]]:
     """Apply every leg's individual filter to a resolved spec list, IN ORDER.
 
@@ -152,12 +212,11 @@ def apply_leg_filters(
 
     Returns a NEW list; `specs` is not mutated.
     """
-    masks: Dict[int, List[Tuple[str, str]]] = {}
+    masked_legs: Dict[int, Dict[str, Any]] = {}
     for i, leg in enumerate(legs or []):
-        m = leg_segments(leg)
-        if m:
-            masks[i + 1] = m
-    if not masks:
+        if leg_segments(leg):
+            masked_legs[i + 1] = leg
+    if not masked_legs:
         return specs  # nothing configured — identical object, zero cost
 
     kept: List[Dict[str, Any]] = []
@@ -167,12 +226,15 @@ def apply_leg_filters(
         except (TypeError, ValueError):
             kept.append(s)
             continue
-        mask = masks.get(leg_id)
-        if mask is None:
+        leg = masked_legs.get(leg_id)
+        if leg is None:
             kept.append(s)
             continue
-        taken, leg_exit, truncated = leg_window(
-            mask, str(s.get("entry_date") or ""), str(s.get("exit_date") or "")
+        taken, leg_exit, truncated = resolve_leg_window(
+            leg,
+            str(s.get("entry_date") or ""),
+            str(s.get("exit_date") or ""),
+            trading_days,
         )
         if not taken:
             continue
@@ -182,7 +244,6 @@ def apply_leg_filters(
             row["_leg_filter_end"] = True
         kept.append(row)
 
-    # A trade every one of whose legs was masked out must vanish completely
-    # rather than survive as an empty trade id.
-    live = {s.get("trade_id") for s in kept}
-    return [s for s in kept if s.get("trade_id") in live]
+    # A trade every one of whose legs was masked out has already vanished: the
+    # loop above simply never appended any of its rows.
+    return kept

@@ -490,13 +490,14 @@ def _load_filter_segments(payload: Dict[str, Any]) -> Optional[List[Tuple[str, s
 
 
 def _last_trading_day_on_or_before(target: str, trading_days: List[str]) -> Optional[str]:
-    """Return the latest trading day <= target, or None."""
-    if not trading_days or not target:
-        return None
-    idx = bisect.bisect_right(trading_days, target) - 1
-    if idx < 0:
-        return None
-    return trading_days[idx]
+    """Return the latest trading day <= target, or None.
+
+    Delegates to services.leg_filter so the per-leg filter module and the engine
+    snap boundaries through ONE implementation (see leg_filter.resolve_leg_window).
+    """
+    from services.leg_filter import last_trading_day_on_or_before
+
+    return last_trading_day_on_or_before(target, trading_days)
 
 
 def _next_trading_day_on_or_after(trading_days: List[str], date_str: str) -> Optional[str]:
@@ -1349,20 +1350,28 @@ def _apply_leg_filter_mask(
                           trade's schedule; caller must tag exit_reason with
                           LEG_FILTER_END.
     """
-    from services.leg_filter import leg_segments, leg_window
+    from services.leg_filter import resolve_leg_window
 
-    mask = leg_segments(leg)
-    if mask is None:
-        return True, exit_date, False
-    taken, leg_exit, truncated = leg_window(mask, entry_date, exit_date)
-    if not taken:
-        return False, exit_date, False
-    if not truncated:
-        return True, exit_date, False
-    snapped = _last_trading_day_on_or_before(leg_exit, sorted_td) or leg_exit
-    if snapped <= entry_date:
-        return False, exit_date, False
-    return True, snapped, True
+    return resolve_leg_window(leg, entry_date, exit_date, sorted_td)
+
+
+def _reject_leg_filter_unsupported(payload: Dict[str, Any], path: str) -> None:
+    """Hard-fail when a per-leg filter file reaches a path that cannot honour it.
+
+    Rust-only, NO silent degradation: a path that would price legs outside the
+    window their uploaded file allows must RAISE, never quietly ignore the mask
+    and hand back wrong numbers. Cheap and exact — a run with no individual
+    filter never trips this, so unfiltered behaviour is untouched.
+    """
+    from services.leg_filter import leg_segments
+
+    if any(leg_segments(l) for l in (payload.get("legs") or [])):
+        raise RuntimeError(
+            "Per-leg Individual Filter is not supported on the %s path: option "
+            "legs there bypass the per-leg mask, so the uploaded file would be "
+            "silently ignored. Remove the individual filter from this strategy "
+            "or run it without that leg combination." % path
+        )
 
 
 def _build_futures_specs(
@@ -1517,6 +1526,10 @@ def _build_futures_specs(
                 )
                 if not _lf_taken:
                     continue
+                # The boundary the mask imposed. The SL/Target scan below can
+                # still exit EARLIER; only an exit that actually lands here was
+                # bound by the filter and may carry the LEG_FILTER_END tag.
+                _lf_bound = fut_exit_date
 
                 # Resolve the rolled contract from the RE-ANCHORED next-cycle exit
                 # (exit_date), NOT the filter-clamped fut_exit_date. On a filter /
@@ -1549,6 +1562,10 @@ def _build_futures_specs(
                 )
                 if not _lf_taken:
                     continue
+                # The boundary the mask imposed. The SL/Target scan below can
+                # still exit EARLIER; only an exit that actually lands here was
+                # bound by the filter and may carry the LEG_FILTER_END tag.
+                _lf_bound = fut_exit_date
 
                 entry_price_raw, exit_price_raw, fut_expiry = _resolve_futures_pnl_native(
                     entry_date=entry_date,
@@ -1578,7 +1595,7 @@ def _build_futures_specs(
             # Futures rows carry their exit reason directly on the row dict
             # (unlike options rows, which are labelled later in the pipeline —
             # see the _leg_filter_end_keys join at engine_rust.py:8736).
-            if _leg_filter_end_row:
+            if _leg_filter_end_row and fut_exit_date == _lf_bound:
                 if not _actual_exit_reason or _actual_exit_reason == "EXPIRY":
                     _actual_exit_reason = LEG_FILTER_END
                 elif LEG_FILTER_END not in _actual_exit_reason:
@@ -1692,7 +1709,7 @@ def _build_futures_specs(
                     # window is already right — but the tag applied to the
                     # primary row (above) only runs once, before this loop, so
                     # it must be repeated here for each re-entry sub-row.
-                    if _leg_filter_end_row:
+                    if _leg_filter_end_row and _re_exit_date == _lf_bound:
                         if not _re_reason or _re_reason == "EXPIRY":
                             _re_reason = LEG_FILTER_END
                         elif LEG_FILTER_END not in _re_reason:
@@ -2752,7 +2769,7 @@ def _build_fixed_entry_futures_specs(
                     # Exit clamped to the segment/filter end (not a natural expiry).
                     exit_reason = "FILTER_END"
 
-                if _leg_filter_end_row:
+                if _leg_filter_end_row and fut_exit_date == _fe_exit_date:
                     if not exit_reason or exit_reason == "EXPIRY":
                         exit_reason = LEG_FILTER_END
                     elif LEG_FILTER_END not in exit_reason:
@@ -4750,6 +4767,11 @@ def run_rust_engine_pipeline(
             for _l in (payload.get("legs") or [])
         )
         if _has_opt_leg and not _has_next_leg and _mixed_gate in ("1", "on", "true", "shadow"):
+            # Futures legs here are priced INLINE with no _apply_leg_filter_mask
+            # call, so an uploaded per-leg file would be ignored on them. Raise
+            # OUTSIDE the try below — the except there would swallow it and fall
+            # back, which is exactly the silent degradation the rule forbids.
+            _reject_leg_filter_unsupported(payload, "mixed FUTURES+OPTIONS (MIXED_FUT_RUST)")
             try:
                 _mixed_rows = _build_mixed_futures_options(
                     payload,
@@ -4772,6 +4794,11 @@ def run_rust_engine_pipeline(
                 return _mixed_rows
         if _has_next_leg:
             # Mixed FUTURES + NEXT_WEEKLY: build each type separately, merge by period.
+            # Option legs here go through _build_next_expiry_specs and are priced
+            # directly, returning before apply_leg_filters ever runs — the futures
+            # legs ARE masked, the option legs are NOT. Raise outside the try so
+            # the except cannot turn it into a silent fallback.
+            _reject_leg_filter_unsupported(payload, "mixed FUTURES+NEXT_WEEKLY")
             try:
                 _mixed = _build_mixed_futures_next_weekly(
                     payload, expiry_dates, trading_days, lot_size, spot_by_date, segments,
@@ -5094,7 +5121,10 @@ def run_rust_engine_pipeline(
     # See docs/superpowers/specs/2026-07-31-per-leg-filter-design.md.
     from services.leg_filter import LEG_FILTER_END, apply_leg_filters
 
-    specs = apply_leg_filters(specs, payload.get("legs") or [])
+    # trading_days is threaded in so a window ending on a non-trading day snaps
+    # back to the last real session — an unsnapped exit prices to nothing and
+    # books a zero-P&L phantom row (simulate.rs sets missing=true; nobody reads it).
+    specs = apply_leg_filters(specs, payload.get("legs") or [], trading_days)
     if not specs:
         return []
 
@@ -5117,14 +5147,58 @@ def run_rust_engine_pipeline(
         if str(payload.get("super_trend_config") or "").strip() in ("5x1", "5x2")
         else "FILTER_END"
     )
-    # Keyed by (trade_id, leg_id): a per-leg truncation is a property of ONE leg
-    # row, unlike _seg_clamped which describes the whole trade.
-    _leg_filter_end_keys: set = {
-        (int(s.get("trade_id") or 0), int(s.get("leg_id") or 1))
-        for s in specs if s.get("_leg_filter_end")
-    }
+    # Per-leg truncation markers. Keyed by (expiry, leg_id) -> the set of
+    # truncated boundary exit dates for that leg in that cycle.
+    #
+    # NOT trade_id (the same warning as _seg_clamped_keys above: re-entry,
+    # bridge and spot-adjustment synthesis allocate FRESH trade ids at :6546,
+    # :6961, :7863 and :8423, so a trade_id key silently loses every derived
+    # row) and NOT entry_date either (a re-entry row enters on a LATER date than
+    # the spec it descends from, while inheriting the same truncated boundary).
+    # (expiry, leg_id) survives both, and the mask is per-leg-per-cycle so any
+    # row of that leg in that cycle landing on the boundary IS filter-ended.
+    #
+    # The exit-date component is what makes the tag truthful: a row whose
+    # realised exit came EARLIER, from its own SL/Target, was never bound by
+    # the filter and must keep its own reason. Tagging it "STOP_LOSS+
+    # LEG_FILTER_END" would wrongly drop a legitimate exit out of the trade's
+    # exit anchor (apply_exit_anchor_exclusion matches on "contains").
+    _leg_filter_end_keys: Dict[Tuple[str, int], Set[str]] = {}
+    for _s in specs:
+        if not _s.get("_leg_filter_end"):
+            continue
+        _lfk = (_normalize_iso(_s.get("expiry", "")), int(_s.get("leg_id") or 1))
+        _leg_filter_end_keys.setdefault(_lfk, set()).add(
+            _normalize_iso(_s.get("exit_date", ""))
+        )
+
+    def _is_leg_filter_ended(row: Dict[str, Any], exit_override: str = "") -> bool:
+        """True when THIS row's realised exit landed on its own filter boundary."""
+        if not _leg_filter_end_keys:
+            return False
+        _b = _leg_filter_end_keys.get(
+            (_normalize_iso(row.get("expiry") or ""), int(row.get("leg_id") or 1))
+        )
+        if not _b:
+            return False
+        return _normalize_iso(exit_override or row.get("exit_date") or "") in _b
 
     if return_specs_only:
+        # The mask itself is applied above, but the LEG_FILTER_END tag is not:
+        # this returns before the tagger (:8846) and before both cascade guards,
+        # and simulate_trades_batch drops the `_leg_filter_end` spec key, so the
+        # truncated row would come back labelled EXPIRY. That row could then
+        # hijack the trade's Exit Date (apply_exit_anchor_exclusion can only see
+        # the tag) and the fused cascade in multi_index_feature.py could re-enter
+        # the leg past its own boundary. Wrong numbers, silently — so raise.
+        if _leg_filter_end_keys:
+            raise RuntimeError(
+                "Per-leg Individual Filter is not supported on the multi-index "
+                "FUSED path: the LEG_FILTER_END tag does not survive the fused "
+                "pricing hand-off, so the truncated leg would be reported as a "
+                "normal expiry exit. Remove the individual filter from this "
+                "strategy or run the indices separately."
+            )
         # Path B (multi-index FUSED): hand the fully-resolved, gated specs back
         # so the caller can concatenate a SECOND symbol's specs and price both
         # in one simulate_trades_batch call. Stops here — no pricing, no
@@ -7700,9 +7774,7 @@ def run_rust_engine_pipeline(
             # outside the window its file allows. Skip only the clamp for
             # THIS row; the leg still gets appended below with its own
             # (already-resolved) exit, it just doesn't get overwritten.
-            _sa_leg_filter_ended = (
-                int(leg["trade_id"]), int(leg["leg_id"])
-            ) in _leg_filter_end_keys
+            _sa_leg_filter_ended = _is_leg_filter_ended(leg, final_exit)
             if spot_adj_clamp and final_exit >= spot_adj_clamp and not _sa_leg_filter_ended:
                 final_exit = spot_adj_clamp
                 reason = _sa_clamp_reason
@@ -8065,7 +8137,7 @@ def run_rust_engine_pipeline(
                         # that would place it outside the window its own filter
                         # file allows. Skips only this leg for this hop; the
                         # other legs in the same mini-trade are unaffected.
-                        if (orig_tid, _sa_lid) in _leg_filter_end_keys:
+                        if _is_leg_filter_ended(_sa_leg):
                             continue
                         _sa_lidx = int(_sa_leg.get("leg_id") or 1) - 1
                         _sa_leg_src = legs_src[_sa_lidx] if _sa_lidx < len(legs_src) else {}
@@ -8849,8 +8921,7 @@ def run_rust_engine_pipeline(
     # the combined-exit-reason convention used elsewhere in this module.
     if _leg_filter_end_keys:
         for _row in final_priced:
-            _k = (int(_row.get("trade_id") or 0), int(_row.get("leg_id") or 1))
-            if _k not in _leg_filter_end_keys:
+            if not _is_leg_filter_ended(_row):
                 continue
             _cur = str(_row.get("exit_reason") or "").strip()
             if not _cur or _cur == "EXPIRY":

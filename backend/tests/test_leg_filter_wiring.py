@@ -21,7 +21,7 @@ class TestLegFilterWiring(unittest.TestCase):
     """
 
     def test_apply_leg_filters_is_called(self):
-        self.assertIn("apply_leg_filters(specs, payload.get(\"legs\")", _source())
+        self.assertIn("apply_leg_filters(specs, payload.get(\"legs\") or [], trading_days)", _source())
 
     def test_runs_after_fixed_rollover_strike_and_before_pricing(self):
         src = _source()
@@ -52,14 +52,14 @@ class TestLegFilterEndReason(unittest.TestCase):
 
     def test_keys_are_captured_before_pricing(self):
         src = _source()
-        self.assertLess(src.index("_leg_filter_end_keys: set = {"),
+        self.assertLess(src.index("_leg_filter_end_keys: Dict[Tuple[str, int], Set[str]] = {}"),
                         src.index("algotest_native.simulate_trades_batch(specs)"))
 
     def test_stamped_after_the_patch_tagger(self):
         src = _source()
         self.assertLess(
             src.index("_apply_filter_end_last_per_patch(final_priced"),
-            src.index("if _leg_filter_end_keys:"),
+            src.index("if not _is_leg_filter_ended(_row):"),
         )
 
 
@@ -144,10 +144,135 @@ class TestSpotAdjGuard(unittest.TestCase):
 
     def test_reentry_synthesis_skips_filter_ended_legs(self):
         src = _source()
-        i_guard = src.index("(orig_tid, _sa_lid) in _leg_filter_end_keys")
+        i_guard = src.index("if _is_leg_filter_ended(_sa_leg):")
         i_append = src.index("mini_specs.append(", i_guard)
         self.assertLess(i_guard, i_append,
                          "guard must precede the mini-trade append")
+
+
+class TestTruncatedExitIsSnapped(unittest.TestCase):
+    """C1: an uploaded window ending on a non-trading day must snap back.
+
+    The rule itself is unit-tested in test_leg_filter.py; what has to be checked
+    HERE is that the engine actually hands the trading-day list over -- the bug
+    was a missing argument, not a wrong algorithm.
+    """
+
+    def test_options_post_pass_receives_trading_days(self):
+        self.assertIn(
+            "apply_leg_filters(specs, payload.get(\"legs\") or [], trading_days)",
+            _source(),
+        )
+
+    def test_both_paths_share_one_implementation(self):
+        # The options post-pass and the futures helper must resolve the mask
+        # through the SAME function, so the same file can never behave
+        # differently on an option leg than on a futures leg.
+        src = _source()
+        i_def = src.index("def _apply_leg_filter_mask(")
+        i_end = src.index("def _build_futures_specs(", i_def)
+        body = src[i_def:i_end]
+        self.assertIn("from services.leg_filter import resolve_leg_window", body)
+        self.assertIn("return resolve_leg_window(leg, entry_date, exit_date, sorted_td)", body)
+        # ...and no second, local re-implementation of the snap.
+        self.assertNotIn("_last_trading_day_on_or_before(leg_exit", body)
+
+    def test_engine_snap_helper_delegates_to_leg_filter(self):
+        src = _source()
+        i = src.index("def _last_trading_day_on_or_before(")
+        body = src[i:i + 700]
+        self.assertIn("from services.leg_filter import last_trading_day_on_or_before", body)
+
+
+class TestUnsupportedPathsHardFail(unittest.TestCase):
+    """C2 / I1: a path that cannot honour the mask must RAISE, never ignore it.
+
+    Rust-only, no silent degradation. Each guard must sit OUTSIDE the try/except
+    that wraps its builder, otherwise the except turns the hard-fail back into
+    the silent fallback it is meant to replace.
+    """
+
+    def test_guard_helper_raises(self):
+        src = _source()
+        i = src.index("def _reject_leg_filter_unsupported(")
+        body = src[i:src.index("def _build_futures_specs(", i)]
+        self.assertIn("raise RuntimeError(", body)
+        self.assertIn("leg_segments", body)
+
+    def test_mixed_futures_next_weekly_is_guarded_before_the_try(self):
+        src = _source()
+        i_guard = src.index('_reject_leg_filter_unsupported(payload, "mixed FUTURES+NEXT_WEEKLY")')
+        i_build = src.index("_build_mixed_futures_next_weekly(", i_guard)
+        i_try = src.rindex("try:", 0, i_build)
+        self.assertLess(i_guard, i_try, "guard must sit outside the swallowing try")
+
+    def test_mixed_futures_options_is_guarded_before_the_try(self):
+        src = _source()
+        i_guard = src.index('_reject_leg_filter_unsupported(payload, "mixed FUTURES+OPTIONS')
+        i_build = src.index("_build_mixed_futures_options(", i_guard)
+        i_try = src.rindex("try:", 0, i_build)
+        self.assertLess(i_guard, i_try, "guard must sit outside the swallowing try")
+
+    def test_fused_multi_index_path_raises_on_a_truncated_leg(self):
+        src = _source()
+        i_ret = src.index("if return_specs_only:")
+        body = src[i_ret:src.index("return specs", i_ret)]
+        self.assertIn("if _leg_filter_end_keys:", body)
+        self.assertIn("raise RuntimeError(", body)
+
+    def test_fused_guard_runs_after_the_keys_are_built(self):
+        src = _source()
+        self.assertLess(
+            src.index("_leg_filter_end_keys: Dict[Tuple[str, int], Set[str]] = {}"),
+            src.index("if return_specs_only:"),
+        )
+
+
+class TestTagOnlyWhenTheBoundaryBound(unittest.TestCase):
+    """Deferred-6: a row that exited EARLIER on SL/Target was not bound by the
+    filter and must keep its own reason. "STOP_LOSS+LEG_FILTER_END" would
+    wrongly drop a legitimate exit out of apply_exit_anchor_exclusion, which
+    matches on `contains`.
+    """
+
+    def test_options_tagger_checks_the_realised_exit(self):
+        src = _source()
+        i = src.index("def _is_leg_filter_ended(")
+        body = src[i:i + 900]
+        self.assertIn("exit_override or row.get(\"exit_date\")", body)
+
+    def test_futures_primary_row_checks_the_boundary(self):
+        self.assertIn("if _leg_filter_end_row and fut_exit_date == _lf_bound:", _source())
+
+    def test_futures_reentry_row_checks_the_boundary(self):
+        self.assertIn("if _leg_filter_end_row and _re_exit_date == _lf_bound:", _source())
+
+    def test_fixed_entry_futures_row_checks_the_boundary(self):
+        self.assertIn("if _leg_filter_end_row and fut_exit_date == _fe_exit_date:", _source())
+
+    def test_no_bare_truncation_tag_remains(self):
+        # Every LEG_FILTER_END tag site must be conditioned on the realised exit.
+        src = _source()
+        self.assertNotIn("if _leg_filter_end_row:\n", src)
+
+
+class TestKeysSurviveTradeIdRenumbering(unittest.TestCase):
+    """I2: the marker must not be keyed on trade_id -- re-entry, bridge and
+    spot-adj synthesis allocate fresh ids (and fresh entry dates), so those
+    rows would fall out of the set and go untagged/unguarded.
+    """
+
+    def test_keys_do_not_contain_trade_id(self):
+        src = _source()
+        i = src.index("_leg_filter_end_keys: Dict[Tuple[str, int], Set[str]] = {}")
+        body = src[i:src.index("def _is_leg_filter_ended(", i)]
+        self.assertNotIn("trade_id", body)
+        self.assertIn("_normalize_iso(_s.get(\"expiry\", \"\"))", body)
+
+    def test_every_consumer_goes_through_the_shared_predicate(self):
+        src = _source()
+        # Three consumers: the clamp guard, the re-entry guard and the tagger.
+        self.assertEqual(src.count("_is_leg_filter_ended("), 4)  # 1 def + 3 uses
 
 
 if __name__ == "__main__":
