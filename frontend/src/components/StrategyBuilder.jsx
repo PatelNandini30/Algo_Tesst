@@ -1876,6 +1876,33 @@ const StrategyBuilder = () => {
     return next;
   }));
   const handleLegChange = (legIndex, nextLeg) => setLegs(prev => prev.map((leg, idx) => idx === legIndex ? { ...leg, ...nextLeg } : leg));
+  const handleLegFilterUpload = async (legId, event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    updateLeg(legId, 'filter_uploading', true);
+    updateLeg(legId, 'filter_error', '');
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await fetch('/api/upload-filter-csv', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      const data = await res.json();
+      if (!data.success) throw new Error(data.message || 'Failed to parse CSV');
+      const segs = (data.segments || []).map(s => ({
+        start: s.start_date || s.start,
+        end: s.end_date || s.end,
+      }));
+      if (!segs.length) throw new Error('No valid date ranges found');
+      updateLeg(legId, 'filter_segments', segs);
+      updateLeg(legId, 'filter_file_name', file.name);
+    } catch (err) {
+      updateLeg(legId, 'filter_error', err.message || 'Upload failed');
+      updateLeg(legId, 'filter_segments', []);
+    } finally {
+      updateLeg(legId, 'filter_uploading', false);
+      event.target.value = '';
+    }
+  };
   const totalLazyLegCount = Object.keys(lazyLegs).length;
   const lazyLegList = Object.values(lazyLegs);
 
@@ -2216,6 +2243,9 @@ const StrategyBuilder = () => {
         if (rolloverToggle || noRollover) {
           leg.rollover_strike_mode = l.rollover_strike_mode || 'fresh';
         }
+      }
+      if (l.individual_filter && (l.filter_segments || []).length) {
+        leg.filter_segments = l.filter_segments;
       }
       if (segmentType === 'futures') {
         leg.expiry = (l.expiry || 'monthly').toLowerCase();
@@ -4646,6 +4676,47 @@ const StrategyBuilder = () => {
                               </>)}
                             </div>
                           </div>
+                          {leg.segment !== 'midcap100' && (
+                            <div className="space-y-1">
+                              <label className="flex items-center gap-2 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={!!leg.individual_filter}
+                                  onChange={e => {
+                                    updateLeg(leg.id, 'individual_filter', e.target.checked);
+                                    if (!e.target.checked) {
+                                      updateLeg(leg.id, 'filter_segments', []);
+                                      updateLeg(leg.id, 'filter_file_name', '');
+                                      updateLeg(leg.id, 'filter_error', '');
+                                    }
+                                  }}
+                                  className="accent-blue-600"
+                                />
+                                <span className="text-xs font-semibold text-muted uppercase tracking-wide">
+                                  Individual filter
+                                </span>
+                              </label>
+                              {leg.individual_filter && (
+                                <div className="space-y-1 pl-6">
+                                  <input
+                                    type="file"
+                                    accept=".csv"
+                                    onChange={e => handleLegFilterUpload(leg.id, e)}
+                                    className="text-[11px]"
+                                  />
+                                  {leg.filter_uploading && <p className="text-[11px] text-muted">Uploading…</p>}
+                                  {leg.filter_error && <p className="text-[11px] text-red-600">{leg.filter_error}</p>}
+                                  {!!(leg.filter_segments || []).length && (
+                                    <p className="text-[11px] text-muted">
+                                      {leg.filter_file_name} — {leg.filter_segments.length} range(s).
+                                      This leg trades only on dates inside them; it exits at whichever
+                                      comes first, its own range end or the trade's exit.
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>
