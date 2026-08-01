@@ -173,5 +173,30 @@ class TestSpotPnlAggregation(unittest.TestCase):
         self.assertEqual(result, 182.75)
 
 
+class TestSpotPnlOptimizerSum(unittest.TestCase):
+    """Step 1 of the audit: metrics.per_leg_pnl sums the whole column with no
+    Leg == 1 filter, so it is placement-independent PROVIDED exactly one row
+    per trade carries a value (guaranteed by engine_rust.py — see the classes
+    above). This pins that sum behaves identically whether the carrying row
+    is leg 1 or a higher leg (leg 1 filtered out of the trade)."""
+
+    def test_sum_unaffected_by_which_leg_carries_the_value(self):
+        from backend.services.optimizer.metrics import per_leg_pnl
+
+        df_leg1 = pd.DataFrame([
+            {"Entry Spot": 100.0, "Spot P&L": 10.0, "Call P&L": 5.0, "Put P&L": 0.0},
+            {"Entry Spot": 100.0, "Spot P&L": "", "Call P&L": 0.0, "Put P&L": 3.0},
+        ])
+        df_leg2 = pd.DataFrame([
+            {"Entry Spot": 100.0, "Spot P&L": "", "Call P&L": 5.0, "Put P&L": 0.0},
+            {"Entry Spot": 100.0, "Spot P&L": 10.0, "Call P&L": 0.0, "Put P&L": 3.0},
+        ])
+        self.assertEqual(
+            per_leg_pnl(df_leg1)["long_spot_pnl"],
+            per_leg_pnl(df_leg2)["long_spot_pnl"],
+        )
+        self.assertEqual(per_leg_pnl(df_leg1)["long_spot_pnl"], 10.0)
+
+
 if __name__ == "__main__":
     unittest.main()

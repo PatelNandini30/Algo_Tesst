@@ -3908,11 +3908,13 @@ def run_sync_weekly_cadence(
         tid = int(row["Trade"])
         if tid in seen:
             cc.append(None); pc.append(None); dc.append(None); pdc.append(None)
-            # Spot P&L is normally a TRADE-level fact carried on leg 1 only, so
-            # leg 2+ is blanked. But a multi-index overlay leg trades a DIFFERENT
-            # underlying — its own spot move is its own fact, not a duplicate of
-            # leg 1's. Keep it for overlay rows; base-engine leg 2+ rows (same
-            # index, Spot P&L 0.0) stay blank exactly as before.
+            # Spot P&L is normally a TRADE-level fact carried on exactly one row
+            # (the trade's lowest PRESENT leg — see priced_to_tradesheet_records
+            # in engine_rust.py), so every other row for this trade is blanked.
+            # But a multi-index overlay leg trades a DIFFERENT underlying — its
+            # own spot move is its own fact, not a duplicate of the carrying
+            # leg's. Keep it for overlay rows; base-engine non-carrying rows
+            # (same index, Spot P&L 0.0) stay blank exactly as before.
             _ov = str(row.get("Exit Reason") or "").upper() == "OVERLAY"
             _rs = row.get("Spot P&L")
             sc.append(_rs if (_ov and _rs is not None and pd.notna(_rs)) else None)

@@ -705,10 +705,11 @@ def _build_cleaned_rows(rows: List[Dict], key_order: List[str], tm: Dict,
             elif key == "Index":
                 val = _tid_to_index_no.get(k, int(str(trade.get("Trade") or trade.get("trade") or 1)))
             elif key == "Spot P&L %":
-                # Spot P&L is a trade-level quantity written only on Leg 1 rows.
-                # Leave Spot P&L % blank on Leg 2+ rows so the column matches
-                # Net P&L's first-leg-only convention and column sums give the
-                # correct trade-level total.
+                # Spot P&L is a trade-level quantity written on exactly one row
+                # per trade (the lowest present leg — see priced_to_tradesheet_records
+                # in engine_rust.py). This is purely row-derived: it's blank
+                # wherever "Spot P&L" itself is blank on that row, so it
+                # automatically follows the same one-row-per-trade placement.
                 spot_pnl = _to_num(trade.get("Spot P&L"))
                 if spot_pnl is None:
                     val = ""
@@ -1727,10 +1728,11 @@ def _summary_layout(
                       fc=(_GREEN_TX if pct_val >= 0 else _RED_TX), bg=_WHITE, align="L", border=True)
         sink.row_height(r, 18)
 
-    # Use backend summary for Spot P&L sum and Spot P&L %.  After the engine
-    # fix that puts Spot P&L only on first-leg rows, the local sums match
-    # backend; but reading from `summary.*` keeps all three Excel builders
-    # consistent (single source of truth, set in base.compute_analytics).
+    # Use backend summary for Spot P&L sum and Spot P&L %.  The engine writes
+    # Spot P&L on exactly one row per trade (the lowest present leg), so the
+    # local sums match backend; but reading from `summary.*` keeps all three
+    # Excel builders consistent (single source of truth, set in
+    # base.compute_analytics).
     _spot_sum_summary = _to_num(S.get("spot_change"))
     if _spot_sum_summary is None: _spot_sum_summary = spot_sum_gated
     _spot_pct_summary = _to_num(S.get("spot_change_pct"))

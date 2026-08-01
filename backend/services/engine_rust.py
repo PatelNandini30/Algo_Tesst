@@ -4296,9 +4296,10 @@ def _build_mixed_futures_next_weekly(
         _first = min(_rows, key=lambda _r: int(_r.get("leg_id") or 1))
         _first["net_pnl"] = _trade_total
 
-    # Order rows by (trade, leg) so leg-1 (carrying Spot P&L + the trade total) is
-    # FIRST within each trade — fixes the optim's `Spot P&L: first` aggregation
-    # picking a leading blank option row.
+    # Order rows by (trade, leg) ascending so the row carrying Spot P&L + the
+    # trade total — the trade's LOWEST PRESENT leg, not necessarily leg 1 (see
+    # priced_to_tradesheet_records) — sorts FIRST within each trade. This fixes
+    # the optim's `Spot P&L: first` aggregation picking a leading blank option row.
     combined.sort(key=lambda _r: (int(_r.get("trade_id") or 0), int(_r.get("leg_id") or 0)))
     return combined if combined else None
 
@@ -4502,10 +4503,12 @@ def _build_mixed_futures_options(
         _total = round(sum(float(r.get("net_pnl") or 0.0) for r in _rows), 4)
         min(_rows, key=lambda r: int(r.get("leg_id") or 1))["net_pnl"] = _total
 
-    # Order rows by (trade, leg) so the leg-1 row — which carries Spot P&L and the
-    # trade-total net_pnl — is FIRST within each trade. The optimizer's
-    # `Spot P&L: first` aggregation (and any first-row logic) then picks the real
-    # value instead of a leading option row whose Spot P&L is intentionally blank.
+    # Order rows by (trade, leg) ascending so the row carrying Spot P&L and the
+    # trade-total net_pnl — the trade's LOWEST PRESENT leg, not necessarily leg 1
+    # (see priced_to_tradesheet_records) — is FIRST within each trade. The
+    # optimizer's `Spot P&L: first` aggregation (and any first-row logic) then
+    # picks the real value instead of a leading option row whose Spot P&L is
+    # intentionally blank.
     combined.sort(key=lambda _r: (int(_r.get("trade_id") or 0), int(_r.get("leg_id") or 0)))
     return combined if combined else None
 
