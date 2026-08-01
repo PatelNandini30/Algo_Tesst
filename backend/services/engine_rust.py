@@ -3848,18 +3848,35 @@ def priced_to_tradesheet_records(
     # the backtest and the optimizer (which share this converter) apply it
     # identically.
     _apply_carry_slippage_guard(priced)
+    # Spot P&L is a trade-level quantity and rides ONE row per trade. That row
+    # is the trade's LOWEST PRESENT leg — not literally leg 1, because a leg
+    # can be absent: an individual per-leg filter file removes it from the
+    # trade. This mirrors native/src/simulate.rs:1793-1803, which places the
+    # Net P&L total on `lowest_leg` computed the same way. Before this, the
+    # gate was `leg_id == 1`, so a trade whose leg 1 was filtered out reported
+    # a BLANK Spot P&L.
+    _lowest_leg_by_trade: Dict[Any, int] = {}
+    for _r in priced:
+        _tid = _r.get("trade_id")
+        _lid = int(_r.get("leg_id") or 1)
+        if _tid not in _lowest_leg_by_trade or _lid < _lowest_leg_by_trade[_tid]:
+            _lowest_leg_by_trade[_tid] = _lid
     out: List[Dict[str, Any]] = []
     for row in priced:
         opt_type = (row.get("option_type") or "").upper()
         position = (row.get("position") or "SELL").upper()
         entry_spot = float(row.get("entry_spot") or 0.0)
         exit_spot = float(row.get("exit_spot") or 0.0)
-        # Spot P&L is a trade-level quantity: write it only on the first-leg
-        # row (leg_id == 1) and leave subsequent leg rows blank, mirroring the
-        # Net P&L convention.  Per-row summing then yields the trade total
-        # without double-counting for multi-leg strategies.
+        # Spot P&L is a trade-level quantity: write it only on the row for the
+        # trade's lowest PRESENT leg (see _lowest_leg_by_trade above) and leave
+        # the rest blank. Per-row summing then yields the trade total without
+        # double-counting for multi-leg strategies.
         _leg_id_val = int(row.get("leg_id") or 1)
-        spot_pnl = round(exit_spot - entry_spot, 2) if _leg_id_val == 1 else ""
+        spot_pnl = (
+            round(exit_spot - entry_spot, 2)
+            if _leg_id_val == _lowest_leg_by_trade.get(row.get("trade_id"), 1)
+            else ""
+        )
         net_pnl = float(row.get("net_pnl") or 0.0)
         # CE/PE P&L are PER-LEG values. The simulate.rs post-process puts the
         # trade total in the parent row's `net_pnl`, so we cannot read per-leg
