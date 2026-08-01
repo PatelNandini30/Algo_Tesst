@@ -147,6 +147,31 @@ class TestSpotPnlAggregation(unittest.TestCase):
         ])
         self.assertIn(self._agg(df)["Spot P&L"].iloc[0], ("", None))
 
+    def test_zero_spot_pnl_survives(self):
+        """A flat close-to-close move is a legitimate 0.0, not a blank.
+        Must FAIL if the helper is ever rewritten with a truthiness check."""
+        df = pd.DataFrame([
+            {"Trade": 4, "Leg": 1, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": 0.0},
+            {"Trade": 4, "Leg": 2, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": ""},
+        ])
+        self.assertEqual(self._agg(df)["Spot P&L"].iloc[0], 0.0)
+
+    def test_negative_spot_pnl_survives(self):
+        df = pd.DataFrame([
+            {"Trade": 5, "Leg": 1, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": -132.75},
+            {"Trade": 5, "Leg": 2, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": ""},
+        ])
+        self.assertEqual(self._agg(df)["Spot P&L"].iloc[0], -132.75)
+
+    def test_pd_na_does_not_raise(self):
+        from backend.services.trade_anchor import spot_first_non_empty
+        result = spot_first_non_empty([pd.NA, 182.75])
+        self.assertEqual(result, 182.75)
+
 
 if __name__ == "__main__":
     unittest.main()

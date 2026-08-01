@@ -323,8 +323,15 @@ def spot_first_non_empty(series: Iterable[Any]) -> Any:
     would win. Returns "" when no row carries a value.
     """
     for v in series:
-        if v != "" and v is not None and not (isinstance(v, float) and v != v):
+        # pd.isna() handles NaN/None/pd.NA/NaT uniformly and returns a real
+        # bool for scalars (unlike `v != ""`, which raises on pd.NA). Guard
+        # the non-scalar case defensively even though a single cell should
+        # never hold a list/array here.
+        if not pd.api.types.is_scalar(v):
             return v
+        if pd.isna(v) or v == "":
+            continue
+        return v
     return ""
 
 
