@@ -359,3 +359,23 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 **Scope check:** four tasks, one of them human-run. Small enough for a single plan.
 
 **Known limitation, ruled by the owner on 2026-08-01:** when the carrying leg is itself truncated by its own filter, Spot P&L describes that row's own (shorter) window rather than the trade's. This is deliberate — the calculation was to stay exactly as it is. If a trade's leg 1 is truncated while leg 2 runs to expiry, the displayed Spot P&L will measure the shorter span.
+
+## Post-implementation corrections (final review, 2026-08-01)
+
+**The futures re-entry duplicate-`leg_id` guard changes no output.** During Task 1 it was believed that
+`_build_futures_specs` emitting its re-entry row (`engine_rust.py:1733-1734`) with the same `trade_id` AND
+`leg_id` as the primary row (`:1623-1624`) had been double-counting Spot P&L in column totals. It had not.
+Every consumer re-derives the column after aggregating, using a per-trade `parent_seen`/`seen` set that
+writes the value on one row and `None` on the rest — `algotest_job.py:559-581`,
+`optimizer/runner.py:1959-1985`, and the four `multi_index_feature.py` sites — and the aggregation itself is
+first-semantics, never a sum. The `_spot_assigned` guard is therefore **defensive only**. No total changed.
+
+**Known second writer, latent.** `multi_index_feature.py:292-294` (`_price_futures_group`) builds its own
+rows and assigns `r["Spot P&L"] = spot_pl if k == 0 else 0.0` — positional first leg rather than lowest
+present leg, and `0.0` rather than `""` for blanks. Because `0.0` is genuinely non-empty,
+`spot_first_non_empty` degenerates to plain `first` on a fused trade whose futures group leads the concat.
+Not reachable through a per-leg filter today (that path reads only the global `_load_filter_segments`), so it
+is a latent gap. Fix it if that path ever gains per-leg filter support.
+
+**Dtype nuance.** For an all-blank float64/NaN column the helper returns `""` where `"first"` returned `NaN`,
+so the cell renders blank instead of `nan`. Benign, arguably better, but it is a real cell-content change.
