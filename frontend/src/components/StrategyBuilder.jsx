@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal, Cpu } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal, Cpu, Upload, FileText, X } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
@@ -4675,45 +4675,78 @@ const StrategyBuilder = () => {
                                 <Tooltip text="This leg's own slippage — independent of every other leg (e.g. give an options leg slippage while a futures hedge leg stays off)." />
                               </>)}
                             </div>
-                          </div>
-                          {leg.segment !== 'midcap100' && (
-                            <div className="space-y-1">
-                              <label className="flex items-center gap-2 cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  checked={!!leg.individual_filter}
-                                  onChange={e => {
-                                    updateLeg(leg.id, 'individual_filter', e.target.checked);
-                                    if (!e.target.checked) {
+                            {leg.segment !== 'midcap100' && (
+                              <div className="flex items-center gap-2">
+                                <Toggle
+                                  enabled={Boolean(leg.individual_filter)}
+                                  onToggle={(val) => {
+                                    const next = val !== undefined ? Boolean(val) : !leg.individual_filter;
+                                    updateLeg(leg.id, 'individual_filter', next);
+                                    if (!next) {
                                       updateLeg(leg.id, 'filter_segments', []);
                                       updateLeg(leg.id, 'filter_file_name', '');
                                       updateLeg(leg.id, 'filter_error', '');
                                     }
                                   }}
-                                  className="accent-blue-600"
+                                  size="sm"
                                 />
-                                <span className="text-xs font-semibold text-muted uppercase tracking-wide">
-                                  Individual filter
-                                </span>
-                              </label>
-                              {leg.individual_filter && (
-                                <div className="space-y-1 pl-6">
-                                  <input
-                                    type="file"
-                                    accept=".csv"
-                                    onChange={e => handleLegFilterUpload(leg.id, e)}
-                                    className="text-[11px]"
-                                  />
-                                  {leg.filter_uploading && <p className="text-[11px] text-muted">Uploading…</p>}
-                                  {leg.filter_error && <p className="text-[11px] text-red-600">{leg.filter_error}</p>}
-                                  {!!(leg.filter_segments || []).length && (
-                                    <p className="text-[11px] text-muted">
-                                      {leg.filter_file_name} — {leg.filter_segments.length} range(s).
-                                      This leg trades only on dates inside them; it exits at whichever
-                                      comes first, its own range end or the trade's exit.
-                                    </p>
+                                <span className="text-xs font-medium text-secondary whitespace-nowrap">Individual Filter</span>
+                                <Tooltip text="Give this leg its own date file. It only subtracts: the strategy Filter still decides which trades exist, and this leg is skipped on trades outside its ranges. It exits at whichever comes first — its own range end or the trade's exit." />
+                              </div>
+                            )}
+                          </div>
+                          {leg.segment !== 'midcap100' && leg.individual_filter && (
+                            <div className="rounded-lg border border-default bg-hover/40 px-3 py-2 space-y-1.5">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <input
+                                  type="file"
+                                  accept=".csv"
+                                  id={`leg-filter-csv-${leg.id}`}
+                                  onChange={e => handleLegFilterUpload(leg.id, e)}
+                                  className="hidden"
+                                />
+                                <label
+                                  htmlFor={`leg-filter-csv-${leg.id}`}
+                                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-secondary bg-hover border border-default rounded-lg hover:bg-base transition-colors cursor-pointer"
+                                >
+                                  {leg.filter_uploading ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                  ) : (
+                                    <Upload className="w-3.5 h-3.5" />
                                   )}
-                                </div>
+                                  Upload CSV
+                                </label>
+                                {leg.filter_file_name && (
+                                  <span className="flex items-center gap-1 text-xs text-profit">
+                                    <FileText className="w-3 h-3" />
+                                    {leg.filter_file_name}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        updateLeg(leg.id, 'filter_segments', []);
+                                        updateLeg(leg.id, 'filter_file_name', '');
+                                        updateLeg(leg.id, 'filter_error', '');
+                                      }}
+                                      className="ml-1 hover:text-loss"
+                                      title="Remove this leg's filter file"
+                                    >
+                                      <X className="w-3 h-3" />
+                                    </button>
+                                  </span>
+                                )}
+                                {!!(leg.filter_segments || []).length && (
+                                  <span className="px-2 py-0.5 rounded-full bg-accent/10 text-accent text-[11px] font-medium">
+                                    {leg.filter_segments.length} range{leg.filter_segments.length === 1 ? '' : 's'}
+                                  </span>
+                                )}
+                              </div>
+                              {leg.filter_error && (
+                                <p className="text-[11px] text-loss">{leg.filter_error}</p>
+                              )}
+                              {!(leg.filter_segments || []).length && !leg.filter_error && (
+                                <p className="text-[11px] text-muted">
+                                  CSV with <span className="text-secondary">Start,End</span> (or Entry,Exit) columns, day-first dates.
+                                </p>
                               )}
                             </div>
                           )}
