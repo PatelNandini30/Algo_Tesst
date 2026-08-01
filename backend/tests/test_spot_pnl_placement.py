@@ -55,13 +55,46 @@ class TestSpotPnlPlacement(unittest.TestCase):
             _row(1, 1, 100.0, 110.0), _row(1, 2, 100.0, 110.0),
             _row(2, 2, 110.0, 105.0), _row(2, 3, 110.0, 105.0),
             _row(3, 3, 105.0, 120.0),
+            # trade 5: futures primary + re-entry row, SAME leg_id (see
+            # _build_futures_specs :1623-1624 / :1733-1734) plus a higher leg.
+            _row(5, 2, 100.0, 105.0), _row(5, 2, 105.0, 108.0), _row(5, 3, 100.0, 108.0),
         ]
         from backend.services.engine_rust import priced_to_tradesheet_records
         out = priced_to_tradesheet_records(rows, {}, 75)
-        for tid in ("1", "2", "3"):
+        for tid in ("1", "2", "3", "5"):
             carried = [r for r in out
                        if r["Trade"] == tid and r["Spot P&L"] != ""]
             self.assertEqual(len(carried), 1, f"trade {tid}")
+
+    def test_duplicate_leg_id_same_trade_first_row_wins(self):
+        """Futures primary + re-entry row can share trade_id AND leg_id.
+
+        Both would match the lowest-leg check; only the FIRST in input order
+        may carry the value, or the trade's Spot P&L doubles when summed.
+        """
+        rows = [
+            _row(6, 1, 100.0, 110.0),  # primary: 10.0
+            _row(6, 1, 110.0, 108.0),  # re-entry: -2.0, same leg_id
+        ]
+        from backend.services.engine_rust import priced_to_tradesheet_records
+        out = priced_to_tradesheet_records(rows, {}, 75)
+        carried = [r for r in out if r["Trade"] == "6" and r["Spot P&L"] != ""]
+        self.assertEqual(len(carried), 1)
+        self.assertEqual(carried[0]["Spot P&L"], 10.0)
+
+    def test_duplicated_lowest_leg_with_higher_leg(self):
+        """Duplicated lowest leg (2, 2) alongside a higher leg (3)."""
+        rows = [
+            _row(7, 2, 100.0, 106.0),
+            _row(7, 2, 106.0, 109.0),
+            _row(7, 3, 100.0, 109.0),
+        ]
+        from backend.services.engine_rust import priced_to_tradesheet_records
+        out = priced_to_tradesheet_records(rows, {}, 75)
+        carried = [r for r in out if r["Trade"] == "7" and r["Spot P&L"] != ""]
+        self.assertEqual(len(carried), 1)
+        self.assertEqual(carried[0]["Leg"], 2)
+        self.assertEqual(carried[0]["Spot P&L"], 6.0)
 
     def test_per_leg_ordering_does_not_matter(self):
         """Rows may arrive in any order; the lowest leg still wins."""

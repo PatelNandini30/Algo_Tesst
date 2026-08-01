@@ -3855,12 +3855,18 @@ def priced_to_tradesheet_records(
     # Net P&L total on `lowest_leg` computed the same way. Before this, the
     # gate was `leg_id == 1`, so a trade whose leg 1 was filtered out reported
     # a BLANK Spot P&L.
+    # A trade can carry TWO rows with the same leg_id (e.g. a futures primary
+    # row + its re-entry row, see _build_futures_specs :1623-1624 / :1733-1734)
+    # — both would match the lowest-leg check below and double the Spot P&L
+    # sum. `_spot_assigned` guards that, mirroring simulate.rs:1799-1805's
+    # `total_assigned` HashSet: the FIRST matching row (input order) wins.
     _lowest_leg_by_trade: Dict[Any, int] = {}
     for _r in priced:
         _tid = _r.get("trade_id")
         _lid = int(_r.get("leg_id") or 1)
         if _tid not in _lowest_leg_by_trade or _lid < _lowest_leg_by_trade[_tid]:
             _lowest_leg_by_trade[_tid] = _lid
+    _spot_assigned: set = set()
     out: List[Dict[str, Any]] = []
     for row in priced:
         opt_type = (row.get("option_type") or "").upper()
@@ -3872,11 +3878,13 @@ def priced_to_tradesheet_records(
         # the rest blank. Per-row summing then yields the trade total without
         # double-counting for multi-leg strategies.
         _leg_id_val = int(row.get("leg_id") or 1)
-        spot_pnl = (
-            round(exit_spot - entry_spot, 2)
-            if _leg_id_val == _lowest_leg_by_trade.get(row.get("trade_id"), 1)
-            else ""
-        )
+        _row_tid = row.get("trade_id")
+        if (_leg_id_val == _lowest_leg_by_trade.get(_row_tid, 1)
+                and _row_tid not in _spot_assigned):
+            spot_pnl = round(exit_spot - entry_spot, 2)
+            _spot_assigned.add(_row_tid)
+        else:
+            spot_pnl = ""
         net_pnl = float(row.get("net_pnl") or 0.0)
         # CE/PE P&L are PER-LEG values. The simulate.rs post-process puts the
         # trade total in the parent row's `net_pnl`, so we cannot read per-leg
