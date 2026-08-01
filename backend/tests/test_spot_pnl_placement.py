@@ -106,5 +106,47 @@ class TestSpotPnlPlacement(unittest.TestCase):
         self.assertEqual(got[("4", 3)], "")
 
 
+import pandas as pd
+
+
+class TestSpotPnlAggregation(unittest.TestCase):
+    """The aggregate must find the carrying row wherever it sorts."""
+
+    def _agg(self, df):
+        from backend.services.algotest_job import _anchor_sorted
+        from backend.services.trade_anchor import spot_first_non_empty
+        # Mirror the real aggregation for just this column.
+        return (_anchor_sorted(df)
+                .groupby("Trade", as_index=False)
+                .agg({"Spot P&L": spot_first_non_empty}))
+
+    def test_carried_yearly_leg_order_still_finds_the_value(self):
+        """Leg 2 enters LATER, so _anchor_sorted puts it first; leg 1 carries
+        the value. Positional "first" returns "" here — the pre-existing bug."""
+        df = pd.DataFrame([
+            {"Trade": 1, "Leg": 1, "Entry Date": pd.Timestamp("2019-01-01"),
+             "Spot P&L": 182.75},
+            {"Trade": 1, "Leg": 2, "Entry Date": pd.Timestamp("2019-11-21"),
+             "Spot P&L": ""},
+        ])
+        self.assertEqual(self._agg(df)["Spot P&L"].iloc[0], 182.75)
+
+    def test_value_on_leg_2_when_leg_1_is_absent(self):
+        df = pd.DataFrame([
+            {"Trade": 2, "Leg": 2, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": -132.75},
+            {"Trade": 2, "Leg": 3, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": ""},
+        ])
+        self.assertEqual(self._agg(df)["Spot P&L"].iloc[0], -132.75)
+
+    def test_all_blank_stays_blank(self):
+        df = pd.DataFrame([
+            {"Trade": 3, "Leg": 1, "Entry Date": pd.Timestamp("2019-11-28"),
+             "Spot P&L": ""},
+        ])
+        self.assertIn(self._agg(df)["Spot P&L"].iloc[0], ("", None))
+
+
 if __name__ == "__main__":
     unittest.main()

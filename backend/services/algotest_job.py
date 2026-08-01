@@ -281,6 +281,7 @@ def _build_fast_lookup_from_bulk(index: str = None, from_date: str = None, to_da
 # services/trade_anchor.py so the optimizer can feed apply_exit_anchor_exclusion
 # the SAME row order this path does (optim == backtest, per the project rule).
 from services.trade_anchor import anchor_sorted as _anchor_sorted
+from services.trade_anchor import spot_first_non_empty as _spot_first_non_empty
 
 
 def _try_rust_engine(payload, index, effective_from, effective_to):
@@ -470,7 +471,7 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
         "Exit Date": "first",
         "Entry Spot": "first",
         "Exit Spot": "first",
-        "Spot P&L": "first",
+        "Spot P&L": _spot_first_non_empty,
         "CE P&L": "sum",
         "PE P&L": "sum",
         "FUT P&L": "sum",

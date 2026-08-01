@@ -1870,12 +1870,13 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
 
         # Mirror Python engine's per-trade aggregation + DD-MM date quirk so
         # CAGR/CAR-MDD match exactly. See services/algotest_job._try_rust_engine.
+        from services.trade_anchor import spot_first_non_empty
         aggregated = df.groupby("Trade", as_index=False).agg({
             "Entry Date": "first",
             "Exit Date": "first",
             "Entry Spot": "first",
             "Exit Spot": "first",
-            "Spot P&L": "first",
+            "Spot P&L": spot_first_non_empty,
             "CE P&L": "sum",
             "PE P&L": "sum",
             "FUT P&L": "sum",

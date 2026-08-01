@@ -58,6 +58,7 @@ __all__ = [
     "trade_entry_spot",
     "trade_pct_pnl",
     "is_reentry_row",
+    "spot_first_non_empty",
 ]
 
 # Columns holding genuinely PER-LEG P&L (engine_rust.py:3740-3745 recomputes
@@ -310,6 +311,21 @@ def apply_exit_anchor_exclusion(aggregated: "pd.DataFrame", sorted_df: "pd.DataF
     aggregated["Exit Date"] = aggregated["Trade"].map(exit_pick["Exit Date"])
     aggregated["Exit Reason"] = aggregated["Trade"].map(exit_pick["Exit Reason"])
     return aggregated
+
+
+def spot_first_non_empty(series: Iterable[Any]) -> Any:
+    """Aggregate a trade-level column that rides ONE leg row (e.g. Spot P&L).
+
+    Positional "first" is wrong here: `anchor_sorted` orders by LATEST entry
+    date, so the first row of a trade is not necessarily the row carrying the
+    value. A carried-YEARLY leg holds an older entry date than the weekly leg
+    that re-enters each cycle, so the weekly leg sorts first and its blank
+    would win. Returns "" when no row carries a value.
+    """
+    for v in series:
+        if v != "" and v is not None and not (isinstance(v, float) and v != v):
+            return v
+    return ""
 
 
 def trade_net_pnl(rows: Iterable[Dict[str, Any]]) -> float:
