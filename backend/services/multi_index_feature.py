@@ -24,6 +24,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.trade_anchor import spot_first_non_empty
+
 logger = logging.getLogger(__name__)
 
 # Last (symbol, from, to) successfully bulk-loaded via _reload_bulk_if_needed,
@@ -1853,7 +1855,13 @@ def run_multi_index_feature(
         "Exit Date": "first",
         "Entry Spot": "first",
         "Exit Spot": "first",
-        "Spot P&L": "first",
+        # Spot P&L rides ONE row per trade (the lowest present leg — see
+        # priced_to_tradesheet_records in engine_rust.py). `combined` here is a
+        # pd.concat of per-group tradesheets straight from the Rust engine with
+        # no leg-order sort applied at this point, so plain "first" can pick a
+        # blank row (the same bug fixed in algotest_job.py/runner.py via this
+        # helper). Use the order-independent aggregator instead.
+        "Spot P&L": spot_first_non_empty,
         "CE P&L": "sum",
         "PE P&L": "sum",
         "FUT P&L": "sum",
@@ -2344,8 +2352,10 @@ def _run_sync_per_index_groups(
     # LATEST leg exit — so when one leg self-spot-adjusts mid-cycle (truncating early)
     # while the other holds to the cadence boundary, the trade's window still shows
     # the full cadence-cycle close. Per-leg exits are preserved on each row.
+    # Spot P&L: use the order-independent aggregator, not positional "first" —
+    # see the comment at the first agg_spec above for why.
     agg_spec = {"Entry Date": "min", "Exit Date": "max", "Entry Spot": "first",
-                "Exit Spot": "first", "Spot P&L": "first",
+                "Exit Spot": "first", "Spot P&L": spot_first_non_empty,
                 "CE P&L": "sum", "PE P&L": "sum", "FUT P&L": "sum",
                 "_legpnl": "sum", "_legpct": "sum"}
     if "Exit Reason" in combined.columns:
@@ -3333,8 +3343,10 @@ def _run_sync_fused_groups(
     combined["% P&L"] = combined["_legpct"]
 
     # ---- 4. Aggregate per cadence trade + combined base-100 compound equity ----
+    # Spot P&L: use the order-independent aggregator, not positional "first" —
+    # see the comment at the first agg_spec above for why.
     agg_spec = {"Entry Date": "min", "Exit Date": "max", "Entry Spot": "first",
-                "Exit Spot": "first", "Spot P&L": "first",
+                "Exit Spot": "first", "Spot P&L": spot_first_non_empty,
                 "CE P&L": "sum", "PE P&L": "sum", "FUT P&L": "sum",
                 "_legpnl": "sum", "_legpct": "sum"}
     if "Exit Reason" in combined.columns:
@@ -3806,8 +3818,10 @@ def run_sync_weekly_cadence(
     # the Rust engine, and from ov_rows, _overlay_legs_onto_base) is ALREADY
     # lots-scaled per its own leg (points x that leg's lots) — Net P&L here is
     # just their sum and must NOT be multiplied by lots again at this level.
+    # Spot P&L: use the order-independent aggregator, not positional "first" —
+    # see the comment at the first agg_spec above for why.
     agg_spec = {"Entry Date": "first", "Exit Date": "first", "Entry Spot": "first",
-                "Exit Spot": "first", "Spot P&L": "first",
+                "Exit Spot": "first", "Spot P&L": spot_first_non_empty,
                 "CE P&L": "sum", "PE P&L": "sum", "FUT P&L": "sum", "% P&L": "sum"}
     if "Exit Reason" in combined.columns:
         agg_spec["Exit Reason"] = "first"

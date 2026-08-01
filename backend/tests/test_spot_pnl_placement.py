@@ -198,5 +198,41 @@ class TestSpotPnlOptimizerSum(unittest.TestCase):
         self.assertEqual(per_leg_pnl(df_leg1)["long_spot_pnl"], 10.0)
 
 
+class TestMultiIndexSpotPnlAggregation(unittest.TestCase):
+    """Step 8 follow-up: multi_index_feature.py's `combined = pd.concat(group_frames)`
+    groupby("Trade").agg(...) sites have NO leg-order sort before them (unlike
+    algotest_job.py's _anchor_sorted or engine_rust.py's trade/leg sort) — the
+    per-group tradesheet arrives in whatever order Rust's simulate_trades_batch
+    returned. Plain "first" can therefore pick a blank row exactly like the bug
+    that made optimizer/runner.py need spot_first_non_empty. This pins the
+    aggregation shape used at multi_index_feature.py:1856/2348/3337/3810."""
+
+    def _agg_spec_shape(self, df, spot_agg):
+        return df.groupby("Trade", as_index=False).agg({
+            "Entry Spot": "first", "Spot P&L": spot_agg,
+            "CE P&L": "sum", "PE P&L": "sum",
+        })
+
+    def test_carrying_row_not_first_breaks_plain_first(self):
+        """Control: proves the bug is real against plain 'first', matching the
+        shape actually used before this fix."""
+        df = pd.DataFrame([
+            {"Trade": 1, "Entry Spot": 100.0, "Spot P&L": "", "CE P&L": 5.0, "PE P&L": 0.0},
+            {"Trade": 1, "Entry Spot": 100.0, "Spot P&L": -132.75, "CE P&L": 0.0, "PE P&L": 3.0},
+        ])
+        got = self._agg_spec_shape(df, "first")["Spot P&L"].iloc[0]
+        self.assertNotEqual(got, -132.75, "plain 'first' should (wrongly) miss the value")
+        self.assertEqual(got, "")
+
+    def test_carrying_row_not_first_spot_first_non_empty_still_finds_it(self):
+        from backend.services.trade_anchor import spot_first_non_empty
+        df = pd.DataFrame([
+            {"Trade": 1, "Entry Spot": 100.0, "Spot P&L": "", "CE P&L": 5.0, "PE P&L": 0.0},
+            {"Trade": 1, "Entry Spot": 100.0, "Spot P&L": -132.75, "CE P&L": 0.0, "PE P&L": 3.0},
+        ])
+        got = self._agg_spec_shape(df, spot_first_non_empty)["Spot P&L"].iloc[0]
+        self.assertEqual(got, -132.75)
+
+
 if __name__ == "__main__":
     unittest.main()
