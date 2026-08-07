@@ -2,24 +2,27 @@ import React, { useState, useEffect, useRef } from 'react';
 import StrategyBuilder from './components/StrategyBuilder';
 
 const HEALTH_POLL_MS = 2000;
-const HEALTH_CHECK_TIMEOUT_MS = 4000;
-// Show the "backend unavailable" overlay only after this many CONSECUTIVE failed
-// health polls, so a quick backend restart/redeploy (a few seconds of downtime)
-// no longer flashes the overlay. A single successful poll clears it immediately.
-// At a 2s poll interval, 3 failures ≈ 4-6s of sustained downtime before it shows.
-const HEALTH_FAIL_THRESHOLD = 3;
+const HEALTH_CHECK_TIMEOUT_MS = 15000;
+// The blocking overlay is shown ONLY when the backend explicitly declares
+// maintenance (`{"maintenance": true}` from /health, set by an operator before a
+// rebuild). It is NEVER inferred from failed or slow health polls.
+//
+// Why: a heavy optimize sweep saturates the CPU enough that /health can take
+// >4s, the old client timeout aborted it, three aborts in a row were read as
+// "the backend is down", and users got a full-screen "Server is restarting…"
+// while nothing had restarted and their jobs were running normally. Guessing
+// from latency cannot distinguish a busy server from a dead one — so it no
+// longer guesses. The timeout above is now generous for the same reason.
 
 function App() {
   const [resetKey, setResetKey] = useState(0);
-  // Tracks whether the backend is reachable right now. Polled continuously
-  // (not just on mount) so a backend rebuild/restart mid-session — e.g. while
-  // deploying a fix — is caught immediately: the overlay below blocks all
-  // interaction with the app underneath, so no backtest/optim can be
-  // submitted while the backend is unavailable. Starts true (optimistic) so
-  // a normal page load doesn't flash the overlay before the first check.
+  // False ONLY while the backend declares maintenance (operator-set flag, or
+  // still warming up after a start). The overlay blocks interaction so nobody
+  // submits a job into a box that is being rebuilt. A busy/slow backend leaves
+  // this true — see the health poll below.
   const [backendUp, setBackendUp] = useState(true);
+  const [maintenanceMsg, setMaintenanceMsg] = useState('');
   const pollRef = useRef(null);
-  const failCountRef = useRef(0);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -40,17 +43,20 @@ function App() {
       try {
         const r = await fetch('/health', { signal: controller.signal, cache: 'no-store' });
         if (cancelled) return;
-        if (r.ok) {
-          failCountRef.current = 0;      // recovered — clear immediately
-          setBackendUp(true);
+        // 503 = still warming up; both it and an explicit flag set maintenance.
+        const body = await r.json().catch(() => ({}));
+        if (body && body.maintenance === true) {
+          setMaintenanceMsg(body.message || 'Maintenance in progress');
+          setBackendUp(false);
         } else {
-          failCountRef.current += 1;
-          if (failCountRef.current >= HEALTH_FAIL_THRESHOLD) setBackendUp(false);
+          setMaintenanceMsg('');
+          setBackendUp(true);
         }
       } catch {
+        // Timeout / network error / server busy: do NOTHING. A slow or briefly
+        // unreachable backend is not maintenance, and blocking the whole UI on
+        // that guess is what scared users mid-sweep. The next poll re-checks.
         if (cancelled) return;
-        failCountRef.current += 1;       // network error / timeout counts as a failure
-        if (failCountRef.current >= HEALTH_FAIL_THRESHOLD) setBackendUp(false);
       } finally {
         clearTimeout(timer);
       }
@@ -97,10 +103,10 @@ function App() {
             }}
           />
           <style>{'@keyframes app-health-spin { to { transform: rotate(360deg); } }'}</style>
-          <div style={{ fontSize: 16, fontWeight: 600 }}>Server is restarting…</div>
+          <div style={{ fontSize: 16, fontWeight: 600 }}>Maintenance in progress…</div>
           <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.7)', maxWidth: 360 }}>
-            Backend is being updated. Backtests and optimizations can't be started right now —
-            this page will unlock automatically as soon as it's back.
+            {maintenanceMsg ||
+              "The system is being updated. Backtests and optimizations can't be started right now — this page will unlock automatically when it's done."}
           </div>
         </div>
       )}

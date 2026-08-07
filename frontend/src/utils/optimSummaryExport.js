@@ -107,6 +107,10 @@ function _humanParamLabel(path) {
     'strike_selection.offset': 'Strike Offset (gaps)',
     'strike_selection.straddle_multiplier': 'Straddle Width',
     'strike_selection.straddle_direction': 'Straddle Direction',
+    'strike_selection.premium': 'Time Value / Premium',
+    'strike_selection.moneyness': 'Time Value Side',
+    'strike_selection.tv_range_pct': 'Time Value Range %',
+    'strike_selection.tv_units': 'Time Value Unit',
     'spot_adjustment.pct': 'Own Spot Adjustment',
     'spot_adjustment.direction': 'Own Spot Adj Direction',
     'spot_adjustment.enabled': 'Own Spot Adj On/Off',
@@ -235,6 +239,43 @@ export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo,
  * button and the auto-download queue so retry/backoff behavior is identical.
  * Returns { blob, filename } or throws.
  */
+/**
+ * Same 202-poll contract, but once the file is ready the BROWSER downloads it
+ * natively (plain navigation) instead of buffering the body into a Blob. A
+ * tradesheets ZIP is ~300 MB — `await r.blob()` holds all of that in tab memory
+ * and silently fails on a constrained browser, which is why big ZIP downloads
+ * did nothing. Navigation streams straight to disk and uses the response's
+ * Content-Disposition filename. Use this for the ZIP; small files (WOW/MOM,
+ * summary) can stay on the Blob path.
+ */
+export async function downloadWhenReady(url, { maxWaitMs = 20 * 60 * 1000, onProgress } = {}) {
+  const start = Date.now();
+  while (true) {
+    // fetch() resolves once the HEADERS arrive; cancel the body so the probe
+    // never transfers the ~300 MB payload (the endpoint ignores Range, so a
+    // ranged GET would download the whole file).
+    const r = await fetch(url);
+    if (r.status === 200) {
+      r.body?.cancel?.();
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = '';           // let Content-Disposition name it
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      return r.headers.get('x-filename') || null;
+    }
+    if (r.status === 202) {
+      if (onProgress) onProgress(await r.json().catch(() => ({})));
+      if (Date.now() - start > maxWaitMs) throw new Error('Build is taking longer than expected — try again later.');
+      await new Promise((res) => setTimeout(res, 2000));
+      continue;
+    }
+    const err = await r.json().catch(() => ({}));
+    throw new Error(err.detail || err.error || `HTTP ${r.status}`);
+  }
+}
+
 export async function fetchBlobWithPoll(url, { maxWaitMs = 20 * 60 * 1000, onProgress } = {}) {
   const start = Date.now();
   while (true) {

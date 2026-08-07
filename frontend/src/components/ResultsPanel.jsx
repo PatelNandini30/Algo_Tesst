@@ -72,7 +72,18 @@ const buildExcelFileName = (config) => {
   const parts = [config.instrument || 'backtest'];
 
   const _stratIdx = String(config.instrument || '').toUpperCase();
-  (config.legs || []).forEach(leg => {
+  // Same-type leg counts (CE/PE) — when a strategy has 2+ legs of the same
+  // option type (e.g. Monthly PE + Weekly PE), each leg's filename segment
+  // gets an L{n} tag below so the name doesn't collapse into two identical-
+  // looking "SELL_PE_SW_..." runs that don't say which leg is which.
+  const _typeCounts = {};
+  (config.legs || []).forEach(l => {
+    if ((l.segment || '') === 'futures' || (l.segment || '') === 'midcap100') return;
+    const o = (l.option_type || '').toLowerCase();
+    const ot = o === 'call' ? 'CE' : o === 'put' ? 'PE' : o.toUpperCase();
+    if (ot) _typeCounts[ot] = (_typeCounts[ot] || 0) + 1;
+  });
+  (config.legs || []).forEach((leg, _legPos) => {
     // Multi-index: tag a cross-index leg with its own index so the export name
     // reflects it (e.g. ...+MIDCPNIFTY-BUY-FUT-MONTHLY). Same-index legs unchanged.
     const _legIdx = String(leg.index || _stratIdx).toUpperCase();
@@ -95,13 +106,16 @@ const buildExcelFileName = (config) => {
       const exp = (leg.expiry || '').toUpperCase().replace('_', '');
       if (exp) parts.push(exp);
     } else {
-      parts.push((leg.position || 'sell').toUpperCase());
       const opt = (() => {
         const o = (leg.option_type || '').toLowerCase();
         if (o === 'call') return 'CE';
         if (o === 'put') return 'PE';
         return o.toUpperCase();
       })();
+      // Only when 2+ legs share this option type (e.g. Monthly PE + Weekly PE)
+      // — a single CE/single PE strategy's filename is byte-identical to before.
+      if (opt && (_typeCounts[opt] || 0) > 1) parts.push(`L${_legPos + 1}`);
+      parts.push((leg.position || 'sell').toUpperCase());
       if (opt) parts.push(opt);
       const criteria = leg.strike_criteria || 'strike_type';
       if (criteria === 'pct_of_atm') {
@@ -114,15 +128,34 @@ const buildExcelFileName = (config) => {
       } else if (criteria === 'straddle_width') {
         const mult = leg.straddle_multiplier != null ? parseFloat(leg.straddle_multiplier) : 0.5;
         const multStr = Number.isInteger(mult) ? String(mult) : parseFloat(mult.toFixed(2)).toString();
-        // Raw +/- sign, applied identically to every leg (no CE/PE meaning).
-        const sign = (leg.straddle_direction || '+').trim() === '-' ? '-' : '+';
-        parts.push(`SW_${multStr}X_${sign}`);
+        // The engine's +/- sign is a raw offset applied identically to every
+        // leg (no CE/PE meaning at the engine level) — but for the filename,
+        // translate it into ITM/OTM per option_type, matching combo_labeler.py:
+        //   CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
+        //   PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
+        const _isCall = opt === 'CE';
+        const _aboveAtm = (leg.straddle_direction || '+').trim() !== '-';
+        const moneyness = mult === 0 ? 'ATM' : (_aboveAtm ? (_isCall ? 'OTM' : 'ITM') : (_isCall ? 'ITM' : 'OTM'));
+        parts.push(`SW_${multStr}X_${moneyness}`);
       } else if (criteria === 'rel_leg') {
         // Relative-to-Leg (Iron Condor wing): reflect parent + offset in gaps,
         // e.g. REL_L1_2G  /  REL_L3_-1G — instead of a misleading "ATM".
         const ref = Number(leg.ref_leg) || 1;
         const off = Number(leg.offset) || 0;
         parts.push(`REL_L${ref}_${off}G`);
+      } else if (criteria.startsWith('time_value')) {
+        // 'TV100' / 'TV100_GTE' / 'TV100_LTE' — same token combo_labeler.py
+        // writes, so an optim combo folder matches a standalone backtest file.
+        const tv = leg.premium_value != null ? parseFloat(leg.premium_value) : 0;
+        const tvStr = Number.isInteger(tv) ? String(tv) : parseFloat(tv.toFixed(2)).toString();
+        const suffix = criteria === 'time_value_gte' ? '_GTE'
+          : criteria === 'time_value_lte' ? '_LTE' : '';
+        const side = String(leg.tv_moneyness || 'ATM').toUpperCase();
+        const cap = Number(leg.tv_range_pct) || 0;
+        // Unit always spelled out (PTS/PCT); range cap gets its own RNG
+        // token so the two percentages in a name can't be confused.
+        const unit = String(leg.tv_units || 'points') === 'percent' ? 'PCT' : 'PTS';
+        parts.push(`TV${tvStr}${unit}${suffix}_${side}` + (cap ? `_RNG${cap}PCT` : ''));
       } else {
         parts.push((leg.strike_type || 'atm').toUpperCase());
       }

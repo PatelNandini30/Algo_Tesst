@@ -1000,8 +1000,8 @@ def _patch_wise_layout(
 
 # ── Sheet 1: Trade Sheet ──────────────────────────────────────────────────────
 
-def _write_rules_sheet(wb: Workbook, rules_sheet: List) -> None:
-    """Render a standalone leg-wise "Rules" sheet as the FIRST tab of the workbook.
+def _rules_layout(sink, rules_sheet: List) -> None:
+    """Emit the leg-wise "Rules" sheet through a layout sink.
 
     `rules_sheet` is a list of typed rows built client-side from the strategy
     payload (frontend buildRulesSheet), so the sheet reflects the full
@@ -1010,43 +1010,50 @@ def _write_rules_sheet(wb: Workbook, rules_sheet: List) -> None:
     Row forms: ["title", text] · ["section", text] · ["kv", label, value] ·
     ["spacer"].
     """
-    ws = wb.create_sheet("Rules", 0)  # index 0 → first tab
-    ws.column_dimensions["A"].width = 34
-    ws.column_dimensions["B"].width = 58
-    wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    sink.col_width(1, 34)
+    sink.col_width(2, 58)
     r = 1
     for row in (rules_sheet or []):
         if not row:
             continue
         kind = str(row[0] or "")
         if kind == "title":
-            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
-            c = ws.cell(row=r, column=1, value=(row[1] if len(row) > 1 else ""))
-            c.font = _font(bold=True, size=14, color=_WHITE_TXT)
-            c.fill = _fill(_NAVY_BG); c.alignment = _CENTER
-            ws.row_dimensions[r].height = 28
+            sink.merge(r, 1, 2)
+            sink.cell(r, 1, (row[1] if len(row) > 1 else ""),
+                      bold=True, size=14, fc=_WHITE_TXT, bg=_NAVY_BG, align="C")
+            sink.row_height(r, 28)
         elif kind == "section":
-            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
-            c = ws.cell(row=r, column=1, value="  " + (row[1] if len(row) > 1 else ""))
-            c.font = _font(bold=True, size=11, color=_WHITE_TXT)
-            c.fill = _fill(_SECTION_BG); c.alignment = _LEFT
-            ws.row_dimensions[r].height = 20
+            sink.merge(r, 1, 2)
+            sink.cell(r, 1, "  " + (row[1] if len(row) > 1 else ""),
+                      bold=True, size=11, fc=_WHITE_TXT, bg=_SECTION_BG)
+            sink.row_height(r, 20)
         elif kind == "kv":
             label = row[1] if len(row) > 1 else ""
             value = row[2] if len(row) > 2 else ""
-            lc = ws.cell(row=r, column=1, value=label)
-            lc.font = _font(bold=True, size=10, color=_DARK2_TXT)
-            lc.fill = _fill(_LABEL_BG); lc.alignment = _LEFT; lc.border = _border()
-            vc = ws.cell(row=r, column=2, value=("" if value is None else value))
-            vc.font = _font(size=10, color=_DARK_TXT)
-            vc.fill = _fill(_WHITE); vc.alignment = wrap; vc.border = _border()
-            ws.row_dimensions[r].height = 18
+            sink.cell(r, 1, label, bold=True, size=10, fc=_DARK2_TXT,
+                      bg=_LABEL_BG, border=True)
+            sink.cell(r, 2, ("" if value is None else value), size=10,
+                      fc=_DARK_TXT, bg=_WHITE, border=True)
+            sink.row_height(r, 18)
         elif kind == "spacer":
-            ws.row_dimensions[r].height = 6
+            sink.row_height(r, 6)
         else:
             continue
         r += 1
-    ws.freeze_panes = "A2"
+    sink.freeze(1, 0)
+
+
+def _write_rules_sheet(wb: Workbook, rules_sheet: List) -> None:
+    """Render "Rules" as the FIRST tab of an openpyxl workbook."""
+    ws = wb.create_sheet("Rules", 0)  # index 0 → first tab
+    _rules_layout(_OpenpyxlSink(ws), rules_sheet)
+
+
+def _rules_ops(rules_sheet: List) -> Dict:
+    """Same sheet, serialized for the Rust layout writer."""
+    sink = _OpsSink("Rules")
+    _rules_layout(sink, rules_sheet)
+    return sink.to_dict()
 
 
 def _write_trade_sheet(wb: Workbook, cleaned: List[Dict], key_order: List[str]) -> None:
@@ -2610,9 +2617,9 @@ def _build_combo_xlsx_rust(
     cleaned, key_order, summary, tm, grouped, sorted_keys,
     combo_label, from_date, to_date, has_calls, has_puts, has_futures,
     has_midcap, midcap_summary, midcap_by_trade, patchwise, filter_segments, want_patch,
-    yearly: bool = False,
+    yearly: bool = False, rules_sheet=None,
 ) -> bytes:
-    """Rust workbook path for build_combo_xlsx (OPTIMIZE_RUST_XLSX=1). Same 4 sheets,
+    """Rust workbook path for build_combo_xlsx (OPTIMIZE_RUST_XLSX=1). Same sheets,
     same order, cell-identical. Trade Sheet is built in Rust from `cleaned`; Summary /
     Patch / WOW come from their ops builders. Hard-fails if the native module or the
     combined writer is unavailable (no openpyxl fallback)."""
@@ -2643,7 +2650,8 @@ def _build_combo_xlsx_rust(
     fd, tp = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
     try:
-        _an.write_workbook_xlsx(cleaned, key_order, summary_ops, patch_ops, wow_ops, tp)
+        _an.write_workbook_xlsx(cleaned, key_order, summary_ops, patch_ops, wow_ops, tp,
+                                _rules_ops(rules_sheet) if rules_sheet else None)
         with open(tp, "rb") as f:
             return f.read()
     finally:
@@ -2724,20 +2732,18 @@ def build_combo_xlsx(
     except Exception as exc:
         logger.warning("[XLSX] summary metric unification skipped: %s", exc)
 
-    # Optional Rust workbook path (default off; opt-in via OPTIMIZE_RUST_XLSX=1). Builds
-    # the SAME four sheets in one Rust call — Trade Sheet in Rust from `cleaned`;
-    # Summary/Patch/WOW from their ops builders — cell-identical to the openpyxl path
-    # (tools/*_writer_verify gates). No Python fallback: a Rust error propagates.
-    # The standalone leg-wise "Rules" sheet is rendered only by the openpyxl path,
-    # so skip the Rust writer when a rules_sheet is present (the single backtest
-    # download). openpyxl cost is negligible for one workbook and the two paths are
-    # cell-identical (tools/workbook_verify) — the Rules sheet is purely additive.
-    if os.environ.get("OPTIMIZE_RUST_XLSX") == "1" and not rules_sheet:
+    # Rust workbook path — ALWAYS. One Rust call builds every sheet: Trade Sheet from
+    # `cleaned`; Rules/Summary/Patch/WOW from their ops builders. No Python fallback:
+    # a Rust error propagates instead of silently degrading to openpyxl.
+    # The openpyxl code below is reference-only, reachable solely when the parity gate
+    # (tools/workbook_verify) sets XLSX_PARITY_PY=1. It is never set in production.
+    if os.environ.get("XLSX_PARITY_PY") != "1":
         return _build_combo_xlsx_rust(
             cleaned, key_order, summary, tm, _grouped, _sorted_keys,
             combo_label, from_date, to_date, has_calls, has_puts, has_futures,
             has_midcap, midcap_summary, midcap_by_trade, patchwise, filter_segments,
             bool(filter_name or force_patch_wise),
+            rules_sheet=rules_sheet,
             # Without this the Rust workbook path silently builds WOW with
             # yearly=False, so every yearly trade collapses into its December
             # expiry's ISO week (~7 cells) instead of spreading by Exit Date.

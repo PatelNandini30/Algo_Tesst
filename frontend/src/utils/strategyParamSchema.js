@@ -117,6 +117,39 @@ export const OPTIM_PARAM_GROUPS = [
         ...ENUM(['+', '-']),
       },
       {
+        // Time Value: pick the strike whose (close − intrinsic) is nearest to /
+        // ≥ / ≤ the target. The target shares the premium input box, so it lands
+        // in strike_selection.premium — same field the engine reads.
+        path: 'legs[I].strike_selection.premium',
+        label: 'Time value target',
+        unit: 'pts',
+        strikeModes: ['TIME_VALUE', 'TIME_VALUE_GTE', 'TIME_VALUE_LTE'],
+        ...RANGE(20, 200, 20),
+      },
+      {
+        // Which side of the money the time-value search may pick from.
+        path: 'legs[I].strike_selection.moneyness',
+        label: 'Time value — side (OTM/ITM/ATM)',
+        strikeModes: ['TIME_VALUE', 'TIME_VALUE_GTE', 'TIME_VALUE_LTE'],
+        ...ENUM(['ATM', 'OTM', 'ITM']),
+      },
+      {
+        // How far from spot the time-value walk may step: |strike/spot - 1| in %.
+        path: 'legs[I].strike_selection.tv_range_pct',
+        label: 'Time value — range cap',
+        unit: '%',
+        strikeModes: ['TIME_VALUE', 'TIME_VALUE_GTE', 'TIME_VALUE_LTE'],
+        ...RANGE(1, 5, 1),
+      },
+      {
+        // Unit the time-value target is expressed in: index points, or a share
+        // of spot ((close - intrinsic) / entry_spot * 100).
+        path: 'legs[I].strike_selection.tv_units',
+        label: 'Time value — unit (pts / %)',
+        strikeModes: ['TIME_VALUE', 'TIME_VALUE_GTE', 'TIME_VALUE_LTE'],
+        ...ENUM(['points', 'percent']),
+      },
+      {
         // Expiry is not strike-mode specific — always available per leg.
         path: 'legs[I].expiry',
         label: 'Expiry window',

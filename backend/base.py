@@ -534,26 +534,31 @@ def _get_ohlc_range_from_feather(symbol: str, from_date: str, to_date: str, expi
         from_dt   = pd.to_datetime(from_date).date()
         to_dt     = pd.to_datetime(to_date).date()
         strike_f  = float(strike)
-        result = (
-            pl.scan_ipc(str(feather))
-            .filter(
-                (pl.col("Symbol") == sym_upper) &
-                (pl.col("OptionType") == opt) &
-                ((pl.col("StrikePrice") - strike_f).abs() <= 0.5) &
-                (pl.col("ExpiryDate") == expiry_dt) &
-                (pl.col("Date") >= from_dt) &
-                (pl.col("Date") <= to_dt)
-            )
-            .select([
-                pl.col("High").max().alias("max_high"),
-                pl.col("Low").min().alias("min_low"),
-            ])
-            .collect()
+        # pyarrow, NOT Polars. This runs inside billiard's FORKED optimizer
+        # children, and pl.scan_ipc(...).collect() hands work to Polars' rayon
+        # pool — whose worker threads do not survive fork(), so collect() blocks
+        # on a futex forever (py-spy on a hung child: collect ->
+        # _get_ohlc_range_from_feather -> _calculate_leg_mae_mfe). Only the
+        # unified-cadence path reaches this fallback (the Rust cache serves the
+        # rest), which is why just those sweeps hung. pyarrow's IPC reader is
+        # not rayon-backed, so it is fork-safe; it memory-maps and pushes the
+        # same filter down, and computes the SAME max(High)/min(Low).
+        import pyarrow.compute as _pc
+        import pyarrow.dataset as _ds
+        _dset = _ds.dataset(str(feather), format="ipc")
+        _filt = (
+            (_pc.field("Symbol") == sym_upper)
+            & (_pc.field("OptionType") == opt)
+            & (_pc.abs(_pc.field("StrikePrice") - strike_f) <= 0.5)
+            & (_pc.field("ExpiryDate") == expiry_dt)
+            & (_pc.field("Date") >= from_dt)
+            & (_pc.field("Date") <= to_dt)
         )
-        if result.is_empty():
+        tbl = _dset.to_table(columns=["High", "Low"], filter=_filt)
+        if tbl.num_rows == 0:
             return None
-        max_high = result["max_high"][0]
-        min_low  = result["min_low"][0]
+        max_high = _pc.max(tbl.column("High")).as_py()
+        min_low = _pc.min(tbl.column("Low")).as_py()
         if max_high is None or min_low is None:
             return None
         return float(max_high), float(min_low)

@@ -92,6 +92,7 @@ _RUST_STRIKE_TYPES = frozenset({
     "", "strike_type",
     "rel_leg", "pct_of_atm",
     "closest_premium", "premium_gte", "premium_lte", "premium_range",
+    "time_value", "time_value_gte", "time_value_lte",
     "straddle_width", "atm_straddle_prem_pct",
 })
 # expiry values that mean "trade a contract one expiry further out" — Python-orchestrated.

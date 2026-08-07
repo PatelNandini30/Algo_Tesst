@@ -3,6 +3,7 @@ Celery tasks for background processing.
 """
 import sys
 import os
+import time
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -112,6 +113,47 @@ def run_optimize_job(self, spec: dict):
     logger.info("[OPTIM] job %s started from ip=%s node=%s", rid[:8], client_ip, node_id or "local")
     if node_id:
         node_registry.record_job_node(rid, node_id)
+    # Register as live BEFORE the gate, not after it. A running sweep re-splits its
+    # pool from this same registry, so a job that only appears once admitted is
+    # invisible to the job holding the memory: A stays at P=6 and frees nothing,
+    # while B waits on RAM only A's downshift can release — each waiting on the
+    # other. Counting the waiter makes A drop to P=3 at its next batch, and that
+    # is what frees the RAM B needs. run_optimization re-registers (idempotent);
+    # it and the finally below unregister, and the registry self-expires
+    # (_ACTIVE_STALE_SEC), so an abandoned wait can't pin the divisor.
+    #
+    # ...but only for the optims that are actually ALLOWED to run concurrently.
+    # OPTIMIZE_MAX_CONCURRENT (default 2) caps how many share the box. Beyond
+    # that a job waits HERE — before registering and before reserving any memory
+    # — so it is completely inert: it holds no budget and does not appear in the
+    # divisor, leaving the running sweeps at their full width. Registering every
+    # arrival made a 3rd request shrink both running jobs to P=1 (observed:
+    # "live_optims=3" with 4 GB free), which is the opposite of what queueing is
+    # for. The two admitted jobs still register before the gate, so the
+    # cooperative downshift that frees RAM between them is unchanged.
+    try:
+        _max_optims = max(1, int(os.environ.get("OPTIMIZE_MAX_CONCURRENT", "2")))
+    except (TypeError, ValueError):
+        _max_optims = 2
+    try:
+        from services.optimizer import result_store as _rs_gate
+        _slot_waited = False
+        while _rs_gate.active_optim_count(node_id) >= _max_optims:
+            if not _slot_waited:
+                logger.info(
+                    "[OPTIM] job %s waiting for an optimizer slot (%d already running, cap=%d)",
+                    rid[:8], _rs_gate.active_optim_count(node_id), _max_optims,
+                )
+                self.update_state(
+                    state='PROCESSING',
+                    meta={'status': f'queued: {_max_optims} optimizations already running',
+                          'client_ip': client_ip},
+                )
+                _slot_waited = True
+            time.sleep(3)
+        _rs_gate.register_active_optim(rid, node_id)
+    except Exception:
+        pass
     memory_gate.acquire(
         rid,
         # #2 dynamic cost: scale reservation by this optim's date span.
@@ -139,6 +181,7 @@ def run_optimize_job(self, spec: dict):
             zip_naming=spec.get('zip_naming'),
             auto_download=bool(spec.get('auto_download')),
             node_id=node_id,
+            resume=bool(spec.get('resume')),
         )
         # Pre-build the tradesheets ZIP and wait for it to finish so the
         # user gets an instant download instead of a progress bar.
@@ -164,6 +207,13 @@ def run_optimize_job(self, spec: dict):
         return _sanitize_result({'status': 'error', 'message': str(e), 'client_ip': client_ip})
     finally:
         memory_gate.release(rid, node_id=node_id)
+        # Mirror of the pre-gate register above: a job that failed or was revoked
+        # while still WAITING never reached run_optimization's own unregister, and
+        # a stale entry would keep every other sweep throttled to a narrower pool.
+        try:
+            _rs_gate.unregister_active_optim(rid, node_id)
+        except Exception:
+            pass
 
 
 @celery_app.task(bind=True)

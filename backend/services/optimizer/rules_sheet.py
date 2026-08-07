@@ -65,6 +65,19 @@ def _strike_label(ss: Optional[Dict[str, Any]], opt_type: Any = "") -> str:
         off = ss.get("offset")
         return (f"Relative to Leg {_num(ref if ref is not None else 1)}, "
                 f"offset {_num(off if off is not None else 0)} gap(s)")
+    if t.startswith("TIME_VALUE"):
+        op = ">=" if t == "TIME_VALUE_GTE" else "<=" if t == "TIME_VALUE_LTE" else "nearest"
+        tv = ss.get("time_value")
+        if tv is None:
+            tv = ss.get("premium")
+        side = str(ss.get("moneyness") or "ATM").upper()
+        try:
+            cap = abs(float(ss.get("tv_range_pct") or 0))
+        except (TypeError, ValueError):
+            cap = 0.0
+        unit = "%" if str(ss.get("tv_units") or "points") == "percent" else " pts"
+        return (f"Time Value {op}: {_num(tv)}{unit} ({side}"
+                + (f", within {_num(cap)}%)" if cap else ")"))
     if t in ("PREMIUM", "CLOSEST_PREMIUM"):
         if ss.get("premium") not in (None, ""):
             return f"Closest Premium: {_num(ss.get('premium'))}"

@@ -154,9 +154,42 @@ x-backend-env: &backend-env
   # real RAM is well under 18500 because all workers mmap-SHARE one copy of the
   # OHLC feather (only the per-job f32 AHashMap ~2.6 GB is duplicated). Raised
   # 14000→19000 on 2026-07-04 so 3 optims + 1 backtest coexist per user request.
-  HEAVY_MEMORY_BUDGET_MB: "11000"
+  # 12500 (was 11000): sized for the target mix of 2 optims + 1 backtest.
+  #   2 optims @ P=6 (1500 base + 150/yr*7.5 + 5*300) = 4125 each = 8250
+  #   + 1 backtest (~3873 for a 7.5y span)            = 12123  -> fits
+  # At 11000 the backtest QUEUED behind two optims, which is the exact
+  # combination the user wants to run concurrently. Still below the
+  # worker-optimize cgroup limit (12.7 GiB) so the gate stays enforceable.
+  # Actual measured usage for that mix is ~9.6 GB, so this reserves ~1.3x.
+  HEAVY_MEMORY_BUDGET_MB: "12500"
+  # RAM kept free for the DESKTOP and OS at all times. Both the admission gate
+  # and the fork-width cap subtract this before deciding anything, so the
+  # optimizer physically cannot fork wide enough to leave the machine short.
+  # Raised 1500 -> 2500 alongside OPTIMIZE_PARALLELISM 6 -> 12: twice the
+  # children means the width cap must protect a bigger cushion, and this box
+  # is someone's DESKTOP (a full-swap episode on 2026-08-06 OOM-killed
+  # LibreOffice and two Chrome processes). Cost: sweeps narrow a little
+  # sooner when RAM is tight -- deliberate, the user does not want lag.
+  HEAVY_GATE_LIVE_RAM_FLOOR_MB: "2500"
   HEAVY_COST_BACKTEST_MB: "5000"
   HEAVY_COST_OPTIMIZE_MB: "4500"          # one optimize job at P=2 (was 6000 at P=6)
+  # ── Cost model re-based on MEASUREMENT (2026-08-05) ─────────────────────────
+  # Measured on a live P=6, 7.3-year sweep (/proc smaps_rollup + cgroup total):
+  #     parent            505 MB PSS
+  #     each child        589 MB PSS,  251 MB PRIVATE  <- true marginal cost
+  #     whole job         2.81 GB (cgroup, sharing accounted)
+  # The old model priced that same job at 9,746 MB — 3.5x over — so ONE optim ate
+  # 89% of the budget and every backtest queued behind it ("budget busy") even
+  # though the box was mostly free. The per_year term was the main error: it dates
+  # from when option data sat in Python dicts, but the feather is now mmap-SHARED
+  # across all workers, so extra years cost almost no anonymous memory.
+  # New values keep a ~1.4x margin over measurement and let the intended mix run:
+  #     2 optims @P=3 (2 x 3,195) + 1 backtest 7.3y (3,825) = 10,215 <= 11,000
+  #     1 optim  @P=6 (4,095)     + 1 backtest 7.3y (3,825) =  7,920 <= 11,000
+  # Re-measure before lowering further; raising is always safe.
+  HEAVY_COST_OPTIMIZE_BASE_MB: "1500"      # parent + engine overhead (measured ~505 MB PSS)
+  HEAVY_COST_OPTIMIZE_PER_YEAR_MB: "150"   # was 500 — data is mmap-shared, not per-job
+  HEAVY_COST_BACKTEST_PER_YEAR_MB: "250"   # was 430 — warm backtest worker measured ~3.1 GB
   HEAVY_GATE_WAIT_MAX_SECONDS: "600"      # then proceed anyway (SSD swap backstop)
   HEAVY_RESERVATION_TTL_SECONDS: "2400"   # auto-reclaim a crashed/cancelled slot
   # Route small ranges to a separate worker so they do not wait behind a long run.
@@ -329,11 +362,17 @@ services:
     image: algotest-backend-app:latest
     container_name: algotest-worker-backtests
     restart: unless-stopped
+    # Recycle workers by TASK COUNT, not just RSS. --max-memory-per-child measures
+    # RESIDENT memory, so once an idle worker's heap is swapped out its RSS falls
+    # below the limit and the check can never fire — that is how 24 GB of swap
+    # filled with idle worker heaps, which then cgroup-OOM-killed a pool child and
+    # wedged a sweep at 160/648. Task-count recycling is immune to swapping.
     command: >
       celery -A worker.celery worker
       --queues=backtests
       --concurrency=1
       -l info
+      --max-tasks-per-child=1
       --max-memory-per-child=5000000
       --without-gossip
       --without-mingle
@@ -369,11 +408,17 @@ services:
     image: algotest-backend-app:latest
     container_name: algotest-worker-backtests-fast
     restart: unless-stopped
+    # Recycle workers by TASK COUNT, not just RSS. --max-memory-per-child measures
+    # RESIDENT memory, so once an idle worker's heap is swapped out its RSS falls
+    # below the limit and the check can never fire — that is how 24 GB of swap
+    # filled with idle worker heaps, which then cgroup-OOM-killed a pool child and
+    # wedged a sweep at 160/648. Task-count recycling is immune to swapping.
     command: >
       celery -A worker.celery worker
       --queues=backtests_fast
       --concurrency=1
       -l info
+      --max-tasks-per-child=25
       --max-memory-per-child=5000000
       --without-gossip
       --without-mingle
@@ -454,8 +499,17 @@ services:
       # (services/optimizer/runner.py) treats this as the max and DYNAMICALLY
       # divides it by the number of optims computing right now (live-optim
       # registry in result_store.py):
-      #     1 optim live  -> P=6  (all 12 cpus: 6 combos × RUST_SIM_THREADS=2)
-      #     2 optims live -> P=3 each (6 cpus each, 12 total — no oversubscribe)
+      #     1 optim live  -> P=12 (fills the 12-cpu quota)
+      #     2 optims live -> P=6 each (12 total — no oversubscribe)
+      # RAISED 6 -> 12 on 2026-08-07 from measurement: a live P=6 sweep used
+      # 605% CPU, i.e. ~1 core per child, NOT the 2 this comment assumed from
+      # RUST_SIM_THREADS=2. So P=6 filled only half the 12-cpu quota and left
+      # the box at ~30% utilisation while a 14,400-combo sweep ran for 80 min.
+      # If a future workload really does use 2 threads/combo, P=12 oversubscribes
+      # the quota — the cgroup THROTTLES (slower), it does not OOM, so this
+      # degrades gracefully rather than breaking.
+      # Still fully DYNAMIC: this is only the ceiling; split_width() divides it
+      # by live optims and re-caps against free RAM at every batch boundary.
       # So a lone optim gets the whole box for max speed, but two never exceed
       # the single-optim CPU/RAM envelope. concurrency=2 caps optims at 2, so P
       # is only ever 6 or 3. Memory (feather ~2.6 GB is mmap-SHARED across all
@@ -464,7 +518,35 @@ services:
       # the 13 GB limit, leaving room for a concurrent backtest (~2.6 GB) with
       # no OOM. Re-tuned 2026-07-06 for "max 2 optims, full speed when alone,
       # dynamic split when two, never OOM" (per user).
-      OPTIMIZE_PARALLELISM: "6"
+      OPTIMIZE_PARALLELISM: "12"
+      # Per-child PRIVATE memory used by the live-RAM fork-width cap in
+      # services/optimizer/parallel.py (cap_parallelism_for_live_ram). Distinct
+      # from HEAVY_COST_OPTIMIZE_PER_CHILD_MB, which sizes the GATE reservation.
+      # It was unset and defaulting to 700 MB, so with ~5 GB free the cap computed
+      # (5000-1500)/(700*2) = 2 and pinned two sweeps at P=2 regardless of the
+      # ceiling. Measured private per child: 91 MB single-index, 225 MB multi-index
+      # (compose header, post pre-fork overlay merge). 300 keeps a 1.3-3x margin.
+      OPTIMIZE_WORKER_PRIVATE_MB: "300"
+      # Hard cap on optims running AT THE SAME TIME. Arrivals beyond this wait
+      # before registering or reserving anything, so a queued job costs nothing
+      # and — critically — does not appear in the divisor that sizes the running
+      # sweeps' fork width. Without the cap a 3rd request made both running jobs
+      # collapse to P=1 while it sat there holding no memory at all.
+      # 2 is the tuned pairing above: 2×P3 ≈ 8.1 GB, leaving room for a backtest.
+      OPTIMIZE_MAX_CONCURRENT: "2"
+      # Marginal PRIVATE memory per forked optimize child — the gate multiplies
+      # this by (P-1) so a reservation tracks fork width, not just date span.
+      # 700 MB is the "~0.7 GB/worker is private" figure measured just above (the
+      # ~2.6 GB feather is mmap-SHARED and already covered by the base cost).
+      # The default (400) under-reserved a P=6 multi-index sweep badly enough that
+      # two of them were admitted together — 9 live children in a 12.7 GiB cap —
+      # and the cgroup OOM-killed one mid-run (2026-08-01). Lower this only with a
+      # fresh measurement; raising it just makes wide sweeps queue instead of race.
+      # 300 MB, from measurement: a live P=6 sweep showed 251 MB PRIVATE per child
+      # (589 MB PSS, but PSS double-counts the mmap-shared feather). 700 was a
+      # guess taken from a stale comment and over-reserved the budget 3.5x, which
+      # is what starved every backtest into "budget busy".
+      HEAVY_COST_OPTIMIZE_PER_CHILD_MB: "300"
       # Inline finalization OFF: doing patchwise XLSX + metrics + WOW/MOM per
       # combo across many parallel workers saturates RAM/CPU (36x sweep inflation)
       # — build them once at finalization instead.
@@ -492,6 +574,7 @@ services:
         --queues=optimize
         --concurrency=2
         -l info
+        --max-tasks-per-child=1
         --max-memory-per-child=5000000
         --without-gossip
         --without-mingle

@@ -177,6 +177,30 @@ enum StrikeSel {
     PremiumGte(f64),
     PremiumLte(f64),
     PremiumRange { lower: f64, upper: f64 },
+    /// Strike picked by TIME VALUE (close - intrinsic, intrinsic floored at 0).
+    /// Same chain + same tie-break as ClosestPremium; only the compared number
+    /// differs. Negative time values (deep ITM, close < intrinsic) stay in the
+    /// candidate set deliberately — target 0 with candidates -1 and 5 must pick -1.
+    TimeValue { target: f64, cmp: TvCmp, side: TvSide, range_pct: f64, pct_units: bool },
+}
+
+/// How a TimeValue selection filters the chain before picking the nearest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TvCmp {
+    Nearest,
+    Gte,
+    Lte,
+}
+
+/// Which side of the money a TimeValue selection may pick from. Time value is
+/// not monotonic in strike (it peaks near ATM and decays both ways), so without
+/// this a target below the peak has an ITM and an OTM answer and the pick flips
+/// between them. `Any` = whole chain, the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TvSide {
+    Any,
+    Otm,
+    Itm,
 }
 
 /// Features that the engine supports but Phase 2b slice 2 does not yet.
@@ -322,6 +346,28 @@ fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
         "premium_range" => Some(StrikeSel::PremiumRange {
             lower: read_f64("lower").unwrap_or(0.0),
             upper: read_f64("upper").unwrap_or(0.0),
+        }),
+        // Target reads `time_value`, falling back to `premium` — the UI reuses the
+        // existing premium input box, so no new payload field is introduced.
+        "time_value" | "time_value_gte" | "time_value_lte" => Some(StrikeSel::TimeValue {
+            target: read_f64("time_value").or_else(|| read_f64("premium")).unwrap_or(0.0),
+            cmp: match mode.as_str() {
+                "time_value_gte" => TvCmp::Gte,
+                "time_value_lte" => TvCmp::Lte,
+                _ => TvCmp::Nearest,
+            },
+            side: match read_str("moneyness").unwrap_or_default().to_uppercase().as_str() {
+                "OTM" => TvSide::Otm,
+                "ITM" => TvSide::Itm,
+                _ => TvSide::Any,
+            },
+            // Range cap: |strike/entry_spot - 1| in percent. 0 = uncapped.
+            range_pct: read_f64("tv_range_pct").unwrap_or(0.0).abs(),
+            // Target unit: "points" (default) or "percent" -> TV/entry_spot*100.
+            pct_units: matches!(
+                read_str("tv_units").unwrap_or_default().to_lowercase().as_str(),
+                "percent" | "pct" | "%"
+            ),
         }),
         _ => None,
     }
@@ -999,6 +1045,192 @@ fn compute_strike_for_leg(
                 return None;
             }
             pick_by_premium(&qualifying, *upper, atm, is_call).map(|(s, _)| *s)
+        }
+        StrikeSel::TimeValue { target, cmp, side, range_pct, pct_units } => {
+            // Python mirror: engine_rust.py::_compute_strike_for_leg_python,
+            // sel_type in ("time_value", "time_value_gte", "time_value_lte").
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            // (1) leg's OWN strike gap — the listed chain is finer (50) than a
+            // leg asking for 100, and ATM/ITMn/OTMn never see that because they
+            // snap through round(spot/interval)*interval.
+            let iv = leg.strike_interval;
+            let on_grid: Vec<(f64, f64)> = if iv > 0.0 {
+                chain.iter().copied()
+                    .filter(|(s, _)| ((s / iv) - (s / iv).round()).abs() < 1e-9)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let source = if on_grid.is_empty() { chain } else { on_grid };
+
+            let mut cands: Vec<(f64, f64, bool)> = Vec::with_capacity(source.len());
+            for (s, p) in source.into_iter() {
+                let intrinsic =
+                    (if is_call { entry_spot - s } else { s - entry_spot }).max(0.0);
+                match side {
+                    TvSide::Otm if intrinsic > 0.0 => continue,
+                    TvSide::Itm if intrinsic <= 0.0 => continue,
+                    _ => {}
+                }
+                // (1b) range cap: |strike/entry_spot - 1| in percent, 0 = uncapped.
+                if *range_pct > 0.0 && entry_spot > 0.0
+                    && ((s / entry_spot) - 1.0).abs() * 100.0 > *range_pct + 1e-9
+                {
+                    continue;
+                }
+                let mut tv = p - intrinsic;
+                if *pct_units && entry_spot > 0.0 {
+                    tv = tv / entry_spot * 100.0;
+                }
+                // (2) NEGATIVE time value stays a candidate, ranked on ABSOLUTE
+                // distance (target 20: TV -50 is 70 away, TV +100 is 80 away,
+                // so -50 wins). See the Python mirror for why this is safe only
+                // alongside the untradeable filter and the stepwise walk.
+                // (3) an untraded strike's stale close makes its "time value"
+                // fiction — see the Python comment for the measured 2019 case.
+                if lookup_option_price_tradeable(entry_date, index, s, &leg.option_type, expiry)
+                    .is_none()
+                {
+                    continue;
+                }
+                cands.push((s, tv, intrinsic > 0.0));
+            }
+            if cands.is_empty() {
+                return None;
+            }
+            // (4) stepwise outward from ATM, PER SIDE — the decay is monotonic
+            // only within one side, so interleaving branches makes a single walk
+            // quit on the first cross-branch step (measured 09-Mar-2026: returned
+            // 23900 / TV 340.55 against a target of 75 instead of 24700 / 63.40).
+            let order = |v: &mut Vec<(f64, f64, bool)>| {
+                v.sort_by(|a, b| {
+                    (a.0 - atm).abs().partial_cmp(&(b.0 - atm).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| if is_call {
+                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+            };
+            // Distances are compared ROUNDED so a genuine tie is detectable: the
+            // intrinsic carries float error (25300 - 25202.35 = 97.65000000000146),
+            // so a "+1 vs -1" pair really differs by ~3e-12 and a strict compare
+            // silently picks one. 1e-6 is far below any real price increment.
+            let q = |d: f64| (d * 1.0e6).round() / 1.0e6;
+            // Returns (dist, strike, tv).
+            let walk = |seq: &Vec<(f64, f64, bool)>, force_nearest: bool| -> Option<(f64, f64, f64)> {
+                let eff = if force_nearest { &TvCmp::Nearest } else { cmp };
+                match eff {
+                    TvCmp::Lte => {
+                        for (s, tv, _) in seq.iter() {
+                            if *tv <= *target { return Some((q((*tv - *target).abs()), *s, *tv)); }
+                        }
+                        None
+                    }
+                    TvCmp::Gte => {
+                        // NEAREST QUALIFYING, mirroring Lte: first strike meeting
+                        // the floor when walking outward from ATM. See the Python
+                        // mirror for the 04-Aug-2022 case this fixed.
+                        for (s, tv, _) in seq.iter() {
+                            if *tv >= *target { return Some((q((*tv - *target).abs()), *s, *tv)); }
+                        }
+                        None
+                    }
+                    TvCmp::Nearest => {
+                        let mut best: Option<(f64, f64, f64)> = None;
+                        for (s, tv, _) in seq.iter() {
+                            let d = q((*tv - *target).abs());
+                            match best {
+                                None => best = Some((d, *s, *tv)),
+                                Some((bd, _, btv)) => {
+                                    if d < bd {
+                                        best = Some((d, *s, *tv));
+                                    } else {
+                                        // EXACT TIE -> a non-negative time value
+                                        // beats a negative one, ahead of ATM
+                                        // distance. Then stop: still the crossing.
+                                        if d == bd && *tv >= 0.0 && btv < 0.0 {
+                                            best = Some((d, *s, *tv));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        best
+                    }
+                }
+            };
+            let hit = if matches!(side, TvSide::Any) {
+                let mut itm: Vec<(f64, f64, bool)> =
+                    cands.iter().copied().filter(|c| c.2).collect();
+                let mut otm: Vec<(f64, f64, bool)> =
+                    cands.iter().copied().filter(|c| !c.2).collect();
+                order(&mut itm);
+                order(&mut otm);
+                let mut hits: Vec<(f64, f64, f64)> =
+                    [walk(&otm, false), walk(&itm, false)].into_iter().flatten().collect();
+                if matches!(cmp, TvCmp::Nearest) {
+                    // NEAREST: smaller |TV-target| wins across the two sides; on
+                    // a tie a non-negative time value beats a negative one, and
+                    // ATM distance decides only after that. (09-Mar-2026, target
+                    // 75, 2% cap: OTM 23600 is 180.85 off, ITM 24500 is 74.75 off
+                    // -> 24500.)
+                    hits.sort_by(|a, b| {
+                        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| (a.2 < 0.0).cmp(&(b.2 < 0.0)))
+                            .then_with(|| (a.1 - atm).abs().partial_cmp(&(b.1 - atm).abs())
+                                .unwrap_or(std::cmp::Ordering::Equal))
+                    });
+                } else {
+                    // GTE / LTE: whichever side the outward walk REACHES FIRST
+                    // wins (closest to ATM); |TV-target| only breaks a tie. Side
+                    // choice only — the walk inside a side still honours the
+                    // floor/ceiling.
+                    hits.sort_by(|a, b| {
+                        (a.1 - atm).abs().partial_cmp(&(b.1 - atm).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.partial_cmp(&b.0)
+                                .unwrap_or(std::cmp::Ordering::Equal))
+                    });
+                }
+                hits.into_iter().next()
+            } else {
+                order(&mut cands);
+                walk(&cands, false)
+            };
+            // CAP FALLBACK: with a tight range cap no in-band strike may satisfy
+            // the floor/ceiling at all (09-Mar-2026, target 75, 2% cap: lowest
+            // in-band TV is 149.75, so "TV <= 75" matched nothing). Take the
+            // CLOSEST available inside the band rather than dropping the trade.
+            let hit = match hit {
+                Some(h) => Some(h),
+                None if !matches!(cmp, TvCmp::Nearest) => {
+                    if matches!(side, TvSide::Any) {
+                        let mut itm: Vec<(f64, f64, bool)> =
+                            cands.iter().copied().filter(|c| c.2).collect();
+                        let mut otm: Vec<(f64, f64, bool)> =
+                            cands.iter().copied().filter(|c| !c.2).collect();
+                        order(&mut itm);
+                        order(&mut otm);
+                        let mut fb: Vec<(f64, f64, f64)> =
+                            [walk(&otm, true), walk(&itm, true)].into_iter().flatten().collect();
+                        fb.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| (a.2 < 0.0).cmp(&(b.2 < 0.0)))
+                                .then_with(|| (a.1 - atm).abs().partial_cmp(&(b.1 - atm).abs())
+                                    .unwrap_or(std::cmp::Ordering::Equal))
+                        });
+                        fb.into_iter().next()
+                    } else {
+                        order(&mut cands);
+                        walk(&cands, true)
+                    }
+                }
+                None => None,
+            };
+            hit.map(|(_, s, _)| s)
         }
         StrikeSel::StraddleWidth { multiplier, direction } => {
             // shift = multiplier × (ATM CE + ATM PE), then snap. direction is a

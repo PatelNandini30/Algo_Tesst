@@ -57,6 +57,87 @@ def _cgroup_mem_limit_mb() -> Optional[int]:
     return None
 
 
+def _live_available_mb() -> Optional[int]:
+    """Current host MemAvailable in MB, or None if unreadable."""
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def cap_parallelism_for_live_ram(requested: int, live_optims: int = 1) -> int:
+    """Clamp requested workers against current MemAvailable.
+
+    This keeps the optimizer dynamic: the same combo can safely run with a
+    higher P when the machine is idle, but it will automatically drop P when
+    the host is already memory-tight.
+    """
+    try:
+        req = max(1, int(requested))
+    except Exception:
+        req = 1
+    try:
+        live = max(1, int(live_optims))
+    except Exception:
+        live = 1
+    # THRASH BRAKE. MemAvailable counts reclaimable page cache as free, so the
+    # box can report GBs "available" while actively swapping — and a wider fork
+    # makes that worse (more concurrent working sets, more page-cache churn
+    # against the mmap'd feather). PSI measures the thing we actually care about:
+    # the % of wall time everything is STALLED waiting on memory. Nonzero swap
+    # USAGE is fine and expected (cold pages, si/so≈0); sustained stall is not.
+    # Halving on real pressure is what keeps this box usable as a DESKTOP.
+    try:
+        _psi_max = float(os.environ.get("OPTIMIZE_MEM_PRESSURE_MAX_PCT", "8"))
+    except (TypeError, ValueError):
+        _psi_max = 8.0
+    try:
+        with open("/proc/pressure/memory") as _fh:
+            for _line in _fh:
+                if _line.startswith("full"):
+                    _avg10 = float(_line.split("avg10=")[1].split()[0])
+                    if _avg10 > _psi_max:
+                        _throttled = max(1, req // 2)
+                        if _throttled < req:
+                            logger.warning(
+                                "[OPTIM_PARALLEL] memory pressure %.1f%% > %.1f%% — "
+                                "halving fork width %d -> %d (box is thrashing)",
+                                _avg10, _psi_max, req, _throttled,
+                            )
+                        req = _throttled
+                    break
+    except (OSError, ValueError, IndexError):
+        pass                      # PSI unavailable -> behave exactly as before
+
+    avail = _live_available_mb()
+    if avail is None:
+        return req
+    try:
+        floor_mb = max(0, int(os.environ.get("HEAVY_GATE_LIVE_RAM_FLOOR_MB", "1500")))
+    except (TypeError, ValueError):
+        floor_mb = 1500
+    try:
+        private_mb = max(100, int(os.environ.get("OPTIMIZE_WORKER_PRIVATE_MB", "700")))
+    except (TypeError, ValueError):
+        private_mb = 700
+    # Use the same headroom floor as the gate, but scale the private-worker
+    # estimate by the number of live optims so concurrent jobs self-throttle.
+    usable = max(0, avail - floor_mb)
+    ram_cap = max(1, usable // max(1, private_mb * live))
+    effective = max(1, min(req, ram_cap))
+    if effective < req:
+        logger.info(
+            "[OPTIM_PARALLEL] live-RAM parallelism clamped %d -> %d "
+            "(avail=%dMB live_optims=%d floor=%d private=%d)",
+            req, effective, avail, live, floor_mb, private_mb,
+        )
+    return effective
+
+
 def get_parallelism() -> int:
     """How many child processes to spawn — DYNAMICALLY clamped to what this box
     can sustain, so a too-high OPTIMIZE_PARALLELISM can never thrash the machine.
@@ -405,11 +486,65 @@ def _worker_entrypoint(
         )
         from services.optimizer.wow_mom import _wm_from_cleaned
         _INLINE_FINALIZE = os.environ.get("OPTIMIZE_INLINE_FINALIZE", "1").strip().lower() in ("1", "true", "yes")
+        # Which per-combo workbook variants this job's download_mode will ask for.
+        try:
+            from services.optimizer.runner import _download_mode_flags as _dmf
+            _want_patchwise, _want_overall = _dmf(base_payload)
+        except Exception:
+            _want_patchwise, _want_overall = True, False
+
+        def _inline_wm(trades_df, has_mc, tag, combo_id):
+            """Per-combo WOW/MOM data for the variant this job will download.
+
+            Computed here, in the parallel workers, from the in-memory trades_df.
+            _prebuild_wow_mom has always had a fast path keyed on these values,
+            but they were only produced under OPTIMIZE_INLINE_FINALIZE — which is
+            "0" — so EVERY combo fell to the slow path there: re-read the CSV and
+            rebuild the cleaned rows (measured: 44s for 180 combos, 3m39s for
+            2160). Deliberately NOT under that flag: the flag was turned off
+            because inline finalization computed BOTH variants plus extra summary
+            passes and inflated the sweep; this computes only the variant
+            download_mode actually asks for, so it replaces the finalize work
+            rather than adding to it. Summary math is untouched.
+
+            Returns (wm_overall, wm_patchwise, has_midcap). has_midcap must come
+            back out: _prebuild_wow_mom's fast path reads it from the stored row,
+            so leaving it False here would silently drop the midcap columns that
+            the slow path used to derive for itself.
+            """
+            if hasattr(trades_df, "empty") and trades_df.empty:
+                return None, None, has_mc
+            wm_over = wm_pw = None
+            found_mc = has_mc
+            try:
+                if _want_overall:
+                    _cl_o, found_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                           patchwise=False, filter_segments=_filter_segments)
+                    wm_over = _wm_from_cleaned(_cl_o, found_mc, yearly=_is_yearly)
+                if _want_patchwise:
+                    _cl_p, found_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
+                                           patchwise=True, filter_segments=_filter_segments)
+                    wm_pw = _wm_from_cleaned(_cl_p, found_mc, yearly=_is_yearly)
+            except Exception as _exc:
+                logger.warning("[OPTIM] %s WOW/MOM data failed for combo %d: %s",
+                               tag, combo_id, _exc)
+                return None, None, has_mc
+            return wm_over, wm_pw, bool(found_mc)
 
         done = 0
         failures = 0
+        first_error = None
         for i, combo in enumerate(chunk):
             try:
+                # A resumed sweep dispatches only the combos it still owes, so
+                # position in the chunk no longer identifies the combo. The
+                # runner stamps the ORIGINAL 1-based index here; without it a
+                # resume would renumber survivors and their combo_label_safe
+                # would collide with files the first run already wrote (combo 1
+                # of the resume overwriting combo 1 of the original). Popped
+                # before apply_combo_for_optim so it is never read as a payload
+                # path — same contract as __optim_callback__.
+                _orig_id = combo.pop("__combo_id__", None) if isinstance(combo, dict) else None
                 merged = apply_combo_for_optim(base_payload, combo)
                 t_combo = time.perf_counter()
                 trades_df, summary = _run_single_backtest(merged)
@@ -425,18 +560,10 @@ def _worker_entrypoint(
                     flat_summary, _summary_pw = rust_authoritative_summary(
                         trades_df, summary, merged, _mc_legs, _mc_sa, _mc_sym, _filter_segments)
                     _has_mc = bool(flat_summary.get("has_midcap"))
-                    _wm_over = _wm_pw = None
-                    if _INLINE_FINALIZE and not (hasattr(trades_df, "empty") and trades_df.empty):
-                        try:
-                            _cl_o, _has_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
-                                                  patchwise=False, filter_segments=_filter_segments)
-                            _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
-                                            patchwise=True, filter_segments=_filter_segments)
-                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc, yearly=_is_yearly)
-                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc, yearly=_is_yearly)
-                        except Exception as _inl_exc:
-                            logger.warning("[OPTIM] rust-mode WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
-                            _wm_over = _wm_pw = None
+                    # _has_mc already came from the Rust summary — keep it as the
+                    # authority and only let the cleaned build confirm it.
+                    _wm_over, _wm_pw, _has_mc = _inline_wm(
+                        trades_df, _has_mc, "rust-mode", starting_combo_id + i)
                 else:
                     optim_extra = compute_optim_metrics(trades_df, summary)
                     flat_summary = {**summary, **optim_extra}
@@ -474,19 +601,12 @@ def _worker_entrypoint(
                         except Exception as _inl_exc:
                             logger.warning("[OPTIM] inline patchwise finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
                             _summary_pw = None
-                        # WOW/MOM cleaned data (overall + patchwise).
-                        try:
-                            _cl_o, _has_mc = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
-                                                  patchwise=False, filter_segments=_filter_segments)
-                            _cl_p, _ = _bcc(trades_df, _mc_legs, _mc_sa, _mc_sym,
-                                            patchwise=True, filter_segments=_filter_segments)
-                            _wm_over = _wm_from_cleaned(_cl_o, _has_mc, yearly=_is_yearly)
-                            _wm_pw = _wm_from_cleaned(_cl_p, _has_mc, yearly=_is_yearly)
-                        except Exception as _inl_exc:
-                            logger.warning("[OPTIM] inline WOW/MOM finalize failed for combo %d: %s", starting_combo_id + i, _inl_exc)
-                            _wm_over = _wm_pw = None
+                    # WOW/MOM data, computed OUTSIDE the _INLINE_FINALIZE gate (see
+                    # _inline_wm) so the finalize pass never rebuilds it from CSV.
+                    _wm_over, _wm_pw, _has_mc = _inline_wm(trades_df, _has_mc, "inline",
+                                                  starting_combo_id + i)
                 labels = label_combo(merged)
-                _combo_id = starting_combo_id + i
+                _combo_id = _orig_id if _orig_id is not None else starting_combo_id + i
                 combo_label_safe = f"{_combo_id}_{safe_filename(labels['combo_label'])}"
                 # RUST SHADOW (OPTIMIZE_RUST_LOOP=shadow): recompute the summary with the
                 # ported Rust engine and diff it vs the Python summary above. Additive,
@@ -516,8 +636,13 @@ def _worker_entrypoint(
                     },
                     "summary": flat_summary,
                     "summary_pw": _summary_pw,
-                    "wm_overall": _wm_over,
-                    "wm_pw": _wm_pw,
+                    # WOW/MOM data goes to DISK, not into this row: it is 13.5 KB
+                    # of a 16.0 KB row (84.5%), which at 60k combos is ~985 MB of
+                    # Redis against a 500 MB maxmemory. `wm_on_disk` tells the
+                    # finalizer to load it from there instead of rebuilding from
+                    # CSV, so the fast path survives without the memory cost.
+                    "wm_on_disk": result_store.write_combo_wm(
+                        job_id, combo_label_safe, _wm_over, _wm_pw),
                     "has_midcap": bool(_has_mc),
                     "inline_finalized": _summary_pw is not None,
                     "objective_value": obj.extract(flat_summary),
@@ -537,30 +662,34 @@ def _worker_entrypoint(
                     # _write_rules_sheet renders it). merged = this combo's payload.
                     from services.optimizer.rules_sheet import build_rules_sheet as _brs
                     _rules_sheet = _brs(merged, _filter_name)
-                    result_store.write_combo_xlsx(
-                        job_id,
-                        combo_label_safe,
-                        trades_df,
-                        flat_summary,
-                        combo_label=labels["combo_label"],
-                        from_date=_from_date,
-                        to_date=_to_date,
-                        index_str=_index_str,
-                        trading_days=_tdays,
-                        midcap_legs=_mc_legs,
-                        midcap_spot_adjustment=_mc_sa,
-                        midcap_symbol=_mc_sym,
-                        filter_segments=_filter_segments,
-                        yearly=_is_yearly,
-                        rules_sheet=_rules_sheet,
-                    )
-                    # Also build the PATCHWISE variant directly from the same
-                    # in-memory trades_df — ONLY when inline finalization is on.
-                    # Gated with _INLINE_FINALIZE because these extra per-combo
-                    # MAE/MFE + build passes, run across many parallel workers,
-                    # saturate RAM/CPU and inflate the whole sweep; with it off
-                    # the patchwise ZIP is built once at finalization instead.
-                    if _INLINE_FINALIZE:
+                    # Build the variant(s) this job will actually DOWNLOAD.
+                    # Previously the overall variant was written unconditionally
+                    # and the patchwise one only under _INLINE_FINALIZE — so a
+                    # download_mode=patchwise job (the default) built 2160 overall
+                    # workbooks nobody wanted, finalize deleted every one of them,
+                    # and then rebuilt 2160 patchwise ones from CSV. Same count of
+                    # builds as before, just the right variant, so the ZIP fast
+                    # path can assemble from them instead of rebuilding.
+                    if _want_overall:
+                        result_store.write_combo_xlsx(
+                            job_id,
+                            combo_label_safe,
+                            trades_df,
+                            flat_summary,
+                            combo_label=labels["combo_label"],
+                            from_date=_from_date,
+                            to_date=_to_date,
+                            index_str=_index_str,
+                            trading_days=_tdays,
+                            midcap_legs=_mc_legs,
+                            midcap_spot_adjustment=_mc_sa,
+                            midcap_symbol=_mc_sym,
+                            filter_name=_filter_name,
+                            filter_segments=_filter_segments,
+                            yearly=_is_yearly,
+                            rules_sheet=_rules_sheet,
+                        )
+                    if _want_patchwise:
                         result_store.write_combo_xlsx_patchwise(
                             job_id,
                             combo_label_safe,
@@ -591,8 +720,13 @@ def _worker_entrypoint(
                 )
             except Exception as exc:
                 failures += 1
+                # Keep the FIRST combo error so a sweep where every combo fails can
+                # report WHY instead of just "0 done". Without this the reason lived
+                # only in the worker log and the job still reported success.
+                if not first_error:
+                    first_error = str(exc)
                 logger.warning("[OPTIM_PARALLEL] combo %d failed: %s", starting_combo_id + i, exc)
-        return {"done": done, "failures": failures}
+        return {"done": done, "failures": failures, "error": first_error}
     except Exception as exc:
         logger.error("[OPTIM_PARALLEL] worker crashed: %s\n%s", exc, traceback.format_exc())
         return {"done": 0, "failures": len(chunk), "error": str(exc)}
@@ -601,6 +735,47 @@ def _worker_entrypoint(
             _teardown_market_data()
         except Exception:
             pass
+
+
+def split_width(solo_ceiling: int, parallelism: int, node_id: Optional[str] = None) -> int:
+    """How many children this sweep may fork RIGHT NOW.
+
+    Re-derived every batch from three live constraints, so the width tracks the
+    box instead of a single sample taken at launch:
+      • other optims running   -> share the ceiling with them
+      • jobs BLOCKED on the memory gate -> share with them too, so a backtest
+        waiting behind this sweep gets budget handed back within one batch
+        instead of sitting there for the whole run
+      • free RAM right now     -> cap_parallelism_for_live_ram
+
+    solo_ceiling<=0 means the caller opted out of adaptive width.
+    """
+    if solo_ceiling <= 0:
+        return max(1, parallelism)
+    try:
+        from services.optimizer import result_store as _rs
+        live = max(1, _rs.active_optim_count(node_id))
+    except Exception:
+        return max(1, parallelism)      # registry unreadable -> fail safe, don't widen
+    # Count BACKTEST waiters only. An optimize-kind waiter is ALREADY inside
+    # active_optim_count(): worker/tasks.py registers a job in the live set
+    # BEFORE it calls the gate, so counting it here as well made a single queued
+    # sweep worth two claimants and narrowed the running job harder than the box
+    # required (observed: live=2 + waiting=1 -> "live_optims=3" with only two
+    # real jobs). Backtests are never in that registry, so they are counted here
+    # and here only — which is exactly the yield this mechanism exists for.
+    waiting = 0
+    try:
+        from services import memory_gate as _mg
+        waiting = max(0, _mg.waiting_count("backtest", node_id=node_id))
+    except Exception:
+        waiting = 0                     # gate unreadable -> behave as before
+    claimants = live + waiting
+    by_optims = max(1, solo_ceiling // claimants)
+    try:
+        return max(1, cap_parallelism_for_live_ram(by_optims, claimants))
+    except Exception:
+        return max(1, min(parallelism, by_optims))
 
 
 def run_parallel(
@@ -613,6 +788,11 @@ def run_parallel(
     progress_cb: Optional[callable] = None,
     prebuilt_feather_root: Optional[str] = None,
     prebuilt_rust_context: Optional[Dict[str, Any]] = None,
+    # Full-box width for a lone optim, and the node whose live-optim registry
+    # decides the split. Supplied -> the pool RE-SIZES between batches as other
+    # optims start/finish. Omitted (0/None) -> fixed `parallelism`, as before.
+    solo_ceiling: int = 0,
+    node_id: Optional[str] = None,
 ) -> Dict[str, int]:
     """
     Execute the optimizer loop in `parallelism` worker processes.
@@ -620,7 +800,20 @@ def run_parallel(
     Returns aggregated `{done, failures}`. Per-combo results are already in
     Redis by the time this returns.
     """
-    if parallelism <= 1:
+    # (A temporary guard here forced P=1 for sync_weekly_roll sweeps, because every
+    # forked child deadlocked in that path. py-spy on a hung child traced it to
+    # pl.scan_ipc(...).collect() in base._get_ohlc_range_from_feather — Polars' rayon
+    # threads don't survive fork(). That fallback now uses pyarrow, which is
+    # fork-safe, so the guard is gone and these sweeps fork like any other.)
+    # P=1 is only TERMINAL when the caller opted out of adaptive width
+    # (solo_ceiling<=0). With adaptive width on, a P=1 start must still fall
+    # through to the batch loop below: P=1 usually means the box was momentarily
+    # tight at launch (observed: MemAvailable 1459MB vs a 1500MB floor), and
+    # returning here froze the sweep serial for its whole life even after RAM
+    # freed — 2160 combos crawling at P=1 with 4.1GB available. The batch loop
+    # runs p==1 batches in-process (no fork, same memory profile as this branch)
+    # and re-measures at every batch boundary, so the job climbs 1 -> 3 -> 6.
+    if parallelism <= 1 and solo_ceiling <= 0:
         # The runner's dynamic split (solo_ceiling // live_optims) can legitimately
         # resolve to P=1 when several optims run concurrently (e.g. ceiling 2 with
         # 2 live → 2//2=1, or ceiling 3 with 2 live → 3//2=1). The runner has
@@ -655,9 +848,9 @@ def run_parallel(
                 pass
         return {"done": _done, "failures": int(res.get("failures", 0))}
 
-    chunks = _chunk(combos, parallelism)
     total_done = 0
     total_failures = 0
+    first_error = None      # first combo error, surfaced when the whole sweep fails
 
     # Use billiard (Celery's vendored multiprocessing). Inside a Celery
     # worker, stdlib multiprocessing.spawn/forkserver/Pool all hit the
@@ -718,7 +911,46 @@ def run_parallel(
         logger.warning("[OPTIM_PARALLEL] pre-fork overlay merge skipped: %s", _pre_exc)
 
     t0 = time.perf_counter()
-    pool = ctx.Pool(processes=parallelism)
+
+    # ── ADAPTIVE FORK WIDTH ──────────────────────────────────────────────────
+    # Combos are dispatched in BATCHES and the pool is rebuilt at the CURRENT
+    # split before each batch, instead of one up-front _chunk(combos, P) that
+    # froze P for the whole sweep. That freeze is what OOM-killed the box: a job
+    # that started alone forked 6 children and kept all 6 when a second optim
+    # arrived and forked 3 more — 9 live children inside a cap sized for 6.
+    #
+    # Now the width tracks BOTH directions, per the batch boundary:
+    #   • a second optim registers  -> live=2 -> this job drops 6 -> 3
+    #   • that optim finishes       -> live=1 -> this job climbs 3 -> 6
+    # Rebuilding (not just idling) the pool is what makes it OOM-safe: the
+    # surplus children are terminated, so their private pages are actually
+    # returned rather than merely going quiet.
+    #
+    # solo_ceiling<=0 means the caller opted out -> behave exactly as before.
+    #
+    # Width is re-derived EVERY batch from both live constraints:
+    #   • other optims running  -> solo_ceiling // live_optims
+    #   • free RAM right now    -> cap_parallelism_for_live_ram (the runner's own check)
+    # Capping at the width the runner picked at START was wrong in the other
+    # direction: that number is a single RAM sample taken before the sweep began,
+    # so a job that launched while the box was busy stayed pinned at P=1 for hours
+    # even after the RAM freed (observed: 3600 combos crawling at P=1 with 3.9 GB
+    # free — enough for P=3). Re-measuring keeps it honest both ways: it still can
+    # never exceed what RAM allows right now, so it cannot OOM.
+    def _current_p() -> int:
+        return split_width(solo_ceiling, parallelism, node_id)
+
+    # Combos per worker per batch. Bigger = fewer re-forks (less overhead) but
+    # coarser reaction to another optim arriving; this is the knob to turn if
+    # either side hurts.
+    _batch_per_worker = max(1, int(os.environ.get("OPTIMIZE_BATCH_PER_WORKER", "40")))
+    # Hang-breaker for a SIGKILLed pool child (see ar.get below). Sized well
+    # above any real batch: 40 combos/worker at even 10s each is ~7min, so 1h
+    # only trips when a child is genuinely gone.
+    try:
+        _batch_timeout = max(60, int(os.environ.get("OPTIMIZE_BATCH_TIMEOUT_SECONDS", "3600")))
+    except (TypeError, ValueError):
+        _batch_timeout = 3600
 
     # When Celery revokes this task it sends SIGTERM to this process.
     # The billiard fork children are in a separate process group and do NOT
@@ -726,11 +958,12 @@ def run_parallel(
     # Install a SIGTERM handler that calls pool.terminate() so all children
     # are killed immediately when the task is cancelled.
     import signal as _signal
-    _pool_ref = [pool]
+    _pool_ref = [None]
 
     def _on_terminate(signum, frame):
         try:
-            _pool_ref[0].terminate()
+            if _pool_ref[0] is not None:
+                _pool_ref[0].terminate()
         except Exception:
             pass
         raise SystemExit(0)
@@ -740,48 +973,135 @@ def run_parallel(
     except (OSError, ValueError):
         _old_sigterm = None  # not the main thread — signal() not allowed
 
+    remaining = list(combos)
+    offset = 1
+    _last_p = None
+    _batches = 0
     try:
-        offset = 1
-        async_results = []
-        for c in chunks:
-            async_results.append(
-                pool.apply_async(
-                    _worker_entrypoint,
-                    args=(job_id, base_payload, c, objective_name, offset),
-                    kwds={
-                        "prebuilt_feather_root": prebuilt_feather_root,
-                        "prebuilt_rust_context": prebuilt_rust_context,
-                    },
+        while remaining:
+            p = _current_p()
+            if p != _last_p:
+                logger.info(
+                    "[OPTIM_PARALLEL] fork width -> P=%d (was %s, %d combos left)",
+                    p, _last_p if _last_p is not None else "-", len(remaining),
                 )
-            )
-            offset += len(c)
-        pool.close()
+                # Re-state the memory reservation at the width we're ACTUALLY about
+                # to fork. Dropping 6->3 hands ~2 GB back so the optim that caused
+                # the drop can start instead of queueing behind memory we freed;
+                # going 3->6 re-takes it once we're alone again. job_id == the
+                # Celery task id the gate keyed the reservation under.
+                if solo_ceiling > 0 and _last_p is not None:
+                    try:
+                        from services import memory_gate as _mg
+                        _mg.resize(job_id, _mg.cost_for_job("optimize", base_payload,
+                                                            p_override=p), node_id)
+                    except Exception as _rz:
+                        logger.debug("[OPTIM_PARALLEL] gate resize skipped: %s", _rz)
+                _last_p = p
+            batch, remaining = remaining[: p * _batch_per_worker], remaining[p * _batch_per_worker:]
+            chunks = _chunk(batch, p)
+            _batches += 1
 
-        for ar in async_results:
-            res = ar.get()
-            total_done += int(res.get("done", 0))
-            total_failures += int(res.get("failures", 0))
-            if progress_cb:
+            # Drop pooled DB connections IMMEDIATELY before every fork, not just
+            # once before the loop. The parent keeps querying between batches
+            # (expiry resolution, rust_context, finalization), which lazily
+            # reopens pooled connections — and fork() hands the child both the
+            # live socket and the pool's mutex, without the thread that would
+            # release it. A child that then touches the DB parks in futex_do_wait
+            # forever (seen: 6 children, 0/36 combos, CPU 0.04% on a 387-window
+            # sweep; a short sweep does little post-dispose DB work and survived).
+            # Cost is ~0: dispose only closes idle sockets, and the pool reopens
+            # lazily on next use — no reconnect happens unless something queries.
+            try:
+                from database import get_engine as _ge
+                _ge().dispose()
+            except Exception:
+                pass
+
+            # NOTE: p==1 forks a single-child pool rather than running the batch
+            # in-process. Running it in-process was tried and deadlocked the very
+            # next batch: the engine initialises Rust/rayon thread state in the
+            # PARENT, and children forked afterwards inherit that state without
+            # the threads that own it, so they hang before their first combo
+            # (observed: 40 combos done, then P=3 forked and produced nothing,
+            # CPU 1%, all children sleeping). Every batch forking from a pristine
+            # parent is exactly why P>=2 has always been safe. The extra child is
+            # near-free — the caches are inherited copy-on-write.
+            pool = ctx.Pool(processes=p)
+            _pool_ref[0] = pool
+            try:
+                async_results = []
+                for c in chunks:
+                    async_results.append(
+                        pool.apply_async(
+                            _worker_entrypoint,
+                            args=(job_id, base_payload, c, objective_name, offset),
+                            kwds={
+                                "prebuilt_feather_root": prebuilt_feather_root,
+                                "prebuilt_rust_context": prebuilt_rust_context,
+                            },
+                        )
+                    )
+                    offset += len(c)
+                pool.close()
+
+                # BOUNDED wait. A pool child that is SIGKILLed (cgroup OOM) dies
+                # without reporting, and an unbounded ar.get() then blocks the
+                # sweep FOREVER: observed a job wedged at 160/648, parent asleep
+                # at 0.06% CPU still holding 5.6 GB, its dead children left as
+                # zombies because the blocked parent never reaped them. SIGKILL
+                # is uncatchable, so the child cannot fail gracefully — the
+                # parent has to give up on its own. This is a hang-breaker, not
+                # a policy: the default is deliberately far longer than any real
+                # batch, so it can only fire when something has actually died.
+                for ar in async_results:
+                    try:
+                        res = ar.get(timeout=_batch_timeout)
+                    except Exception as _lost:
+                        # Includes billiard's TimeoutError and WorkerLostError.
+                        # Surface it and keep going: the combos this chunk owned
+                        # are simply missing, and a RESUME will pick them up
+                        # because results are keyed by parameter values, not by
+                        # position. Far better than wedging the whole sweep.
+                        logger.error(
+                            "[OPTIM_PARALLEL] batch chunk lost (%s: %s) — its combos "
+                            "are unfinished; resume the job to fill them in",
+                            type(_lost).__name__, _lost,
+                        )
+                        if not first_error:
+                            first_error = f"worker lost: {type(_lost).__name__}: {_lost}"
+                        total_failures += 1
+                        continue
+                    total_done += int(res.get("done", 0))
+                    total_failures += int(res.get("failures", 0))
+                    if not first_error:
+                        first_error = res.get("error")
+                    if progress_cb:
+                        try:
+                            progress_cb(total_done)
+                        except Exception:
+                            pass
+                pool.join()
+            finally:
+                # Always reap this batch's children before re-sizing, so surplus
+                # workers' memory is released rather than lingering into the next.
                 try:
-                    progress_cb(total_done)
+                    pool.terminate()
+                    pool.join()
                 except Exception:
                     pass
-        pool.join()
-    except BaseException:
-        pool.terminate()
-        pool.join()
-        raise
+                _pool_ref[0] = None
     finally:
-        _pool_ref[0] = None
         if _old_sigterm is not None:
             try:
                 _signal.signal(_signal.SIGTERM, _old_sigterm)
             except (OSError, ValueError):
                 pass
     logger.info(
-        "[OPTIM_PARALLEL] %d combos in %.2fs across %d workers",
+        "[OPTIM_PARALLEL] %d combos in %.2fs across %d batches (final P=%s)",
         total_done,
         time.perf_counter() - t0,
-        len(chunks),
+        _batches,
+        _last_p,
     )
-    return {"done": total_done, "failures": total_failures}
+    return {"done": total_done, "failures": total_failures, "error": first_error}

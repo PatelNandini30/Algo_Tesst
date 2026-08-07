@@ -2066,7 +2066,8 @@ def _compute_strike_for_leg_python(
     index_up = index.upper()
 
     if sel_type in ("closest_premium", "premium_gte", "premium_lte", "premium_range"):
-        chain = list(algotest_native.get_strikes_for_date(entry_date, index_up, expiry, opt_type))
+        chain = _strikes_for_date_tolerant(
+            algotest_native, entry_date, index_up, expiry, opt_type)
         if not chain:
             return None
         if sel_type == "closest_premium":
@@ -2086,6 +2087,215 @@ def _compute_strike_for_leg_python(
             qualifying = [(s, p) for s, p in chain if lower <= p <= upper]
             item = _pick_by_premium(qualifying, upper, atm, is_ce)
         return float(item[0]) if item else None
+
+    if sel_type in ("time_value", "time_value_gte", "time_value_lte"):
+        # TIME VALUE = close - intrinsic, intrinsic floored at 0:
+        #   CE intrinsic = max(spot - strike, 0)
+        #   PE intrinsic = max(strike - spot, 0)
+        # Same machinery as closest_premium — same chain, same tie-break
+        # (|value-target|, then |strike-atm|, then CE-higher / PE-lower) — only
+        # the compared number changes. Negative time values (deep ITM where
+        # close < intrinsic) stay in the candidate set on purpose: with a target
+        # of 0 and candidates -1 and 5, -1 is the nearer one and must win.
+        chain = _strikes_for_date_tolerant(
+            algotest_native, entry_date, index_up, expiry, opt_type)
+        if not chain:
+            return None
+        _tv_raw = sel.get("time_value")
+        if _tv_raw is None:
+            _tv_raw = sel.get("premium")
+        target = float(_tv_raw or 0.0)
+        _side = str(sel.get("moneyness") or "ATM").upper().strip()
+        try:
+            _cap_pct = abs(float(sel.get("tv_range_pct") or 0.0))
+        except (TypeError, ValueError):
+            _cap_pct = 0.0
+        # TARGET UNIT. "points" (default) compares raw index points; "percent"
+        # compares time value as a share of spot:
+        #     TV%% = (close - intrinsic) / entry_spot * 100
+        # Only the UNIT of comparison changes — the sign, and therefore the
+        # negative-TV drop, is identical either way (entry_spot > 0). Percent
+        # self-adjusts as the index moves: 75 points meant something very
+        # different at 11,600 in 2019 than at 25,200 today.
+        _tv_pct_units = str(sel.get("tv_units") or "points").lower().strip() in (
+            "percent", "pct", "%"
+        )
+
+        # (1) Honour the leg's OWN strike gap. get_strikes_for_date returns every
+        # LISTED strike, which on NIFTY 2019 is a 50-grid even when the leg asks
+        # for 100 — measured: 41 of 83 strikes off-grid, and the sheet picked
+        # 11950 / 21750 / 22950 with gap=100 selected. ATM/ITMn/OTMn never hit
+        # this because they snap via round(spot/interval)*interval.
+        if interval > 0:
+            _on_grid = [
+                (s, p) for s, p in chain
+                if abs(s / interval - round(s / interval)) < 1e-9
+            ]
+            if _on_grid:
+                chain = _on_grid
+
+        cands: List[Tuple[float, float]] = []
+        for s, p in chain:
+            intrinsic = max((entry_spot - s) if is_ce else (s - entry_spot), 0.0)
+            #   OTM = intrinsic 0 (includes strike == spot) | ITM = intrinsic > 0
+            #   ATM = no side restriction
+            if _side == "OTM" and intrinsic > 0.0:
+                continue
+            if _side == "ITM" and intrinsic <= 0.0:
+                continue
+            # (1b) RANGE CAP — research team's formula: strike / entry_spot - 1,
+            # capped on absolute value. "3%" means the walk may only step out to
+            # 3% from spot (so 1%, 2%, 3% are in play and nothing beyond). Blank
+            # or 0 = uncapped, so every existing payload is unchanged. Without a
+            # cap the walk runs until time value crosses the target, which on
+            # NIFTY PE 09-Mar-2026 reached 22800 — 5.11% from spot.
+            if _cap_pct > 0.0 and abs(s / entry_spot - 1.0) * 100.0 > _cap_pct + 1e-9:
+                continue
+            tv = p - intrinsic
+            if _tv_pct_units and entry_spot > 0:
+                tv = tv / entry_spot * 100.0
+            # (2) NEGATIVE time value stays a candidate, ranked on ABSOLUTE
+            # distance like any other: against a target of 20, a TV of -50 is
+            # 70 away and a TV of +100 is 80 away, so -50 is the nearer strike.
+            # Deep-ITM prints below intrinsic are real (thin books, settlement),
+            # so hiding them would misreport what was actually available.
+            #
+            # Safe to admit now only because the other guards landed first: the
+            # untradeable filter removes the fabricated time values that caused
+            # the 22-Sep-2025 26850 pick (TV -143.35, reached via the untraded
+            # 27050's stale close), and the stepwise walk stops at the crossing
+            # so it cannot march out into deep-ITM negatives chasing a positive
+            # target.
+            # (3) Untradeable strikes are FICTION here. A zero-turnover contract
+            # carries a stale close, so its "time value" is invented: measured
+            # 03-Apr-2019, spot 11,643.95 — the 11850 PE showed close 806.40 vs
+            # intrinsic 206.05, i.e. a fake TV of 600, and the 13000 PE (1,356
+            # pts ITM, untraded) showed TV 52.40 and WON a target of ~50. The
+            # liquidity walk then dragged it to 12000, whose real TV is -40.20 —
+            # a strike never evaluated against the target at all. The liquid
+            # answer, 11700 (TV 43.95), was sitting two steps from ATM.
+            if algotest_native.get_option_price_tradeable(
+                entry_date, index_up, s, opt_type, expiry
+            ) is None:
+                continue
+            cands.append((s, tv))
+        if not cands:
+            return None
+
+        # (4) STEPWISE outward from ATM, not a global scan. Time value decays
+        # monotonically with distance from ATM, so the answer is the strike where
+        # TV crosses the target — stop there instead of hunting the whole chain
+        # and landing 1,300 points away.
+        #
+        # PER SIDE. That decay only holds WITHIN one side; interleaving OTM and
+        # ITM by distance is not monotonic, so a single walk quits on the first
+        # cross-branch step. Measured on NIFTY PE 09-Mar-2026, spot 24,028.05,
+        # target 75: 24000 OTM (TV 376.80) -> 23900 OTM (340.55, better) ->
+        # 24100 ITM (348.15, worse) -> STOP, returning 23900 with TV 340.55,
+        # while the ITM branch walked on its own reaches 24700 (TV 63.40). With
+        # moneyness=OTM/ITM only one branch exists and this is a no-op.
+        # Distances are compared ROUNDED to _TIE_DP decimals so a genuine tie is
+        # actually detectable. Raw floats almost never tie: the intrinsic carries
+        # error (25300 - 25202.35 = 97.65000000000146), so a "+1 vs -1" pair
+        # really differs by ~3e-12 and a strict comparison silently picks one.
+        # 1e-6 sits far below any real price increment (NSE ticks at 0.05), so
+        # this can only ever absorb float noise, never a real difference.
+        _TIE_DP = 6
+
+        def _walk(seq: List[Tuple[float, float]],
+                  force_nearest: bool = False) -> Optional[Tuple[float, float, float]]:
+            """seq must already be ordered outward from ATM.
+            Returns (dist, strike, tv).
+
+            force_nearest ignores the floor/ceiling and runs the nearest rule —
+            used as the cap fallback below.
+            """
+            if not force_nearest and sel_type == "time_value_lte":
+                for s, tv in seq:
+                    if tv <= target:
+                        return (round(abs(tv - target), _TIE_DP), s, tv)
+                return None
+            if not force_nearest and sel_type == "time_value_gte":
+                # NEAREST QUALIFYING, mirroring lte: walk outward and take the
+                # FIRST strike meeting the floor. Previously this kept the LAST
+                # one still meeting it (the crossing), which on 04-Aug-2022
+                # (spot 17,382, ATM 17400, CE, TV >= 100) returned 17500 (TV
+                # 115.75) even though 17400 sits AT the money with TV 160.00 and
+                # also qualifies. Note the consequence: time value peaks at ATM,
+                # so the first qualifying strike is usually the ATM strike itself
+                # and the threshold mainly decides whether a trade happens.
+                for s, tv in seq:
+                    if tv >= target:
+                        return (round(abs(tv - target), _TIE_DP), s, tv)
+                return None
+            best = None
+            for s, tv in seq:
+                d = round(abs(tv - target), _TIE_DP)
+                if best is None or d < best[0]:
+                    best = (d, s, tv)
+                elif d == best[0]:
+                    # EXACT TIE on |TV - target|: prefer a non-negative time
+                    # value over a negative one. At a target of 0 with +1 and -1
+                    # both exactly 1 away, +1 wins — and it wins even when the
+                    # negative strike sits closer to ATM, so the sign preference
+                    # outranks distance. Then stop: this is still the crossing.
+                    if tv >= 0.0 > best[2]:
+                        best = (d, s, tv)
+                    break
+                else:
+                    break  # stepped past the crossing — further out only worsens
+            return best
+
+        def _order(seq: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+            # Ties at equal distance keep the existing direction preference.
+            return sorted(seq, key=lambda x: (abs(x[0] - atm), -x[0] if is_ce else x[0]))
+
+        if _side in ("OTM", "ITM"):
+            _hit = _walk(_order(cands))
+        else:
+            _itm = [c for c in cands
+                    if (entry_spot - c[0] if is_ce else c[0] - entry_spot) > 0.0]
+            _otm = [c for c in cands
+                    if (entry_spot - c[0] if is_ce else c[0] - entry_spot) <= 0.0]
+            _hits = [h for h in (_walk(_order(_otm)), _walk(_order(_itm))) if h]
+            if not _hits:
+                _hit = None
+            elif sel_type == "time_value":
+                # NEAREST: the target is what you are selecting on, so the branch
+                # whose |TV-target| is smaller wins. Measured 09-Mar-2026
+                # (target 75, 2% cap): OTM gives 23600 (180.85 off), ITM gives
+                # 24500 (74.75 off) -> 24500. On a TIE, a non-negative time value
+                # beats a negative one; ATM distance decides only after that.
+                _hit = min(_hits, key=lambda h: (h[0],
+                                                 0 if h[2] >= 0.0 else 1,
+                                                 abs(h[1] - atm)))
+            else:
+                # GTE / LTE: whichever branch the outward walk REACHES FIRST wins
+                # (closest to ATM); |TV-target| only breaks a tie. Applies to the
+                # SIDE choice only — the walk inside a side still honours the
+                # floor/ceiling, otherwise gte would always collapse onto the ATM
+                # strike (highest TV satisfies any floor below it).
+                _hit = min(_hits, key=lambda h: (abs(h[1] - atm), h[0]))
+        # CAP FALLBACK. When a range cap is tight, no strike inside the band may
+        # satisfy the floor/ceiling at all — measured 09-Mar-2026, target 75,
+        # 2% cap: the lowest in-band time value is 149.75, so "TV <= 75" matched
+        # nothing and the trade was dropped. Take the CLOSEST available inside the
+        # band instead, so a tight cap thins the strike choice rather than the
+        # tradesheet. Only fires when the strict rule found nothing; `nearest`
+        # never needs it, and an empty candidate set still means no trade.
+        if _hit is None and sel_type != "time_value" and cands:
+            if _side in ("OTM", "ITM"):
+                _hit = _walk(_order(cands), True)
+            else:
+                _fb = [h for h in (_walk(_order(_otm), True), _walk(_order(_itm), True)) if h]
+                # Same tie rule as nearest — the fallback IS a nearest walk.
+                _hit = min(_fb, key=lambda h: (h[0],
+                                               0 if h[2] >= 0.0 else 1,
+                                               abs(h[1] - atm))) if _fb else None
+        chosen: Optional[float] = _hit[1] if _hit else None
+        # Candidates are already tradeable, so this walk is a no-op; kept so the
+        # requested_strike bookkeeping matches every other mode.
+        return _validate(chosen) if chosen is not None else None
 
     if sel_type in ("straddle_width", "atm_straddle_prem_pct"):
         # Fast path: the ENTIRE computation (formula, tradeable check,
@@ -2177,7 +2387,8 @@ def _compute_strike_for_leg_python(
         else:  # atm_straddle_prem_pct
             pct = float(sel.get("value") or 0.0)
             target = (pct / 100.0) * (float(ce_px) + float(pe_px))
-            chain = list(algotest_native.get_strikes_for_date(entry_date, index_up, expiry, opt_type))
+            chain = _strikes_for_date_tolerant(
+                algotest_native, entry_date, index_up, expiry, opt_type)
             item = _pick_by_premium(chain, target, atm, is_ce)
             return float(item[0]) if item else None
 
@@ -3813,18 +4024,16 @@ def priced_to_tradesheet_records(
     # default is 25) and making the display ATM Strike land on a different
     # grid than the actually-traded Strike.
     _sw_leg_intervals: Dict[int, float] = {}
-    # The ATM-straddle context (ATM Strike/Call/Put/Sum) is a display fact for the
-    # OPTIONS leg that uses straddle_width — NOT necessarily leg 1. When a FUTURES
-    # leg is added first it becomes leg 1 and would wrongly carry these columns.
-    # Anchor them on the first straddle_width leg, else the first non-FUTURES leg.
-    _atm_anchor_leg_id = 1
+    # The ATM-straddle context (ATM Strike/Call/Put/Sum) is a PER-LEG display
+    # fact, not a trade-level one — a WEEKLY leg and a MONTHLY leg in the same
+    # trade price against different option chains, so each straddle_width leg
+    # gets its own row filled, not just one "anchor" leg.
+    _sw_leg_ids: set = set()
     if _uses_sw:
         try:
             import algotest_native as _sw_native  # type: ignore
         except ImportError:
             _sw_native = None
-        _first_opt_leg = None
-        _first_sw_leg = None
         for _li, _lg in enumerate((payload.get("legs") or []), start=1):
             if not isinstance(_lg, dict):
                 continue
@@ -3835,13 +4044,9 @@ def priced_to_tradesheet_records(
                 )
             except (TypeError, ValueError):
                 _sw_leg_intervals[_li] = _STRIKE_INTERVALS.get(index_str, 50.0)
-            if str(_lg.get("segment") or "").upper() not in ("FUTURES", "FUTURE") and _first_opt_leg is None:
-                _first_opt_leg = _li
             _sel = _lg.get("strike_selection") or {}
-            if (_first_sw_leg is None and isinstance(_sel, dict)
-                    and str(_sel.get("type") or "").lower().strip() == "straddle_width"):
-                _first_sw_leg = _li
-        _atm_anchor_leg_id = _first_sw_leg or _first_opt_leg or 1
+            if isinstance(_sel, dict) and str(_sel.get("type") or "").lower().strip() == "straddle_width":
+                _sw_leg_ids.add(_li)
     # Carry-aware slippage: strip slippage from rows where a leg was merely
     # carried forward (same strike + expiry as its own previous trade). No-op
     # for ordinary strategies whose legs change every trade. Runs here so both
@@ -4012,11 +4217,11 @@ def priced_to_tradesheet_records(
             "Lazy Exit Date": "",
         }
         # Straddle-width only: surface the ATM strike + its CE/PE prices (and
-        # their sum) that the strike selection was derived from. Trade-level
-        # entry fact → written on the first-leg row only, blank on the rest.
+        # their sum) that the strike selection was derived from — on EVERY
+        # straddle_width leg's own row (each leg's expiry can differ).
         if _uses_sw:
             sw = {"ATM Strike": "", "ATM Call Price": "", "ATM Put Price": "", "ATM Call+Put Price": ""}
-            if _leg_id_val == _atm_anchor_leg_id and _sw_native is not None and entry_spot > 0:
+            if _leg_id_val in _sw_leg_ids and _sw_native is not None and entry_spot > 0:
                 _sw_interval = _sw_leg_intervals.get(_leg_id_val) or float(row.get("strike_interval") or 50.0)
                 _atm = _atm_straddle_prices(
                     _sw_native, _sw_cache, _normalize_iso(row.get("entry_date")),
@@ -4060,6 +4265,91 @@ def priced_to_tradesheet_records(
         if _e:
             _r["Cadence Expiry"] = _e
     return out
+
+
+_KNOWN_STRIKE_SEL_TYPES: frozenset = frozenset({
+    "", "strike_type", "rel_leg", "pct_of_atm",
+    "closest_premium", "premium_gte", "premium_lte", "premium_range",
+    "time_value", "time_value_gte", "time_value_lte",
+    "straddle_width", "atm_straddle_prem_pct",
+})
+
+
+def _assert_known_strike_modes(payload: Dict[str, Any]) -> None:
+    """Raise on any option leg whose strike_selection.type no resolver handles.
+
+    Both builders must agree on this list: `_compute_strike_for_leg_python`
+    above and `extract_strike_sel` in simulate.rs. A mode missing from the Rust
+    half (stale compiled wheel) or from neither (e.g. 'synthetic_future', which
+    exists only as a UI label) otherwise yields a silent zero-trade run.
+    """
+    for _i, _leg in enumerate(payload.get("legs") or [], start=1):
+        if not isinstance(_leg, dict):
+            continue
+        if str(_leg.get("segment", "OPTIONS")).upper() in ("FUTURES", "FUTURE"):
+            continue
+        _sel = _leg.get("strike_selection") or {}
+        if not isinstance(_sel, dict):
+            _sel = {}
+        _t = str(_sel.get("type") or "strike_type").lower().strip()
+        if _t in _KNOWN_STRIKE_SEL_TYPES or _t.startswith(("atm", "itm", "otm")):
+            continue
+        raise RuntimeError(
+            f"Leg {_i}: unsupported strike_selection.type {_t!r}. Supported: "
+            f"{sorted(_KNOWN_STRIKE_SEL_TYPES - {''})} (or a direct ATM/ITMn/OTMn). "
+            "If this mode was added recently, the compiled Rust extension may be "
+            "stale — rebuild the wheel (start.sh rebuilds algo-backend-base) and "
+            "restart the workers."
+        )
+
+
+def _strikes_for_date_tolerant(
+    native: Any, entry_date: str, index_up: str, expiry: str, opt_type: str
+) -> List[Tuple[float, float]]:
+    """get_strikes_for_date with the ±1-day expiry tolerance the PRICE lookups
+    already have (engines/generic_algotest_engine._expiry_candidates, mirrored in
+    optimizer/runner._expiry_cands_str).
+
+    NSE shifts an expiry when the scheduled day is a holiday, and the feather
+    then splits the cycle across two labels. June-2023 is the known case:
+    29-Jun-2023 was a holiday so the weekly moved to 28-Jun, and the feather
+    holds `ExpiryDate=2023-06-29` rows up to 27-Jun (what actually traded) plus
+    `ExpiryDate=2023-06-28` rows on 28-Jun only.
+
+    `get_option_price` carries this tolerance, so ATM/ITMn/OTMn survive — they
+    only need a price. `get_strikes_for_date` does NOT, so every CHAIN-SCANNING
+    mode got an empty chain, failed to resolve a strike and silently dropped the
+    trade. Measured: entry 21-Jun-2023 / expiry 28-Jun-2023 returned 0 strikes
+    while 2023-06-29 returned 111, so the whole 28-Jun cycle went missing from
+    the tradesheet (14-Jun -> 27-Jun, a 13-day hole mid-patch).
+
+    Falls back ONLY when the exact expiry yields nothing, so every ordinary date
+    is byte-identical.
+    """
+    try:
+        chain = list(native.get_strikes_for_date(entry_date, index_up, expiry, opt_type))
+    except Exception:
+        chain = []
+    if chain:
+        return chain
+    try:
+        import pandas as _pd
+        _ts = _pd.Timestamp(expiry)
+        if _pd.isna(_ts):
+            return []
+        for _alt in (
+            (_ts + _pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            (_ts - _pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        ):
+            try:
+                _c = list(native.get_strikes_for_date(entry_date, index_up, _alt, opt_type))
+            except Exception:
+                _c = []
+            if _c:
+                return _c
+    except Exception:
+        pass
+    return []
 
 
 def _supports_reentry_strike(leg_src: Dict[str, Any]) -> bool:
@@ -4563,6 +4853,16 @@ def run_rust_engine_pipeline(
         import algotest_native  # type: ignore
     except ImportError:
         return None
+
+    # HARD-FAIL on a strike mode neither builder can resolve, BEFORE any work.
+    # Rust's resolve_trade_specs rejects such a leg with
+    # UnsupportedReason("unknown strike_selection.type") and hands back an empty
+    # spec list, which this pipeline reported as a clean run with ZERO trades —
+    # indistinguishable from "no trades in this date range". That is exactly how
+    # a stale native extension looks: `time_value` legs silently produced 0
+    # trades on the DTE path while the filter path worked, and nothing in the
+    # logs said why. Fail loudly and name the leg instead.
+    _assert_known_strike_modes(payload)
 
     # Guard: if the Rust feather cache isn't loaded, simulate_trades_batch will
     # return empty for every spec. Fall back to Python rather than silently
@@ -7637,6 +7937,26 @@ def run_rust_engine_pipeline(
                     )
                 )
             }
+            # MONTHLY Fixed legs also refuse a cross-contract anchor. The exemption
+            # documented above is justified by "a plain cadence leg changes contract on
+            # EVERY trade, so the refusal discards every re-anchor" — true for a WEEKLY
+            # leg, false for a MONTHLY one, but the exemption was drawn by leg category
+            # rather than by that property, so monthly got swept in with weekly.
+            #
+            # Measured (NIFTY MONTHLY T-1/T-1, PE BUY ATM gap 500, Fixed, rise 1%,
+            # patch 29-03-2019..10-05-2019): the 16-Apr anchor of 12000 on the APRIL
+            # contract was stamped onto the 24-Apr trade that had already rolled to MAY,
+            # overwriting the correct 11500 the segment lock had written. Worse over
+            # 2024: K26000 held across THREE rolls (28-Nov, 26-Dec, 30-Jan) with no
+            # adjustment on any of them, ending 2,272 pts ITM against spot 23,727.65 on
+            # a leg configured ATM. Rule: reset on adjustment, patch reset, OR expiry
+            # change. Weekly legs are untouched — they are not in this set.
+            _cf_monthly_fixed_lids = {
+                _i + 1 for _i, _lg in enumerate(legs_src)
+                if isinstance(_lg, dict)
+                and (_i + 1) in _cf_fixed_lids
+                and str(_lg.get("expiry") or "").upper() in _MONTHLY_LEG_TYPES
+            }
             # (3b) A FIXED leg's OWN breaches that fired as a cascade sub-hop (some
             # other leg cut the trade first) never reach spot_adj_overrides, so (1)-(3)
             # miss them and the following base trades revert to the locked strike. The
@@ -7712,7 +8032,10 @@ def run_rust_engine_pipeline(
                         # re-anchor, reverting the leg to its segment lock. See
                         # `_cf_contract_locked_lids` above for the measured failure.
                         _cur_exp = _normalize_iso(_crow.get("expiry") or "")
-                        _cf_locked = _clid in _cf_contract_locked_lids
+                        _cf_monthly = _clid in _cf_monthly_fixed_lids
+                        _cf_locked = (
+                            _clid in _cf_contract_locked_lids or _cf_monthly
+                        )
                         _cstrike = None
                         for _d in reversed(_applicable):
                             _v = _anchor_strike.get(_d, {}).get(_clid)
@@ -7723,6 +8046,21 @@ def run_rust_engine_pipeline(
                                 continue  # anchor from a different contract — skip
                             _cstrike = _v
                             break
+                        # Every anchor was refused as cross-contract: this trade rolled,
+                        # so it must re-strike FRESH. Leaving _cstrike None would hand it
+                        # back to the segment lock — the stale patch-first strike — which
+                        # is not a reset either. Take the natural (pre-lock) strike, the
+                        # same map the epoch pass uses. Only for MONTHLY Fixed legs, so
+                        # the pinned/yearly paths keep the behaviour they were verified
+                        # with.
+                        if (
+                            _cstrike is None
+                            and _cf_monthly
+                            and _clid not in _cf_contract_locked_lids
+                        ):
+                            _c_nat = _natural_spec_strikes.get((int(_ctid), _clid))
+                            if _c_nat:
+                                _cstrike = float(_c_nat)
                         if _cstrike and abs(_cstrike - float(_crow.get("strike") or 0)) > 0.01:
                             _crow["strike"] = _cstrike
                             _crow["requested_strike"] = _cstrike
@@ -8829,6 +9167,63 @@ def run_rust_engine_pipeline(
             or adjusted_reason_by_date.get(key)
             or "EXPIRY"
         )
+
+    # EXIT-DAY CROSSINGS — label them. A breach landing on the trade's own
+    # scheduled exit cannot truncate it (the trade was ending anyway), so no
+    # trigger reaches spot_adj_overrides and the row came out as plain
+    # SCHEDULED_EXIT — while the SAME event that did record a trigger came out
+    # as "SCHEDULED_EXIT+SPOT_ADJ_RISE (Leg N ...)". One situation, two labels.
+    #
+    # The adjustment is real: it re-bases the leg's anchor, which is why the
+    # NEXT trade re-strikes. Only the reporting was missing. Measured on NIFTY
+    # WEEKLY cadence, PE Sell weekly Fresh 0.25% + PE Buy MONTHLY Fixed 0.5%
+    # (filter base2-bull-MFI, 2019-2026): 38 trades crossed their own threshold
+    # on the exit day and said only SCHEDULED_EXIT, against 3 that said
+    # SCHEDULED_EXIT+SPOT_ADJ_RISE.
+    #
+    # Reporting only — strike, fill and P&L are untouched; this rewrites the
+    # Exit Reason string and nothing else. The '+' combiner is the established
+    # one, so downstream `"FILTER_END" in reason.split("+")` checks still hold.
+    # Built per TRADE, not per row: the tradesheet carries ONE Exit Reason per
+    # trade, so a label written only on the breaching leg's own row is invisible
+    # there — and a checker reading the trade's reason sees a leg that moved
+    # while unnamed. (Measured: labelling per row put the 3-leg corpus from 0 to
+    # 5 L2-MOVED-UNFIRED.) Collect every leg that crossed on the shared exit day
+    # and stamp the combined reason onto all rows of that trade, exactly as the
+    # cascade path already does for multi-leg breaches.
+    _xr_tags_by_trade: Dict[int, List[str]] = {}
+    for row in final_priced:
+        if "SPOT_ADJ" in str(row.get("exit_reason") or ""):
+            continue  # already named
+        _xr_lid = int(row.get("leg_id") or 1)
+        _xr_exit = _normalize_iso(str(row.get("exit_date") or ""))
+        if not _xr_exit or _xr_exit not in (_leg_own_breach_dates.get(_xr_lid) or ()):
+            continue
+        _xr_cfg = _per_leg_sa.get(_xr_lid) or {}
+        _xr_tag = "%s (%s)" % (
+            _spot_adj_reason_tag(
+                str(_xr_cfg.get("direction") or spot_adj_direction or "rise"),
+                float(row.get("entry_spot") or 0.0),
+                None,
+                float(_xr_cfg.get("pct") or spot_adj_pct or 0.0),
+                str(_xr_cfg.get("units") or spot_adj_units or "percent"),
+            ),
+            _sa_leg_label(_xr_lid),
+        )
+        _bucket = _xr_tags_by_trade.setdefault(int(row.get("trade_id") or 0), [])
+        if _xr_tag not in _bucket:
+            _bucket.append(_xr_tag)
+    if _xr_tags_by_trade:
+        for row in final_priced:
+            _xr_tids = _xr_tags_by_trade.get(int(row.get("trade_id") or 0))
+            if not _xr_tids:
+                continue
+            _xr_reason = str(row.get("exit_reason") or "")
+            if "SPOT_ADJ" in _xr_reason:
+                continue
+            row["exit_reason"] = "+".join(
+                [_xr_reason or "SCHEDULED_EXIT"] + _xr_tids
+            )
 
     # Inject re-entry metadata so priced_to_tradesheet_records can populate
     # ReEntryIndex / ReEntryTrigger / ReEntryMode columns.

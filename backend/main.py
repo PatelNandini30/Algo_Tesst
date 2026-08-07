@@ -90,17 +90,49 @@ def read_root():
         }
     }
 
+def _maintenance_notice():
+    """Operator-declared maintenance banner, or None.
+
+    Set deliberately when locking the box for a rebuild:
+        redis-cli set algotest:maintenance "Rebuilding backend — back in ~5 min"
+        redis-cli del algotest:maintenance          # release
+
+    Deliberately NOT inferred from health-check failures. The frontend used to
+    decide "the server is restarting" whenever a few /health polls timed out —
+    but a heavy sweep starves the API enough to blow the client's 4s timeout,
+    so users saw a "Server is restarting…" screen while nothing had restarted
+    and their jobs were running fine. Only an explicit flag shows that screen now.
+    """
+    try:
+        from services.optimizer.result_store import _redis
+        r = _redis()
+        if r is None:
+            return None
+        v = r.get("algotest:maintenance")
+        if not v:
+            return None
+        msg = v.decode() if isinstance(v, bytes) else str(v)
+        return msg.strip() or "Maintenance in progress"
+    except Exception:
+        return None          # never let this check break /health
+
+
 @app.get("/health")
 def health_check():
     from scripts.prebuild_cache import is_warmup_complete
     from fastapi.responses import JSONResponse
+    notice = _maintenance_notice()
     if not is_warmup_complete():
         # Not ready yet (background cache warmup still running after startup) —
         # 503 so Docker's own healthcheck AND the frontend's restart-overlay
         # both correctly treat this container as not-yet-usable, not just
         # "the HTTP process is listening".
-        return JSONResponse(status_code=503, content={"status": "warming"})
-    return {"status": "ok"}
+        return JSONResponse(status_code=503,
+                            content={"status": "warming", "maintenance": True,
+                                     "message": notice or "Backend is starting up…"})
+    if notice:
+        return {"status": "ok", "maintenance": True, "message": notice}
+    return {"status": "ok", "maintenance": False}
 
 
 @app.get("/health/db")

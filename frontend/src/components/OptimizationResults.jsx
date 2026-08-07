@@ -417,19 +417,17 @@ export default function OptimizationResults({
         ? `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
         : `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip`;
       while (true) {
+        // Headers-only probe, then native navigation — a ~300 MB ZIP must NOT
+        // go through r.blob() (whole file into tab memory → silent failure).
         const r = await fetch(zipUrl);
         if (r.status === 200) {
-          const blob = await r.blob();
-          const filename =
-            r.headers.get('x-filename') ||
-            `optimize_${jobId.slice(0, 8)}_tradesheets.zip`;
+          r.body?.cancel?.();   // don't transfer the payload twice
           const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = filename;
+          a.href = zipUrl;
+          a.download = '';   // Content-Disposition supplies the filename
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);
-          setTimeout(() => URL.revokeObjectURL(a.href), 10000);
           // Unlock the master "Export XLSX" and pin it to this download method.
           setZipMethod(patchwise ? 'patchwise' : 'overall');
           return;

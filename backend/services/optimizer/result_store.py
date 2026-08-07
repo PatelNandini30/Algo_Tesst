@@ -76,6 +76,51 @@ ZIP_BUILDER_VERSION = "v22"  # v22: value ramp compressed into the palest
                              # v17: per-combo leg-wise "Rules" first sheet added
 
 
+def prune_zip_cache(max_gb: float = None) -> int:
+    """Evict oldest cached ZIP/XLSX artifacts until the cache fits its budget.
+
+    There was no eviction at all: the cache had grown to 19 GB, and a single
+    60,000-combo sweep is worth ~8-11 GB of ZIP on its own, so a few large runs
+    would fill the disk. Oldest-first by mtime — a job's artifacts are rebuilt
+    on demand if someone downloads it again. Returns bytes freed.
+    """
+    if max_gb is None:
+        try:
+            max_gb = float(os.environ.get("OPTIM_ZIP_CACHE_MAX_GB", "30"))
+        except (TypeError, ValueError):
+            max_gb = 30.0
+    budget = int(max_gb * (1024 ** 3))
+    try:
+        entries = []
+        for name in os.listdir(ZIP_CACHE_DIR):
+            path = os.path.join(ZIP_CACHE_DIR, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not os.path.isfile(path):
+                continue
+            entries.append((st.st_mtime, st.st_size, path))
+    except OSError:
+        return 0
+    total = sum(e[1] for e in entries)
+    if total <= budget:
+        return 0
+    freed = 0
+    for _mtime, size, path in sorted(entries):          # oldest first
+        if total - freed <= budget:
+            break
+        try:
+            os.remove(path)
+            freed += size
+        except OSError:
+            continue
+    if freed:
+        logger.info("[OPTIM_STORE] ZIP cache pruned: freed %.1f GB (budget %.0f GB)",
+                    freed / (1024 ** 3), max_gb)
+    return freed
+
+
 def zip_cache_path(job_id: str, patchwise: bool = False) -> str:
     """Canonical path for a job's pre-built ZIP file."""
     os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
@@ -86,7 +131,9 @@ def zip_cache_path(job_id: str, patchwise: bool = False) -> str:
 # Bumped on its own when only the WOW/MOM grid LAYOUT changes, so those
 # workbooks rebuild without invalidating (and re-running) every cached ZIP.
 #   wm2 — blocks flow horizontally and wrap into bands instead of stacking.
-WOW_MOM_LAYOUT_VERSION = "wm4"   # wm4: pivot sheets tile 3-across then stack
+WOW_MOM_LAYOUT_VERSION = "wm5"   # wm5: pivot sheets use the summary grid's
+                                #      own slotting (adjustment across, strike down)
+                                # wm4: pivot sheets tile 3-across then stack
                                 # wm3: MIN pivots moved to their own
                                 #      captioned per-combo sheets
 
@@ -99,6 +146,34 @@ def wow_mom_cache_path(job_id: str, patchwise: bool = False) -> str:
         ZIP_CACHE_DIR,
         f"{job_id}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.xlsx",
     )
+
+
+def _stamp_xlsx_version(job_id: str) -> None:
+    """Record that this job's per-combo XLSX were built by the CURRENT builder.
+
+    Written as the sweep writes the workbooks, not at finalize. Without this the
+    marker only ever appeared inside ensure_xlsx_version — so on a job's FIRST
+    finalize it was always missing, the "no marker -> treat as stale" branch
+    fired, and every workbook the sweep had just built was deleted. The ZIP
+    fast path (assemble from pre-built files, seconds) could therefore never hit:
+    it was reliably wiped moments before it was checked, and 2160 workbooks were
+    rebuilt from CSV instead (~3 min). Cheap: one tiny file write per combo.
+    """
+    try:
+        trades_dir = get_trades_dir(job_id)
+        os.makedirs(trades_dir, exist_ok=True)
+        marker = os.path.join(trades_dir, ".xlsx_builder_version")
+        current = f"{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}"
+        try:
+            with open(marker) as fh:
+                if fh.read().strip() == current:
+                    return
+        except OSError:
+            pass
+        with open(marker, "w") as fh:
+            fh.write(current)
+    except Exception:
+        pass          # marker is an optimisation; never fail a combo over it
 
 
 def ensure_xlsx_version(job_id: str) -> int:
@@ -192,6 +267,12 @@ def init_job(
     method: str,
     objective: str,
     extra: Optional[Dict[str, Any]] = None,
+    # RESUME: keep the rows the interrupted run already produced. Wiping them
+    # (the default, correct for a fresh job) defeated resume twice over — the
+    # skip-set was read back empty so every combo was recomputed, AND the first
+    # run's rows vanished from the master summary and WOW/MOM, which are built
+    # from this list.
+    preserve_results: bool = False,
 ) -> None:
     r = _redis()
     if r is None:
@@ -214,7 +295,19 @@ def init_job(
     if extra:
         meta.update(extra)
     r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
+    if preserve_results:
+        # Seed progress from what survived, so the UI resumes at 1632/3600
+        # instead of appearing to restart, and increment_done keeps counting up.
+        try:
+            _kept = int(r.llen(_results_key(job_id)) or 0)
+            meta["done"] = _kept
+            r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
+            r.set(f"optim:{job_id}:done_counter", _kept)
+        except Exception:
+            pass
+        return
     r.delete(_results_key(job_id))
+    r.delete(f"optim:{job_id}:done_counter")
 
 
 def update_progress(
@@ -542,6 +635,46 @@ def get_trades_dir(job_id: str) -> str:
     return os.path.join(OPTIM_TRADES_DIR, job_id)
 
 
+# ── Per-combo WOW/MOM payload: on disk, never in Redis ───────────────────────
+# Measured on a real sweep: a stored result row is 16.0 KB, of which wm_pw alone
+# is 13.5 KB (84.5%). Keeping it in the Redis row costs ~16 KB/combo, so a
+# 60,000-combo sweep would need ~985 MB against a 500 MB maxmemory and die
+# mid-run. On disk (gzipped) the row falls back to ~2.5 KB, i.e. ~150 MB at
+# 60k, while _prebuild_wow_mom still avoids the slow CSV rebuild.
+
+def _wm_path(job_id: str, combo_label_safe: str) -> str:
+    return os.path.join(get_trades_dir(job_id), "wm", f"{combo_label_safe}.json.gz")
+
+
+def write_combo_wm(job_id: str, combo_label_safe: str, wm_overall, wm_patchwise) -> bool:
+    """Persist a combo's WOW/MOM data. Returns True if anything was written."""
+    if wm_overall is None and wm_patchwise is None:
+        return False
+    import gzip
+    import json as _json
+    try:
+        path = _wm_path(job_id, combo_label_safe)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {"wm_overall": wm_overall, "wm_pw": wm_patchwise}
+        with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as fh:
+            _json.dump(payload, fh)
+        return True
+    except Exception as exc:
+        logger.warning("[OPTIM_STORE] wm write failed (%s): %s", combo_label_safe, exc)
+        return False
+
+
+def read_combo_wm(job_id: str, combo_label_safe: str, patchwise: bool):
+    """Load a combo's stored WOW/MOM data for one variant, or None if absent."""
+    import gzip
+    import json as _json
+    try:
+        with gzip.open(_wm_path(job_id, combo_label_safe), "rt", encoding="utf-8") as fh:
+            return (_json.load(fh) or {}).get("wm_pw" if patchwise else "wm_overall")
+    except (OSError, ValueError):
+        return None
+
+
 def write_combo_tradesheet(
     job_id: str,
     combo_label_safe: str,
@@ -574,6 +707,7 @@ def write_combo_xlsx(
     midcap_legs=None,
     midcap_spot_adjustment=None,
     midcap_symbol: str = "NIFTYMIDCAP100",
+    filter_name: str = "",
     filter_segments=None,
     yearly: bool = False,
     rules_sheet=None,
@@ -593,7 +727,18 @@ def write_combo_xlsx(
         # Enrich MAE/MFE for the download tradesheet.  The optimizer skips this
         # during combo execution (OPTIMIZE_SKIP_MAE_MFE=1) for speed, so we do
         # it here using the feather that's already on disk.
-        if index_str and trading_days:
+        #
+        # SKIP for multi-index combos ("Group Index" column present): those
+        # trades already have CORRECT per-leg MAE/MFE from
+        # run_multi_index_feature (each leg priced against its OWN index).
+        # _compute_mae_mfe_batch takes one blanket `index_str` (the strategy's
+        # BASE index) for every row — for a MIDCPNIFTY futures leg on a NIFTY
+        # strategy this OVERWRITES the correct value with one computed against
+        # NIFTY's own high/low, producing the -85%+ scale-mismatch garbage
+        # (MIDCPNIFTY entry ~12,700 vs NIFTY high/low ~23,800). See
+        # [[multi-index-fut-mae-mfe-scale-bug]].
+        _is_multi_index = hasattr(trades_df, "columns") and "Group Index" in trades_df.columns
+        if index_str and trading_days and not _is_multi_index:
             try:
                 from services.optimizer.runner import (
                     _compute_mae_mfe_batch,
@@ -622,6 +767,11 @@ def write_combo_xlsx(
             midcap_legs=midcap_legs,
             midcap_spot_adjustment=midcap_spot_adjustment,
             midcap_symbol=midcap_symbol,
+            # Without this the inline workbook had NO "Patch wise" sheet while the
+            # finalize rebuild (which passes zip_naming level1) did — so the ZIP
+            # fast path would have shipped a workbook one sheet short of the
+            # rebuild it replaces. Same source both sides now.
+            filter_name=filter_name,
             filter_segments=filter_segments,
             yearly=yearly,
             rules_sheet=rules_sheet,
@@ -631,6 +781,7 @@ def write_combo_xlsx(
         path = os.path.join(dirpath, f"{combo_label_safe}.xlsx")
         with open(path, "wb") as fh:
             fh.write(xlsx_bytes)
+        _stamp_xlsx_version(job_id)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] xlsx write failed (%s): %s", combo_label_safe, exc)
 
@@ -665,7 +816,10 @@ def write_combo_xlsx_patchwise(
         if hasattr(trades_df, "empty") and trades_df.empty:
             return
         # Enrich MAE/MFE identically to the overall write (same code path).
-        if index_str and trading_days:
+        # SKIP for multi-index combos — see the identical guard + explanation
+        # in write_combo_xlsx above ([[multi-index-fut-mae-mfe-scale-bug]]).
+        _is_multi_index = hasattr(trades_df, "columns") and "Group Index" in trades_df.columns
+        if index_str and trading_days and not _is_multi_index:
             try:
                 from services.optimizer.runner import (
                     _compute_mae_mfe_batch,
@@ -704,6 +858,7 @@ def write_combo_xlsx_patchwise(
         path = os.path.join(dirpath, f"{combo_label_safe}.xlsx")
         with open(path, "wb") as fh:
             fh.write(xlsx_bytes)
+        _stamp_xlsx_version(job_id)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] pw xlsx write failed (%s): %s", combo_label_safe, exc)
 
@@ -862,6 +1017,25 @@ def touch_active_optim(job_id: str, node_id: Optional[str] = None) -> None:
         r.hset(_active_key(node_id), job_id, time.time())
     except Exception as exc:
         logger.debug("[OPTIM_STORE] touch_active_optim failed: %s", exc)
+
+
+def is_active_optim(job_id: str, node_id: Optional[str] = None) -> bool:
+    """Is this job currently registered as a LIVE optim on `node_id`?
+
+    Lets callers tell a genuinely-running job from one frozen at
+    status=running by a crash or worker restart — the registry entry is
+    refreshed by a 60s heartbeat and self-expires (_ACTIVE_STALE_SEC), so a
+    dead job stops being 'active' on its own. Errors return False: treating an
+    unreachable registry as 'not running' is the safe direction here, since the
+    alternative blocks recovery of a job nobody can restart.
+    """
+    try:
+        r = _redis()
+        if r is None:
+            return False
+        return bool(r.hexists(_active_key(node_id), job_id))
+    except Exception:
+        return False
 
 
 def unregister_active_optim(job_id: str, node_id: Optional[str] = None) -> None:

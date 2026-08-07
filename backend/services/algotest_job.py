@@ -602,6 +602,39 @@ def _safe_clear_fast_lookup() -> None:
         pass
 
 
+
+def route_yearly_futures(payload: dict) -> dict:
+    """Route a single-index YEARLY-options + FUTURES strategy to the unified-cadence
+    sync path, which prices each leg off its own calendar.
+
+    run_rust_engine_pipeline REFUSES this shape (futures have no December pin and
+    its rollover builder would roll them across the option cadence), so it must be
+    caught before the engine. The direct backtest did this inline; the optimizer did
+    not, so the same strategy returned 600 trades as a backtest and failed every
+    combo as a sweep. Shared here so the two paths cannot drift apart again.
+
+    Returns the payload unchanged unless it matches; never mutates the input.
+    """
+    if payload.get("multi_index_mode"):
+        return payload
+    legs = payload.get("legs") or []
+
+    def _isfut(l):
+        return str((l or {}).get("segment") or "").upper() in ("FUTURE", "FUTURES")
+
+    def _isyear(l):
+        return str((l or {}).get("expiry") or (l or {}).get("expiry_type") or "").upper().startswith("YEAR")
+
+    has_fut = any(_isfut(l) for l in legs)
+    has_opt = any(not _isfut(l) for l in legs)
+    yearly = str(payload.get("expiry_type") or "").upper().startswith("YEAR") or any(
+        _isyear(l) and not _isfut(l) for l in legs)
+    if has_fut and has_opt and yearly:
+        logger.info("[YEARLY_FUT] single-index yearly+futures → routing to unified-cadence sync path")
+        return dict(payload, multi_index_mode=True, sync_weekly_roll=True)
+    return payload
+
+
 def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     job_t0 = time.perf_counter()
     payload = _normalize_request(request)
@@ -618,19 +651,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
     # the future to co-enter/co-exit with. Every config that does NOT hit the yearly+
     # futures blocker (yearly option-only, non-yearly + futures, already multi-index)
     # fails this gate and runs completely unchanged.
-    if not payload.get("multi_index_mode"):
-        _yfr_legs = payload.get("legs") or []
-        def _yfr_isfut(_l):
-            return str((_l or {}).get("segment") or "").upper() in ("FUTURE", "FUTURES")
-        def _yfr_isyear(_l):
-            return str((_l or {}).get("expiry") or (_l or {}).get("expiry_type") or "").upper().startswith("YEAR")
-        _yfr_has_fut = any(_yfr_isfut(_l) for _l in _yfr_legs)
-        _yfr_has_opt = any(not _yfr_isfut(_l) for _l in _yfr_legs)
-        _yfr_yearly = str(payload.get("expiry_type") or "").upper().startswith("YEAR") or any(
-            _yfr_isyear(_l) and not _yfr_isfut(_l) for _l in _yfr_legs)
-        if _yfr_has_fut and _yfr_has_opt and _yfr_yearly:
-            logger.info("[YEARLY_FUT] single-index yearly+futures → routing to unified-cadence sync path")
-            payload = dict(payload, multi_index_mode=True, sync_weekly_roll=True)
+    payload = route_yearly_futures(payload)
 
     # NEW FEATURE (opt-in, isolated): multi-index / multi-expiry legs.
     # Reached ONLY when the new builder set this flag. Routes to a separate

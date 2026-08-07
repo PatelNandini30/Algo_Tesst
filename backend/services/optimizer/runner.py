@@ -446,7 +446,7 @@ def _build_combo_xlsx_worker(args: tuple) -> Tuple[str, Optional[bytes], Optiona
     """
     (csv_path, label_safe, summary, combo_label, from_date, to_date,
      midcap_legs, midcap_spot_adjustment, midcap_symbol, filter_name,
-     filter_segments, patchwise, yearly) = args
+     filter_segments, patchwise, yearly, rules_sheet) = args
     try:
         import pandas as _pd_w
         from services.optimizer.excel_builder import build_combo_xlsx as _build_xlsx_w
@@ -466,6 +466,12 @@ def _build_combo_xlsx_worker(args: tuple) -> Tuple[str, Optional[bytes], Optiona
             # WOW buckets by Expiry unless YEARLY, where the leg holds ONE
             # contract and the whole run collapses into its ISO week.
             yearly=yearly,
+            # Leg-wise "Rules" first sheet. This prebuild runs right after the
+            # sweep and wins the race to the ZIP cache, so the on-demand builder
+            # in routers/optimize.py (which always passed rules_sheet) almost
+            # never runs — dropping it here meant every downloaded combo
+            # workbook shipped WITHOUT its Rules tab.
+            rules_sheet=rules_sheet,
         )
         return label_safe, xlsx_bytes, None
     except Exception as exc:
@@ -490,6 +496,18 @@ def _build_cleaned_combo_worker(args: tuple):
         return cleaned, has_midcap, None
     except Exception as exc:
         return None, False, str(exc)
+
+
+def _combo_key(combo: dict) -> str:
+    """Stable identity for a swept parameter tuple, ignoring internal markers.
+
+    Used by resume to decide what has already been computed. Keys starting with
+    `__` are dispatch metadata (`__combo_id__`, `__optim_callback__`), never
+    part of the strategy, so they must not affect identity.
+    """
+    import json as _json
+    clean = {k: v for k, v in (combo or {}).items() if not str(k).startswith("__")}
+    return _json.dumps(clean, sort_keys=True, default=str)
 
 
 def _download_mode_flags(base_payload: dict) -> tuple:
@@ -641,8 +659,12 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
                 _df = _pd.read_csv(_csv_path, dtype=str)
                 if _df.empty:
                     continue
-                # Enrich with MAE/MFE if the CSV still has zeros (fast-exec path)
-                if "MAE" in _df.columns and trading_days:
+                # Enrich with MAE/MFE if the CSV still has zeros (fast-exec path).
+                # SKIP for multi-index combos ("Group Index" column) — those
+                # trades need per-leg-symbol MAE/MFE, not this blanket
+                # index_str recompute. See [[multi-index-fut-mae-mfe-scale-bug]].
+                if ("MAE" in _df.columns and trading_days
+                        and "Group Index" not in _df.columns):
                     _mae_s = _pd.to_numeric(_df["MAE"], errors="coerce").fillna(0.0)
                     _mfe_s = _pd.to_numeric(_df["MFE"], errors="coerce").fillna(0.0)
                     if (_mae_s.abs().sum() + _mfe_s.abs().sum()) <= 0.0001:
@@ -731,12 +753,31 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
                     pass
         return
 
+    # Reaching here means the fast path MISSED and every combo workbook is about
+    # to be rebuilt from CSV — minutes instead of seconds on a large sweep. That
+    # is a defect signal, not a normal mode: the sweep is supposed to leave a
+    # complete set of pre-built workbooks behind. Logged loudly (with what was
+    # missing) so it can't quietly become the default again, as it did when the
+    # builder-version marker started wiping the very files this path wants.
+    _missing = sorted(combo_labels_set - xlsx_labels_set)
+    logger.warning(
+        "[OPTIM] ZIP fast-path MISS for job %s (patchwise=%s): %d/%d combos lack a "
+        "pre-built XLSX — rebuilding from CSV (slow). Missing e.g. %s",
+        job_id[:8], patchwise, len(_missing), len(combo_labels_set),
+        ", ".join(_missing[:3]) or "(none — dir empty)",
+    )
+
     # ── Step 1: Enrich each combo CSV with MAE/MFE while OHLC is in _RUST_CONTEXT.
     for fname in combo_files:
         csv_path = os.path.join(trades_dir, fname)
         try:
             df = _pd.read_csv(csv_path, dtype=str)
             if df.empty or "MAE" not in df.columns:
+                continue
+            # Multi-index combos ("Group Index" column) already have correct
+            # per-leg-symbol MAE/MFE — never run them through this blanket
+            # index_str recompute. See [[multi-index-fut-mae-mfe-scale-bug]].
+            if "Group Index" in df.columns:
                 continue
             mae_s = _pd.to_numeric(df["MAE"], errors="coerce").fillna(0.0)
             mfe_s = _pd.to_numeric(df["MFE"], errors="coerce").fillna(0.0)
@@ -778,6 +819,12 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
     # of its inputs — see _build_combo_xlsx_worker). Sized dynamically so this
     # doesn't oversubscribe CPU/RAM alongside a second concurrently-running
     # optim (mirrors the sweep's own dynamic-P logic).
+    # Per-combo leg-wise "Rules" sheet — rebuild each combo's merged payload from
+    # base_payload + that combo's swept values, exactly as routers/optimize.py's
+    # on-demand ZIP builder does, so both paths produce the same workbook.
+    from services.optimizer.param_expander import apply_combo_for_optim as _apply_combo
+    from services.optimizer.rules_sheet import build_rules_sheet as _brs
+
     from concurrent.futures import ProcessPoolExecutor
     n_workers = _finalize_worker_count()
     xlsx_results: dict = {}
@@ -786,12 +833,17 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
         for fname in combo_files:
             label_safe = fname[:-4]
             row = summary_by_label.get(label_safe, {})
+            try:
+                _rules = _brs(_apply_combo(base_payload, row.get("combo") or {}), _filter_name)
+            except Exception:
+                _rules = None
             args = (
                 os.path.join(trades_dir, fname), label_safe,
                 row.get("summary") or {}, row.get("combo_label") or label_safe,
                 from_date, to_date, _mc_legs, _mc_sa, _mc_sym,
                 _filter_name, _filter_segments, patchwise,
                 str(base_payload.get("expiry_type") or "").upper() == "YEARLY",
+                _rules,
             )
             futs[_ex.submit(_build_combo_xlsx_worker, args)] = fname
         for fut in _as_completed(futs):
@@ -924,6 +976,10 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
             label_safe = fname[:-4]
             _stored = rows_by_safe.get(label_safe) or {}
             _wm = _stored.get("wm_pw" if pw else "wm_overall")
+            if _wm is None and _stored.get("wm_on_disk"):
+                # Written beside the tradesheet during the sweep rather than
+                # carried in the Redis row (13.5 KB/combo — see write_combo_wm).
+                _wm = result_store.read_combo_wm(job_id, label_safe, patchwise=pw)
             if _wm is not None:
                 results[label_safe] = (None, bool(_stored.get("has_midcap")), _wm)
             else:
@@ -2004,8 +2060,14 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         # that preload and only sets the flag after retries are exhausted, logging
         # loudly (ERROR) when it does — so this path is now rare and always visible
         # rather than silently producing zeros.)
-        _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
-        df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
+        # Defensive guard (this function is single-index-only by dispatch —
+        # multi_index_mode returns via _run_single_backtest_multi_index before
+        # ever reaching here — but never trust a blanket index_str against a
+        # "Group Index" frame if some other caller ever bypasses that dispatch).
+        # See [[multi-index-fut-mae-mfe-scale-bug]].
+        if "Group Index" not in df.columns:
+            _index_str = str(payload.get("index") or payload.get("symbol") or "NIFTY").upper()
+            df = _compute_mae_mfe_batch(df, _index_str, ctx["trading_days"])
         df = _compute_live_dd_from_mae(df, aggregated)
 
         # Sort by Entry Date so cascade mini-trades (which get NEW trade_ids
@@ -2085,6 +2147,9 @@ def _run_single_backtest(payload: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[st
     # SAME path the direct backtest uses. The single base-index Rust fast path below
     # cannot do this — it would price every leg (e.g. a MIDCPNIFTY future) against the
     # base index (NIFTY). See _run_single_backtest_multi_index.
+    # NOTE: yearly+futures routing happens in run_optimization on the BASE payload,
+    # before the fork — never here. Flipping multi_index_mode inside the child
+    # deadlocks it (see the comment there).
     if payload.get("multi_index_mode"):
         return _run_single_backtest_multi_index(payload)
 
@@ -2107,6 +2172,22 @@ def _run_single_backtest(payload: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[st
     )
 
 
+
+def _terminal_state(done: int, failures: int, error: str = None):
+    """Decide a sweep's FINAL state honestly.
+
+    A run where every combo raised produced no results at all, but it used to
+    return status="success" with total=0 — so the UI showed a finished job with
+    nothing in it and no reason (e.g. the engine refusing YEARLY + same-index
+    FUTURES legs). Report that as failed and carry the first combo's error, so
+    the cause reaches the user instead of only the worker log.
+    Partial failures stay "success": the surviving combos are real results.
+    """
+    if int(done or 0) == 0 and int(failures or 0) > 0:
+        return "failed", (error or f"all {failures} combos failed — see worker log")
+    return "success", None
+
+
 def run_optimization(
     job_id: str,
     *,
@@ -2123,6 +2204,10 @@ def run_optimization(
     zip_naming: Optional[Dict[str, Any]] = None,
     auto_download: bool = False,
     node_id: Optional[str] = None,
+    # Continue an interrupted sweep: skip combos this job already has results
+    # for and dispatch only the remainder. Passed through from the Celery spec
+    # by worker/tasks.py; default False keeps a normal run untouched.
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """
     Top-level entry point invoked by the Celery task.
@@ -2135,6 +2220,19 @@ def run_optimization(
     process because it needs the ask/tell feedback loop.
     """
     obj = resolve_objective(objective)
+    # Route a single-index YEARLY-options + FUTURES sweep to the unified-cadence
+    # path HERE, in the parent, before any market-data prep or forking. Doing it
+    # per-combo inside the child instead flips the payload to multi_index_mode
+    # AFTER the fork, so the parent skips its pre-fork setup (overlay merge,
+    # rust_context, OHLC preload) and the child then does that thread-backed work
+    # itself — which deadlocks on a lock inherited from a dead parent thread
+    # (observed: all pool children parked in futex_do_wait, 0 combos, 1% CPU).
+    # Same helper the direct backtest uses, so both agree on the shape.
+    try:
+        from services.algotest_job import route_yearly_futures
+        base_payload = route_yearly_futures(base_payload)
+    except Exception as _yf_exc:
+        logger.debug("[OPTIM] yearly+futures routing skipped: %s", _yf_exc)
     total = validate_request(base_payload, param_specs, method, sample_n)
     logger.info(
         "[OPTIM] job=%s launch download_mode=%s objective=%s method=%s",
@@ -2146,6 +2244,7 @@ def run_optimization(
 
     result_store.init_job(
         job_id,
+        preserve_results=bool(resume),
         total=total,
         method=method,
         objective=obj.name,
@@ -2265,6 +2364,34 @@ def run_optimization(
             for c in combos:
                 c.pop("__optim_callback__", None)
 
+            # ── RESUME ──────────────────────────────────────────────────────
+            # Re-running an interrupted sweep used to recompute all of it: a
+            # resubmit got a fresh job_id and an empty trades dir, so 1600
+            # finished combos were thrown away. Resuming keeps the SAME job_id,
+            # so the per-combo CSV/XLSX/wm files and result rows already on disk
+            # stay valid, and we dispatch only what is genuinely missing.
+            #
+            # Combos are matched on their PARAMETER VALUES, not on position or
+            # label — the grid expands deterministically, but matching by index
+            # would silently mismatch if the sweep definition ever differed.
+            # The stamped __combo_id__ preserves each survivor's original index
+            # so its filenames line up with the first run's.
+            for _i, _c in enumerate(combos, 1):
+                _c["__combo_id__"] = _i
+            if bool(resume):
+                _prior = result_store.get_all_results_raw(job_id)
+                _done = {_combo_key(r.get("combo") or {}) for r in _prior}
+                _before = len(combos)
+                combos = [c for c in combos if _combo_key(c) not in _done]
+                _resume_done = _before - len(combos)
+                logger.info(
+                    "[OPTIM] RESUME job=%s: %d/%d combos already computed — "
+                    "dispatching the remaining %d",
+                    job_id[:8], _resume_done, _before, len(combos),
+                )
+            else:
+                _resume_done = 0
+
             # Install the FULL context (with ohlc_df_pandas) into the parent's
             # _RUST_CONTEXT BEFORE forking — children inherit it via CoW fork
             # at zero cost. Without this set_rust_context() call, _RUST_CONTEXT
@@ -2290,6 +2417,17 @@ def run_optimization(
             # another is already mid-run correctly takes the smaller share.
             _live = result_store.active_optim_count(node_id)
             parallelism = max(1, _solo_ceiling // max(1, _live))
+            # Keep the final worker count dynamic. The solo ceiling already
+            # tracks the container/host capacity, and live optims divide that
+            # ceiling at runtime so concurrent jobs self-throttle without any
+            # fixed per-strategy cap. Apply a second live-RAM clamp at spawn
+            # time so a combo that is safe on an idle box still backs off when
+            # the host is already memory-tight.
+            try:
+                from services.optimizer.parallel import cap_parallelism_for_live_ram
+                parallelism = cap_parallelism_for_live_ram(parallelism, _live)
+            except Exception:
+                pass
             logger.info(
                 "[OPTIM] dynamic parallelism: solo_ceiling=%d / live_optims=%d -> P=%d",
                 _solo_ceiling, _live, parallelism,
@@ -2300,8 +2438,14 @@ def run_optimization(
                 combos=combos,
                 objective_name=obj.name,
                 parallelism=parallelism,
+                # Let the pool re-split between batches as optims start/finish.
+                solo_ceiling=_solo_ceiling,
+                node_id=node_id,
+                # A resumed sweep only dispatches the remainder, so its progress
+                # counts from 0 — offset it by what the first run finished or the
+                # UI shows the job starting over.
                 progress_cb=lambda done: result_store.update_progress(
-                    job_id, done=done, total=total
+                    job_id, done=_resume_done + done, total=total
                 ),
                 prebuilt_feather_root=feather_root,
                 prebuilt_rust_context=_worker_ctx,
@@ -2330,11 +2474,25 @@ def run_optimization(
                 _prebuild_csv_zip(job_id, base_payload, patchwise=True)
             result_store.heartbeat(job_id, phase="finalizing:wow_mom")
             _prebuild_wow_mom(job_id, base_payload, want_patchwise=_want_pw, want_overall=_want_ov)
+            # Keep the artifact cache inside its disk budget (oldest-first).
+            # Done AFTER this job's artifacts are written so a fresh download is
+            # never the thing evicted.
+            try:
+                result_store.prune_zip_cache()
+            except Exception as _pz:
+                logger.debug("[OPTIM] zip cache prune skipped: %s", _pz)
             result_store.heartbeat(job_id, phase="finalizing:done")
+            # Include the combos the interrupted run had already finished, so a
+            # resumed sweep reports (and is judged terminal on) the FULL count —
+            # otherwise a resume that only had 100 combos left would look like a
+            # 100/3600 job and _terminal_state could call it a failure.
+            agg["done"] = _resume_done + agg["done"]
             result_store.update_progress(job_id, done=agg["done"], total=total)
-            result_store.mark_complete(job_id)
+            _state, _err = _terminal_state(agg["done"], agg.get("failures", 0), agg.get("error"))
+            result_store.mark_complete(job_id, error=_err)
             logger.info(
-                "[OPTIM] COMPLETE job=%s | %d/%d combos done | %d failures | P=%d",
+                "[OPTIM] %s job=%s | %d/%d combos done | %d failures | P=%d",
+                _state.upper(),
                 job_id[:8],
                 agg["done"],
                 total,
@@ -2342,7 +2500,8 @@ def run_optimization(
                 parallelism,
             )
             return {
-                "status": "success",
+                "status": _state,
+                "error": _err,
                 "total": agg["done"],
                 "failures": agg["failures"],
                 "parquet_path": spill_path,
@@ -2568,7 +2727,8 @@ def run_optimization(
         result_store.heartbeat(job_id, phase="finalizing:done")
 
         result_store.update_progress(job_id, done=done)
-        result_store.mark_complete(job_id)
+        _state, _err = _terminal_state(done, failures)
+        result_store.mark_complete(job_id, error=_err)
         # Strip non-JSON-serializable objects (Polars DataFrame) before Celery
         # serializes the task result.
         _rc = {k: v for k, v in (market_meta.get("rust_context") or {}).items()
@@ -2576,7 +2736,8 @@ def run_optimization(
         _safe_meta = {**{k: v for k, v in market_meta.items() if k != "rust_context"},
                       "rust_context": _rc}
         return {
-            "status": "success",
+            "status": _state,
+            "error": _err,
             "total": done,
             "failures": failures,
             "parquet_path": spill_path,

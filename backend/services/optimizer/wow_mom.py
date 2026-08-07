@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+from functools import lru_cache
 import re
 from datetime import datetime
 from statistics import mode
@@ -392,9 +393,26 @@ STAT_FMT = [PCT_FMT, PCT_FMT, PCT_FMT, PCT_FMT, K_FMT, INT_FMT,
             RAT_FMT, RAT_FMT, K_FMT, K_FMT, K_FMT, RAT_FMT, PCT_FMT]
 
 
+# Style objects are IMMUTABLE and shareable in openpyxl, but building them is
+# expensive — and _Sheet.h/v built a fresh Font + PatternFill + Border for EVERY
+# cell. On a merged grid that is millions of allocations: profiling the WOW/MOM
+# pre-build showed 46.0s of 47.9s (96%) in cell writing versus 1.8s in save().
+# Caching by value hands out the same object for the same style, which is what
+# openpyxl serializes anyway, so the workbook is byte-for-byte unchanged.
+@lru_cache(maxsize=None)
 def _thin(color: str = _BORDER_CLR) -> Border:
     s = Side(style="thin", color=color)
     return Border(top=s, left=s, bottom=s, right=s)
+
+
+@lru_cache(maxsize=None)
+def _cached_font(bold: bool, size, color: str) -> Font:
+    return Font(bold=bold, size=size, color=color, name="Calibri")
+
+
+@lru_cache(maxsize=None)
+def _cached_fill(bg: str) -> PatternFill:
+    return PatternFill("solid", fgColor=bg)
 
 
 def _sign_fill(v):
@@ -417,8 +435,8 @@ class _Sheet:
 
     def h(self, r, c, val, *, size=9, tx=_HEADER_TX, bg=_HEADER_BG, align=None):
         cell = self.ws.cell(r, c, val)
-        cell.font = Font(bold=True, size=size, color=tx, name="Calibri")
-        cell.fill = PatternFill("solid", fgColor=bg)
+        cell.font = _cached_font(True, size, tx)
+        cell.fill = _cached_fill(bg)
         cell.alignment = align or _CENTER
         cell.border = _thin()
         return cell
@@ -426,13 +444,13 @@ class _Sheet:
     def v(self, r, c, val, fmt=None, *, size=9, tx=None, bg=None):
         cell = self.ws.cell(r, c)
         cell.value = "" if val is None else val
-        cell.font = Font(bold=False, size=size, color=(tx or _BLACK), name="Calibri")
+        cell.font = _cached_font(False, size, tx or _BLACK)
         if fmt and isinstance(val, (int, float)):
             cell.number_format = fmt
         cell.alignment = _CENTER
         cell.border = _thin()
         if bg:
-            cell.fill = PatternFill("solid", fgColor=bg)
+            cell.fill = _cached_fill(bg)
         return cell
 
 
@@ -498,7 +516,7 @@ def _write_wow_block(S, wm, title, base_row: int, base_col: int = 1) -> int:
         start_w = sw.get(mi + 1, 1)
         if 1 <= start_w <= nw:
             cell = S.ws.cell(w_month, cc + 1 + start_w, mn)
-            cell.font = Font(bold=True, size=8, color=_SUB_TX, name="Calibri")
+            cell.font = _cached_font(True, 8, _SUB_TX)
             cell.alignment = _CENTER
 
     r = w_data0
@@ -798,7 +816,7 @@ def _write_min_weekly_grid(S, wm, title: str, key: str,
         start_w = sw.get(mi + 1, 1)
         if 1 <= start_w <= nw:
             cell = S.ws.cell(r_month, cc + 1 + start_w, mn)
-            cell.font = Font(bold=True, size=8, color=_GRID_BAND_TX, name="Calibri")
+            cell.font = _cached_font(True, 8, _GRID_BAND_TX)
             cell.alignment = _CENTER
 
     S.h(r_hdr, cc + 1, "Year", size=8, tx=_GRID_HDR_TX, bg=_GRID_HDR_BG)
@@ -894,22 +912,25 @@ def _write_min_grids(S, wm, axis: str, after_row: int, base_col: int = 1) -> int
     return r
 
 
-MIN_PIVOTS_PER_LINE = 3   # captioned units across before wrapping to a new band
+def _write_min_pivot_sheet(wb: Workbook, placed: List[Tuple[Dict, int, int]],
+                           axis: str, sheet_name: str, n_cols: int) -> None:
+    """MIN pivots arranged on the SAME axes as the WOW/MOM Summary grid.
 
+    `placed` is [(item, band_row_index, col_index), ...] computed by the caller
+    with the summary's own slotting, so a pivot sits at the same grid position
+    as its block: adjustment across (No Adj -> Rise -> Fall -> Rise or Fall),
+    strike down. Laying these out by a blind "N per line" instead made the order
+    look random — a 4-adjustment sweep got split 3+1 across lines and the columns
+    no longer meant anything.
 
-def _write_min_pivot_sheet(wb: Workbook, items: List[Dict], axis: str,
-                           sheet_name: str) -> None:
-    """MIN pivots laid out 3-across then stacked, each captioned by combination.
-
-    Kept OFF the WOW/MOM Summary sheets on purpose: those are cross-combo
-    comparison grids and two extra tables under all 24+ blocks made them
-    unreadable. Here a "unit" is caption + Min-of-MAE + Min-of-Live-DD; units
-    flow left to right, wrap after MIN_PIVOTS_PER_LINE, and every band is a
-    fixed height so the columns stay aligned all the way down.
+    Kept OFF the Summary sheets on purpose: those are cross-combo comparison
+    grids and two extra tables under all 24+ blocks made them unreadable. Each
+    unit here is caption + Min-of-MAE + Min-of-Live-DD.
     """
     ws = wb.create_sheet(sheet_name)
     ws.freeze_panes = "B1"
     S = _Sheet(ws)
+    items = [p[0] for p in placed]
     nw = items[0]["wm"]["n_weeks"] if items else 53
     ny = len(items[0]["wm"]["wow_years" if axis == "wow" else "mom_years"]) if items else 0
 
@@ -919,10 +940,9 @@ def _write_min_pivot_sheet(wb: Workbook, items: List[Dict], axis: str,
     col_stride = span + 2                            # 2-column gutter, as the summary uses
     row_stride = unit_h + (MIN_GRID_GAP - 1)         # 3 blank rows under each band
 
-    for i, it in enumerate(items):
-        band, slot = divmod(i, MIN_PIVOTS_PER_LINE)
-        row = 1 + band * row_stride
-        col = 1 + slot * col_stride
+    for it, ri, ci in placed:
+        row = 1 + ri * row_stride
+        col = 1 + ci * col_stride
         # Combination caption — the whole point of the separate sheet.
         S.h(row, col, it["title"], size=11, tx=_HEADER_TX, bg=_HEADER_BG,
             align=Alignment(horizontal="left", vertical="center", indent=1))
@@ -933,7 +953,7 @@ def _write_min_pivot_sheet(wb: Workbook, items: List[Dict], axis: str,
         ws.row_dimensions[row].height = 18
         _write_min_grids(S, it["wm"], axis, row, col)
 
-    for slot in range(min(MIN_PIVOTS_PER_LINE, len(items))):
+    for slot in range(n_cols):
         base = 1 + slot * col_stride
         if axis == "wow":
             _set_wow_widths(ws, nw, base)
@@ -1395,42 +1415,74 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     Gw = 2                     # column gap between adjustment sections
     Hw = 5 + ny_w              # block height (4 header rows + years + total)
     Gr = 2                     # row gap between strike sections
-    ws_w = wb.create_sheet("WOW Summary")
-    ws_w.freeze_panes = "B1"
-    Sw = _Sheet(ws_w)
+    # Excel hard limit. A wide sweep lays blocks ACROSS, so past a certain column
+    # count the grid silently exceeds it and Excel refuses to open the file —
+    # after the entire sweep has already been paid for. Blocks past the limit
+    # continue on "<name> (2)", "(3)", ... instead: same slotting, column index
+    # re-based per page, so every page reads exactly like the first.
+    XL_MAX_COLS = 16384
+
+    def _paged(name, block_w, gap, set_widths):
+        per_sheet = max(1, XL_MAX_COLS // (block_w + gap))
+        sheets = {}
+
+        def sheet_for(ci):
+            page = ci // per_sheet
+            if page not in sheets:
+                ws = wb.create_sheet(name if page == 0 else f"{name} ({page + 1})")
+                ws.freeze_panes = "B1"
+                sheets[page] = _Sheet(ws), ws
+            return sheets[page][0]
+
+        def finish():
+            for page, (_s, ws) in sheets.items():
+                lo = page * per_sheet
+                for ci in range(lo, min(n_cols, lo + per_sheet)):
+                    set_widths(ws, 1 + (ci - lo) * (block_w + gap))
+            if len(sheets) > 1:
+                logger.warning(
+                    "[WOW_MOM] %s split across %d sheets: %d block columns exceed "
+                    "Excel's %d-column limit", name, len(sheets), n_cols, XL_MAX_COLS,
+                )
+        return per_sheet, sheet_for, finish
+
+    w_per_sheet, w_sheet_for, w_finish = _paged(
+        "WOW Summary", Wb, Gw, lambda ws, c: _set_wow_widths(ws, nw, c))
     for it in items:
         band, ci = _slot(it)
         ri = row_index[it["row_key"]] * n_bands + band
         base_row = 1 + ri * (Hw + Gr)
-        base_col = 1 + ci * (Wb + Gw)
+        base_col = 1 + (ci % w_per_sheet) * (Wb + Gw)
         # NOTE: no MIN grids here — they belong to the per-combo tradesheet only.
         # The merged summary is a cross-combo comparison grid; stacking two extra
         # tables under all 24+ blocks made it unreadable.
-        _write_wow_block(Sw, it["wm"], it["title"], base_row, base_col)
-    for ci in range(n_cols):
-        _set_wow_widths(ws_w, nw, 1 + ci * (Wb + Gw))
+        _write_wow_block(w_sheet_for(ci), it["wm"], it["title"], base_row, base_col)
+    w_finish()
 
     # ── MOM Summary grid ────────────────────────────────────────────────────
     Mb = 18                    # block width (Year + 12 months + Total+MaxDD+Live+RMDD, stats to col 18)
     Gm = 2                     # column gap between adjustment sections (matches Gw)
     Hm = 4 + ny_m
-    ws_m = wb.create_sheet("MOM Summary")
-    ws_m.freeze_panes = "B1"
-    Sm = _Sheet(ws_m)
+    m_per_sheet, m_sheet_for, m_finish = _paged(
+        "MOM Summary", Mb, Gm, lambda ws, c: _set_mom_widths(ws, c))
     for it in items:
         band, ci = _slot(it)
         ri = row_index[it["row_key"]] * n_bands + band
         base_row = 1 + ri * (Hm + Gr)
-        base_col = 1 + ci * (Mb + Gm)
-        _write_mom_block(Sm, it["wm"], it["title"], base_row, base_col)
-    for ci in range(n_cols):
-        _set_mom_widths(ws_m, 1 + ci * (Mb + Gm))
+        base_col = 1 + (ci % m_per_sheet) * (Mb + Gm)
+        _write_mom_block(m_sheet_for(ci), it["wm"], it["title"], base_row, base_col)
+    m_finish()
 
     # ── MIN pivots, one sheet per axis ──────────────────────────────────────
-    # Same tables the per-combo tradesheet carries, but every combination that
-    # ran gets its own captioned pair here, ordered exactly as the summary grid
-    # above reads (strike group, then left-to-right across the band).
-    ordered = sorted(items, key=lambda it: (row_index[it["row_key"]],) + _slot(it))
-    _write_min_pivot_sheet(wb, ordered, "wow", "WOW Min Pivots")
-    _write_min_pivot_sheet(wb, ordered, "mom", "MOM Min Pivots")
+    # Placed with the SAME slotting as the blocks above, so each pivot sits at
+    # its block's grid position: adjustment across, strike down. Reuse _slot /
+    # row_index rather than re-deriving an order — that's what kept the two
+    # sheets from agreeing.
+    placed = []
+    for it in items:
+        band, ci = _slot(it)
+        placed.append((it, row_index[it["row_key"]] * n_bands + band, ci))
+    placed.sort(key=lambda p: (p[1], p[2]))
+    _write_min_pivot_sheet(wb, placed, "wow", "WOW Min Pivots", n_cols)
+    _write_min_pivot_sheet(wb, placed, "mom", "MOM Min Pivots", n_cols)
     return True

@@ -62,6 +62,13 @@ function _strikeLabel(ss, optType) {
   if (type === 'REL_LEG') {
     return `Relative to Leg ${_num(ss.ref_leg ?? 1)}, offset ${_num(ss.offset ?? 0)} gap(s)`;
   }
+  if (type.startsWith('TIME_VALUE')) {
+    const op = type === 'TIME_VALUE_GTE' ? '>=' : type === 'TIME_VALUE_LTE' ? '<=' : 'nearest';
+    const side = String(ss.moneyness || 'ATM').toUpperCase();
+    const cap = Number(ss.tv_range_pct) || 0;
+    const unit = String(ss.tv_units || 'points') === 'percent' ? '%' : ' pts';
+    return `Time Value ${op}: ${_num(ss.time_value ?? ss.premium)}${unit} (${side}` + (cap ? `, within ${_num(cap)}%)` : ')');
+  }
   if (type === 'PREMIUM' || type === 'CLOSEST_PREMIUM') {
     if (ss.premium != null && ss.premium !== '') return `Closest Premium: ${_num(ss.premium)}`;
     if (ss.lower != null || ss.upper != null) return `Premium Range: ${_num(ss.lower)}–${_num(ss.upper)}`;

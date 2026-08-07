@@ -516,9 +516,33 @@ pub(crate) fn lookup_strikes_for_date(
     let sym_id = *cache.symbol_ids.get(&index.trim().to_uppercase())?;
     let expiry_days = date_str_to_days(&normalize_date_str(expiry))?;
     let type_id = opt_type_to_id(opt_type);
-    cache.strikes
-        .get(&(date_days, sym_id, expiry_days, type_id))
-        .cloned()
+    // ±1-DAY EXPIRY TOLERANCE — the same rule the PRICE lookups already carry
+    // (engines/generic_algotest_engine::_expiry_candidates, mirrored in
+    // optimizer/runner::_expiry_cands_str). NSE moves an expiry when the
+    // scheduled day is a holiday and the feather then splits that cycle across
+    // two labels: 29-Jun-2023 was a holiday so the weekly shifted to 28-Jun, and
+    // the feather holds ExpiryDate=2023-06-29 rows up to 27-Jun (what actually
+    // traded) plus ExpiryDate=2023-06-28 rows on 28-Jun only.
+    //
+    // Without this, an exact-match miss returned an empty chain, so every
+    // CHAIN-SCANNING strike mode (time_value*, closest_premium, premium_gte/lte,
+    // premium_range, atm_straddle_prem_pct) failed to resolve a strike and
+    // SILENTLY DROPPED the trade, while ATM/ITMn/OTMn survived because they only
+    // need a price. Measured: entry 21-Jun-2023 / expiry 28-Jun-2023 gave 0
+    // strikes where 2023-06-29 gave 111, leaving a 13-day hole mid-patch
+    // (14-Jun -> 27-Jun) in the tradesheet.
+    //
+    // The fallbacks fire ONLY on an exact-match miss, so every ordinary date is
+    // byte-identical to before.
+    if let Some(v) = cache.strikes.get(&(date_days, sym_id, expiry_days, type_id)) {
+        return Some(v.clone());
+    }
+    for alt in [expiry_days + 1, expiry_days - 1] {
+        if let Some(v) = cache.strikes.get(&(date_days, sym_id, alt, type_id)) {
+            return Some(v.clone());
+        }
+    }
+    None
 }
 
 pub(crate) fn lookup_spot_price(date: &str, index: &str) -> Option<f64> {

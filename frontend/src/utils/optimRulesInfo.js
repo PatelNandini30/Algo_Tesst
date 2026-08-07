@@ -162,10 +162,46 @@ export function buildRulesInfo(basePayload, filterName, selectedList = []) {
       } else {
         multLabel = `${Number(_ss.straddle_multiplier ?? 0.5)}`;
       }
+      // Translate the engine's raw +/- sign into ITM/OTM per option_type,
+      // same convention as combo_labeler.py, so the Rules block / ZIP
+      // folder name reads unambiguously instead of a bare "+"/"-":
+      //   CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
+      //   PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
+      const _isCall = String(leg.option_type || '').toUpperCase().startsWith('C');
+      const _toMoneyness = (sign) => {
+        const above = String(sign).trim() !== '-';
+        return above ? (_isCall ? 'OTM' : 'ITM') : (_isCall ? 'ITM' : 'OTM');
+      };
       const dirLabel = (dirSpec && dirSpec.kind === 'enum')
-        ? (dirSpec.values || []).join('/')
-        : String(_ss.straddle_direction || '+').trim();
-      parts.push(`Straddle ${dirLabel}${multLabel}x`);
+        ? [...new Set((dirSpec.values || []).map(_toMoneyness))].join('/')
+        : _toMoneyness(_ss.straddle_direction || '+');
+      parts.push(`Straddle ${multLabel}x ${dirLabel}`);
+      return parts.join(' ');
+    }
+    if (ssType.startsWith('time_value')) {
+      // Target (+unit), side and range cap — each shown as its swept range when
+      // the optimizer is sweeping it, otherwise as the fixed base value.
+      const tgtSpec = selectedList.find(s => s.path === `legs[${idx}].strike_selection.premium`);
+      const sideSpec = selectedList.find(s => s.path === `legs[${idx}].strike_selection.moneyness`);
+      const capSpec = selectedList.find(s => s.path === `legs[${idx}].strike_selection.tv_range_pct`);
+      const unitSpec = selectedList.find(s => s.path === `legs[${idx}].strike_selection.tv_units`);
+      const spread = (spec, fallback) => {
+        if (spec && spec.kind === 'range') {
+          const vals = _rangeValues(spec);
+          return vals && vals.length <= 8 ? vals.join('/') : `${spec.min}–${spec.max}`;
+        }
+        if (spec && spec.kind === 'enum') return (spec.values || []).join('/');
+        return fallback;
+      };
+      const op = ssType === 'time_value_gte' ? '>=' : ssType === 'time_value_lte' ? '<=' : '';
+      const unit = unitSpec
+        ? spread(unitSpec, '').split('/').map(u => (u === 'percent' ? '%' : 'pts')).join('/')
+        : (String(_ss.tv_units || 'points') === 'percent' ? '%' : 'pts');
+      const tgt = spread(tgtSpec, `${_ss.time_value ?? _ss.premium ?? 0}`);
+      const side = spread(sideSpec, String(_ss.moneyness || 'ATM').toUpperCase());
+      const cap = spread(capSpec, `${Number(_ss.tv_range_pct) || 0}`);
+      parts.push(`TV ${op}${op ? ' ' : ''}${tgt}${unit} ${side}`);
+      if (cap && cap !== '0') parts.push(`range ${cap}%`);
       return parts.join(' ');
     }
     if (ssType === 'atm_straddle_prem_pct') {

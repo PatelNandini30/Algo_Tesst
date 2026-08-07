@@ -494,11 +494,17 @@ pub fn write_layout_sheet_xlsx(sheet: &Bound<'_, PyDict>, path: String) -> PyRes
     Ok(())
 }
 
-// ── Combined workbook: all four sheets in one .xlsx, in build_combo_xlsx order ──
-// Trade Sheet (Rust from cleaned) · Summary · [Patch wise] · WOW & MOM Summary.
+// ── Combined workbook: every sheet in one .xlsx, in build_combo_xlsx order ──
+// [Rules] · Trade Sheet (Rust from cleaned) · Summary · [Patch wise] · WOW & MOM.
 // patch_ops / wow_ops are None when that sheet is absent (matching openpyxl).
+//
+// rules_ops is LAST in the signature and defaults to None purely so existing
+// callers keep working unchanged; when present it is pushed FIRST, because the
+// leg-wise Rules sheet is the workbook's first tab. Without this parameter a
+// tradesheet that wanted a Rules sheet had to fall back to openpyxl, which cost
+// ~2.4 s per combo — the whole reason sweeps ran slow.
 #[pyfunction]
-#[pyo3(signature = (trade_cleaned, trade_key_order, summary_ops, patch_ops, wow_ops, path))]
+#[pyo3(signature = (trade_cleaned, trade_key_order, summary_ops, patch_ops, wow_ops, path, rules_ops=None))]
 pub fn write_workbook_xlsx(
     trade_cleaned: &Bound<'_, PyList>,
     trade_key_order: Vec<String>,
@@ -506,8 +512,12 @@ pub fn write_workbook_xlsx(
     patch_ops: Option<Bound<'_, PyDict>>,
     wow_ops: Option<Bound<'_, PyDict>>,
     path: String,
+    rules_ops: Option<Bound<'_, PyDict>>,
 ) -> PyResult<()> {
     let mut wb = Workbook::new();
+    if let Some(r) = &rules_ops {
+        wb.push_worksheet(build_layout_sheet(r)?);
+    }
     wb.push_worksheet(build_trade_sheet(trade_cleaned, &trade_key_order)?);
     wb.push_worksheet(build_layout_sheet(summary_ops)?);
     if let Some(p) = &patch_ops {

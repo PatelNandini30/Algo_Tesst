@@ -1,4 +1,4 @@
-"""Full-workbook parity gate: build_combo_xlsx openpyxl vs Rust (OPTIMIZE_RUST_XLSX=1).
+"""Full-workbook parity gate: build_combo_xlsx openpyxl (XLSX_PARITY_PY=1) vs Rust.
 Compares the ENTIRE workbook — all sheets, sheet order + names — cell-by-cell.
 
     docker exec -w /app algotest-backend python -m tools.workbook_verify
@@ -24,17 +24,23 @@ def _one(name, payload, force_patch, synth_midcap):
         # exercise the midcap branch (3-phase patch + combined summary/wow)
         midcap_legs = [{"symbol": "NIFTYMIDCAP100", "mode": "hypothetical_future",
                         "lots": 1, "position": "SELL"}]
+    # A rules_sheet is passed on every case so the leg-wise "Rules" tab (first sheet,
+    # rendered in Rust via build_layout_sheet) stays inside the parity gate too.
+    rules_sheet = [["title", "Strategy Rules"], ["section", "Leg 1 (CE)"],
+                   ["kv", "Strike Gap", "100"], ["kv", "Slippage", "0.5%"], ["spacer"],
+                   ["section", "Leg 2 (FUT)"], ["kv", "Own Spot Adjustment", "2% (Yearly)"]]
     kw = dict(combo_label="combo-" + name, from_date=payload["from_date"],
               to_date=payload["to_date"], force_patch_wise=force_patch,
-              midcap_legs=midcap_legs)
+              midcap_legs=midcap_legs, rules_sheet=rules_sheet)
 
-    os.environ.pop("OPTIMIZE_RUST_XLSX", None)
-    py_bytes = build_combo_xlsx(df, res["summary"], **kw)
-    os.environ["OPTIMIZE_RUST_XLSX"] = "1"
+    # Rust is the only production path; XLSX_PARITY_PY=1 is what reaches the
+    # reference openpyxl builder, and exists purely for this gate.
+    os.environ["XLSX_PARITY_PY"] = "1"
     try:
-        rust_bytes = build_combo_xlsx(df, res["summary"], **kw)
+        py_bytes = build_combo_xlsx(df, res["summary"], **kw)
     finally:
-        os.environ.pop("OPTIMIZE_RUST_XLSX", None)
+        os.environ.pop("XLSX_PARITY_PY", None)
+    rust_bytes = build_combo_xlsx(df, res["summary"], **kw)
 
     diffs = celldiff(py_bytes, rust_bytes, max_report=40)
     import openpyxl, io

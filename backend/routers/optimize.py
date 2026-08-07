@@ -246,6 +246,84 @@ async def enqueue_optimization(request: Request):
     }
 
 
+@router.post("/optimize/jobs/{job_id}/resume")
+async def resume_optimize_job(job_id: str):
+    """Continue an interrupted sweep instead of recomputing it.
+
+    Re-enqueues the ORIGINAL spec under the SAME job_id, with `resume` set. The
+    runner then matches the expanded grid against the result rows already stored
+    and dispatches only the combos still missing — the per-combo CSV/XLSX/wm
+    files from the first run stay exactly where they are and are reused by the
+    ZIP fast path.
+
+    Reusing the job_id is what makes this cheap (no copying between trades dirs),
+    and it is safe because the stored spec is replayed verbatim: same payload,
+    same param_specs, same expansion order. A job whose combos are all present
+    is not re-run — it is simply finalized.
+    """
+    meta = result_store.get_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Unknown optimize job {job_id}")
+    if meta.get("status") == "running":
+        # A job killed mid-sweep (worker restart, cgroup OOM, crash) is left
+        # frozen at status=running — which is PRECISELY when resume is wanted.
+        # So refuse only if it is genuinely alive: still registered in the
+        # live-optim set, or still heartbeating. Registry entries self-expire
+        # (_ACTIVE_STALE_SEC) and the heartbeat stops the moment the process
+        # dies, so a dead job clears this check on its own.
+        alive = result_store.is_active_optim(job_id, meta.get("node_id"))
+        if not alive:
+            try:
+                alive = (time.time() - float(meta.get("last_progress_at") or 0)) < 120
+            except (TypeError, ValueError):
+                alive = False
+        if alive:
+            raise HTTPException(
+                status_code=409,
+                detail="Job is still running — cancel it first or wait")
+        logger.info("[OPTIM] resume: job %s is stale-running (no live worker) — allowing",
+                    job_id[:8])
+
+    base_payload = meta.get("base_payload") or {}
+    param_specs = meta.get("param_specs") or []
+    if not param_specs:
+        raise HTTPException(
+            status_code=400,
+            detail="Job has no stored param_specs — cannot resume; resubmit it instead",
+        )
+
+    done_rows = len(result_store.get_all_results_raw(job_id))
+    spec = {
+        "base_payload": base_payload,
+        "param_specs": param_specs,
+        "method": meta.get("method") or "exhaustive",
+        "sample_n": meta.get("sample_n"),
+        "objective": meta.get("objective") or "total_pnl",
+        "algorithm": meta.get("algorithm"),
+        "seed": meta.get("seed"),
+        "parallelism": meta.get("parallelism"),
+        "zip_naming": meta.get("zip_naming") or None,
+        "client_ip": meta.get("client_ip"),
+        "node_id": meta.get("node_id"),
+        "auto_download": bool(meta.get("auto_download")),
+        "resume": True,
+    }
+    node_id = meta.get("node_id")
+    queue_name = f"optimize@{node_id}" if node_id else "optimize"
+    # Same task id as the original job so job_id, trades dir and result list all
+    # continue to line up.
+    run_optimize_job.apply_async(args=[spec], queue=queue_name, task_id=job_id)
+    logger.info("[OPTIM] resume queued job %s (%d combos already done)",
+                job_id[:8], done_rows)
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "already_done": done_rows,
+        "total_combos": meta.get("total"),
+        "queue": queue_name,
+    }
+
+
 @router.get("/optimize/jobs")
 async def list_optimize_jobs(limit: int = Query(200, ge=1, le=500)):
     """List every known optimize job (any machine, any browser) with just
@@ -418,6 +496,11 @@ def _enrich_tradesheet_with_mae_mfe(csv_path: str, index_str: str) -> bool:
         logger.warning("[OPTIM_DL] CSV read failed for %s: %s", csv_path, exc)
         return False
     if trades_df.empty or "MAE" not in trades_df.columns or "MFE" not in trades_df.columns:
+        return False
+    # Multi-index combos ("Group Index" column) already have correct per-leg-
+    # symbol MAE/MFE from run_multi_index_feature — never run them through
+    # this blanket index_str recompute. See [[multi-index-fut-mae-mfe-scale-bug]].
+    if "Group Index" in trades_df.columns:
         return False
     # Skip if already enriched (any non-zero MAE/MFE means populated)
     mae_num = _pd.to_numeric(trades_df["MAE"], errors="coerce").fillna(0.0)
@@ -1328,7 +1411,14 @@ async def cancel_optimize_job(job_id: str, only_if_active: bool = Query(False)):
     # (the TTL would also reclaim it, but cancellation should free it at once).
     try:
         from services import memory_gate, node_registry
-        memory_gate.release(job_id, node_id=node_registry.get_job_node(job_id))
+        _node = node_registry.get_job_node(job_id)
+        memory_gate.release(job_id, node_id=_node)
+        # ...and drop it from the LIVE-OPTIM registry in the same breath. Releasing
+        # only the reservation left the cancelled job counted as a live claimant
+        # until the 5-minute stale sweep, so every RUNNING sweep kept dividing the
+        # box by a job that no longer existed and stayed pinned at a narrower fork
+        # width for minutes after the cancel (observed: P=1 with 4.1 GB free).
+        result_store.unregister_active_optim(job_id, _node)
     except Exception as exc:
         logger.debug("memory_gate release on cancel failed: %s", exc)
     result_store.delete_job(job_id)

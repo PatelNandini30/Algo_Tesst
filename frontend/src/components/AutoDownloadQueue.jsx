@@ -31,7 +31,7 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Loader2, XCircle, ChevronDown, ChevronUp, X } from 'lucide-react';
-import { buildSummaryWorkbookBlob, rulesFilename, fetchBlobWithPoll, triggerBlobDownload } from '../utils/optimSummaryExport';
+import { buildSummaryWorkbookBlob, rulesFilename, fetchBlobWithPoll, triggerBlobDownload, downloadWhenReady } from '../utils/optimSummaryExport';
 import { mergeWithStoredQueue, tryClaim, markStatus, getStatus, onStoreChange, loadDownloadLog, appendDownloadLog, clearDownloadLog, removeJobsFromQueue } from '../utils/optimQueueStore';
 import { resolveDownloadBase } from '../utils/downloadBase';
 
@@ -67,9 +67,10 @@ async function autoDownloadJob(job, patchwise, onLabel) {
   const zipUrl = patchwise
     ? `${base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
     : `${base}/api/optimize/jobs/${jobId}/tradesheets.zip`;
-  const { blob: zipBlob, filename: zipName } = await fetchBlobWithPoll(zipUrl);
+  // Native streaming download — the ZIP is ~300 MB and blowing it into a Blob
+  // exhausts tab memory (downloads silently did nothing).
+  const zipName = await downloadWhenReady(zipUrl);
   const zipFile = zipName || `optimize_${jobId.slice(0, 8)}_tradesheets${suffix}.zip`;
-  triggerBlobDownload(zipBlob, zipFile);
   files.push(zipFile);
   await new Promise((res) => setTimeout(res, DOWNLOAD_STAGGER_MS));
 

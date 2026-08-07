@@ -188,7 +188,7 @@ def _span_years(base_payload: dict) -> float:
         return 7.0
 
 
-def cost_for_job(kind: str, base_payload: dict = None) -> int:
+def cost_for_job(kind: str, base_payload: dict = None, p_override: int = 0) -> int:
     """#2 — DYNAMIC active-memory reservation (MB), scaled by the job's date
     span: base + per_year × years, clamped to [floor, flat-ceiling]. Never
     exceeds the old flat cost_for(kind), so this only ever RELAXES the gate for
@@ -207,11 +207,35 @@ def cost_for_job(kind: str, base_payload: dict = None) -> int:
     # while the span-only model reserved 3300 MB. The gate therefore admitted a
     # job it under-estimated by 3.3x and the cgroup SIGKILLed it.
     if kind == "optimize":
+        # `parallelism` is the UI's per-run override. It lives at the TOP level of
+        # the Celery spec, NOT inside base_payload — which is all this function is
+        # handed (worker/tasks.py). So this lookup was always None, p stayed 0, and
+        # the whole fork-width branch below was dead: every sweep got costed by date
+        # span alone and a P=6 multi-index run was under-reserved ~3x straight into
+        # the cgroup OOM killer. Fall back to OPTIMIZE_PARALLELISM, which is exactly
+        # what parallel.get_parallelism() uses when the payload doesn't override, so
+        # the reservation matches the fork width the job will actually spawn.
         p = 0
         try:
-            p = int((base_payload or {}).get("parallelism") or 0)
+            p = int(p_override or (base_payload or {}).get("parallelism")
+                    or os.environ.get("OPTIMIZE_PARALLELISM") or 0)
         except Exception:
             p = 0
+        # Price at the SPLIT width, not the solo ceiling. runner.py sizes the pool
+        # as solo_ceiling // live_optims, so a job starting while another runs gets
+        # 3 children, not 6 — costing it at 6 reserved memory it would never use and
+        # made the gate serialize two sweeps that genuinely fit side by side. `+1`
+        # counts THIS job: at acquire time it hasn't registered itself yet.
+        # p_override skips this — the pool passes the width it actually just forked.
+        # No +1: worker/tasks.py registers this job in the live set BEFORE calling
+        # the gate, so the count already includes it.
+        if p > 1 and not p_override:
+            try:
+                from services.optimizer import result_store as _rs
+                live = max(1, _rs.active_optim_count(None))
+                p = max(1, p // live)
+            except Exception:
+                pass                      # unreadable -> keep full width (conservative)
         if p > 1:
             est += (p - 1) * _PER_CHILD_MB
             # Deliberately NOT clamped to `ceiling`: that ceiling encodes the old
@@ -246,6 +270,68 @@ def _live_available_mb():
 
 def _hash_key(node_id: str) -> str:
     return _HASH_KEY_PREFIX + (node_id or _LOCAL_NODE)
+
+
+# ── Waiting-jobs registry ────────────────────────────────────────────────────
+# Reservations alone say what is RUNNING; they say nothing about who is BLOCKED.
+# Without that, a P=6 sweep holding most of the budget had no reason to narrow,
+# so a backtest queued behind it for the whole sweep. Jobs that have to wait
+# publish themselves here; the optimizer reads it each batch and gives width
+# back. Entries carry a short TTL and are refreshed while waiting, so a killed
+# waiter cannot pin the optimizer narrow forever.
+_WAIT_KEY_PREFIX = "algotest:mem_gate:waiting:"
+_WAIT_TTL = int(os.environ.get("HEAVY_GATE_WAITING_TTL_SECONDS", "60"))
+
+
+def _wait_key(node_id: str) -> str:
+    return _WAIT_KEY_PREFIX + (node_id or _LOCAL_NODE)
+
+
+def _mark_waiting(rid: str, kind: str, node_id: str) -> None:
+    try:
+        key = _wait_key(node_id)
+        _redis().hset(key, rid, f"{kind or 'unknown'}:{time.time() + _WAIT_TTL}")
+        _redis().expire(key, 86400)
+    except Exception:
+        pass          # never let bookkeeping block admission
+
+
+def _refresh_waiting(rid: str, kind: str, node_id: str) -> None:
+    _mark_waiting(rid, kind, node_id)
+
+
+def _clear_waiting(rid: str, kind: str, node_id: str) -> None:
+    try:
+        _redis().hdel(_wait_key(node_id), rid)
+    except Exception:
+        pass
+
+
+def waiting_count(kind: str = None, node_id: str = None) -> int:
+    """How many jobs are currently blocked on the budget (optionally of `kind`).
+
+    Expired entries are ignored rather than deleted — reads stay cheap and the
+    next writer overwrites them anyway. Any error returns 0, so a Redis hiccup
+    makes the optimizer behave exactly as it did before this existed.
+    """
+    try:
+        raw = _redis().hgetall(_wait_key(node_id or _LOCAL_NODE)) or {}
+    except Exception:
+        return 0
+    now = time.time()
+    n = 0
+    for _rid, val in raw.items():
+        try:
+            v = val.decode() if isinstance(val, bytes) else str(val)
+            k, _, exp = v.rpartition(":")
+            if float(exp) <= now:
+                continue
+            if kind and k != kind:
+                continue
+            n += 1
+        except Exception:
+            continue
+    return n
 
 
 def _budget_for_node(node_id: str) -> int:
@@ -319,6 +405,28 @@ def _force_reserve(rid: str, cost: int, node_id: str) -> None:
     _redis().expire(key, 86400)
 
 
+def resize(rid: str, cost: int, node_id: str = None) -> None:
+    """Shrink (or grow) an ALREADY-HELD reservation in place.
+
+    An optimize sweep re-splits its worker pool between batches as other optims
+    start/finish (parallel.run_parallel). When it drops 6 -> 3 children it is no
+    longer using what it reserved at P=6, and leaving that stale reservation
+    parked is what forces the next optim to queue behind a job that has already
+    made room for it. Re-reserving at the new width hands the difference back
+    immediately.
+
+    Deliberately unconditional (same as _force_reserve): the caller is already
+    admitted and only ever re-states what it is actually using, so this can
+    never let a NEW job in past the budget.
+    """
+    if not _ENABLED or not rid:
+        return
+    try:
+        _force_reserve(rid, int(cost), node_id or _LOCAL_NODE)
+    except Exception as exc:
+        logger.debug("[MEM_GATE] resize skipped for %s: %s", rid[:8], exc)
+
+
 def acquire(rid: str, cost: int, on_wait=None, node_id: str = None, kind: str = None) -> bool:
     """Block until `cost` MB fits the budget for `node_id` (default: local, this
     box), then reserve it.
@@ -337,43 +445,53 @@ def acquire(rid: str, cost: int, on_wait=None, node_id: str = None, kind: str = 
     node_id = node_id or _LOCAL_NODE
     deadline = time.time() + _WAIT_MAX
     waited = False
-    while True:
-        try:
-            if _try_acquire(rid, cost, node_id, kind):
-                if waited:
-                    logger.info("[MEM_GATE] %s acquired %d MB after waiting (node=%s)", rid, cost, node_id)
-                return True
-        except Exception as exc:
-            logger.warning("[MEM_GATE] acquire error (%s) — proceeding without gate", exc)
-            return True  # fail open
-        if time.time() >= deadline:
-            if _ON_TIMEOUT == "fail":
+    try:
+        while True:
+            try:
+                if _try_acquire(rid, cost, node_id, kind):
+                    if waited:
+                        logger.info("[MEM_GATE] %s acquired %d MB after waiting (node=%s)", rid, cost, node_id)
+                    return True
+            except Exception as exc:
+                logger.warning("[MEM_GATE] acquire error (%s) — proceeding without gate", exc)
+                return True  # fail open
+            if time.time() >= deadline:
+                if _ON_TIMEOUT == "fail":
+                    logger.warning(
+                        "[MEM_GATE] %s waited %ds for %d MB budget (node=%s) — rejecting (policy=fail)",
+                        rid, _WAIT_MAX, cost, node_id,
+                    )
+                    return False
                 logger.warning(
-                    "[MEM_GATE] %s waited %ds for %d MB budget (node=%s) — rejecting (policy=fail)",
+                    "[MEM_GATE] %s waited %ds for %d MB budget (node=%s) — proceeding anyway (swap backstop)",
                     rid, _WAIT_MAX, cost, node_id,
                 )
-                return False
-            logger.warning(
-                "[MEM_GATE] %s waited %ds for %d MB budget (node=%s) — proceeding anyway (swap backstop)",
-                rid, _WAIT_MAX, cost, node_id,
-            )
-            try:
-                _force_reserve(rid, cost, node_id)
-            except Exception:
-                pass
-            return True
-        if not waited:
-            logger.info(
-                "[MEM_GATE] %s waiting for %d MB (node=%s budget busy) — job queued",
-                rid, cost, node_id,
-            )
-            if on_wait is not None:
                 try:
-                    on_wait()
+                    _force_reserve(rid, cost, node_id)
                 except Exception:
                     pass
-            waited = True
-        time.sleep(_POLL)
+                return True
+            if not waited:
+                logger.info(
+                    "[MEM_GATE] %s waiting for %d MB (node=%s budget busy) — job queued",
+                    rid, cost, node_id,
+                )
+                if on_wait is not None:
+                    try:
+                        on_wait()
+                    except Exception:
+                        pass
+                waited = True
+                # Publish that this job is blocked, so a running optimizer can
+                # NARROW its fork width and hand budget back instead of making a
+                # backtest sit here for its whole sweep. Registered only once we
+                # actually have to wait — a job admitted immediately never shows up.
+                _mark_waiting(rid, kind, node_id)
+            _refresh_waiting(rid, kind, node_id)
+            time.sleep(_POLL)
+    finally:
+        if waited:
+            _clear_waiting(rid, kind, node_id)
 
 
 def release(rid: str, node_id: str = None) -> None:

@@ -1,5 +1,9 @@
 fastapi==0.104.1
-granian==1.6.0
+# 1.6.0 was pulled from PyPI (index now jumps 1.5.2 -> 1.6.4), so any rebuild
+# that re-resolves this layer fails with "No matching distribution". 1.6.4 is
+# the nearest surviving release in the same minor line — patch-level only, so
+# the ASGI/uvloop invocation in Dockerfile + docker-compose is unchanged.
+granian==1.6.4
 pandas==2.1.3
 polars==0.20.31
 pyarrow==15.0.0

@@ -89,10 +89,23 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
             mult = float(strike_selection.get("straddle_multiplier", 1))
         except (TypeError, ValueError):
             mult = 1.0
-        # Raw +/- sign, applied identically to every leg (no CE/PE meaning).
+        if mult == 0.0:
+            return "StraddleW0_ATM"
+        # The engine's +/- sign is a raw offset applied identically to every
+        # leg (no CE/PE meaning at the engine level) — but for the LABEL,
+        # translate it into ITM/OTM per option_type, same convention as
+        # pct_of_atm above, so two same-type legs (e.g. a Monthly PE + a
+        # Weekly PE) read unambiguously instead of a bare "+"/"-":
+        #   CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
+        #   PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
         direction = str(strike_selection.get("straddle_direction") or "+").strip()
-        sign = "-" if direction == "-" else "+"
-        return f"StraddleW{mult:g}_{sign}"
+        is_call = option_type.upper().startswith("C")
+        above_atm = direction != "-"
+        if above_atm:
+            moneyness = "OTM" if is_call else "ITM"
+        else:
+            moneyness = "ITM" if is_call else "OTM"
+        return f"StraddleW{mult:g}_{moneyness}"
     if kind == "rel_leg":
         # Relative-to-Leg (Iron Condor wing): 'REL_L1_2G' = Leg 1 + 2 gaps.
         # Matches the backtest export filename label (ResultsPanel.jsx).
@@ -102,6 +115,28 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
         except (TypeError, ValueError):
             ref, off = 1, 0.0
         return f"REL_L{ref}_{off:g}G"
+    if kind.startswith("time_value"):
+        # 'TV100' / 'TV100_GTE' / 'TV100_LTE'. Matches the backtest export
+        # filename label (ResultsPanel.jsx) so an optim combo folder and a
+        # standalone backtest of the same leg produce the same token.
+        tv = strike_selection.get("time_value")
+        if tv is None:
+            tv = strike_selection.get("premium")
+        try:
+            tv = float(tv or 0)
+        except (TypeError, ValueError):
+            tv = 0.0
+        suffix = {"time_value_gte": "_GTE", "time_value_lte": "_LTE"}.get(kind, "")
+        side = str(strike_selection.get("moneyness") or "ATM").upper()
+        try:
+            cap = abs(float(strike_selection.get("tv_range_pct") or 0))
+        except (TypeError, ValueError):
+            cap = 0.0
+        # Unit is ALWAYS spelled out so PTS vs PCT can never be confused,
+        # and the range cap uses its own RNG token so the two "PCT"s in a
+        # name are unambiguous: TV0.3PCT_ITM_RNG2PCT.
+        unit = "PCT" if str(strike_selection.get("tv_units") or "points") == "percent" else "PTS"
+        return f"TV{tv:g}{unit}{suffix}_{side}" + (f"_RNG{cap:g}PCT" if cap else "")
     return kind.upper()
 
 
@@ -187,21 +222,6 @@ def _find_leg(payload: Dict[str, Any], option_type: str) -> Optional[Dict[str, A
         if (leg.get("option_type") or "").upper() == target:
             return leg
     return None
-
-
-def _find_legs(payload: Dict[str, Any], option_type: str) -> List[Dict[str, Any]]:
-    """Return ALL legs with the given option_type (CE / PE), in payload order.
-
-    A spread whose two legs share an option type (e.g. PE Sell + PE Buy) has two
-    PE legs; labelling only the first (via _find_leg) silently drops the second,
-    so combos that differ only in the second leg's strike collapse to one label.
-    This returns every matching leg so the label can describe them all.
-    """
-    target = option_type.upper()
-    return [
-        leg for leg in (payload.get("legs") or [])
-        if isinstance(leg, dict) and (leg.get("option_type") or "").upper() == target
-    ]
 
 
 def _position_label(leg: Optional[Dict[str, Any]]) -> str:
@@ -392,8 +412,12 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     # differs when a strategy has multiple legs of the same option type (e.g. a
     # PE Sell + PE Buy spread), where both legs are now described so combos that
     # differ only in the second leg no longer collapse to an identical label.
-    ce_legs = _find_legs(payload, "CE")
-    pe_legs = _find_legs(payload, "PE")
+    # (index, leg) pairs — the 1-based index is the leg's position in the
+    # OVERALL strategy (matching the "Leg" column everywhere else), needed to
+    # tag same-type legs unambiguously below (L1/L2), not just filter by type.
+    _all_legs = list(enumerate(payload.get("legs") or [], start=1))
+    ce_legs = [(i, leg) for i, leg in _all_legs if isinstance(leg, dict) and (leg.get("option_type") or "").upper() == "CE"]
+    pe_legs = [(i, leg) for i, leg in _all_legs if isinstance(leg, dict) and (leg.get("option_type") or "").upper() == "PE"]
 
     def _leg_segment(leg: Dict[str, Any], otype: str):
         strike = _strike_label(leg.get("strike_selection"), otype)
@@ -411,16 +435,26 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     shift = _shift_label(payload)
 
     parts = []
-    call_strikes: List[str] = []
-    for _leg in ce_legs:
+    call_strikes: List[tuple] = []
+    for _i, _leg in ce_legs:
         _seg, _st = _leg_segment(_leg, "CE")
+        # Same L{n} disambiguation as the summary columns below, applied to the
+        # combo filename too — only when there's more than one CE (or PE) leg,
+        # so a single-CE/single-PE strategy's filename is byte-identical to
+        # before ("easy search": a Monthly PE + Weekly PE combo's ZIP/tradesheet
+        # filename now reads ..._L1_StraddleW2_OTM_Sell_..._L2_StraddleW0.5_OTM_Sell...
+        # instead of two look-alike "PE_StraddleW..._Sell" segments back to back).
+        if len(ce_legs) > 1:
+            _seg = f"L{_i}_{_seg}"
         parts.append(_seg)
-        call_strikes.append(_st)
-    put_strikes: List[str] = []
-    for _leg in pe_legs:
+        call_strikes.append((_i, _st))
+    put_strikes: List[tuple] = []
+    for _i, _leg in pe_legs:
         _seg, _st = _leg_segment(_leg, "PE")
+        if len(pe_legs) > 1:
+            _seg = f"L{_i}_{_seg}"
         parts.append(_seg)
-        put_strikes.append(_st)
+        put_strikes.append((_i, _st))
 
     # Futures legs (no strike) — appended after the option legs, e.g. 'FUT_Sell'.
     # Previously dropped from the combo label / per-combo filename entirely.
@@ -429,11 +463,20 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         if _fseg:
             parts.append(_fseg)
 
-    # Master-summary strike columns: single leg → unchanged; multiple same-type
-    # legs → joined with '+' so each distinct multi-leg combo gets a distinct
-    # label (previously only the first leg per type was recorded).
-    call_strike = "+".join(call_strikes) if call_strikes else _strike_label(None, "CE")
-    put_strike = "+".join(put_strikes) if put_strikes else _strike_label(None, "PE")
+    # Master-summary strike columns: single leg → unchanged (byte-identical to
+    # before). Multiple same-type legs → tagged with the leg's own number and
+    # joined with '/' (e.g. "L1_StraddleW2_OTM/L2_StraddleW0.5_OTM") so a
+    # Monthly PE + Weekly PE combo no longer collapses into an ambiguous
+    # "StraddleW2_-+StraddleW0.5_-" that doesn't say which leg is which.
+    def _join_strikes(pairs: List[tuple], otype: str) -> str:
+        if not pairs:
+            return _strike_label(None, otype)
+        if len(pairs) == 1:
+            return pairs[0][1]
+        return "/".join(f"L{i}_{st}" for i, st in pairs)
+
+    call_strike = _join_strikes(call_strikes, "CE")
+    put_strike = _join_strikes(put_strikes, "PE")
     # Midcap cross-index overlay leg(s) — appended after the option legs, like
     # the backtest filename (only present when a Midcap leg ran).
     midcap_seg = _midcap_label(payload)

@@ -2221,6 +2221,13 @@ const StrategyBuilder = () => {
             ? (_moneyness === 'OTM' ? '+' : '-')
             : (_moneyness === 'ITM' ? '+' : '-');
         }
+        if (String(l.strike_criteria || '').startsWith('time_value')) {
+          // OTM = intrinsic 0, ITM = intrinsic > 0, ATM = whole chain.
+          leg.strike_selection.moneyness = (l.tv_moneyness || 'ATM').toUpperCase();
+          // Range cap: |strike/entry_spot - 1| in %. Blank/0 = uncapped.
+          leg.strike_selection.tv_range_pct = Number(l.tv_range_pct) || 0;
+          leg.strike_selection.tv_units = l.tv_units || 'points';
+        }
         if (l.strike_criteria === 'atm_straddle_prem_pct') {
           leg.strike_selection.value = Number(l.atm_straddle_prem_pct) || 0;
         }
@@ -3914,6 +3921,9 @@ const StrategyBuilder = () => {
                       <option value="closest_premium">Closest Premium</option>
                       <option value="premium_gte">Premium &gt;=</option>
                       <option value="premium_lte">Premium &lt;=</option>
+                      <option value="time_value">Time Value (nearest)</option>
+                      <option value="time_value_gte">Time Value &gt;=</option>
+                      <option value="time_value_lte">Time Value &lt;=</option>
                       <option value="straddle_width">Straddle Width</option>
                       <option value="pct_of_atm">% of ATM</option>
                       <option value="synthetic_future">Synthetic Future</option>
@@ -3992,12 +4002,34 @@ const StrategyBuilder = () => {
                       </>
                     )}
 
-                    {(draftLeg.strike_criteria === 'closest_premium' || draftLeg.strike_criteria === 'premium_gte' || draftLeg.strike_criteria === 'premium_lte') && (
+                    {(['closest_premium','premium_gte','premium_lte','time_value','time_value_gte','time_value_lte'].includes(draftLeg.strike_criteria)) && (
                       <>
-                        <label className="field-label">Premium</label>
-                        <input type="number" min={0} placeholder="Premium" value={draftLeg.premium_value || ''}
-                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: +e.target.value }))}
+                        <label className="field-label">{String(draftLeg.strike_criteria || '').startsWith('time_value') ? 'Time Value' : 'Premium'}</label>
+                        <input type="number" min={0} placeholder={String(draftLeg.strike_criteria || '').startsWith('time_value') ? 'Time Value' : 'Premium'} value={draftLeg.premium_value ?? ''}
+                          onChange={e => setDraftLeg(prev => ({ ...prev, premium_value: e.target.value === '' ? null : +e.target.value }))}
                           className="w-24 h-8 px-2 border border-default rounded text-xs text-center" />
+                                      {String(draftLeg.strike_criteria || '').startsWith('time_value') && (
+                                        <>
+                                          <select value={draftLeg.tv_moneyness || 'ATM'}
+                                            onChange={e => setDraftLeg(prev => ({ ...prev, tv_moneyness: e.target.value }))}
+                                            className="h-8 px-2 border border-default rounded text-xs bg-surface">
+                                            <option value="ATM">ATM (both sides)</option>
+                                            <option value="OTM">OTM only</option>
+                                            <option value="ITM">ITM only</option>
+                                          </select>
+                                          <label className="field-label">Range %</label>
+                                          <input type="number" min={0} step="0.5" placeholder="all"
+                                            value={draftLeg.tv_range_pct ?? ''}
+                                            onChange={e => setDraftLeg(prev => ({ ...prev, tv_range_pct: e.target.value === '' ? null : +e.target.value }))}
+                                            className="w-20 h-8 px-1 border border-default rounded text-xs text-center" />
+                                            <select value={draftLeg.tv_units || 'points'}
+                                              onChange={e => setDraftLeg(prev => ({ ...prev, tv_units: e.target.value }))}
+                                              className="h-8 px-1 border border-default rounded text-xs bg-surface">
+                                              <option value="points">pts</option>
+                                              <option value="percent">%</option>
+                                            </select>
+                                        </>
+                                      )}
                       </>
                     )}
 
@@ -4280,6 +4312,9 @@ const StrategyBuilder = () => {
                                   <option value="closest_premium">Closest Premium</option>
                                   <option value="premium_gte">Premium &gt;=</option>
                                   <option value="premium_lte">Premium &lt;=</option>
+                                  <option value="time_value">Time Value (nearest)</option>
+                                  <option value="time_value_gte">Time Value &gt;=</option>
+                                  <option value="time_value_lte">Time Value &lt;=</option>
                                   <option value="straddle_width">Straddle Width</option>
                                   <option value="pct_of_atm">% of ATM</option>
                                   <option value="synthetic_future">Synthetic Future</option>
@@ -4351,12 +4386,34 @@ const StrategyBuilder = () => {
                                     </div>
                                   )}
 
-                                  {(leg.strike_criteria === 'closest_premium' || leg.strike_criteria === 'premium_gte' || leg.strike_criteria === 'premium_lte') && (
+                                  {(['closest_premium','premium_gte','premium_lte','time_value','time_value_gte','time_value_lte'].includes(leg.strike_criteria)) && (
                                     <>
-                                      <label className="field-label">Premium</label>
-                                      <input type="number" min={0} placeholder="Premium" value={leg.premium_value || ''}
-                                        onChange={e => updateLeg(leg.id, 'premium_value', +e.target.value)}
+                                      <label className="field-label">{String(leg.strike_criteria || '').startsWith('time_value') ? 'Time Value' : 'Premium'}</label>
+                                      <input type="number" min={0} placeholder={String(leg.strike_criteria || '').startsWith('time_value') ? 'Time Value' : 'Premium'} value={leg.premium_value ?? ''}
+                                        onChange={e => updateLeg(leg.id, 'premium_value', e.target.value === '' ? null : +e.target.value)}
                                         className="w-20 h-7 px-1 border border-default rounded text-xs text-center" />
+                                      {String(leg.strike_criteria || '').startsWith('time_value') && (
+                                        <>
+                                          <select value={leg.tv_moneyness || 'ATM'}
+                                            onChange={e => updateLeg(leg.id, 'tv_moneyness', e.target.value)}
+                                            className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                            <option value="ATM">ATM (both sides)</option>
+                                            <option value="OTM">OTM only</option>
+                                            <option value="ITM">ITM only</option>
+                                          </select>
+                                          <label className="field-label">Range %</label>
+                                          <input type="number" min={0} step="0.5" placeholder="all"
+                                            value={leg.tv_range_pct ?? ''}
+                                            onChange={e => updateLeg(leg.id, 'tv_range_pct', e.target.value === '' ? null : +e.target.value)}
+                                            className="w-16 h-7 px-1 border border-default rounded text-xs text-center" />
+                                            <select value={leg.tv_units || 'points'}
+                                              onChange={e => updateLeg(leg.id, 'tv_units', e.target.value)}
+                                              className="h-7 px-1 border border-default rounded text-xs bg-surface">
+                                              <option value="points">pts</option>
+                                              <option value="percent">%</option>
+                                            </select>
+                                        </>
+                                      )}
                                     </>
                                   )}
 

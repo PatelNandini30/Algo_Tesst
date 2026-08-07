@@ -277,51 +277,76 @@ class TestMergedSummaryHasNoGrids(unittest.TestCase):
                      if isinstance(c.value, str) and c.value.startswith("Min of")]
             self.assertEqual(len(grids), 2 * len(self.ADJS), f"{name} grid count")
 
-    def _merged_n(self, n):
+    ADJ_ORDER = ("No Adj", "Rise 1%", "Fall 1%", "Rise or Fall 1%")
+
+    def _merged_grid(self, strikes=("PE ATM", "PE 1% OTM"), adjs=None):
         from openpyxl import Workbook as WB
         from services.optimizer.wow_mom import write_merged_wow_mom
+        adjs = adjs or self.ADJ_ORDER
         combos = [{
-            "title": f"PE ATM | V{i}", "cleaned": CLEANED, "has_midcap": False,
-            "adj_key": f"V{i}", "adj_label": f"V{i}", "row_key": "PE ATM||",
-        } for i in range(n)]
+            "title": f"{s} | {a}", "cleaned": CLEANED, "has_midcap": False,
+            "adj_key": a, "adj_label": a, "row_key": f"{s}||",
+        } for s in strikes for a in adjs]
         wb = WB()
         wb.remove(wb.active)
         if write_merged_wow_mom(wb, combos) is not True:
             raise AssertionError("write_merged_wow_mom returned falsy")
         return wb
 
-    def test_units_tile_three_across_then_wrap(self):
-        """7 combos -> rows of 3, 3, 1; columns reused, no two units overlap."""
-        wb = self._merged_n(7)
+    @staticmethod
+    def _positions(ws, pred):
+        """{title: (band_rank, col_rank)} — position by ORDER, not raw coords,
+        so the two sheets can be compared despite different strides."""
+        hits = [(c.row, c.column, c.value) for row in ws.iter_rows() for c in row
+                if isinstance(c.value, str) and pred(c.value)]
+        rows = sorted({r for r, _, _ in hits})
+        cols = sorted({c for _, c, _ in hits})
+        return {v: (rows.index(r), cols.index(c)) for r, c, v in hits}
+
+    def test_pivot_position_matches_its_summary_block(self):
+        """A pivot sits at the same grid slot as the block it belongs to."""
+        wb = self._merged_grid()
+        for summary, pivot in (("WOW Summary", "WOW Min Pivots"),
+                               ("MOM Summary", "MOM Min Pivots")):
+            blocks = self._positions(wb[summary], lambda v: " | " in v)
+            pivots = self._positions(wb[pivot], lambda v: " | " in v)
+            self.assertEqual(blocks, pivots,
+                             f"{pivot} placement diverges from {summary}")
+
+    def test_adjustments_run_across_in_canonical_order(self):
+        """Columns read No Adj -> Rise -> Fall -> Rise or Fall, not random."""
+        wb = self._merged_grid()
         for name in ("WOW Min Pivots", "MOM Min Pivots"):
-            ws = wb[name]
-            caps = sorted((c.row, c.column) for row in ws.iter_rows() for c in row
-                          if isinstance(c.value, str) and c.value.startswith("PE ATM | V"))
-            self.assertEqual(len(caps), 7, name)
-            by_row = {}
-            for r, c in caps:
-                by_row.setdefault(r, []).append(c)
-            widths = [len(v) for _, v in sorted(by_row.items())]
-            self.assertEqual(widths, [3, 3, 1], f"{name} should tile 3 per line")
-            # every band starts at the same three column positions
-            bands = [sorted(v) for _, v in sorted(by_row.items())]
-            self.assertEqual(bands[0][:len(bands[1])], bands[1])
-            self.assertEqual(len(set(caps)), len(caps), "units overlap")
+            pos = self._positions(wb[name], lambda v: v.startswith("PE ATM | "))
+            by_col = sorted(pos.items(), key=lambda kv: kv[1][1])
+            self.assertEqual([t.split(" | ", 1)[1] for t, _ in by_col],
+                             list(self.ADJ_ORDER), name)
+
+    def test_strikes_stack_downward(self):
+        """Each strike gets its own band; same adjustment keeps its column."""
+        wb = self._merged_grid()
+        for name in ("WOW Min Pivots", "MOM Min Pivots"):
+            pos = self._positions(wb[name], lambda v: " | " in v)
+            atm = {t.split(" | ")[1]: p for t, p in pos.items() if t.startswith("PE ATM |")}
+            otm = {t.split(" | ")[1]: p for t, p in pos.items() if t.startswith("PE 1% OTM |")}
+            self.assertEqual(len(atm), 4)
+            self.assertEqual({p[0] for p in atm.values()}, {0}, f"{name} band 0")
+            self.assertEqual({p[0] for p in otm.values()}, {1}, f"{name} band 1")
+            for adj in self.ADJ_ORDER:
+                self.assertEqual(atm[adj][1], otm[adj][1],
+                                 f"{name}: {adj} changes column between strikes")
 
     def test_bands_do_not_collide_vertically(self):
-        """The second band must start below the first band's last grid row."""
-        wb = self._merged_n(4)
+        wb = self._merged_grid()
         for name in ("WOW Min Pivots", "MOM Min Pivots"):
             ws = wb[name]
             caps = sorted((c.row, c.column) for row in ws.iter_rows() for c in row
-                          if isinstance(c.value, str) and c.value.startswith("PE ATM | V"))
-            first_band = min(r for r, _ in caps)
-            second_band = max(r for r, _ in caps)
-            self.assertGreater(second_band, first_band, name)
-            # last "Grand Total" of band 1 sits above band 2's caption
+                          if isinstance(c.value, str) and " | " in c.value)
+            self.assertEqual(len(set(caps)), len(caps), f"{name}: units overlap")
+            second = max(r for r, _ in caps)
             gts = [c.row for row in ws.iter_rows() for c in row
-                   if c.value == "Grand Total" and c.row < second_band]
-            self.assertTrue(gts and max(gts) < second_band,
+                   if c.value == "Grand Total" and c.row < second]
+            self.assertTrue(gts and max(gts) < second,
                             f"{name}: band 2 overlaps band 1")
 
     def test_pivot_sheets_use_the_right_axis(self):
