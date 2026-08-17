@@ -26,6 +26,7 @@ __all__ = [
     "split_windows",
     "resolve_leg_window",
     "apply_leg_filters",
+    "apply_leg_filters_split",
     "LEG_FILTER_END",
 ]
 
@@ -316,3 +317,160 @@ def apply_leg_filters(
     # A trade every one of whose legs was masked out has already vanished: the
     # loop above simply never appended any of its rows.
     return kept
+
+
+def apply_leg_filters_split(
+    specs: List[Dict[str, Any]],
+    legs: Sequence[Dict[str, Any]],
+    trading_days: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Mid-cycle split variant of apply_leg_filters (Option C).
+
+    Behaviour when NO leg carries a filter: returns `specs` unchanged (same
+    list object) — byte-identical to before. This is the single most important
+    property.
+
+    When at least one leg carries a filter:
+
+    1. Group specs by trade_id (preserving arrival order).
+    2. For each trade, collect interior cut-points from every filtered leg's
+       range boundaries that fall strictly inside the trade's (entry, exit)
+       window, via split_windows.
+    3. No interior cuts → apply the original drop/truncate logic (same as
+       apply_leg_filters).
+    4. Interior cuts → split the trade's [entry, exit] window into sub-windows
+       at those boundaries. Each sub-window becomes its own trade block:
+         - Unfiltered legs: duplicated across every sub-window with the same
+           strike/expiry/contract. Adjacent rows with identical (strike, expiry)
+           are automatically treated as carries by _apply_carry_slippage_guard
+           — no extra marking needed.  P&L is only partitioned; the boundary
+           mark cancels and the total is unchanged.
+         - Filtered legs (Task 2): still dropped/truncated exactly as today for
+           each sub-window independently. Task 3 will add the mid-cycle fresh
+           entry for filtered legs at range-start boundaries.
+    5. Renumber trade_id sequentially (1-based) across the whole output list.
+
+    See docs/superpowers/specs/2026-08-01-per-leg-filter-split-design.md.
+    """
+    masked_legs: Dict[int, Dict[str, Any]] = {}
+    for i, leg in enumerate(legs or []):
+        if leg_segments(leg):
+            masked_legs[i + 1] = leg
+    if not masked_legs:
+        return specs  # ← same list object; no-filter path is byte-identical
+
+    # Group by trade_id, preserving insertion order.
+    from collections import defaultdict as _dd
+    trade_groups: Dict[int, List[Dict[str, Any]]] = _dd(list)
+    for s in specs:
+        try:
+            tid = int(s.get("trade_id") or 0)
+        except (TypeError, ValueError):
+            tid = 0
+        trade_groups[tid].append(s)
+
+    out: List[Dict[str, Any]] = []
+    new_tid = 1  # sequential counter for renumbered trade_ids
+
+    for tid, group in trade_groups.items():
+        # Trade window: entry is the min entry_date in the group; exit is
+        # the max exit_date (legs can have different exit_dates when one is
+        # already truncated — use the unfiltered legs' exit where possible).
+        entry = min(str(s.get("entry_date") or "") for s in group)
+        exit_ = max(str(s.get("exit_date") or "") for s in group)
+
+        # Collect interior cut-points from every filtered leg in this trade.
+        interior_cuts: set = set()
+        for leg_id, leg in masked_legs.items():
+            ranges = leg_segments(leg)
+            if not ranges:
+                continue
+            # split_windows returns windows with boundaries; extract the
+            # interior cuts (the seg_start values that are > entry).
+            for w in split_windows(entry, exit_, ranges, trading_days):
+                if entry < w["seg_start"] < exit_:
+                    interior_cuts.add(w["seg_start"])
+
+        if not interior_cuts:
+            # No split needed: apply the original drop/truncate logic.
+            for s in group:
+                try:
+                    leg_id = int(s.get("leg_id") or 1)
+                except (TypeError, ValueError):
+                    leg_id = -1
+                leg = masked_legs.get(leg_id)
+                if leg is None:
+                    row = dict(s)
+                    row["trade_id"] = new_tid
+                    out.append(row)
+                    continue
+                taken, leg_exit, truncated = resolve_leg_window(
+                    leg,
+                    str(s.get("entry_date") or ""),
+                    str(s.get("exit_date") or ""),
+                    trading_days,
+                )
+                if not taken:
+                    continue
+                row = dict(s)
+                row["trade_id"] = new_tid
+                if truncated:
+                    row["exit_date"] = leg_exit
+                    row["_leg_filter_end"] = True
+                out.append(row)
+            # Advance trade counter only if at least one leg survived.
+            if out and out[-1].get("trade_id") == new_tid:
+                new_tid += 1
+        else:
+            # Split: build sub-windows and emit one trade block per sub-window.
+            cuts = sorted(interior_cuts)
+            windows = [entry] + cuts + [exit_]
+            # Build sub-windows as (seg_start, seg_end) pairs.
+            sub_windows = [(windows[i], windows[i + 1]) for i in range(len(windows) - 1)]
+
+            for seg_start, seg_end in sub_windows:
+                seg_had_any = False
+                for s in group:
+                    try:
+                        leg_id = int(s.get("leg_id") or 1)
+                    except (TypeError, ValueError):
+                        leg_id = -1
+                    leg = masked_legs.get(leg_id)
+                    if leg is None:
+                        # Unfiltered leg: carried across the sub-window with
+                        # the same strike/expiry — _apply_carry_slippage_guard
+                        # detects the carry automatically via identical keys.
+                        row = dict(s)
+                        row["trade_id"] = new_tid
+                        row["entry_date"] = seg_start
+                        row["exit_date"] = seg_end
+                        # Preserve _seg_clamped only on the LAST sub-window
+                        # (the boundary that was clamped to a segment/filter end
+                        # is the final exit, not the mid-cycle splits).
+                        if seg_end != exit_ and row.get("_seg_clamped"):
+                            row["_seg_clamped"] = False
+                        out.append(row)
+                        seg_had_any = True
+                    else:
+                        # Filtered leg (Task 2): apply drop/truncate on the
+                        # sub-window. Task 3 will add mid-cycle fresh entries.
+                        taken, leg_exit, truncated = resolve_leg_window(
+                            leg,
+                            seg_start,
+                            seg_end,
+                            trading_days,
+                        )
+                        if not taken:
+                            continue
+                        row = dict(s)
+                        row["trade_id"] = new_tid
+                        row["entry_date"] = seg_start
+                        row["exit_date"] = leg_exit if truncated else seg_end
+                        if truncated:
+                            row["_leg_filter_end"] = True
+                        out.append(row)
+                        seg_had_any = True
+                if seg_had_any:
+                    new_tid += 1
+
+    return out

@@ -644,12 +644,35 @@ _PER_LEG_INDEPENDENT: bool = True
 _WEEKLY_CADENCE_TYPES: frozenset = frozenset({"WEEKLY", "NEXT_WEEKLY", "WEEKLY_T1"})
 
 
+def _weekly_roll_cadence(payload: Dict[str, Any]) -> bool:
+    """True when the trade re-books on a WEEKLY cadence, so a MONTHLY leg is coarser
+    than the roll and must be pinned to its own contract.
+
+    Two cases produce a weekly re-book:
+      * expiry_type is itself weekly (the original mixed-expiry case), or
+      * expiry_type is YEARLY but rolls WEEKLY within the December contract
+        (rollover_cadence=weekly). The December contract re-books every week, so a
+        MONTHLY leg is coarser than the roll here EXACTLY as under a weekly cadence
+        — before this, such a monthly leg silently fell back to weekly contracts.
+
+    Every caller ALSO requires the leg's own expiry to be MONTHLY, so this can only
+    change a payload that already has a monthly leg; weekly and yearly-without-a-
+    monthly-leg runs are untouched.
+    """
+    et = str(payload.get("expiry_type") or "").upper()
+    if et in _WEEKLY_CADENCE_TYPES:
+        return True
+    if et == "YEARLY":
+        return str(payload.get("rollover_cadence") or "").lower().startswith("week")
+    return False
+
+
 def _has_monthly_pinned_leg(payload: Dict[str, Any]) -> bool:
     """True when a leg is pinned to a contract COARSER than the run cadence
     (a MONTHLY leg under a WEEKLY cadence). Such a leg holds one contract across
     several cadence re-books, so its strike epoch and its spot-adj re-anchor must
     both follow the CONTRACT, not the weekly trade."""
-    if str(payload.get("expiry_type") or "").upper() not in _WEEKLY_CADENCE_TYPES:
+    if not _weekly_roll_cadence(payload):
         return False
     return any(
         isinstance(_l, dict)
@@ -994,6 +1017,147 @@ def resolve_expiry_inputs(
             f"(December contracts: {december[:3]}…, T-{n_months} months)"
         )
     return (cadence_expiries, cycles)
+
+
+def _inject_per_leg_rollover_inputs(payload: Dict[str, Any], trading_days: List[str]) -> None:
+    """PER-LEG ROLLOVER (opt-in): stamp each leg with its OWN cadence expiry list
+    (`_rollover_expiries`), its own exit T-n (`exit_dte`), and — for a YEARLY leg
+    — its pinned December cycles (`_rollover_cycles`), so simulate.rs
+    `resolve_per_leg_core` can build the union schedule.
+
+    No-op unless `payload['per_leg_rollover']` is truthy, so every existing run is
+    byte-identical. Mutates `payload['legs']` in place (the same list object every
+    downstream builder / native call reads), matching the straddle-width pattern.
+    """
+    if not payload.get("per_leg_rollover"):
+        return
+    index = str(payload.get("index") or "NIFTY").upper()
+    from_date = str(payload.get("from_date") or payload.get("date_from") or "")
+    to_date = str(payload.get("to_date") or payload.get("date_to") or "")
+    legs = payload.get("legs") or []
+    if not (from_date and to_date and isinstance(legs, list) and legs):
+        raise ValueError("per_leg_rollover requires from_date/to_date and a non-empty legs list")
+
+    # v1 is the No-Adjustment variant. Spot-adjustment as a boundary source that
+    # merges into the per-leg union is Phase 4 — fail LOUD here rather than run
+    # the spot-adj post-processor over union rows it was not designed for and
+    # emit a plausible-but-wrong tradesheet.
+    if payload.get("spot_adjustment_enabled") and (_maybe_float(payload.get("spot_adjustment_pct")) or 0) > 0:
+        raise ValueError(
+            "per_leg_rollover does not yet support spot-adjustment (No-Adjustment variant only). "
+            "Turn off spot-adjustment, or wait for the Adjustment phase."
+        )
+
+    import datetime as _dt
+    # Widen the to_date so each leg's LAST roll window has an expiry to exit into
+    # (mirrors _fetch_one_extra_expiry's look-ahead, per leg).
+    try:
+        wide_to = (_dt.date.fromisoformat(to_date) + _dt.timedelta(days=45)).isoformat()
+    except ValueError:
+        wide_to = to_date
+
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        etype = str(leg.get("expiry") or "weekly").upper()
+        # Each leg's expiry calendar is its OWN index's (multi-index baskets put
+        # different indices on different legs); fall back to the strategy index.
+        leg_index = str(leg.get("index") or index).upper()
+        # Per-leg exit T-n: leg-level value is authoritative; fall back to global.
+        # simulate.rs reads leg['exit_dte'] (with the same global fallback).
+        if leg.get("exit_dte") is None:
+            leg["exit_dte"] = int(payload.get("exit_dte") or 0)
+
+        if etype == "YEARLY":
+            # Reuse the existing cycle resolver on a per-leg mini-payload. A yearly
+            # leg rolls only at each cycle's T-n exit, so feed those exit dates as
+            # the leg's "expiries" with exit_dte=0 (the exit lands exactly there),
+            # and pass the cycles so the contract pins to the right December.
+            leg_payload = dict(payload)
+            leg_payload["index"] = leg_index
+            leg_payload["expiry_type"] = "YEARLY"
+            leg_payload["rollover_cadence"] = (
+                leg.get("rollover_cadence") or payload.get("rollover_cadence") or "weekly"
+            )
+            leg_payload["yearly_exit_months_before"] = leg.get(
+                "yearly_exit_months_before", payload.get("yearly_exit_months_before", 0)
+            )
+            leg_payload["yearly_roll_months"] = (
+                leg.get("yearly_roll_months") or payload.get("yearly_roll_months") or ["12"]
+            )
+            _cadence, cycles = resolve_expiry_inputs(leg_index, leg_payload, from_date, to_date, trading_days)
+            cycles = cycles or []
+            leg["_rollover_expiries"] = [str(c["end"]) for c in cycles]
+            leg["_rollover_cycles"] = [dict(c) for c in cycles]
+            leg["exit_dte"] = 0
+        else:
+            freq = etype.lower()
+            if freq not in ("weekly", "monthly"):
+                freq = "weekly"
+            leg["_rollover_expiries"] = _expiry_date_list(leg_index, freq, from_date, wide_to)
+            leg["_rollover_cycles"] = None
+
+
+def _annotate_per_leg_rollover_exit_reason(
+    rows: List[Dict[str, Any]], legs: Optional[List[Dict[str, Any]]]
+) -> None:
+    """PER-LEG ROLLOVER (display-only): append WHICH leg(s) actually rolled at
+    each trade's scheduled exit, so the Exit Reason reads e.g.
+    'SCHEDULED_EXIT (Leg 2 PE Monthly roll)' on a monthly-roll boundary vs
+    '... (Leg 1 CE Weekly roll)' on a weekly one.
+
+    A leg rolled at a trade's exit iff its contract (expiry) differs from that
+    same leg's NEXT trade — detected purely from the emitted rows, so it needs no
+    schedule recomputation. In-place; changes ONLY exit_reason.
+    """
+    if not rows:
+        return
+    cadence: Dict[int, str] = {}
+    for i, l in enumerate(legs or []):
+        if isinstance(l, dict):
+            cadence[i + 1] = str(l.get("expiry") or "").title()
+    from collections import defaultdict
+    by_leg: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_leg[int(r.get("leg_id") or 0)].append(r)
+    rolled: Dict[int, List[str]] = defaultdict(list)  # trade_id -> [leg labels]
+    for lid, lrows in by_leg.items():
+        lrows.sort(key=lambda r: (_normalize_iso(r.get("entry_date", "")), int(r.get("trade_id") or 0)))
+        for a, b in zip(lrows, lrows[1:]):
+            if str(a.get("expiry")) != str(b.get("expiry")):
+                tid = int(a.get("trade_id") or 0)
+                typ = str(a.get("option_type") or "").upper()
+                rolled[tid].append(f"Leg {lid} {typ} {cadence.get(lid, '')}".strip())
+    for r in rows:
+        labels = rolled.get(int(r.get("trade_id") or 0))
+        if labels:
+            base = str(r.get("exit_reason") or "").strip() or "SCHEDULED_EXIT"
+            r["exit_reason"] = f"{base} ({' + '.join(sorted(set(labels)))} roll)"
+
+
+def _apply_per_leg_qty(payload: Dict[str, Any]) -> None:
+    """PER-LEG QUANTITY (opt-in, additive): when a leg carries an explicit `qty`,
+    make it that leg's P&L multiplier by setting leg['lots'] = qty.
+
+    The engine scales P&L — and MAE/MFE — by `lots`, NEVER by lot_size (lot_size
+    is display/turnover only), so overriding `lots` makes the ENTIRE tradesheet
+    (leg P&L, Net P&L, MAE/MFE, % P&L, Cumulative/DD/NAV) scale linearly by qty,
+    with no change to strikes/rolls/exits. The Qty DISPLAY column is corrected
+    separately (it must read the raw qty, not qty × lot_size). `_qty_override` is
+    the marker the tradesheet builder keys on. No-op when no leg sets qty ⇒ every
+    existing run stays byte-identical.
+    """
+    for leg in (payload.get("legs") or []):
+        if not isinstance(leg, dict):
+            continue
+        raw = leg.get("qty")
+        try:
+            qv = int(raw) if raw not in (None, "", 0, "0") else 0
+        except (TypeError, ValueError):
+            qv = 0
+        if qv > 0:
+            leg["lots"] = qv
+            leg["_qty_override"] = qv
 
 
 def _futures_get_exit_date(anchor: str, exit_mode: str, n_days: int, sorted_td: List[str]) -> str:
@@ -2445,7 +2609,7 @@ def _build_fixed_entry_specs(
     # MONTHLY leg IS the cadence leg and must keep resolving to target_expiry
     # exactly as before, so this stays None and the pin branch never runs.
     _cadence_weekly = (
-        str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+        _weekly_roll_cadence(payload)
     )
     _has_monthly_pin_leg = _cadence_weekly and any(
         isinstance(_l, dict)
@@ -3523,7 +3687,7 @@ def _apply_fixed_rollover_strike(
     # ran 16,641 -> 17,944 (a 1,344-pt ITM short call). A Fresh pinned leg must
     # re-strike at EVERY cadence re-book, i.e. be left alone here.
     pinned_ids: Set[int] = set()
-    if str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES:
+    if _weekly_roll_cadence(payload):
         pinned_ids = {
             idx + 1
             for idx, leg in enumerate(legs_src)
@@ -4029,6 +4193,15 @@ def priced_to_tradesheet_records(
     # trade price against different option chains, so each straddle_width leg
     # gets its own row filled, not just one "anchor" leg.
     _sw_leg_ids: set = set()
+    # PER-LEG QUANTITY: leg_ids that carry an explicit qty override, so the Qty
+    # column shows the raw qty (not qty × lot_size). Empty ⇒ unchanged behavior.
+    _qty_override_by_leg: Dict[int, int] = {}
+    for _qi, _ql in enumerate((payload.get("legs") or []), start=1):
+        if isinstance(_ql, dict) and _ql.get("_qty_override"):
+            try:
+                _qty_override_by_leg[_qi] = int(_ql["_qty_override"])
+            except (TypeError, ValueError):
+                pass
     if _uses_sw:
         try:
             import algotest_native as _sw_native  # type: ignore
@@ -4110,7 +4283,12 @@ def priced_to_tradesheet_records(
         fut_pnl = per_leg_pnl if is_fut else 0
         pct_pnl = round(net_pnl / entry_spot * 100.0, 4) if entry_spot else 0.0
         _row_lots_int = int(row.get("lots") or 1)
-        qty = _row_lots_int * int(row.get("lot_size") or lot_size or 1)
+        # PER-LEG QUANTITY override → show the raw qty; else lots × lot_size.
+        _ql_id = int(row.get("leg_id") or 1)
+        if _ql_id in _qty_override_by_leg:
+            qty = _qty_override_by_leg[_ql_id]
+        else:
+            qty = _row_lots_int * int(row.get("lot_size") or lot_size or 1)
         # FUTURES: Strike = '' (matches Python engine convention); options: float.
         strike_val = "" if is_fut else float(row.get("strike") or 0.0)
         # Strike Shift Reason — populated whenever the engine moved the
@@ -4272,6 +4450,10 @@ _KNOWN_STRIKE_SEL_TYPES: frozenset = frozenset({
     "closest_premium", "premium_gte", "premium_lte", "premium_range",
     "time_value", "time_value_gte", "time_value_lte",
     "straddle_width", "atm_straddle_prem_pct",
+    # Resolved by a Python spec post-pass, never by either per-leg resolver —
+    # the leg reaches them swapped to an ATM placeholder. Listed so the
+    # hard-fail below doesn't reject it as unknown.
+    "rel_leg_premium",
 })
 
 
@@ -4461,6 +4643,483 @@ def _apply_buffer_strike_to_specs(
         new_spec["requested_strike"] = float(snapped)
         result.append(new_spec)
     return result
+
+
+# ── Relative to Leg Premium strike mode ─────────────────────────────────────
+# A leg's premium TARGET is derived from another (earlier) leg's actual entry
+# fill, rescaled for the fact that the two legs live for different lengths of
+# time, then handed to the SAME chain scan every other premium mode uses:
+#
+#   target = ref_premium x (lots_ref x lot_size_ref)
+#                        / (N x lots_child x lot_size_child)
+#
+#   N = how many CHILD-cycle expiries fall in (entry_date, ref_expiry], counted
+#       from the real (holiday-shifted) expiry calendar — never hardcoded.
+#
+# Direction is symmetric: whichever leg is longer-dated is the numerator basis,
+# so a weekly ref under a monthly child MULTIPLIES by N instead of dividing.
+#
+# Implemented as a spec POST-PASS (the `_apply_buffer_strike_to_specs` pattern)
+# rather than inside `_compute_strike_for_leg_python`, because only the spec
+# rows carry the ref leg's resolved strike AND its own expiry/option_type —
+# the per-leg resolver sees neither. That also keeps this mode entirely in
+# Python: `resolve_trade_specs` never has to learn it, so no Rust wheel change.
+_RELPREM_TYPE = "rel_leg_premium"
+# Same contract multipliers the tradesheet uses for Qty. Only consulted when the
+# two legs sit on different indices, where lot_size does NOT cancel out.
+_RELPREM_LOT_SIZES: Dict[str, int] = {
+    "NIFTY": 65, "BANKNIFTY": 35, "FINNIFTY": 65, "MIDCPNIFTY": 140,
+    "SENSEX": 20, "BANKEX": 30,
+}
+
+
+def _relprem_cadence_days(leg_expiry: Any) -> float:
+    """Days per cycle for the SHORTER leg's cadence — the unit the divisor counts.
+
+    The divisor is "how many of the shorter leg's cycles fit in the longer leg's
+    life": weekly -> ÷7 (52/yr), monthly -> ÷30.44 (12/yr), yearly -> ÷365.25.
+    Hardcoding ÷7 made a MONTHLY child divide by weeks (~52) instead of months
+    (~12), so its target came out ~4.3x too small.
+    """
+    e = str(leg_expiry or "").upper()
+    if e.startswith("YEAR"):
+        return 365.25
+    if e.startswith("MONTH"):
+        return 365.25 / 12.0  # 30.4375
+    return 7.0  # weekly / next-weekly / default
+
+
+def _relprem_legs(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """{1-based leg_id: strike_selection} for every leg using this mode.
+
+    Empty dict (the overwhelmingly common case) means every helper below is a
+    no-op and the pipeline behaves exactly as it did before this mode existed.
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    for i, leg in enumerate(payload.get("legs") or [], start=1):
+        if not isinstance(leg, dict):
+            continue
+        sel = leg.get("strike_selection") or {}
+        if isinstance(sel, dict) and str(sel.get("type") or "").lower().strip() == _RELPREM_TYPE:
+            out[i] = sel
+    return out
+
+
+def _validate_relprem(payload: Dict[str, Any], relprem: Dict[int, Dict[str, Any]]) -> None:
+    """Reject configurations this mode cannot resolve, loudly and at setup.
+
+    Silently dropping the leg (what an unknown strike mode does today) is the
+    worst outcome: the run still produces a tradesheet, just missing a leg.
+    """
+    legs = payload.get("legs") or []
+    base_index = str(payload.get("index") or "NIFTY").upper()
+    for child_id, sel in relprem.items():
+        try:
+            ref_id = int(sel.get("ref_leg") or 0)
+        except (TypeError, ValueError):
+            ref_id = 0
+        if ref_id < 1 or ref_id > len(legs):
+            raise ValueError(
+                f"Leg {child_id}: 'Relative to Leg Premium' references leg {ref_id or '(unset)'}, "
+                f"which does not exist."
+            )
+        if ref_id >= child_id:
+            # Mirrors rel_leg: the parent must already be resolved. Also makes
+            # cycles structurally impossible — no cycle detection needed.
+            raise ValueError(
+                f"Leg {child_id}: 'Relative to Leg Premium' must reference an EARLIER leg "
+                f"(got leg {ref_id}). Reorder the legs."
+            )
+        ref_leg = legs[ref_id - 1] if isinstance(legs[ref_id - 1], dict) else {}
+        if str(ref_leg.get("segment", "OPTIONS")).upper() in ("FUTURES", "FUTURE"):
+            raise ValueError(
+                f"Leg {child_id}: cannot reference leg {ref_id} — a futures leg has no premium."
+            )
+        child_leg = legs[child_id - 1] if isinstance(legs[child_id - 1], dict) else {}
+        ref_index = str(ref_leg.get("index") or base_index).upper()
+        child_index = str(child_leg.get("index") or base_index).upper()
+        if ref_index != child_index:
+            # v1 scope. The formula already carries lot_size so enabling this
+            # later is a validation change, not a maths change.
+            raise ValueError(
+                f"Leg {child_id}: 'Relative to Leg Premium' across indices "
+                f"({ref_index} -> {child_index}) is not supported."
+            )
+        # Re-entry and spot-adjustment both RE-RESOLVE a leg mid-trade by calling
+        # _compute_strike_for_leg_python on the payload leg — which by then holds
+        # the ATM placeholder, not this mode. They would therefore re-enter at ATM
+        # with no warning. Block loudly instead of emitting a wrong strike; the
+        # fix is to teach those two sites the derived target, not to guess here.
+        if isinstance(child_leg.get("reEntryOnSL"), dict) or isinstance(
+            child_leg.get("reEntryOnTarget"), dict
+        ):
+            raise ValueError(
+                f"Leg {child_id}: 'Relative to Leg Premium' cannot be combined with "
+                f"re-entry on SL/Target yet — the re-entry would resolve to ATM."
+            )
+        if payload.get("spot_adjustment_enabled"):
+            raise ValueError(
+                "'Relative to Leg Premium' cannot be combined with spot adjustment yet — "
+                "the re-entry after a spot breach would resolve to ATM."
+            )
+
+
+def _payload_with_relprem_placeholder(
+    payload: Dict[str, Any], relprem: Dict[int, Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Swap each rel_leg_premium leg to a plain ATM selection for spec building.
+
+    Every spec builder (Rust `resolve_trade_specs` and the three Python ones)
+    then resolves a perfectly ordinary leg; the post-pass overwrites the strike
+    afterwards. This is what lets the mode ship without teaching simulate.rs
+    anything. The ATM placeholder is never observable — the post-pass rewrites
+    both `strike` and `requested_strike` on every affected spec row.
+    """
+    legs = list(payload.get("legs") or [])
+    for child_id in relprem:
+        leg = dict(legs[child_id - 1])
+        leg["strike_selection"] = {"type": "strike_type", "strike_type": "ATM"}
+        legs[child_id - 1] = leg
+    out = dict(payload)
+    out["legs"] = legs
+    return out
+
+
+def _apply_rel_leg_premium_to_specs(
+    specs: List[Dict[str, Any]],
+    payload: Dict[str, Any],
+    relprem: Dict[int, Dict[str, Any]],
+    lot_size: int,
+) -> List[Dict[str, Any]]:
+    """Rewrite each rel_leg_premium leg's strike from its ref leg's actual fill.
+
+    Runs once, after every spec builder has converged, so all four entry modes
+    (DTE, fixed, min_days, next-weekly) are covered by this single call.
+    """
+    import algotest_native  # type: ignore  # function-local, as everywhere else here
+    from datetime import date as _date
+
+    legs = payload.get("legs") or []
+    base_index = str(payload.get("index") or "NIFTY").upper()
+
+    # Group by trade so a child can find its ref within the SAME cycle.
+    by_trade: Dict[Any, Dict[int, Dict[str, Any]]] = {}
+    for s in specs:
+        by_trade.setdefault(s.get("trade_id"), {})[int(s.get("leg_id") or 0)] = s
+
+    out: List[Dict[str, Any]] = []
+    for s in specs:
+        child_id = int(s.get("leg_id") or 0)
+        sel = relprem.get(child_id)
+        if sel is None:
+            out.append(s)
+            continue
+
+        ref_id = int(sel.get("ref_leg") or 0)
+        ref_spec = by_trade.get(s.get("trade_id"), {}).get(ref_id)
+        if ref_spec is None:
+            # Ref leg never resolved for this cycle -> drop just this leg, the
+            # same thing rel_leg does on a missing parent.
+            continue
+
+        child_leg = legs[child_id - 1] if 0 <= child_id - 1 < len(legs) else {}
+        ref_leg = legs[ref_id - 1] if 0 <= ref_id - 1 < len(legs) else {}
+        index_up = str(child_leg.get("index") or base_index).upper()
+
+        entry_iso = _normalize_iso(str(s.get("entry_date") or ""))
+        ref_expiry = _normalize_iso(str(ref_spec.get("expiry") or ""))
+        child_expiry = _normalize_iso(str(s.get("expiry") or ""))
+        if not (entry_iso and ref_expiry and child_expiry):
+            continue
+
+        # 1. Reference premium — the ref leg's ACTUAL fill, read with
+        #    get_option_price (the SAME close every leg fills at), NOT the
+        #    tradeable-only variant. The reference here is routinely a long-dated
+        #    deep-OTM leg (e.g. a yearly OTM2 PE) with zero turnover on many days;
+        #    the tradeable variant returns None on those days, which silently
+        #    aborted the whole leg and left it at the ATM placeholder (measured:
+        #    67/151 trades). The ref leg still FILLS at that close, so it is the
+        #    real premium to divide, not a fabricated one. (The tradeable filter
+        #    stays on the CHILD strike scan below, so we never SELL a dead strike.)
+        # Reference premium at the ref leg's strike ON THIS SPEC. In the initial
+        # pass ref_spec.strike is the pre-cascade strike (fine — the final result
+        # comes from the post-cascade re-size in _apply_relprem_from_adjusted,
+        # which reads the ref leg's ACTUAL spot-adjusted/rolled strike). Kept here
+        # so the initial child strike is sensible for the cascade's date pass.
+        ref_strike = float(ref_spec.get("strike") or 0.0)
+        ref_type = str(ref_spec.get("option_type") or "").upper()
+        ref_prem = None
+        try:
+            ref_prem = algotest_native.get_option_price(
+                entry_iso, index_up, ref_strike, ref_type, ref_expiry,
+            )
+        except Exception:
+            ref_prem = None
+        if ref_prem is None or float(ref_prem) <= 0:
+            continue
+
+        # 2. Cycle divisor — (longer_exp - entry) counted in the SHORTER leg's
+        #    cadence: how many of its cycles fit in the longer leg's remaining
+        #    life. Weekly child ÷7, monthly child ÷30.44, yearly ÷365.25 — NOT a
+        #    hardcoded ÷7 (that made a monthly child divide by weeks). Ref longer
+        #    than child (the normal case) divides; a shorter ref multiplies.
+        if ref_expiry >= child_expiry:
+            longer_exp = ref_expiry
+            _cyc = _relprem_cadence_days(child_leg.get("expiry"))
+        else:
+            longer_exp = child_expiry
+            _cyc = _relprem_cadence_days(ref_leg.get("expiry"))
+        try:
+            n = (_date.fromisoformat(longer_exp)
+                 - _date.fromisoformat(entry_iso)).days / _cyc
+        except ValueError:
+            continue
+        if n <= 0:
+            continue
+        time_scale = (1.0 / n) if ref_expiry >= child_expiry else n
+
+        # 3. Quantity — lots x contract multiplier on both sides, so the child's
+        #    N cycles collect the same money the ref leg collects once. lot_size
+        #    cancels within one index; it is carried anyway so the formula stays
+        #    correct if cross-index is ever unblocked.
+        ref_ls = _RELPREM_LOT_SIZES.get(
+            str(ref_leg.get("index") or base_index).upper(), int(lot_size) or 1)
+        child_ls = _RELPREM_LOT_SIZES.get(index_up, int(lot_size) or 1)
+        try:
+            qty_scale = (
+                (float(ref_leg.get("lots") or 1) * ref_ls)
+                / (float(child_leg.get("lots") or 1) * child_ls)
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            qty_scale = 1.0
+
+        target = float(ref_prem) * time_scale * qty_scale
+        logger.info(
+            "[RELPREM_DBG] tid=%s leg=%s entry=%s ref_strike=%s ref_exp=%s "
+            "child_exp=%s ref_prem=%.2f n=%.2f time_scale=%.5f qty=%.4f target=%.3f",
+            s.get("trade_id"), child_id, entry_iso, ref_strike,
+            ref_expiry, child_expiry, float(ref_prem), float(n), time_scale,
+            qty_scale, target,
+        )
+
+        # 4. Same chain scan every other premium mode uses. Unlike
+        #    closest_premium this mode DOES apply the strike-gap grid and
+        #    tradeable-only filters (the ones time_value has) — it is new, so
+        #    there are no existing tradesheets for the stricter chain to move.
+        opt_type = str(s.get("option_type") or "").upper()
+        is_ce = opt_type in ("CE", "CALL", "C")
+        try:
+            interval = float(child_leg.get("strike_interval") or 0) or float(
+                _BUFFER_STRIKE_INTERVALS.get(index_up, 50))
+        except (TypeError, ValueError):
+            interval = float(_BUFFER_STRIKE_INTERVALS.get(index_up, 50))
+        # The placeholder resolved this leg to ATM, so the strike sitting on the
+        # spec right now IS the ATM strike — no separate spot lookup needed for
+        # the scan's |strike-atm| tie-break.
+        atm = round(float(s.get("strike") or 0.0) / interval) * interval
+        picked = _relprem_pick_strike(
+            entry_iso, index_up, is_ce, child_expiry, interval, target, atm)
+        if picked is None:
+            continue
+
+        new_spec = dict(s)
+        new_spec["strike"] = float(picked)
+        # Derived, not a forced liquidity shift — keep the Strike Shift Reason
+        # column silent by syncing requested_strike, exactly as buffer does.
+        new_spec["requested_strike"] = float(picked)
+        new_spec["rel_leg_premium_target"] = round(target, 4)
+        new_spec["rel_leg_premium_n"] = round(float(n), 2)
+        out.append(new_spec)
+
+    return out
+
+
+def _relprem_pick_strike(
+    entry_iso: str, index_up: str, is_ce: bool, child_expiry: str,
+    interval: float, target: float, atm: float,
+) -> Optional[float]:
+    """Nearest-premium tradeable grid strike to `target`. Shared by the initial
+    post-pass AND the spot-adjustment re-entry (engine_rust.py ~9060) so a leg
+    that spot-adjusts mid-cycle re-picks by the same premium rule instead of
+    falling back to ATM. Returns None when the chain has no qualifying strike.
+
+    Rank by |premium-target|, then |strike-atm|, then CE-prefers-higher; walk
+    that order and stop at the first tradeable strike (a stable sort makes this
+    identical to filtering-then-min but at ~1-3 native lookups, not one/strike).
+    """
+    import algotest_native  # type: ignore
+    chain = _strikes_for_date_tolerant(
+        algotest_native, entry_iso, index_up, child_expiry, "CE" if is_ce else "PE")
+    cands = [
+        (k, p) for (k, p) in chain
+        if abs(k / interval - round(k / interval)) < 1e-9
+    ]
+    if not cands:
+        return None
+    cands.sort(key=lambda it: (
+        abs(it[1] - target), abs(it[0] - atm), -it[0] if is_ce else it[0]))
+    item = next(
+        (it for it in cands
+         if _relprem_tradeable(entry_iso, index_up, it[0], is_ce, child_expiry)),
+        None,
+    )
+    return float(item[0]) if item else None
+
+
+def _relprem_tradeable(
+    entry_iso: str, index_up: str, strike: float, is_ce: bool, expiry: str
+) -> bool:
+    """True when the contract actually traded — an untraded strike carries a
+    stale NSE close that fabricates a premium (measured on MIDCPNIFTY: a
+    0-contract PE quoting 1223.85 against a real ~330)."""
+    try:
+        import algotest_native  # type: ignore
+        return algotest_native.get_option_price_tradeable(
+            entry_iso, index_up, float(strike), "CE" if is_ce else "PE", expiry) is not None
+    except Exception:
+        return False
+
+
+def _apply_relprem_from_adjusted(
+    adjusted_specs: List[Dict[str, Any]],
+    payload: Dict[str, Any],
+    relprem: Dict[int, Dict[str, Any]],
+    lot_size: int,
+) -> List[Dict[str, Any]]:
+    """Re-size every RELPREM child from the reference leg's ACTUAL strike.
+
+    Runs on the FINAL post-cascade spec list, where the reference leg's strike
+    already reflects spot-adjustment, patch-reset AND rollover (it carries between
+    those events, exactly like the no-adjustment case). The initial post-pass
+    (`_apply_rel_leg_premium_to_specs`) can only see the pre-cascade strike, so for
+    a spot-adjusting reference it divides a stale premium; this pass corrects it.
+
+    The reference strike is looked up by DATE (latest ref-leg spec whose entry is
+    on/before the child's entry), so a child re-entry synthesised by the cascade —
+    which has no matching ref spec under its own trade_id — still finds the ref
+    strike that was live at its entry. Nothing is dropped: a child that can't be
+    resolved is left exactly as the cascade produced it.
+    """
+    import algotest_native  # type: ignore
+    from datetime import date as _rp_date
+
+    legs = payload.get("legs") or []
+    base_index = str(payload.get("index") or "NIFTY").upper()
+    ref_ids = {int(sel.get("ref_leg") or 0) for sel in relprem.values()}
+
+    # Per ref leg: time-sorted (entry_iso, strike, expiry, option_type).
+    ref_tl: Dict[int, List[Tuple[str, float, str, str]]] = {}
+    for s in adjusted_specs:
+        lid = int(s.get("leg_id") or 0)
+        if lid in ref_ids:
+            ref_tl.setdefault(lid, []).append((
+                _normalize_iso(s.get("entry_date") or ""),
+                float(s.get("strike") or 0.0),
+                _normalize_iso(s.get("expiry") or ""),
+                str(s.get("option_type") or "").upper(),
+            ))
+    for lid in ref_tl:
+        ref_tl[lid].sort()
+
+    def _ref_at(ref_id: int, entry_iso: str) -> Optional[Tuple[str, float, str, str]]:
+        best = None
+        for e in ref_tl.get(ref_id, ()):  # ascending by entry
+            if e[0] and e[0] <= entry_iso:
+                best = e
+            elif e[0] > entry_iso:
+                break
+        return best
+
+    out: List[Dict[str, Any]] = []
+    for s in adjusted_specs:
+        cid = int(s.get("leg_id") or 0)
+        sel = relprem.get(cid)
+        if sel is None:
+            out.append(s)
+            continue
+        entry_iso = _normalize_iso(s.get("entry_date") or "")
+        refinfo = _ref_at(int(sel.get("ref_leg") or 0), entry_iso)
+        child_expiry = _normalize_iso(s.get("expiry") or "")
+        if not refinfo or not (entry_iso and child_expiry):
+            out.append(s)
+            continue
+        _, ref_strike, ref_expiry, ref_type = refinfo
+        if not (ref_strike and ref_expiry):
+            out.append(s)
+            continue
+
+        child_leg = legs[cid - 1] if 0 <= cid - 1 < len(legs) else {}
+        ref_leg = legs[int(sel.get("ref_leg") or 0) - 1] if 0 <= int(sel.get("ref_leg") or 0) - 1 < len(legs) else {}
+        index_up = str(child_leg.get("index") or base_index).upper()
+
+        try:
+            ref_prem = algotest_native.get_option_price(
+                entry_iso, index_up, float(ref_strike), ref_type, ref_expiry)
+        except Exception:
+            ref_prem = None
+        if not ref_prem or float(ref_prem) <= 0:
+            out.append(s)
+            continue
+
+        # Divisor in the SHORTER leg's cadence (weekly ÷7, monthly ÷30.44,
+        # yearly ÷365.25) — same rule as the initial pass, see
+        # _relprem_cadence_days.
+        if ref_expiry >= child_expiry:
+            longer_exp = ref_expiry
+            _cyc = _relprem_cadence_days(child_leg.get("expiry"))
+        else:
+            longer_exp = child_expiry
+            _cyc = _relprem_cadence_days(ref_leg.get("expiry"))
+        try:
+            weeks = (_rp_date.fromisoformat(longer_exp)
+                     - _rp_date.fromisoformat(entry_iso)).days / _cyc
+        except ValueError:
+            out.append(s)
+            continue
+        if weeks <= 0:
+            out.append(s)
+            continue
+        time_scale = (1.0 / weeks) if ref_expiry >= child_expiry else weeks
+
+        ref_ls = _RELPREM_LOT_SIZES.get(
+            str(ref_leg.get("index") or base_index).upper(), int(lot_size) or 1)
+        child_ls = _RELPREM_LOT_SIZES.get(index_up, int(lot_size) or 1)
+        try:
+            qty_scale = ((float(ref_leg.get("lots") or 1) * ref_ls)
+                         / (float(child_leg.get("lots") or 1) * child_ls))
+        except (TypeError, ValueError, ZeroDivisionError):
+            qty_scale = 1.0
+        target = float(ref_prem) * time_scale * qty_scale
+
+        try:
+            interval = float(child_leg.get("strike_interval") or 0) or float(
+                _BUFFER_STRIKE_INTERVALS.get(index_up, 50))
+        except (TypeError, ValueError):
+            interval = float(_BUFFER_STRIKE_INTERVALS.get(index_up, 50))
+        is_ce = str(s.get("option_type") or "").upper() in ("CE", "CALL", "C")
+        try:
+            spot = algotest_native.get_spot_price(entry_iso, index_up) or float(s.get("strike") or 0.0)
+        except Exception:
+            spot = float(s.get("strike") or 0.0)
+        atm = round(float(spot) / interval) * interval
+        picked = _relprem_pick_strike(
+            entry_iso, index_up, is_ce, child_expiry, interval, target, atm)
+        logger.info(
+            "[RELPREM_ADJ] tid=%s leg=%s entry=%s ref_strike=%s ref_prem=%.2f "
+            "weeks=%.2f target=%.3f picked=%s",
+            s.get("trade_id"), cid, entry_iso, ref_strike, float(ref_prem),
+            weeks, target, picked,
+        )
+        if picked is None:
+            out.append(s)
+            continue
+        ns = dict(s)
+        ns["strike"] = float(picked)
+        ns["requested_strike"] = float(picked)
+        ns["rel_leg_premium_target"] = round(target, 4)
+        out.append(ns)
+
+    return out
 
 
 def _build_mixed_futures_next_weekly(
@@ -4864,6 +5523,17 @@ def run_rust_engine_pipeline(
     # logs said why. Fail loudly and name the leg instead.
     _assert_known_strike_modes(payload)
 
+    # ── Relative to Leg Premium: swap to an ATM placeholder for spec building ──
+    # `_relprem` is empty for every payload that does not use the mode, which
+    # makes both this swap and the post-pass below strictly inert. When it IS
+    # used, each affected leg is resolved as plain ATM by whichever spec builder
+    # runs, and `_apply_rel_leg_premium_to_specs` overwrites the strike once all
+    # four builders have converged (see Slice 6b below).
+    _relprem = _relprem_legs(payload)
+    if _relprem:
+        _validate_relprem(payload, _relprem)
+        payload = _payload_with_relprem_placeholder(payload, _relprem)
+
     # Guard: if the Rust feather cache isn't loaded, simulate_trades_batch will
     # return empty for every spec. Fall back to Python rather than silently
     # returning zero trades. (Cache load happens in algotest_job before this call;
@@ -4877,13 +5547,24 @@ def run_rust_engine_pipeline(
         logger.warning("[ENGINE_RUST] Rust cache not loaded — rejecting payload (no Python fallback exists)")
         return None
 
+    # PER-LEG ROLLOVER (opt-in): stamp each leg's own cadence expiry list / cycles
+    # onto payload['legs'] before any spec builder runs. No-op when the flag is
+    # off, so every existing path is untouched.
+    _inject_per_leg_rollover_inputs(payload, trading_days)
+
+    # PER-LEG QUANTITY (opt-in): map each leg's explicit `qty` onto lots so P&L /
+    # MAE/MFE scale by it. No-op unless a leg sets qty ⇒ existing runs unchanged.
+    _apply_per_leg_qty(payload)
+
     # ── YEARLY blockers ────────────────────────────────────────────────────────
     # YEARLY pins the option contract to a December expiry while the cadence
     # list drives entry/exit. Anything that assumes "contract == cadence element"
     # must be rejected LOUDLY here rather than silently producing a
     # plausible-but-wrong tradesheet. (simulate.rs separately rejects YEARLY
     # without yearly_cycles, and YEARLY + rollover_min_days_to_expiry.)
-    if str(payload.get("expiry_type") or "").upper() == "YEARLY":
+    # Per-leg rollover carries its cycles PER LEG (`_rollover_cycles`); the
+    # strategy-level YEARLY pin/gate does not apply.
+    if str(payload.get("expiry_type") or "").upper() == "YEARLY" and not payload.get("per_leg_rollover"):
         if not payload.get("yearly_cycles"):
             raise ValueError(
                 "expiry_type=YEARLY reached the engine without 'yearly_cycles'. "
@@ -5005,9 +5686,11 @@ def run_rust_engine_pipeline(
     # payloads server-side and never touch it, so this is the real guard.
     segments = _load_filter_segments(payload)
 
-    if filter_entry_mode != "fixed" and str(
-        payload.get("expiry_type") or ""
-    ).upper() in _WEEKLY_CADENCE_TYPES:
+    # Per-leg rollover resolves the monthly pin itself (resolve_per_leg_core on
+    # the DTE path), and with each leg's OWN exit T-n — so the fixed-builder
+    # promotion below (which rolls every leg on the shared cadence) must NOT run,
+    # or it would silently override per-leg rollover with T-1 shared-cadence rolls.
+    if filter_entry_mode != "fixed" and _weekly_roll_cadence(payload) and not payload.get("per_leg_rollover"):
         _mixed_legs = [
             i + 1
             for i, _l in enumerate(payload.get("legs") or [])
@@ -5228,7 +5911,14 @@ def run_rust_engine_pipeline(
             if not specs:
                 return []
 
-    elif filter_entry_mode == "fixed":
+    elif filter_entry_mode == "fixed" and not payload.get("per_leg_rollover"):
+        # PER-LEG ROLLOVER: the fixed-entry builder resolves the monthly pin on
+        # the SHARED cadence (T-1) and knows nothing about per-leg exit T-n, so a
+        # filtered per-leg run must NOT land here — it falls through to the DTE
+        # branch (resolve_per_leg_core → union T-n boundaries), and the same
+        # downstream segment gating (entry-in-window + exit-clamp) applies to
+        # those union rows. That's what makes per-leg rollover honour a filter.
+        #
         # Step 1 (fixed): Python builds schedule then Rust prices each spec.
         # Rollover lookahead: the last rollover window (entry = last in-range
         # expiry) needs one expiry BEYOND it to roll into, otherwise the final
@@ -5414,6 +6104,27 @@ def run_rust_engine_pipeline(
                 specs, payload, segments, spot_by_date,
             )
 
+    # ── Relative to Leg Premium: rewrite derived strikes ────────────────────
+    # Single call site on purpose: all four spec builders above (DTE,
+    # next-weekly, fixed, min_days) have converged by here, so the mode works
+    # on every entry mode without touching any of them. Inert when unused.
+    # Per-(leg, cycle) premium target, stashed so the spot-adjustment cascade can
+    # re-resolve a RELPREM leg by its OWN target instead of ATM when it re-enters
+    # mid-cycle. Keyed by (leg_id, child expiry) — the expiry identifies the cycle,
+    # which is unchanged by a same-cycle spot-adj re-entry, so the re-entry reuses
+    # the exact target its original entry used. (target = ref fill / weeks / lots.)
+    _relprem_targets: Dict[Tuple[int, str], float] = {}
+    if _relprem:
+        specs = _apply_rel_leg_premium_to_specs(specs, payload, _relprem, int(lot_size))
+        if not specs:
+            return []
+        for _rs in specs:
+            _rt = _rs.get("rel_leg_premium_target")
+            if _rt is not None:
+                _relprem_targets[
+                    (int(_rs.get("leg_id") or 0), _normalize_iso(_rs.get("expiry") or ""))
+                ] = float(_rt)
+
     # ── Slice 6b: no_rollover post-processing ───────────────────────────────
     # Keep only the first trade per segment (or globally when no filter).
     # Mirrors generic_algotest_engine.py:4054-4072.
@@ -5447,11 +6158,17 @@ def run_rust_engine_pipeline(
     # trade-exit wins). No-op — same list object — when no leg has a file, so
     # every existing strategy is byte-identical.
     # See docs/superpowers/specs/2026-07-31-per-leg-filter-design.md.
-    from services.leg_filter import LEG_FILTER_END, apply_leg_filters
+    from services.leg_filter import LEG_FILTER_END, apply_leg_filters_split as apply_leg_filters
 
     # trading_days is threaded in so a window ending on a non-trading day snaps
     # back to the last real session — an unsnapped exit prices to nothing and
     # books a zero-P&L phantom row (simulate.rs sets missing=true; nobody reads it).
+    # apply_leg_filters is the mid-cycle-split variant (Option C, Task 2): when a
+    # filtered leg's range boundary falls strictly inside a live trade's window,
+    # the unfiltered leg is carried across the cut with slippage suppressed at
+    # the synthetic boundary (detected automatically by _apply_carry_slippage_guard
+    # via identical strike/expiry keys). The no-filter path returns `specs`
+    # unchanged (same list object) — byte-identical to before.
     specs = apply_leg_filters(specs, payload.get("legs") or [], trading_days)
     if not specs:
         return []
@@ -5639,6 +6356,8 @@ def run_rust_engine_pipeline(
         # the (entry,expiry)-clamped trade — so a boundary trade that expired
         # exactly on the window end is also covered.
         _apply_filter_end_last_per_patch(priced, original_segments, _clamp_reason)
+        if payload.get("per_leg_rollover"):
+            _annotate_per_leg_rollover_exit_reason(priced, payload.get("legs"))
         return list(priced)
 
     # Re-entry Rollover same-day chain: handled in Slice 6 via synthesis below.
@@ -6037,7 +6756,7 @@ def run_rust_engine_pipeline(
             # The seeding body is generic (keys on the leg's OWN expiry), and
             # yearly keeps its `_pl_cycles` requirement, so yearly is untouched.
             _leg_pinned_cyc = (
-                str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+                _weekly_roll_cadence(payload)
                 and str((_lg_src or {}).get("expiry") or "").upper() in _MONTHLY_LEG_TYPES
                 and str((_lg_src or {}).get("segment", "OPTIONS")).upper()
                 not in ("FUTURES", "FUTURE")
@@ -6132,7 +6851,7 @@ def run_rust_engine_pipeline(
             # legs whose contract does NOT change every trade. A plain cadence leg
             # keeps _sc_rollover_reset=False and is untouched.
             _leg_monthly_pinned = (
-                str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+                _weekly_roll_cadence(payload)
                 and str((_lg_src or {}).get("expiry") or "").upper() in _MONTHLY_LEG_TYPES
                 and str((_lg_src or {}).get("segment", "OPTIONS")).upper()
                 not in ("FUTURES", "FUTURE")
@@ -6327,7 +7046,7 @@ def run_rust_engine_pipeline(
     for _pr_lid in list(_leg_own_breach_dates):
         _pr_src = legs_src[_pr_lid - 1] if 0 <= _pr_lid - 1 < len(legs_src) else {}
         if (
-            str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+            _weekly_roll_cadence(payload)
             and str((_pr_src or {}).get("expiry") or "").upper() in _MONTHLY_LEG_TYPES
             and str((_pr_src or {}).get("segment", "OPTIONS")).upper()
             not in ("FUTURES", "FUTURE")
@@ -7932,7 +8651,7 @@ def run_rust_engine_pipeline(
                 and (
                     str(_lg.get("expiry") or "").upper() == "YEARLY"
                     or (
-                        str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+                        _weekly_roll_cadence(payload)
                         and str(_lg.get("expiry") or "").upper() in _MONTHLY_LEG_TYPES
                     )
                 )
@@ -8607,7 +9326,7 @@ def run_rust_engine_pipeline(
                         # for pinned legs stays mode-blind — it measures SPOT movement,
                         # which is independent of the strike; see `_leg_pinned_cyc`.)
                         _sa_leg_pinned = (
-                            str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+                            _weekly_roll_cadence(payload)
                             and str((_sa_leg_src or {}).get("expiry") or "").upper()
                             in _MONTHLY_LEG_TYPES
                             and str((_sa_leg_src or {}).get("segment", "OPTIONS")).upper()
@@ -8739,12 +9458,31 @@ def run_rust_engine_pipeline(
                             ) or float(_sa_prev_strike or 0.0)
                             _sa_strike_info["requested_strike"] = float(_sa_carry)
                         else:
-                            _sa_strike = _compute_strike_for_leg_python(
-                                _sa_leg_src, _sa_spot, _sa_leg_interval,
-                                entry_date=_sa_cur_entry, expiry=_sa_leg_expiry,
-                                index=_sa_index,
-                                out_info=_sa_strike_info, resolved_strikes=_sa_resolved,
-                            ) or float(_sa_prev_strike or 0.0)
+                            # RELPREM leg re-entering mid-cycle: the payload leg
+                            # holds the ATM placeholder, so _compute_strike_for_leg
+                            # would re-strike at ATM (the 9900@100.8 bug). Re-pick by
+                            # the cycle's stashed premium target instead. Same-cycle
+                            # re-entry -> same expiry -> same target.
+                            _rp_tgt = _relprem_targets.get(
+                                (_sa_lid, _normalize_iso(_sa_leg_expiry))
+                            ) if _relprem_targets else None
+                            if _rp_tgt is not None:
+                                _rp_is_ce = str(
+                                    _sa_leg.get("option_type") or "CE"
+                                ).upper() in ("CE", "CALL", "C")
+                                _rp_atm = round(
+                                    _sa_spot / _sa_leg_interval) * _sa_leg_interval
+                                _sa_strike = _relprem_pick_strike(
+                                    _sa_cur_entry, _sa_index, _rp_is_ce,
+                                    _sa_leg_expiry, _sa_leg_interval, _rp_tgt, _rp_atm,
+                                ) or float(_sa_prev_strike or 0.0)
+                            else:
+                                _sa_strike = _compute_strike_for_leg_python(
+                                    _sa_leg_src, _sa_spot, _sa_leg_interval,
+                                    entry_date=_sa_cur_entry, expiry=_sa_leg_expiry,
+                                    index=_sa_index,
+                                    out_info=_sa_strike_info, resolved_strikes=_sa_resolved,
+                                ) or float(_sa_prev_strike or 0.0)
                         if not _sa_strike:
                             continue
                         _sa_resolved[_sa_lid] = float(_sa_strike)
@@ -9071,7 +9809,7 @@ def run_rust_engine_pipeline(
         _i + 1
         for _i, _lg in enumerate(payload.get("legs") or [])
         if isinstance(_lg, dict)
-        and str(payload.get("expiry_type") or "").upper() in _WEEKLY_CADENCE_TYPES
+        and _weekly_roll_cadence(payload)
         and str(_lg.get("expiry") or "").upper() in _MONTHLY_LEG_TYPES
         and str(_lg.get("segment", "OPTIONS")).upper() not in ("FUTURES", "FUTURE")
         and (
@@ -9154,6 +9892,14 @@ def run_rust_engine_pipeline(
 
     if not adjusted_specs:
         return []
+
+    # Post-cascade RELPREM re-size: adjusted_specs now carries the reference leg's
+    # ACTUAL strike (spot-adjustment / patch-reset / rollover all applied). Re-pick
+    # each RELPREM child from the ref leg's real premium before final pricing, so a
+    # spot-adjusting reference no longer divides the stale pre-cascade premium.
+    if _relprem:
+        adjusted_specs = _apply_relprem_from_adjusted(
+            adjusted_specs, payload, _relprem, int(lot_size))
 
     final_priced = list(algotest_native.simulate_trades_batch(adjusted_specs))
 
