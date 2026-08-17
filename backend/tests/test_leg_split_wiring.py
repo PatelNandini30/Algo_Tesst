@@ -377,6 +377,55 @@ class TestSegClampedNotPropagated(unittest.TestCase):
         # Last sub-window keeps _seg_clamped from the original (it IS the final exit).
         self.assertTrue(leg1_rows[1].get("_seg_clamped"), "_seg_clamped must be preserved on final split row")
 
+    def test_filtered_leg_seg_clamped_not_on_intermediate_split_row_case_a(self):
+        """
+        Filtered leg (Case A — original entry already in range) must NOT carry
+        _seg_clamped=True on a non-final sub-window even when the original spec had it.
+
+        Setup:
+          leg_id=1: unfiltered, carried across the whole window 2020-01-02..2020-01-09
+          leg_id=2: filtered [2020-01-02..2020-01-31] — always in range (Case A).
+            Both specs have _seg_clamped=True on the original.
+          A SECOND trade (trade_id=2) entering after the cut gives a second sub-window.
+
+        The cut is produced by a THIRD leg (leg_id=3) whose filter start falls
+        strictly inside the window: [2020-01-06..2020-01-31].
+        Sub-window 1: 2020-01-02 .. 2020-01-06  (non-final)
+        Sub-window 2: 2020-01-06 .. 2020-01-09  (final)
+
+        For the FILTERED leg (leg_id=2), the intermediate row must have _seg_clamped falsy;
+        the final row must retain _seg_clamped=True from the original spec.
+        """
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", seg_clamped=True),
+            # leg_id=2 is the filtered leg; it has a wide range covering the whole window.
+            _spec(1, 2, "2020-01-02", "2020-01-09", seg_clamped=True),
+            # leg_id=3 is the leg whose filter boundary causes the cut.
+            _spec(1, 3, "2020-01-02", "2020-01-09", seg_clamped=True),
+        ]
+        legs = [
+            _leg(),  # leg_id=1: unfiltered
+            _leg(filter_segments=[{"start": "2020-01-01", "end": "2020-01-31"}]),  # leg_id=2: wide range
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),  # leg_id=3: causes cut
+        ]
+        result = apply_leg_filters_split(specs, legs, TRADING_DAYS)
+        leg2_rows = sorted(
+            [r for r in result if r["leg_id"] == 2],
+            key=lambda r: r["entry_date"],
+        )
+        # There must be 2 sub-windows for the filtered leg (Case A: in range for both).
+        self.assertEqual(len(leg2_rows), 2, f"expected 2 sub-windows for filtered leg, got {len(leg2_rows)}: {leg2_rows}")
+        # Non-final sub-window must NOT carry _seg_clamped=True.
+        self.assertFalse(
+            leg2_rows[0].get("_seg_clamped"),
+            f"_seg_clamped must be False on non-final filtered-leg split row, got {leg2_rows[0].get('_seg_clamped')}",
+        )
+        # Final sub-window must retain the original _seg_clamped=True.
+        self.assertTrue(
+            leg2_rows[1].get("_seg_clamped"),
+            "_seg_clamped must be preserved on final filtered-leg split row",
+        )
+
 
 class TestCarryGuardNumerical(unittest.TestCase):
     """

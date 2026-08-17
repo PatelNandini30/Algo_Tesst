@@ -560,6 +560,10 @@ def apply_leg_filters_split(
                                 row["_leg_filter_end"] = True
                             else:
                                 row.pop("_leg_filter_end", None)
+                            # Mirror carried-leg rule: _seg_clamped belongs only
+                            # on the FINAL sub-window (the true exit boundary).
+                            if seg_end != exit_ and row.get("_seg_clamped"):
+                                row["_seg_clamped"] = False
                             out.append(row)
                             seg_had_any = True
                         else:
@@ -570,6 +574,10 @@ def apply_leg_filters_split(
                             row["exit_date"] = leg_exit if truncated else seg_end
                             if truncated:
                                 row["_leg_filter_end"] = True
+                            # Mirror carried-leg rule: _seg_clamped belongs only
+                            # on the FINAL sub-window (the true exit boundary).
+                            if seg_end != exit_ and row.get("_seg_clamped"):
+                                row["_seg_clamped"] = False
                             out.append(row)
                             seg_had_any = True
                 if seg_had_any:
