@@ -22,6 +22,8 @@ __all__ = [
     "leg_segments",
     "leg_window",
     "last_trading_day_on_or_before",
+    "first_trading_day_on_or_after",
+    "split_windows",
     "resolve_leg_window",
     "apply_leg_filters",
     "LEG_FILTER_END",
@@ -154,6 +156,73 @@ def last_trading_day_on_or_before(
     if idx < 0:
         return None
     return trading_days[idx]
+
+
+def first_trading_day_on_or_after(
+    target: str, trading_days: Sequence[str]
+) -> Optional[str]:
+    """Earliest trading day >= target, or None.
+
+    Mirror of last_trading_day_on_or_before — same bisect approach, forward snap.
+    `trading_days` must be sorted ascending ISO strings.
+    """
+    if not trading_days or not target:
+        return None
+    idx = bisect.bisect_left(trading_days, target)
+    if idx >= len(trading_days):
+        return None
+    return trading_days[idx]
+
+
+def split_windows(
+    entry: str,
+    exit: str,
+    ranges: Sequence[Tuple[str, str]],
+    trading_days: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Split [entry, exit] at filter-range boundaries that fall strictly inside.
+
+    Each range start snaps forward (first trading day >= start); each range end
+    snaps back (last trading day <= end).  Only snapped boundaries that are
+    strictly between entry and exit produce a split.
+
+    Returns a list of {"seg_start", "seg_end", "in_range"} dicts, consecutive,
+    together covering exactly [entry, exit].  in_range is True iff the window's
+    seg_start falls inside any snapped range [start, end] inclusive.
+    """
+    # Snap every range boundary and collect boundaries strictly inside (entry, exit).
+    snapped: List[Tuple[str, str]] = []
+    for rng_start, rng_end in ranges:
+        s = first_trading_day_on_or_after(rng_start, trading_days)
+        e = last_trading_day_on_or_before(rng_end, trading_days)
+        if s is None or e is None or e < s:
+            continue
+        snapped.append((s, e))
+
+    # Collect interior cut points (deduplicated, sorted).
+    interior: List[str] = []
+    seen: set = set()
+    for s, e in snapped:
+        for boundary in (s, e):
+            if boundary not in seen and entry < boundary < exit:
+                seen.add(boundary)
+                interior.append(boundary)
+    interior.sort()
+
+    # Build consecutive windows over the cut points.
+    cuts = [entry] + interior + [exit]
+
+    def _in_range(date: str) -> bool:
+        # Half-open: [s, e) — a window starting AT the range-end boundary is outside.
+        for s, e in snapped:
+            if s <= date < e:
+                return True
+        return False
+
+    return [
+        {"seg_start": cuts[i], "seg_end": cuts[i + 1], "in_range": _in_range(cuts[i])}
+        for i in range(len(cuts) - 1)
+    ]
 
 
 def resolve_leg_window(
