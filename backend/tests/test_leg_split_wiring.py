@@ -1374,5 +1374,127 @@ class TestTask5WowMomPatchwise(unittest.TestCase):
         self.assertEqual(expiries.pop(), "2020-01-09")
 
 
+class TestBugAFilteredLegRangeEndMarked(unittest.TestCase):
+    """Task 7 Bug A: a filtered leg's OWN range-end exit under the split must set
+    _leg_filter_end=True (so the engine tags it LEG_FILTER_END), while a filtered
+    segment running to the trade's natural exit must NOT be marked (stays EXPIRY).
+    """
+
+    def _filtered_seg(self, result, tid_selector):
+        rows = [r for r in result if r["leg_id"] == 2]
+        return [r for r in rows if tid_selector(r)]
+
+    def test_exit_split_filtered_leg_range_end_is_marked(self):
+        # Leg 2 range [01-02, 02-04]; trade [01-30, 02-06]. Split at 02-04.
+        # Sub-window 1 filtered-leg exit=02-04 IS the leg's range end (not the
+        # trade's 02-06 natural exit) → must be _leg_filter_end.
+        specs = [
+            _spec(1, 1, "2020-01-30", "2020-02-06", expiry="2020-02-06"),
+            _spec(1, 2, "2020-01-30", "2020-02-06", expiry="2020-02-06"),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-02", "end": "2020-02-04"}]),
+        ]
+        result = apply_leg_filters_split(specs, legs, TRADING_DAYS)
+        leg2 = [r for r in result if r["leg_id"] == 2]
+        self.assertEqual(len(leg2), 1, "filtered leg present only in sub-window 1")
+        self.assertEqual(leg2[0]["exit_date"], "2020-02-04")
+        self.assertTrue(
+            leg2[0].get("_leg_filter_end"),
+            "filtered leg's own range-end exit must be marked _leg_filter_end",
+        )
+
+    def test_fresh_mid_cycle_entry_to_natural_expiry_not_marked(self):
+        # Leg 2 range [01-06, 01-31]; trade [01-02, 01-09]. Fresh entry at 01-06
+        # runs to natural expiry 01-09 (range does NOT end inside) → NOT marked.
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0),
+            _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        result = apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=_SPOT,
+            resolve_strike=_resolve_strike_synthetic,
+        )
+        leg2 = [r for r in result if r["leg_id"] == 2]
+        self.assertEqual(len(leg2), 1, "one fresh filtered-leg segment expected")
+        self.assertEqual(leg2[0]["exit_date"], "2020-01-09")
+        self.assertFalse(
+            leg2[0].get("_leg_filter_end"),
+            "a filtered segment running to natural expiry must stay EXPIRY",
+        )
+
+    def test_fresh_mid_cycle_entry_range_end_is_marked(self):
+        # Both a start-split AND an end-split: range [01-06, 01-16] inside trade
+        # [01-02, 01-31/next]. Fresh entry at 01-06, but the range ENDS at 01-16
+        # before natural exit → the fresh segment's range-end exit IS marked.
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-31", strike=12000.0,
+                  expiry="2020-01-31"),
+            _spec(1, 2, "2020-01-02", "2020-01-31", strike=12000.0,
+                  expiry="2020-01-31"),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-16"}]),
+        ]
+        result = apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=_SPOT,
+            resolve_strike=_resolve_strike_synthetic,
+        )
+        leg2 = [r for r in result if r["leg_id"] == 2]
+        self.assertEqual(len(leg2), 1, "fresh filtered-leg segment expected")
+        self.assertEqual(leg2[0]["entry_date"], "2020-01-06")
+        self.assertEqual(leg2[0]["exit_date"], "2020-01-16")
+        self.assertTrue(
+            leg2[0].get("_leg_filter_end"),
+            "fresh entry truncated at its range end must be marked",
+        )
+
+
+class TestBugBEarlyReturnTaggerSourceText(unittest.TestCase):
+    """Task 7 Bug B: the two LEG_FILTER_END taggers are extracted into
+    _apply_leg_filter_end_tags and called in BOTH the no-risk-control early-return
+    path AND the late risk-control path. Source-text (no market data)."""
+
+    def _src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def test_helper_defined(self):
+        self.assertIn("def _apply_leg_filter_end_tags(", self._src())
+
+    def test_helper_runs_both_loops(self):
+        src = self._src()
+        i = src.index("def _apply_leg_filter_end_tags(")
+        body = src[i:i + 1200]
+        self.assertIn("_is_leg_filter_ended", body,
+                      "helper must run the filtered-leg tagger loop")
+        self.assertIn("_is_carried_seg_ended", body,
+                      "helper must run the carried-leg tagger loop")
+
+    def test_helper_called_in_early_return_path(self):
+        src = self._src()
+        # The early-return helper call must precede `return list(priced)`.
+        ret = src.index("return list(priced)")
+        pre = src[:ret]
+        self.assertIn("_apply_leg_filter_end_tags(priced)", pre,
+                      "early-return path must call the helper before returning")
+
+    def test_helper_called_in_late_path(self):
+        self.assertIn("_apply_leg_filter_end_tags(final_priced)", self._src(),
+                      "late path must call the helper on final_priced")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,10 +61,13 @@ class TestLegFilterEndReason(unittest.TestCase):
                         src.index("algotest_native.simulate_trades_batch(specs)"))
 
     def test_stamped_after_the_patch_tagger(self):
+        # The LEG_FILTER_END taggers now live in the _apply_leg_filter_end_tags
+        # helper (Task 7 Bug B). It must be CALLED after the patch tagger on the
+        # late path so it still wins on the rows it owns.
         src = _source()
         self.assertLess(
             src.index("_apply_filter_end_last_per_patch(final_priced"),
-            src.index("if not _is_leg_filter_ended(_row):"),
+            src.index("_apply_leg_filter_end_tags(final_priced)"),
         )
 
 

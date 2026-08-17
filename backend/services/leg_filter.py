@@ -504,6 +504,29 @@ def apply_leg_filters_split(
                         if not taken:
                             continue
 
+                        # Is this segment truncated by the leg's OWN range END?
+                        # True when seg_end is strictly before the trade's natural
+                        # exit AND the leg's range closes at seg_end (the next
+                        # consecutive sub-window, starting at seg_end, is
+                        # out-of-range).  This is the filtered leg's own
+                        # LEG_FILTER_END boundary (spec rule 5) — distinct from a
+                        # segment that runs to natural expiry (stays EXPIRY) and
+                        # from one that ends only because a LATER range starts.
+                        _range_ends_here = False
+                        if seg_end != exit_:
+                            _lranges = leg_segments(leg) or []
+                            _snapped = []
+                            for _rs, _re in _lranges:
+                                _ss = first_trading_day_on_or_after(_rs, trading_days)
+                                _ee = last_trading_day_on_or_before(_re, trading_days)
+                                if _ss is None or _ee is None or _ee < _ss:
+                                    continue
+                                _snapped.append((_ss, _ee))
+                            # Half-open [s, e): in-range at seg_start, OUT at seg_end.
+                            _in_start = any(_s <= seg_start < _e for _s, _e in _snapped)
+                            _out_end = not any(_s <= seg_end < _e for _s, _e in _snapped)
+                            _range_ends_here = _in_start and _out_end
+
                         # The sub-window is in-range.  Now decide whether this
                         # is a continuation of the original range entry (Case A)
                         # or a FRESH mid-cycle entry triggered by a range-start
@@ -556,7 +579,7 @@ def apply_leg_filters_split(
                             row["exit_date"] = leg_exit if truncated else seg_end
                             row["strike"] = float(fresh_strike)
                             row["requested_strike"] = float(fresh_strike)
-                            if truncated:
+                            if truncated or _range_ends_here:
                                 row["_leg_filter_end"] = True
                             else:
                                 row.pop("_leg_filter_end", None)
@@ -572,7 +595,7 @@ def apply_leg_filters_split(
                             row["trade_id"] = new_tid
                             row["entry_date"] = seg_start
                             row["exit_date"] = leg_exit if truncated else seg_end
-                            if truncated:
+                            if truncated or _range_ends_here:
                                 row["_leg_filter_end"] = True
                             # Mirror carried-leg rule: _seg_clamped belongs only
                             # on the FINAL sub-window (the true exit boundary).

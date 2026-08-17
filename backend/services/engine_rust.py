@@ -6328,6 +6328,32 @@ def run_rust_engine_pipeline(
         """
         return _leg_filter_bounds(row) is not None
 
+    def _apply_leg_filter_end_tags(rows: List[Dict[str, Any]]) -> None:
+        """Tag filtered-leg and carried-leg range-boundary rows LEG_FILTER_END.
+
+        No-op when both key-dicts are empty (no-filter runs unaffected). Runs
+        BOTH tagger loops so the early-return (no-risk-control) path and the late
+        (risk-control) path label filter boundaries identically. Display-only.
+        """
+        if _leg_filter_end_keys:
+            for _row in rows:
+                if not _is_leg_filter_ended(_row):
+                    continue
+                _cur = str(_row.get("exit_reason") or "").strip()
+                if not _cur or _cur == "EXPIRY":
+                    _row["exit_reason"] = LEG_FILTER_END
+                elif LEG_FILTER_END not in _cur:
+                    _row["exit_reason"] = _cur + "+" + LEG_FILTER_END
+        if _carried_seg_end_keys:
+            for _row in rows:
+                if not _is_carried_seg_ended(_row):
+                    continue
+                _cur = str(_row.get("exit_reason") or "").strip()
+                if not _cur or _cur == "EXPIRY":
+                    _row["exit_reason"] = LEG_FILTER_END
+                elif LEG_FILTER_END not in _cur:
+                    _row["exit_reason"] = _cur + "+" + LEG_FILTER_END
+
     if return_specs_only:
         # FIX 1: fail-closed on ANY per-leg individual filter, not just the
         # truncation case.  A fresh mid-cycle entry (range-start lands mid-trade,
@@ -6453,6 +6479,10 @@ def run_rust_engine_pipeline(
         # the (entry,expiry)-clamped trade — so a boundary trade that expired
         # exactly on the window end is also covered.
         _apply_filter_end_last_per_patch(priced, original_segments, _clamp_reason)
+        # Filter-boundary rows (filtered leg's own range-end + carried leg's
+        # seg-1) must be tagged LEG_FILTER_END here too: the late path that owns
+        # these taggers is skipped entirely on no-risk-control runs.
+        _apply_leg_filter_end_tags(priced)
         if payload.get("per_leg_rollover"):
             _annotate_per_leg_rollover_exit_reason(priced, payload.get("legs"))
         return list(priced)
@@ -10207,32 +10237,11 @@ def run_rust_engine_pipeline(
     # corrected position.
     _apply_filter_end_last_per_patch(final_priced, original_segments, _clamp_reason)
 
-    # Per-leg filter truncation. Runs AFTER the strategy-patch tagger so it wins
-    # on the rows it owns, and joins any co-occurring reason with "+" to match
-    # the combined-exit-reason convention used elsewhere in this module.
-    if _leg_filter_end_keys:
-        for _row in final_priced:
-            if not _is_leg_filter_ended(_row):
-                continue
-            _cur = str(_row.get("exit_reason") or "").strip()
-            if not _cur or _cur == "EXPIRY":
-                _row["exit_reason"] = LEG_FILTER_END
-            elif LEG_FILTER_END not in _cur:
-                _row["exit_reason"] = _cur + "+" + LEG_FILTER_END
-
-    # Carried-leg segment-1 boundary tagging. A carried (unfiltered) leg's
-    # segment-1 row whose exit lands on a filtered-leg range boundary is tagged
-    # LEG_FILTER_END, same as the filtered leg itself (spec rule 5).  Uses the
-    # separate _carried_seg_end_keys dict so _leg_was_truncated is NOT affected.
-    if _carried_seg_end_keys:
-        for _row in final_priced:
-            if not _is_carried_seg_ended(_row):
-                continue
-            _cur = str(_row.get("exit_reason") or "").strip()
-            if not _cur or _cur == "EXPIRY":
-                _row["exit_reason"] = LEG_FILTER_END
-            elif LEG_FILTER_END not in _cur:
-                _row["exit_reason"] = _cur + "+" + LEG_FILTER_END
+    # Per-leg filter truncation + carried-leg segment-1 boundary tagging. Runs
+    # AFTER the strategy-patch tagger so it wins on the rows it owns, joining any
+    # co-occurring reason with "+". Same helper the early-return path calls, so
+    # both paths label filter boundaries identically (spec rule 5).
+    _apply_leg_filter_end_tags(final_priced)
 
     # T-n scheduled-exit label. When the run exits N>0 trading days before the
     # contract expiry (exit_dte > 0), a trade that rides to its scheduled exit
