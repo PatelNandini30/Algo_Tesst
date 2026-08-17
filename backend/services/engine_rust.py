@@ -6158,7 +6158,11 @@ def run_rust_engine_pipeline(
     # trade-exit wins). No-op — same list object — when no leg has a file, so
     # every existing strategy is byte-identical.
     # See docs/superpowers/specs/2026-07-31-per-leg-filter-design.md.
-    from services.leg_filter import LEG_FILTER_END, apply_leg_filters_split as apply_leg_filters
+    from services.leg_filter import (
+        LEG_FILTER_END,
+        CARRIED_SEG1_END_KEY,
+        apply_leg_filters_split as apply_leg_filters,
+    )
 
     # trading_days is threaded in so a window ending on a non-trading day snaps
     # back to the last real session — an unsnapped exit prices to nothing and
@@ -6268,6 +6272,31 @@ def run_rust_engine_pipeline(
         _leg_filter_end_keys.setdefault(_lfk, set()).add(
             _normalize_iso(_s.get("exit_date", ""))
         )
+
+    # Carried-leg segment-1 boundaries. An unfiltered leg whose segment-1 exit
+    # lands on a filtered leg's range boundary (start-split or end-split) is
+    # tagged LEG_FILTER_END — same convention as the filtered leg itself.  Kept
+    # SEPARATE from _leg_filter_end_keys so _leg_was_truncated/_leg_filter_bounds
+    # are not poisoned for this unfiltered leg: it was NOT truncated (it runs to
+    # natural expiry in segment-2) and must NOT be blocked from spot-adj cascade
+    # re-entry.  spec key: CARRIED_SEG1_END_KEY ("_carried_seg1_end").
+    _carried_seg_end_keys: Dict[Tuple[str, int], Set[str]] = {}
+    for _s in specs:
+        if not _s.get(CARRIED_SEG1_END_KEY):
+            continue
+        _csk = (_normalize_iso(_s.get("expiry", "")), int(_s.get("leg_id") or 1))
+        _carried_seg_end_keys.setdefault(_csk, set()).add(
+            _normalize_iso(_s.get("exit_date", ""))
+        )
+
+    def _is_carried_seg_ended(row: Dict[str, Any]) -> bool:
+        """True when this row is a carried-leg segment-1 whose exit is a filter boundary."""
+        if not _carried_seg_end_keys:
+            return False
+        _b = _carried_seg_end_keys.get(
+            (_normalize_iso(row.get("expiry") or ""), int(row.get("leg_id") or 1))
+        )
+        return bool(_b and _normalize_iso(row.get("exit_date") or "") in _b)
 
     def _leg_filter_bounds(row: Dict[str, Any]) -> Optional[Set[str]]:
         """The truncation boundaries configured for THIS row's leg + cycle."""
@@ -10184,6 +10213,20 @@ def run_rust_engine_pipeline(
     if _leg_filter_end_keys:
         for _row in final_priced:
             if not _is_leg_filter_ended(_row):
+                continue
+            _cur = str(_row.get("exit_reason") or "").strip()
+            if not _cur or _cur == "EXPIRY":
+                _row["exit_reason"] = LEG_FILTER_END
+            elif LEG_FILTER_END not in _cur:
+                _row["exit_reason"] = _cur + "+" + LEG_FILTER_END
+
+    # Carried-leg segment-1 boundary tagging. A carried (unfiltered) leg's
+    # segment-1 row whose exit lands on a filtered-leg range boundary is tagged
+    # LEG_FILTER_END, same as the filtered leg itself (spec rule 5).  Uses the
+    # separate _carried_seg_end_keys dict so _leg_was_truncated is NOT affected.
+    if _carried_seg_end_keys:
+        for _row in final_priced:
+            if not _is_carried_seg_ended(_row):
                 continue
             _cur = str(_row.get("exit_reason") or "").strip()
             if not _cur or _cur == "EXPIRY":

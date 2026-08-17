@@ -864,5 +864,188 @@ class TestFix1ReturnSpecsOnlyGuard(unittest.TestCase):
         )
 
 
+class TestCarriedSeg1EndMarking(unittest.TestCase):
+    """Task 4 — exit-reason tagging on split rows.
+
+    The split must mark carried-leg segment-1 rows (ending at a filter boundary,
+    not at the trade's natural exit) with _carried_seg1_end=True so the engine's
+    tagger can label them LEG_FILTER_END.  The mark must NOT appear on segment-2
+    (which ends at natural expiry) so _leg_was_truncated stays unaffected.
+
+    Tests are purely structural (on the spec list returned by apply_leg_filters_split)
+    because the LEG_FILTER_END tag itself is applied after pricing — which requires
+    real market data. Source-text assertions cover the tagger.
+    """
+
+    def _entry_split_specs(self):
+        """Entry-split: leg 2 range starts 01-06 inside T1 window [01-02, 01-09].
+        Carried leg 1 → seg-1 exits 01-06 (filter boundary), seg-2 exits 01-09 (expiry).
+        """
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0, expiry="2020-01-09"),
+            _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0, expiry="2020-01-09"),
+        ]
+        legs = [
+            _leg(),  # leg 1 unfiltered (carried)
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        return apply_leg_filters_split(specs, legs, TRADING_DAYS,
+                                       spot_by_date=_SPOT,
+                                       resolve_strike=_resolve_strike_synthetic)
+
+    def _exit_split_specs(self):
+        """Exit-split: leg 2 range ends 02-04 inside T1 window [01-30, 02-06].
+        Carried leg 1 → seg-1 exits 02-04 (filter boundary), seg-2 exits 02-06 (expiry).
+        """
+        specs = [
+            _spec(1, 1, "2020-01-30", "2020-02-06", strike=12000.0, expiry="2020-02-06"),
+            _spec(1, 2, "2020-01-30", "2020-02-06", strike=12000.0, expiry="2020-02-06"),
+        ]
+        legs = [
+            _leg(),  # leg 1 unfiltered (carried)
+            _leg(filter_segments=[{"start": "2020-01-02", "end": "2020-02-04"}]),
+        ]
+        return apply_leg_filters_split(specs, legs, TRADING_DAYS,
+                                       spot_by_date=_SPOT,
+                                       resolve_strike=_resolve_strike_synthetic)
+
+    # ── Entry-split ──
+
+    def test_entry_split_carried_seg1_is_marked(self):
+        """Carried leg 1 segment-1 (exits at range-start boundary 01-06) must have _carried_seg1_end=True."""
+        result = self._entry_split_specs()
+        # sub-window 1: entry 01-02, exit 01-06 — carried leg 1
+        sub1_leg1 = [r for r in result if r["leg_id"] == 1 and r["exit_date"] == "2020-01-06"]
+        self.assertEqual(len(sub1_leg1), 1, "carried seg-1 row must exist")
+        self.assertTrue(
+            sub1_leg1[0].get("_carried_seg1_end"),
+            "carried seg-1 row must have _carried_seg1_end=True",
+        )
+
+    def test_entry_split_carried_seg2_not_marked(self):
+        """Carried leg 1 segment-2 (exits at natural expiry 01-09) must NOT have _carried_seg1_end."""
+        result = self._entry_split_specs()
+        sub2_leg1 = [r for r in result if r["leg_id"] == 1 and r["exit_date"] == "2020-01-09"]
+        self.assertEqual(len(sub2_leg1), 1, "carried seg-2 row must exist")
+        self.assertFalse(
+            sub2_leg1[0].get("_carried_seg1_end"),
+            "carried seg-2 row must NOT have _carried_seg1_end (only natural expiry)",
+        )
+
+    # ── Exit-split ──
+
+    def test_exit_split_carried_seg1_is_marked(self):
+        """Exit-split: carried leg 1 segment-1 (exits at range-end boundary 02-04) is marked."""
+        result = self._exit_split_specs()
+        sub1_leg1 = [r for r in result if r["leg_id"] == 1 and r["exit_date"] == "2020-02-04"]
+        self.assertEqual(len(sub1_leg1), 1, "carried seg-1 row at range-end boundary must exist")
+        self.assertTrue(
+            sub1_leg1[0].get("_carried_seg1_end"),
+            "carried seg-1 row must have _carried_seg1_end=True at exit-split boundary",
+        )
+
+    def test_exit_split_carried_seg2_not_marked(self):
+        """Exit-split: carried leg 1 segment-2 (exits at natural expiry 02-06) is NOT marked."""
+        result = self._exit_split_specs()
+        sub2_leg1 = [r for r in result if r["leg_id"] == 1 and r["exit_date"] == "2020-02-06"]
+        self.assertEqual(len(sub2_leg1), 1, "carried seg-2 row at expiry must exist")
+        self.assertFalse(
+            sub2_leg1[0].get("_carried_seg1_end"),
+            "carried seg-2 row (natural expiry) must NOT have _carried_seg1_end",
+        )
+
+    def test_no_filter_no_carried_mark(self):
+        """No-filter path: returned same list → no _carried_seg1_end key anywhere."""
+        specs = [_spec(1, 1, "2020-01-02", "2020-01-09")]
+        result = apply_leg_filters_split(specs, [], TRADING_DAYS)
+        self.assertIs(result, specs, "no-filter path must return same list object")
+        for row in result:
+            self.assertFalse(row.get("_carried_seg1_end"),
+                             "no-filter row must not have _carried_seg1_end")
+
+    def test_filtered_leg_row_not_marked_carried(self):
+        """The FILTERED leg's rows must not have _carried_seg1_end (that mark is for the carried leg only)."""
+        result = self._entry_split_specs()
+        for row in result:
+            if row["leg_id"] == 2:
+                self.assertFalse(
+                    row.get("_carried_seg1_end"),
+                    "filtered leg row must not carry _carried_seg1_end",
+                )
+
+
+class TestCarriedSeg1EndTaggerSourceText(unittest.TestCase):
+    """Source-text assertions that the engine's tagger reads _carried_seg_end_keys
+    and applies LEG_FILTER_END to carried segment-1 rows after pricing.
+
+    Engine-level logic can't be unit-tested without pricing (real market data),
+    so we verify the wiring is present in the source — same pattern as the
+    existing FIX 1 tests above.
+    """
+
+    def _engine_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def test_carried_seg_end_keys_dict_built(self):
+        """engine_rust.py must build _carried_seg_end_keys from specs."""
+        src = self._engine_src()
+        self.assertIn(
+            "_carried_seg_end_keys",
+            src,
+            "engine must define _carried_seg_end_keys dict for carried-seg-1 tagging",
+        )
+
+    def test_carried_seg1_end_key_imported_from_leg_filter(self):
+        """CARRIED_SEG1_END_KEY must be imported from services.leg_filter."""
+        src = self._engine_src()
+        self.assertIn(
+            "CARRIED_SEG1_END_KEY",
+            src,
+            "engine must import CARRIED_SEG1_END_KEY from leg_filter",
+        )
+
+    def test_carried_seg_end_tagger_applies_leg_filter_end(self):
+        """The _carried_seg_end_keys tagger block must set exit_reason to LEG_FILTER_END."""
+        src = self._engine_src()
+        # The tagger block for carried segments exists after _is_carried_seg_ended
+        self.assertIn(
+            "_is_carried_seg_ended",
+            src,
+            "engine must define _is_carried_seg_ended helper",
+        )
+        # The tagger must assign LEG_FILTER_END when _is_carried_seg_ended is True
+        i_tagger = src.index("_is_carried_seg_ended(_row)")
+        block_after = src[i_tagger:i_tagger + 400]
+        self.assertIn(
+            "LEG_FILTER_END",
+            block_after,
+            "tagger block must assign LEG_FILTER_END to exit_reason for carried seg-1 rows",
+        )
+
+    def test_leg_was_truncated_not_poisoned(self):
+        """_carried_seg_end_keys must be SEPARATE from _leg_filter_end_keys so
+        _leg_was_truncated (which keys off _leg_filter_end_keys) is unaffected."""
+        src = self._engine_src()
+        # _leg_was_truncated must reference _leg_filter_bounds (not _carried_seg_end_keys)
+        i_func = src.index("def _leg_was_truncated(")
+        # The function body ends at the next blank line after the return
+        func_block = src[i_func:i_func + 600]
+        self.assertNotIn(
+            "_carried_seg_end_keys",
+            func_block,
+            "_leg_was_truncated must NOT reference _carried_seg_end_keys",
+        )
+        self.assertIn(
+            "_leg_filter_bounds",
+            func_block,
+            "_leg_was_truncated must still reference _leg_filter_bounds",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

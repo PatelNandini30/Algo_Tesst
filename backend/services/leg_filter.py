@@ -28,9 +28,15 @@ __all__ = [
     "apply_leg_filters",
     "apply_leg_filters_split",
     "LEG_FILTER_END",
+    "CARRIED_SEG1_END_KEY",
 ]
 
 LEG_FILTER_END = "LEG_FILTER_END"
+# Spec key used to mark a carried (unfiltered) leg's segment-1 row whose exit
+# lands on a filtered-leg range boundary.  The engine's _carried_seg_end_keys
+# tagger reads this to emit LEG_FILTER_END, kept SEPARATE from
+# _leg_filter_end_keys so _leg_was_truncated is not poisoned for an unfiltered leg.
+CARRIED_SEG1_END_KEY = "_carried_seg1_end"
 
 
 def seg_iso(v: Any) -> str:
@@ -475,6 +481,15 @@ def apply_leg_filters_split(
                         # is the final exit, not the mid-cycle splits).
                         if seg_end != exit_ and row.get("_seg_clamped"):
                             row["_seg_clamped"] = False
+                        # A carried sub-window ending at a filter boundary (not
+                        # the trade's natural exit) gets tagged LEG_FILTER_END by
+                        # the engine's _carried_seg_end_keys tagger — separate
+                        # from _leg_filter_end_keys so _leg_was_truncated is NOT
+                        # poisoned for this unfiltered leg.
+                        if seg_end != exit_:
+                            row["_carried_seg1_end"] = True
+                        else:
+                            row.pop("_carried_seg1_end", None)
                         out.append(row)
                         seg_had_any = True
                     else:
