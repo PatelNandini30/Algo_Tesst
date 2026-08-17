@@ -239,6 +239,12 @@ def resolve_leg_window(
     engine_rust._apply_leg_filter_mask. Both must behave identically on the same
     uploaded file, so both land here.
 
+    TODO (FIX 3): Futures filtered legs receive subtract-only behaviour here
+    (no mid-cycle split entry); there is no callback path for the futures inline
+    builders.  The Task-6 optimizer/coverage gate MUST hard-fail a futures leg
+    that carries filter_segments rather than silently diverge from options legs
+    — emit a clear error at that gate rather than producing wrong numbers quietly.
+
     Returns (taken, exit_date, truncated):
       * taken=False    -> the leg is ABSENT from this trade.
       * exit_date      -> unchanged, or the truncated boundary SNAPPED BACK to
@@ -501,12 +507,23 @@ def apply_leg_filters_split(
                         _orig_in_range, _, _ = resolve_leg_window(
                             leg, orig_entry, seg_end, trading_days,
                         )
+                        # ponytail: fresh emission requires a resolver; production
+                        # always supplies one via _mid_cycle_strike_resolver.
+                        # Without it, DROP the filtered leg for this sub-window
+                        # rather than emit a wrong-strike row (FIX 2).
                         is_fresh_entry = (
                             not _orig_in_range
                             and seg_start > orig_entry
                             and resolve_strike is not None
                             and spot_by_date is not None
                         )
+                        _needs_fresh = (
+                            not _orig_in_range
+                            and seg_start > orig_entry
+                        )
+                        if _needs_fresh and not is_fresh_entry:
+                            # No callbacks: drop rather than emit wrong-strike row.
+                            continue
                         if is_fresh_entry:
                             spot = spot_by_date.get(seg_start)
                             if not spot:

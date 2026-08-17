@@ -212,14 +212,19 @@ class TestEntrySplit(unittest.TestCase):
         sub1_leg2 = [r for r in result if r["trade_id"] == sub1_tid and r["leg_id"] == 2]
         self.assertEqual(len(sub1_leg2), 0, "Filtered leg must be absent before range start")
 
-    def test_filtered_leg_present_after_range_start(self):
-        """Sub-window starting at range start: filtered leg should be present."""
+    def test_filtered_leg_absent_after_range_start_without_callbacks(self):
+        """Without callbacks, fresh mid-cycle entry is DROPPED (FIX 2).
+
+        The original spec entry (01-02) is before the range start (01-06), so a
+        fresh strike would be needed but no resolver is supplied → dropped.
+        Sub-window 2 exists (unfiltered leg is present) but filtered leg is absent.
+        """
         specs, legs = self._make_split_case()
         result = apply_leg_filters_split(specs, legs, TRADING_DAYS)
         sub2_tid = max(_tids(result))
         sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
-        self.assertEqual(len(sub2_leg2), 1)
-        self.assertEqual(sub2_leg2[0]["entry_date"], "2020-01-06")
+        self.assertEqual(len(sub2_leg2), 0,
+                         "without callbacks, fresh-entry filtered leg must be dropped")
 
 
 class TestExitSplit(unittest.TestCase):
@@ -622,8 +627,12 @@ class TestMidCycleEntryFreshSpec(unittest.TestCase):
                                          resolve_strike=_resolve_strike_synthetic)
         self.assertIs(result, specs)
 
-    def test_fresh_spec_without_callbacks_uses_original_strike(self):
-        """Without callbacks, falls back to Task-2: emits with original strike, not a fresh one."""
+    def test_fresh_spec_without_callbacks_drops_leg(self):
+        """Without callbacks, a fresh mid-cycle entry is DROPPED (not emitted with wrong strike).
+
+        FIX 2: no resolver → safe drop rather than wrong-strike row.  Production
+        always supplies _mid_cycle_strike_resolver; this path is tests/edge-only.
+        """
         specs = [
             _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0),
             _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0),
@@ -633,16 +642,13 @@ class TestMidCycleEntryFreshSpec(unittest.TestCase):
             _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
         ]
         result = apply_leg_filters_split(specs, legs, TRADING_DAYS)
-        # Without callbacks → old Task-2 behaviour: the sub-window starting at
-        # the range boundary still emits the filtered leg (resolve_leg_window
-        # finds it in-range), but with the ORIGINAL strike, not a fresh one.
+        # Without callbacks the range-start falls mid-trade; the filtered leg
+        # needs a fresh strike but none can be resolved → it is DROPPED for the
+        # sub-window starting at the range boundary (safe drop, not wrong-strike).
         sub2_tid = max(r["trade_id"] for r in result)
         sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
-        self.assertEqual(len(sub2_leg2), 1,
-                         "without callbacks, filtered leg is still emitted (Task-2 path)")
-        # Original strike is preserved (no fresh resolution)
-        self.assertAlmostEqual(sub2_leg2[0]["strike"], 12000.0, places=4,
-                               msg="without callbacks, original strike must be kept")
+        self.assertEqual(len(sub2_leg2), 0,
+                         "without callbacks, fresh-entry filtered leg must be dropped")
 
 
 class TestMidCycleEntryExitSplit(unittest.TestCase):
@@ -781,6 +787,81 @@ class TestEngineCallSiteWiring(unittest.TestCase):
             src = f.read()
         self.assertIn("resolve_strike=_mid_cycle_strike_resolver", src,
                       "engine must thread resolve_strike into apply_leg_filters call")
+
+
+class TestFix1ReturnSpecsOnlyGuard(unittest.TestCase):
+    """FIX 1: return_specs_only path in engine_rust.py must fail-closed on ANY
+    per-leg individual filter, not just the truncation (LEG_FILTER_END) case.
+    Verified via source-text inspection (no Docker / real engine needed).
+    """
+
+    def _engine_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def test_guard_checks_filter_segments_presence_not_only_leg_filter_end(self):
+        """The return_specs_only block must inspect payload legs for filter_segments
+        BEFORE (or instead of) relying on _leg_filter_end_keys alone."""
+        src = self._engine_src()
+        i_ret = src.index("if return_specs_only:")
+        # The block after 'if return_specs_only:' must contain the payload guard.
+        # Find the next top-level 'priced = ' to bound the block.
+        i_priced = src.index("priced = algotest_native.simulate_trades_batch", i_ret)
+        block = src[i_ret:i_priced]
+        self.assertIn(
+            'filter_segments',
+            block,
+            "return_specs_only block must check for filter_segments on payload legs (FIX 1)",
+        )
+        self.assertIn(
+            'payload.get("legs")',
+            block,
+            "return_specs_only block must iterate payload legs to detect filter_segments",
+        )
+
+    def test_guard_raises_for_filter_segments_present(self):
+        """Source must raise RuntimeError when a leg has filter_segments on the fused path."""
+        src = self._engine_src()
+        i_ret = src.index("if return_specs_only:")
+        i_priced = src.index("priced = algotest_native.simulate_trades_batch", i_ret)
+        block = src[i_ret:i_priced]
+        self.assertIn(
+            "raise RuntimeError",
+            block,
+            "return_specs_only block must raise RuntimeError when filter_segments present",
+        )
+        # The error message must name both the feature and the unsupported path.
+        self.assertIn(
+            "per-leg individual filter",
+            block.lower(),
+            "RuntimeError message must name 'per-leg individual filter'",
+        )
+        self.assertIn(
+            "fused",
+            block.lower(),
+            "RuntimeError message must name the 'fused' path",
+        )
+
+    def test_guard_does_not_fire_on_single_index_path(self):
+        """The guard only executes inside 'if return_specs_only:'.
+        The single-index path never sets return_specs_only=True, so the guard
+        never fires there — confirm the guard is inside that conditional block."""
+        src = self._engine_src()
+        i_ret = src.index("if return_specs_only:")
+        # The filter_segments guard must appear AFTER the return_specs_only gate.
+        # If filter_segments appeared BEFORE, it would block the single-index path.
+        i_filter_guard = src.index(
+            'for _fused_leg in payload.get("legs") or []:',
+            i_ret,
+        )
+        self.assertGreater(
+            i_filter_guard, i_ret,
+            "filter_segments guard must be INSIDE the return_specs_only block",
+        )
 
 
 if __name__ == "__main__":

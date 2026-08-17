@@ -6300,6 +6300,22 @@ def run_rust_engine_pipeline(
         return _leg_filter_bounds(row) is not None
 
     if return_specs_only:
+        # FIX 1: fail-closed on ANY per-leg individual filter, not just the
+        # truncation case.  A fresh mid-cycle entry (range-start lands mid-trade,
+        # sub-window runs to natural expiry) does NOT set _leg_filter_end, so
+        # _leg_filter_end_keys is empty — but the unpriced fresh spec is still
+        # wrong on the fused path.  Gate on payload presence instead so
+        # drop/truncate/fresh-entry are all caught uniformly.
+        for _fused_leg in payload.get("legs") or []:
+            if _fused_leg.get("filter_segments"):
+                raise RuntimeError(
+                    "Per-leg individual filter is not supported on the "
+                    "multi-index fused / return_specs_only path: the "
+                    "LEG_FILTER_END tag and fresh mid-cycle specs do not "
+                    "survive the fused pricing hand-off, producing silently "
+                    "wrong numbers. Port the per-leg filter to the fused "
+                    "path before enabling it here."
+                )
         # The mask itself is applied above, but the LEG_FILTER_END tag is not:
         # this returns before the tagger (:8846) and before both cascade guards,
         # and simulate_trades_batch drops the `_leg_filter_end` spec key, so the
