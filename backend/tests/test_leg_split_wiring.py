@@ -506,5 +506,282 @@ class TestCarryGuardNumerical(unittest.TestCase):
                                   msg="non-carry boundary must NOT cancel — proves the guard is active")
 
 
+# ---------------------------------------------------------------------------
+# Task 3: Mid-cycle fresh entry for a filtered leg
+# ---------------------------------------------------------------------------
+
+# Synthetic spot lookup and strike resolver used by Task-3 tests.
+# The resolver returns ATM = round(spot / 50) * 50, so tests can predict the
+# expected strike from the spot dict without touching real market data.
+
+_SPOT = {
+    "2020-01-02": 12000.0,
+    "2020-01-06": 11800.0,  # range-start boundary spot
+    "2020-01-09": 11900.0,
+    "2020-01-13": 12100.0,
+    "2020-01-30": 12200.0,
+    "2020-02-04": 12050.0,
+    "2020-02-06": 11950.0,
+}
+
+_INTERVAL = 50.0
+
+
+def _resolve_strike_synthetic(leg, orig_spec, spot, entry_date):
+    """ATM resolver: round(spot / interval) * interval. Returns None to simulate illiquid."""
+    if spot == 0.0 or spot is None:
+        return None
+    return round(spot / _INTERVAL) * _INTERVAL
+
+
+def _resolve_strike_always_none(leg, orig_spec, spot, entry_date):
+    """Illiquid resolver — always returns None to test the guard."""
+    return None
+
+
+class TestMidCycleEntryFreshSpec(unittest.TestCase):
+    """
+    Task 3: when a filtered leg is absent from a sub-window because its
+    original entry was outside the range, but the sub-window IS in-range
+    (the range STARTS at that sub-window's start), synthesise a fresh
+    mid-cycle entry with strike from the boundary-date spot.
+    """
+
+    def _entry_split_result(self, resolve_strike=_resolve_strike_synthetic):
+        """
+        T1: entry=01-02, exit=01-09
+        Leg 1: unfiltered
+        Leg 2: filtered, range [01-06, 01-31]
+          → split at 01-06 → sub-window [01-02,01-06] (leg2 absent) and
+            [01-06,01-09] (leg2 fresh entry at 01-06 spot=11800 → ATM=11800).
+        """
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0),
+            _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        return apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=_SPOT,
+            resolve_strike=resolve_strike,
+        )
+
+    def test_fresh_spec_emitted_in_range_sub_window(self):
+        """Filtered leg should appear in the sub-window starting at range start."""
+        result = self._entry_split_result()
+        sub2_tid = max(r["trade_id"] for r in result)
+        sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub2_leg2), 1, "fresh filtered-leg spec must be emitted for in-range sub-window")
+
+    def test_fresh_spec_entry_date_is_boundary(self):
+        """Fresh spec entry_date == range-start boundary."""
+        result = self._entry_split_result()
+        sub2_tid = max(r["trade_id"] for r in result)
+        row = next(r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2)
+        self.assertEqual(row["entry_date"], "2020-01-06")
+
+    def test_fresh_spec_exit_date_is_sub_window_end(self):
+        """Fresh spec exit_date == sub-window end (range covers the full sub-window)."""
+        result = self._entry_split_result()
+        sub2_tid = max(r["trade_id"] for r in result)
+        row = next(r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2)
+        self.assertEqual(row["exit_date"], "2020-01-09")
+
+    def test_fresh_spec_strike_from_boundary_spot(self):
+        """Strike must be ATM(spot at range-start boundary) = round(11800/50)*50 = 11800."""
+        result = self._entry_split_result()
+        sub2_tid = max(r["trade_id"] for r in result)
+        row = next(r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2)
+        expected_atm = round(_SPOT["2020-01-06"] / _INTERVAL) * _INTERVAL  # 11800
+        self.assertAlmostEqual(row["strike"], expected_atm, places=4,
+                               msg="fresh entry strike must come from the boundary-date spot")
+
+    def test_filtered_leg_absent_before_range_start(self):
+        """Sub-window before range start: filtered leg must still be absent."""
+        result = self._entry_split_result()
+        sub1_tid = min(r["trade_id"] for r in result)
+        sub1_leg2 = [r for r in result if r["trade_id"] == sub1_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub1_leg2), 0, "filtered leg must be absent before range start")
+
+    def test_unfiltered_leg_not_affected(self):
+        """Unfiltered leg still has 2 sub-windows with identical (strike, expiry)."""
+        result = self._entry_split_result()
+        leg1_rows = sorted([r for r in result if r["leg_id"] == 1], key=lambda r: r["entry_date"])
+        self.assertEqual(len(leg1_rows), 2)
+        self.assertEqual(leg1_rows[0]["strike"], leg1_rows[1]["strike"])
+        self.assertEqual(leg1_rows[0]["expiry"], leg1_rows[1]["expiry"])
+
+    def test_no_filter_path_unchanged(self):
+        """No-filter path returns same list object (no-op, not affected by new params)."""
+        specs = [_spec(1, 1, "2020-01-02", "2020-01-09")]
+        result = apply_leg_filters_split(specs, [], TRADING_DAYS,
+                                         spot_by_date=_SPOT,
+                                         resolve_strike=_resolve_strike_synthetic)
+        self.assertIs(result, specs)
+
+    def test_fresh_spec_without_callbacks_uses_original_strike(self):
+        """Without callbacks, falls back to Task-2: emits with original strike, not a fresh one."""
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0),
+            _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        result = apply_leg_filters_split(specs, legs, TRADING_DAYS)
+        # Without callbacks → old Task-2 behaviour: the sub-window starting at
+        # the range boundary still emits the filtered leg (resolve_leg_window
+        # finds it in-range), but with the ORIGINAL strike, not a fresh one.
+        sub2_tid = max(r["trade_id"] for r in result)
+        sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub2_leg2), 1,
+                         "without callbacks, filtered leg is still emitted (Task-2 path)")
+        # Original strike is preserved (no fresh resolution)
+        self.assertAlmostEqual(sub2_leg2[0]["strike"], 12000.0, places=4,
+                               msg="without callbacks, original strike must be kept")
+
+
+class TestMidCycleEntryExitSplit(unittest.TestCase):
+    """
+    Exit-split: the filtered leg's range END is strictly inside the trade window.
+    In the sub-window after the range end (starting at range end boundary), the
+    filtered leg should be absent (not synthesised — the range is over).
+    """
+
+    def test_filtered_leg_absent_after_range_end(self):
+        """
+        T1: entry=01-30, exit=02-06; Leg 2 range [01-02, 02-04].
+        Sub-window 2 starts at 02-04 (range end): filtered leg must be absent
+        (half-open [start, end) means 02-04 is outside [01-02, 02-04)).
+        """
+        specs = [
+            _spec(1, 1, "2020-01-30", "2020-02-06", expiry="2020-02-06"),
+            _spec(1, 2, "2020-01-30", "2020-02-06", expiry="2020-02-06"),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-02", "end": "2020-02-04"}]),
+        ]
+        result = apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=_SPOT, resolve_strike=_resolve_strike_synthetic,
+        )
+        sub2_tid = max(r["trade_id"] for r in result)
+        sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub2_leg2), 0,
+                         "filtered leg must be absent after range end — not synthesised")
+
+    def test_filtered_leg_present_in_sub_window_before_range_end(self):
+        """First sub-window (01-30 → 02-04): filtered leg was already in range and stays."""
+        specs = [
+            _spec(1, 1, "2020-01-30", "2020-02-06", expiry="2020-02-06"),
+            _spec(1, 2, "2020-01-30", "2020-02-06", expiry="2020-02-06"),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-02", "end": "2020-02-04"}]),
+        ]
+        result = apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=_SPOT, resolve_strike=_resolve_strike_synthetic,
+        )
+        sub1_tid = min(r["trade_id"] for r in result)
+        sub1_leg2 = [r for r in result if r["trade_id"] == sub1_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub1_leg2), 1,
+                         "filtered leg must be present in sub-window before range end")
+
+
+class TestMidCycleEntryUnresolvableStrike(unittest.TestCase):
+    """
+    Guard: if resolve_strike returns None (illiquid), drop just the
+    filtered-leg segment and keep the carried leg.
+    """
+
+    def test_illiquid_drops_filtered_leg_keeps_carried(self):
+        """
+        Resolver returns None → filtered leg absent from the in-range sub-window.
+        Unfiltered (carried) leg must still appear in both sub-windows.
+        """
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0),
+            _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        result = apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=_SPOT,
+            resolve_strike=_resolve_strike_always_none,
+        )
+        # Unfiltered leg must be present in both sub-windows
+        leg1_rows = [r for r in result if r["leg_id"] == 1]
+        self.assertEqual(len(leg1_rows), 2, "carried leg must survive both sub-windows")
+        # Filtered leg must be absent from the in-range sub-window (resolver returned None)
+        sub2_tid = max(r["trade_id"] for r in result)
+        sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub2_leg2), 0,
+                         "illiquid filtered leg must be dropped, not abort the whole trade")
+
+    def test_missing_spot_drops_filtered_leg_keeps_carried(self):
+        """
+        If spot is missing for the boundary date, the filtered leg is also dropped.
+        """
+        spot_missing_boundary = {k: v for k, v in _SPOT.items() if k != "2020-01-06"}
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", strike=12000.0),
+            _spec(1, 2, "2020-01-02", "2020-01-09", strike=12000.0),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        result = apply_leg_filters_split(
+            specs, legs, TRADING_DAYS,
+            spot_by_date=spot_missing_boundary,
+            resolve_strike=_resolve_strike_synthetic,
+        )
+        leg1_rows = [r for r in result if r["leg_id"] == 1]
+        self.assertEqual(len(leg1_rows), 2, "carried leg must survive even when boundary spot is missing")
+        sub2_tid = max(r["trade_id"] for r in result)
+        sub2_leg2 = [r for r in result if r["trade_id"] == sub2_tid and r["leg_id"] == 2]
+        self.assertEqual(len(sub2_leg2), 0, "filtered leg must be dropped when boundary spot missing")
+
+
+class TestEngineCallSiteWiring(unittest.TestCase):
+    """
+    Source-text assertion: the engine's apply_leg_filters call now passes
+    spot_by_date and resolve_strike. This is approved per the project's
+    pattern for engine-level assertions that can't be exercised without market data.
+    """
+
+    def test_engine_passes_spot_by_date_to_split(self):
+        """apply_leg_filters call in engine_rust.py must include spot_by_date=."""
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            src = f.read()
+        self.assertIn("spot_by_date=spot_by_date", src,
+                      "engine must thread spot_by_date into apply_leg_filters call")
+
+    def test_engine_passes_resolve_strike_to_split(self):
+        """apply_leg_filters call in engine_rust.py must include resolve_strike=."""
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            src = f.read()
+        self.assertIn("resolve_strike=_mid_cycle_strike_resolver", src,
+                      "engine must thread resolve_strike into apply_leg_filters call")
+
+
 if __name__ == "__main__":
     unittest.main()

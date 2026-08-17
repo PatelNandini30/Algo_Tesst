@@ -21,19 +21,24 @@ class TestLegFilterWiring(unittest.TestCase):
     """
 
     def test_apply_leg_filters_is_called(self):
-        self.assertIn("apply_leg_filters(specs, payload.get(\"legs\") or [], trading_days)", _source())
+        src = _source()
+        # Task 3 expanded the call to include spot_by_date and resolve_strike;
+        # assert the core positional args are still threaded through.
+        self.assertIn("apply_leg_filters(", src)
+        self.assertIn("payload.get(\"legs\") or []", src)
+        self.assertIn("trading_days,", src)
 
     def test_runs_after_fixed_rollover_strike_and_before_pricing(self):
         src = _source()
         i_fixed = src.index("_apply_fixed_rollover_strike(specs, payload")
-        i_mask = src.index("apply_leg_filters(specs, payload.get(\"legs\")")
+        i_mask = src.index("specs = apply_leg_filters(")
         i_price = src.index("algotest_native.simulate_trades_batch(specs)")
         self.assertLess(i_fixed, i_mask, "mask must not disturb strike epochs")
         self.assertLess(i_mask, i_price, "mask must be applied before pricing")
 
     def test_runs_before_the_return_specs_only_early_exit(self):
         src = _source()
-        i_mask = src.index("apply_leg_filters(specs, payload.get(\"legs\")")
+        i_mask = src.index("specs = apply_leg_filters(")
         i_ret = src.index("if return_specs_only:")
         self.assertLess(i_mask, i_ret, "multi-index FUSED path must be masked too")
 
@@ -159,10 +164,12 @@ class TestTruncatedExitIsSnapped(unittest.TestCase):
     """
 
     def test_options_post_pass_receives_trading_days(self):
-        self.assertIn(
-            "apply_leg_filters(specs, payload.get(\"legs\") or [], trading_days)",
-            _source(),
-        )
+        # Task 3 expanded the call to include spot_by_date and resolve_strike.
+        # Verify trading_days is still passed (as the third positional arg).
+        src = _source()
+        self.assertIn("apply_leg_filters(", src)
+        self.assertIn("trading_days,", src)
+        self.assertIn("spot_by_date=spot_by_date", src)
 
     def test_both_paths_share_one_implementation(self):
         # The options post-pass and the futures helper must resolve the mask

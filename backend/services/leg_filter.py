@@ -323,6 +323,9 @@ def apply_leg_filters_split(
     specs: List[Dict[str, Any]],
     legs: Sequence[Dict[str, Any]],
     trading_days: Sequence[str],
+    *,
+    spot_by_date: Optional[Dict[str, float]] = None,
+    resolve_strike: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Mid-cycle split variant of apply_leg_filters (Option C).
 
@@ -345,9 +348,14 @@ def apply_leg_filters_split(
            are automatically treated as carries by _apply_carry_slippage_guard
            — no extra marking needed.  P&L is only partitioned; the boundary
            mark cancels and the total is unchanged.
-         - Filtered legs (Task 2): still dropped/truncated exactly as today for
-           each sub-window independently. Task 3 will add the mid-cycle fresh
-           entry for filtered legs at range-start boundaries.
+         - Filtered legs: if `in_range` but the original spec's entry was outside
+           the range (so resolve_leg_window would drop it), emit a FRESH spec
+           with entry_date=seg_start, strike resolved at seg_start via the
+           `resolve_strike` callback.  If the callback returns None (illiquid /
+           not listed), that filtered-leg segment is dropped and the carried leg
+           is kept — mirror the builders' unresolvable-strike behaviour.
+           Requires `spot_by_date` and `resolve_strike` (Task 3).  When absent,
+           the old Task-2 drop/truncate behaviour is preserved.
     5. Renumber trade_id sequentially (1-based) across the whole output list.
 
     See docs/superpowers/specs/2026-08-01-per-leg-filter-split-design.md.
@@ -464,8 +472,8 @@ def apply_leg_filters_split(
                         out.append(row)
                         seg_had_any = True
                     else:
-                        # Filtered leg (Task 2): apply drop/truncate on the
-                        # sub-window. Task 3 will add mid-cycle fresh entries.
+                        # Filtered leg: check if this sub-window is in-range.
+                        # Use seg_start as entry (same as original Task-2 logic).
                         taken, leg_exit, truncated = resolve_leg_window(
                             leg,
                             seg_start,
@@ -474,14 +482,64 @@ def apply_leg_filters_split(
                         )
                         if not taken:
                             continue
-                        row = dict(s)
-                        row["trade_id"] = new_tid
-                        row["entry_date"] = seg_start
-                        row["exit_date"] = leg_exit if truncated else seg_end
-                        if truncated:
-                            row["_leg_filter_end"] = True
-                        out.append(row)
-                        seg_had_any = True
+
+                        # The sub-window is in-range.  Now decide whether this
+                        # is a continuation of the original range entry (Case A)
+                        # or a FRESH mid-cycle entry triggered by a range-start
+                        # boundary landing at seg_start (Case B).
+                        #
+                        #   Case A: original spec entry was already inside the
+                        #   range (seg_start > orig_entry but both in-range) →
+                        #   keep the original strike; just update the dates.
+                        #
+                        #   Case B: original spec entry was BEFORE the range
+                        #   start, and seg_start == range-start boundary →
+                        #   resolve a fresh strike at the boundary-date spot.
+                        #   Falls back to original strike (Task-2 behaviour)
+                        #   when callbacks are absent.
+                        orig_entry = str(s.get("entry_date") or "")
+                        _orig_in_range, _, _ = resolve_leg_window(
+                            leg, orig_entry, seg_end, trading_days,
+                        )
+                        is_fresh_entry = (
+                            not _orig_in_range
+                            and seg_start > orig_entry
+                            and resolve_strike is not None
+                            and spot_by_date is not None
+                        )
+                        if is_fresh_entry:
+                            spot = spot_by_date.get(seg_start)
+                            if not spot:
+                                # Missing spot at boundary — drop filtered leg,
+                                # keep carried leg (guard against unpriced entry).
+                                continue
+                            fresh_strike = resolve_strike(leg, s, spot, seg_start)
+                            if fresh_strike is None:
+                                # Illiquid / not listed — drop just this
+                                # filtered-leg segment; the carried leg stays.
+                                continue
+                            row = dict(s)
+                            row["trade_id"] = new_tid
+                            row["entry_date"] = seg_start
+                            row["exit_date"] = leg_exit if truncated else seg_end
+                            row["strike"] = float(fresh_strike)
+                            row["requested_strike"] = float(fresh_strike)
+                            if truncated:
+                                row["_leg_filter_end"] = True
+                            else:
+                                row.pop("_leg_filter_end", None)
+                            out.append(row)
+                            seg_had_any = True
+                        else:
+                            # Case A (or no callbacks): keep original strike.
+                            row = dict(s)
+                            row["trade_id"] = new_tid
+                            row["entry_date"] = seg_start
+                            row["exit_date"] = leg_exit if truncated else seg_end
+                            if truncated:
+                                row["_leg_filter_end"] = True
+                            out.append(row)
+                            seg_had_any = True
                 if seg_had_any:
                     new_tid += 1
 

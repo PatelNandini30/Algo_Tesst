@@ -6190,7 +6190,38 @@ def run_rust_engine_pipeline(
     # key and slippage will be double-charged at the synthetic cut, silently
     # corrupting P&L.  The test in test_leg_split_wiring.TestCarryGuardNumerical
     # exercises this path numerically and would fail if the guard were bypassed.
-    specs = apply_leg_filters(specs, payload.get("legs") or [], trading_days)
+    # Thread spot_by_date and a strike resolver so the split can synthesise a
+    # fresh mid-cycle entry for a filtered leg whose range opens mid-trade.
+    # The resolver wraps _compute_strike_for_leg_python, using the expiry and
+    # index already stored on the original spec (correct contract for that cycle).
+    def _mid_cycle_strike_resolver(
+        leg: Dict[str, Any],
+        orig_spec: Dict[str, Any],
+        entry_spot: float,
+        entry_date: str,
+    ) -> Optional[float]:
+        # Use the strike_interval and index from the original spec — those were
+        # resolved by the spec builder for this exact leg and contract.
+        try:
+            _interval = float(leg.get("strike_interval") or orig_spec.get("strike_interval") or 50.0)
+        except (TypeError, ValueError):
+            _interval = 50.0
+        return _compute_strike_for_leg_python(
+            leg,
+            entry_spot,
+            _interval,
+            entry_date=entry_date,
+            expiry=str(orig_spec.get("expiry") or ""),
+            index=str(orig_spec.get("index") or ""),
+        )
+
+    specs = apply_leg_filters(
+        specs,
+        payload.get("legs") or [],
+        trading_days,
+        spot_by_date=spot_by_date,
+        resolve_strike=_mid_cycle_strike_resolver,
+    )
     if not specs:
         return []
 
