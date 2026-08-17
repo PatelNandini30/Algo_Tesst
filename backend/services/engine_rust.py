@@ -6169,6 +6169,27 @@ def run_rust_engine_pipeline(
     # the synthetic boundary (detected automatically by _apply_carry_slippage_guard
     # via identical strike/expiry keys). The no-filter path returns `specs`
     # unchanged (same list object) — byte-identical to before.
+    #
+    # LOAD-BEARING INVARIANT — pass ordering (do not reorder without verifying):
+    # The cost-free carry relies on the two boundary rows of a carried (unfiltered)
+    # leg sharing an IDENTICAL (strike, expiry) key so that _apply_carry_slippage_guard
+    # treats the boundary as a pure mark (no slippage charged) and the P&L of the
+    # two sub-windows sums to the unsplit P&L.
+    #
+    # This is safe RIGHT HERE because:
+    #   (a) _apply_fixed_rollover_strike has already run above, so a Fixed leg's
+    #       epoch strike is stamped on every spec row before we split — both
+    #       sub-windows will carry the same resolved strike.
+    #   (b) _natural_spec_strikes is built before the split but the spot-adj
+    #       cascade falls back to `row["strike"]` for new split trade_ids — still
+    #       the same strike.
+    #
+    # If a future task moves this call BEFORE _apply_fixed_rollover_strike, or
+    # introduces any pass that mutates `strike`/`expiry` between the split and
+    # _apply_carry_slippage_guard, the boundary rows will no longer share the same
+    # key and slippage will be double-charged at the synthetic cut, silently
+    # corrupting P&L.  The test in test_leg_split_wiring.TestCarryGuardNumerical
+    # exercises this path numerically and would fail if the guard were bypassed.
     specs = apply_leg_filters(specs, payload.get("legs") or [], trading_days)
     if not specs:
         return []

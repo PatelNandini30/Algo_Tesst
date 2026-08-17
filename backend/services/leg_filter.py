@@ -351,6 +351,18 @@ def apply_leg_filters_split(
     5. Renumber trade_id sequentially (1-based) across the whole output list.
 
     See docs/superpowers/specs/2026-08-01-per-leg-filter-split-design.md.
+
+    LOAD-BEARING INVARIANT — pass ordering:
+    The cost-free boundary relies on the two split rows of a carried leg sharing
+    an IDENTICAL (strike, expiry) key.  This is only guaranteed when this
+    function runs AFTER _apply_fixed_rollover_strike (which resolves the epoch
+    strike that both sub-windows must share) and AFTER the initial spec list is
+    assembled with strikes already set.  If a later task reorders these passes so
+    that a carried leg's strike could DIFFER between sub-windows, the carry guard
+    (_apply_carry_slippage_guard) would treat the boundary as a real open/close
+    and charge slippage, breaking P&L conservation.  Any change to the call
+    ordering in engine_rust.py that touches `apply_leg_filters` must verify this
+    invariant is preserved.  See also the comment at the call site in engine_rust.py.
     """
     masked_legs: Dict[int, Dict[str, Any]] = {}
     for i, leg in enumerate(legs or []):

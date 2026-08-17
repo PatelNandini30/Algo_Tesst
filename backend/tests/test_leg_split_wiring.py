@@ -373,5 +373,138 @@ class TestSegClampedNotPropagated(unittest.TestCase):
         self.assertTrue(leg1_rows[1].get("_seg_clamped"), "_seg_clamped must be preserved on final split row")
 
 
+class TestCarryGuardNumerical(unittest.TestCase):
+    """
+    Numerical proof that _apply_carry_slippage_guard suppresses slippage at
+    a synthetic split boundary and that the two segments' P&L sums to the
+    unsplit P&L.
+
+    Uses pure synthetic dicts — NO market data, NO build_cache/warm_cache.
+
+    Scenario: SELL position, slippage_pct=0.5, lots=1.
+      - Market at entry E:   100  (raw)
+      - Market at boundary B: 90  (raw)
+      - Market at final exit X: 80 (raw)
+
+    Unsplit single-trade P&L (SELL: buy_back - sell_open, reversed sign):
+      entry_slipped = 100 * (1 - 0.005) = 99.5   (SELL entry: get less)
+      exit_slipped  =  80 * (1 + 0.005) = 80.4   (SELL exit: pay more)
+      pnl_unsplit   = (99.5 - 80.4) * 1 = 19.1
+
+    When naively split at B with slippage on BOTH sides of the boundary:
+      sub1: entry=99.5, exit=90*(1+0.005)=90.45  → pnl=(99.5-90.45)=9.05
+      sub2: entry=90*(1-0.005)=89.55, exit=80.4  → pnl=(89.55-80.4)=9.15
+      sum = 18.2  ← WRONG (0.9 drained at boundary)
+
+    After the guard suppresses slippage at the boundary (same strike/expiry):
+      sub1: entry=99.5  (slipped open), exit=90.0  (raw carry mark)
+      sub2: entry=90.0  (raw carry mark), exit=80.4 (slipped close)
+      sub1_pnl = (99.5 - 90.0) = 9.5
+      sub2_pnl = (90.0 - 80.4) = 9.6
+      sum = 19.1 == pnl_unsplit ✓
+
+    The negative case shows that if the two rows had DIFFERENT strikes, the
+    guard treats both as real open+close → slippage is NOT suppressed → the
+    boundary prices remain slipped (90.45 / 89.55) and the test detects it.
+    """
+
+    def _make_split_priced(self, same_strike: bool):
+        """
+        Return a list of two priced rows for the same leg, representing sub1
+        and sub2 of a split carried position.  If same_strike=False the second
+        row uses a different strike — the guard should NOT suppress slippage.
+
+        The rows have slippage already applied on both sides of the boundary
+        (as if the guard had not run), so the guard has something to undo.
+        """
+        strike1 = 12000.0
+        strike2 = 12000.0 if same_strike else 12050.0
+        # sub1: opens contract (is_open=True) and naively closes at boundary.
+        sub1 = {
+            "trade_id": 1,
+            "leg_id": 1,
+            "entry_date": "2020-01-02",
+            "exit_date": "2020-01-06",
+            "strike": strike1,
+            "expiry": "2020-01-09",
+            "position": "SELL",
+            "slippage_pct": 0.5,
+            "lots": 1,
+            "lot_size": 75,
+            "raw_entry_price": 100.0,
+            "entry_price": 99.5,    # 100 * (1 - 0.005) — correct slipped SELL entry
+            "raw_exit_price": 90.0,
+            "exit_price": 90.45,    # 90 * (1 + 0.005) — wrongly slipped exit (naïve)
+        }
+        # sub2: naively re-enters at boundary and closes at final exit.
+        sub2 = {
+            "trade_id": 2,
+            "leg_id": 1,
+            "entry_date": "2020-01-06",
+            "exit_date": "2020-01-09",
+            "strike": strike2,
+            "expiry": "2020-01-09",
+            "position": "SELL",
+            "slippage_pct": 0.5,
+            "lots": 1,
+            "lot_size": 75,
+            "raw_entry_price": 90.0,
+            "entry_price": 89.55,   # 90 * (1 - 0.005) — wrongly slipped entry (naïve)
+            "raw_exit_price": 80.0,
+            "exit_price": 80.4,     # 80 * (1 + 0.005) — correct slipped SELL exit
+        }
+        return [sub1, sub2]
+
+    def test_carry_suppresses_boundary_slippage(self):
+        """Same (strike, expiry): guard restores raw prices at the boundary."""
+        from backend.services.engine_rust import _apply_carry_slippage_guard
+        priced = self._make_split_priced(same_strike=True)
+        _apply_carry_slippage_guard(priced)
+        sub1, sub2 = priced[0], priced[1]
+        # sub1 is the open (real sell) → entry stays slipped
+        self.assertAlmostEqual(sub1["entry_price"], 99.5, places=4,
+                               msg="sub1 entry must stay slipped (real open)")
+        # sub1 is a middle carry (sub2 has same key) → exit restored to raw
+        self.assertAlmostEqual(sub1["exit_price"], 90.0, places=4,
+                               msg="sub1 exit must be raw at the carry boundary")
+        # sub2 is a middle carry → entry restored to raw
+        self.assertAlmostEqual(sub2["entry_price"], 90.0, places=4,
+                               msg="sub2 entry must be raw at the carry boundary")
+        # sub2 is the close (real buy-back) → exit stays slipped
+        self.assertAlmostEqual(sub2["exit_price"], 80.4, places=4,
+                               msg="sub2 exit must stay slipped (real close)")
+        # Boundary prices cancel: sub1.exit == sub2.entry
+        self.assertAlmostEqual(sub1["exit_price"], sub2["entry_price"], places=4,
+                               msg="boundary mark must cancel exactly")
+
+    def test_carry_pnl_equals_unsplit_pnl(self):
+        """Sum of the two split segments' P&L must equal the unsplit P&L."""
+        from backend.services.engine_rust import _apply_carry_slippage_guard
+        priced = self._make_split_priced(same_strike=True)
+        _apply_carry_slippage_guard(priced)
+        sub1, sub2 = priced[0], priced[1]
+        # SELL: pnl = (entry - exit) * lots
+        pnl1 = (sub1["entry_price"] - sub1["exit_price"]) * sub1["lots"]
+        pnl2 = (sub2["entry_price"] - sub2["exit_price"]) * sub2["lots"]
+        pnl_unsplit = (99.5 - 80.4) * 1  # 19.1
+        self.assertAlmostEqual(pnl1 + pnl2, pnl_unsplit, places=4,
+                               msg="split P&L must sum to unsplit P&L")
+
+    def test_negative_different_strikes_no_suppression(self):
+        """NEGATIVE CASE: different strikes → guard does NOT suppress slippage."""
+        from backend.services.engine_rust import _apply_carry_slippage_guard
+        priced = self._make_split_priced(same_strike=False)
+        _apply_carry_slippage_guard(priced)
+        sub1, sub2 = priced[0], priced[1]
+        # Both rows are real open+close (different strike keys) → slippage unchanged.
+        self.assertAlmostEqual(sub1["exit_price"], 90.45, places=4,
+                               msg="sub1 exit must remain slipped for a real close (different strikes)")
+        self.assertAlmostEqual(sub2["entry_price"], 89.55, places=4,
+                               msg="sub2 entry must remain slipped for a real open (different strikes)")
+        # Confirm boundary prices do NOT cancel (the test is real, not degenerate)
+        self.assertNotAlmostEqual(sub1["exit_price"], sub2["entry_price"], places=4,
+                                  msg="non-carry boundary must NOT cancel — proves the guard is active")
+
+
 if __name__ == "__main__":
     unittest.main()
