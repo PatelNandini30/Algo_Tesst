@@ -1047,5 +1047,283 @@ class TestCarriedSeg1EndTaggerSourceText(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Task 5: Downstream absorption + P&L conservation
+# ---------------------------------------------------------------------------
+
+class TestTask5PnLConservationSourceText(unittest.TestCase):
+    """
+    Sub-step 1 (P&L conservation).
+
+    The numerical proof that the carried leg's P&L sums correctly across
+    split segments is already in TestCarryGuardNumerical (3 tests above).
+    This class covers the two remaining claims that require source-text
+    inspection rather than numerical evaluation:
+
+    (a) Spot P&L: exactly ONE per split trade, on the lowest PRESENT leg.
+        The engine uses _lowest_leg_by_trade keyed by trade_id and
+        _spot_assigned to guard the first-writer rule.  After a split, each
+        sub-window has its OWN trade_id — so the guard assigns one Spot P&L
+        to each sub-window independently.  No code change needed.
+
+    (b) MAE/MFE: computed over each split window.
+        simulate_trades_batch receives specs whose entry_date / exit_date
+        are the sub-window boundaries.  The Rust pricer builds the holding
+        window as (entry_date, exit_date] per spec (simulate.rs:2590-2593),
+        so each split segment's MAE/MFE is windowed to its own sub-range
+        automatically.  No code change needed.
+    """
+
+    def _engine_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def _sim_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "native", "src", "simulate.rs"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def test_spot_pnl_keyed_by_trade_id_not_leg(self):
+        """_lowest_leg_by_trade is keyed on trade_id so each split sub-window
+        (which has its own trade_id) gets exactly one Spot P&L write."""
+        src = self._engine_src()
+        # Both the accumulator and the writer must reference trade_id
+        self.assertIn("_lowest_leg_by_trade", src)
+        self.assertIn("_spot_assigned", src)
+        # The guard that limits one write per trade uses the trade_id key
+        i_spot = src.index("_lowest_leg_by_trade")
+        block = src[i_spot:i_spot + 600]
+        self.assertIn("trade_id", block,
+                      "_lowest_leg_by_trade loop must read trade_id")
+        self.assertIn("_spot_assigned", block,
+                      "_spot_assigned must appear in the same block")
+
+    def test_spot_pnl_assigned_once_per_trade_id(self):
+        """_spot_assigned.add(_row_tid) ensures only one Spot P&L per trade_id.
+        After a split, each sub-window has a distinct trade_id, so each
+        sub-window independently gets exactly one Spot P&L row."""
+        src = self._engine_src()
+        # The assignment and the guard must both reference _row_tid
+        self.assertIn("_spot_assigned.add(_row_tid)", src,
+                      "engine must add trade_id to _spot_assigned after first write")
+        self.assertIn("_row_tid not in _spot_assigned", src,
+                      "engine must guard Spot P&L writes with _row_tid not in _spot_assigned")
+
+    def test_mae_mfe_windowed_by_entry_exit_date(self):
+        """The Rust holding window is built from entry_date / exit_date of each
+        spec.  Split specs carry the sub-window dates, so MAE/MFE is naturally
+        computed over each split window without any extra code."""
+        sim = self._sim_src()
+        # The holding-window comment names entry and exit explicitly
+        self.assertIn("entry_date", sim)
+        self.assertIn("exit_date", sim)
+        # The literal window filter is the canonical gate
+        self.assertIn('d.as_str() > entry_date.as_str() && d.as_str() <= exit_date.as_str()',
+                      sim,
+                      "simulate.rs holding window must be (entry_date, exit_date]")
+
+
+class TestTask5SpotAdjGuard(unittest.TestCase):
+    """
+    Sub-step 2: Spot-adjustment cascade guard coverage for split rows.
+
+    Three scenarios — no code change was needed in any of them.  Each test
+    records the source-text evidence that the existing guard already handles
+    the split path correctly.
+
+    Scenario A — exit-split, filtered leg (e.g. leg 2) truncated at range end:
+        _leg_filter_end=True → in _leg_filter_end_keys → _leg_was_truncated
+        returns True → cascade skips leg 2.  The guard path is unchanged from
+        the pre-split subtraction-only behaviour.
+
+    Scenario B — entry-split, carried leg (leg 1) seg-1:
+        NOT in _leg_filter_end_keys (CARRIED_SEG1_END_KEY is separate;
+        _leg_was_truncated only reads _leg_filter_bounds → _leg_filter_end_keys).
+        This is CORRECT: leg 1 is not truncated.  It runs to natural expiry in
+        seg-2 and SHOULD be eligible for cascade re-entry in that segment.
+
+    Scenario C — entry-split, fresh mid-cycle entry of filtered leg (leg 2)
+        that runs to natural expiry (not truncated at range end):
+        NOT in _leg_filter_end_keys because no _leg_filter_end was set (line 562
+        of leg_filter.py pops it).  The cascade CAN re-enter this leg — correct,
+        because the sub-window containing the fresh entry is within leg 2's own
+        range, so a re-entry stays within the range by definition.
+    """
+
+    def _engine_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def _filter_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "leg_filter.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def test_guard_reads_only_leg_filter_end_keys(self):
+        """_leg_was_truncated returns True iff the row's (expiry, leg_id) is in
+        _leg_filter_end_keys (via _leg_filter_bounds).  The carried-leg dict
+        _carried_seg_end_keys is deliberately excluded so carried seg-2 is
+        not blocked from cascade re-entry."""
+        src = self._engine_src()
+        i_func = src.index("def _leg_was_truncated(")
+        func_block = src[i_func:i_func + 600]
+        self.assertIn("_leg_filter_bounds", func_block,
+                      "_leg_was_truncated must check _leg_filter_bounds")
+        self.assertNotIn("_carried_seg_end_keys", func_block,
+                         "_leg_was_truncated must NOT read _carried_seg_end_keys")
+
+    def test_truncated_filtered_leg_in_leg_filter_end_keys(self):
+        """A filtered leg truncated at its range end has _leg_filter_end=True in
+        the spec, so it lands in _leg_filter_end_keys — the existing guard fires
+        and skips it in the cascade (Scenario A)."""
+        src = self._filter_src()
+        # leg_filter.py sets _leg_filter_end on the truncated filtered-leg row
+        self.assertIn('"_leg_filter_end"', src,
+                      "leg_filter.py must set the _leg_filter_end key")
+        # Confirmed: lines 560/572 set _leg_filter_end=True when truncated=True
+        i_trunc = src.index("row[\"_leg_filter_end\"] = True")
+        # Must appear inside a `if truncated:` branch
+        context = src[max(0, i_trunc - 100):i_trunc + 80]
+        self.assertIn("truncated", context,
+                      "_leg_filter_end must be set inside a truncated branch")
+
+    def test_fresh_mid_cycle_no_leg_filter_end_when_not_truncated(self):
+        """A fresh mid-cycle entry that runs to natural sub-window end (not
+        truncated) does NOT have _leg_filter_end set — leg_filter.py pops it.
+        So _leg_was_truncated returns False and cascade re-entry is allowed
+        (correct — the sub-window is within the leg's range, Scenario C)."""
+        src = self._filter_src()
+        # leg_filter.py explicitly pops _leg_filter_end when not truncated
+        self.assertIn('row.pop("_leg_filter_end", None)', src,
+                      "leg_filter.py must pop _leg_filter_end on non-truncated fresh entry")
+
+    def test_carried_leg_never_in_leg_filter_end_keys(self):
+        """The carried (unfiltered) leg is never marked _leg_filter_end.
+        _carried_seg1_end is a separate key that doesn't feed _leg_filter_end_keys
+        — so _leg_was_truncated returns False for both carried seg-1 and seg-2,
+        allowing cascade re-entry for the continuing contract (Scenario B)."""
+        src = self._engine_src()
+        # _leg_filter_end_keys is built from specs where _leg_filter_end is set
+        i_build = src.index("_leg_filter_end_keys: Dict[")
+        build_block = src[i_build:i_build + 300]
+        self.assertIn('_s.get("_leg_filter_end")', build_block,
+                      "_leg_filter_end_keys must only be populated from _leg_filter_end specs")
+        # Carried-seg key must go to _carried_seg_end_keys, not _leg_filter_end_keys
+        self.assertNotIn("CARRIED_SEG1_END_KEY", build_block,
+                         "_leg_filter_end_keys build block must not read CARRIED_SEG1_END_KEY")
+
+
+class TestTask5WowMomPatchwise(unittest.TestCase):
+    """
+    Sub-step 3: WOW/MOM and patch-wise bucketing of split rows.
+
+    No code change was needed.  Three source-text proofs below.
+
+    WOW bucketing (wow_mom.py:256-264): uses Cadence Expiry or Expiry (not Exit
+    Date) for the week identity — except under YEARLY where Exit Date is used.
+    A split segment's Expiry is the same contract as the parent trade's (the
+    carried leg uses the same contract; the fresh mid-cycle entry uses the same
+    expiry copied from the original spec in leg_filter.py:553-558).  So all
+    split segments bucket to the same ISO week as the parent.  Under YEARLY the
+    split sub-window's Exit Date is within the parent's window, placing it in
+    the same or an adjacent week — still correct, since YEARLY splits respect
+    the original expiry contract boundary.
+
+    MOM bucketing (wow_mom.py:270-284): by Exit Date year/month.  A split
+    segment's Exit Date is the sub-window end, which is between the parent's
+    entry and exit — within the same month in virtually all real cases (a weekly
+    contract is 7 days; a filter boundary that crosses a month boundary would
+    generate sub-windows in different months, which IS the desired behaviour for
+    MOM: each sub-window's P&L is attributed to its own month).
+
+    Patchwise reset (summary_metrics.rs:326-329): a patch boundary is detected
+    by FILTER_END in the previous trade's exit_reason (or by filter_segments
+    segment start comparison).  Split rows are tagged LEG_FILTER_END (not
+    FILTER_END), so they do NOT trigger a patch reset.  This is correct: the
+    per-leg filter's range boundary is not a strategy-patch boundary.
+    """
+
+    def _wow_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "optimizer", "wow_mom.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def _rs_src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "native", "src", "summary_metrics.rs"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def test_wow_buckets_by_expiry_not_patch_id(self):
+        """WOW bucketing uses Cadence Expiry (or Expiry) as the week source.
+        No patch ID is involved: split segments sharing the same Expiry
+        automatically land in the same ISO week."""
+        src = self._wow_src()
+        self.assertIn('t.get("Cadence Expiry") or t.get("Expiry")', src,
+                      "WOW must bucket by Cadence Expiry / Expiry, not by patch ID")
+
+    def test_mom_buckets_by_exit_date(self):
+        """MOM bucketing is by Exit Date year/month.  A split segment's Exit Date
+        is within the parent trade's window, so it maps to the correct month."""
+        src = self._wow_src()
+        self.assertIn('t.get("Exit Date")', src,
+                      "MOM must bucket by Exit Date")
+
+    def test_patchwise_reset_on_filter_end_not_leg_filter_end(self):
+        """The Rust patchwise loop only resets on FILTER_END, not on LEG_FILTER_END.
+        Split segments tagged LEG_FILTER_END therefore do NOT trigger a patch reset —
+        the per-leg range boundary is not a strategy-patch boundary."""
+        src = self._rs_src()
+        # The exact string checked in the Rust reset guard
+        self.assertIn('"FILTER_END"', src,
+                      "summary_metrics.rs must check for FILTER_END")
+        # LEG_FILTER_END must NOT appear in the patchwise reset logic
+        i_reset = src.index('"FILTER_END"')
+        context = src[max(0, i_reset - 200):i_reset + 200]
+        self.assertNotIn("LEG_FILTER_END", context,
+                         "patchwise reset context must not check LEG_FILTER_END — "
+                         "only strategy-patch boundaries (FILTER_END) reset the patch")
+
+    def test_split_segment_expiry_matches_parent(self):
+        """Structural: after a split, the carried leg's sub-windows share the same
+        expiry as the original spec — confirmed by the split invariant tests above
+        (test_unfiltered_leg_same_strike_and_expiry).  This cross-reference test
+        ensures the carried-leg expiry invariant feeds WOW correctly."""
+        specs = [
+            _spec(1, 1, "2020-01-02", "2020-01-09", expiry="2020-01-09"),
+            _spec(1, 2, "2020-01-02", "2020-01-09", expiry="2020-01-09"),
+        ]
+        legs = [
+            _leg(),
+            _leg(filter_segments=[{"start": "2020-01-06", "end": "2020-01-31"}]),
+        ]
+        result = apply_leg_filters_split(specs, legs, TRADING_DAYS)
+        leg1_rows = [r for r in result if r["leg_id"] == 1]
+        expiries = {r["expiry"] for r in leg1_rows}
+        self.assertEqual(len(expiries), 1,
+                         "all carried-leg split segments must share the same Expiry "
+                         "so WOW buckets them into the same ISO week")
+        self.assertEqual(expiries.pop(), "2020-01-09")
+
+
 if __name__ == "__main__":
     unittest.main()
