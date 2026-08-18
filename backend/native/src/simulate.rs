@@ -685,6 +685,236 @@ fn build_rollover_schedule_pinned(
     out
 }
 
+/// One leg's slot within a per-leg-rollover trade row (see
+/// `build_rollover_schedule_per_leg`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PerLegSlot {
+    /// Contract this leg holds for this row — the pinned December for a YEARLY
+    /// leg, otherwise its own cadence expiry.
+    contract: String,
+    /// True when this row's start IS this leg's own roll boundary → the leg
+    /// re-picks (subject to its Fresh/Fixed epoch rule). False ⇒ the leg carries
+    /// its epoch strike, marked-to-market over this sub-segment.
+    own_boundary: bool,
+    /// New yearly cycle for this leg — only meaningful together with
+    /// `own_boundary`.
+    new_cycle: bool,
+    /// PER-LEG SPOT-ADJUSTMENT (Phase 4): this row's START is one of THIS leg's
+    /// breach dates ⇒ force a FRESH re-strike here regardless of the epoch rule.
+    /// False on every non-spot-adj leg ⇒ the No-Adjustment path is unchanged.
+    breach_spot_adj: bool,
+    /// FILTER SEGMENT START: this row's START is a filter segment open that fell
+    /// MID-HOLD (not on any leg's own roll). The non-per-leg path enters the
+    /// active contract FRESH at the segment start; per-leg must mirror that, so
+    /// force a fresh ATM re-strike here even though it is not this leg's own
+    /// boundary. Empty seg_starts (no filter) ⇒ always false ⇒ path unchanged.
+    seg_start_entry: bool,
+}
+
+/// PER-LEG ROLLOVER scheduler — the N-cadence generalization of
+/// `build_rollover_schedule_pinned`. Each leg rolls on its OWN expiry cadence +
+/// OWN exit T-n; trade-row boundaries are the sorted UNION of every leg's roll
+/// dates. For each row, each leg is tagged with the contract it holds and whether
+/// this row's start is that leg's own boundary (roll) or not (carry).
+///
+/// Semantics locked with the user (worked Feb–Mar 2026 example):
+///   * Every leg is HELD from `run_start`; its first pick happens at run_start.
+///   * Thereafter a leg rolls only at its OWN exit T-n (`trading_day_before(exp,
+///     exit_dte)`). Entry is always the previous roll — so per-leg ENTRY T-n is
+///     moot under rollover and only per-leg EXIT T-n is an input.
+///   * A leg mid-hold when ANOTHER leg rolls simply CARRIES (own_boundary=false),
+///     exactly like a pinned yearly leg carries across weekly rows today.
+///
+/// Rows are emitted only while ALL legs are active (a complete multi-leg trade);
+/// tail rows where a leg has run out of listed expiries are dropped, matching the
+/// atomic-commit rule in `resolve_trade_specs_core`.
+///
+/// This function is pure and independently unit-tested; it is wired into the
+/// resolve path behind the `per_leg_rollover` flag (OFF ⇒ never called).
+#[allow(dead_code)]
+fn build_rollover_schedule_per_leg(
+    run_start: &str,
+    leg_expiries: &[Vec<String>],
+    leg_exit_dte: &[u32],
+    leg_cycles: &[Option<Vec<YearlyCycle>>],
+    leg_breach_dates: &[Vec<String>],
+    seg_starts: &[String],
+    trading_days: &[String],
+) -> Vec<(i64, String, String, Vec<PerLegSlot>)> {
+    let n = leg_expiries.len();
+    let mut out: Vec<(i64, String, String, Vec<PerLegSlot>)> = Vec::new();
+    if n == 0 || trading_days.is_empty() {
+        return out;
+    }
+
+    // 1. Per-leg contiguous segments (entry, exit, contract, new_cycle), built
+    //    directly from each leg's own exit T-n. The segment ending at exit_k
+    //    trades the contract expiring at exp_k; the first segment holds the leg
+    //    from run_start on its first tradeable contract.
+    let mut leg_segs: Vec<Vec<(String, String, String, bool)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut exps = leg_expiries[i].clone();
+        exps.sort();
+        // (exit_date, contract) for each expiry whose exit falls after run_start.
+        let mut exits: Vec<(String, String)> = Vec::new();
+        for exp in &exps {
+            let exit = match trading_day_before(exp, leg_exit_dte[i], trading_days) {
+                Some(v) => v,
+                None => continue,
+            };
+            if exit.as_str() <= run_start {
+                continue;
+            }
+            let contract = match &leg_cycles[i] {
+                Some(cyc) => match cycle_for_exit(cyc, &exit) {
+                    Some(c) => c.contract.clone(),
+                    None => continue, // past the last pinnable December
+                },
+                None => exp.clone(),
+            };
+            exits.push((exit, contract));
+        }
+        exits.sort();
+        exits.dedup_by(|a, b| a.0 == b.0);
+
+        // NOTE: the first segment [run_start, exit_1) is the FRONT-MONTH stub.
+        // It is retained here so every leg stays ACTIVE from run_start — that
+        // coverage is what makes a foreign leg's early rows "complete" in the
+        // multi-leg union. It must NOT, however, be emitted as its own trade row
+        // (see the run_start-row skip in the emission loop below): under rollover
+        // no leg enters at an arbitrary run_start; the pinned same-day chain
+        // 0-DTE-skips the front-month and enters on exit_1 holding the NEXT
+        // contract. Emitting the stub as a trade invented an extra opening trade
+        // that shifted every downstream row and broke single-leg per-leg == normal.
+        let mut segs: Vec<(String, String, String, bool)> = Vec::new();
+        let mut prev = run_start.to_string();
+        let mut prev_contract: Option<String> = None;
+        for (exit, contract) in exits {
+            if exit.as_str() <= prev.as_str() {
+                continue;
+            }
+            let new_cycle = prev_contract.as_deref() != Some(contract.as_str());
+            segs.push((prev.clone(), exit.clone(), contract.clone(), new_cycle));
+            prev = exit;
+            prev_contract = Some(contract);
+        }
+        leg_segs.push(segs);
+    }
+
+    // 2. Union of all segment start dates = candidate row boundaries, plus a
+    //    terminal boundary (the latest last-exit) so the final row has an end.
+    let mut bounds: Vec<String> = leg_segs
+        .iter()
+        .flat_map(|s| s.iter().map(|seg| seg.0.clone()))
+        .collect();
+    if let Some(term) = leg_segs
+        .iter()
+        .filter_map(|s| s.last().map(|seg| seg.1.clone()))
+        .max()
+    {
+        bounds.push(term);
+    }
+    // PER-LEG SPOT-ADJUSTMENT: each leg's breach dates become extra union
+    // boundaries (a breach on leg A starts a new row; other legs carry there).
+    // Only keep breaches strictly inside (run_start, term); a breach at or past
+    // the terminal boundary has no row to open. Empty for every non-spot-adj leg
+    // ⇒ these merges are inert on the No-Adjustment path.
+    for bd in leg_breach_dates {
+        for d in bd {
+            if d.as_str() > run_start {
+                bounds.push(d.clone());
+            }
+        }
+    }
+    // FILTER SEGMENT STARTS: each segment open becomes an extra union boundary so
+    // a row starts ON the segment open holding whatever contract is active there
+    // — mirroring the non-per-leg path, which enters the active contract fresh at
+    // the segment start. Only keep starts strictly inside (run_start, term); one
+    // at/before run_start (the run's own first day) or at/after the terminal
+    // boundary opens no coverable row. A start that already coincides with a leg
+    // roll/breach dedups away and stays that leg's OWN boundary. Empty (no filter)
+    // ⇒ inert. Callers pass starts already snapped to trading days.
+    for d in seg_starts {
+        if d.as_str() > run_start {
+            bounds.push(d.clone());
+        }
+    }
+    bounds.sort();
+    bounds.dedup();
+    if bounds.len() < 2 {
+        return out;
+    }
+    // O(1) "does this row START on a filter segment open" lookup. A leg whose own
+    // segment covers this row but does NOT own this boundary must still re-strike
+    // fresh here (the position is re-entered at the filter open), so this flag
+    // forces Fresh in the resolver just like a breach does.
+    let seg_start_set: std::collections::HashSet<&str> =
+        seg_starts.iter().map(|s| s.as_str()).collect();
+
+    // Per-leg breach sets for O(1) "does this row START breach for leg i" lookup.
+    let breach_sets: Vec<std::collections::HashSet<&str>> = (0..n)
+        .map(|i| {
+            leg_breach_dates
+                .get(i)
+                .map(|v| v.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    // 3. Emit a row per [bound, next_bound) where ALL legs are active.
+    let mut trade_id: i64 = 0;
+    for w in bounds.windows(2) {
+        let (start, end) = (&w[0], &w[1]);
+        // Skip the FRONT-MONTH opening window [run_start, first_bound). No leg
+        // enters at run_start under rollover (the pinned same-day chain 0-DTE-
+        // skips the front-month and enters on the first roll instead); emitting
+        // it invented a spurious opening trade and shifted every downstream row,
+        // breaking single-leg per-leg == normal. The front segment is still in
+        // `leg_segs` so every leg stays ACTIVE from run_start — that only affects
+        // COVERAGE (foreign legs' early rows), never adds a run_start trade.
+        // Breach dates are always > run_start (see the merge above), so no
+        // spot-adj boundary is dropped here.
+        if start.as_str() == run_start {
+            continue;
+        }
+        let mut slots: Vec<PerLegSlot> = Vec::with_capacity(n);
+        let mut complete = true;
+        for (li, segs) in leg_segs.iter().enumerate() {
+            match segs
+                .iter()
+                .find(|(e, x, _, _)| e.as_str() <= start.as_str() && start.as_str() < x.as_str())
+            {
+                Some((e, _x, contract, nc)) => {
+                    let own = e.as_str() == start.as_str();
+                    slots.push(PerLegSlot {
+                        contract: contract.clone(),
+                        own_boundary: own,
+                        new_cycle: *nc && own,
+                        breach_spot_adj: breach_sets[li].contains(start.as_str()),
+                        // A segment-open boundary that is NOT this leg's own roll
+                        // still re-enters the active contract fresh (mirrors the
+                        // non-per-leg fixed-entry segment start). When it DOES
+                        // coincide with the leg's own roll, own_boundary already
+                        // drives the (Fresh/Fixed) re-strike, so only flag the
+                        // mid-hold case to avoid double semantics.
+                        seg_start_entry: !own && seg_start_set.contains(start.as_str()),
+                    });
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            trade_id += 1;
+            out.push((trade_id, start.clone(), end.clone(), slots));
+        }
+    }
+    out
+}
+
 /// Closest-premium picker matching the Python engine's tie-breaking.
 ///
 /// Primary key: |premium - target| (closer wins)
@@ -1424,6 +1654,153 @@ pub(crate) struct ResolveCfg {
     /// existing (weekly/monthly) path — the contract is then the cadence
     /// element, exactly as before.
     yearly_cycles: Option<Vec<YearlyCycle>>,
+    /// PER-LEG ROLLOVER (opt-in). False on every existing path ⇒ the four fields
+    /// below are empty and `resolve_trade_specs_core` never takes the union
+    /// branch, so behaviour is byte-identical to today.
+    per_leg_rollover: bool,
+    /// Index-aligned to `legs`: each leg's OWN cadence expiry list.
+    leg_rollover_expiries: Vec<Vec<String>>,
+    /// Index-aligned to `legs`: each leg's OWN exit T-n.
+    leg_exit_dte: Vec<u32>,
+    /// Index-aligned to `legs`: pinned December cycles for a YEARLY leg, else None.
+    leg_cycles: Vec<Option<Vec<YearlyCycle>>>,
+    /// PER-LEG SPOT-ADJUSTMENT (opt-in). Index-aligned to `legs`: each leg's own
+    /// breach dates (Python-computed). Empty per leg ⇒ no forced re-strike, so the
+    /// No-Adjustment path is byte-identical.
+    leg_breach_dates: Vec<Vec<String>>,
+    /// PER-LEG ROLLOVER + FILTER: filter segment START dates (trading-day-snapped
+    /// by Python), injected as extra union boundaries so a filter that opens
+    /// mid-contract enters the active contract fresh at the open — mirroring the
+    /// non-per-leg path. Empty with no filter ⇒ inert.
+    seg_starts: Vec<String>,
+}
+
+/// PER-LEG ROLLOVER resolve loop. Drives trade rows off the union scheduler
+/// (`build_rollover_schedule_per_leg`); for each row, each leg either ROLLS at
+/// its own boundary (re-pick subject to its Fresh/Fixed epoch rule) or CARRIES
+/// its epoch strike (re-validated against this entry, marked-to-market by the
+/// sim over the sub-segment). Reuses the exact same helpers as the pinned path
+/// — `opens_new_epoch`, `compute_strike_for_leg`, `validate_or_shift_strike` —
+/// so there is no new strike/pricing logic; only the schedule shape is new.
+fn resolve_per_leg_core(
+    cfg: &ResolveCfg,
+    td: &[String],
+    spot_by_date: &HashMap<String, f64>,
+) -> Vec<TradeSpec> {
+    let mut out: Vec<TradeSpec> = Vec::new();
+    if cfg.legs.is_empty() || td.is_empty() {
+        return out;
+    }
+    // All legs are held from the first trading day; each rolls on its own T-n.
+    let run_start = td[0].clone();
+    let schedule = build_rollover_schedule_per_leg(
+        &run_start,
+        &cfg.leg_rollover_expiries,
+        &cfg.leg_exit_dte,
+        &cfg.leg_cycles,
+        &cfg.leg_breach_dates,
+        &cfg.seg_starts,
+        td,
+    );
+
+    // Per-leg strike epochs + per-leg previous OWN-entry anchor (the pinned path
+    // keeps a single shared anchor because it has one cadence; here every leg
+    // rolls on its own schedule, so both maps are keyed by leg_id).
+    let mut epoch_strike: HashMap<i64, f64> = HashMap::new();
+    let mut prev_own_entry: HashMap<i64, String> = HashMap::new();
+
+    'row: for (trade_id, entry_date, exit_date, slots) in &schedule {
+        let entry_spot = match spot_by_date.get(entry_date) {
+            Some(&v) if v > 0.0 => v,
+            _ => continue,
+        };
+        // Defensive: the scheduler only emits rows where every leg is active.
+        if slots.len() != cfg.legs.len() {
+            continue;
+        }
+        let mut buf: Vec<TradeSpec> = Vec::with_capacity(cfg.legs.len());
+        let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
+        for (leg_idx, leg) in cfg.legs.iter().enumerate() {
+            let leg_id = (leg_idx + 1) as i64;
+            let slot = &slots[leg_idx];
+            let leg_expiry = &slot.contract;
+
+            // Roll (own boundary) ⇒ epoch rule decides Fresh vs carry.
+            // Carry (foreign boundary, i.e. a row created because ANOTHER leg
+            // rolled) ⇒ reuse the epoch strike, marked-to-market: a non-rolling
+            // leg HOLDS its strike between its OWN rolls (the per-leg-rollover
+            // carry spec / calendar-spread convention), re-striking only on its
+            // own roll/breach — never because a foreign leg re-booked.
+            // PER-LEG SPOT-ADJUSTMENT: a breach at this row's START forces a FRESH
+            // re-strike (ATM at the breach-day spot) regardless of own_boundary or
+            // the epoch/Fresh-Fixed rule. False on every non-spot-adj leg.
+            let fresh = if slot.breach_spot_adj || slot.seg_start_entry {
+                true
+            } else if slot.own_boundary {
+                match prev_own_entry.get(&leg_id) {
+                    None => true, // first own-entry always resolves fresh
+                    Some(prev) => opens_new_epoch(
+                        leg.rollover_strike_mode, prev, entry_date, slot.new_cycle, leg.is_yearly,
+                    ),
+                }
+            } else {
+                false
+            };
+
+            let (strike, requested_strike) = match (fresh, epoch_strike.get(&leg_id).copied()) {
+                (false, Some(carried)) => {
+                    // Carry-over is RE-VALIDATED against this entry date + this
+                    // contract, never blindly reused (long-dated strikes can go
+                    // unlisted/illiquid). Same as the pinned carry.
+                    let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
+                    let is_call = matches!(
+                        leg.option_type.to_ascii_uppercase().as_str(), "CE" | "CALL" | "C"
+                    );
+                    match validate_or_shift_strike(
+                        carried, atm, leg.strike_interval, is_call, entry_date, leg_expiry,
+                        &cfg.index, &leg.option_type, cfg.strike_shift_max,
+                    ) {
+                        Some((s, _shifts)) => (s, carried),
+                        None => continue 'row,
+                    }
+                }
+                _ => match compute_strike_for_leg(
+                    leg, entry_date, leg_expiry, &cfg.index, entry_spot, cfg.strike_shift_max, &resolved,
+                ) {
+                    Some(v) => v,
+                    None => continue 'row,
+                },
+            };
+
+            epoch_strike.insert(leg_id, strike);
+            resolved.insert(leg_id, strike);
+            buf.push(TradeSpec {
+                trade_id: *trade_id,
+                leg_id,
+                index: cfg.index.clone(),
+                entry_date: entry_date.clone(),
+                exit_date: exit_date.clone(),
+                expiry: leg_expiry.clone(),
+                strike: round2(strike),
+                requested_strike: round2(requested_strike),
+                strike_interval: leg.strike_interval,
+                option_type: leg.option_type.clone(),
+                position: leg.position.clone(),
+                lots: leg.lots,
+                lot_size: cfg.lot_size,
+                slippage_pct: cfg.slippage_pct,
+            });
+        }
+        out.extend(buf);
+        // Advance the OWN-entry anchor only for legs that rolled this row, and
+        // only for a trade that actually emitted (a `continue 'row` skips this).
+        for (leg_idx, slot) in slots.iter().enumerate() {
+            if slot.own_boundary {
+                prev_own_entry.insert((leg_idx + 1) as i64, entry_date.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Pure-Rust core of `resolve_trade_specs` — no PyO3, no GIL. Enumerates
@@ -1445,6 +1822,13 @@ pub(crate) fn resolve_trade_specs_core(
 
     let mut td: Vec<String> = trading_days.to_vec();
     td.sort();
+
+    // PER-LEG ROLLOVER — opt-in union scheduler. Gated: false on every existing
+    // path, so nothing below the branch is reachable for legacy runs.
+    if cfg.per_leg_rollover {
+        return resolve_per_leg_core(cfg, &td, spot_by_date);
+    }
+
     let mut expiries_sorted: Vec<String> = expiry_dates.to_vec();
     expiries_sorted.sort();
 
@@ -1679,6 +2063,75 @@ pub fn resolve_trade_specs(
         0
     };
 
+    // ── PER-LEG ROLLOVER extraction (opt-in) ─────────────────────────────────
+    // Python injects each leg's OWN cadence expiry list (`_rollover_expiries`),
+    // its own exit T-n (`exit_dte`, falling back to the global one), and — for a
+    // YEARLY leg — its pinned December cycles (`_rollover_cycles`). Empty on every
+    // existing path (flag false), so the union branch is unreachable there.
+    let per_leg_rollover = payload
+        .get_item("per_leg_rollover").ok().flatten()
+        .and_then(|v| v.extract::<bool>().ok())
+        .unwrap_or(false);
+    let (leg_rollover_expiries, leg_exit_dte, leg_cycles, leg_breach_dates): (
+        Vec<Vec<String>>, Vec<u32>, Vec<Option<Vec<YearlyCycle>>>, Vec<Vec<String>>,
+    ) = if per_leg_rollover {
+        let legs_any = payload.get_item("legs").ok().flatten().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("per_leg_rollover set but payload has no 'legs'")
+        })?;
+        let legs_list = legs_any.downcast::<PyList>()?;
+        let mut exps: Vec<Vec<String>> = Vec::with_capacity(legs_list.len());
+        let mut xdtes: Vec<u32> = Vec::with_capacity(legs_list.len());
+        let mut cycs: Vec<Option<Vec<YearlyCycle>>> = Vec::with_capacity(legs_list.len());
+        let mut brs: Vec<Vec<String>> = Vec::with_capacity(legs_list.len());
+        for (i, item) in legs_list.iter().enumerate() {
+            let leg = item.downcast::<PyDict>()?;
+            let e: Vec<String> = leg
+                .get_item("_rollover_expiries").ok().flatten()
+                .and_then(|v| v.extract::<Vec<String>>().ok())
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!(
+                    "per_leg_rollover: leg {} missing '_rollover_expiries' (Python must inject \
+                     each leg's own cadence expiry list)", i)))?;
+            let x: u32 = leg
+                .get_item("exit_dte").ok().flatten()
+                .and_then(|v| v.extract::<u32>().ok())
+                .unwrap_or(exit_dte);
+            let c: Option<Vec<YearlyCycle>> = match leg.get_item("_rollover_cycles").ok().flatten() {
+                Some(v) if !v.is_none() => {
+                    let list = v.downcast::<PyList>().map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "per_leg_rollover: leg {} '_rollover_cycles' must be a list", i))
+                    })?;
+                    let mut cc: Vec<YearlyCycle> = Vec::with_capacity(list.len());
+                    for row in list.iter() {
+                        let d = row.downcast::<PyDict>()?;
+                        let contract = extract_str(d, "contract");
+                        let start = extract_str(d, "start");
+                        let end = extract_str(d, "end");
+                        if contract.is_empty() || start.is_empty() || end.is_empty() {
+                            continue;
+                        }
+                        cc.push(YearlyCycle { contract, start, end });
+                    }
+                    if cc.is_empty() { None } else { Some(cc) }
+                }
+                _ => None,
+            };
+            // PER-LEG SPOT-ADJUSTMENT: Python-computed breach dates. Absent/None
+            // ⇒ empty vec ⇒ no forced re-strike (No-Adjustment path unchanged).
+            let br: Vec<String> = leg
+                .get_item("_spot_adj_breaches").ok().flatten()
+                .and_then(|v| v.extract::<Vec<String>>().ok())
+                .unwrap_or_default();
+            exps.push(e);
+            xdtes.push(x);
+            cycs.push(c);
+            brs.push(br);
+        }
+        (exps, xdtes, cycs, brs)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    };
+
     // YEARLY pins the contract to a December expiry; the cadence list only
     // drives entry/exit. Python resolves the cycles (they are expiry_calendar
     // rows + a T-n month offset against the trading calendar — neither of which
@@ -1688,7 +2141,10 @@ pub fn resolve_trade_specs(
     // leave leg_expiry = cur_exp, producing a plausible-but-wrong tradesheet
     // that trades the CADENCE contract. That is worse than the silent disable
     // this gate used to do. Never guess the pin.
-    let yearly_cycles: Option<Vec<YearlyCycle>> = if etype == "YEARLY" {
+    // Per-leg rollover carries its cycles PER LEG (`leg_cycles`), so the
+    // strategy-level YEARLY pin/gate does not apply — a per-leg run's top-level
+    // expiry_type is a mix, not a single YEARLY.
+    let yearly_cycles: Option<Vec<YearlyCycle>> = if etype == "YEARLY" && !per_leg_rollover {
         match extract_yearly_cycles(payload)? {
             Some(c) if !c.is_empty() => Some(c),
             _ => {
@@ -1709,9 +2165,23 @@ pub fn resolve_trade_specs(
         ));
     }
 
+    // PER-LEG ROLLOVER + FILTER: Python injects `_per_leg_seg_starts` — the filter
+    // segment opens already snapped to trading days. Only read under per_leg_rollover
+    // (absent/empty otherwise ⇒ inert), so no existing path is touched.
+    let seg_starts: Vec<String> = if per_leg_rollover {
+        payload
+            .get_item("_per_leg_seg_starts").ok().flatten()
+            .and_then(|v| v.extract::<Vec<String>>().ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let cfg = ResolveCfg {
         legs, index, entry_dte, exit_dte, slippage_pct, strike_shift_max,
         rollover_active, rollover_min_days, lot_size, yearly_cycles,
+        per_leg_rollover, leg_rollover_expiries, leg_exit_dte, leg_cycles,
+        leg_breach_dates, seg_starts,
     };
 
     // Pure-Rust resolution — no Python objects touched, so release the GIL.
@@ -2425,6 +2895,172 @@ mod rollover_schedule_tests {
         for r in &out {
             assert_eq!(r.3, r.4, "unpinned: leg_expiry must equal cur_exp");
         }
+    }
+
+    // Feb–Mar 2026 weekdays — dense enough for weekly T-1 and monthly T-7.
+    fn weekdays_feb_mar_2026() -> Vec<String> {
+        let mut v: Vec<String> = [
+            "2026-02-02","2026-02-03","2026-02-04","2026-02-05","2026-02-06",
+            "2026-02-09","2026-02-10","2026-02-11","2026-02-12","2026-02-13",
+            "2026-02-16","2026-02-17","2026-02-18","2026-02-19","2026-02-20",
+            "2026-02-23","2026-02-24","2026-02-25","2026-02-26","2026-02-27",
+            "2026-03-02","2026-03-03","2026-03-04","2026-03-05","2026-03-06",
+            "2026-03-09","2026-03-10","2026-03-11","2026-03-12","2026-03-13",
+            "2026-03-16","2026-03-17","2026-03-18","2026-03-19","2026-03-20",
+            "2026-03-23","2026-03-24","2026-03-25","2026-03-26","2026-03-27",
+            "2026-03-30","2026-03-31",
+        ].iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn find_row<'a>(
+        rows: &'a [(i64, String, String, Vec<PerLegSlot>)],
+        start: &str,
+    ) -> &'a (i64, String, String, Vec<PerLegSlot>) {
+        rows.iter().find(|r| r.1 == start).unwrap_or_else(|| panic!("no row starting {start}"))
+    }
+
+    /// PER-LEG ROLLOVER: weekly leg (T-1) + monthly leg (T-7). Trade boundaries
+    /// are the UNION of both legs' rolls; the weekly leg CARRIES across the
+    /// monthly boundary (17-Feb) while the monthly leg rolls, exactly as agreed.
+    #[test]
+    fn per_leg_union_carry_across_foreign_boundary() {
+        let td = weekdays_feb_mar_2026();
+        let weekly = vec![
+            "2026-02-05","2026-02-12","2026-02-19","2026-02-26",
+            "2026-03-05","2026-03-12","2026-03-19","2026-03-26",
+        ].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let monthly = vec!["2026-02-26".to_string(), "2026-03-26".to_string()];
+        let rows = build_rollover_schedule_per_leg(
+            "2026-02-02",
+            &[weekly, monthly],
+            &[1, 7],          // weekly T-1, monthly T-7
+            &[None, None],
+            &[Vec::new(), Vec::new()],  // no spot-adj breaches
+            &[],                        // no filter segments
+            &td,
+        );
+
+        // 17-Feb (monthly T-7) is a boundary even though no weekly roll is there.
+        let r = find_row(&rows, "2026-02-17");
+        assert_eq!(r.3[0].own_boundary, false, "weekly carries across the monthly boundary");
+        assert_eq!(r.3[0].contract, "2026-02-19", "weekly keeps its held contract");
+        assert_eq!(r.3[1].own_boundary, true, "monthly rolls on its own T-7");
+        assert_eq!(r.3[1].contract, "2026-03-26", "monthly rolled to the next contract");
+
+        // 04-Feb (weekly T-1) — weekly rolls, monthly carries its Feb contract.
+        let r = find_row(&rows, "2026-02-04");
+        assert_eq!(r.3[0].own_boundary, true, "weekly rolls on its own T-1");
+        assert_eq!(r.3[0].contract, "2026-02-12");
+        assert_eq!(r.3[1].own_boundary, false, "monthly carries across the weekly boundary");
+        assert_eq!(r.3[1].contract, "2026-02-26");
+
+        // Run start — the FRONT-MONTH opening window is NOT emitted as a trade.
+        // Under rollover no leg enters at an arbitrary run_start (the pinned
+        // same-day chain 0-DTE-skips the front-month and enters on the first
+        // roll), so there is no row starting at run_start. Each leg still makes
+        // its FIRST real pick at its own first roll boundary below.
+        assert!(rows.iter().all(|r| r.1 != "2026-02-02"),
+            "no trade is emitted for the front-month opening window at run_start");
+        // Weekly's first real entry is its first roll (04-Feb), holding the next
+        // weekly contract; monthly's first real entry is its first roll (17-Feb).
+        let r = find_row(&rows, "2026-02-04");
+        assert!(r.3[0].own_boundary, "weekly's first emitted row is its own first roll");
+    }
+
+    /// REGRESSION (money path): a SINGLE monthly leg under per_leg_rollover must
+    /// produce the SAME schedule as the normal (pinned/unpinned) monthly path —
+    /// one leg has no foreign boundaries, so the union collapses to the plain
+    /// monthly chain. Before the front-month-stub fix, per-leg invented an extra
+    /// opening trade [run_start, first_expiry) on the front-month and shifted
+    /// every downstream row by one contract. Assert (entry, exit, contract) match
+    /// the pinned builder row-for-row (T0/T0).
+    #[test]
+    fn single_leg_per_leg_equals_normal_monthly_schedule() {
+        // Mirror a real backtest: run_start is a trading day strictly BEFORE the
+        // first in-range expiry (as when from_date lands between expiries). Both
+        // builders then 0-DTE-skip the front-month (MARCH) and enter on it via
+        // the chain, so trade 1 = 28-Mar → 25-Apr holding APRIL for BOTH paths.
+        // Expiries seen by the run start at the March expiry (Feb-28 out of range).
+        let expiries: Vec<String> = [
+            "2019-03-28", "2019-04-25", "2019-05-30", "2019-06-27", "2019-07-25",
+            "2019-08-29", "2019-09-26", "2019-10-31", "2019-11-28", "2019-12-26",
+        ].iter().map(|s| s.to_string()).collect();
+        let mut td = expiries.clone();
+        td.push("2019-03-01".to_string()); // run_start (before first expiry)
+        td.sort();
+        let run_start = "2019-03-01".to_string();
+
+        // Normal (unpinned) monthly T0/T0 — the reference. Its same-day chain
+        // 0-DTE-skips MARCH and emits [28-Mar, 25-Apr] holding APRIL first.
+        let normal = build_rollover_schedule_pinned(&expiries, &td, 0, 0, 0, None);
+        // Single monthly leg, exit T-0, no cycles, no breaches.
+        let per_leg = build_rollover_schedule_per_leg(
+            &run_start, &[expiries.clone()], &[0], &[None], &[Vec::new()], &[], &td,
+        );
+
+        assert_eq!(
+            per_leg.len(), normal.len(),
+            "single-leg per-leg must emit the same number of trades as normal \
+             (no extra front-month opening trade)"
+        );
+        for (i, (pl, nm)) in per_leg.iter().zip(normal.iter()).enumerate() {
+            // pl = (trade_id, start, end, [slot]); nm = (trade_id, entry, exit, leg_expiry, orig, new_cycle)
+            assert_eq!(pl.1, nm.1, "trade {i}: entry date must match normal");
+            assert_eq!(pl.2, nm.2, "trade {i}: exit date must match normal");
+            assert_eq!(pl.3[0].contract, nm.3, "trade {i}: contract must match normal");
+        }
+        // Explicitly: first trade is 28-Mar → 25-Apr holding APRIL, NOT the
+        // dropped 01-Mar → 28-Mar front-month stub.
+        assert_eq!((per_leg[0].1.as_str(), per_leg[0].2.as_str()), ("2019-03-28", "2019-04-25"));
+        assert_eq!(per_leg[0].3[0].contract, "2019-04-25");
+    }
+
+    /// REGRESSION (money path): a filter segment opening MID-CONTRACT must emit a
+    /// row entering the ACTIVE contract fresh at the segment start — mirroring the
+    /// non-per-leg fixed-entry path. Without seg_starts the union only breaks at
+    /// rolls, so a segment opening between two monthly rolls has no row and the
+    /// active contract is dropped by the downstream entry-in-window gate.
+    #[test]
+    fn seg_start_opens_row_on_active_contract() {
+        // Single monthly leg, T0/T0. run_start before first expiry.
+        let expiries: Vec<String> = [
+            "2019-03-28", "2019-04-25", "2019-05-30", "2019-06-27",
+        ].iter().map(|s| s.to_string()).collect();
+        let mut td = expiries.clone();
+        td.push("2019-03-01".to_string());
+        td.push("2019-04-01".to_string()); // a trading day mid-APRIL-contract
+        td.sort();
+
+        // No seg_starts → normal schedule: first row 28-Mar → 25-Apr (APRIL).
+        let base = build_rollover_schedule_per_leg(
+            "2019-03-01", &[expiries.clone()], &[0], &[None], &[Vec::new()], &[], &td,
+        );
+        assert_eq!(base[0].1.as_str(), "2019-03-28");
+
+        // Segment opens 01-Apr, MID the APRIL contract (28-Mar..25-Apr). A row must
+        // now START at 01-Apr holding APRIL (2019-04-25), flagged seg_start_entry
+        // (it is NOT the leg's own roll), forcing a fresh re-strike there.
+        let with_seg = build_rollover_schedule_per_leg(
+            "2019-03-01", &[expiries.clone()], &[0], &[None], &[Vec::new()],
+            &["2019-04-01".to_string()], &td,
+        );
+        let r = with_seg.iter().find(|r| r.1 == "2019-04-01")
+            .expect("a row must open at the mid-contract segment start");
+        assert_eq!(r.3[0].contract, "2019-04-25", "row holds the ACTIVE (APRIL) contract");
+        assert!(r.3[0].seg_start_entry, "mid-hold segment start forces fresh re-strike");
+        assert!(!r.3[0].own_boundary, "segment start is NOT the leg's own roll");
+        // A seg_start that coincides with a leg's own roll stays own_boundary and
+        // is NOT double-flagged.
+        let with_roll_seg = build_rollover_schedule_per_leg(
+            "2019-03-01", &[expiries.clone()], &[0], &[None], &[Vec::new()],
+            &["2019-04-25".to_string()], &td,
+        );
+        let r = with_roll_seg.iter().find(|r| r.1 == "2019-04-25")
+            .expect("the own-roll row still exists");
+        assert!(r.3[0].own_boundary, "own roll stays own_boundary");
+        assert!(!r.3[0].seg_start_entry, "own roll is not double-flagged as seg_start_entry");
     }
 
     /// PINNED, T=0: every segment holds the December contract while entry/exit

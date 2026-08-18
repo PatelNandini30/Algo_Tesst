@@ -903,6 +903,71 @@ def _build_yearly_cycles(
     return cycles
 
 
+def _norm_sa_unit(v):
+    """Normalize a per-row spot-adj unit to 'percent'/'points', or None if
+    absent/blank (caller then falls back to the leg's own units — preserving
+    today's behaviour for rows without an explicit unit)."""
+    s = str(v or "").strip().lower()
+    if s in ("percent", "pct", "%", "percentage"):
+        return "percent"
+    if s in ("points", "point", "pts", "pt"):
+        return "points"
+    return None
+
+
+def _yearly_schedule_row(leg, contract_iso):
+    """{strike_gap, spot_adj_pct, spot_adj_unit} for the December-YEAR of
+    `contract_iso`, or None.
+
+    `contract_iso` is the pinned December date (yearly_cycles[i].contract, e.g.
+    '2023-12-30'); we key the schedule by its YEAR so the row is tied to the
+    contract the leg holds, not a calendar boundary. None => caller keeps its
+    existing gap / pct, which is the opt-in / fallback guarantee.
+    `spot_adj_unit` is 'percent'/'points' when the row sets it explicitly, else
+    None (caller uses the leg's own units).
+    """
+    sched = (leg or {}).get("yearly_contract_schedule")
+    if not isinstance(sched, list) or not sched or not contract_iso:
+        return None
+    year = str(contract_iso)[:4]
+    for row in sched:
+        if isinstance(row, dict) and str(row.get("contract")).strip()[:4] == year:
+            try:
+                g = float(row.get("strike_gap") or 0); p = float(row.get("spot_adj_pct") or 0)
+            except (TypeError, ValueError):
+                return None
+            if g > 0 and p > 0:
+                return {"strike_gap": g, "spot_adj_pct": p,
+                        "spot_adj_unit": _norm_sa_unit(row.get("spot_adj_unit"))}
+    return None
+
+
+def _validate_yearly_schedule(payload):
+    """Reject malformed rows at setup rather than silently ignoring them."""
+    for leg in (payload.get("legs") or []):
+        sched = (leg or {}).get("yearly_contract_schedule")
+        if not isinstance(sched, list):
+            continue
+        seen = set()
+        for row in sched:
+            if not isinstance(row, dict):
+                raise ValueError("yearly_contract_schedule rows must be objects")
+            yr = str(row.get("contract")).strip()[:4]
+            if not yr.isdigit():
+                raise ValueError(f"yearly_contract_schedule: bad contract '{row.get('contract')}'")
+            if yr in seen:
+                raise ValueError(f"yearly_contract_schedule: duplicate contract year {yr}")
+            seen.add(yr)
+            try:
+                if float(row.get("strike_gap") or 0) <= 0 or float(row.get("spot_adj_pct") or 0) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise ValueError(f"yearly_contract_schedule: gap and spot_adj_pct must be > 0 (year {yr})")
+            _u = row.get("spot_adj_unit")
+            if _u not in (None, "") and _norm_sa_unit(_u) is None:
+                raise ValueError(f"yearly_contract_schedule: bad spot_adj_unit '{_u}' (year {yr})")
+
+
 def resolve_expiry_inputs(
     index: str,
     payload: Dict[str, Any],
@@ -1019,7 +1084,11 @@ def resolve_expiry_inputs(
     return (cadence_expiries, cycles)
 
 
-def _inject_per_leg_rollover_inputs(payload: Dict[str, Any], trading_days: List[str]) -> None:
+def _inject_per_leg_rollover_inputs(
+    payload: Dict[str, Any],
+    trading_days: List[str],
+    spot_by_date: Optional[Dict[str, float]] = None,
+) -> None:
     """PER-LEG ROLLOVER (opt-in): stamp each leg with its OWN cadence expiry list
     (`_rollover_expiries`), its own exit T-n (`exit_dte`), and — for a YEARLY leg
     — its pinned December cycles (`_rollover_cycles`), so simulate.rs
@@ -1038,14 +1107,21 @@ def _inject_per_leg_rollover_inputs(payload: Dict[str, Any], trading_days: List[
     if not (from_date and to_date and isinstance(legs, list) and legs):
         raise ValueError("per_leg_rollover requires from_date/to_date and a non-empty legs list")
 
-    # v1 is the No-Adjustment variant. Spot-adjustment as a boundary source that
-    # merges into the per-leg union is Phase 4 — fail LOUD here rather than run
-    # the spot-adj post-processor over union rows it was not designed for and
-    # emit a plausible-but-wrong tradesheet.
-    if payload.get("spot_adjustment_enabled") and (_maybe_float(payload.get("spot_adjustment_pct")) or 0) > 0:
+    # PER-LEG spot-adjustment (Phase 4) IS now supported below — each spot-adj leg
+    # re-strikes fresh at its OWN breach dates, merged as extra boundaries into the
+    # union schedule. The STRATEGY-level global spot-adjustment toggle, however,
+    # remains unsupported alongside per-leg rollover (it re-strikes every leg off a
+    # single shared reference, which contradicts the per-leg own-reference model) —
+    # keep failing LOUD on that combo only.
+    def _leg_spotadj_on(_lg: Dict[str, Any]) -> bool:
+        _sa = _lg.get("spot_adjustment") or {}
+        return bool(_sa.get("enabled")) and (_maybe_float(_sa.get("pct")) or 0) > 0
+    _strat_sa = bool(payload.get("spot_adjustment_enabled")) and (_maybe_float(payload.get("spot_adjustment_pct")) or 0) > 0
+    if _strat_sa:
         raise ValueError(
-            "per_leg_rollover does not yet support spot-adjustment (No-Adjustment variant only). "
-            "Turn off spot-adjustment, or wait for the Adjustment phase."
+            "per_leg_rollover does not support STRATEGY-level spot-adjustment "
+            "(spot_adjustment_enabled). Use per-LEG spot-adjustment instead, or "
+            "turn off the strategy-level toggle."
         )
 
     import datetime as _dt
@@ -1097,6 +1173,131 @@ def _inject_per_leg_rollover_inputs(payload: Dict[str, Any], trading_days: List[
             leg["_rollover_expiries"] = _expiry_date_list(leg_index, freq, from_date, wide_to)
             leg["_rollover_cycles"] = None
 
+    # ── PER-LEG SPOT-ADJUSTMENT breach dates (Phase 4, opt-in per leg) ──────────
+    # For each leg with its own spot-adjustment ON, walk the strategy trading-day
+    # spot series and record every date its spot breached >= its OWN pct from ITS
+    # OWN last reference (reset on the leg's own roll dates and on each breach).
+    # These dates are merged into the Rust union schedule as extra boundaries and
+    # force a FRESH re-strike there. Legs without spot-adj get an empty list ⇒ the
+    # OFF path stays byte-identical.
+    #
+    # Each leg walks ITS OWN index's spot series: a NIFTY leg breaches on NIFTY
+    # spot, a BANKNIFTY leg on BANKNIFTY spot (multi-index baskets). The strategy
+    # spot dict covers the strategy index; other indices are loaded on demand via
+    # algotest_native.get_spot_price and cached per index. If an index has no spot
+    # available (not loaded for this run), fall back to the strategy series so the
+    # walk never crashes — same as the prior single-index behaviour.
+    sbd = spot_by_date or {}
+    td_sorted = sorted(trading_days)
+    _spot_map_cache: Dict[str, Dict[str, float]] = {index: sbd}
+
+    # Filter-segment starts (snapped to the next trading day) are reference-reset
+    # points for the breach walk, exactly as the normal spot-adj cascade re-anchors
+    # on each segment's first TRADE entry. Without this the continuous walk carries
+    # ref_spot across the segment gap (resetting only on routine rolls), so the
+    # first breach of a mid-range segment measures off the last pre-gap roll spot
+    # instead of the segment-open spot — shifting the breach date ~1 day and
+    # diverging from normal. No filter ⇒ empty set ⇒ inert.
+    _seg_reset = _load_filter_segments(payload)
+    _seg_start_resets: set = set()
+    if _seg_reset:
+        for _s_start, _ in _seg_reset:
+            _snap = _next_trading_day_on_or_after(td_sorted, _s_start)
+            if _snap:
+                _seg_start_resets.add(_snap)
+
+    def _leg_spot_map(_idx_up: str) -> Dict[str, float]:
+        _cached = _spot_map_cache.get(_idx_up)
+        if _cached is not None:
+            return _cached
+        _m: Dict[str, float] = {}
+        try:
+            import algotest_native  # type: ignore  # function-local, as everywhere else here
+            for _d in td_sorted:
+                _v = algotest_native.get_spot_price(_d, _idx_up)
+                if _v:
+                    _m[_d] = float(_v)
+        except Exception as _e:  # pragma: no cover - defensive
+            logger.warning("[PER_LEG_SA] per-index spot load failed for %s: %s", _idx_up, _e)
+            _m = {}
+        if not _m:
+            logger.info(
+                "[PER_LEG_SA] no spot for index %s — using strategy spot (fallback)", _idx_up
+            )
+            _m = sbd
+        _spot_map_cache[_idx_up] = _m
+        return _m
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        _sa = leg.get("spot_adjustment") or {}
+        pct = _maybe_float(_sa.get("pct")) or 0.0
+        if not (bool(_sa.get("enabled")) and pct > 0):
+            leg["_spot_adj_breaches"] = []
+            continue
+        direction = str(_sa.get("direction") or "both").lower()
+        units = str(_sa.get("units") or "percent").lower()
+        leg_sbd = _leg_spot_map(str(leg.get("index") or index).upper())
+        watch_rise = direction in ("rise", "both")
+        watch_fall = direction in ("fall", "both")
+        # Reference reset dates = this leg's own roll dates (the exit T-n before
+        # each of its expiries — same computation the union scheduler uses).
+        _leg_xdte = int(leg.get("exit_dte") or 0)
+        roll_dates = set()
+        for _exp in (leg.get("_rollover_expiries") or []):
+            _rd = _trading_day_n_before(str(_exp), _leg_xdte, td_sorted)
+            if _rd:
+                roll_dates.add(_rd)
+        breaches: List[str] = []
+        ref_spot: Optional[float] = None
+        for d in td_sorted:
+            if d < from_date or d > to_date:
+                continue
+            spot = leg_sbd.get(d)
+            if spot is None:
+                continue
+            if ref_spot is None:
+                ref_spot = spot  # first entry spot = initial reference
+                continue
+            # Own-roll dates AND filter-segment starts reset the reference (and do
+            # NOT count as a breach) — the normal cascade re-anchors at each trade
+            # entry, which happens on every roll and at each segment's first trade.
+            if d in roll_dates or d in _seg_start_resets:
+                ref_spot = spot
+                continue
+            if units == "points":
+                move = spot - ref_spot
+                rise_hit = watch_rise and move >= pct
+                fall_hit = watch_fall and -move >= pct
+            else:
+                move_pct = (spot / ref_spot - 1.0) * 100.0 if ref_spot > 0 else 0.0
+                rise_hit = watch_rise and move_pct >= pct
+                fall_hit = watch_fall and -move_pct >= pct
+            if rise_hit or fall_hit:
+                breaches.append(d)
+                ref_spot = spot  # reset reference at each breach
+        leg["_spot_adj_breaches"] = breaches
+        leg["_spot_adj_direction"] = direction
+        leg["_spot_adj_pct"] = pct
+
+    # ── PER-LEG ROLLOVER + FILTER: segment-start boundaries ─────────────────────
+    # A filter segment that OPENS mid-contract must enter the active contract
+    # fresh at the open — exactly what the non-per-leg fixed-entry builder does.
+    # The union scheduler only breaks rows at leg rolls/breaches, so a segment
+    # open falling between rolls has no row and the active contract is dropped by
+    # the downstream entry-in-window gate. Inject each segment start (snapped to
+    # the next trading day, like the fixed builder) as an extra union boundary so
+    # a row opens there; simulate.rs forces a fresh re-strike on that row.
+    # No filter ⇒ _load_filter_segments returns None ⇒ empty list ⇒ inert.
+    _seg = _load_filter_segments(payload)
+    _seg_starts: List[str] = []
+    if _seg:
+        for _s_start, _ in _seg:
+            _snapped = _next_trading_day_on_or_after(td_sorted, _s_start)
+            if _snapped:
+                _seg_starts.append(_snapped)
+    payload["_per_leg_seg_starts"] = sorted(set(_seg_starts))
+
 
 def _annotate_per_leg_rollover_exit_reason(
     rows: List[Dict[str, Any]], legs: Optional[List[Dict[str, Any]]]
@@ -1133,6 +1334,57 @@ def _annotate_per_leg_rollover_exit_reason(
         if labels:
             base = str(r.get("exit_reason") or "").strip() or "SCHEDULED_EXIT"
             r["exit_reason"] = f"{base} ({' + '.join(sorted(set(labels)))} roll)"
+
+
+def _annotate_per_leg_spot_adj_exit_reason(
+    rows: List[Dict[str, Any]], legs: Optional[List[Dict[str, Any]]]
+) -> None:
+    """PER-LEG SPOT-ADJUSTMENT (display-only): for any output row whose EXIT date
+    is one of leg L's `_spot_adj_breaches`, append SPOT_ADJ_RISE/SPOT_ADJ_FALL
+    with a `(Leg N <TYPE> <CADENCE>)` label to that row's exit_reason, joined by
+    '+' like the roll labels. In-place; changes ONLY exit_reason. No-op when no
+    leg has breaches ⇒ the OFF path is byte-identical.
+    """
+    if not rows or not legs:
+        return
+    from collections import defaultdict
+    # leg_id (1-based) -> {breach_iso: label}
+    breach_label: Dict[int, Dict[str, str]] = {}
+    for i, l in enumerate(legs or []):
+        if not isinstance(l, dict):
+            continue
+        breaches = l.get("_spot_adj_breaches") or []
+        if not breaches:
+            continue
+        lid = i + 1
+        cadence = str(l.get("expiry") or "").title()
+        typ = str(l.get("option_type") or "").upper()
+        direction = str(l.get("_spot_adj_direction") or "both")
+        pct = _maybe_float(l.get("_spot_adj_pct")) or 0.0
+        units = str((l.get("spot_adjustment") or {}).get("units") or "percent").lower()
+        # RISE/FALL is fixed for one-directional; for 'both' _spot_adj_reason_tag
+        # resolves it from the trigger-day spot vs entry threshold (fallback RISE).
+        tag = _spot_adj_reason_tag(direction, 0.0, None, pct, units)
+        lbl = f"{tag} (Leg {lid} {typ} {cadence})".strip()
+        breach_label[lid] = {_normalize_iso(str(b)): lbl for b in breaches}
+    if not breach_label:
+        return
+    # trade_id -> collected labels (row exit that landed on a breach date).
+    per_trade: Dict[int, List[str]] = defaultdict(list)
+    for r in rows:
+        lid = int(r.get("leg_id") or 0)
+        m = breach_label.get(lid)
+        if not m:
+            continue
+        exit_iso = _normalize_iso(str(r.get("exit_date", "")))
+        lbl = m.get(exit_iso)
+        if lbl:
+            per_trade[int(r.get("trade_id") or 0)].append(lbl)
+    for r in rows:
+        labels = per_trade.get(int(r.get("trade_id") or 0))
+        if labels:
+            base = str(r.get("exit_reason") or "").strip() or "SCHEDULED_EXIT"
+            r["exit_reason"] = f"{base} + {' + '.join(sorted(set(labels)))}"
 
 
 def _apply_per_leg_qty(payload: Dict[str, Any]) -> None:
@@ -1374,8 +1626,12 @@ def _resolve_futures_pnl_native(entry_date, exit_date, symbol, position, prefere
         return None, None, None
     if entry_expiry >= xd:
         exit_price = _fut_price(symbol, xd, entry_expiry)
-        if exit_price is None:
-            exit_price = entry_price
+        # NOT `exit_price = entry_price`. A genuinely missing exit-day quote
+        # (even with _fut_price's own ±1-day tolerance) silently zeroed the
+        # leg's P&L for the WHOLE hold, mislabeled as a real close price. Every
+        # other missing-price site in this file (entry_price_raw is None) skips
+        # the leg via `continue`/`break` rather than fabricating a price —
+        # returning None here lets every caller apply that SAME convention.
         return entry_price, exit_price, entry_expiry
     # ── rollover: entry contract expires mid-hold ──
     roll_date = entry_expiry
@@ -1393,15 +1649,13 @@ def _resolve_futures_pnl_native(entry_date, exit_date, symbol, position, prefere
         roll_price_new = roll_price_old
     if next_expiry >= xd:
         exit_price = _fut_price(symbol, xd, next_expiry)
-        if exit_price is None:
-            exit_price = roll_price_new
+        # See the no-rollover branch above: do not fabricate an exit price.
         return entry_price, exit_price, next_expiry
     final_expiry = _fut_nearest_expiry(symbol, xd)
     if not final_expiry:
         return entry_price, roll_price_new, next_expiry
     exit_price = _fut_price(symbol, xd, final_expiry)
-    if exit_price is None:
-        exit_price = roll_price_new
+    # See the no-rollover branch above: do not fabricate an exit price.
     return entry_price, exit_price, final_expiry
 
 
@@ -1741,7 +1995,10 @@ def _build_futures_specs(
                 if entry_price_raw is None:
                     continue
                 if exit_price_raw is None:
-                    exit_price_raw = entry_price_raw
+                    # Same convention as a missing entry price: skip rather than
+                    # fabricate a fill (was `exit_price_raw = entry_price_raw`,
+                    # silently zeroing a real mid-hold move).
+                    continue
 
             # Save scheduled exit BEFORE the SL scan — re-entry (Task 3) uses it as cap.
             _orig_sched_exit = fut_exit_date
@@ -1855,7 +2112,9 @@ def _build_futures_specs(
                     if _re_ep_raw is None:
                         break
                     if _re_xp_raw is None:
-                        _re_xp_raw = _re_ep_raw
+                        # Same convention as a missing entry price: stop rather
+                        # than fabricate a fill.
+                        break
 
                     _re_scan_date, _re_scan_raw, _re_reason = _scan_futures_sl_target(
                         _re_entry_date, float(_re_ep_raw), position, leg, sorted_td,
@@ -2873,6 +3132,10 @@ def _build_fixed_entry_specs(
                 # NIFTY in the leg form). Without this, every fixed-mode trade
                 # snaps to the index default (50 for NIFTY).
                 _leg_iv_raw = leg.get("strike_interval")
+                if _leg_is_yearly and _pin is not None:
+                    _yr_row = _yearly_schedule_row(leg, _pin["contract"])
+                    if _yr_row is not None:
+                        _leg_iv_raw = _yr_row["strike_gap"]
                 try:
                     leg_interval = float(_leg_iv_raw) if _leg_iv_raw else interval
                 except (TypeError, ValueError):
@@ -3127,7 +3390,9 @@ def _build_fixed_entry_futures_specs(
                 if entry_price_raw is None:
                     continue
                 if exit_price_raw is None:
-                    exit_price_raw = entry_price_raw
+                    # Same convention as a missing entry price: skip rather than
+                    # fabricate a fill.
+                    continue
 
                 fut_exit_date = _fe_exit_date
                 _sc_date, _sc_raw, _reason = _scan_futures_sl_target(
@@ -4132,6 +4397,7 @@ def priced_to_tradesheet_records(
     priced: List[Dict[str, Any]],
     payload: Dict[str, Any],
     lot_size: int,
+    spot_by_date: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Convert the Rust orchestrator's priced spec rows into tradesheet records
@@ -4249,8 +4515,25 @@ def priced_to_tradesheet_records(
     for row in priced:
         opt_type = (row.get("option_type") or "").upper()
         position = (row.get("position") or "SELL").upper()
-        entry_spot = float(row.get("entry_spot") or 0.0)
-        exit_spot = float(row.get("exit_spot") or 0.0)
+        # Rust's spot lookup can miss for a date the OPTION data covers (a
+        # narrower spot/index feather than the options table — a documented
+        # recurring data-coverage gap) and returns 0.0 with no error, since a
+        # genuinely-missing spot must not drop an otherwise-priceable trade
+        # (native/src/simulate.rs's `missing` flag deliberately does NOT cover
+        # this). `spot_by_date` is the same authoritative map already used as
+        # a fallback at other sites in this file (e.g. line ~3867); using it
+        # here too means a coverage gap degrades AT MOST to "no spot for this
+        # date anywhere" (0.0, same as before) instead of masking a spot that
+        # WAS available and silently reporting a fabricated Spot P&L / % P&L
+        # from the other side being real and this side being a phantom zero.
+        _sbd = spot_by_date or {}
+        # entry_date/exit_date on the raw row are not guaranteed ISO (see the
+        # _normalize_iso(...) calls elsewhere in this function, e.g. line 4358)
+        # but spot_by_date IS keyed by ISO date — normalize before the lookup.
+        entry_spot = float(row.get("entry_spot")
+                            or _sbd.get(_normalize_iso(row.get("entry_date"))) or 0.0)
+        exit_spot = float(row.get("exit_spot")
+                           or _sbd.get(_normalize_iso(row.get("exit_date"))) or 0.0)
         # Spot P&L is a trade-level quantity: write it only on the row for the
         # trade's lowest PRESENT leg (see _lowest_leg_by_trade above) and leave
         # the rest blank. Per-row summing then yields the trade total without
@@ -4442,7 +4725,59 @@ def priced_to_tradesheet_records(
         _e = _cad_by_trade.get(_r.get("Trade"))
         if _e:
             _r["Cadence Expiry"] = _e
+    _stamp_yearly_roll_reason(out, payload.get("legs") or [])
     return out
+
+
+def _stamp_yearly_roll_reason(
+    out: List[Dict[str, Any]],
+    legs_src: List[Dict[str, Any]],
+) -> None:
+    """Post-pass: annotate the first row of each new December contract for
+    YEARLY legs that carry a yearly_contract_schedule.
+
+    Mutates ``out`` in place — appends to "Strike Shift Reason" with " + "
+    join on the first row of each scheduled new contract, leaves all other
+    rows untouched.
+    """
+    from collections import defaultdict as _dd2
+    # Sort rows by entry date then leg so we walk in chronological order.
+    _rows_by_leg: Dict[int, List[Dict[str, Any]]] = _dd2(list)
+    for _r in out:
+        try:
+            _rows_by_leg[int(_r.get("Leg") or 1)].append(_r)
+        except (TypeError, ValueError):
+            pass
+    for _leg_idx, _leg in enumerate(legs_src):
+        if not isinstance(_leg, dict):
+            continue
+        if str(_leg.get("expiry") or "").upper() != "YEARLY":
+            continue
+        if not _leg.get("yearly_contract_schedule"):
+            continue
+        _lid = _leg_idx + 1  # 1-indexed
+        _rows = sorted(
+            _rows_by_leg.get(_lid, []),
+            key=lambda r: (_normalize_iso(r.get("Entry Date") or "") or "", str(r.get("Trade") or "")),
+        )
+        _prev_year: Optional[str] = None
+        for _r in _rows:
+            _expiry = _r.get("Expiry") or ""
+            _year = str(_expiry)[:4] if _expiry else ""
+            if not _year:
+                continue
+            if _year != _prev_year:
+                _srow = _yearly_schedule_row(_leg, _expiry)
+                if _srow is not None:
+                    _g = int(_srow["strike_gap"]) if float(_srow["strike_gap"]).is_integer() else round(_srow["strike_gap"], 2)
+                    _p = int(_srow["spot_adj_pct"]) if float(_srow["spot_adj_pct"]).is_integer() else round(_srow["spot_adj_pct"], 2)
+                    _usfx = "%" if _srow.get("spot_adj_unit") == "percent" else ("pt" if _srow.get("spot_adj_unit") == "points" else "")
+                    _note = f"YEARLY_ROLL → Dec-{_year} (gap {_g}, adj {_p}{_usfx})"
+                    _existing = _r.get("Strike Shift Reason") or ""
+                    _r["Strike Shift Reason"] = f"{_existing} + {_note}" if _existing else _note
+                _prev_year = _year
+            else:
+                pass  # same contract — no annotation
 
 
 _KNOWN_STRIKE_SEL_TYPES: frozenset = frozenset({
@@ -5534,6 +5869,8 @@ def run_rust_engine_pipeline(
         _validate_relprem(payload, _relprem)
         payload = _payload_with_relprem_placeholder(payload, _relprem)
 
+    _validate_yearly_schedule(payload)
+
     # Guard: if the Rust feather cache isn't loaded, simulate_trades_batch will
     # return empty for every spec. Fall back to Python rather than silently
     # returning zero trades. (Cache load happens in algotest_job before this call;
@@ -5550,7 +5887,7 @@ def run_rust_engine_pipeline(
     # PER-LEG ROLLOVER (opt-in): stamp each leg's own cadence expiry list / cycles
     # onto payload['legs'] before any spec builder runs. No-op when the flag is
     # off, so every existing path is untouched.
-    _inject_per_leg_rollover_inputs(payload, trading_days)
+    _inject_per_leg_rollover_inputs(payload, trading_days, spot_by_date)
 
     # PER-LEG QUANTITY (opt-in): map each leg's explicit `qty` onto lots so P&L /
     # MAE/MFE scale by it. No-op unless a leg sets qty ⇒ existing runs unchanged.
@@ -6485,6 +6822,7 @@ def run_rust_engine_pipeline(
         _apply_leg_filter_end_tags(priced)
         if payload.get("per_leg_rollover"):
             _annotate_per_leg_rollover_exit_reason(priced, payload.get("legs"))
+            _annotate_per_leg_spot_adj_exit_reason(priced, payload.get("legs"))
         return list(priced)
 
     # Re-entry Rollover same-day chain: handled in Slice 6 via synthesis below.
@@ -7124,9 +7462,20 @@ def run_rust_engine_pipeline(
                     )
                     if not _m_base:
                         continue
+                    # Per-contract spot-adj pct override for yearly legs.
+                    _m_lg_src = legs_src[_m_lg - 1] if 0 <= _m_lg - 1 < len(legs_src) else {}
+                    _m_eff_pct = _m_cfg["pct"]
+                    _m_eff_units = _m_cfg["units"]
+                    if str((_m_lg_src or {}).get("expiry") or "").upper() == "YEARLY" and _m_ck:
+                        _m_yr_row = _yearly_schedule_row(_m_lg_src, _m_ck)
+                        if _m_yr_row is not None:
+                            _m_eff_pct = _m_yr_row["spot_adj_pct"]
+                            _m_eff_units = _m_yr_row["spot_adj_unit"] or _m_cfg["units"]
+                            if _m_eff_units == "percent":
+                                _m_eff_pct = max(0.25, min(5.0, _m_eff_pct))
                     _m_t = _compute_spot_adjustment_trigger(
                         _m_cur, _m_base, _m_sched, _m_cfg["direction"],
-                        _m_cfg["pct"], _m_cfg["units"], trading_days, spot_by_date,
+                        _m_eff_pct, _m_eff_units, trading_days, spot_by_date,
                     )
                     if _m_t:
                         _m_cands.append((_m_t, _m_lg))
@@ -7244,9 +7593,18 @@ def run_rust_engine_pipeline(
                     _sl_base = _sl_mark.get(_sl_ck, 0.0)
                     if _sl_base <= 0:
                         break
+                    # Per-contract spot-adj pct override for yearly legs.
+                    _sl_eff_pct = _sl_cfg["pct"]
+                    _sl_eff_units = _sl_cfg["units"]
+                    _sl_yr_row = _yearly_schedule_row(_sl_src, _sl_ck)
+                    if _sl_yr_row is not None:
+                        _sl_eff_pct = _sl_yr_row["spot_adj_pct"]
+                        _sl_eff_units = _sl_yr_row["spot_adj_unit"] or _sl_cfg["units"]
+                        if _sl_eff_units == "percent":
+                            _sl_eff_pct = max(0.25, min(5.0, _sl_eff_pct))
                     _sl_t = _compute_spot_adjustment_trigger(
                         _sl_cur, _sl_base, _sl_sched, _sl_cfg["direction"],
-                        _sl_cfg["pct"], _sl_cfg["units"], trading_days, spot_by_date,
+                        _sl_eff_pct, _sl_eff_units, trading_days, spot_by_date,
                     )
                     if not _sl_t:
                         break
@@ -7318,9 +7676,25 @@ def run_rust_engine_pipeline(
                     _lbase = _leg_mark_at_trade.get((trade_id, _leg_id), _lbase)
                 if _lbase <= 0:
                     continue
+                # Per-contract spot-adj pct override for yearly legs.
+                _lg_src_l = legs_src[_leg_id - 1] if 0 <= _leg_id - 1 < len(legs_src) else {}
+                _leff_pct = _lcfg["pct"]
+                _leff_units = _lcfg["units"]
+                if str((_lg_src_l or {}).get("expiry") or "").upper() == "YEARLY":
+                    _lrow_c = next(
+                        (r for r in legs if int(r.get("leg_id") or 0) == _leg_id), None
+                    )
+                    _lcontract = _normalize_iso((_lrow_c or {}).get("expiry") or "")
+                    if _lcontract:
+                        _lyr_row = _yearly_schedule_row(_lg_src_l, _lcontract)
+                        if _lyr_row is not None:
+                            _leff_pct = _lyr_row["spot_adj_pct"]
+                            _leff_units = _lyr_row["spot_adj_unit"] or _lcfg["units"]
+                            if _leff_units == "percent":
+                                _leff_pct = max(0.25, min(5.0, _leff_pct))
                 _ltrig = _compute_spot_adjustment_trigger(
                     entry_iso, _lbase, scheduled_exit,
-                    _lcfg["direction"], _lcfg["pct"], _lcfg["units"],
+                    _lcfg["direction"], _leff_pct, _leff_units,
                     trading_days, spot_by_date,
                 )
                 if _ltrig:
@@ -9272,13 +9646,29 @@ def run_rust_engine_pipeline(
                                 or _sa_spot
                             )
                         _sa_casc_bases[_cl_lid] = _cl_base
+                        # Per-contract spot-adj pct override for yearly legs.
+                        _cl_lg_src = legs_src[_cl_lid - 1] if 0 <= _cl_lid - 1 < len(legs_src) else {}
+                        _cl_eff_pct = _cl_cfg["pct"]
+                        _cl_eff_units = _cl_cfg["units"]
+                        if str((_cl_lg_src or {}).get("expiry") or "").upper() == "YEARLY":
+                            _cl_orig_row = next(
+                                (r for r in orig_legs_s if int(r.get("leg_id") or 0) == _cl_lid), None
+                            )
+                            _cl_contract = _normalize_iso((_cl_orig_row or {}).get("expiry") or "")
+                            if _cl_contract:
+                                _cl_yr_row = _yearly_schedule_row(_cl_lg_src, _cl_contract)
+                                if _cl_yr_row is not None:
+                                    _cl_eff_pct = _cl_yr_row["spot_adj_pct"]
+                                    _cl_eff_units = _cl_yr_row["spot_adj_unit"] or _cl_cfg["units"]
+                                    if _cl_eff_units == "percent":
+                                        _cl_eff_pct = max(0.25, min(5.0, _cl_eff_pct))
                         _cl_trig = _compute_spot_adjustment_trigger(
                             _sa_cur_entry,
                             _cl_base,
                             _sa_cur_exit,
                             _cl_cfg["direction"],
-                            _cl_cfg["pct"],
-                            _cl_cfg["units"],
+                            _cl_eff_pct,
+                            _cl_eff_units,
                             trading_days,
                             spot_by_date,
                         )
