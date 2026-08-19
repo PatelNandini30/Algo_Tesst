@@ -559,6 +559,30 @@ class TestCarryGuardNumerical(unittest.TestCase):
         self.assertNotAlmostEqual(sub1["exit_price"], sub2["entry_price"], places=4,
                                   msg="non-carry boundary must NOT cancel — proves the guard is active")
 
+    def test_time_gap_same_contract_still_a_carry(self):
+        """A TIME GAP between sub1's exit and sub2's entry (a filter patch ended,
+        then a new patch re-entered later) does NOT by itself make it a trade: a
+        leg holding the SAME (strike, expiry) across the gap is a carried hold
+        (e.g. a yearly hedge while another leg owns the patches), so slippage is
+        still suppressed at the boundary. Slippage is decided by contract change
+        alone — this guards against re-introducing the temporal-gap rule that
+        wrongly slipped a carried yearly leg across patch boundaries."""
+        from backend.services.engine_rust import _apply_carry_slippage_guard
+        priced = self._make_split_priced(same_strike=True)
+        # sub1 closes on 2020-01-06; sub2 re-enters months later — same contract.
+        priced[1]["entry_date"] = "2020-04-01"
+        _apply_carry_slippage_guard(priced)
+        sub1, sub2 = priced[0], priced[1]
+        # Open of the whole hold stays slipped; boundary is a carry (raw).
+        self.assertAlmostEqual(sub1["entry_price"], 99.5, places=4,
+                               msg="sub1 entry stays slipped (real open)")
+        self.assertAlmostEqual(sub1["exit_price"], 90.0, places=4,
+                               msg="sub1 exit is a carry boundary → raw, not slipped")
+        self.assertAlmostEqual(sub2["entry_price"], 90.0, places=4,
+                               msg="sub2 entry is a carry boundary → raw, not slipped")
+        self.assertAlmostEqual(sub2["exit_price"], 80.4, places=4,
+                               msg="sub2 exit stays slipped (real close)")
+
 
 # ---------------------------------------------------------------------------
 # Task 3: Mid-cycle fresh entry for a filtered leg
@@ -1494,6 +1518,112 @@ class TestBugBEarlyReturnTaggerSourceText(unittest.TestCase):
     def test_helper_called_in_late_path(self):
         self.assertIn("_apply_leg_filter_end_tags(final_priced)", self._src(),
                       "late path must call the helper on final_priced")
+
+
+class TestBug9SpotAdjReentryGuardSourceText(unittest.TestCase):
+    """Bug 9: the spot-adj cascade re-entry guard must be DATE-AWARE.
+
+    Previously `if _leg_was_truncated(_sa_leg): continue` blocked a filtered
+    long-dated leg for the WHOLE contract once it was truncated anywhere on it,
+    dropping re-entries a month INSIDE the leg's active filter range. The fix
+    replaces that with a per-hop check via _apply_leg_filter_mask
+    (resolve_leg_window) that only skips when the re-entry is outside every
+    active range, and otherwise clamps this leg's mini-trade exit to the range
+    end. Source-text (no market data)."""
+
+    def _src(self):
+        import os
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "services", "engine_rust.py"
+        )
+        with open(os.path.abspath(path)) as f:
+            return f.read()
+
+    def _guard_block(self, src):
+        # The cascade re-entry loop body, between the sorted(orig_legs_s) header
+        # and the mini_specs.append that emits this leg's spec.
+        start = src.index("for _sa_leg in sorted(orig_legs_s")
+        end = src.index("mini_specs.append(", start)
+        return src[start:end]
+
+    def test_guard_is_date_aware(self):
+        block = self._guard_block(self._src())
+        # The blunt whole-contract guard must be gone from this site.
+        self.assertNotIn(
+            "if _leg_was_truncated(_sa_leg):", block,
+            "the blunt whole-contract guard must be replaced by a date-aware check",
+        )
+        # Replaced by the shared date-aware mask (resolve_leg_window under the hood).
+        self.assertIn("leg_segments(_sa_leg_src)", block,
+                      "guard must gate on the leg having an individual filter")
+        self.assertIn("_apply_leg_filter_mask(", block,
+                      "guard must call the shared date-aware mask helper")
+        self.assertIn("_sa_cur_entry", block,
+                      "date-aware check must key on the re-entry date")
+
+    def test_exit_clamped_per_leg(self):
+        src = self._src()
+        block = self._guard_block(src)
+        self.assertIn("_sa_leg_this_exit = _sa_this_exit", block,
+                      "per-leg exit defaults to the hop exit (byte-identical for "
+                      "unfiltered legs)")
+        self.assertIn("_sa_leg_this_exit = _sa_leg_exit", block,
+                      "a truncated in-range re-entry clamps THIS leg's exit")
+        # The mini-spec exit_date must use the per-leg clamped value.
+        self.assertIn('"exit_date":    _sa_leg_this_exit,', src,
+                      "mini-spec exit_date must be the per-leg clamped exit")
+
+    def test_restrike_logic_untouched(self):
+        # The re-strike / epoch-carry markers must still be present — the fix
+        # must not have removed any of the owner's spot-adj strike logic.
+        block = self._guard_block(self._src())
+        for marker in ("_sa_yr_row", "_sa_carry", "_sa_leg_interval",
+                       "_yearly_schedule_row", "_sa_leg_pinned"):
+            self.assertIn(marker, block,
+                          f"re-strike marker {marker} must remain untouched")
+
+
+class TestBug9ReentryWindowDecision(unittest.TestCase):
+    """Behavioral: the shared helper the guard now uses (resolve_leg_window)
+    makes the right taken/clamp decision on synthetic dicts — no market data."""
+
+    def setUp(self):
+        from backend.services.leg_filter import resolve_leg_window
+        self.rw = resolve_leg_window
+        # A long-dated leg with an active range 07-Apr..13-May-2025.
+        self.leg = {"filter_segments": [{"start": "2025-04-07", "end": "2025-05-13"}]}
+        # Trading days spanning the range and beyond (weekdays only, illustrative).
+        import datetime as _dt
+        d = _dt.date(2025, 4, 1)
+        self.td = []
+        while d <= _dt.date(2025, 12, 31):
+            if d.weekday() < 5:
+                self.td.append(d.isoformat())
+            d += _dt.timedelta(days=1)
+
+    def test_reentry_inside_range_is_taken(self):
+        # 15-Apr is INSIDE 07-Apr..13-May — must be taken (old guard wrongly dropped).
+        taken, exit_, trunc = self.rw(self.leg, "2025-04-15", "2025-05-30", self.td)
+        self.assertTrue(taken)
+        self.assertTrue(trunc, "hop exit runs past range end -> truncated")
+        self.assertEqual(exit_, "2025-05-13", "exit clamped to snapped range end")
+
+    def test_reentry_inside_range_within_window_not_truncated(self):
+        taken, exit_, trunc = self.rw(self.leg, "2025-04-15", "2025-05-02", self.td)
+        self.assertTrue(taken)
+        self.assertFalse(trunc, "exit inside range -> not truncated")
+        self.assertEqual(exit_, "2025-05-02")
+
+    def test_reentry_outside_range_not_taken(self):
+        # A December re-entry is outside the leg's only range -> dropped.
+        taken, _e, _t = self.rw(self.leg, "2025-12-01", "2025-12-26", self.td)
+        self.assertFalse(taken)
+
+    def test_no_filter_passes_through(self):
+        taken, exit_, trunc = self.rw({}, "2025-12-01", "2025-12-26", self.td)
+        self.assertTrue(taken)
+        self.assertFalse(trunc)
+        self.assertEqual(exit_, "2025-12-26", "unfiltered leg: exit unchanged")
 
 
 if __name__ == "__main__":

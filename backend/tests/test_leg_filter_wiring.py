@@ -151,11 +151,19 @@ class TestSpotAdjGuard(unittest.TestCase):
                          "guard must be evaluated before the clamp is applied")
 
     def test_reentry_synthesis_skips_filter_ended_legs(self):
+        # Bug 9: the re-entry guard is now DATE-AWARE. It gates on the leg
+        # having an individual filter and skips only when THIS re-entry date is
+        # outside every active range (via the shared _apply_leg_filter_mask /
+        # resolve_leg_window), clamping the exit otherwise. It still precedes
+        # the mini-trade append, so a leg outside its window is never revived.
         src = _source()
-        i_guard = src.index("if _leg_was_truncated(_sa_leg):")
-        i_append = src.index("mini_specs.append(", i_guard)
-        self.assertLess(i_guard, i_append,
-                         "guard must precede the mini-trade append")
+        i_loop = src.index("for _sa_leg in sorted(orig_legs_s")
+        i_append = src.index("mini_specs.append(", i_loop)
+        body = src[i_loop:i_append]
+        self.assertIn("leg_segments(_sa_leg_src)", body)
+        self.assertIn("_apply_leg_filter_mask(", body)
+        self.assertIn("continue", body,
+                      "out-of-range re-entry must still be skipped")
 
 
 class TestTruncatedExitIsSnapped(unittest.TestCase):
@@ -281,26 +289,26 @@ class TestKeysSurviveTradeIdRenumbering(unittest.TestCase):
 
     def test_every_consumer_goes_through_the_shared_predicate(self):
         src = _source()
-        # Three consumers: the clamp guard, the re-entry guard and the tagger.
-        # 1 def + 2 uses (clamp guard, tagger). The re-entry-synthesis guard
-        # deliberately uses the WIDER _leg_was_truncated -- see
-        # TestReentryGuardTestsPresenceNotExitEquality below.
+        # Three consumers of the exit-equality predicate: clamp guard + tagger.
+        # 1 def + 2 uses. Bug 9 moved the re-entry-synthesis guard OFF the wide
+        # _leg_was_truncated onto a date-aware per-hop mask, so _leg_was_truncated
+        # is now def-only (1) -- see TestReentryGuardIsDateAware below.
         self.assertEqual(src.count("_is_leg_filter_ended("), 3)
-        self.assertEqual(src.count("_leg_was_truncated("), 2)  # 1 def + 1 use
+        self.assertEqual(src.count("_leg_was_truncated("), 1)  # def only
 
 
-class TestReentryGuardTestsPresenceNotExitEquality(unittest.TestCase):
-    """The spot-adj RE-ENTRY-SYNTHESIS guard is a safety guard, not a label.
+class TestReentryGuardIsDateAware(unittest.TestCase):
+    """Bug 9: the spot-adj RE-ENTRY-SYNTHESIS guard is date-aware.
 
-    Narrowing it to "the realised exit landed on the boundary" (correct for the
-    three TAG sites) lets a leg that was truncated but exited EARLIER on its own
-    SL/Target be resurrected into a spot-adjustment mini-trade. Mini-specs never
-    pass back through apply_leg_filters, so that re-entry can hold PAST the
-    leg's own window end -- the window violation this whole feature prevents.
+    The old blunt guard (`if _leg_was_truncated(_sa_leg): continue`) skipped a
+    filtered long-dated leg for the WHOLE contract once it was truncated
+    anywhere on it -- dropping re-entries a month INSIDE the leg's active filter
+    range. The fix asks, per hop, whether THIS re-entry date is inside an active
+    range (via _apply_leg_filter_mask / resolve_leg_window): outside -> skip (as
+    before, no window violation); inside -> allow but CLAMP this leg's mini-trade
+    exit to the snapped range end, so it still can never hold past the window.
 
-    The sibling CLAMP guard is correctly left on the narrow predicate: applying
-    or skipping the clamp only ever moves an exit earlier, so it cannot violate
-    a window.
+    The sibling CLAMP guard is left untouched on its narrow predicate.
     """
 
     def _reentry_guard_line(self):
@@ -311,14 +319,24 @@ class TestReentryGuardTestsPresenceNotExitEquality(unittest.TestCase):
         i_append = src.index("mini_specs.append(", i_loop)
         return src[i_loop:i_append]
 
-    def test_guard_uses_the_wide_presence_predicate(self):
+    def test_guard_is_date_aware_not_wide_presence(self):
         body = self._reentry_guard_line()
-        self.assertIn("if _leg_was_truncated(_sa_leg):", body)
-        self.assertIn("continue", body)
+        self.assertNotIn("if _leg_was_truncated(_sa_leg):", body,
+                         "wide whole-contract guard must be gone from this site")
+        self.assertIn("leg_segments(_sa_leg_src)", body)
+        self.assertIn("_apply_leg_filter_mask(", body)
+        self.assertIn("continue", body,
+                      "out-of-range re-entry must still be skipped")
+
+    def test_guard_clamps_this_legs_exit(self):
+        body = self._reentry_guard_line()
+        self.assertIn("_sa_leg_this_exit = _sa_leg_exit", body,
+                      "in-range truncated re-entry clamps THIS leg's exit")
+        self.assertIn('"exit_date":    _sa_leg_this_exit,', _source(),
+                      "mini-spec must use the per-leg clamped exit")
 
     def test_guard_does_not_use_the_exit_equality_predicate(self):
-        # This is the regression itself: _is_leg_filter_ended here would let an
-        # SL-exited truncated leg through.
+        # _is_leg_filter_ended here would let an SL-exited truncated leg through.
         self.assertNotIn("_is_leg_filter_ended", self._reentry_guard_line())
 
     def test_presence_predicate_ignores_the_rows_exit_date(self):

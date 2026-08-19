@@ -916,30 +916,47 @@ def _norm_sa_unit(v):
 
 
 def _yearly_schedule_row(leg, contract_iso):
-    """{strike_gap, spot_adj_pct, spot_adj_unit} for the December-YEAR of
+    """{strike_gap, spot_adj_pct, spot_adj_unit} for the December contract of
     `contract_iso`, or None.
 
+    STICKY / forward-fill: a row applies to its own December contract AND every
+    later December, until a later row overrides it. So `2023 -> 1000` means 1000
+    for Dec-2023, Dec-2024, Dec-2025 ... until (say) a `2026` row changes it.
+    The applicable row is the one with the greatest contract-year <= the held
+    contract's year. Contracts *before* the first row fall back to the leg's
+    base gap/pct (return None) — the opt-in / fallback guarantee is preserved.
+
     `contract_iso` is the pinned December date (yearly_cycles[i].contract, e.g.
-    '2023-12-30'); we key the schedule by its YEAR so the row is tied to the
-    contract the leg holds, not a calendar boundary. None => caller keeps its
-    existing gap / pct, which is the opt-in / fallback guarantee.
-    `spot_adj_unit` is 'percent'/'points' when the row sets it explicitly, else
-    None (caller uses the leg's own units).
+    '2023-12-30'). `spot_adj_unit` is 'percent'/'points' when the winning row
+    sets it explicitly, else None (caller uses the leg's own units).
     """
     sched = (leg or {}).get("yearly_contract_schedule")
     if not isinstance(sched, list) or not sched or not contract_iso:
         return None
     year = str(contract_iso)[:4]
+    if not year.isdigit():
+        return None
+    held = int(year)
+    best = None
+    best_year = None
     for row in sched:
-        if isinstance(row, dict) and str(row.get("contract")).strip()[:4] == year:
-            try:
-                g = float(row.get("strike_gap") or 0); p = float(row.get("spot_adj_pct") or 0)
-            except (TypeError, ValueError):
-                return None
-            if g > 0 and p > 0:
-                return {"strike_gap": g, "spot_adj_pct": p,
-                        "spot_adj_unit": _norm_sa_unit(row.get("spot_adj_unit"))}
-    return None
+        if not isinstance(row, dict):
+            continue
+        ry = str(row.get("contract")).strip()[:4]
+        if not ry.isdigit():
+            continue
+        ryi = int(ry)
+        if ryi > held or (best_year is not None and ryi <= best_year):
+            continue  # later than the held contract, or not the newest so far
+        try:
+            g = float(row.get("strike_gap") or 0); p = float(row.get("spot_adj_pct") or 0)
+        except (TypeError, ValueError):
+            continue
+        if g > 0 and p > 0:
+            best = {"strike_gap": g, "spot_adj_pct": p,
+                    "spot_adj_unit": _norm_sa_unit(row.get("spot_adj_unit"))}
+            best_year = ryi
+    return best
 
 
 def _validate_yearly_schedule(payload):
@@ -2225,6 +2242,36 @@ def _liquidity_walk_step(index: Optional[str], interval: float) -> Tuple[float, 
     return step, True
 
 
+def _revalidate_carried_strike_python(
+    carried: float,
+    atm: float,
+    interval: float,
+    is_call: bool,
+    entry_date: Optional[str],
+    expiry: Optional[str],
+    index: Optional[str],
+    opt_type: str,
+    max_shifts: int,
+) -> Optional[float]:
+    """Mirror of Rust `revalidate_carried_strike`. A carried (Fixed-mode held)
+    strike that is merely `zero_contracts` — LISTED and priced, just no turnover
+    that session — is HELD, not shifted toward ATM. Only a genuinely unlisted
+    (`missing`) carried strike walks. Fresh strike SELECTION never routes here."""
+    if entry_date and expiry and index:
+        try:
+            import algotest_native  # type: ignore
+            _stfn = getattr(algotest_native, "get_option_status", None)
+            if _stfn is not None and _stfn(
+                entry_date, index, carried, opt_type, expiry
+            ) == "zero_contracts":
+                return carried
+        except Exception:
+            pass
+    return _validate_or_shift_strike_python(
+        carried, atm, interval, is_call, entry_date, expiry, index, opt_type, max_shifts,
+    )
+
+
 def _validate_or_shift_strike_python(
     strike: float,
     atm: float,
@@ -3168,7 +3215,7 @@ def _build_fixed_entry_specs(
                     # can go unlisted/illiquid.
                     _atm = round(entry_spot / leg_interval) * leg_interval
                     _is_ce = str(leg.get("option_type") or "CE").upper() in ("CE", "CALL", "C")
-                    strike = _validate_or_shift_strike_python(
+                    strike = _revalidate_carried_strike_python(
                         _carried, _atm, leg_interval, _is_ce, current_entry,
                         leg_expiry, index_str, str(leg.get("option_type") or "CE").upper(), 1,
                     )
@@ -4156,7 +4203,7 @@ def _reanchor_yearly_fresh_on_segments(
                     _new_strike = None
                     _new_req = None
             elif _held is not None:
-                _validated = _validate_or_shift_strike_python(
+                _validated = _revalidate_carried_strike_python(
                     _held, _atm, _leg_iv, _is_ce, _entry, _expiry,
                     index_str, _opt, 1,
                 )
@@ -4204,11 +4251,15 @@ def _atm_straddle_prices(
     entry, or None.
 
     Display-only: re-reads the SAME ATM CE/PE prices the straddle_width strike
-    selection already used — including the same liquidity check and gap-
-    widening fallback (gap, 2x, 3x, 4x) as _compute_strike_for_leg_python, so
-    this never shows a stale zero-turnover close price (e.g. a dead PE's
-    stale close of 1223.85) when the strike math itself used a corrected,
-    widened price. Cached per (entry_date, expiry, atm) so a multi-leg
+    selection already used — including the same liquidity check, gap-widening
+    fallback (gap, 2x, 3x, 4x), AND outward strike-by-strike walk as
+    native's straddle_atm_prices (native/src/simulate.rs), so this never
+    shows a stale zero-turnover close price (e.g. a dead PE's stale close of
+    1223.85) when the strike math itself used a corrected, widened, or
+    walked price — and never shows BLANK on a trade that the strike math
+    successfully resolved via the outward walk (e.g. 2020-03-25, where the
+    near-ATM strikes were all dead but a real liquid CE+PE pair existed ~700
+    points out). Cached per (entry_date, expiry, atm) so a multi-leg
     straddle only hits the lookup once. Never affects strike/P&L.
     """
     if native is None or not (entry_date and expiry and interval and entry_spot and entry_spot > 0):
@@ -4221,6 +4272,7 @@ def _atm_straddle_prices(
         ce = native.get_option_price_tradeable(entry_date, index, atm, "CE", expiry)
         pe = native.get_option_price_tradeable(entry_date, index, atm, "PE", expiry)
         source = ""
+        used_strike = atm
         if ce is None or pe is None:
             missing = ("CE" if ce is None else "") + ("PE" if pe is None else "")
             widened = None
@@ -4230,20 +4282,61 @@ def _atm_straddle_prices(
                 w_ce = native.get_option_price_tradeable(entry_date, index, w_atm, "CE", expiry)
                 w_pe = native.get_option_price_tradeable(entry_date, index, w_atm, "PE", expiry)
                 if w_ce is not None and w_pe is not None:
-                    widened = (w_gap, w_ce, w_pe)
+                    widened = (w_gap, w_atm, w_ce, w_pe)
                     break
-            if widened is None:
-                cache[key] = None
-                return None
-            w_gap, ce, pe = widened
-            source = f"{interval:g}→{w_gap:g} (ATM {missing} zero turnover)"
+            if widened is not None:
+                w_gap, used_strike, ce, pe = widened
+                source = f"{interval:g}→{w_gap:g} (ATM {missing} zero turnover)"
+            else:
+                # All 4 fixed anchors dead — walk outward strike-by-strike in
+                # both directions until CE AND PE are both tradeable at the
+                # SAME strike, or the real chain edge is hit. Mirrors native's
+                # straddle_atm_prices outward walk exactly, so this display
+                # recompute can never disagree with (or blank out) a trade the
+                # strike math itself resolved via that same walk.
+                up_alive = down_alive = True
+                step = 1
+                walked = None
+                while step <= 2000 and (up_alive or down_alive):
+                    for direction in (1, -1):
+                        if direction == 1 and not up_alive:
+                            continue
+                        if direction == -1 and not down_alive:
+                            continue
+                        candidate = atm + direction * step * interval
+                        if candidate <= 0:
+                            if direction == 1:
+                                up_alive = False
+                            else:
+                                down_alive = False
+                            continue
+                        c_ce = native.get_option_price_tradeable(entry_date, index, candidate, "CE", expiry)
+                        c_pe = native.get_option_price_tradeable(entry_date, index, candidate, "PE", expiry)
+                        if c_ce is not None and c_pe is not None:
+                            walked = (candidate, c_ce, c_pe, direction * step * interval)
+                            break
+                        ce_status = native.get_option_status(entry_date, index, candidate, "CE", expiry)
+                        pe_status = native.get_option_status(entry_date, index, candidate, "PE", expiry)
+                        if ce_status == "missing" and pe_status == "missing":
+                            if direction == 1:
+                                up_alive = False
+                            else:
+                                down_alive = False
+                    if walked is not None:
+                        break
+                    step += 1
+                if walked is None:
+                    cache[key] = None
+                    return None
+                used_strike, ce, pe, offset = walked
+                source = f"{interval:g}→walk{offset:+.0f}pt (ATM {missing} zero turnover)"
     except Exception:
         cache[key] = None
         return None
     if ce is None or pe is None:
         cache[key] = None
         return None
-    res = (float(atm), round(float(ce), 2), round(float(pe), 2), round(float(ce) + float(pe), 2), source)
+    res = (float(used_strike), round(float(ce), 2), round(float(pe), 2), round(float(ce) + float(pe), 2), source)
     cache[key] = res
     return res
 
@@ -4352,6 +4445,12 @@ def _apply_carry_slippage_guard(priced: List[Dict[str, Any]]) -> None:
         for pos, i in enumerate(idxs):
             r = priced[i]
             k = keys[pos]
+            # A carry is decided purely by the contract: same (strike, expiry) as
+            # the neighbour → held → no slippage on that side. A leg that keeps the
+            # same contract across a filter-patch gap (e.g. a carried yearly hedge
+            # while another leg owns the patches) is HELD, not re-traded, so it is
+            # never slipped there — matching the original behaviour. Slippage
+            # applies only where the contract actually changes (strike or expiry).
             is_open = (pos == 0) or (k != keys[pos - 1])
             is_close = (pos == n - 1) or (k != keys[pos + 1])
             _posn = r.get("position")
@@ -4761,6 +4860,7 @@ def _stamp_yearly_roll_reason(
             key=lambda r: (_normalize_iso(r.get("Entry Date") or "") or "", str(r.get("Trade") or "")),
         )
         _prev_year: Optional[str] = None
+        _prev_eff: Optional[tuple] = None  # (gap, pct, unit) that was in effect
         for _r in _rows:
             _expiry = _r.get("Expiry") or ""
             _year = str(_expiry)[:4] if _expiry else ""
@@ -4768,7 +4868,13 @@ def _stamp_yearly_roll_reason(
                 continue
             if _year != _prev_year:
                 _srow = _yearly_schedule_row(_leg, _expiry)
-                if _srow is not None:
+                _eff = ((_srow["strike_gap"], _srow["spot_adj_pct"], _srow["spot_adj_unit"])
+                        if _srow is not None else None)
+                # Sticky schedule: only annotate when the EFFECTIVE gap/adj
+                # actually changes at this roll (a row first becoming active, or
+                # a later row overriding). Contracts that merely inherit the same
+                # row get no note.
+                if _srow is not None and _eff != _prev_eff:
                     _g = int(_srow["strike_gap"]) if float(_srow["strike_gap"]).is_integer() else round(_srow["strike_gap"], 2)
                     _p = int(_srow["spot_adj_pct"]) if float(_srow["spot_adj_pct"]).is_integer() else round(_srow["spot_adj_pct"], 2)
                     _usfx = "%" if _srow.get("spot_adj_unit") == "percent" else ("pt" if _srow.get("spot_adj_unit") == "points" else "")
@@ -4776,6 +4882,7 @@ def _stamp_yearly_roll_reason(
                     _existing = _r.get("Strike Shift Reason") or ""
                     _r["Strike Shift Reason"] = f"{_existing} + {_note}" if _existing else _note
                 _prev_year = _year
+                _prev_eff = _eff
             else:
                 pass  # same contract — no annotation
 
@@ -6498,6 +6605,7 @@ def run_rust_engine_pipeline(
     from services.leg_filter import (
         LEG_FILTER_END,
         CARRIED_SEG1_END_KEY,
+        leg_segments,
         apply_leg_filters_split as apply_leg_filters,
     )
 
@@ -9059,6 +9167,13 @@ def run_rust_engine_pipeline(
                                 _tiv = float(_tiv_raw) if _tiv_raw else _cf_iv_default
                             except (TypeError, ValueError):
                                 _tiv = _cf_iv_default
+                            # Per-December-contract schedule: the re-anchor for a
+                            # scheduled yearly contract must use the schedule's gap
+                            # (keyed by this row's December year), else the anchor —
+                            # and every trade that inherits it — lands off-grid.
+                            _t_yr = _yearly_schedule_row(_tsrc, _normalize_iso(_trow.get("expiry") or ""))
+                            if _t_yr is not None:
+                                _tiv = float(_t_yr["strike_gap"])
                             _tspot = float(spot_by_date.get(_tdate) or 0.0)
                             if _tspot > 0:
                                 _tnat = _compute_strike_for_leg_python(
@@ -9099,6 +9214,12 @@ def run_rust_engine_pipeline(
                         _oiv = float(_oiv_raw) if _oiv_raw else _cf_iv_default
                     except (TypeError, ValueError):
                         _oiv = _cf_iv_default
+                    # Per-December-contract schedule: re-anchor on the schedule's
+                    # gap for the contract this override holds (keyed by expiry),
+                    # so the propagated anchor stays on the scheduled grid.
+                    _o_yr = _yearly_schedule_row(_osrc, _normalize_iso(_orow.get("expiry") or ""))
+                    if _o_yr is not None:
+                        _oiv = float(_o_yr["strike_gap"])
                     _onat = _compute_strike_for_leg_python(
                         _osrc, _ospot, _oiv,
                         entry_date=_odate,
@@ -9207,8 +9328,16 @@ def run_rust_engine_pipeline(
                             _bexp = _re_exp
                         else:
                             break
+                    # Per-December-contract schedule: this fixed leg's OWN-breach
+                    # re-anchor must use the schedule's gap for the contract it
+                    # breached on (keyed by _bexp's December year), else the anchor
+                    # — and every base trade that inherits it — lands off-grid.
+                    _fl_iv_eff = _fl_iv
+                    _fl_yr = _yearly_schedule_row(_fl_src, _bexp)
+                    if _fl_yr is not None:
+                        _fl_iv_eff = float(_fl_yr["strike_gap"])
                     _bstk = _compute_strike_for_leg_python(
-                        _fl_src, _bspot, _fl_iv, entry_date=_bd, expiry=_bexp, index=_cf_index,
+                        _fl_src, _bspot, _fl_iv_eff, entry_date=_bd, expiry=_bexp, index=_cf_index,
                     )
                     if _bstk:
                         # This is the fixed leg's OWN breach, so it is the
@@ -9764,10 +9893,33 @@ def run_rust_engine_pipeline(
                         # into a mini-trade — those specs never pass back through
                         # apply_leg_filters, so the re-entry could hold PAST the
                         # leg's own window end.
-                        if _leg_was_truncated(_sa_leg):
-                            continue
+                        #
+                        # DATE-AWARE: _leg_was_truncated is True whenever the leg
+                        # is truncated ANYWHERE on this contract (its filter-end
+                        # key includes only (expiry, leg_id)), which is too wide
+                        # for a long-dated leg — it blocked a re-entry a month
+                        # INSIDE the leg's active filter range just because the
+                        # range ends later on the same contract. Ask instead
+                        # whether THIS re-entry date is inside an active range;
+                        # if so allow it but clamp the mini-trade exit to the
+                        # range end so it cannot hold past the window.
                         _sa_lidx = int(_sa_leg.get("leg_id") or 1) - 1
                         _sa_leg_src = legs_src[_sa_lidx] if _sa_lidx < len(legs_src) else {}
+                        _sa_leg_this_exit = _sa_this_exit
+                        if leg_segments(_sa_leg_src):
+                            _sa_taken, _sa_leg_exit, _sa_trunc = _apply_leg_filter_mask(
+                                _sa_leg_src, _sa_cur_entry, _sa_this_exit, trading_days
+                            )
+                            if not _sa_taken:
+                                # Re-entry is outside every active range (or the
+                                # window snaps to nothing) — skip, as before.
+                                continue
+                            if _sa_trunc:
+                                # In-range but the range ends before this hop's
+                                # exit: clamp THIS leg's mini-trade exit to the
+                                # snapped range end (resolve_leg_window already
+                                # snapped it and dropped degenerate windows).
+                                _sa_leg_this_exit = _sa_leg_exit
                         _sa_prev_strike = (
                             _sa_prev_strike_by_leg.get(_sa_lid)
                             or float(_sa_leg.get("strike") or 0.0)
@@ -9811,6 +9963,16 @@ def run_rust_engine_pipeline(
                         _sa_leg_expiry = (
                             _normalize_iso(_sa_leg.get("expiry") or "") or orig_expiry
                         )
+                        # Per-December-contract schedule: a yearly leg's spot-adj
+                        # RE-STRIKE must use the schedule gap for the contract it
+                        # holds (keyed by _sa_leg_expiry's December year), so a
+                        # re-entry inside a scheduled contract lands on the SAME
+                        # grid as its scheduled entries. Without this the re-strike
+                        # used the leg's base gap (e.g. 500) and fell off the
+                        # scheduled 1000-grid (23500/24500 in a Dec-2024 run).
+                        _sa_yr_row = _yearly_schedule_row(_sa_leg_src, _sa_leg_expiry)
+                        if _sa_yr_row is not None:
+                            _sa_leg_interval = float(_sa_yr_row["strike_gap"])
                         _sa_strike_info: Dict[str, Any] = {}
                         # A YEARLY leg holds one strike per calendar MONTH; only a
                         # weekly/monthly leg re-strikes at every adjustment. This
@@ -10008,7 +10170,7 @@ def run_rust_engine_pipeline(
                             "leg_id":       _sa_lid,
                             "index":        _sa_leg.get("index") or _sa_index,
                             "entry_date":   _sa_cur_entry,
-                            "exit_date":    _sa_this_exit,
+                            "exit_date":    _sa_leg_this_exit,
                             "expiry":       _sa_leg_expiry,
                             "strike":       _sa_strike,
                             "requested_strike": float(_sa_strike_info.get("requested_strike") or _sa_strike),
@@ -10175,6 +10337,22 @@ def run_rust_engine_pipeline(
                 _pl_iv = _pl_interval_default
             if _pl_iv not in (25.0, 50.0, 100.0, 500.0, 1000.0):
                 _pl_iv = _pl_interval_default
+            # Per-December-contract schedule (yearly leg): this per-leg re-entry
+            # loop must use the schedule's gap for the RE-STRIKE and the schedule's
+            # magnitude/unit for the RE-TRIGGER, keyed by the contract it holds
+            # (_pl_expiry). Contract-scoped (not trade-scoped), so it applies to
+            # every re-entry of every scheduled December uniformly. Without this
+            # the loop re-struck on the base gap (e.g. 500) and re-triggered on the
+            # base pct, dropping scheduled contracts off their own grid/threshold.
+            _pl_yr_row = _yearly_schedule_row(_pl_src, _pl_expiry)
+            _pl_eff_pct = _pl_cfg["pct"]
+            _pl_eff_units = _pl_cfg["units"]
+            if _pl_yr_row is not None:
+                _pl_iv = float(_pl_yr_row["strike_gap"])
+                _pl_eff_pct = _pl_yr_row["spot_adj_pct"]
+                _pl_eff_units = _pl_yr_row["spot_adj_unit"] or _pl_cfg["units"]
+                if _pl_eff_units == "percent":
+                    _pl_eff_pct = max(0.25, min(5.0, _pl_eff_pct))
             _pl_depth = 0
             while _pl_depth < 250 and _pl_cur_entry < _pl_sched_exit:
                 _pl_depth += 1
@@ -10185,7 +10363,7 @@ def run_rust_engine_pipeline(
                 # cascade and the _trade_adj_baseline re-base rule.
                 _pl_next = _compute_spot_adjustment_trigger(
                     _pl_cur_entry, _pl_spot, _pl_sched_exit,
-                    _pl_cfg["direction"], _pl_cfg["pct"], _pl_cfg["units"],
+                    _pl_cfg["direction"], _pl_eff_pct, _pl_eff_units,
                     trading_days, spot_by_date,
                 )
                 _pl_this_exit = (
@@ -10220,7 +10398,7 @@ def run_rust_engine_pipeline(
                     _sa_leg_reentry_reasons[(_pl_new_tid, _pl_lid, _pl_cur_entry)] = (
                         _spot_adj_reason_tag(
                             _pl_cfg["direction"], _pl_spot, spot_by_date.get(_pl_next),
-                            _pl_cfg["pct"], _pl_cfg["units"],
+                            _pl_eff_pct, _pl_eff_units,
                         )
                     )
                 _pl_new_tid += 1
