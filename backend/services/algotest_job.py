@@ -384,7 +384,7 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
     if not priced:
         return (pd.DataFrame(), {}, {"headers": [], "rows": []})
 
-    records = priced_to_tradesheet_records(priced, payload, int(lot_size))
+    records = priced_to_tradesheet_records(priced, payload, int(lot_size), spots)
 
     # Compute MAE/MFE per leg using the same DB/feather range query the Python engine uses.
     if os.environ.get("BACKTEST_INCLUDE_MAE_MFE", "1").strip().lower() not in ("0", "false", "no", "off"):
@@ -443,7 +443,22 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
                 if mfe_val is not None:
                     rec["MFE"] = mfe_val * _rec_lots
         except Exception as _mae_exc:
-            logger.warning("[MAE/MFE] Rust path computation failed (non-fatal): %s", _mae_exc)
+            # NOT non-fatal. This try wraps the WHOLE per-row loop, so a failure
+            # partway leaves every remaining row at MAE/MFE = 0.0 — which reads
+            # as "no adverse excursion" rather than "unknown". That 0.0 feeds
+            # native/src/summary_metrics.rs lowest_nav and therefore Live DD,
+            # Final MAE and Max DD, silently UNDERSTATING drawdown on a run that
+            # otherwise looks completely normal. Wrong risk numbers are worse
+            # than no numbers, so fail loudly (project rule: no silent fallback).
+            logger.error("[MAE/MFE] computation failed after enriching part of the "
+                         "tradesheet — remaining rows would keep MAE/MFE=0.0 and "
+                         "understate drawdown: %s", _mae_exc)
+            raise RuntimeError(
+                "MAE/MFE enrichment failed mid-tradesheet (%s). Refusing to return a "
+                "result whose drawdown metrics are silently understated. Set "
+                "BACKTEST_INCLUDE_MAE_MFE=0 to run without MAE/MFE deliberately."
+                % _mae_exc
+            ) from _mae_exc
 
     trades_df = pd.DataFrame(records)
     for c in ("Entry Date", "Exit Date"):
@@ -739,7 +754,21 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
             payload, index, effective_from, effective_to
         )
         logger.info("[JOB_PERF] rust_engine %.2fs", time.perf_counter() - stage_t)
-        all_trades = trades_df.to_dict('records') if trades_df is not None and not trades_df.empty else []
+        # (None, None, None) is the Rust path's REFUSAL signal, not a result. The
+        # docstring says the caller "falls back to the Python engine" — there is no
+        # such fallback here, and the code below treated None exactly like an empty
+        # tradesheet. A refusal therefore surfaced as a perfectly normal, successful
+        # backtest reporting 0 trades, which reads as "this strategy never triggered"
+        # when in fact it was never run. A genuinely empty run returns an EMPTY
+        # DataFrame, not None, so this discriminates refusal from zero trades.
+        if trades_df is None:
+            raise RuntimeError(
+                "Rust engine declined this payload (returned no result). Refusing to "
+                "report it as a successful 0-trade backtest — that is indistinguishable "
+                "from a strategy that legitimately never traded. Check the engine log "
+                "for the unsupported condition."
+            )
+        all_trades = trades_df.to_dict('records') if not trades_df.empty else []
         if engine_summary is None:
             engine_summary = {}
         if engine_pivot is None:
@@ -947,6 +976,9 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                         
                         initial_capital = 100000.0
                         final_capital = initial_capital + pnl_vals.sum()
+                        equity_peak = initial_capital + peak
+                        dd_pct = np.where(equity_peak > 0, dd / equity_peak * 100, 0)
+                        max_dd_pct = round(float(dd_pct.min()), 2) if len(dd_pct) > 0 else 0
                         if len(fallback_df) > 1 and 'Entry Date' in fallback_df.columns:
                             dates = pd.to_datetime(fallback_df['Entry Date'], dayfirst=True, errors='coerce')
                             if dates.notna().any():
@@ -957,8 +989,8 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                                 cagr_options = 0
                         else:
                             cagr_options = 0
-                        
-                        car_mdd = round(cagr_options / abs(max_dd_pts) * 100, 2) if max_dd_pts > 0 else 0
+
+                        car_mdd = round(cagr_options / abs(max_dd_pct), 4) if max_dd_pct != 0 else 0
                         
                         result_summary = {
                             'total_pnl': round(pnl_vals.sum(), 2),
@@ -974,6 +1006,7 @@ def execute_algotest_job(request: Dict[str, Any]) -> Dict[str, Any]:
                             'reward_to_risk': round(reward_to_risk, 2),
                             'cagr_options': cagr_options,
                             'max_dd_pts': max_dd_pts,
+                            'max_dd_pct': max_dd_pct,
                             'car_mdd': car_mdd,
                             'recovery_factor': round(pnl_vals.sum() / max_dd_pts, 2) if max_dd_pts > 0 else 0,
                             'max_win_streak': 0,

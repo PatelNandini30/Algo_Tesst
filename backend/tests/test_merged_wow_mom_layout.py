@@ -216,18 +216,18 @@ class TestVariantLabels(unittest.TestCase):
 class TestPerLegAdjustmentLabel(unittest.TestCase):
 
     def test_reads_per_leg_segment_from_combo_label(self):
-        lbl = "CE_2%_ITM_Sell_PE_ITM1_Buy_L1RiseBy1%_NoAdjustment_Monthly_Expiry_T-1_To_T-1"
-        self.assertEqual(adj_label_from_combo_label(lbl), "Rise 1% (L1)")
+        lbl = "NIFTY_M_PE_S_ATM_adj_rise_1pct_M_PE_B_RtL1_T-1_To_T-1"
+        self.assertEqual(adj_label_from_combo_label(lbl), "Rise 1%")
 
     def test_direction_and_units(self):
-        self.assertEqual(adj_label_from_combo_label("x_L2FallsBy1000pts_y"),
-                         "Fall 1000pts (L2)")
-        self.assertEqual(adj_label_from_combo_label("x_L1MoveBy2%_y"),
-                         "Rise or Fall 2% (L1)")
+        self.assertEqual(adj_label_from_combo_label("x_adj_fall_1000pts_y"),
+                         "Fall 1000pts")
+        self.assertEqual(adj_label_from_combo_label("x_adj_both_2pct_y"),
+                         "Rise or Fall 2%")
 
     def test_multiple_legs_joined(self):
-        self.assertEqual(adj_label_from_combo_label("x_L1RiseBy1%_L2FallsBy1%_y"),
-                         "Rise 1% (L1) + Fall 1% (L2)")
+        self.assertEqual(adj_label_from_combo_label("x_adj_rise_1pct_y_adj_fall_1pct_z"),
+                         "Rise 1% + Fall 1%")
 
     def test_absent_returns_empty(self):
         self.assertEqual(adj_label_from_combo_label("CE_ATM_Sell_NoAdjustment"), "")

@@ -22,7 +22,6 @@ pd.Series.sort_values = _patched_series_sort
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import ORJSONResponse
 import os
 import sys
@@ -57,8 +56,18 @@ app = FastAPI(
     default_response_class=ORJSONResponse,
 )
 
-# Compress payloads > 1KB
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# NOT app.add_middleware(GZipMiddleware, ...). Starlette 0.27's GZipMiddleware
+# never checks the response status and skips minimum_size on the streaming
+# branch, so it gzipped 206 Partial Content — measured on the cached ZIP path:
+# a Range request came back gzip-encoded with Content-Length stripped and
+# Content-Range still describing the UNCOMPRESSED file, silently breaking the
+# Range/resume support in this router and the browser's download progress bar.
+# It also re-deflated already-compressed ZIPs for ~0% size gain. nginx already
+# does JSON gzip in front of this (frontend/nginx.conf: gzip on; gzip_types
+# application/json ...), so removing this duplicates nothing for browser
+# clients; only same-origin callers that bypass nginx (LAN remote nodes on
+# :8100, the API published directly on :8000) lose JSON compression, and those
+# paths carry small meta JSON plus file downloads that must not be gzipped.
 
 # Add CORS middleware
 app.add_middleware(
@@ -192,6 +201,11 @@ def cache_stats():
         from services.data_memory_cache import get_memory_cache
         memory_cache = get_memory_cache()
         stats["memory"] = memory_cache.get_stats()
+        stats["memory"]["active"] = False
+        stats["memory"]["note"] = (
+            "not wired into the live backtest loading pipeline (no callers hit "
+            "set()/get()) - these numbers are always zero, not real telemetry"
+        )
     except Exception as e:
         stats["memory"] = {"error": str(e)}
     

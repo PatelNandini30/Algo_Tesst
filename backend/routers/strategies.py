@@ -63,7 +63,7 @@ async def get_date_range(index: str = "NIFTY"):
     
     if get_data_source() == "postgres":
         try:
-            dr = _repo.get_available_date_range()
+            dr = _repo.get_available_date_range(symbol=index)
             if dr["min_date"] and dr["max_date"]:
                 return DateRangeResponse(
                     min_date=pd.to_datetime(dr["min_date"]).strftime('%Y-%m-%d'),

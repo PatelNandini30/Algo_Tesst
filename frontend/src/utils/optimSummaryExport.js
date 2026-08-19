@@ -171,23 +171,16 @@ export function buildOptimizedParamsRows(paramSpecs, comboCount) {
   return rows;
 }
 
-export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId, basePayload) {
-  // The WORKBOOK is built on the backend (services/optimizer/summary_workbook.py), so
-  // every .xlsx this product emits comes from one builder — openpyxl, server-side:
-  //   tradesheet -> excel_builder.build_combo_xlsx
-  //   WOW & MOM  -> wow_mom.write_merged_wow_mom
-  //   this sheet -> summary_workbook.build_summary_workbook
-  // We still resolve the per-combo summary and derive the Rules block here, because
-  // that reads the sweep config the client already holds; re-deriving it in Python
-  // would create a second implementation of the sweep-label logic, which is exactly
-  // the duplication this consolidation removes.
-  const payloadRows = rows.map((row) => ({
-    summary:
-      (summaryByCombo && summaryByCombo.get(String(row.combo_id))) ||
-      row.summary ||
-      {},
-    combo_columns: row.combo_columns || {},
-  }));
+export async function buildSummaryWorkbookBlob(ruleConfig, jobId, basePayload, patchwise = true, sort = null) {
+  // The WORKBOOK is built entirely on the backend (services/optimizer/
+  // summary_workbook.py + get_optim_summary's patchwise overlay) — the browser
+  // used to relay every row (and, for patchwise, a SECOND full fetch of every
+  // row's summary) back up as the POST body, so an export held 2-3 complete
+  // copies of the sweep in tab memory at once and could OOM the tab well before
+  // any table-render cost. The server already has the rows (result_store) and
+  // already applies the identical patchwise overlay (get_optim_summary), so
+  // there is nothing left for the client to supply except the Rules block,
+  // which genuinely does live only in the browser's sweep-config state.
   const base = await resolveDownloadBase(jobId);
 
   // Leg-wise "Rules" sheet — the SAME buildRulesSheet the backtest download uses,
@@ -200,6 +193,7 @@ export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo,
     // Always fetch the meta so we have param_specs (the sweep axes) for the
     // "Optimized Parameters" section — and use its base_payload when the caller
     // didn't pass one.
+    let comboCount = 0;
     try {
       const mr = await fetch(`${base}/api/optimize/jobs/${jobId}`);
       if (mr.ok) {
@@ -207,6 +201,7 @@ export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo,
         const meta = md?.meta || md || {};
         if (!bp) bp = meta.base_payload || md?.base_payload || null;
         paramSpecs = meta.param_specs || md?.param_specs || [];
+        comboCount = Number(meta.total ?? md?.total ?? 0);
       }
     } catch { /* fall back to no Rules sheet / no optimized-params section */ }
   }
@@ -216,7 +211,7 @@ export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo,
   // Append the swept combination space (which axes were optimized + their values).
   try {
     if (rulesSheet && paramSpecs && paramSpecs.length) {
-      const optRows = buildOptimizedParamsRows(paramSpecs, Array.isArray(rows) ? rows.length : 0);
+      const optRows = buildOptimizedParamsRows(paramSpecs, comboCount);
       if (optRows.length) rulesSheet = [...rulesSheet, ['spacer'], ...optRows];
     }
   } catch { /* optimized-params section is best-effort */ }
@@ -224,7 +219,26 @@ export async function buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo,
   const res = await fetch(`${base}/api/optimize/jobs/${jobId}/summary.xlsx`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rows: payloadRows, rule_rows: buildRuleRows(ruleConfig), rules_sheet: rulesSheet }),
+    // Rows are NOT sent for large sweeps. Each trimmed row is ~1,888 bytes, so
+    // 26,500 combos already exceeds nginx's client_max_body_size (50 MB) and the
+    // export died with a 413 that looked like a broken download — 63,504 combos
+    // is 120 MB, 100,000 is 189 MB. Above the threshold the backend reads the
+    // same stored rows itself (and applies the same patchwise override), so the
+    // workbook is identical without shipping the data back to the server.
+    // Small sweeps keep posting rows: that path is well-tested and lets the
+    // client's already-resolved per-combo summary win.
+    body: JSON.stringify({
+      // No `rows`: the server loads them itself (result_store.get_all_results)
+      // and applies the identical patchwise overlay — see the note above.
+      // MUST be sent explicitly. Omitting it let the backend default
+      // (payload.get("patchwise", True)) win, so an Overall-mode sweep got a
+      // patchwise workbook saved under an _overall filename — the same
+      // inversion as the download buttons.
+      patchwise: Boolean(patchwise),
+      ...(sort && sort.by ? { sort_by: sort.by, order: sort.order || 'desc' } : {}),
+      rule_rows: buildRuleRows(ruleConfig),
+      rules_sheet: rulesSheet,
+    }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -279,10 +293,10 @@ export async function downloadWhenReady(url, { maxWaitMs = 20 * 60 * 1000, onPro
 export async function fetchBlobWithPoll(url, { maxWaitMs = 20 * 60 * 1000, onProgress } = {}) {
   const start = Date.now();
   while (true) {
-    const r = await fetch(url);
-    if (r.status === 200) {
-      const blob = await r.blob();
-      const filename = r.headers.get('x-filename') || null;
+      const r = await fetch(url);
+      if (r.status === 200) {
+        const blob = await r.blob();
+        const filename = r.headers.get('x-filename') || null;
       return { blob, filename };
     }
     if (r.status === 202) {

@@ -133,6 +133,7 @@ def _cmp(tag, ref, got, checked, diffs, keys=None):
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     grand = 0
+    skipped_patchwise = 0
     for name, payload in PAYLOADS:
         if only and only not in name:
             continue
@@ -206,7 +207,11 @@ def main():
                         if v is not None:
                             Bpw.setdefault(key, v)
                 _cmp("B!=C PATCHWISE per-combo vs master", Cpw, Bpw, checked, diffs)
+            else:
+                skipped_patchwise += 1
+                print(f"  [warn] patchwise check skipped: fewer than 4 Entry Dates ({len(_d)})")
         except Exception as exc:
+            skipped_patchwise += 1
             print(f"  [warn] patchwise check skipped: {type(exc).__name__}: {exc}")
         print(f"  trades={len(df)}  metrics compared={len(checked)}  diffs={len(diffs)}"
               f"  [{'OK' if not diffs else 'DIVERGED'}]")
@@ -221,8 +226,12 @@ def main():
 
     print()
     print("=" * 78)
-    print(f"TOTAL divergences from the backtest: {grand}"
-          f"  {'-> ALL THREE IDENTICAL' if grand == 0 else '(NOT YET UNIFIED)'}")
+    if skipped_patchwise:
+        print(f"TOTAL divergences from the backtest: {grand}"
+              f"  (patchwise check SKIPPED for {skipped_patchwise} combo(s) — NOT verified for those)")
+    else:
+        print(f"TOTAL divergences from the backtest: {grand}"
+              f"  {'-> ALL THREE IDENTICAL' if grand == 0 else '(NOT YET UNIFIED)'}")
     return 0
 
 

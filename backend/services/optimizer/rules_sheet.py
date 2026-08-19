@@ -65,6 +65,12 @@ def _strike_label(ss: Optional[Dict[str, Any]], opt_type: Any = "") -> str:
         off = ss.get("offset")
         return (f"Relative to Leg {_num(ref if ref is not None else 1)}, "
                 f"offset {_num(off if off is not None else 0)} gap(s)")
+    if t == "REL_LEG_PREMIUM":
+        # Wording kept identical to frontend/src/utils/backtestRulesSheet.js so a
+        # backtest workbook and an optim combo workbook read the same.
+        ref = ss.get("ref_leg")
+        return (f"Relative to Leg {_num(ref if ref is not None else 1)} Premium, "
+                f"÷ weeks to expiry ÷ lots")
     if t.startswith("TIME_VALUE"):
         op = ">=" if t == "TIME_VALUE_GTE" else "<=" if t == "TIME_VALUE_LTE" else "nearest"
         tv = ss.get("time_value")
@@ -91,7 +97,7 @@ def _kv(rows: List, label: str, value: Any) -> None:
     rows.append(["kv", label, "—" if value in (None, "") else str(value)])
 
 
-def _leg_section(rows: List, leg: Dict[str, Any], n: int) -> None:
+def _leg_section(rows: List, leg: Dict[str, Any], n: int, per_leg: bool = False) -> None:
     seg = str(leg.get("segment") or "OPTIONS").upper()
     side = _side(leg.get("position"))
     head = f"FUT {side}" if seg == "FUTURES" else f"{str(leg.get('option_type') or '').upper()} {side}"
@@ -99,9 +105,33 @@ def _leg_section(rows: List, leg: Dict[str, Any], n: int) -> None:
 
     _kv(rows, "Position", side)
     _kv(rows, "Lots", leg.get("lots") if leg.get("lots") is not None else 1)
+    # Per-leg quantity override (direct P&L multiplier). Shown only when set.
+    _qov = leg.get("qty") or leg.get("_qty_override")
+    if _qov:
+        _kv(rows, "Quantity (override)", _qov)
     if leg.get("index"):
         _kv(rows, "Index", leg.get("index"))
     _kv(rows, "Expiry", _expiry(leg.get("expiry")))
+    # Makes the strategy-level "Filter" row's "see leg sections below" pointer
+    # (above) actually true.
+    _leg_filter_segs = leg.get("filter_segments") or []
+    if leg.get("individual_filter") and _leg_filter_segs:
+        try:
+            _flo = min(str(x.get("start") or "") for x in _leg_filter_segs if x.get("start"))
+            _fhi = max(str(x.get("end") or "") for x in _leg_filter_segs if x.get("end"))
+        except ValueError:
+            _flo = _fhi = ""
+        _fspan = f" ({_flo} → {_fhi})" if _flo and _fhi else ""
+        _kv(rows, "Filter",
+            f"{len(_leg_filter_segs)} segment{'s' if len(_leg_filter_segs) != 1 else ''}{_fspan}")
+    # Per-leg rollover: this leg rolls on its OWN expiry cadence + own exit T-n
+    # (union boundaries, carried between its rolls). Only shown when the run
+    # opted into per-leg rollover — a shared-cadence run leaves this off and
+    # documents its single T-n at the strategy level instead.
+    if per_leg and seg != "FUTURES":
+        _xd = leg.get("exit_dte")
+        _kv(rows, "Leg Rollover",
+            f"Yes — {_expiry(leg.get('expiry'))} cadence, exit T-{_xd if _xd is not None else 0}")
 
     if seg == "FUTURES":
         _kv(rows, "Exit Mode", leg.get("fut_exit_mode"))
@@ -131,6 +161,27 @@ def _leg_section(rows: List, leg: Dict[str, Any], n: int) -> None:
         _kv(rows, "Spot Adjustment", f"Yes ({d} {_num(sa.get('pct'))}{u})")
     else:
         _kv(rows, "Spot Adjustment", "Uses strategy-level setting")
+
+    # Per-December-contract schedule (yearly legs): each row is a From→To year
+    # range; the range runs until the next row's From (sticky), last row = onward.
+    # Unlisted early years use the leg's base above.
+    sched = leg.get("yearly_contract_schedule")
+    if isinstance(sched, list) and sched:
+        _valid = []
+        for _r in sched:
+            if not isinstance(_r, dict):
+                continue
+            _yr = str(_r.get("contract") or "").strip()[:4]
+            if _yr.isdigit():
+                _valid.append((int(_yr), _r))
+        _valid.sort(key=lambda t: t[0])
+        for _i, (_fy, _r) in enumerate(_valid):
+            _to = f"Dec-{_valid[_i + 1][0] - 1}" if _i + 1 < len(_valid) else "onward"
+            _u = _r.get("spot_adj_unit")
+            _usfx = "%" if _u == "percent" else (" pts" if _u == "points" else "")
+            _kv(rows, f"Contract Dec-{_fy} → {_to}",
+                f"Strike Gap {_num(_r.get('strike_gap'))}, "
+                f"Spot Adj {_num(_r.get('spot_adj_pct'))}{_usfx}")
 
     try:
         _slp = float(leg.get("slippage_pct") or 0)
@@ -222,6 +273,9 @@ def build_rules_sheet(payload: Optional[Dict[str, Any]], filter_name: Optional[s
     else:
         _kv(rows, "Rollover", "None")
 
+    if payload.get("per_leg_rollover"):
+        _kv(rows, "Rollover Mode", "Per-Leg (each leg rolls on its own expiry + exit T-n; see legs)")
+
     if payload.get("spot_adjustment_enabled"):
         u = "%" if payload.get("spot_adjustment_units") == "percent" else " pts"
         d = _SA_DIR.get(payload.get("spot_adjustment_direction"), payload.get("spot_adjustment_direction") or "")
@@ -255,14 +309,49 @@ def build_rules_sheet(payload: Optional[Dict[str, Any]], filter_name: Optional[s
     if payload.get("overall_target_type"):
         _kv(rows, "Overall Target", f"{payload.get('overall_target_type')}: {_num(payload.get('overall_target_value'))}")
     _kv(rows, "Cost / Charges", "Enabled" if payload.get("charges_enabled") else "Disabled")
-    _kv(rows, "Filter", filter_name or "No Filter")
+    # "custom" is all the payload carries as a NAME — the filter's real identity is
+    # its segment list, which was previously dropped entirely, so the sheet said
+    # 'Filter: custom' and you could not tell WHICH filter ran. Render the span and
+    # the segments themselves (the UI already shows "12 segments · dd/mm/yyyy →
+    # dd/mm/yyyy"; this makes the workbook say the same thing).
+    _segs = payload.get("filter_segments") or []
+    if _segs:
+        try:
+            _lo = min(str(x.get("start") or "") for x in _segs if x.get("start"))
+            _hi = max(str(x.get("end") or "") for x in _segs if x.get("end"))
+        except ValueError:
+            _lo = _hi = ""
+        _span = f" · {_lo} → {_hi}" if _lo and _hi else ""
+        _name = payload.get("filter_label") or filter_name or "custom"
+        _kv(rows, "Filter", f"{_name} · {len(_segs)} segments{_span}")
+        rows.append(["section", f"Filter Segments ({len(_segs)})"])
+        for _n, _sg in enumerate(_segs, 1):
+            _kv(rows, f"Segment {_n}",
+                f"{_sg.get('start') or '?'} → {_sg.get('end') or '?'}")
+    else:
+        # Top-level filter_segments only covers the STRATEGY-LEVEL filter. A
+        # leg's own uploaded filter (leg.individual_filter + leg.filter_segments)
+        # restricts that leg's trading dates regardless of the strategy-level
+        # toggle (engine_rust.py's apply_leg_filters applies it either way), so
+        # this said "No Filter" on a run that was genuinely, per-leg filtered.
+        _per_leg_filtered = [
+            l for l in (payload.get("legs") or [])
+            if isinstance(l, dict) and l.get("individual_filter") and l.get("filter_segments")
+        ]
+        if _per_leg_filtered:
+            _kv(rows, "Filter",
+                f"Per-leg ({len(_per_leg_filtered)} leg"
+                f"{'s' if len(_per_leg_filtered) != 1 else ''} filtered — see leg sections below)")
+        else:
+            _kv(rows, "Filter", payload.get("filter_label") or filter_name or "No Filter")
 
     rows.append(["spacer"])
 
     legs = payload.get("legs") if isinstance(payload.get("legs"), list) else []
+    _per_leg = bool(payload.get("per_leg_rollover"))
     for i, leg in enumerate(legs):
         if isinstance(leg, dict):
-            _leg_section(rows, leg, i + 1)
+            _leg_section(rows, leg, i + 1, per_leg=_per_leg)
     mc_legs = payload.get("midcap_legs") if isinstance(payload.get("midcap_legs"), list) else []
     for i, leg in enumerate(mc_legs):
         if isinstance(leg, dict):

@@ -31,7 +31,7 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Loader2, XCircle, ChevronDown, ChevronUp, X } from 'lucide-react';
-import { buildSummaryWorkbookBlob, rulesFilename, fetchBlobWithPoll, triggerBlobDownload, downloadWhenReady } from '../utils/optimSummaryExport';
+import { buildSummaryWorkbookBlob, rulesFilename, triggerBlobDownload, downloadWhenReady } from '../utils/optimSummaryExport';
 import { mergeWithStoredQueue, tryClaim, markStatus, getStatus, onStoreChange, loadDownloadLog, appendDownloadLog, clearDownloadLog, removeJobsFromQueue } from '../utils/optimQueueStore';
 import { resolveDownloadBase } from '../utils/downloadBase';
 
@@ -40,16 +40,6 @@ const POLL_MS = 3000;
 // browser doesn't treat a burst of same-tick downloads as a popup flood.
 const DOWNLOAD_STAGGER_MS = 600;
 
-async function fetchAllRows(jobId, totalCombos) {
-  // No sort_by: the backend's sort_key indexes into each row's `summary` dict
-  // (not top-level combo_id), so omitting it just returns natural insertion
-  // order — fine here since only the full row SET matters for the export.
-  const limit = Math.min(2000, Math.max(100, totalCombos || 500));
-  const r = await fetch(`/api/optimize/jobs/${jobId}/results?offset=0&limit=${limit}`);
-  if (!r.ok) throw new Error(await r.text());
-  const data = await r.json();
-  return data.rows || [];
-}
 
 /** Downloads all 3 files for a finished job and returns the filenames written
  * (for the persistent download log — see optimQueueStore.appendDownloadLog). */
@@ -66,7 +56,7 @@ async function autoDownloadJob(job, patchwise, onLabel) {
   onLabel('Downloading tradesheets ZIP…');
   const zipUrl = patchwise
     ? `${base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
-    : `${base}/api/optimize/jobs/${jobId}/tradesheets.zip`;
+    : `${base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=false`;
   // Native streaming download — the ZIP is ~300 MB and blowing it into a Blob
   // exhausts tab memory (downloads silently did nothing).
   const zipName = await downloadWhenReady(zipUrl);
@@ -74,28 +64,22 @@ async function autoDownloadJob(job, patchwise, onLabel) {
   files.push(zipFile);
   await new Promise((res) => setTimeout(res, DOWNLOAD_STAGGER_MS));
 
-  // 2) WOW/MOM Excel
+  // 2) WOW/MOM Excel — native streaming download, same as the ZIP above. A
+  // large sweep's WOW/MOM comes back as a multi-hundred-MB parts ZIP, and
+  // `await r.blob()` (the old fetchBlobWithPoll path) buffered all of it into
+  // the SAME tab that just crashed on the results table.
   onLabel('Downloading WOW/MOM…');
-  const wmUrl = `${base}/api/optimize/jobs/${jobId}/wow_mom.xlsx${patchwise ? '?patchwise=true' : ''}`;
-  const { blob: wmBlob, filename: wmName } = await fetchBlobWithPoll(wmUrl);
-  const wmFile = wmName || `optimize_${jobId.slice(0, 8)}_WOW_MOM${suffix}.xlsx`;
-  triggerBlobDownload(wmBlob, wmFile);
+  const wmUrl = `${base}/api/optimize/jobs/${jobId}/wow_mom.xlsx?patchwise=${patchwise ? 'true' : 'false'}`;
+  const wmName = await downloadWhenReady(wmUrl);
+  const wmFile = wmName || `WOW_MOM${suffix}.xlsx`;
   files.push(wmFile);
   await new Promise((res) => setTimeout(res, DOWNLOAD_STAGGER_MS));
 
-  // 3) Optimization Summary Excel (patchwise-recomputed metrics when selected —
-  // same compute path the manual Export-XLSX button uses).
+  // 3) Optimization Summary Excel — built entirely server-side now (rows AND,
+  // for patchwise, the per-combo overlay), so this tab never holds a second or
+  // third full copy of the sweep just to auto-download it.
   onLabel('Downloading summary Excel…');
-  let summaryByCombo = null;
-  if (patchwise) {
-    const sr = await fetch(`${base}/api/optimize/jobs/${jobId}/summary?patchwise=true`);
-    if (sr.ok) {
-      const sdata = await sr.json();
-      summaryByCombo = new Map((sdata.rows || []).map((x) => [String(x.combo_id), x.summary || {}]));
-    }
-  }
-  const rows = await fetchAllRows(jobId, job.totalCombos);
-  const wb = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId);
+  const wb = await buildSummaryWorkbookBlob(ruleConfig, jobId, undefined, patchwise);
   const summaryFile = rulesFilename(ruleConfig, jobId, suffix);
   triggerBlobDownload(wb, summaryFile);
   files.push(summaryFile);

@@ -17,6 +17,7 @@ numbers to the JS formula results.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from functools import lru_cache
 import re
@@ -27,6 +28,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+# write_merged_wow_mom's column-pagination fallback (below) has called
+# logger.warning(...) since it was written, but nothing in this module ever
+# defined `logger` — so the first sweep wide enough to need a second sheet
+# raised NameError and destroyed the very workbook the paging existed to
+# rescue, instead of just logging that it split.
+logger = logging.getLogger(__name__)
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -1204,29 +1212,28 @@ def variant_labels(combo_by_safe: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
     return out
 
 
-_PER_LEG_ADJ = re.compile(
-    r"L(\d+)(RiseBy|FallsBy|RisesOrFallsBy|MoveBy|AdjustBy)([\d.]+)(pts|%)",
-    re.IGNORECASE)
+#  Matches combo_labeler.py's _adjustment_token: 'adj_{rise|fall|both}_{val}{unit}',
+# written inline right after the owning leg's own tokens rather than collected
+# at the end with an 'L{n}' tag — so the leg number isn't recoverable from the
+# token text alone, only "which adjustments fired" is.
+_PER_LEG_ADJ = re.compile(r"adj_(rise|fall|both)_([\d.]+)(pct|pts)", re.IGNORECASE)
 
-_PER_LEG_ADJ_WORD = {
-    "riseby": "Rise", "fallsby": "Fall", "risesorfallsby": "Rise or Fall",
-    "moveby": "Rise or Fall", "adjustby": "Adjust",
-}
+_PER_LEG_ADJ_WORD = {"rise": "Rise", "fall": "Fall", "both": "Rise or Fall"}
 
 
 def adj_label_from_combo_label(combo_label: str) -> str:
-    """'..._L1RiseBy1%_NoAdjustment_...' → 'Rise 1% (L1)'; '' when there is none.
+    """'..._adj_rise_1pct_...' → 'Rise 1%'; '' when there is none.
 
     `combo_columns.spot_adjustment` only carries the STRATEGY-level knob, so a
     sweep that adjusts spot PER LEG reports "NoAdjustment" for every combo and
-    the whole grid collapses into a single column. The per-leg segment IS in the
-    combo label (combo_labeler._per_leg_spot_adjustment_label), so read it back
-    from there. Only consulted when the strategy-level knob is off.
+    the whole grid collapses into a single column. The per-leg token IS in the
+    combo label (combo_labeler._adjustment_token), so read it back from there.
+    Only consulted when the strategy-level knob is off.
     """
     segs = []
-    for leg, word, mag, unit in _PER_LEG_ADJ.findall(combo_label or ""):
+    for word, mag, unit in _PER_LEG_ADJ.findall(combo_label or ""):
         pretty = _PER_LEG_ADJ_WORD.get(word.lower(), word)
-        segs.append(f"{pretty} {mag}{'pts' if unit.lower() == 'pts' else '%'} (L{leg})")
+        segs.append(f"{pretty} {mag}{'pts' if unit.lower() == 'pts' else '%'}")
     return " + ".join(segs)
 
 
@@ -1486,3 +1493,238 @@ def write_merged_wow_mom(wb: Workbook, combos: List[Dict]) -> bool:
     _write_min_pivot_sheet(wb, placed, "wow", "WOW Min Pivots", n_cols)
     _write_min_pivot_sheet(wb, placed, "mom", "MOM Min Pivots", n_cols)
     return True
+
+
+# ── Ops-emitting workbook (Rust render path) ────────────────────────────────
+# Drop-in stand-ins for the handful of openpyxl objects the block writers touch,
+# so the ~1,500 lines of layout logic above run UNCHANGED and simply produce the
+# layout-ops dicts that algotest_native renders.
+#
+# Why this exists: openpyxl charges for every `cell.font = ...` — the descriptor
+# routes into the workbook's style table, which hashes the style object to dedupe
+# it. Profiling the merged WOW/MOM for 3,969 combos measured 432s of build vs 42s
+# of save, and 31M calls to Serialisable.__hash__ inside that build. Caching the
+# style OBJECTS (see _cached_font above) does not help, because the cost is per
+# ASSIGNMENT, not per construction. Here assignment is a plain attribute store.
+#
+# The writers mutate cells after creating them (per-side borders, month edges,
+# drawdown boxes, partial overwrites), so cells are kept live in a dict keyed by
+# (row, col) and only flattened to ops at the end — mirroring what _ws_to_ops
+# extracts from a finished openpyxl sheet.
+class _OpsCell:
+    __slots__ = ("row", "column", "value", "font", "fill", "alignment",
+                 "border", "number_format")
+
+    @property
+    def column_letter(self):
+        from openpyxl.utils import get_column_letter
+        return get_column_letter(self.column)
+
+    def __init__(self, row, column, value=None):
+        self.row = row
+        self.column = column
+        self.value = value
+        # set below; declared here so __slots__ stays accurate
+        self.font = None
+        self.fill = None
+        self.alignment = None
+        self.border = None
+        self.number_format = None
+
+
+class _OpsDim:
+    __slots__ = ("width", "height")
+
+    def __init__(self):
+        self.width = None
+        self.height = None
+
+
+class _OpsWorksheet:
+    """Quacks like the slice of openpyxl.Worksheet the WOW/MOM writers use."""
+
+    def __init__(self, title):
+        self.title = title
+        self.freeze_panes = None
+        self._cells = {}
+        self._merges = []
+        self.column_dimensions = _DimMap()
+        self.row_dimensions = _DimMap()
+        # Row/column extents are tracked incrementally, and the columns present
+        # in each row are indexed. Deriving either by scanning _cells is O(cells)
+        # per call, and both are called once PER ROW by the row-oriented builders
+        # (append → max_row, then ws[max_row]) — that is quadratic, and it made a
+        # 2,205-row summary take 6.5s when the actual write is 0.15s.
+        self._max_row = 0
+        self._row_cols = {}
+
+    def cell(self, row, column, value=None):
+        key = (row, column)
+        c = self._cells.get(key)
+        if c is None:
+            c = _OpsCell(row, column, value)
+            self._cells[key] = c
+            cols = self._row_cols.get(row)
+            if cols is None:
+                cols = self._row_cols[row] = []
+            cols.append(column)
+            if row > self._max_row:
+                self._max_row = row
+        elif value is not None:
+            c.value = value
+        return c
+
+    def merge_cells(self, start_row=None, start_column=None,
+                    end_row=None, end_column=None):
+        self._merges.append((start_row, start_column, end_row, end_column))
+
+    # ── row-oriented API (summary_workbook builds this way) ─────────────────
+    @property
+    def max_row(self):
+        return self._max_row
+
+    @property
+    def max_column(self):
+        return max((c for _, c in self._cells), default=0)
+
+    def append(self, values):
+        """openpyxl-compatible append: write `values` as the next row.
+
+        Cells are created even for None so max_row advances on an all-empty
+        row, matching openpyxl — otherwise the next append would overwrite it.
+        """
+        r = self.max_row + 1
+        for i, v in enumerate(values, start=1):
+            cell = self.cell(r, i)
+            cell.value = v
+        return r
+
+    def __getitem__(self, key):
+        """ws[row_index] → that row's cells, left to right (openpyxl returns a
+        tuple). Only integer row access is used by the summary builder."""
+        if isinstance(key, int):
+            cols = self._row_cols.get(key) or []
+            return tuple(self._cells[(key, c)] for c in sorted(cols))
+        raise TypeError("only integer row access is supported")
+
+    @property
+    def columns(self):
+        """Iterate columns as tuples of cells, like openpyxl."""
+        by_col = {}
+        for (r, c), cell in self._cells.items():
+            by_col.setdefault(c, []).append((r, cell))
+        for c in sorted(by_col):
+            yield tuple(cell for _r, cell in sorted(by_col[c]))
+
+    # ── serialise ───────────────────────────────────────────────────────────
+    def to_ops(self):
+        covered = set()
+        for r1, c1, r2, c2 in self._merges:
+            for rr in range(r1, r2 + 1):
+                for cc in range(c1, c2 + 1):
+                    if (rr, cc) != (r1, c1):
+                        covered.add((rr, cc))
+
+        cells = []
+        for (r, c), cell in self._cells.items():
+            if (r, c) in covered:
+                continue
+            fill = cell.fill
+            fill_rgb = (_rgb6(fill.fgColor)
+                        if (fill is not None and fill.patternType) else None)
+            b = cell.border
+            if b is None:
+                sides = [None, None, None, None]
+            else:
+                sides = [getattr(getattr(b, s), "style", None)
+                         for s in ("top", "left", "bottom", "right")]
+            has_border = any(sides)
+            val = cell.value
+            if (val is None or val == "") and fill_rgb is None and not has_border:
+                continue
+            f = cell.font
+            if not has_border:
+                border = False
+            elif all(s == "thin" for s in sides):
+                border = True
+            else:
+                border = sides
+            nf = cell.number_format
+            al = cell.alignment
+            cells.append({
+                "r": r, "c": c,
+                "v": (None if val == "" else val),
+                "bold": bool(f.bold) if f is not None else False,
+                "size": float((f.size if f is not None else None) or 11),
+                "fc": ((_rgb6(f.color) if f is not None else None) or "000000"),
+                "bg": fill_rgb,
+                "align": ("L" if (al is not None and al.horizontal == "left") else "C"),
+                "border": border,
+                "nfmt": (None if nf in (None, "General") else nf),
+            })
+        # Deterministic order, so a diff against the openpyxl path lines up.
+        cells.sort(key=lambda d: (d["r"], d["c"]))
+
+        col_widths = [(_col_index(letter), float(dim.width))
+                      for letter, dim in self.column_dimensions.items()
+                      if dim.width is not None]
+        row_heights = [(r, float(dim.height))
+                       for r, dim in self.row_dimensions.items()
+                       if dim.height is not None]
+        freeze = None
+        if self.freeze_panes:
+            from openpyxl.utils.cell import range_boundaries
+            c0, r0, *_ = range_boundaries(self.freeze_panes)
+            freeze = (r0 - 1, c0 - 1)
+        # Sorted, not insertion-ordered: openpyxl keeps merges in an unordered
+        # set, so sorting is what makes this path diffable against _ws_to_ops
+        # (the parity harness compares them directly). Excel does not care about
+        # merge order, only the set.
+        return {"name": self.title, "cells": cells,
+                "merges": sorted(tuple(m) for m in self._merges),
+                "row_heights": row_heights, "col_widths": col_widths,
+                "freeze": freeze}
+
+
+class _DimMap(dict):
+    """column_dimensions[letter] / row_dimensions[idx] auto-vivify, like openpyxl."""
+
+    def __getitem__(self, key):
+        d = self.get(key)
+        if d is None:
+            d = _OpsDim()
+            self[key] = d
+        return d
+
+
+def _col_index(letter):
+    from openpyxl.utils import column_index_from_string
+    return column_index_from_string(letter)
+
+
+class _OpsWorkbook:
+    """Stand-in for openpyxl.Workbook — only create_sheet is used by the writers."""
+
+    def __init__(self, with_active=False):
+        self.worksheets = []
+        # openpyxl.Workbook() starts with one sheet; summary_workbook builds on
+        # it via wb.active. The WOW/MOM callers create their own sheets and pass
+        # with_active=False so no empty tab is emitted.
+        self.active = self.create_sheet("Sheet") if with_active else None
+
+    def create_sheet(self, title=None, index=None):
+        ws = _OpsWorksheet(title or f"Sheet{len(self.worksheets) + 1}")
+        if index is None:
+            self.worksheets.append(ws)
+        else:
+            self.worksheets.insert(index, ws)   # index 0 → first tab
+        return ws
+
+    def __getitem__(self, name):
+        for ws in self.worksheets:
+            if ws.title == name:
+                return ws
+        raise KeyError(name)
+
+    def to_ops(self):
+        return [ws.to_ops() for ws in self.worksheets]

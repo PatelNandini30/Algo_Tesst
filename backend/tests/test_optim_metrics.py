@@ -66,8 +66,8 @@ class TestLiveDD(unittest.TestCase):
         self.assertEqual(out["actual_live_dd_avg"], -1.3333)
 
     def test_car_mdd_live(self):
-        # (cagr/100) / |dd| — dd is in NAV points (e.g. -4.0 = 4 points)
-        self.assertAlmostEqual(car_mdd_live({"cagr_options": 12}, -4.0), 0.03)
+        # cagr / |dd| — both cagr and dd are percent-scale (e.g. -4.0 = -4%)
+        self.assertAlmostEqual(car_mdd_live({"cagr_options": 12}, -4.0), 3.0)
         self.assertEqual(car_mdd_live({"cagr_options": 12}, 0.0), 0.0)
 
 

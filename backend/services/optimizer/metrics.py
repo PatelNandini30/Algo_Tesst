@@ -174,7 +174,7 @@ def car_mdd_live(summary: Dict[str, Any], live_dd_max: float) -> float:
         cagr = float(summary.get("cagr_options", 0) or 0)
     except (TypeError, ValueError):
         cagr = 0.0
-    return round((cagr / 100.0) / abs(live_dd_max), 4)
+    return round(cagr / abs(live_dd_max), 4)
 
 
 def _trade_outlier_analysis(trades: pd.DataFrame) -> Dict[str, float]:

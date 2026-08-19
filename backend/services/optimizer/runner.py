@@ -46,6 +46,7 @@ from services.optimizer.param_expander import (
     apply_combo_for_optim,
     count_combinations,
     effective_combo_count,
+    expand_param_specs,
 )
 from services.optimizer.samplers import build_sampler
 
@@ -57,6 +58,94 @@ logger = logging.getLogger(__name__)
 # at 100k for Exhaustive, allowing the user to switch to Random/Smart for
 # bigger spaces.
 MAX_COMBOS = int(os.environ.get("OPTIMIZE_MAX_COMBOS", "100000"))
+# Ceiling on the RAW product we are willing to expand in order to count distinct
+# combos. The exact count costs ~0.136 ms per raw combo (measured on a 262,144
+# grid: 35.7s), so this bounds that analysis to roughly a minute. Grids beyond it
+# are rejected on the cheap O(1) product without expanding anything.
+MAX_RAW_COMBOS = int(os.environ.get("OPTIMIZE_MAX_RAW_COMBOS", "500000"))
+
+
+# Grid axis labels for the merged WOW/MOM. Module level, not closures inside
+# run_optimization, so a rebuild of an already-finished sweep
+# (tools/wow_mom_rebuild.py) derives IDENTICAL row/column keys instead of
+# carrying a second copy that can drift. Both are pure functions of their input.
+def _adj_display(raw):
+    import re as _re          # `re` is imported per-function elsewhere in this module
+    s = (raw or "").strip()
+    if not s or s.lower().startswith("noadjust"):
+        return "No Adj"
+    m = _re.match(r"(RiseBy|FallsBy|RisesOrFallsBy)([\d.]+)%?", s)
+    if m:
+        word = {"RiseBy": "Rise", "FallsBy": "Fall", "RisesOrFallsBy": "Rise or Fall"}[m.group(1)]
+        return f"{word} {m.group(2)}%"
+    return s
+
+
+def _strike_display(cc):
+    def fmt(lbl, cepe):
+        if not lbl or lbl == "-":
+            return None
+        return f"{cepe} {str(lbl).replace('_', ' ')}"
+    parts = [p for p in (fmt(cc.get("call_strike_label"), "CE"),
+                          fmt(cc.get("put_strike_label"), "PE")) if p]
+    return " ".join(parts) if parts else "Strategy"
+
+
+def wow_mom_batches(combos, chunk):
+    """Split combos into WOW/MOM parts along GRID ROW BANDS, not a flat count.
+
+    write_merged_wow_mom lays blocks out as a grid: adjustments across, row_key
+    (strike/expiry/shifting) down. Slicing `combos[off:off+chunk]` cuts that grid
+    mid-band, and because each part re-derives its axes from whatever combos it
+    happens to hold, every interior cut leaves holes: a real 38,416-combo sweep
+    measured 440 empty slots in a 15x196 grid (15%), blocks-per-band running
+    193, 177, 24, ..., 48 instead of a full 196 — and slot (0,0) empty, so the
+    workbook opened on blank space.
+
+    Packing whole row_key groups keeps each part a dense rectangle. Peak memory
+    still tracks the part size, which is all the budget guard cares about.
+
+    A group larger than `chunk` is emitted alone rather than split: splitting it
+    would reintroduce exactly the holes this exists to remove.
+    """
+    from collections import OrderedDict as _OD
+    groups = _OD()
+    for c in combos:
+        groups.setdefault(c.get("row_key") or "", []).append(c)
+    batches, cur = [], []
+    for g in groups.values():
+        if len(g) > chunk:
+            if cur:
+                batches.append(cur)
+                cur = []
+            batches.append(g)              # oversized band — keep it whole
+            continue
+        if cur and len(cur) + len(g) > chunk:
+            batches.append(cur)
+            cur = []
+        cur.extend(g)
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def distinct_combo_count(
+    base_payload: Dict[str, Any], param_specs: Sequence[Dict[str, Any]]
+) -> int:
+    """Combos that will ACTUALLY run, per the sweep's own dedup rule.
+
+    Deliberately reuses `effective_fingerprint` — the exact function
+    run_optimization dedups with — instead of re-deriving the collapse rules.
+    Any future gated parameter is then honoured here for free, and the count the
+    UI shows can never disagree with the count the sweep runs (a mismatch is
+    what produced a done>total progress bar earlier).
+    """
+    from services.optimizer.combo_dedup import effective_fingerprint
+
+    seen: set = set()
+    for combo in expand_param_specs(param_specs):
+        seen.add(effective_fingerprint(apply_combo_for_optim(base_payload, combo)))
+    return len(seen)
 
 
 class OptimizationError(Exception):
@@ -125,11 +214,34 @@ def validate_request(
 
     method = (method or "exhaustive").lower()
     if method == "exhaustive":
+        # The cap must judge the work we will ACTUALLY do, not the raw product.
+        # A grid whose axes are mostly gated collapses hard: a real 18-axis sweep
+        # measured 262,144 raw -> 63,504 distinct (4.13x), i.e. comfortably under
+        # the cap while being rejected for being over it. `count_combinations` is
+        # blind to this, and so is `effective_combo_count` — its _GATED_PARAMS
+        # table only knows the legacy GLOBAL "spot_adjustment_enabled" path, not
+        # the per-leg `legs[N].spot_adjustment.enabled` form the UI emits today,
+        # nor straddle_multiplier=0 making straddle_direction inert.
+        #
+        # So ask the ONE authority: the same fingerprint the sweep itself dedups
+        # with. Only consulted when the raw product exceeds the cap — that is the
+        # only case where the answer changes a decision, and it keeps every
+        # ordinary grid on the existing zero-cost path.
         if grid_size > MAX_COMBOS:
-            raise OptimizationError(
-                f"Grid has {grid_size} combinations — exceeds cap of {MAX_COMBOS}. "
-                "Narrow your ranges or switch to random / smart sampling."
-            )
+            if grid_size > MAX_RAW_COMBOS:
+                raise OptimizationError(
+                    f"Grid has {grid_size} raw combinations — beyond the "
+                    f"{MAX_RAW_COMBOS} ceiling this can analyse. Narrow your "
+                    "ranges or switch to random / smart sampling."
+                )
+            distinct = distinct_combo_count(base_payload, param_specs)
+            if distinct > MAX_COMBOS:
+                raise OptimizationError(
+                    f"Grid has {grid_size} combinations ({distinct} unique after "
+                    f"collapsing inert parameters) — exceeds cap of {MAX_COMBOS}. "
+                    "Narrow your ranges or switch to random / smart sampling."
+                )
+            return distinct
         # Return the DISTINCT count so progress/total reflect the combos that
         # actually run. When a gated toggle (e.g. spot_adjustment_enabled) is
         # swept OFF, its dependent params are collapsed → no duplicate combos
@@ -612,18 +724,22 @@ def _prebuild_csv_zip(job_id: str, base_payload: dict, patchwise: bool = False) 
     _has_no_adj = any("NoAdjustment" in f for f in combo_files)
     _has_adj    = any("NoAdjustment" not in f for f in combo_files)
     _use_adj_folders = _has_no_adj and _has_adj
-    _no_adj_seen: set = set()
 
     def _arc_base(label_safe: str) -> Optional[str]:
-        """Combo's archive path (without extension), or None to skip (deduped
-        No-Adjustment repeat)."""
+        """Combo's archive path (without extension). Never returns None to
+        "dedup" — see note below; every combo that reaches here already went
+        through effective_fingerprint dedup at expansion time (line ~147), so
+        it is already known distinct. This function used to ALSO collapse
+        No-Adjustment combos whose label text matched after stripping the
+        combo_id prefix — a second, lossier dedup keyed on DISPLAY TEXT, not
+        content. Any swept axis invisible in the label (e.g. a spot_adjustment
+        value that never fires under NoAdjustment) made two genuinely distinct
+        combos collide, and the loser's workbook silently never made it into
+        the ZIP while the master summary still listed it. Folder split by
+        adjustment is kept; the dedup is not.
+        """
         if _use_adj_folders:
             subfolder = "No_Adjustment" if "NoAdjustment" in label_safe else "Adjustment"
-            if subfolder == "No_Adjustment":
-                base = label_safe.split("_", 1)[1] if "_" in label_safe else label_safe
-                if base in _no_adj_seen:
-                    return None
-                _no_adj_seen.add(base)
             return f"{tradesheets_root}/{subfolder}/{label_safe}"
         return f"{tradesheets_root}/{label_safe}"
 
@@ -944,25 +1060,6 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
     if not combo_csvs:
         return
 
-    def _adj_display(raw):
-        s = (raw or "").strip()
-        if not s or s.lower().startswith("noadjust"):
-            return "No Adj"
-        m = _re.match(r"(RiseBy|FallsBy|RisesOrFallsBy)([\d.]+)%?", s)
-        if m:
-            word = {"RiseBy": "Rise", "FallsBy": "Fall", "RisesOrFallsBy": "Rise or Fall"}[m.group(1)]
-            return f"{word} {m.group(2)}%"
-        return s
-
-    def _strike_display(cc):
-        def fmt(lbl, cepe):
-            if not lbl or lbl == "-":
-                return None
-            return f"{cepe} {str(lbl).replace('_', ' ')}"
-        parts = [p for p in (fmt(cc.get("call_strike_label"), "CE"),
-                              fmt(cc.get("put_strike_label"), "PE")) if p]
-        return " ".join(parts) if parts else "Strategy"
-
     def _read_combos(pw: bool):
         # Split fast-path (wm already inline-computed — cheap dict lookups,
         # stays sequential) from slow-path (needs a CSV rebuild via
@@ -1005,9 +1102,11 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
                     results[label_safe] = (cleaned, has_midcap, None)
 
         combos = []
+        _dropped_fnames = []
         for fname in combo_csvs:
             label_safe = fname[:-4]
             if label_safe not in results:
+                _dropped_fnames.append(fname)
                 continue  # read or cleaned-build failed — same as the previous skip
             cleaned, has_midcap, _wm = results[label_safe]
             cc = cols_by_safe.get(label_safe) or {}
@@ -1032,7 +1131,7 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
                 "variant_label": variant_by_safe.get(label_safe, ""),
                 "yearly": _is_yearly,
             })
-        return combos
+        return combos, _dropped_fnames
 
     _pw_variants = [pw for pw in (False, True) if (pw and want_patchwise) or (not pw and want_overall)]
     for pw in _pw_variants:
@@ -1040,17 +1139,108 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
         if os.path.isfile(cache_path):
             continue
         try:
-            combos = _read_combos(pw)
-            wb = Workbook()
-            wb.remove(wb.active)
+            combos, _dropped_fnames = _read_combos(pw)
+            if _dropped_fnames and os.environ.get("OPTIM_WOW_MOM_ALLOW_PARTIAL") != "1":
+                # Do NOT write this cache. Once cache_path exists, every future
+                # download (routers/optimize.py's download_wow_mom) serves it
+                # straight from disk and never revalidates — a partial grid
+                # written here would be served as "the" WOW/MOM for this job
+                # FOREVER, silently, since the on-demand build path is only
+                # reached when the cache is ABSENT. Leaving it unbuilt means a
+                # later on-demand request hits that path's own hard-fail
+                # instead (routers/optimize.py's OPTIM_WOW_MOM_ALLOW_PARTIAL
+                # check), which at least surfaces the problem to the user.
+                logger.warning(
+                    "[WOW_MOM pre] job=%s pw=%s: %d/%d combo(s) dropped — "
+                    "SKIPPING cache write (would serve a permanently-partial "
+                    "grid). Set OPTIM_WOW_MOM_ALLOW_PARTIAL=1 to accept it: %s",
+                    job_id[:8], pw, len(_dropped_fnames), len(combo_csvs),
+                    _dropped_fnames[:10],
+                )
+                continue
+            # MEMORY GUARD. The merged workbook is built whole in RAM before it is
+            # written: ~3,272 cells per combo across its four sheets (14x58 WOW +
+            # 14x18 MOM + 32x55 and 32x14 pivots). A real 50,176-combo sweep is
+            # 164 M cell objects — 13-20 GB — and the kernel SIGKILLed the worker
+            # five minutes after the ZIP was already built, leaving the job frozen
+            # at "running" so its finished results could not even be downloaded.
+            #
+            # Over budget -> build in fixed-size PARTS and ship them as one ZIP.
+            # Peak memory then tracks the PART size, not the sweep size: measured
+            # flat at ~800 MB for 2,500-combo parts, 21 parts in 6.4 min on a real
+            # 50,176-combo job. Paging fixes Excel's sheet limits, not memory, so
+            # it does not help here — only bounding the batch does.
+            _wm_budget_mb = float(os.environ.get("OPTIM_WOW_MOM_MAX_MB", "3500"))
+            _wm_projected_mb = len(combos) * 3272 * 100 / 1e6
+            if _wm_projected_mb > _wm_budget_mb:
+                _chunk = int(os.environ.get("OPTIM_WOW_MOM_PART_COMBOS", "2500"))
+                _zip_path = result_store.wow_mom_parts_zip_path(job_id, pw)
+                if os.path.isfile(_zip_path):
+                    continue
+                # Cut along grid row-bands so each part is a dense rectangle;
+                # a flat combos[off:off+chunk] slice leaves 15% of every part's
+                # grid empty (see wow_mom_batches).
+                _batches = wow_mom_batches(combos, _chunk)
+                logger.info(
+                    "[OPTIM] job=%s WOW/MOM as PARTS: %d combos (~%.1f GB whole, "
+                    "budget %.1f GB) -> %d parts (band-aligned, max %d, sizes %s)",
+                    job_id[:8], len(combos), _wm_projected_mb / 1000,
+                    _wm_budget_mb / 1000, len(_batches), _chunk,
+                    [len(b) for b in _batches[:8]],
+                )
+                import gc as _gc
+                import zipfile as _zf2
+                from services.optimizer.wow_mom import _OpsWorkbook as _OpsWB
+                import algotest_native as _an2
+                _tmp_zip = _zip_path + ".building"
+                _n_parts = 0
+                with _zf2.ZipFile(_tmp_zip, "w", _zf2.ZIP_DEFLATED, compresslevel=3) as _zh:
+                    for _idx, _batch in enumerate(_batches):
+                        _part = _idx + 1
+                        _wb = _OpsWB()
+                        try:
+                            if not write_merged_wow_mom(_wb, _batch):
+                                continue
+                            _pf = f"{_zip_path}.part{_part:02d}.tmp"
+                            _an2.write_layout_workbook_xlsx(_wb.to_ops(), _pf)
+                            _zh.write(_pf, f"WOW_MOM_part{_part:02d}.xlsx")
+                            os.remove(_pf)
+                            _n_parts += 1
+                        finally:
+                            # Freed before the next part is built — this is what
+                            # keeps peak memory flat instead of accumulating.
+                            del _wb
+                            _gc.collect()
+                os.replace(_tmp_zip, _zip_path)
+                logger.info("[OPTIM] job=%s WOW/MOM parts ZIP built: %d parts, %.1f MB",
+                            job_id[:8], _n_parts, os.path.getsize(_zip_path) / 1e6)
+                continue
+            # Rust render path. The block writers are UNCHANGED — they run against
+            # an ops-emitting stand-in for openpyxl (_OpsWorkbook) and the native
+            # writer turns those ops into the .xlsx. openpyxl charged a style-table
+            # hash on every cell assignment: 3,969 combos measured 432s building
+            # vs 42s saving, with 31M calls to Serialisable.__hash__ inside the
+            # build. Measured 15.6x faster on 640,500 cells, byte-identical output
+            # (tools/wow_mom_parity.py diffs both paths cell-by-cell).
+            from services.optimizer.wow_mom import _OpsWorkbook
+            import algotest_native as _an
+            wb = _OpsWorkbook()
             if not write_merged_wow_mom(wb, combos):
                 continue
             tmp_path = cache_path + ".building"
-            wb.save(tmp_path)
+            _an.write_layout_workbook_xlsx(wb.to_ops(), tmp_path)
             os.replace(tmp_path, cache_path)
             logger.info("[OPTIM] WOW/MOM pre-built for job %s patchwise=%s", job_id[:8], pw)
         except Exception as exc:
-            logger.warning("[OPTIM] WOW/MOM pre-build failed for job %s patchwise=%s: %s", job_id[:8], pw, exc)
+            # LOUD, and no second path. There is no openpyxl fallback to drop to:
+            # a failure here means the native writer is broken or missing, and
+            # silently shipping a job with no WOW/MOM file (the old behaviour of
+            # this handler) hides that until a user opens an empty download.
+            logger.error(
+                "[OPTIM] WOW/MOM pre-build FAILED for job %s patchwise=%s: %s",
+                job_id[:8], pw, exc, exc_info=True,
+            )
+            raise
 
     # Pre-build patchwise summary JSON so /summary?patchwise=true is instant.
     # Skipped when the job's download_mode is "overall" — nobody will request
@@ -1070,6 +1260,7 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
                 or "NIFTYMIDCAP100"
             )
             _pw_rows = []
+            _pw_missing = []
             for _r in _all_results:
                 _ls = _r.get("combo_label_safe") or ""
                 _stored = _r.get("summary") or {}
@@ -1080,7 +1271,13 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
                     continue
                 _csv = os.path.join(_trades_dir, f"{_ls}.csv")
                 if not _ls or not os.path.isfile(_csv):
-                    _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": _stored})
+                    # OMIT rather than append the OVERALL summary. This file is the
+                    # PATCHWISE cache; writing overall rows into it made them
+                    # indistinguishable from real patchwise rows and defeated the
+                    # consumer's missing-patchwise guard in routers/optimize.py,
+                    # which counts absent combo_ids. Omitted => counted as missing
+                    # => warned about (or 409'd) instead of silently mislabelled.
+                    _pw_missing.append(_r.get("combo_id"))
                     continue
                 try:
                     _df = _pd.read_csv(_csv, dtype=str)
@@ -1092,7 +1289,17 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
                     )
                     _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": {**_stored, **_m}})
                 except Exception as _e2:
-                    _pw_rows.append({"combo_id": _r.get("combo_id"), "summary": _stored})
+                    # Same reasoning as above: a failed patchwise recompute must not
+                    # masquerade as a patchwise row.
+                    logger.warning("[OPTIM] patchwise recompute failed for combo %s: %s",
+                                   _r.get("combo_id"), _e2)
+                    _pw_missing.append(_r.get("combo_id"))
+            if _pw_missing:
+                logger.warning(
+                    "[OPTIM] patchwise summary cache: %d/%d combos have NO patchwise "
+                    "metrics and were OMITTED (not silently stored as overall): %s",
+                    len(_pw_missing), len(_pw_rows) + len(_pw_missing), _pw_missing[:10],
+                )
             _tmp = _summary_cache + ".building"
             with open(_tmp, "w") as _fh:
                 _json.dump({"rows": _pw_rows}, _fh)
@@ -1297,6 +1504,36 @@ _SL_CAP_REASONS = {
 }
 
 
+# ── MAE/MFE sub-phase probes (OPTIM_PROFILE=1) ───────────────────────────────
+# mae_enrich measured ~690ms/combo — 38% of a combo, against ~790ms for the whole
+# Rust engine. That ratio is implausible for a Rust batch over ~250 trades, so the
+# cost is split here: pandas->records conversion, the native call itself, the
+# lots-scaling column writes, and the futures pass.
+_MPROF = os.environ.get("OPTIM_PROFILE", "0").strip().lower() in ("1", "true", "yes")
+_macc: Dict[str, float] = {}
+_mn = 0
+
+
+def _mnow() -> float:
+    return time.perf_counter()
+
+
+def _mmark(bucket: str, t0: float) -> float:
+    global _mn
+    if not _MPROF:
+        return t0
+    _macc[bucket] = _macc.get(bucket, 0.0) + (time.perf_counter() - t0)
+    if bucket == "futures_mae":
+        _mn += 1
+        if _mn % max(1, int(os.environ.get("OPTIM_PROFILE_EVERY", "5"))) == 0:
+            tot = sum(_macc.values()) or 1e-9
+            logger.info("[MAE_PROFILE] pid=%d n=%d avg=%.0fms | %s", os.getpid(), _mn,
+                        tot / _mn * 1000,
+                        " ".join(f"{k}={v / _mn * 1000:.0f}ms/{100 * v / tot:.0f}%"
+                                 for k, v in sorted(_macc.items(), key=lambda kv: -kv[1])))
+    return time.perf_counter()
+
+
 def _compute_mae_mfe_batch(
     df: "pd.DataFrame",
     index_str: str,
@@ -1347,12 +1584,14 @@ def _compute_mae_mfe_batch(
             raise RuntimeError(
                 "MAE/MFE requires the native cache loaded — no Python fallback per policy"
             )
+        _mp = _mnow()
         _recs = df.to_dict("records")
         for _r0 in _recs:
             for _dc in ("Entry Date", "Exit Date"):
                 _v = _r0.get(_dc)
                 if hasattr(_v, "strftime"):
                     _r0[_dc] = _v.strftime("%d-%m-%Y")
+        _mp = _mmark("to_records+dates", _mp)
         _pairs = _an_mae.compute_mae_mfe_batch(
             _recs, index_str.upper(), list(trading_days)
         )
@@ -1374,9 +1613,13 @@ def _compute_mae_mfe_batch(
             pd.to_numeric(df["lots"], errors="coerce").fillna(1.0).tolist()
             if "lots" in df.columns else [1.0] * len(df)
         )
+        _mp = _mmark("rust_batch", _mp)
         df["MAE"] = [p[0] * _lots_list[i] for i, p in enumerate(_pairs)]
         df["MFE"] = [p[1] * _lots_list[i] for i, p in enumerate(_pairs)]
-        return _apply_futures_mae_mfe(df, index_str, trading_days)
+        _mp = _mmark("scale_cols", _mp)
+        _r = _apply_futures_mae_mfe(df, index_str, trading_days)
+        _mmark("futures_mae", _mp)
+        return _r
 
     try:
         import polars as pl
@@ -1781,11 +2024,20 @@ def _compute_live_dd_from_mae(
     # Process trades in the same sorted order used by cumulative computation.
     # Revised research-verified rule: every trade (incl. the first, where
     # prev_cum = 100.0) anchors the low to AS_n = AN_(n-1) * (1 + AR_n/100).
+    # One groupby instead of a full boolean-mask scan of `df` PER TRADE. The old
+    # `df[df["Trade"] == tid]` inside the loop is O(trades x rows): measured 17ms
+    # of this function's 25ms on a 588-row / 196-trade combo, versus 2ms for a
+    # single groupby (10x). It also allocates a fresh DataFrame per trade, which
+    # is what makes it disproportionately expensive under the 12-way fork pool
+    # (this whole block measured ~690ms in-sweep against ~43ms standalone).
+    # Verified equivalent: 0 mismatches / 196 trades against the scan it replaces.
+    _groups = {str(_k): _v for _k, _v in df.groupby("Trade")}
+    _empty = df.iloc[0:0]
     for _, agg_row in aggregated.iterrows():
         tid = str(agg_row.get("Trade") or "")
         if not tid:
             continue
-        trade_legs = df[df["Trade"] == tid]
+        trade_legs = _groups.get(tid, _empty)
         final_mae = (
             _calc_final_mae_for_trade(trade_legs, _trade_net_pnl_pct(trade_legs))
             if not trade_legs.empty else None
@@ -1864,7 +2116,7 @@ def _run_single_backtest_rust_fast(payload: Dict[str, Any]) -> Optional[tuple[pd
         if not priced:
             return pd.DataFrame(), {}
 
-        records = priced_to_tradesheet_records(priced, payload, ctx["lot_size"])
+        records = priced_to_tradesheet_records(priced, payload, ctx["lot_size"], ctx["spots"])
         df = pd.DataFrame(records)
         for c in ("Entry Date", "Exit Date"):
             if c in df.columns:
@@ -2376,8 +2628,57 @@ def run_optimization(
             # would silently mismatch if the sweep definition ever differed.
             # The stamped __combo_id__ preserves each survivor's original index
             # so its filenames line up with the first run's.
+            # ── DEDUP: drop combos that describe the SAME strategy ────────────
+            # Runs BEFORE __combo_id__ is stamped: that marker rides into the
+            # merged payload via apply_combo_for_optim, and being unique per
+            # combo it would make every fingerprint unique and silently disable
+            # dedup. (combo_dedup also strips `__` keys defensively.)
+            # An exhaustive grid multiplies every axis, but some are inert under
+            # others: with spot_adjustment.enabled=False a leg's pct/direction
+            # change nothing, so the grid emits the identical strategy many
+            # times. Measured on two real 14,400-combo sweeps: 4,900 distinct
+            # strategies, i.e. 66% of each run was recomputation.
+            #
+            # Collapsing here (before dispatch) rather than at the summary means
+            # the duplicates are never computed AND never reach the tradesheet
+            # ZIP, WOW/MOM or master summary — the user asked for unique
+            # combinations only.
+            #
+            # The rule is verified against completed jobs by
+            # tools/combo_dedup_verify.py, which fails if any merged group holds
+            # two different P&Ls. It merges only what it can prove identical, so
+            # it is more conservative than the old post-hoc (label, pnl) dedup.
+            if os.environ.get("OPTIMIZE_DEDUP_COMBOS", "1").strip().lower() not in ("0", "false", "no"):
+                try:
+                    from services.optimizer.combo_dedup import effective_fingerprint
+                    _seen: set = set()
+                    _unique = []
+                    for _c in combos:
+                        _fp = effective_fingerprint(apply_combo_for_optim(base_payload, _c))
+                        if _fp in _seen:
+                            continue
+                        _seen.add(_fp)
+                        _unique.append(_c)
+                    if len(_unique) < len(combos):
+                        logger.info(
+                            "[OPTIM] DEDUP job=%s: %d grid combos -> %d unique strategies "
+                            "(skipping %d duplicates, %.0f%% of the grid)",
+                            job_id[:8], len(combos), len(_unique),
+                            len(combos) - len(_unique),
+                            100.0 * (1 - len(_unique) / max(len(combos), 1)),
+                        )
+                        combos = _unique
+                        # The UI/watchdog compare done vs total; total must be
+                        # what we will actually run or the job never "completes".
+                        total = len(combos)
+                        result_store.update_progress(job_id, done=0, total=total)
+                except Exception as _dd_exc:      # never block a sweep on this
+                    logger.warning("[OPTIM] dedup skipped (%s) — running full grid", _dd_exc)
+
+            # Stamp AFTER dedup so survivors carry stable 1..N ids (see above).
             for _i, _c in enumerate(combos, 1):
                 _c["__combo_id__"] = _i
+
             if bool(resume):
                 _prior = result_store.get_all_results_raw(job_id)
                 _done = {_combo_key(r.get("combo") or {}) for r in _prior}
@@ -2389,6 +2690,18 @@ def run_optimization(
                     "dispatching the remaining %d",
                     job_id[:8], _resume_done, _before, len(combos),
                 )
+                # Re-baseline the progress counter to the UNIQUE work actually
+                # left to do. init_job(preserve_results=True) seeds it from the
+                # raw row count, which is right for a plain resume but wrong when
+                # dedup has since shrunk the grid: a job that computed 6,237 rows
+                # of a 14,400 grid resumed against a 3,969 total and reported
+                # "6268 / 3969" — over 100%, which reads as broken even though
+                # the job completes correctly.
+                try:
+                    result_store.reset_done_counter(job_id, _resume_done)
+                    result_store.update_progress(job_id, done=_resume_done, total=total)
+                except Exception as _rb:
+                    logger.debug("[OPTIM] resume progress re-baseline skipped: %s", _rb)
             else:
                 _resume_done = 0
 
@@ -2481,6 +2794,15 @@ def run_optimization(
                 result_store.prune_zip_cache()
             except Exception as _pz:
                 logger.debug("[OPTIM] zip cache prune skipped: %s", _pz)
+            # Same 7-day window for the per-combo trade artifacts. That directory
+            # had no eviction at all and reached 67.9 GB across 2,572 jobs — the
+            # largest single consumer of a disk that was 86% full. Running jobs
+            # are skipped; best-effort, since housekeeping must never fail a
+            # sweep that has already produced its results.
+            try:
+                result_store.prune_trades_dir()
+            except Exception as _pt:
+                logger.debug("[OPTIM] trades prune skipped: %s", _pt)
             result_store.heartbeat(job_id, phase="finalizing:done")
             # Include the combos the interrupted run had already finished, so a
             # resumed sweep reports (and is judged terminal on) the FULL count —
@@ -2652,6 +2974,12 @@ def run_optimization(
                     "put_strike_label": labels["put_strike_label"],
                     "call_strike_label": labels["call_strike_label"],
                     "spot_adjustment": labels["spot_adjustment"],
+                    # Leg-wise view (additive) — one block per EXISTING leg, so a
+                    # 2-leg sweep emits no L3 columns. See combo_labeler.
+                    "leg_cols": labels.get("leg_cols") or [],
+                    "overall_adjustment": labels.get("overall_adjustment") or "",
+                    "midcap_leg": labels.get("midcap_leg") or "",
+                    "midcap_adj": labels.get("midcap_adj") or "",
                 },
                 "summary": flat_summary,
                 "summary_pw": _seq_summary_pw,

@@ -19,6 +19,7 @@ import json
 import logging
 import threading
 from pathlib import Path
+import time
 from typing import Dict, Optional, Tuple
 
 from sqlalchemy import text
@@ -46,7 +47,80 @@ def _meta_path(symbol: str) -> Path:
     return _feather_dir() / f"{symbol.upper()}.meta.json"
 
 
+# Per-process memo for _db_signature. The fingerprint is a STALENESS key: it can
+# only change when futures rows are imported, so recomputing it per combo is pure
+# waste — and expensive waste. build_futures_feather() is called from
+# engine_rust._fut_expiry_index PER COMBO in every fork worker, and the query is a
+# DISTINCT + string_agg + md5 aggregate over the FUTIDX slice of option_data that
+# needs a ~25 MB Postgres dynamic-shared-memory segment. Twelve fork workers running
+# it at once exhausted the postgres container's 512 MB /dev/shm and failed 13 of 24
+# combos with "psycopg2.errors.DiskFull: could not resize shared memory segment"
+# (observed 2026-08-14, with 178 GB free on disk — it was never a disk problem).
+#
+# Keyed by the shared data_version that the import path already bumps
+# (backtest_cache.bump_data_version), so a real import still invalidates it. Falls
+# back to a short TTL when Redis is unreachable, rather than caching forever.
+_SIG_MEMO: Dict[str, Tuple[float, str, Tuple[int, str, str]]] = {}
+_SIG_TTL_SEC = 300.0
+
+
+def _data_version_safe() -> str:
+    try:
+        from services.backtest_cache import get_data_version
+        return str(get_data_version() or "")
+    except Exception:
+        return ""
+
+
+def _sig_redis_get(key: str, dv: str):
+    """Shared (cross-process) signature cache. The per-process memo alone does not
+    help a fork pool: all 12 children miss simultaneously on their first combo and
+    fire 12 concurrent DISTINCT+string_agg+md5 aggregates, each needing a ~25 MB
+    Postgres DSM segment — that thundering herd is what exhausted the 512 MB
+    /dev/shm and made ensure_futures_loaded fail (silently yielding trades=0)."""
+    try:
+        from services.backtest_cache import _dv_client as _get_client  # type: ignore
+        c = _get_client()
+        if c is None:
+            return None
+        raw = c.get(f"algotest:futsig:{dv}:{key}")
+        if not raw:
+            return None
+        n, mx, fp = json.loads(raw)
+        return (int(n), str(mx), str(fp))
+    except Exception:
+        return None
+
+
+def _sig_redis_set(key: str, dv: str, sig) -> None:
+    try:
+        from services.backtest_cache import _dv_client as _get_client  # type: ignore
+        c = _get_client()
+        if c is not None:
+            c.setex(f"algotest:futsig:{dv}:{key}", 86400, json.dumps(list(sig)))
+    except Exception:
+        pass
+
+
 def _db_signature(symbol: str) -> Tuple[int, str, str]:
+    key = symbol.upper()
+    dv = _data_version_safe()
+    hit = _SIG_MEMO.get(key)
+    if hit is not None:
+        ts, hit_dv, sig = hit
+        if hit_dv == dv and (dv or (time.time() - ts) < _SIG_TTL_SEC):
+            return sig
+    shared = _sig_redis_get(key, dv)
+    if shared is not None:
+        _SIG_MEMO[key] = (time.time(), dv, shared)
+        return shared
+    sig = _db_signature_uncached(key)
+    _SIG_MEMO[key] = (time.time(), dv, sig)
+    _sig_redis_set(key, dv, sig)
+    return sig
+
+
+def _db_signature_uncached(symbol: str) -> Tuple[int, str, str]:
     """(row_count, max_date, expiry_fingerprint) for the symbol's FUTIDX rows — cheap
     staleness key. expiry_fingerprint is an md5 of the DISTINCT expiry_date set, so a
     pure LABEL correction (e.g. an NSE expiry reschedule that renames/merges contracts
@@ -249,10 +323,14 @@ def ensure_futures_loaded(symbol: str) -> bool:
     Falls back gracefully (False) if the native extension/feather is unavailable."""
     symbol = symbol.upper()
 
-    with _lock:
-        if _loaded.get(symbol) and _rf.futures_is_loaded():
-            return True
-
+    # NOT an early-return on `_loaded.get(symbol)` truthiness alone — that used
+    # to return True the moment a symbol had been loaded ONCE in this process,
+    # skipping the DB signature check below entirely (unreachable dead code) for
+    # the rest of the worker's life. A worker recycles only every
+    # --max-tasks-per-child (10-25) tasks, so a market-data re-import between
+    # then and the next NIFTY job priced futures legs off stale closes with no
+    # error — same row count/columns, only the VALUES wrong. Every call now
+    # always fetches the current signature and compares it.
     sig = _db_signature(symbol)
     if sig[0] == 0:
         return False

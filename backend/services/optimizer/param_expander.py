@@ -302,6 +302,30 @@ def apply_combo_for_optim(payload: Dict[str, Any], combo: Dict[str, Any]) -> Dic
         _sa.setdefault("units", "percent")
         _sa.setdefault("direction", "rise")
 
+    # Per-leg SCHEDULE spot-adjustment sweep (None / Rise / Fall / Both): the
+    # per-contract GAP schedule stays ON in every combo — only the adjustment
+    # changes. "none" disables adjustment (gap-only); rise/fall/both enable it with
+    # that direction (the magnitude keeps the per-contract schedule values). The
+    # synthetic sweep key is UI-only — removed so it never reaches the engine.
+    for _li in range(len(new_payload.get("legs") or [])):
+        _dir_key = f"legs[{_li}].yearly_schedule_direction"
+        if _dir_key not in combo:
+            continue
+        _leg = new_payload["legs"][_li] if 0 <= _li < len(new_payload["legs"]) else None
+        if not isinstance(_leg, dict):
+            continue
+        _dv = str(combo[_dir_key]).strip().lower()
+        _sa = _leg.get("spot_adjustment")
+        if not isinstance(_sa, dict):
+            _sa = {}
+            _leg["spot_adjustment"] = _sa
+        if _dv in ("none", "off", "no", "false"):
+            _sa["enabled"] = False
+        elif _dv in ("rise", "fall", "both"):
+            _sa["enabled"] = True
+            _sa["direction"] = _dv
+        _leg.pop("yearly_schedule_direction", None)
+
     for path in combo:
         m = _STRIKE_VALUE_RE.match(path)
         if m:

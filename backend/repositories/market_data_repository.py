@@ -323,14 +323,19 @@ class MarketDataRepository:
             df = pd.read_sql(q, conn)
         return df
 
-    def get_available_date_range(self) -> dict:
+    def get_available_date_range(self, symbol: str = None) -> dict:
         cols = self._table_columns("option_data")
         if not cols:
             return {"min_date": None, "max_date": None}
         date_col = self._pick(cols, "trade_date", "date")
-        q = text(f"SELECT MIN({date_col}) AS min_date, MAX({date_col}) AS max_date FROM option_data")
+        params = {}
+        where = ""
+        if symbol:
+            where = "WHERE symbol = :symbol"
+            params["symbol"] = symbol.upper()
+        q = text(f"SELECT MIN({date_col}) AS min_date, MAX({date_col}) AS max_date FROM option_data {where}")
         with self.engine.begin() as conn:
-            row = conn.execute(q).first()
+            row = conn.execute(q, params).first()
         return {"min_date": row[0], "max_date": row[1]}
 
     def get_trading_calendar(self, from_date: str, to_date: str) -> pd.DataFrame:

@@ -139,7 +139,7 @@ pub fn compute_optim_metrics(
 
     // ── car_mdd_live ──
     let cagr = s_f64("cagr_options");
-    let car_mdd_live = if live_max == 0.0 { 0.0 } else { py_round((cagr / 100.0) / live_max.abs(), 4) };
+    let car_mdd_live = if live_max == 0.0 { 0.0 } else { py_round(cagr / live_max.abs(), 4) };
     out.set_item("car_mdd_live", car_mdd_live)?;
 
     // ── outlier_stripped_live_dd (_trade_outlier_analysis) ──

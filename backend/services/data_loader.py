@@ -1295,9 +1295,18 @@ def bulk_load(symbol: str, from_date: str, to_date: str) -> dict:
         merged_options = options_results[0] if options_results else None
         if merged_options is not None and not merged_options.empty:
             _bulk_options_df = pl.from_pandas(merged_options)
-        elif _bulk_options_df is None:
+        else:
+            # UNCONDITIONAL reset, not `elif _bulk_options_df is None:`. A
+            # full-range load means the caller wants THIS symbol/range replacing
+            # whatever was cached — a zero-row DB result for it does not mean
+            # "keep the old data", it means "this symbol/range has no data". The
+            # old `elif` left a PRIOR symbol's frame in place whenever it was
+            # already non-None, and the code below then stamped the NEW symbol's
+            # name onto it (no Symbol-column filter exists on any read path), so
+            # every subsequent price lookup for the new symbol silently served
+            # the old symbol's option prices/strikes.
             _bulk_options_df = pl.DataFrame()
-            logger.warning("[BULK] No option data available (cache and DB)")
+            logger.warning("[BULK] No option data available (cache and DB) for %s", symbol_upper)
     elif options_loaded_from_db:
         # Delta path: merge new slices into the cache we already had.
         before_rows = len(_bulk_options_df) if _bulk_options_df is not None else 0

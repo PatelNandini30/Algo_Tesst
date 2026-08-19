@@ -20,20 +20,40 @@ const DEFAULT_METHOD = 'exhaustive';
 const DEFAULT_OBJECTIVE = 'total_pnl';
 
 /** Read a dotted path ('midcap_spot_adjustment.units') off an object. */
-function _getByDotPath(obj, path) {
-  return String(path)
-    .split('.')
-    .reduce((o, k) => (o == null ? undefined : o[k]), obj);
+/** Split 'legs[2].spot_adjustment.units' into ['legs', 2, 'spot_adjustment', 'units'].
+ *  Plain dot-paths with no brackets are unaffected. */
+function _splitPath(path) {
+  const out = [];
+  for (const seg of String(path).split('.')) {
+    const m = seg.match(/^([^[]+)((?:\[\d+\])*)$/);
+    if (!m) { out.push(seg); continue; }
+    out.push(m[1]);
+    for (const idx of m[2].matchAll(/\[(\d+)\]/g)) out.push(Number(idx[1]));
+  }
+  return out;
 }
 
-/** Write a dotted path, cloning each nested level so the source object (and
- *  anything else holding a reference to its sub-objects) is never mutated. */
+function _getByDotPath(obj, path) {
+  // A plain `.split('.')` treated "legs[2]" as ONE literal key — never a
+  // property on the object (the array lives at `.legs`, indexed by 2) — so
+  // EVERY per-leg unitPayloadPath ('legs[I].spot_adjustment.units') read back
+  // as undefined regardless of what the user actually set, and the panel
+  // silently fell back to 'percent' (see the unitChoice seeding effect below).
+  return _splitPath(path).reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+
+/** Write a bracket-aware path, cloning each nested level (object OR array) so
+ *  the source object is never mutated. */
 function _setByDotPath(root, path, value) {
-  const keys = String(path).split('.');
+  const keys = _splitPath(path);
   const last = keys.pop();
   let cur = root;
   for (const k of keys) {
-    cur[k] = (cur[k] != null && typeof cur[k] === 'object') ? { ...cur[k] } : {};
+    const isArrIdx = typeof k === 'number';
+    const existing = cur[k];
+    cur[k] = existing != null && typeof existing === 'object'
+      ? (Array.isArray(existing) ? [...existing] : { ...existing })
+      : (isArrIdx ? [] : {});
     cur = cur[k];
   }
   cur[last] = value;
@@ -78,6 +98,7 @@ export default function OptimizePanel({
   // Lifted state — owned by StrategyBuilder so settings survive panel close/reopen
   checked, setChecked,
   savedValues, setSavedValues,
+  unitChoice = {}, setUnitChoice,
   method, setMethod,
   sampleN, setSampleN,
   algorithm, setAlgorithm,
@@ -118,6 +139,12 @@ export default function OptimizePanel({
     const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
     return legs.map(l => Boolean(l?.spot_adjustment?.enabled));
   }, [basePayload]);
+  // Per-leg contract-gap-schedule axis is only sweepable for a leg that actually
+  // carries a per-contract schedule (Per-Contract Schedule set in StrategyBuilder).
+  const _legHasYearlySchedule = useMemo(() => {
+    const legs = Array.isArray(basePayload?.legs) ? basePayload.legs : [];
+    return legs.map(l => Array.isArray(l?.yearly_contract_schedule) && l.yearly_contract_schedule.length > 0);
+  }, [basePayload]);
   const allParams = useMemo(
     () => expandSchemaForLegs(nLegs || 1)
       .filter(p => !p.midcapOnly || _hasMidcapLeg)
@@ -125,6 +152,8 @@ export default function OptimizePanel({
       // Per-leg spot-adjustment axes show ONLY when the leg's own adjustment is
       // enabled in the strategy (mirrors strike-mode gating below).
       .filter(p => !p.requiresLegSpotAdj || _legHasOwnSA[p.legIndex])
+      // Per-leg gap-schedule axis shows ONLY when the leg has a per-contract schedule.
+      .filter(p => !p.requiresLegYearlySchedule || _legHasYearlySchedule[p.legIndex])
       // Strike-mode gating: a param tagged with strikeModes only shows when the
       // leg's actual strike mode matches. If we can't resolve the leg's mode
       // (no basePayload legs yet), fall back to showing it rather than hiding.
@@ -198,7 +227,7 @@ export default function OptimizePanel({
   // adjustment thresholds). Keyed by param path. Seeded below from whatever
   // the strategy builder already had, so opening this panel never silently
   // flips the base strategy's units.
-  const [unitChoice, setUnitChoice] = useState({});
+
 
   useEffect(() => {
     if (!isOpen) return;
@@ -286,9 +315,35 @@ export default function OptimizePanel({
   }, [allParams, checked, savedValues, unitChoice]);
 
   const gridSize = useMemo(() => totalCombos(selectedList), [selectedList]);
-  const plannedRuns =
+  // Planned runs = what the sweep will ACTUALLY execute. The raw product counted
+  // here in the browser can be far larger than that: parameters gated by another
+  // (a leg's spot-adjustment pct/direction under its on/off, or straddle
+  // direction under a 0 multiplier) collapse to one combo, and only the server
+  // knows that rule. A real 18-axis grid reads 262,144 here but runs 63,504.
+  // So prefer the server's count once Validate has been run, and keep the local
+  // product purely as the "Grid size" figure beside it.
+  const previewRuns =
+    preview && Number.isFinite(Number(preview.planned_runs))
+      ? Number(preview.planned_runs)
+      : null;
+  const localPlanned =
     method === 'exhaustive' ? gridSize : Math.min(gridSize || sampleN, Number(sampleN) || 0);
-  const estSeconds = Math.round(plannedRuns * 0.2);
+  const plannedRuns = previewRuns != null ? previewRuns : localPlanned;
+  // Prefer the server's estimate: it is calibrated from this box's completed
+  // jobs and counts the serial ZIP/WOW-MOM/summary tail, which the flat 0.2 s
+  // guess here ignores entirely. Falls back to the local guess before Validate.
+  const estSeconds =
+    preview && Number.isFinite(Number(preview.estimated_seconds))
+      ? Number(preview.estimated_seconds)
+      : Math.round(plannedRuns * 0.2);
+
+  // A server count describes the grid it was asked about. Editing the sweep
+  // afterwards invalidates it, so drop it — otherwise "Planned runs" would keep
+  // showing the old number while "Grid size" moves, which reads as a bug and,
+  // worse, hides that the new grid was never validated.
+  useEffect(() => {
+    setPreview(null);
+  }, [selectedList, method, sampleN]);
 
   function toggleParam(p) {
     setChecked((prev) => {

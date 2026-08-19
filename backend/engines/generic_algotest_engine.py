@@ -2792,8 +2792,19 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
         if newly_triggered_this_day:
             if square_off_mode == 'complete':
                 trigger_date   = newly_triggered_this_day[0][1]
+                # The reason of whichever leg triggered FIRST (lowest leg index)
+                # this day — used ONLY to label the COLLATERAL legs below (legs
+                # that didn't trigger themselves; "the trade squared off because
+                # leg 0 hit its target"). It must NOT be reused for a leg that
+                # triggered on its OWN account: when 2+ legs trigger the same
+                # day (e.g. CE hits TARGET, PE independently hits STOP_LOSS),
+                # every triggered leg was getting stamped with leg 0's reason —
+                # PE's Exit Reason read "TARGET" instead of "STOP_LOSS". Each
+                # triggered leg now looks up its OWN reason from the tuple that
+                # actually recorded it.
                 trigger_reason = newly_triggered_this_day[0][2]
-                triggered_indices = {li for (li, _, _) in newly_triggered_this_day}
+                reason_by_leg = {li: treason for (li, _, treason) in newly_triggered_this_day}
+                triggered_indices = set(reason_by_leg)
                 for li2 in range(len(leg_results)):
                     if not leg_results[li2]['triggered']:
                         if li2 in triggered_indices:
@@ -2801,7 +2812,7 @@ def check_leg_stop_loss_target(entry_date, exit_date, expiry_date, entry_spot, l
                             leg_results[li2] = {
                                 'triggered': True,
                                 'exit_date': trigger_date,
-                                'exit_reason': trigger_reason,
+                                'exit_reason': reason_by_leg[li2],
                                 'exit_price_override': leg_exit_overrides.get(li2),
                             }
                         else:

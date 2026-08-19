@@ -161,7 +161,29 @@ x-backend-env: &backend-env
   # combination the user wants to run concurrently. Still below the
   # worker-optimize cgroup limit (12.7 GiB) so the gate stays enforceable.
   # Actual measured usage for that mix is ~9.6 GB, so this reserves ~1.3x.
-  HEAVY_MEMORY_BUDGET_MB: "12500"
+  # ZIP/WOW-MOM artifact cache. 60 GB (was an implicit 30) because the cache
+  # hit its budget and began evicting OLDEST-first every job — and an evicted
+  # job rebuilds from CSV (minutes) instead of serving in <1s, which is what
+  # made colleagues' downloads slow. Disk is the resource we have most of
+  # (90 GB free of 468 GB). Artifacts also expire by AGE so every job stays
+  # downloadable for a predictable window rather than until someone else
+  # runs a big sweep.
+  OPTIM_ZIP_CACHE_MAX_GB: "60"
+  # 8000 (was 12500). 12500 + backtests 5000 + backend 6000 = 24GB of limits on a
+  # 15GB box: the kernel absorbed the overshoot in swap until swap hit 100% (16kB
+  # free of 24GB), then global-OOM'd — killing desktop apps, and cgroup-OOM'ing
+  # worker-optimize itself (OOMKilled=true, fork children SIGKILLed). The gate must
+  # leave room for the DESKTOP this box also runs (Chrome/Firefox/CLI ~4-5GB), not
+  # just for the other containers.
+  # 12,200 = 2 optims (4,124 each = 8,248) + 1 backtest (3,873 measured on a 7.5y
+  # range). Was 8,000, which blocked even TWO optims by 248 MB — that is why "we can
+  # run 2 optims" stopped being true. The header's older "backtest ~2,700" figure is
+  # stale; the gate's own logs say 3,873 (ceiling 5,000).
+  # This is a RESERVATION LEDGER, not an allocation: the real protection is the
+  # live-RAM guard below, which refuses to start a job unless (cost + floor) is
+  # actually free. Raising this only stops the ledger from rejecting work the box
+  # could genuinely have run.
+  HEAVY_MEMORY_BUDGET_MB: "12200"
   # RAM kept free for the DESKTOP and OS at all times. Both the admission gate
   # and the fork-width cap subtract this before deciding anything, so the
   # optimizer physically cannot fork wide enough to leave the machine short.
@@ -170,7 +192,14 @@ x-backend-env: &backend-env
   # is someone's DESKTOP (a full-swap episode on 2026-08-06 OOM-killed
   # LibreOffice and two Chrome processes). Cost: sweeps narrow a little
   # sooner when RAM is tight -- deliberate, the user does not want lag.
-  HEAVY_GATE_LIVE_RAM_FLOOR_MB: "2500"
+  # 1800 (was 2500, was 1500). 2500 over-corrected: with two optims sharing the
+  # box and ~3.1 GB available, the floor left only ~0.6 GB to divide and pinned
+  # BOTH sweeps at P=1 while PSI reported 0.00% memory stall — i.e. throttling
+  # hard while the desktop was provably fine. Lag is now guarded by the PSI
+  # thrash brake (OPTIMIZE_MEM_PRESSURE_MAX_PCT), which measures actual stall
+  # instead of guessing from MemAvailable; this floor only needs to stop the
+  # optimizer eating the last of RAM.
+  HEAVY_GATE_LIVE_RAM_FLOOR_MB: "1800"
   HEAVY_COST_BACKTEST_MB: "5000"
   HEAVY_COST_OPTIMIZE_MB: "4500"          # one optimize job at P=2 (was 6000 at P=6)
   # ── Cost model re-based on MEASUREMENT (2026-08-05) ─────────────────────────
@@ -190,7 +219,14 @@ x-backend-env: &backend-env
   HEAVY_COST_OPTIMIZE_BASE_MB: "1500"      # parent + engine overhead (measured ~505 MB PSS)
   HEAVY_COST_OPTIMIZE_PER_YEAR_MB: "150"   # was 500 — data is mmap-shared, not per-job
   HEAVY_COST_BACKTEST_PER_YEAR_MB: "250"   # was 430 — warm backtest worker measured ~3.1 GB
-  HEAVY_GATE_WAIT_MAX_SECONDS: "600"      # then proceed anyway (SSD swap backstop)
+  # QUEUE, never force-in. At 600s the gate gave up waiting and started the job on
+  # whatever RAM existed ("proceeding anyway (swap backstop)") — that is how
+  # dc907e3f was SIGKILLed mid-finalize (10 combos stored as trades=0) and how
+  # 7ba4779c cut a running sweep from P=10 to P=2. A job that does not fit should
+  # WAIT, not gamble. 24h is effectively "until the box has room"; the
+  # OPTIMIZE_MAX_CONCURRENT=2 slot cap already keeps a 3rd job inert (no budget, not
+  # in the parallelism divisor), so a long wait cannot pile up.
+  HEAVY_GATE_WAIT_MAX_SECONDS: "86400"
   HEAVY_RESERVATION_TTL_SECONDS: "2400"   # auto-reclaim a crashed/cancelled slot
   # Route small ranges to a separate worker so they do not wait behind a long run.
   BACKTEST_FAST_QUEUE_MAX_DAYS: "550"
@@ -270,12 +306,19 @@ services:
     image: redis:7-bullseye
     container_name: algotest-redis
     restart: unless-stopped
+    # --appendonly yes (was "no"). Redis holds the ONLY index of finished jobs —
+    # meta, results and download links — so every restart discarded them and users
+    # lost working downloads whose files were still on disk (3x on 2026-08-10, once
+    # costing a 28,224-combo sweep its 2,688 completed combos). AOF writes to the
+    # existing redis_data volume, so state survives container recreates. RDB stays
+    # off: AOF alone covers this, without the fork-to-save memory spike — which
+    # matters on this RAM-tight box.
     command: >
       redis-server
       --maxmemory 500mb
       --maxmemory-policy allkeys-lru
       --save ""
-      --appendonly no
+      --appendonly yes
       --tcp-keepalive 60
       --timeout 0
     environment:
@@ -335,6 +378,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-algotest}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-algotest_password}
       OPTIMIZE_PARALLELISM: "2"
+      # MUST mirror worker-optimize. validate_request() runs HERE, not in the
+      # worker — routers/optimize.py calls it on both the preview and the submit
+      # path — and runner.py reads these caps from the environment at import. Set
+      # only on worker-optimize, the API silently fell back to the code defaults
+      # (100000/500000) and rejected the very 200k sweeps the worker was raised
+      # to run. Keep the two services in step.
+      OPTIMIZE_MAX_COMBOS: "250000"
+      OPTIMIZE_MAX_RAW_COMBOS: "1000000"
     user: "0:0"
     volumes: *backend-volumes
     depends_on:
@@ -367,12 +418,24 @@ services:
     # below the limit and the check can never fire — that is how 24 GB of swap
     # filled with idle worker heaps, which then cgroup-OOM-killed a pool child and
     # wedged a sweep at 160/648. Task-count recycling is immune to swapping.
+    #
+    # 10. This was 1 (added Aug-7 with the swap fix above), which made EVERY long
+    # backtest cold: a fresh child rebuilds the Rust option index from the feather
+    # each time — measured 4.96s to load NIFTY's 8.5M rows (3.2 GB resident),
+    # against 0.13s for the actual engine run. Reusing the child amortises that,
+    # as the fast queue (25) already did.
+    # Cost of the trade: a child now lives long enough to be swapped out and evade
+    # the RSS check — the exact hazard the comment above describes. 10 rather than
+    # the fast queue's 25 because THIS queue holds the big multi-year jobs: it caps
+    # how long the ~3.2 GB idle footprint persists before the child retires and
+    # hands it back, which matters when a large optimize sweep (8.8 GiB limit) runs
+    # alongside on a 15 GB box. Drop back to 1 if swap climbs.
     command: >
       celery -A worker.celery worker
       --queues=backtests
       --concurrency=1
       -l info
-      --max-tasks-per-child=1
+      --max-tasks-per-child=10
       --max-memory-per-child=5000000
       --without-gossip
       --without-mingle
@@ -494,7 +557,92 @@ services:
       # crash with `'NoneType' object has no attribute 'split'` otherwise.
       PYTHONOPTIMIZE: "1"
       BACKTEST_WORKERS: "1"
-      OPTIMIZE_MAX_COMBOS: "100000"
+      # 250,000 (was 100,000). The cap now judges DISTINCT combos — the runner
+      # asks the same fingerprint the sweep dedups with — so a 262,144-raw grid
+      # resolves to 63,504 real runs and the old ceiling was rejecting sweeps far
+      # smaller than they looked. Excel is no longer the constraint either: the
+      # summary holds 1,048,576 rows and the WOW/MOM grids page across sheets on
+      # BOTH axes (they previously had no row paging at all).
+      #
+      # Disk was the real limit at ~198 KB/combo (144 KB ZIP + 54 KB trades), so
+      # 200,000 combos is ~40 GB for one sweep. Safe to raise now that both
+      # caches expire on a 7-day rule: free space went 65 GB -> 154 GB.
+      OPTIMIZE_MAX_COMBOS: "250000"
+      # Raw-product ceiling for the distinct-count analysis (0.136 ms per raw
+      # combo, so this bounds it to ~2 min). Bigger grids are rejected on the
+      # cheap O(1) product without expanding anything.
+      OPTIMIZE_MAX_RAW_COMBOS: "1000000"
+      # Per-combo metrics in RUST instead of pandas. compute_optim_metrics and
+      # compute_summary_metrics (overall + patchwise) already exist in
+      # algotest_native and are called by rust_combo_loop.rust_authoritative_summary;
+      # this flag is the only thing that selects them (parallel.py _rust_loop_mode_safe,
+      # default "0" = the Python branch).
+      #
+      # Measured on a live 38,416-combo sweep: the Rust engine takes ~1.0s/combo
+      # but a forked worker is only busy 41% of the time at P=12 — the other ~1.4s
+      # is the pandas metrics that this flag replaces.
+      #
+      # DO NOT SET TO "1" YET. rust_combo_loop.rust_batch_unsupported() rejects
+      # filter / yearly_expiry / spot_adjustment / midcap / multi_index /
+      # leg_filter / overall_sl_target, and authoritative mode HARD-FAILS an
+      # unsupported combo (require_rust_supported) rather than using Python.
+      # Every real sweep here carries filter_segments — verified 2026-08-13:
+      #   262c8e6e -> REJECTED: filter      dc907e3f -> REJECTED: filter
+      # so "1" today would fail 100% of combos. NOTE the gate is a PRICING-coverage
+      # gate: rust_authoritative_summary only SUMMARISES an already-Rust trades_df
+      # and takes filter_segments + midcap as parameters, so the metrics themselves
+      # may well handle these shapes. "shadow" settles that with evidence —
+      # it runs the same Rust metrics on every real combo and diffs them key-by-key
+      # against Python, inside try/except, with Python staying authoritative
+      # (parallel.py:611). Read-only: it cannot change a single output value.
+      # Grep [RUST_SHADOW ...] for CLEAN vs "N diff(s)".
+      # AUTHORITATIVE. Per-combo summary computed entirely in Rust
+      # (rust_authoritative_summary). Enabled 2026-08-13 after lifting the
+      # filter / yearly_expiry / per-leg-spot_adjustment rejects, each backed by
+      # measured parity: 96 real combos of a 7-segment+YEARLY+spot-adj sweep
+      # CLEAN=96 WITH-DIFFS=0, plus tools/mode1_parity on the 3-payload corpus.
+      # Revert to "0" if any summary number moves.
+      # REVERTED TO "0" 2026-08-14. Mode 1 hard-fails any shape the coverage gate
+      # still rejects, and multi_index is one of them: a real multi-index sweep
+      # (job 4472962b) lost ALL 24 combos to
+      #   "combo not owned by the Rust batch yet (multi_index)".
+      # Under mode 0 the same sweep runs fine. The measured upside of mode 1 was
+      # ~10.5ms of a ~2430ms combo (~0.4%) — nowhere near worth breaking a whole
+      # strategy class. The lifted filter/yearly/per-leg-spot-adj rejects and the
+      # fut_pnl fix in rust_combo_loop.py are KEPT (all parity-proven); only the
+      # authoritative switch is off. Re-enable only once multi_index (and midcap /
+      # leg_filter / overall_sl_target / mixed_expiry / futures / lazy / reentry)
+      # each have their own parity corpus — see tools/mode1_parity.py.
+      # Re-enabled 2026-08-14 after the multi_index + futures-leg rejects were
+      # lifted on measured parity (24 real combos of a multi_index+sync_roll+
+      # FUTURES+YEARLY+14-filter-segment sweep, 2,688 fields, 0 diffs) — the
+      # shape that broke job 4472962b when this was first switched on.
+      # PROVEN + LIFTED (each with its own measured corpus, 0 diffs):
+      #   filter, yearly_expiry, per-leg spot_adjustment  (96 combos / job ec385761)
+      #   multi_index, leg-futures                        (24 combos / job 2e133fd4)
+      #   midcap                                          ( 6 combos / job 8c6273a4)
+      #   leg_filter                                      ( 6 combos / job 26736821)
+      # STILL hard-fails: overall_sl_target (corpus never triggered the stop —
+      # 0 SL exits in 4,536 rows, so untested), mixed_expiry, lazy, reentry,
+      # next_expiry, payload-level spot_adjustment_enabled.
+      # If a sweep of one of those shapes fails, set this back to "0".
+      # OFF. Mode 1 hard-fails any shape the coverage gate still rejects, and real
+      # sweeps keep hitting the remainder: 4472962b lost 24/24 to multi_index, then
+      # 027a9a6a lost 2/2 to mixed_expiry. Measured upside is ~10.5ms of a ~2430ms
+      # combo (~0.4%) — not worth failing live work. All the LIFTED rejects and the
+      # fut_pnl fix in rust_combo_loop.py stay (parity-proven, inert at "0").
+      # Re-enable only when the gate returns None for every shape actually in use:
+      # still rejected = mixed_expiry, overall_sl_target, lazy, reentry,
+      # next_expiry, payload-level spot_adjustment_enabled. Each needs its own
+      # measured corpus first (tools/mode1_parity.py, gate_parity.py).
+      OPTIMIZE_RUST_LOOP: "0"
+      # Per-combo phase profiler (services/optimizer/parallel.py _pm/_pflush).
+      # Externally measured, a worker is busy only ~41% of its wall slot at P=12
+      # and the per-combo functions account for ~1.08s of ~2.43s — the other
+      # ~1.35s was unattributed. These probes time every phase INCLUDING the
+      # persistence calls. Logs [OPTIM_PROFILE] every OPTIM_PROFILE_EVERY combos.
+      OPTIM_PROFILE: "0"
+      OPTIM_PROFILE_EVERY: "5"
       # SOLO CEILING (full-box parallelism when ONE optim runs). The runner
       # (services/optimizer/runner.py) treats this as the max and DYNAMICALLY
       # divides it by the number of optims computing right now (live-optim
@@ -547,10 +695,19 @@ services:
       # guess taken from a stale comment and over-reserved the budget 3.5x, which
       # is what starved every backtest into "budget busy".
       HEAVY_COST_OPTIMIZE_PER_CHILD_MB: "300"
-      # Inline finalization OFF: doing patchwise XLSX + metrics + WOW/MOM per
-      # combo across many parallel workers saturates RAM/CPU (36x sweep inflation)
-      # — build them once at finalization instead.
-      OPTIMIZE_INLINE_FINALIZE: "0"
+      # Inline finalization ON. It was disabled when this flag also covered the
+      # per-combo XLSX and the WOW/MOM data (the "36x sweep inflation"), but it
+      # no longer does: the XLSX is built by runner.py's own process pool and
+      # _inline_wm sits OUTSIDE the gate. All that remains inside is two metric
+      # computations on a trades_df already in memory.
+      #
+      # Leaving it off meant the finalize pass re-read all 50,176 per-combo CSVs
+      # to recompute what the workers had already held. Measured on this box:
+      #     CSV read only    3.4 ms/combo
+      #     read + metrics  16.0 ms/combo   <- finalize pays this, serially
+      #     metrics only    12.6 ms/combo   <- inline pays this, across 12 workers
+      # i.e. 13.4 min of serial tail versus 0.9 min of parallel work.
+      OPTIMIZE_INLINE_FINALIZE: "1"
       # ── Stuck-job watchdog (services/optimizer/watchdog.py) ──────────────────
       # Runs as a daemon thread in THIS worker (guard = OPTIMIZE_WATCHDOG). It
       # auto-cancels any optimize job whose progress heartbeat freezes for
@@ -622,7 +779,7 @@ services:
           # keep the ACTIVE set bounded so the cgroup never OOM-kills a job.
           # cpus 12.0: 3 jobs × 2 billiard workers + parents; ~8 threads left for
           # backend/postgres on the 20-thread i5-14500. Updated 2026-07-04.
-          memory: 13000M
+          memory: 9000M
           cpus: "12.0"
         reservations:
           memory: 256M

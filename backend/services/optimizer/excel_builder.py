@@ -158,6 +158,25 @@ def _is_lazy(row: Dict) -> bool:
     return v is True or str(v).lower() == "true" or bool(row.get("Lazy Leg Name"))
 
 
+def _main_leg(legs):
+    """The trade's ANCHOR leg row — LATEST Entry Date, ties to lowest Leg number.
+
+    Was `next(<first non-reentry leg in list order>, legs[0])`, i.e. whichever
+    leg the user happened to put first in the builder. That made Entry Spot —
+    the %P&L / NAV denominator — and the patch-segment assignment depend on leg
+    ORDER: reordering a carried-yearly + weekly pair flipped Entry Spot between
+    23000 and 25000, moving Max DD, CAGR and every NAV-based stat with it.
+
+    `_is_lazy` is kept in the filter because trade_anchor.is_reentry_row does
+    not know about the "Is Lazy Leg"/"Lazy Leg Name" markers this module uses.
+    See services/trade_anchor.py for why LATEST entry is the right anchor.
+    """
+    mains = [l for l in legs
+             if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
+             and not l.get("ReEntryMode") and not _is_lazy(l)]
+    return _anchor_row(mains) or (legs[0] if legs else {})
+
+
 def _get_reentry_type(row: Dict) -> str:
     if _is_lazy(row):
         return "Lazy"
@@ -399,9 +418,7 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
 
     def _pw_seg_idx(key: str) -> int:
         legs = grouped.get(key, [])
-        mr = next((l for l in legs
-                   if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
-                   and not l.get("ReEntryMode") and not _is_lazy(l)), legs[0] if legs else {})
+        mr = _main_leg(legs)
         em = _date_ms(mr.get("Entry Date"))
         i = -1
         if em is not None:
@@ -414,9 +431,7 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
 
     tm: Dict[str, Any] = {}
     for k, legs in grouped.items():
-        main = next((l for l in legs
-                     if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
-                     and not l.get("ReEntryMode") and not _is_lazy(l)), legs[0])
+        main = _main_leg(legs)
         spot    = _to_num(main.get("Entry Spot")) or 0.0
         raw_net = _to_num(main.get("Net P&L"))
         if raw_net is None:
@@ -798,9 +813,7 @@ def _patch_wise_layout(
     for k in sorted_keys:
         t = tm[k]
         legs = grouped.get(k, [])
-        main = next((l for l in legs
-                     if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
-                     and not l.get("ReEntryMode") and not _is_lazy(l)), legs[0] if legs else {})
+        main = _main_leg(legs)
         spot = _to_num(main.get("Entry Spot")) or 0.0
         mc = (midcap_by_trade or {}).get(k) or {}
         # Phase uses whatever DIRECTIONAL leg(s) are present — option legs (CE and/or
@@ -1481,7 +1494,7 @@ def _summary_layout(
     else:
         mdd_dur = 0; mdd_start = ""; mdd_end = ""
 
-    car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
+    car_mdd = opt_cagr / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
     # (car_mdd is taken from the single engine in the AUTHORITATIVE READ block below.)
 
     opt_sum = (
@@ -1626,7 +1639,7 @@ def _summary_layout(
     ldd_no_o1  = _ldd_pair(1, _ldd_exc_stats(1, 1))
     ldd_no_o2  = _ldd_pair(2, _ldd_exc_stats(2, 2))
     ldd_no_o3  = _ldd_pair(3, _ldd_exc_stats(3, 3))
-    car_mdd_live = (opt_cagr / 100) / abs(live_dd_min) if live_dd_min != 0 else 0.0
+    car_mdd_live = opt_cagr / abs(live_dd_min) if live_dd_min != 0 else 0.0
 
     # ── AUTHORITATIVE READ ────────────────────────────────────────────────────────
     # Everything above this line is now only a FALLBACK for callers that hand us no
@@ -1779,7 +1792,7 @@ def _summary_layout(
               bg=_RED_BG, align="C", border=True)
     sink.row_height(r, 18); r += 1
 
-    _kv("Return / MaxDD", f"{car_mdd:.4f}", r, "A", True, _GREEN_TX if car_mdd >= 0 else _RED_TX); r += 1
+    _kv("Return / MaxDD", f"{car_mdd:.2f}%", r, "A", True, _GREEN_TX if car_mdd >= 0 else _RED_TX); r += 1
 
     r += 1
 
@@ -1948,8 +1961,8 @@ def _summary_layout(
     _kv("Avg Actual Live DD",   f"{live_dd_avg:.2f}%", r, "D", False, _RED_TX); r += 1
     _kv("Avg Combined Final MAE" if has_midcap else "Avg Final MAE",
         f"{avg_final_mae:.2f}%", r, "A", False, _RED_TX); r += 1
-    _kv("CAR/MDD (Booked)",     f"{car_mdd:.4f}",       r, "A", True,  _GREEN_TX if car_mdd     >= 0 else _RED_TX)
-    _kv("CAR/MDD Live",         f"{car_mdd_live:.4f}",  r, "D", True,  _GREEN_TX if car_mdd_live >= 0 else _RED_TX); r += 1
+    _kv("CAR/MDD (Booked)",     f"{car_mdd:.2f}%",       r, "A", True,  _GREEN_TX if car_mdd     >= 0 else _RED_TX)
+    _kv("CAR/MDD Live",         f"{car_mdd_live:.2f}%",  r, "D", True,  _GREEN_TX if car_mdd_live >= 0 else _RED_TX); r += 1
 
     r += 1
     _kv("+ve Outlier 1", _fmt_pct(_p1), r, "A", False, _GREEN_TX)
@@ -2161,11 +2174,7 @@ def compute_xlsx_summary_metrics(
             spp = sp / es
         spot_pct_sum += spp if spp is not None else 0
 
-    def _main_of(_legs):
-        return next((l for l in _legs
-                     if not l.get("ReEntryIndex") and not l.get("ReEntryTrigger")
-                     and not l.get("ReEntryMode") and not _is_lazy(l)),
-                    _legs[0] if _legs else {})
+    _main_of = _main_leg
 
     # PER-TRADE accumulation. This previously iterated the raw per-LEG `rows`, which
     # double-counted multi-leg trades and produced the cagr_spot (e.g. straddle
@@ -2305,7 +2314,7 @@ def compute_xlsx_summary_metrics(
                     max_dd_pct = ddp
     if has_midcap:
         combined_max_dd = max_dd_pct
-    car_mdd = (opt_cagr / 100) / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
+    car_mdd = opt_cagr / abs(max_dd_pct) if max_dd_pct != 0 else 0.0
 
     opt_sum = (
         (ce_sum + pe_sum) if (ce_sum != 0 or pe_sum != 0)
@@ -2409,7 +2418,7 @@ def compute_xlsx_summary_metrics(
     ldd_no_o1    = _ldd_exc(1, 1)
     ldd_no_o2    = _ldd_exc(2, 2)
     ldd_no_o3    = _ldd_exc(3, 3)
-    car_mdd_live = (opt_cagr / 100) / abs(live_dd_min) if live_dd_min != 0 else 0.0
+    car_mdd_live = opt_cagr / abs(live_dd_min) if live_dd_min != 0 else 0.0
 
     _spot_chg     = _to_num(S.get("spot_change"))     or round(spot_sum_gated, 2)
     _spot_chg_pct = _to_num(S.get("spot_change_pct")) or round(spot_pct_sum * 100, 4)
@@ -2583,6 +2592,16 @@ def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustmen
             "ABSENT from the Trade Sheet. First projected window: %s",
             len(midcap_legs), len(proj), (proj[0] if proj else None),
         )
+        if os.environ.get("OPTIM_MIDCAP_ALLOW_EMPTY") != "1":
+            # The workbook would silently become NIFTY-only: 21 Midcap/Combined
+            # columns vanish AND the headline numbers change (measured: Net P&L
+            # 353.46 -> 40.00), under a combo label that still says Midcap.
+            raise RuntimeError(
+                "Midcap overlay produced nothing for any of %d trades though %d "
+                "Midcap leg(s) are configured. Refusing to emit a NIFTY-only "
+                "workbook under a Midcap label. Set OPTIM_MIDCAP_ALLOW_EMPTY=1 to "
+                "override deliberately." % (len(proj), len(midcap_legs))
+            )
         return {}, None, False
     by_trade = {
         str(rr.get("trade_id")): rr
@@ -2597,6 +2616,13 @@ def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustmen
             "will be ABSENT from the Trade Sheet. First projected window: %s",
             len(midcap_legs), len(_unpriced), len(proj), (proj[0] if proj else None),
         )
+        if os.environ.get("OPTIM_MIDCAP_ALLOW_EMPTY") != "1":
+            raise RuntimeError(
+                "Midcap overlay priced 0 of %d projected trades though %d Midcap "
+                "leg(s) are configured. Refusing to emit a NIFTY-only workbook "
+                "under a Midcap label. Set OPTIM_MIDCAP_ALLOW_EMPTY=1 to override."
+                % (len(proj), len(midcap_legs))
+            )
         return {}, None, False
     _missing = len(proj) - len(by_trade)
     if _missing > 0:
@@ -2695,9 +2721,7 @@ def build_combo_xlsx(
         rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
     )
 
-    wb = Workbook()
-    # Remove default sheet
-    wb.remove(wb.active)
+
 
     key_order, has_calls, has_puts, has_futures = _build_key_order(rows, has_midcap)
     tm, _grouped, _sorted_keys = _aggregate_trades(rows, has_midcap, midcap_by_trade,
@@ -2730,7 +2754,17 @@ def build_combo_xlsx(
             filter_segments=filter_segments,
         )}
     except Exception as exc:
-        logger.warning("[XLSX] summary metric unification skipped: %s", exc)
+        # NOT skippable. This block is what makes the workbook's Summary sheet
+        # agree with the requested basis; skipping it leaves the OVERALL numbers
+        # in place inside a workbook that is otherwise built as patchwise, and
+        # the sheet gives no sign of it (project rule: no silent basis switch).
+        logger.error("[XLSX] summary metric unification FAILED for %s (patchwise=%s): %s",
+                     combo_label, patchwise, exc)
+        raise RuntimeError(
+            "Summary metric unification failed for combo %r (patchwise=%s): %s. "
+            "Refusing to emit a workbook whose Summary sheet silently carries the "
+            "other basis." % (combo_label, patchwise, exc)
+        ) from exc
 
     # Rust workbook path — ALWAYS. One Rust call builds every sheet: Trade Sheet from
     # `cleaned`; Rules/Summary/Patch/WOW from their ops builders. No Python fallback:
@@ -2749,6 +2783,12 @@ def build_combo_xlsx(
             # expiry's ISO week (~7 cells) instead of spreading by Exit Date.
             yearly=yearly,
         )
+
+    # Built HERE, not before the Rust return above: this workbook is only used by
+    # the openpyxl reference path, and constructing one costs 0.277 ms — paid on
+    # every combo and thrown away, i.e. ~17.6 s of pure waste on a 63,504 sweep.
+    wb = Workbook()
+    wb.remove(wb.active)   # drop the default sheet
 
     _write_trade_sheet(wb, cleaned, key_order)
     _write_summary_sheet(

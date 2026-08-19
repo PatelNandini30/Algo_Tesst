@@ -156,20 +156,36 @@ pub fn compute_mae_mfe_batch(
         let mut lows: Vec<f64> = Vec::new();
         for day in &td[lo..hi] {
             for cand in &cands {
-                // "row exists" = the cache has this (day, strike, opt, cand-expiry).
-                match lookup_option_high(day, &index, strike, &opt_type, cand) {
-                    Some(high) => {
-                        let low = lookup_option_low(day, &index, strike, &opt_type, cand).unwrap_or(0.0);
-                        let settled = lookup_option_settled(day, &index, strike, &opt_type, cand)
-                            .filter(|&s| s > 0.0);
-                        if high > 0.0 { highs.push(high); }
-                        else if let Some(s) = settled { highs.push(s); }
-                        if low > 0.0 { lows.push(low); }
-                        else if let Some(s) = settled { lows.push(s); }
-                        break; // first existing candidate wins
-                    }
-                    None => continue,
+                // "row exists" = EITHER High or Low is present for this
+                // (day, strike, opt, cand-expiry) — NOT High alone. High and
+                // Low are independently-optional columns (older feathers may
+                // be missing just one; lib.rs's own lookup_option_high/_low
+                // docstrings say "None if absent" for EACH separately, backed
+                // by separate cache maps options_high/options_low). Gating
+                // row-existence on High alone meant a day with a null High
+                // but a valid Low was skipped ENTIRELY — the valid Low was
+                // silently never captured, and if enough days were affected
+                // this way `lows` could end up empty while `highs` was not,
+                // tripping the empty-guard below and zeroing BOTH MAE and MFE
+                // for the whole trade. The Python reference this mirrors
+                // (runner.py's _compute_mae_mfe_batch) evaluates High and Low
+                // independently for exactly this reason.
+                let high_opt = lookup_option_high(day, &index, strike, &opt_type, cand);
+                let low_opt = lookup_option_low(day, &index, strike, &opt_type, cand);
+                if high_opt.is_none() && low_opt.is_none() {
+                    continue; // genuinely no row for this candidate expiry
                 }
+                let settled = lookup_option_settled(day, &index, strike, &opt_type, cand)
+                    .filter(|&s| s > 0.0);
+                match high_opt {
+                    Some(high) if high > 0.0 => highs.push(high),
+                    _ => if let Some(s) = settled { highs.push(s); }
+                }
+                match low_opt {
+                    Some(low) if low > 0.0 => lows.push(low),
+                    _ => if let Some(s) = settled { lows.push(s); }
+                }
+                break; // first existing candidate wins
             }
         }
 

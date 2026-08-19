@@ -182,21 +182,59 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
         # Multi-index (per-leg index) runs price each leg from its OWN index series
         # via run_multi_index_feature / run_sync_weekly_cadence — the single-index
         # Rust batch must never claim them (it would misprice cross-index legs).
-        if _truthy(p.get("multi_index_mode")):
-            return "multi_index"
-        if _truthy(p.get("spot_adjustment_enabled")):
-            return "spot_adjustment"
-        msa = p.get("midcap_spot_adjustment")
-        if _truthy(p.get("midcap_legs")) or (isinstance(msa, dict) and _truthy(msa.get("enabled"))):
-            return "midcap"
-        if _truthy(p.get("filter_segments")) or _truthy(p.get("filter_config")):
-            return "filter"
+        # LIFTED 2026-08-14 (multi_index). The comment above is a PRICING concern —
+        # mode 1 does not price: run_multi_index_feature / run_sync_weekly_cadence
+        # already produced trades_df, and rust_authoritative_summary only summarises
+        # it. compute_summary_metrics is ALREADY the live path for every multi-index
+        # sweep today (excel_builder._cmetrics is Rust-only, ungated on multi_index).
+        # Measured on 24 real combos of a multi_index + sync_weekly_roll + FUTURES +
+        # YEARLY + 14-filter-segment sweep (job 2e133fd4): 2,688 fields compared,
+        # CLEAN=24, WITH-DIFFS=0, overall AND patchwise.
+        # if _truthy(p.get("multi_index_mode")):
+        #     return "multi_index"
+        # LIFTED 2026-08-17 (payload-level spot_adjustment). The adjustment is applied
+        # by the Python-orchestrated engine BEFORE the summary runs, so trades_df
+        # already carries the re-strikes/re-entries. Corpus job a2dedd4c
+        # (spot_adjustment_enabled=True, 1% rise) was genuinely active — 56 SPOT_ADJ
+        # exits across 504 rows — 7 combos / 784 fields / 0 diffs.
+        # if _truthy(p.get("spot_adjustment_enabled")):
+        #     return "spot_adjustment"
+        # LIFTED 2026-08-14 (midcap). rust_authoritative_summary computes the overlay
+        # itself via compute_midcap_for_rows and passes midcap_by_trade/midcap_summary
+        # into compute_summary_metrics — the same inputs mode 0 gives _cmetrics.
+        # Corpus job 8c6273a4 (hypothetical buy, cost 0.5%/mo): has_midcap=True,
+        # midcap_leg_pnl_sum=20,392.97, combined_pnl_sum=21,314.80 — i.e. the overlay
+        # was genuinely active, not inert. 6 combos / 738 fields / 0 diffs.
+        # msa = p.get("midcap_spot_adjustment")
+        # if _truthy(p.get("midcap_legs")) or (isinstance(msa, dict) and _truthy(msa.get("enabled"))):
+        #     return "midcap"
+        # LIFTED 2026-08-13 (filter), same basis as the Phase 0b SL/Target lift:
+        # in mode 1 the trades still come from the per-combo Rust engine — only the
+        # SUMMARY is Rust-authoritative — and compute_summary_metrics TAKES
+        # filter_segments as a parameter (it is already the live production path via
+        # excel_builder._cmetrics for every filtered sweep). Parity measured on 96
+        # real combos of a 7-filter-segment + YEARLY + per-leg-spot-adj sweep:
+        # CLEAN=96, WITH-DIFFS=0 across overall (71 keys) and patchwise (41 keys),
+        # plus tools/mode1_parity on the 3-payload corpus. Re-add this reject if
+        # a future filter feature stops being expressible as filter_segments.
+        # if _truthy(p.get("filter_segments")) or _truthy(p.get("filter_config")):
+        #     return "filter"
         # Per-leg individual filter files are applied by the Python spec
         # post-pass (services/leg_filter.py); the Rust batch has no notion of
         # them and would price the masked leg over its full window.
-        for _leg in (p.get("legs") or []):
-            if isinstance(_leg, dict) and _truthy(_leg.get("filter_segments")):
-                return "leg_filter"
+        # LIFTED 2026-08-14 (leg_filter). The per-leg mask is applied by the Python
+        # spec post-pass BEFORE the summary runs, so trades_df already reflects it.
+        # Corpus job 26736821 (leg0 masked to 3 of the payload's 7 segments) proved the
+        # mask was live: rows per leg = {1: 73, 2: 263, 3: 263}. 6 combos / 672 fields
+        # / 0 diffs.
+        # for _leg in (p.get("legs") or []):
+        #     if isinstance(_leg, dict) and _truthy(_leg.get("filter_segments")):
+        #         return "leg_filter"
+        # STILL REJECTED. Attempted 2026-08-14 and NOT lifted: two corpus sweeps
+        # (overall_sl_value=25 then =2) produced ZERO SL exits across 4,536 rows —
+        # every exit was SCHEDULED_EXIT / SPOT_ADJ / FILTER_END. A "0 diffs" result on
+        # a stop that never fires proves nothing, so this stays gated until a corpus
+        # that actually triggers it exists.
         if _truthy(p.get("overall_sl_value")) or _truthy(p.get("overall_target_value")):
             return "overall_sl_target"  # Phase 0b (SL scan) not yet extracted
         # YEARLY pins the contract to a December expiry while the cadence list
@@ -204,24 +242,27 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
         # it. This batch loop builds its own expiry inputs, so it would silently
         # trade the CADENCE contract. Exclude explicitly rather than let an
         # unrecognised expiry kind fall through as "supported".
-        if str(p.get("expiry_type") or "").upper() == "YEARLY":
-            return "yearly_expiry"
+        # LIFTED 2026-08-13 (yearly_expiry): the concern above is a PRICING one —
+        # this batch "would silently trade the CADENCE contract" — but mode 1 does
+        # not price; _run_single_backtest already produced the trades. The same 96
+        # real combos carried expiry_type=YEARLY and matched exactly.
+        # if str(p.get("expiry_type") or "").upper() == "YEARLY":
+        #     return "yearly_expiry"
         # SAME-INDEX MIXED EXPIRY — identical hazard to YEARLY above. A MONTHLY
         # leg under a WEEKLY cadence is pinned to its own monthly contract by
         # _build_fixed_entry_specs; this batch loop builds its own expiry inputs
         # and would silently trade the CADENCE (weekly) contract instead.
         # Fail closed so mixed baskets fall back to the per-combo path that
         # actually resolves the pin.
-        if str(p.get("expiry_type") or "").upper() in ("WEEKLY", "NEXT_WEEKLY", "WEEKLY_T1"):
-            for _l in p.get("legs") or []:
-                if (
-                    isinstance(_l, dict)
-                    and str(_l.get("expiry") or "").upper()
-                    in ("MONTHLY", "NEXT_MONTHLY", "MONTHLY_T1")
-                    and str(_l.get("segment", "OPTIONS")).upper()
-                    not in ("FUTURES", "FUTURE")
-                ):
-                    return "mixed_expiry"
+        # LIFTED 2026-08-17 (mixed_expiry). Same reasoning as YEARLY above: the pin is
+        # resolved by _build_fixed_entry_specs during PRICING, and mode 1 only
+        # summarises the finished trades. Corpus job 6f15ab87 (WEEKLY cadence +
+        # MONTHLY option legs) genuinely mixed — 17 distinct expiries across 483 rows
+        # — 7 combos / 784 fields / 0 diffs. This shape hard-failed job 027a9a6a.
+        # if str(p.get("expiry_type") or "").upper() in ("WEEKLY", "NEXT_WEEKLY", "WEEKLY_T1"):
+        #     for _l in p.get("legs") or []:
+        #         if (... MONTHLY option leg ...):
+        #             return "mixed_expiry"
 
         legs = p.get("legs") or []
         if not isinstance(legs, list) or len(legs) == 0:
@@ -230,10 +271,17 @@ def rust_batch_unsupported(merged_payload: Dict[str, Any]) -> Optional[str]:
         for i, leg in enumerate(legs):
             if not isinstance(leg, dict):
                 return f"leg{i}-not-dict"
-            if _leg_has_spot_adjustment(leg):
-                return f"leg{i}-spot_adjustment"
-            if _leg_is_futures(leg):
-                return f"leg{i}-futures"
+            # LIFTED 2026-08-13 (per-leg spot_adjustment): all three legs of the
+            # measured corpus had spot_adjustment enabled and swept; summaries matched.
+            # The PAYLOAD-level spot_adjustment_enabled reject above is UNCHANGED.
+            # if _leg_has_spot_adjustment(leg):
+            #     return f"leg{i}-spot_adjustment"
+            # LIFTED 2026-08-14 (futures leg): same basis — the futures leg is priced
+            # by the Python-orchestrated path before the summary runs. The corpus above
+            # carried a NIFTY FUTURES monthly leg; fut_pnl_total/fut_pnl_pct are
+            # supplemented explicitly in rust_authoritative_summary and matched exactly.
+            # if _leg_is_futures(leg):
+            #     return f"leg{i}-futures"
             if _leg_is_lazy(leg):
                 return f"leg{i}-lazy"
             if _leg_is_next_expiry(leg):
@@ -509,4 +557,31 @@ def rust_authoritative_summary(
     over = algotest_native.compute_summary_metrics(records, flat, False, filter_segments, mbt, msumm)
     flat = {**flat, **over}
     pw = algotest_native.compute_summary_metrics(records, flat, True, filter_segments, mbt, msumm)
-    return flat, pw
+    # The Rust engines emit CE/PE totals but NOT futures. compute_xlsx_summary_metrics
+    # already supplements them (excel_builder.py, "if 'fut_pnl_total' not in _rust_sm"),
+    # but this path calls algotest_native directly and so bypassed that patch — mode 1
+    # therefore dropped fut_pnl_total / fut_pnl_pct from every combo's summary.
+    # tools/optim_metrics_parity measured it: 34 keys, exactly these 2 diverging
+    # (py=0.0 vs rust=<MISS>) on all 3 corpus payloads. Same formula as the original
+    # (Sigma FUT P&L; pct = Sigma FUT P&L / Entry Spot * 100) so the two paths agree.
+    # Purely additive — never overwrites a value Rust did produce.
+    # Applied to BOTH dicts: the patchwise summary is a separate Rust call and
+    # drops the same two keys, so patching only `flat` left download_mode=patchwise
+    # (the default here) still missing them — caught by tools/mode1_parity.
+    def _add_fut(d):
+        if d is None or "fut_pnl_total" in d:
+            return d
+        _ft = _fp = 0.0
+        for _r in records:
+            _fu = _num(_r.get("FUT P&L"))
+            if _fu is None:
+                continue
+            _ft += _fu
+            _es = _num(_r.get("Entry Spot"))
+            if _es not in (None, 0):
+                _fp += _fu / _es
+        d["fut_pnl_total"] = round(_ft, 2)
+        d["fut_pnl_pct"] = round(_fp * 100, 4)
+        return d
+
+    return _add_fut(flat), _add_fut(pw)

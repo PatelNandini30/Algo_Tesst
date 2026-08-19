@@ -66,6 +66,21 @@ export const OPTIM_PARAM_GROUPS = [
     ],
   },
   {
+    group: 'Per-Leg — Quantity',
+    forLeg: true,
+    items: [
+      {
+        // Lots per leg. Applies to every leg (option or future); the engine
+        // scales Qty and Net P&L by lots, and 'Relative to Leg Premium' divides
+        // the target by the child's lots — so sweeping this is a real axis.
+        path: 'legs[I].lots',
+        label: 'Lots',
+        unit: 'lots',
+        ...RANGE(1, 5, 1),
+      },
+    ],
+  },
+  {
     group: 'Per-Leg — Strike',
     forLeg: true,
     items: [
@@ -276,6 +291,25 @@ export const OPTIM_PARAM_GROUPS = [
         label: 'Own Spot Adjustment on/off',
         ...ENUM([false, true]),
         valueLabels: { false: 'No Adj', true: 'With Adj' },
+      },
+    ],
+  },
+  {
+    // Per-leg SCHEDULE spot-adjustment sweep — keeps the per-contract GAP schedule
+    // ON in every combo and sweeps the adjustment: None (gap-only) / Rise / Fall /
+    // Both. Only shown when the leg carries a yearly_contract_schedule (built in
+    // StrategyBuilder). Handled in apply_combo_for_optim (legs[I].yearly_schedule_
+    // direction → sets spot_adjustment.enabled/direction).
+    group: 'Per-Leg — Schedule Spot Adjustment',
+    forLeg: true,
+    optionOnly: true,
+    requiresLegYearlySchedule: true,
+    items: [
+      {
+        path: 'legs[I].yearly_schedule_direction',
+        label: 'Schedule adjustment (None / Rise / Fall / Both)',
+        ...ENUM(['none', 'rise', 'fall', 'both']),
+        valueLabels: { none: 'No Adj', rise: 'Rise', fall: 'Fall', both: 'Both' },
       },
     ],
   },

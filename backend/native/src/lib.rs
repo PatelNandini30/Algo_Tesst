@@ -1838,13 +1838,23 @@ fn check_leg_stop_loss_target(
         if !newly_triggered_this_day.is_empty() {
             if square_off_mode.to_lowercase() == "complete" {
                 let trigger_date = newly_triggered_this_day[0].1.clone();
+                // Used ONLY to label COLLATERAL legs below (legs that did not
+                // trigger themselves — "the trade squared off because leg 0
+                // hit its target"). Must NOT be reused for a leg that
+                // triggered on its own: when 2+ legs trigger the same day
+                // (e.g. CE hits TARGET, PE independently hits STOP_LOSS),
+                // every triggered leg was stamped with leg 0's reason — PE's
+                // Exit Reason read "TARGET" instead of "STOP_LOSS". Each
+                // triggered leg now looks up its OWN reason.
                 let trigger_reason = newly_triggered_this_day[0].2.clone();
-                let triggered_indices: std::collections::HashSet<usize> =
-                    newly_triggered_this_day.iter().map(|(li, _, _)| *li).collect();
+                let reason_by_leg: std::collections::HashMap<usize, String> = newly_triggered_this_day
+                    .iter()
+                    .map(|(li, _, treason)| (*li, treason.clone()))
+                    .collect();
                 for li2 in 0..leg_results.len() {
                     if !leg_results[li2].0 {
-                        if triggered_indices.contains(&li2) {
-                            leg_results[li2] = (true, trigger_date.clone(), trigger_reason.clone());
+                        if let Some(own_reason) = reason_by_leg.get(&li2) {
+                            leg_results[li2] = (true, trigger_date.clone(), own_reason.clone());
                         } else {
                             leg_results[li2] = (true, trigger_date.clone(), format!("COMPLETE_{}", trigger_reason));
                         }
@@ -2093,6 +2103,7 @@ fn algotest_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(summary_metrics::compute_summary_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(xlsx_writer::write_trade_sheet_xlsx, m)?)?;
     m.add_function(wrap_pyfunction!(xlsx_writer::write_layout_sheet_xlsx, m)?)?;
+    m.add_function(wrap_pyfunction!(xlsx_writer::write_layout_workbook_xlsx, m)?)?;
     m.add_function(wrap_pyfunction!(xlsx_writer::write_workbook_xlsx, m)?)?;
     m.add_function(wrap_pyfunction!(get_ohlc_range, m)?)?;
     // Index OHLC (additive — Midcap overlay)

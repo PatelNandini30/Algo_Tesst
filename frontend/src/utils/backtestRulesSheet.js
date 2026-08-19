@@ -62,6 +62,11 @@ function _strikeLabel(ss, optType) {
   if (type === 'REL_LEG') {
     return `Relative to Leg ${_num(ss.ref_leg ?? 1)}, offset ${_num(ss.offset ?? 0)} gap(s)`;
   }
+  if (type === 'REL_LEG_PREMIUM') {
+    // Wording kept identical to backend/services/optimizer/rules_sheet.py so a
+    // backtest workbook and an optim combo workbook read the same.
+    return `Relative to Leg ${_num(ss.ref_leg ?? 1)} Premium, ÷ weeks to expiry ÷ lots`;
+  }
   if (type.startsWith('TIME_VALUE')) {
     const op = type === 'TIME_VALUE_GTE' ? '>=' : type === 'TIME_VALUE_LTE' ? '<=' : 'nearest';
     const side = String(ss.moneyness || 'ATM').toUpperCase();
@@ -78,7 +83,7 @@ function _strikeLabel(ss, optType) {
   return String(ss.strike_type || 'ATM');
 }
 
-function _legSection(rows, leg, n) {
+function _legSection(rows, leg, n, perLeg = false) {
   const push = (l, v) =>
     rows.push(['kv', l, (v === null || v === undefined || v === '') ? '—' : String(v)]);
   const seg = String(leg.segment || 'OPTIONS').toUpperCase();
@@ -91,8 +96,25 @@ function _legSection(rows, leg, n) {
 
   push('Position', side);
   push('Lots', leg.lots ?? 1);
+  if (Number(leg.qty) > 0) push('Quantity (override)', Math.trunc(Number(leg.qty)));
   if (leg.index) push('Index', leg.index);
   push('Expiry', _expiry(leg.expiry));
+  // Makes the strategy-level "Filter" row's "see leg sections below" pointer
+  // (above) actually true — previously nothing here named the per-leg filter
+  // at all, even though engine_rust.py applies it regardless of the
+  // strategy-level toggle.
+  if (leg.individual_filter && Array.isArray(leg.filter_segments) && leg.filter_segments.length) {
+    const _segs = leg.filter_segments;
+    const _lo = _segs.reduce((a, s) => (s.start && (!a || s.start < a) ? s.start : a), '');
+    const _hi = _segs.reduce((a, s) => (s.end && (!a || s.end > a) ? s.end : a), '');
+    push('Filter', `${_segs.length} segment${_segs.length === 1 ? '' : 's'}${_lo && _hi ? ` (${_lo} → ${_hi})` : ''}`);
+  }
+  // Per-leg rollover: this leg rolls on its OWN expiry cadence + own exit T-n.
+  // Only shown when the run opted into per-leg rollover (shared-cadence runs
+  // document their single T-n at the strategy level instead).
+  if (perLeg && seg !== 'FUTURES') {
+    push('Leg Rollover', `Yes — ${_expiry(leg.expiry)} cadence, exit T-${leg.exit_dte ?? 0}`);
+  }
 
   if (seg === 'FUTURES') {
     push('Exit Mode', leg.fut_exit_mode);
@@ -123,6 +145,23 @@ function _legSection(rows, leg, n) {
     push('Spot Adjustment', `Yes (${dir} ${_num(legSA.pct)}${unit})`);
   } else {
     push('Spot Adjustment', 'Uses strategy-level setting');
+  }
+
+  // Per-December-contract schedule (yearly legs): each row is a From→To year
+  // range; runs until the next row's From (sticky), last row = onward.
+  const sched = leg.yearly_contract_schedule;
+  if (Array.isArray(sched) && sched.length) {
+    const valid = sched
+      .filter((r) => r && /^\d{4}/.test(String(r.contract || '').trim()))
+      .map((r) => ({ fy: parseInt(String(r.contract).trim().slice(0, 4), 10), r }))
+      .sort((a, b) => a.fy - b.fy);
+    valid.forEach(({ fy, r }, i) => {
+      const to = i + 1 < valid.length ? `Dec-${valid[i + 1].fy - 1}` : 'onward';
+      const usfx = r.spot_adj_unit === 'percent' ? '%'
+        : r.spot_adj_unit === 'points' ? ' pts' : '';
+      push(`Contract Dec-${fy} → ${to}`,
+        `Strike Gap ${_num(r.strike_gap)}, Spot Adj ${_num(r.spot_adj_pct)}${usfx}`);
+    });
   }
 
   // Per-leg slippage — buildPayload sends 0 when the leg's slippage is toggled off.
@@ -211,6 +250,10 @@ export function buildRulesSheet(payload, filterName) {
     push('Rollover', 'None');
   }
 
+  if (payload.per_leg_rollover) {
+    push('Rollover Mode', 'Per-Leg (each leg rolls on its own expiry + exit T-n; see legs)');
+  }
+
   if (payload.spot_adjustment_enabled) {
     const unit = payload.spot_adjustment_units === 'percent' ? '%' : ' pts';
     push('Spot Adjustment',
@@ -244,13 +287,30 @@ export function buildRulesSheet(payload, filterName) {
   if (payload.overall_sl_type) push('Overall Stop Loss', `${payload.overall_sl_type}: ${_num(payload.overall_sl_value)}`);
   if (payload.overall_target_type) push('Overall Target', `${payload.overall_target_type}: ${_num(payload.overall_target_value)}`);
   push('Cost / Charges', payload.charges_enabled ? 'Enabled' : 'Disabled');
-  push('Filter', filterName || 'No Filter');
+  // filterName only carries the STRATEGY-LEVEL filter toggle. A leg's OWN
+  // uploaded filter (leg.individual_filter + leg.filter_segments, set
+  // per-leg in StrategyBuilder) restricts that leg's trading dates just as
+  // effectively (engine_rust.py's apply_leg_filters/_apply_leg_filter_mask
+  // apply it regardless of the strategy-level toggle) but was never checked
+  // here — the sheet said "No Filter" on a run that was genuinely filtered.
+  const _legsForFilterCheck = Array.isArray(payload.legs) ? payload.legs : [];
+  const _perLegFilterCount = _legsForFilterCheck.filter(
+    l => l && l.individual_filter && Array.isArray(l.filter_segments) && l.filter_segments.length
+  ).length;
+  if (filterName) {
+    push('Filter', filterName);
+  } else if (_perLegFilterCount) {
+    push('Filter', `Per-leg (${_perLegFilterCount} leg${_perLegFilterCount === 1 ? '' : 's'} filtered — see leg sections below)`);
+  } else {
+    push('Filter', 'No Filter');
+  }
 
   rows.push(['spacer']);
 
   // ── Per-leg (options + futures) ───────────────────────────────────────────
   const legs = Array.isArray(payload.legs) ? payload.legs : [];
-  legs.forEach((leg, i) => _legSection(rows, leg, i + 1));
+  const _perLeg = !!payload.per_leg_rollover;
+  legs.forEach((leg, i) => _legSection(rows, leg, i + 1, _perLeg));
 
   // ── Midcap overlay legs ───────────────────────────────────────────────────
   const mcLegs = Array.isArray(payload.midcap_legs) ? payload.midcap_legs : [];

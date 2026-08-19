@@ -3,7 +3,15 @@ Build human-readable labels for a parameter combination.
 
 Matches the research team's filename convention, e.g.
 
-    CE_0.5%_OTM_Sell_PE_0.5%_ITM_Sell_NoAdjustment_Weekly_Expiry_T-1_To_T-1
+    NF_CE_0.5%_OTM_Wkly_Sell_NF_PE_0.5%_ITM_Wkly_Sell_NoAdjustment_T-1_To_T-1
+
+Each leg is tagged with its own index abbreviation (NF=NIFTY, BNF=BANKNIFTY,
+FNF=FINNIFTY, MCN=MIDCPNIFTY) instead of an ordinal leg number — a leg is
+self-identifying by index + option type + strike + expiry + position, so two
+legs never need a "L1"/"L2" tag to tell them apart. Expiry is per-leg (inline,
+right after that leg's strike), not one combo-level token at the end, since a
+same-index mixed-expiry strategy (e.g. a Weekly PE + a Yearly PE) has no single
+expiry that would be correct for every leg.
 
 Two labellers:
 
@@ -25,22 +33,150 @@ from typing import Any, Dict, List, Optional
 from services.optimizer.param_expander import get_by_path
 
 
-def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str = "CE") -> str:
-    """Render a single leg's strike spec into '0.5%_OTM' / 'ATM' / '2.0%_ITM'.
+_INDEX_ABBREV = {
+    "NIFTY": "NF",
+    "BANKNIFTY": "BNF",
+    "FINNIFTY": "FNF",
+    "MIDCPNIFTY": "MCN",
+}
 
-    option_type is required for pct_of_atm because the direction field is stored
-    as '+'/'-' (engine sign convention), not 'OTM'/'ITM'. The semantic meaning
-    of '+'/'-' flips between calls and puts:
+_MIDCAP_SYM_ABBREV = {"MIDCAP100": "MC100"}
+
+_EXPIRY_LABEL_ABBREV = {
+    "weekly": "Wkly",
+    "monthly": "Mnly",
+    "yearly": "Yrly",
+    "yearly_weekly": "YrlyWkly",
+    "yearly_monthly": "YrlyMnly",
+    "next_weekly": "NxtWkly",
+    "next_monthly": "NxtMnly",
+}
+
+_LEG_EXPIRY_RAW = {
+    "weekly": "weekly", "weekly_expiry": "weekly",
+    "monthly": "monthly", "monthly_expiry": "monthly",
+    "yearly": "yearly",
+    "next_weekly": "next_weekly", "weekly_t1": "next_weekly",
+    "next_monthly": "next_monthly", "monthly_t1": "next_monthly",
+}
+
+
+def _leg_index_abbrev(leg: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> str:
+    """This leg's own index (falls back to the strategy default), abbreviated
+    for filenames — NF/BNF/FNF/MCN. An unrecognized index falls back to its
+    raw upper-cased symbol so a new index can never crash the labeller."""
+    sym = str((leg or {}).get("index") or payload.get("index") or "NIFTY").strip().upper()
+    return _INDEX_ABBREV.get(sym, sym)
+
+
+def _abbrev_expiry_word(raw: str) -> str:
+    key = raw.strip().lower().replace(" ", "_")
+    return _EXPIRY_LABEL_ABBREV.get(key, raw)
+
+
+# FILENAME_FORMAT.md only defines W/NW/M/NM — YEARLY is an EOD-only cadence its
+# source repo doesn't have, so 'Y' is a local extension. Separate from
+# `_EXPIRY_LABEL_ABBREV` above, which still feeds the master-summary display
+# columns (Wkly/Mnly/...) — this map is filename-only.
+_EXPIRY_FILENAME_CODE = {
+    "weekly": "W", "monthly": "M", "yearly": "Y",
+    "next_weekly": "NW", "next_monthly": "NM",
+}
+
+
+def _expiry_filename_code(raw: str) -> str:
+    key = raw.strip().lower().replace(" ", "_")
+    return _EXPIRY_FILENAME_CODE.get(key, raw.upper() if raw else "W")
+
+
+def _leg_expiry_abbrev(leg: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> str:
+    """This leg's own expiry cadence, as a short filename code (W/NW/M/NM/Y).
+    Falls back to the combo-level expiry (`_expiry_label`, defined below) when
+    the leg carries no override of its own — the common case, where every leg
+    shares one expiry."""
+    raw = str((leg or {}).get("expiry") or (leg or {}).get("expiry_type") or "").strip().lower()
+    mapped = _LEG_EXPIRY_RAW.get(raw)
+    if mapped:
+        return _expiry_filename_code(mapped)
+    return _expiry_filename_code(_expiry_label(payload))
+
+
+def _fmt_num(v: Any) -> str:
+    """Integers stay whole ('40'); else trimmed to <=2 decimals ('0.3')."""
+    try:
+        n = float(v or 0)
+    except (TypeError, ValueError):
+        n = 0.0
+    if n == int(n):
+        return str(int(n))
+    return f"{round(n, 2):g}"
+
+
+_PCT_BASIS = re.compile(r"pct|percent", re.IGNORECASE)
+
+
+def _unit_of(basis: Any) -> str:
+    """unit(basis): a basis containing 'pct'/'percent' -> 'pct', else 'pts'."""
+    return "pct" if _PCT_BASIS.search(str(basis or "")) else "pts"
+
+
+_REENTRY_MODE = {
+    "RE_ASAP": "asap", "RE_ASAP_REV": "asaprev",
+    "RE_MOMENTUM": "momentum", "RE_MOMENTUM_REV": "momentumrev",
+    "LAZY_LEG": "lazy",
+}
+
+
+def _reentry_mode(mode: Any) -> str:
+    return _REENTRY_MODE.get(str(mode or "").upper(), "asap")
+
+
+def _side_code(leg: Optional[Dict[str, Any]]) -> str:
+    pos = str((leg or {}).get("position") or "").lower()
+    if pos in ("buy", "long"):
+        return "B"
+    if pos in ("sell", "short"):
+        return "S"
+    return pos[:1].upper() or "S"
+
+
+def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str = "CE") -> str:
+    """Render a leg's strike spec per FILENAME_FORMAT.md's token table
+    (initials + value): 'pctoA2_OTM' / 'ATM' / 'SW0.5' / 'CP50' / etc.
+
+    Two things the spec doesn't cover, because this app has them and the
+    doc's source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing —
+    extends the spec's own RtL prefix with a _G{gaps} suffix, alongside its
+    _TV/_D) and Delta-basis anything (no delta strike mode exists here at
+    all, confirmed absent from StrategyBuilder.jsx).
+
+    option_type is required for pct_of_atm because the direction field is
+    stored as '+'/'-' (engine sign convention), not 'OTM'/'ITM'. The semantic
+    meaning of '+'/'-' flips between calls and puts:
 
         CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
         PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
     """
     if not isinstance(strike_selection, dict):
+        # `_join_strikes` passes None for a master-summary column when no leg of
+        # this option type exists at all — distinct from a leg that HAS a
+        # strike_selection but no explicit strike_type (which defaults to ATM
+        # in the branch below). Filename building never hits this branch: every
+        # leg in ce_legs/pe_legs always carries a real strike_selection dict.
         return "-"
     kind = (strike_selection.get("type") or "").lower()
     if kind in ("strike_type", "", None):
-        st = (strike_selection.get("strike_type") or "ATM").upper()
-        return st
+        return str(strike_selection.get("strike_type") or "ATM").upper().replace(" ", "")
+    if kind == "closest_premium":
+        return f"CP{_fmt_num(strike_selection.get('premium'))}"
+    if kind == "premium_gte":
+        return f"Pgte{_fmt_num(strike_selection.get('premium'))}"
+    if kind == "premium_lte":
+        return f"Plte{_fmt_num(strike_selection.get('premium'))}"
+    if kind == "premium_range":
+        return f"PR{_fmt_num(strike_selection.get('lower'))}_{_fmt_num(strike_selection.get('upper'))}"
+    if kind == "synthetic_future":
+        return "SF"
     if kind == "pct_of_atm":
         try:
             val = float(strike_selection.get("value", 0))
@@ -53,17 +189,13 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
             # Already a semantic label — use val as magnitude directly.
             if val == 0.0 or raw_dir.upper() == "ATM":
                 return "ATM"
-            return f"{abs(val):g}%_{raw_dir.upper()}"
+            return f"pctoA{_fmt_num(abs(val))}_{raw_dir.upper()}"
 
         # Engine sign convention: "+" means add val% above ATM, "-" means below.
         # Default (empty direction) matches the strike-picker default in
         # engine_rust.py:_compute_strike_for_leg_python which does
         #     raw = entry_spot - shift if direction == "-" else entry_spot + shift
         # i.e. anything that isn't "-" behaves as "+" (add shift above ATM).
-        # Previously this defaulted to -1, which mislabeled positive values as
-        # ITM when the engine actually placed them OTM (above spot for CE).
-        # When the optimizer sweeps value through negative territory (e.g. val=-1
-        # with direction="+") the net offset is negative = below ATM = ITM for CE.
         dir_sign = -1 if raw_dir == "-" else +1
         net_offset = dir_sign * val
         abs_val = abs(net_offset)
@@ -77,48 +209,39 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
             direction = "OTM" if is_call else "ITM"
         else:
             direction = "ITM" if is_call else "OTM"
-        return f"{abs_val:g}%_{direction}"
+        return f"pctoA{_fmt_num(abs_val)}_{direction}"
     if kind == "atm_straddle_prem_pct":
         try:
             val = float(strike_selection.get("value", 0))
         except (TypeError, ValueError):
             val = 0.0
-        return f"Straddle{val:g}%"
+        return f"ASP{_fmt_num(val)}pct"
     if kind == "straddle_width":
         try:
-            mult = float(strike_selection.get("straddle_multiplier", 1))
+            mult = float(strike_selection.get("straddle_multiplier", 0.5))
         except (TypeError, ValueError):
-            mult = 1.0
-        if mult == 0.0:
-            return "StraddleW0_ATM"
-        # The engine's +/- sign is a raw offset applied identically to every
-        # leg (no CE/PE meaning at the engine level) — but for the LABEL,
-        # translate it into ITM/OTM per option_type, same convention as
-        # pct_of_atm above, so two same-type legs (e.g. a Monthly PE + a
-        # Weekly PE) read unambiguously instead of a bare "+"/"-":
-        #   CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
-        #   PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
-        direction = str(strike_selection.get("straddle_direction") or "+").strip()
-        is_call = option_type.upper().startswith("C")
-        above_atm = direction != "-"
-        if above_atm:
-            moneyness = "OTM" if is_call else "ITM"
-        else:
-            moneyness = "ITM" if is_call else "OTM"
-        return f"StraddleW{mult:g}_{moneyness}"
+            mult = 0.5
+        return f"SW{_fmt_num(mult)}"
     if kind == "rel_leg":
-        # Relative-to-Leg (Iron Condor wing): 'REL_L1_2G' = Leg 1 + 2 gaps.
-        # Matches the backtest export filename label (ResultsPanel.jsx).
+        # Gap-offset Iron Condor wing has no FILENAME_FORMAT.md equivalent —
+        # extend RtL with a _G{gaps} suffix (mirrors _TV/_D there). Matches
+        # the backtest export filename label (ResultsPanel.jsx).
         try:
             ref = int(strike_selection.get("ref_leg") or 1)
             off = float(strike_selection.get("offset") or 0)
         except (TypeError, ValueError):
             ref, off = 1, 0.0
-        return f"REL_L{ref}_{off:g}G"
+        return f"RtL{ref}_G{_fmt_num(off)}"
+    if kind == "rel_leg_premium":
+        # Premium target derived from leg #ref_leg's entry fill — the spec's
+        # default "All"/premium RtL basis, so no suffix. Matches the backtest
+        # export filename label (ResultsPanel.jsx).
+        try:
+            ref = int(strike_selection.get("ref_leg") or 1)
+        except (TypeError, ValueError):
+            ref = 1
+        return f"RtL{ref}"
     if kind.startswith("time_value"):
-        # 'TV100' / 'TV100_GTE' / 'TV100_LTE'. Matches the backtest export
-        # filename label (ResultsPanel.jsx) so an optim combo folder and a
-        # standalone backtest of the same leg produce the same token.
         tv = strike_selection.get("time_value")
         if tv is None:
             tv = strike_selection.get("premium")
@@ -126,18 +249,74 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
             tv = float(tv or 0)
         except (TypeError, ValueError):
             tv = 0.0
-        suffix = {"time_value_gte": "_GTE", "time_value_lte": "_LTE"}.get(kind, "")
+        base = {"time_value_gte": "TVgte", "time_value_lte": "TVlte"}.get(kind, "TV")
         side = str(strike_selection.get("moneyness") or "ATM").upper()
         try:
             cap = abs(float(strike_selection.get("tv_range_pct") or 0))
         except (TypeError, ValueError):
             cap = 0.0
-        # Unit is ALWAYS spelled out so PTS vs PCT can never be confused,
-        # and the range cap uses its own RNG token so the two "PCT"s in a
-        # name are unambiguous: TV0.3PCT_ITM_RNG2PCT.
-        unit = "PCT" if str(strike_selection.get("tv_units") or "points") == "percent" else "PTS"
-        return f"TV{tv:g}{unit}{suffix}_{side}" + (f"_RNG{cap:g}PCT" if cap else "")
+        unit = _unit_of(strike_selection.get("tv_units"))
+        token = f"{base}{_fmt_num(tv)}{unit}"
+        if side != "ATM":
+            token += f"_{side}"
+        if cap:
+            token += f"_rng{_fmt_num(cap)}pct"
+        return token
     return kind.upper()
+
+
+def _on_toggle_tokens(leg: Dict[str, Any]) -> List[str]:
+    """TP / SL / TS / SLB / RoS / RoT, in FILENAME_FORMAT.md's order, only
+    when active. Breakeven / Wait&Trade / Scale&Trade have no equivalent in
+    this app (confirmed absent from the leg schema — intraday-only features),
+    so they're skipped entirely; Volume Filter and Roll Forward are never
+    named, per spec.
+    """
+    def _val(d: Dict[str, Any], key: str) -> float:
+        try:
+            return float(d.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    out: List[str] = []
+    tp = leg.get("targetProfit") or {}
+    if isinstance(tp, dict) and _val(tp, "value") > 0:
+        out.append(f"TP{_fmt_num(tp.get('value'))}{_unit_of(tp.get('mode'))}")
+    sl = leg.get("stopLoss") or {}
+    if isinstance(sl, dict) and _val(sl, "value") > 0:
+        out.append(f"SL{_fmt_num(sl.get('value'))}{_unit_of(sl.get('mode'))}")
+    trail = leg.get("trailSL") or {}
+    if isinstance(trail, dict) and trail:
+        out.append(f"TS{_fmt_num(trail.get('trigger'))}_{_fmt_num(trail.get('move'))}{_unit_of(trail.get('mode'))}")
+    slb = leg.get("slWithBuffer") or {}
+    if isinstance(slb, dict) and _val(slb, "value") > 0:
+        out.append(f"SLB{_fmt_num(slb.get('value'))}{_unit_of(slb.get('mode'))}_{_fmt_num(slb.get('buffer_pct'))}pct")
+    ros = leg.get("reEntryOnSL") or {}
+    if isinstance(ros, dict) and ros:
+        out.append(f"RoS{_fmt_num(ros.get('count'))}{_reentry_mode(ros.get('mode'))}")
+    rot = leg.get("reEntryOnTarget") or {}
+    if isinstance(rot, dict) and rot:
+        out.append(f"RoT{_fmt_num(rot.get('count'))}{_reentry_mode(rot.get('mode'))}")
+    return out
+
+
+def _adjustment_token(leg: Dict[str, Any]) -> Optional[str]:
+    """Per-leg adjustment sub-trigger token. This app only has "Spot
+    Adjustment" as an own-leg sub-trigger — no Spot-vs-Strike / Adjustment-
+    Relative-to-Leg controls exist here (confirmed absent from the leg
+    schema) — so leg['spot_adjustment']['enabled'] doubles as both the
+    spec's adjOn parent and the sub-trigger.
+    """
+    sa = leg.get("spot_adjustment")
+    if not isinstance(sa, dict) or not sa.get("enabled"):
+        return None
+    direction = str(sa.get("direction") or "").lower()
+    if direction not in ("rise", "fall", "both"):
+        direction = "rise"
+    pct = sa.get("pct")
+    if pct is None:
+        pct = sa.get("value")
+    return f"adj_{direction}_{_fmt_num(pct)}{_unit_of(sa.get('units'))}"
 
 
 def _spot_adjustment_label(payload: Dict[str, Any]) -> str:
@@ -185,8 +364,21 @@ def _expiry_label(payload: Dict[str, Any]) -> str:
         return "Next_Weekly"
     if any(e in ("next_monthly", "monthly_t1") for e in leg_expiries):
         return "Next_Monthly"
+    # Per-leg expiry PREFERRED over payload.expiry_window generally, not just
+    # for the next_* cases above. legs[*].expiry IS a swept axis
+    # (param_expander.py), but expiry_window is a base-payload field that
+    # does not change per-combo — so a sweep across Weekly/Monthly on the
+    # leg had every combo's "Expiry" column/WOW-MOM axis read the SAME
+    # base-payload value regardless of which cadence that combo actually
+    # traded, collapsing genuinely distinct combos onto one grid cell with
+    # no way to tell them apart. The leg's own value is what the trades
+    # actually ran under; window is now only a fallback when no leg has one.
+    _leg_candidates = {e for e in leg_expiries if e}
     window = (payload.get("expiry_window") or "").lower()
-    candidate = window or (next(iter(leg_expiries)) if leg_expiries else "")
+    if len(_leg_candidates) == 1:
+        candidate = next(iter(_leg_candidates))
+    else:
+        candidate = window or (next(iter(_leg_candidates)) if _leg_candidates else "")
     candidate = candidate.replace("_expiry", "")
     if not candidate:
         return "Weekly"
@@ -224,42 +416,6 @@ def _find_leg(payload: Dict[str, Any], option_type: str) -> Optional[Dict[str, A
     return None
 
 
-def _position_label(leg: Optional[Dict[str, Any]]) -> str:
-    if not leg:
-        return ""
-    pos = (leg.get("position") or "").lower()
-    if pos in ("buy", "long"):
-        return "Buy"
-    if pos in ("sell", "short"):
-        return "Sell"
-    return pos.capitalize() if pos else ""
-
-
-def _sl_label(leg: Optional[Dict[str, Any]]) -> str:
-    """Return SL suffix for a leg, e.g. 'SL_50%' or 'SL_50PTS_Buffer_10%'."""
-    if not leg:
-        return ""
-    sl_buf = leg.get("slWithBuffer") or {}
-    if sl_buf:
-        val = sl_buf.get("value")
-        buf_pct = sl_buf.get("buffer_pct")
-        if val and buf_pct:
-            mode = (sl_buf.get("mode") or "PERCENT").upper()
-            suffix = "%" if "PERCENT" in mode else "PTS"
-            val_str = f"{float(val):g}"
-            buf_str = f"{float(buf_pct):g}"
-            return f"SL_{val_str}{suffix}_Buffer_{buf_str}%"
-    sl = leg.get("stopLoss") or {}
-    if sl:
-        val = sl.get("value")
-        if val:
-            mode = (sl.get("mode") or "PERCENT").upper()
-            suffix = "%" if "PERCENT" in mode else "PTS"
-            val_str = f"{float(val):g}"
-            return f"SL_{val_str}{suffix}"
-    return ""
-
-
 def _find_futures_legs(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return all futures legs (segment == FUTURES), in payload order. Futures
     carry no option_type, so the CE/PE labellers skip them entirely."""
@@ -269,20 +425,30 @@ def _find_futures_legs(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     ]
 
 
-def _futures_segment(leg: Optional[Dict[str, Any]]) -> str:
-    """Render a futures leg for the combo label / filename, e.g. 'FUT_Buy' or
-    'FUT_Sell_SL_50%'. Futures have no strike, so only position (+ any SL) is
-    shown — mirrors the CE_/PE_ option segments. Empty when leg is missing."""
+def _futures_segment(leg: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> str:
+    """Render a futures leg for the combo label / filename: '{idx}_M_{B|S}_FUT'
+    per FILENAME_FORMAT.md ('Futures / non-Options legs collapse to
+    {expiry}_{B|S}_FUT'). Expiry is hardcoded to 'M' — futures only ever trade
+    a monthly contract, never weekly/yearly. idx is only shown when this leg's
+    index differs from the strategy default (multi-index feature the spec's
+    source repo doesn't have — see _leg_segment below for the same rule).
+    Lots is likewise not in the spec but kept so a lots-only sweep still gets
+    a distinct filename. Empty when leg is missing."""
     if not isinstance(leg, dict):
         return ""
-    pos = _position_label(leg)
-    sl = _sl_label(leg)
-    seg = "FUT"
-    if pos:
-        seg += f"_{pos}"
-    if sl:
-        seg += f"_{sl}"
-    return seg
+    strat_idx = str(payload.get("index") or "NIFTY").strip().upper()
+    leg_idx = str(leg.get("index") or strat_idx).strip().upper()
+    parts = []
+    if leg_idx != strat_idx:
+        parts.append(_leg_index_abbrev(leg, payload))
+    parts += ["M", _side_code(leg), "FUT"]
+    try:
+        _lots = int(round(float(leg.get("lots") or 1)))
+    except (TypeError, ValueError):
+        _lots = 1
+    if _lots != 1:
+        parts.append(f"{_lots}lt")
+    return "_".join(parts)
 
 
 def _midcap_label(payload: Dict[str, Any]) -> str:
@@ -297,7 +463,11 @@ def _midcap_label(payload: Dict[str, Any]) -> str:
         pos = str(l.get("position") or "BUY").upper()
         mode = str(l.get("midcap_mode") or l.get("mode") or "hypothetical").lower()
         sym = str(l.get("symbol") or "NIFTYMIDCAP100").upper().replace("NIFTY", "") or "MIDCAP100"
-        mode_lbl = "Hypothetical_Future" if mode == "hypothetical" else "Spot"
+        sym = _MIDCAP_SYM_ABBREV.get(sym, sym)
+        # "Hypothetical_Future" pricing mode always trades a monthly contract
+        # (same reasoning as a real futures leg — never weekly/yearly), so it
+        # carries "Mnly" too. "Spot" mode has no expiry concept at all.
+        mode_lbl = "Hypothetical_Future_Mnly" if mode == "hypothetical" else "Spot"
         segs.append(f"{pos}_{sym}_{mode_lbl}")
     return "_".join(segs)
 
@@ -367,7 +537,19 @@ def _per_leg_spot_adjustment_label(payload: Dict[str, Any]) -> str:
     label/filename to before. Distinguishes combos that sweep a leg's own threshold
     / direction / units. Mirrors _spot_adjustment_label's Rise/Falls/Move wording.
     """
-    segs: List[str] = []
+    adj = _per_leg_spot_adjustment_map(payload)
+    return "_".join(f"L{i}{word}" for i, word in sorted(adj.items()))
+
+
+def _per_leg_spot_adjustment_map(payload: Dict[str, Any]) -> Dict[int, str]:
+    """{leg_number: 'RiseBy1%'} for every leg carrying its OWN enabled adjustment.
+
+    Split out of `_per_leg_spot_adjustment_label` so the filename (which writes
+    each leg's adjustment beside that leg) and the master-summary column (which
+    collects them into one cell) derive from ONE rule. Wording is deliberately
+    identical to `_spot_adjustment_label`.
+    """
+    out: Dict[int, str] = {}
     for _i, leg in enumerate(payload.get("legs") or [], start=1):
         if not isinstance(leg, dict):
             continue
@@ -389,8 +571,8 @@ def _per_leg_spot_adjustment_label(payload: Dict[str, Any]) -> str:
             word = f"MoveBy{pct_str}"
         else:
             word = f"AdjustBy{pct_str}"
-        segs.append(f"L{_i}{word}")
-    return "_".join(segs)
+        out[_i] = word
+    return out
 
 
 def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -404,7 +586,7 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         put_strike_label    e.g. "0.5%_ITM"
         call_strike_label   e.g. "3.0%_OTM"
         spot_adjustment     e.g. "NoAdjustment"
-        combo_label         e.g. "CE_3.0%_OTM_Sell_PE_0.5%_ITM_Sell_NoAdjustment_Weekly_Expiry_T-1_To_T-1"
+        combo_label         e.g. "NF_CE_3.0%_OTM_Wkly_Sell_NF_PE_0.5%_ITM_Wkly_Sell_NoAdjustment_T-1_To_T-1"
     """
     # Describe EVERY leg, not just the first CE + first PE. For the common
     # single-CE / single-PE strategy this produces byte-identical output to the
@@ -420,46 +602,60 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     pe_legs = [(i, leg) for i, leg in _all_legs if isinstance(leg, dict) and (leg.get("option_type") or "").upper() == "PE"]
 
     def _leg_segment(leg: Dict[str, Any], otype: str):
+        """Leg block per FILENAME_FORMAT.md:
+        '{expiry}_{opt}_{B|S}_{strikeCriteria}[_{onToggle}...][_{adjustment}...]'.
+
+        idx prefix and lots suffix aren't in the spec (its source repo is
+        single-index / doesn't need lots for dedup) — added only when this
+        leg's index differs from the strategy default / lots != 1, so a
+        normal single-index 1-lot strategy stays byte-identical to the spec's
+        worked examples. The adjustment token is now INLINE per leg (matching
+        the spec's own per-leg placement) rather than gated on whether any
+        OTHER leg in the strategy also uses per-leg adjustment.
+        """
         strike = _strike_label(leg.get("strike_selection"), otype)
-        pos = _position_label(leg)
-        sl = _sl_label(leg)
-        seg = f"{otype}_{strike}"
-        if pos:
-            seg += f"_{pos}"
-        if sl:
-            seg += f"_{sl}"
-        return seg, strike
+        leg_expiry = _leg_expiry_abbrev(leg, payload)
+        side = _side_code(leg)
+        strat_idx = str(payload.get("index") or "NIFTY").strip().upper()
+        leg_idx = str(leg.get("index") or strat_idx).strip().upper()
+        seg_parts: List[str] = []
+        if leg_idx != strat_idx:
+            seg_parts.append(_leg_index_abbrev(leg, payload))
+        seg_parts += [leg_expiry, otype, side, strike]
+        try:
+            _lots = int(round(float(leg.get("lots") or 1)))
+        except (TypeError, ValueError):
+            _lots = 1
+        if _lots != 1:
+            seg_parts.append(f"{_lots}lt")
+        seg_parts += _on_toggle_tokens(leg)
+        adj_tok = _adjustment_token(leg)
+        if adj_tok:
+            seg_parts.append(adj_tok)
+        return "_".join(seg_parts), strike
 
     spot_adj = _spot_adjustment_label(payload)
     expiry = _expiry_label(payload)
     shift = _shift_label(payload)
 
-    parts = []
+    # Leading {SYMBOL} token — the full instrument name (not abbreviated),
+    # matching ResultsPanel.jsx's buildExcelFileName so an optim combo folder
+    # and a standalone backtest filename read identically.
+    parts = [str(payload.get("index") or "NIFTY").strip().upper()]
     call_strikes: List[tuple] = []
     for _i, _leg in ce_legs:
         _seg, _st = _leg_segment(_leg, "CE")
-        # Same L{n} disambiguation as the summary columns below, applied to the
-        # combo filename too — only when there's more than one CE (or PE) leg,
-        # so a single-CE/single-PE strategy's filename is byte-identical to
-        # before ("easy search": a Monthly PE + Weekly PE combo's ZIP/tradesheet
-        # filename now reads ..._L1_StraddleW2_OTM_Sell_..._L2_StraddleW0.5_OTM_Sell...
-        # instead of two look-alike "PE_StraddleW..._Sell" segments back to back).
-        if len(ce_legs) > 1:
-            _seg = f"L{_i}_{_seg}"
         parts.append(_seg)
         call_strikes.append((_i, _st))
     put_strikes: List[tuple] = []
     for _i, _leg in pe_legs:
         _seg, _st = _leg_segment(_leg, "PE")
-        if len(pe_legs) > 1:
-            _seg = f"L{_i}_{_seg}"
         parts.append(_seg)
         put_strikes.append((_i, _st))
 
-    # Futures legs (no strike) — appended after the option legs, e.g. 'FUT_Sell'.
-    # Previously dropped from the combo label / per-combo filename entirely.
+    # Futures legs (no strike) — appended after the option legs, e.g. 'NF_Fut_Sell'.
     for _leg in _find_futures_legs(payload):
-        _fseg = _futures_segment(_leg)
+        _fseg = _futures_segment(_leg, payload)
         if _fseg:
             parts.append(_fseg)
 
@@ -488,9 +684,10 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     midcp_adj_seg = _midcpnifty_spot_adjustment_label(payload)
     if midcp_adj_seg:
         parts.append(midcp_adj_seg)
+    # NOT appended here any more — each leg carries its own adjustment inline
+    # (see _with_adj). Still computed for the master-summary column below, which
+    # wants them collected in one cell.
     per_leg_adj_seg = _per_leg_spot_adjustment_label(payload)
-    if per_leg_adj_seg:
-        parts.append(per_leg_adj_seg)
     # Strategy-level token in the FILENAME: only when it's a REAL strategy-level
     # adjustment, OR when no other adjustment token exists (so a genuinely-unadjusted
     # combo still reads "NoAdjustment"). Without this, a combo that sweeps a leg's OWN
@@ -501,7 +698,12 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         per_leg_adj_seg or midcap_adj_seg or midcp_adj_seg
     ):
         parts.append(spot_adj)
-    parts.append(f"{expiry}_Expiry")
+    # Expiry is no longer a single combo-level token here — each leg already
+    # carries its OWN expiry inline (see _leg_segment), which is required for
+    # same-index mixed-expiry strategies (e.g. a Weekly PE + Yearly PE) where a
+    # single global expiry token would be wrong for at least one leg. The
+    # combo-level `expiry` value is still returned below for the master-summary
+    # column, which wants one column value regardless of per-leg mixing.
     parts.append(shift)
     combo_label = "_".join(parts)
 
@@ -521,6 +723,57 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         _adj.append(per_leg_adj_seg)   # e.g. L2RiseBy1000pts
     spot_adjustment_col = "_".join(_adj) if _adj else "NoAdjustment"
 
+    # ── LEG-WISE master-summary columns (additive) ───────────────────────────
+    # The three columns above pack every leg into one cell: two same-type legs
+    # collapse to "L1_ATM/L3_OTM2", every adjustment concatenates into
+    # "L1RiseBy1%_L2MoveBy1%_L3FallsBy1000pts", and a futures leg disappears
+    # entirely. None of that is sortable or filterable per leg, and it does not
+    # say which index a leg belongs to. So emit ONE BLOCK PER LEG as well, using
+    # the same abbreviations the combo_label already uses (NF/BNF/FNF/MCN,
+    # Wkly/Mnly/Yrly) so the two namings can't drift.
+    #
+    # Header carries the leg's identity — safe because option_type / position /
+    # index / expiry are NEVER swept (only strike_selection.* and
+    # spot_adjustment.*), so it is constant for every combo of a sweep.
+    # Only legs that EXIST get a block: a 2-leg sweep emits no L3 columns.
+    _leg_adj_map = _per_leg_spot_adjustment_map(payload)
+    _has_global_adj = bool(payload.get("spot_adjustment_enabled"))
+    leg_cols: List[Dict[str, str]] = []
+    for _i, _leg in enumerate(payload.get("legs") or [], 1):
+        if not isinstance(_leg, dict):
+            continue
+        _seg_raw = str(_leg.get("segment") or "OPTIONS").upper()
+        _is_fut = _seg_raw in ("FUTURES", "FUTURE", "FUT")
+        _ot = "FUT" if _is_fut else str(_leg.get("option_type") or "").upper()
+        _idx = _leg_index_abbrev(_leg, payload)
+        _exp = _EXPIRY_LABEL_ABBREV.get(
+            str(_leg.get("expiry") or payload.get("expiry_type") or "").strip().lower(),
+            str(_leg.get("expiry") or "").title() or "-")
+        _side = str(_leg.get("position") or "").title()
+        _hdr = " ".join(x for x in (f"L{_i}", _idx, _ot, _exp, _side) if x)
+        # Header WITHOUT the expiry token — used by summary_workbook when a leg's
+        # expiry is itself the swept axis, so a single static column header does
+        # not falsely assert one cadence (e.g. "L1 NF CE Wkly Sell") over rows
+        # that actually swept Monthly/Next-Weekly/Next-Monthly for that leg.
+        _hdr_stable = " ".join(x for x in (f"L{_i}", _idx, _ot, _side) if x)
+        # Futures have no strike; an em dash reads better than an empty cell.
+        _strike = "-" if _is_fut else _strike_label(_leg.get("strike_selection"),
+                                                    _ot if _ot in ("CE", "PE") else "CE")
+        _own = _leg_adj_map.get(_i)
+        # "(strategy)" distinguishes "inherits the payload-level knob" from "none",
+        # which the packed column cannot express.
+        _adj_val = _own if _own else ("(strategy)" if _has_global_adj else "-")
+        leg_cols.append({"hdr": _hdr, "hdr_stable": _hdr_stable, "strike": _strike, "adj": _adj_val})
+
+    # Strategy-wide adjustments live in their own column, NOT in a leg block —
+    # they apply to every leg, so numbering them would be a lie.
+    _overall = []
+    if _has_global_adj:
+        _overall.append(spot_adj)
+    if midcp_adj_seg:
+        _overall.append(midcp_adj_seg)
+    overall_adjustment = "_".join(_overall) if _overall else "NoAdjustment"
+
     return {
         "expiry": expiry,
         "shifting": shift,
@@ -528,6 +781,13 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         "call_strike_label": call_strike,
         "spot_adjustment": spot_adjustment_col,
         "combo_label": combo_label,
+        # additive leg-wise view — see block above
+        "leg_cols": leg_cols,
+        "overall_adjustment": overall_adjustment,
+        # Midcap is an OVERLAY (payload["midcap_legs"]), not an L1/L2/L3 leg, so it
+        # gets its own pair of columns rather than a numbered block.
+        "midcap_leg": midcap_seg or "",
+        "midcap_adj": midcap_adj_seg or "",
     }
 
 

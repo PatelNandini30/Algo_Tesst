@@ -111,6 +111,11 @@ if [ "$RUST_HASH" != "$STORED_RUST_HASH" ] || [ "$WHEEL_EXISTS" -eq 0 ]; then
     fi
     echo "$RUST_HASH" > .rust_wheel_hash
     echo "  Wheel ready: $(ls backend/prebuilt/*.whl | xargs basename)"
+    # The .so ships INSIDE algo-backend-base (Dockerfile.base installs the wheel);
+    # only .py is bind-mounted. So a fresh wheel does nothing until containers are
+    # recreated — and the healthy-containers shortcut below used to exit 0 right
+    # after printing "Wheel ready", leaving every worker on the OLD Rust engine.
+    NEEDS_DEPLOY=true
 else
     echo "  Rust wheel up to date — skipping compilation."
     echo "  Wheel: $(ls backend/prebuilt/*.whl 2>/dev/null | xargs basename 2>/dev/null)"
@@ -133,6 +138,7 @@ if ! docker image inspect algo-backend-base:latest > /dev/null 2>&1 || [ "$DEPS_
     fi
     echo "$DEPS_HASH" > .deps_build_hash
     echo "  Base image ready."
+    NEEDS_DEPLOY=true
 else
     echo "  Base image is current — skipping rebuild."
 fi
@@ -173,6 +179,14 @@ for container in backend frontend postgres redis worker-backtests worker-backtes
 done
 
 # Only stop containers if not all are healthy
+if [ "$ALL_HEALTHY" = "true" ] && [ "${NEEDS_DEPLOY:-false}" = "true" ]; then
+    echo ""
+    echo "Containers are healthy, but a NEW wheel / base image was just built."
+    echo "Recreating so the new native engine is actually loaded (a bind mount"
+    echo "only covers .py — the .so lives in the image)."
+    ALL_HEALTHY=false
+fi
+
 if [ "$ALL_HEALTHY" = "true" ]; then
     echo ""
     echo "All containers are healthy! Skipping restart."
@@ -223,10 +237,13 @@ for port in 5432 6379 8000 3000; do
 done
 
 # Build the frontend bundle on the host BEFORE docker compose builds the
-# image.  The frontend Dockerfile only COPYs ./frontend/dist (npm install
-# OOM-crashes inside the container on this 16GB HDD host — see the comment
-# at the top of frontend/Dockerfile).  Running `npm run build` here keeps
-# source changes in frontend/src/ flowing through to the deployed bundle.
+# image.  The frontend Dockerfile only COPYs ./frontend/build (vite.config.js
+# sets outDir: 'build', NOT the default 'dist' — a deploy that looked in
+# frontend/dist here found nothing and silently shipped whatever was already
+# in frontend/build). npm install OOM-crashes inside the container on this
+# 16GB host — see the comment at the top of frontend/Dockerfile. Running
+# `npm run build` here keeps source changes in frontend/src/ flowing through
+# to the deployed bundle.
 echo ""
 echo "[1.7/5] Building frontend bundle (vite)..."
 if command -v npm >/dev/null 2>&1; then
@@ -237,11 +254,11 @@ if command -v npm >/dev/null 2>&1; then
         }
     fi
     (cd frontend && npm run build) || {
-        echo "  WARNING: npm run build failed — using existing frontend/dist"
+        echo "  WARNING: npm run build failed — using existing frontend/build"
     }
 else
     echo "  WARNING: npm not found on host — skipping frontend build"
-    echo "  (Docker image will use whatever is already in frontend/dist)"
+    echo "  (Docker image will use whatever is already in frontend/build)"
 fi
 
 # Build and start services

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -90,6 +91,18 @@ def prune_zip_cache(max_gb: float = None) -> int:
         except (TypeError, ValueError):
             max_gb = 30.0
     budget = int(max_gb * (1024 ** 3))
+    # AGE first, then the size budget. Size alone let the cache sit permanently
+    # AT its ceiling, so every new sweep evicted the oldest artifacts — which are
+    # exactly the ones someone comes back for, and a miss costs a multi-minute
+    # rebuild instead of a <1s serve. Expiring by age keeps a predictable window
+    # (7 days, matching the trades retention) and the budget stays as the
+    # backstop for a burst of very large sweeps inside that window.
+    try:
+        max_age_days = float(os.environ.get("OPTIM_ZIP_CACHE_MAX_AGE_DAYS", "7"))
+    except (TypeError, ValueError):
+        max_age_days = 7.0
+    age_cutoff = (time.time() - max_age_days * 86400) if max_age_days > 0 else None
+    freed_age = 0
     try:
         entries = []
         for name in os.listdir(ZIP_CACHE_DIR):
@@ -100,13 +113,23 @@ def prune_zip_cache(max_gb: float = None) -> int:
                 continue
             if not os.path.isfile(path):
                 continue
+            if age_cutoff is not None and st.st_mtime < age_cutoff:
+                try:
+                    os.remove(path)
+                    freed_age += st.st_size
+                    continue
+                except OSError:
+                    pass
             entries.append((st.st_mtime, st.st_size, path))
+        if freed_age:
+            logger.info("[OPTIM_STORE] ZIP cache: expired %.1f GB older than %.0fd",
+                        freed_age / (1024 ** 3), max_age_days)
     except OSError:
         return 0
     total = sum(e[1] for e in entries)
     if total <= budget:
-        return 0
-    freed = 0
+        return freed_age
+    freed = freed_age
     for _mtime, size, path in sorted(entries):          # oldest first
         if total - freed <= budget:
             break
@@ -115,9 +138,9 @@ def prune_zip_cache(max_gb: float = None) -> int:
             freed += size
         except OSError:
             continue
-    if freed:
-        logger.info("[OPTIM_STORE] ZIP cache pruned: freed %.1f GB (budget %.0f GB)",
-                    freed / (1024 ** 3), max_gb)
+    if freed > freed_age:
+        logger.info("[OPTIM_STORE] ZIP cache pruned: freed %.1f GB over budget (%.0f GB)",
+                    (freed - freed_age) / (1024 ** 3), max_gb)
     return freed
 
 
@@ -145,6 +168,24 @@ def wow_mom_cache_path(job_id: str, patchwise: bool = False) -> str:
     return os.path.join(
         ZIP_CACHE_DIR,
         f"{job_id}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.xlsx",
+    )
+
+
+def wow_mom_parts_zip_path(job_id: str, patchwise: bool = False) -> str:
+    """Path for a LARGE sweep's WOW/MOM, delivered as a ZIP of part workbooks.
+
+    One workbook cannot hold a big sweep: the builder needs ~3,272 cells per
+    combo across its four sheets, so 50,176 combos is 164M cell objects (13-20
+    GB) and the worker was SIGKILLed after the sweep had already finished.
+    Building in fixed-size parts keeps peak memory tied to the PART size, not
+    the sweep size — measured flat at ~800 MB for 2,500-combo parts, 21 parts in
+    6.4 min for a real 50,176-combo job.
+    """
+    os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
+    suffix = "-pw" if patchwise else ""
+    return os.path.join(
+        ZIP_CACHE_DIR,
+        f"{job_id}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.parts.zip",
     )
 
 
@@ -338,6 +379,23 @@ def update_progress(
     r.setex(_meta_key(job_id), OPTIM_TTL, json.dumps(meta))
 
 
+def reset_done_counter(job_id: str, value: int = 0) -> None:
+    """Re-baseline the running done counter.
+
+    Needed on RESUME: the counter persists across runs (deliberately — a resumed
+    job must keep counting up, not restart at zero), but if the grid has since
+    been deduplicated the old count refers to a larger grid and progress reads
+    over 100%. Setting it to the unique work already done keeps done <= total.
+    """
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.set(f"optim:{job_id}:done_counter", int(max(0, value)))
+    except Exception as exc:
+        logger.debug("[OPTIM_STORE] reset_done_counter failed: %s", exc)
+
+
 def increment_done(job_id: str) -> None:
     """Atomically increment the running done counter in Redis.
 
@@ -492,23 +550,60 @@ def get_results(
     limit: int = 100,
     sort_key: Optional[str] = None,
     descending: bool = True,
+    patchwise: bool = True,
 ) -> Dict[str, Any]:
-    """Return {"rows": [...], "total": <unique_count>} for the results page."""
+    """Return {"rows": [...], "total": <unique_count>} for the results page.
+
+    patchwise (default) overlays each row's summary_pw onto its summary BEFORE
+    sorting, so the on-screen table both ranks and displays on the same basis the
+    downloads use. Overlaying after the sort would rank on overall and show
+    patchwise — the table's "best" combo would not be the best one shown.
+    `pw_missing` reports rows that had no patchwise metrics and kept overall.
+    """
     r = _redis()
     if r is None:
-        return {"rows": [], "total": 0}
+        return {"rows": [], "total": 0, "pw_missing": 0}
     raw = r.lrange(_results_key(job_id), 0, -1)
     rows = _dedupe_by_label([json.loads(x) for x in raw])
     total = len(rows)
-    if sort_key:
-        def _k(row):
-            try:
-                return float(row.get("summary", {}).get(sort_key, 0) or 0)
-            except (TypeError, ValueError):
-                return 0.0
+    pw_missing = 0
+    if patchwise:
+        merged = []
+        for row in rows:
+            pw = row.get("summary_pw")
+            if pw:
+                merged.append({**row, "summary": {**(row.get("summary") or {}), **pw}})
+            else:
+                pw_missing += 1
+                merged.append(row)
+        rows = merged
+    sort_rows(rows, sort_key, descending)
+    from services.optimizer.summary_workbook import compute_leg_presence
+    # Computed over the FULL set, not the page being returned — otherwise a
+    # paginated table would gain/lose conditional columns (Midcap, FUT) as the
+    # user pages, since which legs appear can differ page to page.
+    leg_presence = compute_leg_presence(rows)
+    return {
+        "rows": rows[offset : offset + limit],
+        "total": total,
+        "pw_missing": pw_missing,
+        "leg_presence": leg_presence,
+    }
 
-        rows.sort(key=_k, reverse=descending)
-    return {"rows": rows[offset : offset + limit], "total": total}
+
+def sort_rows(rows: List[Dict[str, Any]], sort_key: Optional[str], descending: bool = True) -> None:
+    """In-place sort by a summary-dict key. Shared by get_results and the POST
+    summary.xlsx export path so the two never implement sorting twice."""
+    if not sort_key:
+        return
+
+    def _k(row):
+        try:
+            return float(row.get("summary", {}).get(sort_key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    rows.sort(key=_k, reverse=descending)
 
 
 def get_all_results(job_id: str) -> List[Dict[str, Any]]:
@@ -635,6 +730,108 @@ def get_trades_dir(job_id: str) -> str:
     return os.path.join(OPTIM_TRADES_DIR, job_id)
 
 
+def mark_job_access(job_id: str) -> None:
+    """Refresh a job's idle timer whenever the user downloads any of its files.
+
+    prune_trades_dir() and the disk-cleanup cron reap a job by the NEWEST mtime
+    in its trades dir. Without this, a job is deleted N days after it was
+    CREATED even if the user re-downloaded it today. Touch a `.accessed` marker
+    (never the served artifacts — their mtime feeds the resume ETag in
+    _file_response) so retention becomes idle-based, not age-based.
+    Best-effort: a download must never fail over a bookkeeping touch.
+    """
+    d = get_trades_dir(job_id)
+    if not os.path.isdir(d):
+        return  # 0-trade job: nothing on disk to keep alive
+    try:
+        with open(os.path.join(d, ".accessed"), "w"):
+            pass
+    except OSError:
+        pass
+
+
+def prune_trades_dir(max_age_days: float = None) -> int:
+    """Delete per-combo trade artifacts for jobs older than the retention window.
+
+    This directory had NO eviction of any kind, unlike the ZIP cache which at
+    least has a size budget — it reached 67.9 GB across 2,572 jobs and was the
+    single largest consumer of the disk (86% full), which is a slow way to break
+    every sweep at once. Age-based, whole-job: a job's per-combo CSVs are only
+    useful together.
+
+    Deliberately generous at 7 days, and applied per job's NEWEST file, because
+    these are also what a ZIP is rebuilt from when its cached archive is gone —
+    delete both and a sweep nobody downloaded is unrecoverable. A running job is
+    never touched. Returns bytes freed.
+    """
+    try:
+        days = float(max_age_days if max_age_days is not None
+                     else os.environ.get("OPTIM_TRADES_MAX_AGE_DAYS", "7"))
+    except (TypeError, ValueError):
+        days = 7.0
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+
+    running: set = set()
+    r = _redis()
+    if r is not None:
+        try:
+            for key in r.scan_iter("optim:*:meta"):
+                raw = r.get(key)
+                if not raw:
+                    continue
+                if (json.loads(raw) or {}).get("status") == "running":
+                    # _redis() sets decode_responses=True, so scan_iter yields
+                    # str, not bytes — an unconditional .decode() raised
+                    # AttributeError here and the except below swallowed it as
+                    # "cannot prove what is live", skipping every prune.
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    running.add(key.split(":")[1])
+        except Exception as exc:
+            # Cannot prove what is live -> prune nothing. Deleting a running
+            # job's trades mid-sweep loses combos already computed.
+            logger.warning("[OPTIM_STORE] trades prune skipped (no job state): %s", exc)
+            return 0
+
+    freed = 0
+    removed = 0
+    try:
+        names = os.listdir(OPTIM_TRADES_DIR)
+    except OSError:
+        return 0
+    for job_id in names:
+        path = os.path.join(OPTIM_TRADES_DIR, job_id)
+        if not os.path.isdir(path) or job_id in running:
+            continue
+        newest = 0.0
+        size = 0
+        try:
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    try:
+                        st = os.stat(os.path.join(root, name))
+                    except OSError:
+                        continue
+                    size += st.st_size
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+        except OSError:
+            continue
+        if newest and newest < cutoff:
+            try:
+                shutil.rmtree(path)
+                freed += size
+                removed += 1
+            except OSError:
+                continue
+    if removed:
+        logger.info("[OPTIM_STORE] trades pruned: %d jobs older than %.0fd, freed %.1f GB",
+                    removed, days, freed / (1024 ** 3))
+    return freed
+
+
 # ── Per-combo WOW/MOM payload: on disk, never in Redis ───────────────────────
 # Measured on a real sweep: a stored result row is 16.0 KB, of which wm_pw alone
 # is 13.5 KB (84.5%). Keeping it in the Redis row costs ~16 KB/combo, so a
@@ -694,6 +891,39 @@ def write_combo_tradesheet(
         logger.warning("[OPTIM_STORE] tradesheet write failed (%s): %s", combo_label_safe, exc)
 
 
+# ── xlsx-write phase probes (OPTIM_PROFILE=1) ────────────────────────────────
+# The sweep profiler attributes ~48% of every combo to "xlsx_write", but that
+# bucket wraps THREE things: the deferred MAE/MFE enrichment (skipped in the
+# combo loop via OPTIMIZE_SKIP_MAE_MFE and paid here), the workbook build, and
+# the disk write. build_combo_xlsx measured ~64ms in isolation against 830ms in
+# place, so the split must be measured before anything is changed.
+_XPROF = os.environ.get("OPTIM_PROFILE", "0").strip().lower() in ("1", "true", "yes")
+_xacc: Dict[str, float] = {}
+_xn = 0
+
+
+def _xnow() -> float:
+    return time.perf_counter()
+
+
+def _xmark(bucket: str, t0: float) -> float:
+    global _xn
+    if not _XPROF:
+        return t0
+    _xacc[bucket] = _xacc.get(bucket, 0.0) + (time.perf_counter() - t0)
+    if bucket == "xlsx_disk":
+        _xn += 1
+        if _xn % max(1, int(os.environ.get("OPTIM_PROFILE_EVERY", "25"))) == 0:
+            tot = sum(_xacc.values()) or 1e-9
+            logger.info(
+                "[XLSX_PROFILE] pid=%d n=%d avg=%.0fms | %s", os.getpid(), _xn,
+                tot / _xn * 1000,
+                " ".join(f"{k}={v / _xn * 1000:.0f}ms/{100 * v / tot:.0f}%"
+                         for k, v in sorted(_xacc.items(), key=lambda kv: -kv[1])),
+            )
+    return time.perf_counter()
+
+
 def write_combo_xlsx(
     job_id: str,
     combo_label_safe: str,
@@ -745,6 +975,7 @@ def write_combo_xlsx(
                     _compute_live_dd_from_mae,
                 )
                 import pandas as _pd
+                _xp = _xnow()
                 enriched = _compute_mae_mfe_batch(trades_df, index_str, trading_days)
                 if "Trade" in enriched.columns:
                     _pr = enriched.drop_duplicates(subset=["Trade"], keep="first")
@@ -754,10 +985,12 @@ def write_combo_xlsx(
                             _agg[_c] = _pr[_c].values
                     enriched = _compute_live_dd_from_mae(enriched, _agg)
                 trades_df = enriched
+                _xp = _xmark("mae_enrich", _xp)
             except Exception as _mae_exc:
                 logger.warning("[OPTIM_STORE] MAE/MFE enrich FAILED (%s): %s", combo_label_safe, _mae_exc)
 
         from services.optimizer.excel_builder import build_combo_xlsx
+        _xp = _xnow()
         xlsx_bytes = build_combo_xlsx(
             trades_df,
             summary,
@@ -779,9 +1012,11 @@ def write_combo_xlsx(
         dirpath = get_trades_dir(job_id)
         os.makedirs(dirpath, exist_ok=True)
         path = os.path.join(dirpath, f"{combo_label_safe}.xlsx")
+        _xp = _xmark("xlsx_build", _xp)
         with open(path, "wb") as fh:
             fh.write(xlsx_bytes)
         _stamp_xlsx_version(job_id)
+        _xmark("xlsx_disk", _xp)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] xlsx write failed (%s): %s", combo_label_safe, exc)
 
@@ -825,6 +1060,7 @@ def write_combo_xlsx_patchwise(
                     _compute_mae_mfe_batch,
                     _compute_live_dd_from_mae,
                 )
+                _xp = _xnow()
                 enriched = _compute_mae_mfe_batch(trades_df, index_str, trading_days)
                 if "Trade" in enriched.columns:
                     _pr = enriched.drop_duplicates(subset=["Trade"], keep="first")
@@ -834,10 +1070,12 @@ def write_combo_xlsx_patchwise(
                             _agg[_c] = _pr[_c].values
                     enriched = _compute_live_dd_from_mae(enriched, _agg)
                 trades_df = enriched
+                _xp = _xmark("mae_enrich", _xp)
             except Exception as _mae_exc:
                 logger.warning("[OPTIM_STORE] pw MAE/MFE enrich FAILED (%s): %s", combo_label_safe, _mae_exc)
 
         from services.optimizer.excel_builder import build_combo_xlsx
+        _xp = _xnow()
         xlsx_bytes = build_combo_xlsx(
             trades_df,
             summary,
@@ -856,9 +1094,11 @@ def write_combo_xlsx_patchwise(
         dirpath = os.path.join(get_trades_dir(job_id), "patchwise")
         os.makedirs(dirpath, exist_ok=True)
         path = os.path.join(dirpath, f"{combo_label_safe}.xlsx")
+        _xp = _xmark("xlsx_build", _xp)
         with open(path, "wb") as fh:
             fh.write(xlsx_bytes)
         _stamp_xlsx_version(job_id)
+        _xmark("xlsx_disk", _xp)
     except Exception as exc:
         logger.warning("[OPTIM_STORE] pw xlsx write failed (%s): %s", combo_label_safe, exc)
 
@@ -1014,7 +1254,17 @@ def touch_active_optim(job_id: str, node_id: Optional[str] = None) -> None:
     if r is None:
         return
     try:
-        r.hset(_active_key(node_id), job_id, time.time())
+        # REFRESH ONLY — never (re)create. A plain HSET resurrects an entry that
+        # was deliberately removed: a job killed before its cleanup ran can leave
+        # an orphaned heartbeat thread, and that thread's touch put the dead job
+        # straight back into the registry ~60s after every removal. The ghost then
+        # counted as a live claimant forever, halving the fork width of the jobs
+        # that ARE running (observed: a real sweep pinned at P=6 instead of 12,
+        # 2.45 combos/s instead of 3.75). HEXISTS-guarded, so a genuine job (which
+        # register_active_optim created) still refreshes normally.
+        key = _active_key(node_id)
+        if r.hexists(key, job_id):
+            r.hset(key, job_id, time.time())
     except Exception as exc:
         logger.debug("[OPTIM_STORE] touch_active_optim failed: %s", exc)
 

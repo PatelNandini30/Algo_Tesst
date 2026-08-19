@@ -55,7 +55,15 @@ export function buildZipNaming(basePayload, filterName, selectedList = []) {
   const slLevel2 = { trail: 'Trail SL', buffer: 'SL With Buffer', sl: 'SL' }[slType] || null;
   const slLevel3 = { trail: 'With Trail SL', buffer: 'With SL Buffer', sl: 'With SL' }[slType] || null;
 
-  const adjEnabled = Boolean(basePayload.spot_adjustment_enabled);
+  // Was `Boolean(basePayload.spot_adjustment_enabled)` alone — the STRATEGY-
+  // level toggle only. A leg can carry its OWN spot_adjustment.enabled with
+  // the strategy-level toggle off (engine_rust.py's _resolve_leg_sa applies
+  // it regardless — the leg's own threshold is live and changes trades), so
+  // a per-leg-only adjusted sweep's ZIP folder tree read "No Adj"/"No
+  // Adjustment" while the combo workbooks inside it were named
+  // "..._L1RiseBy1000pts_...". Folder and contents must agree.
+  const legHasOwnAdj = legs.some(l => l && l.spot_adjustment && l.spot_adjustment.enabled);
+  const adjEnabled = Boolean(basePayload.spot_adjustment_enabled) || legHasOwnAdj;
   const adjLevel2 = adjEnabled ? 'With Adj' : 'No Adj';
   const adjLevel3 = adjEnabled ? 'Adjustment' : 'No Adjustment';
 

@@ -3135,7 +3135,7 @@ def _run_sync_fused_groups(
         _grp_payload = {**payload, "index": sym,
                         "legs": [dict(_l, expiry="YEARLY", _sa_label_expiry=str(_l.get("expiry") or _l.get("expiry_type") or "").upper()) for _l in _opt_glegs],
                         "expiry_type": "YEARLY"}
-        _recs = priced_to_tradesheet_records(_grp_priced, _grp_payload, group_lot_by_gid[gid])
+        _recs = priced_to_tradesheet_records(_grp_priced, _grp_payload, group_lot_by_gid[gid], group_spots_by_gid.get(gid))
         # Record this group's option sub-trade windows for the futures replay.
         if _any_fut:
             for _r in _recs:
@@ -3223,6 +3223,7 @@ def _run_sync_fused_groups(
             _fspots = group_spots_by_gid[gid]
             _fut_lot = group_lot_by_gid[gid]
             _frecs: List[dict] = []
+            _fut_skipped_windows: List[tuple] = []
             for (_edate, _xdate), _reason in _canon_windows.items():
                 _contract = _holdable_contract(_fut_series, _xdate, exit_dte, tdays) or \
                     _near_contract_on(sym, "MONTHLY", _xdate, _fut_series)
@@ -3247,6 +3248,14 @@ def _run_sync_fused_groups(
                             _contract, _ep, _xp = _cand, _e2, _x2
                             break
                     if _ep is None or _xp is None:
+                        # A skipped window drops ONLY the futures leg for that one
+                        # trade — the option legs still price normally, so the
+                        # trade still appears, looking hedged when it is not. The
+                        # only downstream check was "did EVERY window fail"
+                        # (_frecs empty), so a strategy that lost its futures hedge
+                        # on some fraction of trades reported a normal, successful
+                        # run with no signal that any of them were unhedged.
+                        _fut_skipped_windows.append((_edate, _xdate))
                         continue  # genuinely missing contract on this window → skip
                 _ep = round(float(_ep), 2)
                 _xp = round(float(_xp), 2)
@@ -3291,6 +3300,22 @@ def _run_sync_fused_groups(
                     "[SYNC_FUSED] futures group %s priced to ZERO rows over %d shared "
                     "windows — refusing a sheet missing a configured futures leg."
                     % (sym, len(_canon_windows))
+                )
+            if _fut_skipped_windows and os.environ.get("SYNC_FUSED_ALLOW_PARTIAL_FUT") != "1":
+                raise RuntimeError(
+                    "[SYNC_FUSED] futures group %s: %d/%d shared window(s) could not be "
+                    "priced (missing contract) and would silently have appeared as "
+                    "un-hedged option-only trades under a strategy that configures a "
+                    "futures leg: %s. Set SYNC_FUSED_ALLOW_PARTIAL_FUT=1 to accept a "
+                    "partially-hedged sheet deliberately."
+                    % (sym, len(_fut_skipped_windows), len(_canon_windows),
+                       _fut_skipped_windows[:5])
+                )
+            if _fut_skipped_windows:
+                logger.warning(
+                    "[SYNC_FUSED] futures group %s: %d/%d shared window(s) unhedged "
+                    "(SYNC_FUSED_ALLOW_PARTIAL_FUT=1): %s",
+                    sym, len(_fut_skipped_windows), len(_canon_windows), _fut_skipped_windows[:5],
                 )
             _fdf = pd.DataFrame(_frecs)
             _fdf["Group Index"] = sym

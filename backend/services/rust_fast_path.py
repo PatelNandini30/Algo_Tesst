@@ -731,23 +731,29 @@ def get_spot_price(date, index: str) -> Optional[float]:
 # depends on those. Memoize it so every combo after the first reuses it.
 #
 # Safety: purely reference data (same values), so it never changes calc output —
-# the parity test must be byte-identical. Keyed with `_cache_version()` so a
-# cache-version bump (feather rebuild / reload) invalidates it. Bounded: a run
-# touches only a couple of (symbol, range) keys; we cap the dict anyway. Each
-# forked optim worker has its own copy, populated once.
+# the parity test must be byte-identical. Keyed with `_loaded_cache_signature`
+# (the same options+spot feather mtime/size tuple build_cache/_activate_feather
+# already track to detect an on-disk feather swap) so an in-process cache
+# reload actually invalidates this memo. NOTE: `_cache_version()` itself is
+# NOT usable here — it is also used to construct the on-disk feather cache
+# directory path (see _cache_root() callers above), and that path is what
+# _loaded_cache_signature's mtime/size are read FROM, so folding the signature
+# into _cache_version() would be circular. Bounded: a run touches only a
+# couple of (symbol, range) keys; we cap the dict anyway. Each forked optim
+# worker has its own copy, populated once.
 _SPOT_SERIES_MEMO: "Dict[tuple, Dict[str, float]]" = {}
 _SPOT_SERIES_MEMO_MAX = 16
 
 
 def spot_series(symbol: str, days: List[str], loader=None) -> Dict[str, float]:
     """Return {iso_date: spot} for `symbol` across `days`, memoized per
-    (cache_version, symbol, first_day, last_day, n_days). `loader` (a
-    data_loader) is the per-symbol DB fallback used when the native cache has
+    (cache_version, symbol, first_day, last_day, n_days, loaded_cache_signature).
+    `loader` (a data_loader) is the per-symbol DB fallback used when the native cache has
     no spot for a date — same fallback the direct engine path uses."""
     sym = str(symbol or "").strip().upper()
     if not days:
         return {}
-    key = (_cache_version(), sym, days[0], days[-1], len(days))
+    key = (_cache_version(), sym, days[0], days[-1], len(days), _loaded_cache_signature)
     cached = _SPOT_SERIES_MEMO.get(key)
     if cached is not None:
         return cached

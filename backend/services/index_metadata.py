@@ -122,4 +122,17 @@ def get_lot_size_for_index(symbol: str | None, entry_date) -> int:
         return 20
     if index == "BANKEX":
         return 30
-    return 1
+    # NOT `return 1`. That silently priced every leg of an unrecognized index
+    # (e.g. a per-leg "index" string in a multi-index request — the single-
+    # index path's validate_index_payload() is skipped for multi_index_mode,
+    # so nothing else catches this) at lot_size=1 instead of its real size —
+    # up to 140x understated Qty and P&L, with no error, no log line, nothing
+    # in the tradesheet indicating the fallback. NIFTYNXT50 already has real
+    # option/futures data loaded in Postgres, so this was reachable with real
+    # data, not just a typo. Fail loud instead (matches the ValueError already
+    # raised a few lines up in this file for the monthly_only violation).
+    raise ValueError(
+        f"No lot size configured for index {index!r}. Add it to "
+        f"get_lot_size_for_index() in services/index_metadata.py — silently "
+        f"defaulting to 1 would misprice every trade for this index."
+    )

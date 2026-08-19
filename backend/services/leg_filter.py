@@ -512,16 +512,21 @@ def apply_leg_filters_split(
                         # LEG_FILTER_END boundary (spec rule 5) — distinct from a
                         # segment that runs to natural expiry (stays EXPIRY) and
                         # from one that ends only because a LATER range starts.
+                        # Snapped once per sub-window, used both for the
+                        # LEG_FILTER_END check below and for the Case A/B decision
+                        # further down (a leg can have 2+ DISJOINT date ranges;
+                        # both checks need to know which range seg_start is in).
+                        _lranges = leg_segments(leg) or []
+                        _snapped = []
+                        for _rs, _re in _lranges:
+                            _ss = first_trading_day_on_or_after(_rs, trading_days)
+                            _ee = last_trading_day_on_or_before(_re, trading_days)
+                            if _ss is None or _ee is None or _ee < _ss:
+                                continue
+                            _snapped.append((_ss, _ee))
+
                         _range_ends_here = False
                         if seg_end != exit_:
-                            _lranges = leg_segments(leg) or []
-                            _snapped = []
-                            for _rs, _re in _lranges:
-                                _ss = first_trading_day_on_or_after(_rs, trading_days)
-                                _ee = last_trading_day_on_or_before(_re, trading_days)
-                                if _ss is None or _ee is None or _ee < _ss:
-                                    continue
-                                _snapped.append((_ss, _ee))
                             # Half-open [s, e): in-range at seg_start, OUT at seg_end.
                             _in_start = any(_s <= seg_start < _e for _s, _e in _snapped)
                             _out_end = not any(_s <= seg_end < _e for _s, _e in _snapped)
@@ -542,8 +547,27 @@ def apply_leg_filters_split(
                         #   Falls back to original strike (Task-2 behaviour)
                         #   when callbacks are absent.
                         orig_entry = str(s.get("entry_date") or "")
-                        _orig_in_range, _, _ = resolve_leg_window(
-                            leg, orig_entry, seg_end, trading_days,
+                        # BUG (fixed here): this used to be
+                        # `resolve_leg_window(leg, orig_entry, seg_end, ...)[0]`
+                        # -- True whenever orig_entry falls in ANY of the leg's
+                        # segments, anywhere. With 2+ DISJOINT filter ranges that
+                        # answers the wrong question: a trade whose original entry
+                        # was in segment 1 re-entering segment 2 after a gap always
+                        # read as "in range" and silently kept segment 1's stale
+                        # strike (Case A) instead of resolving a fresh one for
+                        # segment 2 (Case B). What actually distinguishes
+                        # continuation from a fresh re-entry is whether orig_entry
+                        # is in the SAME segment as THIS sub-window (seg_start).
+                        _orig_seg = next(
+                            (i for i, (_s, _e) in enumerate(_snapped) if _s <= orig_entry <= _e),
+                            None,
+                        )
+                        _start_seg = next(
+                            (i for i, (_s, _e) in enumerate(_snapped) if _s <= seg_start <= _e),
+                            None,
+                        )
+                        _orig_in_range = (
+                            _orig_seg is not None and _orig_seg == _start_seg
                         )
                         # ponytail: fresh emission requires a resolver; production
                         # always supplies one via _mid_cycle_strike_resolver.

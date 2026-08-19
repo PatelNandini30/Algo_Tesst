@@ -7520,6 +7520,28 @@ def run_rust_engine_pipeline(
     # its strike reverted to the locked value, e.g. 19000->18000 on 05-07-2023).
     _leg_own_breach_dates: Dict[int, Set[str]] = {}
     _mark_seg_starts = {s for s, _e in (_eff_segs_sa or [])}
+    # Per-leg segment starts for the mark re-base. With Individual Filter each
+    # leg carries its OWN filter_segments (per-leg date ranges), and the split
+    # (apply_leg_filters_split via leg_segments) re-anchors that leg's contract
+    # only at ITS OWN segment boundaries. The mark must re-base on the SAME
+    # boundaries, else one leg's patch start wrongly re-bases another leg's
+    # spot-adj anchor (breaking per-leg independence). Snap each start to the
+    # next trading day exactly like _seg_starts / _segment_carry_baseline do.
+    # A leg with no individual filter falls back to the global _mark_seg_starts,
+    # so single-leg / non-individual-filter runs stay byte-identical.
+    _leg_seg_starts: Dict[int, Set[str]] = {}
+    for _ls_lg in _per_leg_sa:
+        _ls_src = legs_src[_ls_lg - 1] if 0 <= _ls_lg - 1 < len(legs_src) else {}
+        _ls_own = leg_segments(_ls_src) if isinstance(_ls_src, dict) else None
+        if _ls_own:
+            _ls_set: Set[str] = set()
+            for _ls_s, _ls_e in _ls_own:
+                _ls_snap = _next_trading_day_on_or_after(list(trading_days), _ls_s)
+                if _ls_snap:
+                    _ls_set.add(_ls_snap)
+            _leg_seg_starts[_ls_lg] = _ls_set
+        else:
+            _leg_seg_starts[_ls_lg] = _mark_seg_starts
     if _has_per_leg_sa and _leg_cycle_of:
         _mark: Dict[Tuple[int, str], float] = dict(_leg_cycle_seed)
         for _mt in sorted(_tid_entry_iso_sa, key=lambda t: (_tid_entry_iso_sa[t], t)):
@@ -7535,8 +7557,10 @@ def run_rust_engine_pipeline(
             # strike to fresh ATM, so its own spot-adjustment mark must re-base
             # to the patch-start spot as well. The live mark still also resets on
             # contract roll (new expiry key) and on every own breach below.
-            if _m_entry in _mark_seg_starts and _m_spot > 0:
+            if _m_spot > 0:
                 for _m_lg0 in _per_leg_sa:
+                    if _m_entry not in _leg_seg_starts.get(_m_lg0, _mark_seg_starts):
+                        continue
                     _m_ck0 = _leg_cycle_of.get((_mt, _m_lg0))
                     if _m_ck0 is not None:
                         _mark[(_m_lg0, _m_ck0)] = _m_spot
@@ -7680,8 +7704,11 @@ def run_rust_engine_pipeline(
                 _sl_spot0 = float(_sl_row.get("entry_spot") or spot_by_date.get(_sl_entry) or 0.0)
                 if _sl_spot0 <= 0:
                     continue
-                # Re-base the mark at a contract roll (new expiry) or a patch start.
-                if _sl_ck not in _sl_mark or _sl_entry in _mark_seg_starts:
+                # Re-base the mark at a contract roll (new expiry) or a patch
+                # start. Use THIS leg's own segment starts so an Individual-Filter
+                # sibling's boundary can't re-anchor it (falls back to global when
+                # the leg has no individual filter).
+                if _sl_ck not in _sl_mark or _sl_entry in _leg_seg_starts.get(_sl_lid, _mark_seg_starts):
                     _sl_mark[_sl_ck] = _sl_spot0
                 # Feed the ADVANCING anchor into the trigger baseline. `_leg_adj_baseline`
                 # (from `_segment_carry_baseline`) LAGGED for the single-leg path — it did
@@ -9920,6 +9947,22 @@ def run_rust_engine_pipeline(
                                 # snapped range end (resolve_leg_window already
                                 # snapped it and dropped degenerate windows).
                                 _sa_leg_this_exit = _sa_leg_exit
+                            # A TRUNCATED filtered leg (its range ends before the
+                            # trade's natural exit) re-enters ONLY on its OWN
+                            # spot-adj breach. When some OTHER leg's breach drives
+                            # this hop, this leg is still running the bounded
+                            # segment its filter file / mid-cycle split assigned it
+                            # — resurrecting it here double-books it against that
+                            # segment (the Trade 45 / 80-81 overlap: Leg 2 running
+                            # to its range end AND re-entering at Leg 1's breach).
+                            # _sa_casc_leg_set is the set of legs that triggered at
+                            # this hop; a fully-in-range filtered leg is NOT
+                            # truncated and still re-books with the whole trade.
+                            if (
+                                _leg_was_truncated(_sa_leg)
+                                and _sa_lid not in (_sa_casc_leg_set or frozenset())
+                            ):
+                                continue
                         _sa_prev_strike = (
                             _sa_prev_strike_by_leg.get(_sa_lid)
                             or float(_sa_leg.get("strike") or 0.0)

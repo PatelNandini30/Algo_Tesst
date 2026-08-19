@@ -33,6 +33,26 @@ _HASH_DIRS = ("services", "worker", "engines", "strategies")
 _HASH_FILES = ("base.py",)
 _SO_GLOBS = ("/usr/local/lib/python*/site-packages/algotest_native*.so",)
 
+# Env vars that SELECT A CALCULATION PATH. Identical code + a different value
+# here = different numbers, which is exactly what this guard claims to catch.
+# The LAN node shipped without MIXED_FUT_RUST while the main box set "1", so a
+# mixed FUTURES+OPTIONS strategy silently lost its OPTION leg on that node and
+# the node still reported itself up to date. Hashing the VALUES (not just the
+# names) makes any such drift a version mismatch.
+#
+# Only add a var here if changing it changes RESULTS. Performance/pool-size knobs
+# (parallelism, memory budgets, cache dirs) must NOT be listed — they differ
+# legitimately per node and would flag every node stale.
+_HASH_ENV = (
+    "MIXED_FUT_RUST",
+    "FAST_LOOKUP_MODE",
+    "ENGINE_BACKEND",
+    "OPTIMIZE_RUST_LOOP",
+    "OPTIMIZE_RUST_XLSX",
+    "BACKTEST_INCLUDE_MAE_MFE",
+    "OPTIMIZE_SKIP_MAE_MFE",
+)
+
 _cached = None
 
 
@@ -75,6 +95,12 @@ def compute_code_version() -> str:
                     h.update(fh.read())
             except Exception as exc:
                 logger.debug("[CODE_VERSION] skip so %s: %s", so, exc)
+    for _name in _HASH_ENV:
+        h.update(_name.encode())
+        h.update(b"=")
+        # Normalised so "1"/" 1 " are the same value but "1"/"0" are not.
+        h.update(str(os.environ.get(_name, "")).strip().lower().encode())
+        h.update(b"\0")
     _cached = h.hexdigest()[:16]
     logger.info("[CODE_VERSION] %s", _cached)
     return _cached

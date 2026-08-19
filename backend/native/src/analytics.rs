@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -202,8 +203,16 @@ pub fn compute_analytics_summary(trades: &PyList) -> PyResult<PyObject> {
         });
     }
 
-    // line 860: sort per-leg by Entry Date STRING (lexicographic, stable).
-    legs.sort_by(|a, b| a.entry_date.cmp(&b.entry_date));
+    // Was: sort per-leg by Entry Date STRING (lexicographic, stable) — matched
+    // base.py's compute_analytics at the time this was written, but base.py
+    // was later patched to parse dates with pd.to_datetime(dayfirst=True)
+    // before sorting (see base.py's _sort_dt / dayfirst comments) specifically
+    // to fix the lexicographic-order bug this line still had. Any trade set
+    // whose Entry Date sorts differently lexicographically than chronologically
+    // (e.g. spanning a month/year boundary) processed legs out of order,
+    // silently changing the equity curve (Cumulative/Peak/DD) derived from it.
+    legs.sort_by(|a, b| parse_dayfirst(&a.entry_date).unwrap_or(NaiveDate::MIN)
+        .cmp(&parse_dayfirst(&b.entry_date).unwrap_or(NaiveDate::MIN)));
 
     // groupby Trade (sort=False → first-seen order over the sorted legs), agg:
     // Net P&L=sum, others=first.
@@ -235,8 +244,9 @@ pub fn compute_analytics_summary(trades: &PyList) -> PyResult<PyObject> {
     }
     let mut adf: Vec<TradeAgg> = order.iter().map(|k| map.get(k).unwrap().clone()).collect();
 
-    // line 891: sort per-trade by Entry Date STRING again (stable).
-    adf.sort_by(|a, b| a.entry_date.cmp(&b.entry_date));
+    // Same fix as the per-leg sort above — chronological, not lexicographic.
+    adf.sort_by(|a, b| parse_dayfirst(&a.entry_date).unwrap_or(NaiveDate::MIN)
+        .cmp(&parse_dayfirst(&b.entry_date).unwrap_or(NaiveDate::MIN)));
 
     let n = adf.len();
 
@@ -324,10 +334,15 @@ pub fn compute_analytics_summary(trades: &PyList) -> PyResult<PyObject> {
         }
     }
 
-    // n_years: pd.to_datetime(min entry str, dayfirst) .. max exit str (base.py:997)
-    let min_entry = adf.iter().map(|t| t.entry_date.as_str()).min().unwrap_or("");
-    let max_exit = adf.iter().map(|t| t.exit_date.as_str()).max().unwrap_or("");
-    let n_years = match (parse_dayfirst(min_entry), parse_dayfirst(max_exit)) {
+    // n_years: pd.to_datetime(min entry, dayfirst) .. max exit (base.py:997)
+    // Was: STRING min()/max() taken BEFORE parsing, then the (already wrong)
+    // selected string got parsed — parsing the wrong string correctly doesn't
+    // fix selecting the wrong string. min()/max() now run on the PARSED
+    // NaiveDate, matching base.py's dayfirst-parsed min/max (base.py:1017-1021)
+    // exactly, not just re-using its parser after the wrong value was chosen.
+    let min_entry = adf.iter().filter_map(|t| parse_dayfirst(&t.entry_date)).min();
+    let max_exit = adf.iter().filter_map(|t| parse_dayfirst(&t.exit_date)).max();
+    let n_years = match (min_entry, max_exit) {
         (Some(a), Some(b)) => ((b - a).num_days() as f64 / 365.0).max(0.01),
         _ => 0.01,
     };
@@ -374,7 +389,7 @@ pub fn compute_analytics_summary(trades: &PyList) -> PyResult<PyObject> {
         }
     }
 
-    let car_mdd = if max_dd_pct != 0.0 { py_round((cagr / 100.0 / max_dd_pct.abs()).min(99999.0), 4) } else { 0.0 };
+    let car_mdd = if max_dd_pct != 0.0 { py_round((cagr / max_dd_pct.abs()).min(99999.0), 4) } else { 0.0 };
     let recovery_factor = if max_dd_pts != 0.0 { py_round((total_pnl / max_dd_pts.abs()).min(99999.0), 2) } else { 0.0 };
 
     // spot change (base.py:1035-1049)

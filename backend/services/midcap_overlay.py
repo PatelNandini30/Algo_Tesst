@@ -370,7 +370,7 @@ def compute_midcap_legs(
             if mode == "hypothetical":
                 pnl = sp + csign * roll * spot_entry
                 pnl_pct = sp_pct + csign * roll
-                rollover_pct_repr = csign * roll * 100.0
+                rollover_pct_repr += csign * roll * 100.0
             else:
                 pnl, pnl_pct = sp, sp_pct
             # Scale exactly once, here, at the first point these become this

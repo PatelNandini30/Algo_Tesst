@@ -387,6 +387,8 @@ const STRIKE_INTERVALS = Object.fromEntries(
   Object.entries(INDEX_CONFIG).map(([symbol, config]) => [symbol, config.strikeInterval])
 );
 const STRIKE_INTERVAL_OPTIONS = [25, 50, 100, 500, 1000];
+// December-contract years selectable in the yearly per-contract schedule table.
+const YEAR_OPTIONS = Array.from({ length: 21 }, (_, i) => 2015 + i);
 // Per-index selectable gaps: MIDCPNIFTY trades at every 25 points so it gets
 // 25/50/100; other indices only ever trade at their own native gap (50 or
 // 100), so showing 25 there would be a selectable-but-wrong option. Every index
@@ -802,6 +804,10 @@ const StrategyBuilder = () => {
   const [yearlyExitMonthsBefore, setYearlyExitMonthsBefore] = useState(0);
   const [rolloverToggle, setRolloverToggle] = useState(false);
   const [rolloverMinDaysToExpiry, setRolloverMinDaysToExpiry] = useState(0);
+  // PER-LEG ROLLOVER (opt-in): each leg rolls on its OWN expiry + own exit T-n;
+  // trade boundaries are the union of all legs' rolls (a carried leg is
+  // marked-to-market). Additive — OFF sends a byte-identical payload.
+  const [perLegRollover, setPerLegRollover] = useState(false);
   const [noRollover, setNoRollover] = useState(false);
   const [noRolloverMinDays, setNoRolloverMinDays] = useState(0);
   // YEARLY is meaningless without rollover: the engine only pins the December
@@ -1088,6 +1094,22 @@ const StrategyBuilder = () => {
   const jobPollRef = useRef(null);
   const errorTimerRef = useRef(null);
   const [jobId, setJobId] = useState(null);
+  // Tracks the MOST RECENTLY STARTED job, independent of React state timing.
+  // The Midcap-overlay fetch below is un-awaited and can resolve after a
+  // second run has already started and reset the panel — without this guard
+  // job A's overlay result silently overwrote job B's results on screen (same
+  // shape: valid trades/summary, just from the wrong run).
+  const latestJobIdRef = useRef(null);
+  // Snapshot of the payload/config that PRODUCED the results on screen, taken
+  // at submission time — NOT re-derived from live state on every render. The
+  // Rules sheet and download filename used to read buildPayload()/legs/etc
+  // LIVE, so editing a leg after a run completed (without re-running) changed
+  // the downloaded workbook's declared config while the trades in its body
+  // stayed from the OLD run — the artifact asserted a configuration that
+  // never produced those rows. rulesSubmittedPayloadRef is the value actually
+  // POSTed to /api/algotest/jobs for the run currently on screen.
+  const rulesSubmittedPayloadRef = useRef(null);
+  const [resultsSnapshotConfig, setResultsSnapshotConfig] = useState(null);
   const [jobStatusLabel, setJobStatusLabel] = useState('');
   const [jobState, setJobState] = useState('idle'); // 'idle' | 'queued' | 'running' | 'completed'
   const [cacheWarmReady, setCacheWarmReady] = useState(false);
@@ -1107,6 +1129,15 @@ const StrategyBuilder = () => {
   // Lifted optimizer panel state — survives panel close/reopen
   const [optimChecked, setOptimChecked] = useState({});
   const [optimSavedValues, setOptimSavedValues] = useState({});
+  // %/pts choice per swept param. Previously declared LOCALLY inside
+  // OptimizePanel, so it was the one piece of that panel's state that did NOT
+  // survive close/reopen (optimChecked/optimSavedValues above already lived
+  // here for exactly this reason) — closing the panel with a leg's spot
+  // adjustment set to "points" and reopening it silently reset that param back
+  // to "percent" (and therefore its min/max/step back to the percent preset),
+  // discarding a range the user had explicitly entered, with nothing in the
+  // UI indicating a reset had happened.
+  const [optimUnitChoice, setOptimUnitChoice] = useState({});
   const [optimMethod, setOptimMethod] = useState('exhaustive');
   const [optimSampleN, setOptimSampleN] = useState(200);
   const [optimAlgorithm, setOptimAlgorithm] = useState('cma-es');
@@ -1448,15 +1479,43 @@ const StrategyBuilder = () => {
           setChargesEnabled(payload?.meta?.charges_enabled ?? false);
           setResults(payload);
           // Midcap overlay (additive): enrich with the cross-index leg if present.
+          // Un-awaited, so a SECOND run can start (loading was already cleared
+          // above) and finish before this resolves — guard against writing a
+          // stale job's enriched results over the job that's on screen now.
           applyMidcapOverlay(payload).then(enriched => {
+            if (jobId !== latestJobIdRef.current) return;
             if (enriched && enriched.midcap) {
               setRawResults(enriched);
               setDisplayResults(enriched);
               setResults(enriched);
             }
           });
-          if (strFilter.enabled && Array.isArray(payload?.trades) && payload.trades.length === 0) {
-            setError(`No trades matched the ${strFilter.configLabel} filter for this date range. Try a different filter or widen the date range.`);
+          if (Array.isArray(payload?.trades) && payload.trades.length === 0) {
+            // Don't blame the filter unless it's actually implicated. The old
+            // message said "No trades matched the <filter> filter" for EVERY
+            // zero-trade run with a filter on, which sent people hunting the
+            // filter when the real cause was elsewhere — e.g. MIDCPNIFTY weekly
+            // options end 25-Nov-2024, so a weekly leg after that date has no
+            // contract to book while the filter covers the range perfectly.
+            const toIso = (s) => {
+              const m = String(s || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+              return m ? `${m[3]}-${m[2]}-${m[1]}` : String(s || '');
+            };
+            const from = toIso(startDate);
+            const to = toIso(endDate);
+            const segs = Array.isArray(strFilter.segments) ? strFilter.segments : [];
+            const covering = segs.filter((s) => {
+              const ss = String(s?.start || s?.Start || '');
+              const se = String(s?.end || s?.End || '');
+              return ss && se && ss <= to && se >= from;
+            });
+            if (strFilter.enabled && segs.length > 0 && covering.length === 0) {
+              setError(`No ${strFilter.configLabel} segment overlaps ${from} → ${to}. Widen the date range or choose a different filter.`);
+            } else if (strFilter.enabled && covering.length > 0) {
+              setError(`0 trades for ${from} → ${to}. ${covering.length} ${strFilter.configLabel} segment(s) do cover this range, so the filter is not the cause — check that each leg's Expiry has contracts for this period (some indices stop publishing weekly expiries).`);
+            } else {
+              setError(`0 trades for ${from} → ${to}. Check that each leg's Expiry has contracts for this period, and that the date range is the one you meant.`);
+            }
           } else {
             setError(null);
           }
@@ -1500,7 +1559,7 @@ const StrategyBuilder = () => {
     };
 
     jobPollRef.current = setTimeout(fetchStatus, 0);
-  }, [stopJobPolling, strFilter.configLabel, strFilter.enabled, applyMidcapOverlay]);
+  }, [stopJobPolling, strFilter.configLabel, strFilter.enabled, strFilter.segments, startDate, endDate, applyMidcapOverlay]);
 
   const formatSummaryDateInput = (value) => {
     if (!value) return null;
@@ -2140,6 +2199,28 @@ const StrategyBuilder = () => {
     return multi;
   }, [legs, instrument]);
 
+  // Same shape as the strategyConfig object below — extracted so it can be
+  // called at SUBMISSION time (see rulesSubmittedPayloadRef above) instead of
+  // being rebuilt from live state on every ResultsPanel render.
+  const buildStrategyConfigSnapshot = () => ({
+    instrument,
+    legs,
+    entryDaysBefore,
+    exitDaysBefore,
+    expiryBasis,
+    rolloverCadence,
+    yearlyExitMonthsBefore,
+    yearlyRollMonths,
+    spotAdjustmentEnabled,
+    spotAdjustmentDirection,
+    spotAdjustmentValue: normalizedSpotAdjustmentValue,
+    spotAdjustmentUnits,
+    midcapSpotAdjustmentEnabled: midcapSpotAdjEnabled && legs.some(l => l.segment === 'midcap100'),
+    midcapSpotAdjustmentDirection: midcapSpotAdjDirection,
+    midcapSpotAdjustmentValue: clampSpotAdjustmentValue(midcapSpotAdjValue, midcapSpotAdjUnits),
+    midcapSpotAdjustmentUnits: midcapSpotAdjUnits,
+  });
+
   const buildPayload = () => {
     const legsPayload = legs.map(l => {
       const segmentType = (l.segment || '').toLowerCase();
@@ -2147,6 +2228,10 @@ const StrategyBuilder = () => {
         segment: segmentType.toUpperCase(),
         position: l.position.toUpperCase(),
         lots: l.lot || 1,
+        // Per-leg QUANTITY override (opt-in): direct P&L multiplier for this leg.
+        // Emitted only when > 0, so legs without it send a byte-identical payload
+        // and the engine falls back to lots × index-lot-size exactly as before.
+        ...(Number(l.qty) > 0 ? { qty: Math.trunc(Number(l.qty)) } : {}),
         // Per-leg index (multi-index feature). Defaults to the strategy index,
         // so single-index strategies are unaffected.
         index: String(l.index || instrument).toUpperCase(),
@@ -2181,6 +2266,12 @@ const StrategyBuilder = () => {
           ? String(l.expiry || _legCfg.defaultOptionExpiry || 'monthly').toUpperCase()
           : (_legMonthlyOnly ? 'MONTHLY' : normalizeExpiryForIndex(l.expiry, _legIdx, 'options', expiryBasis).toUpperCase());
         leg.strike_interval = _legInterval;
+        // PER-LEG ROLLOVER: this leg's OWN exit T-n (defaults to the global exit
+        // offset). The engine reads leg.exit_dte with the same fallback, so
+        // omitting per-leg values is safe.
+        if (perLegRollover) {
+          leg.exit_dte = Number.isFinite(Number(l.exit_dte)) ? Number(l.exit_dte) : exitDaysBefore;
+        }
         // Per-leg spot adjustment. Emitted ONLY when the leg opts in, so a
         // strategy that never touches this control sends a byte-identical
         // payload and the backend resolves every leg to the strategy-level
@@ -2200,6 +2291,47 @@ const StrategyBuilder = () => {
               ? l.spot_adj_direction
               : 'rise',
           };
+        }
+        // Per-contract schedule (yearly legs only): emit only when the leg is
+        // yearly, the opt-in toggle is ON, AND there is ≥1 complete row (all
+        // three fields filled). Toggle off / absent → backend stays on the
+        // existing single-schedule fallback path (existing behaviour untouched).
+        if (String(leg.expiry || '').toUpperCase() === 'YEARLY' && l.yearly_schedule_enabled) {
+          // "None" = per-contract STRIKE GAP schedule with NO spot adjustment.
+          const noAdj = l.yearly_schedule_direction === 'none';
+          const sched = (l.yearly_contract_schedule || [])
+            // Gap is always required; Spot Adj only when adjustment is on.
+            .filter(r => r.year && Number.isFinite(Number(r.year)) && r.gap !== '' && r.gap != null && (noAdj || (r.adj !== '' && r.adj != null)))
+            // Each range starts at its "From" December; the sticky backend runs it
+            // until the next range's From (i.e. up to the "To" the user typed for
+            // contiguous ranges). Earliest range is the baseline for anything before.
+            // With adjustment off we still send a positive spot_adj_pct so the row
+            // validates, but the leg's spot_adjustment is disabled below so it never fires.
+            .map(r => ({ contract: String(Number(r.year)), strike_gap: Number(r.gap), spot_adj_pct: noAdj ? (Number(r.adj) > 0 ? Number(r.adj) : 1) : Number(r.adj), spot_adj_unit: r.adj_unit === 'points' ? 'points' : 'percent' }))
+            .sort((a, b) => Number(a.contract) - Number(b.contract));
+          if (sched.length) {
+            leg.yearly_contract_schedule = sched;
+            // The schedule table is the SINGLE source for a yearly leg (the outer
+            // Strike Gap + Own Spot Adj are hidden). Derive the leg's base gap +
+            // spot-adjustment from the earliest row so no base-vs-schedule conflict
+            // is possible, and take the direction from the table's own control.
+            const first = sched[0];
+            leg.strike_interval = first.strike_gap;
+            if (noAdj) {
+              // Gap-only schedule: adjustment fully off, gaps still apply per range.
+              leg.spot_adjustment = { enabled: false };
+            } else {
+              const dir = ['rise', 'fall', 'both'].includes(l.yearly_schedule_direction) ? l.yearly_schedule_direction : 'both';
+              leg.spot_adjustment = {
+                enabled: true,
+                pct: first.spot_adj_unit === 'percent'
+                  ? Math.min(5, Math.max(0.25, first.spot_adj_pct))
+                  : Math.max(0, first.spot_adj_pct),
+                units: first.spot_adj_unit,
+                direction: dir,
+              };
+            }
+          }
         }
         leg.strike_selection = {
           type: l.strike_criteria.toUpperCase(),
@@ -2238,6 +2370,12 @@ const StrategyBuilder = () => {
           leg.strike_selection.ref_leg = Number(l.ref_leg) || 1;
           leg.strike_selection.offset = Number(l.offset) || 0;
         }
+        if (l.strike_criteria === 'rel_leg_premium') {
+          // Premium target = leg #ref_leg's actual entry fill, rescaled by the
+          // expiry-count ratio between the two legs and by their lot sizes.
+          // ref_leg is 1-based and MUST reference an earlier leg.
+          leg.strike_selection.ref_leg = Number(l.ref_leg) || 1;
+        }
         if (l.strike_criteria === 'straddle_width') {
           leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
           leg.straddle_direction = l.straddle_direction ?? '+';
@@ -2253,6 +2391,10 @@ const StrategyBuilder = () => {
       }
       if (l.individual_filter && (l.filter_segments || []).length) {
         leg.filter_segments = l.filter_segments;
+        // Propagate the flag so the Rules sheet (buildRulesSheet / rules_sheet.py,
+        // which gate on individual_filter) actually shows the per-leg filter.
+        // The engine keys on filter_segments, so this is display-only.
+        leg.individual_filter = true;
       }
       if (segmentType === 'futures') {
         leg.expiry = (l.expiry || 'monthly').toLowerCase();
@@ -2410,6 +2552,10 @@ const StrategyBuilder = () => {
       rollover_min_days_to_expiry: (rolloverToggle && expiryBasis !== 'yearly') ? rolloverMinDaysToExpiry : 0,
       no_rollover: noRollover && ['weekly', 'monthly'].includes(expiryBasis),
       no_rollover_min_days: (noRollover && expiryBasis !== 'yearly') ? noRolloverMinDays : 0,
+      // PER-LEG ROLLOVER: each leg rolls on its own expiry + own exit T-n
+      // (leg.exit_dte, stamped below). Union boundaries + carry are the engine's
+      // resolve_per_leg_core. Additive — false ⇒ byte-identical payload.
+      per_leg_rollover: perLegRollover,
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
       square_off_mode: squareOffMode,
@@ -2481,6 +2627,10 @@ const StrategyBuilder = () => {
       } : {}),
       filter: strFilter.enabled ? strFilter.configId : null,
       filter_config: strFilter.enabled ? strFilter.configId : null,
+      // configId is 'custom' for an uploaded CSV, which names nothing. filterName is
+      // the CSV filename (or the preset's label) — the only real identity the filter
+      // has — and the Rules sheet had no way to print it because it was never sent.
+      filter_label: strFilter.enabled ? (strFilter.filterName || strFilter.configLabel || null) : null,
       filter_segments: strFilter.enabled && strFilter.segments ? strFilter.segments : [],
       super_trend_config: 'None',
       // Filter ON  → only 'fixed' is offered in the UI (DTE / Min-Days options removed).
@@ -2563,7 +2713,10 @@ const StrategyBuilder = () => {
       .some(l => l.expiry === 'monthly');
     const hasCurrentExpiryLegs = hasCurrentExpiryOptionLegs || hasCurrentExpiryFuturesLegs;
 
-    if (hasCurrentExpiryLegs && !rolloverToggle && !noRollover) {
+    // Under Per-Leg Rollover the strategy-level entry/exit offsets are ignored
+    // (each leg carries its own exit T-n; entry is the previous roll), so this
+    // Entry>Exit check does not apply.
+    if (hasCurrentExpiryLegs && !rolloverToggle && !noRollover && !perLegRollover) {
       const basisLabel = hasCurrentExpiryOptionLegs
         ? (expiryBasis === 'weekly' ? 'Weekly' : 'Monthly')
         : 'Monthly Futures';
@@ -2596,8 +2749,10 @@ const StrategyBuilder = () => {
     // EARLIER leg (1-based position < its own). A dangling reference — e.g. after
     // deleting the parent leg — would otherwise be silently dropped by the engine
     // (0 trades) with no explanation. Fail loudly instead.
+    // rel_leg_premium shares the earlier-leg rule for the same reason, so it is
+    // validated by the same pass.
     const relLegErrors = legs.reduce((acc, leg, idx) => {
-      if (leg.strike_criteria !== 'rel_leg') return acc;
+      if (leg.strike_criteria !== 'rel_leg' && leg.strike_criteria !== 'rel_leg_premium') return acc;
       const ref = Number(leg.ref_leg) || 0;
       if (ref < 1 || ref > idx) acc.push(`Leg ${idx + 1}`);
       return acc;
@@ -2649,6 +2804,11 @@ const StrategyBuilder = () => {
     const sanitized = sanitizePayload(payload);
     // LAN remote-worker routing (see remote-worker/) — null = run locally, unchanged.
     sanitized.node_id = selectedNodeId || null;
+    // Snapshot the config that IS being submitted, for the Rules sheet/filename
+    // once results land — not the live state at download time, which may have
+    // been edited since (see the ref's own comment for why this matters).
+    rulesSubmittedPayloadRef.current = sanitized;
+    setResultsSnapshotConfig(buildStrategyConfigSnapshot());
     stopJobPolling();
     setLoading(true);
     setError(null);
@@ -2692,6 +2852,7 @@ const StrategyBuilder = () => {
       if (!data?.job_id) {
         throw new Error('No job ID returned. Please try again.');
       }
+      latestJobIdRef.current = data.job_id;
       setJobId(data.job_id);
       const queueDepth = Number(data.queue_depth);
       setJobStatusLabel(Number.isFinite(queueDepth) && queueDepth > 0 ? `Queued (${queueDepth} ahead)…` : 'Queued…');
@@ -2944,8 +3105,11 @@ const StrategyBuilder = () => {
                   </div>
                 )}
 
-                {/* Entry/Exit Days — EOD only */}
-                {backtestMode === 'eod' && (
+                {/* Entry/Exit Days — EOD only. Hidden under Per-Leg Rollover:
+                    each leg carries its OWN exit T-n and entry is always the
+                    previous roll / run start, so a single strategy-level
+                    entry/exit offset is meaningless there. */}
+                {backtestMode === 'eod' && !perLegRollover && (
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="field-label">Entry (days before expiry)</label>
@@ -3043,6 +3207,53 @@ const StrategyBuilder = () => {
                             </button>
                           ))}
                         </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Per-Leg Rollover — EOD. Each leg rolls on its OWN expiry +
+                    own exit T-n; trade boundaries are the union of all legs'
+                    rolls (a carried leg is marked-to-market). Additive/opt-in. */}
+                {backtestMode === 'eod' && (
+                  <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-xs font-semibold uppercase tracking-widest text-secondary border-l-4 border-accent-border pl-2">
+                          Per-Leg Rollover
+                        </span>
+                        <span className="text-[11px] text-muted pl-2">
+                          Each leg rolls on its own expiry &amp; exit T-n. Boundaries = union of all legs; a leg that isn&apos;t rolling carries (mark-to-market).
+                        </span>
+                      </div>
+                      <Toggle
+                        enabled={perLegRollover}
+                        onToggle={(val) => setPerLegRollover(val !== undefined ? Boolean(val) : !perLegRollover)}
+                        size="sm"
+                      />
+                    </div>
+                    {perLegRollover && (
+                      <div className="space-y-2 pt-2 border-t border-default">
+                        <p className="text-[11px] font-medium text-secondary pl-2">Exit T-n per leg (trading days before that leg&apos;s expiry)</p>
+                        <div className="space-y-1.5 pl-2">
+                          {legs.filter(l => l.segment === 'options').map((l, i) => (
+                            <div key={l.id} className="flex items-center justify-between gap-3">
+                              <span className="text-[11px] text-secondary">
+                                L{i + 1} · {l.option_type === 'call' ? 'CE' : 'PE'} · {String(l.expiry || 'weekly').toUpperCase()}
+                              </span>
+                              <input
+                                type="number"
+                                min={0}
+                                value={l.exit_dte ?? exitDaysBefore}
+                                onChange={e => updateLeg(l.id, 'exit_dte', Math.max(0, Number(e.target.value) || 0))}
+                                className="h-8 px-2 w-20 text-center border border-default rounded text-xs bg-surface"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-muted pl-2">
+                          Entry is always the previous roll / run start. Spot-adjustment is not supported in this mode yet.
+                        </p>
                       </div>
                     )}
                   </div>
@@ -3929,6 +4140,7 @@ const StrategyBuilder = () => {
                       <option value="synthetic_future">Synthetic Future</option>
                       <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
                       {legs.length > 0 && <option value="rel_leg">Relative to Leg</option>}
+                      {legs.length > 0 && <option value="rel_leg_premium">Relative to Leg Premium</option>}
                     </select>
                     {draftLeg.strike_criteria === 'straddle_width' && (
                       <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
@@ -4128,6 +4340,26 @@ const StrategyBuilder = () => {
                         </div>
                       </>
                     )}
+
+                    {draftLeg.strike_criteria === 'rel_leg_premium' && (
+                      <>
+                        <label className="field-label">Source Leg</label>
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1 h-8">
+                            <select
+                              value={draftLeg.ref_leg ?? 1}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, ref_leg: parseInt(e.target.value, 10) || 1 }))}
+                              className="h-8 px-2 border border-default rounded text-xs bg-surface font-medium"
+                            >
+                              {legs.map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                            </select>
+                          </div>
+                          <span className="text-xs text-muted">
+                            {`Target premium = Leg ${draftLeg.ref_leg ?? 1} entry premium ÷ expiries in its life, adjusted for lot size`}
+                          </span>
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 
@@ -4251,6 +4483,14 @@ const StrategyBuilder = () => {
                               className="w-16 h-7 px-2 border border-default rounded text-xs text-center bg-surface" />
                           </div>
                           <div>
+                            <label className="field-label">Quantity</label>
+                            <input type="number" min={0} value={leg.qty ?? ''}
+                              placeholder="auto"
+                              title="Per-leg quantity — direct P&L multiplier for this leg. Blank = lots × index lot size (default)."
+                              onChange={e => updateLeg(leg.id, 'qty', e.target.value === '' ? '' : (parseInt(e.target.value) || 0))}
+                              className="w-16 h-7 px-2 border border-default rounded text-xs text-center bg-surface" />
+                          </div>
+                          <div>
                             <label className="field-label">Position</label>
                             <div className="flex items-center gap-2">
                               <SegBtn size="sm"
@@ -4320,6 +4560,7 @@ const StrategyBuilder = () => {
                                   <option value="synthetic_future">Synthetic Future</option>
                                   <option value="atm_straddle_prem_pct">ATM Straddle Premium %</option>
                                   {idx > 0 && <option value="rel_leg">Relative to Leg</option>}
+                                  {idx > 0 && <option value="rel_leg_premium">Relative to Leg Premium</option>}
                                 </select>
                                 {leg.strike_criteria === 'straddle_width' && (
                                   <div className="flex items-center gap-1 mt-2 text-xs text-secondary">
@@ -4346,7 +4587,7 @@ const StrategyBuilder = () => {
                                   </div>
                                 )}
                               </div>
-                              {backtestMode === 'eod' && (
+                              {backtestMode === 'eod' && !(String(leg.expiry || '') === 'yearly' && leg.yearly_schedule_enabled) && (
                                 <div>
                                   <label className="field-label">Strike Gap</label>
                                   <StrikeIntervalSelect
@@ -4503,6 +4744,26 @@ const StrategyBuilder = () => {
                                       </div>
                                     </>
                                   )}
+
+                                  {leg.strike_criteria === 'rel_leg_premium' && (
+                                    <>
+                                      <label className="field-label">Source Leg</label>
+                                      <div className="flex flex-col gap-0.5">
+                                        <div className="flex items-center gap-1">
+                                          <select
+                                            value={leg.ref_leg ?? 1}
+                                            onChange={e => updateLeg(leg.id, 'ref_leg', parseInt(e.target.value, 10) || 1)}
+                                            className="h-7 px-2 border border-default rounded text-xs bg-surface font-medium"
+                                          >
+                                            {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                                          </select>
+                                        </div>
+                                        <span className="text-xs text-muted">
+                                          {`Leg ${leg.ref_leg ?? 1} premium ÷ expiries in its life`}
+                                        </span>
+                                      </div>
+                                    </>
+                                  )}
                                 </div>
                               )}
                             </>
@@ -4537,8 +4798,10 @@ const StrategyBuilder = () => {
 
                         {/* Per-leg Spot Adjustment — only meaningful while the
                             strategy-level Spot Adjustment section is in play.
-                            OFF leaves the leg on the strategy-level settings. */}
-                        {leg.segment === 'options' && (
+                            OFF leaves the leg on the strategy-level settings.
+                            Hidden for a yearly leg when its Per-Contract Schedule
+                            is on — the schedule table is the single source. */}
+                        {leg.segment === 'options' && !(String(leg.expiry || '') === 'yearly' && leg.yearly_schedule_enabled) && (
                           <div className="flex flex-wrap items-center gap-2 pt-1">
                             <Toggle
                               enabled={Boolean(leg.spot_adj_enabled)}
@@ -4579,6 +4842,147 @@ const StrategyBuilder = () => {
                             )}
                             {!leg.spot_adj_enabled && (
                               <span className="text-[10px] text-muted">Uses strategy-level Spot Adjustment</span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Per-contract schedule — only on yearly legs, behind an opt-in toggle */}
+                        {leg.segment === 'options' && String(leg.expiry || '') === 'yearly' && (
+                          <div className="space-y-1.5">
+                            <div className="flex items-center gap-2 pt-1">
+                              <Toggle
+                                enabled={Boolean(leg.yearly_schedule_enabled)}
+                                onToggle={(val) => updateLeg(leg.id, 'yearly_schedule_enabled', val !== undefined ? Boolean(val) : !leg.yearly_schedule_enabled)}
+                                size="sm"
+                              />
+                              <span className="text-xs font-medium text-secondary whitespace-nowrap">Per-Contract Schedule</span>
+                              {!leg.yearly_schedule_enabled && (
+                                <span className="text-[10px] text-muted">off — leg uses its single strike gap &amp; spot-adj for all contracts</span>
+                              )}
+                            </div>
+                            {leg.yearly_schedule_enabled && (
+                              <div className="rounded-lg border border-default bg-hover/40 px-3 py-2 space-y-1.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[10px] text-muted">Adjust on</span>
+                                    <select
+                                      value={leg.yearly_schedule_direction || 'both'}
+                                      onChange={e => updateLeg(leg.id, 'yearly_schedule_direction', e.target.value)}
+                                      className="h-7 px-1 border border-default rounded text-xs bg-surface"
+                                      title="Spot-adjustment direction (applies to all rows)"
+                                    >
+                                      <option value="rise">Rise</option>
+                                      <option value="fall">Fall</option>
+                                      <option value="both">Both</option>
+                                      <option value="none">None (gap only)</option>
+                                    </select>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateLeg(leg.id, 'yearly_contract_schedule', [...(leg.yearly_contract_schedule || []), { year: '', gap: '', adj: '', adj_unit: 'points' }])}
+                                    className="flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-accent border border-accent rounded hover:bg-accent hover:text-white transition-colors"
+                                  >
+                                    <Plus size={11} /> Add
+                                  </button>
+                                </div>
+                                <div className="rounded bg-surface/60 border border-subtle px-2 py-1.5 text-[10px] leading-relaxed text-muted">
+                                  <span className="font-semibold text-secondary">How to set it:</span> each row is one <span className="text-secondary">year range</span> — type the <span className="text-secondary">From</span> and <span className="text-secondary">To</span> December years (leave <span className="text-secondary">To</span> blank = onward), then its <span className="text-secondary">Strike Gap</span> and <span className="text-secondary">Spot Adj</span> + <span className="text-secondary">pt/%</span> unit (like Own Spot Adj).
+                                  Click <span className="text-secondary">+ Add</span> for the next range and keep them back-to-back (next From = previous To + 1). <span className="text-secondary">Adjust on</span> (Rise/Fall/Both) applies to every range.
+                                  <br />e.g. <span className="text-secondary">2019–2022 → gap 500, adj 200 pt</span>; <span className="text-secondary">2023–onward → gap 1000, adj 1000 pt</span>.
+                                </div>
+                                {(leg.yearly_contract_schedule || []).length === 0 && (
+                                  <p className="text-[11px] text-muted">No ranges yet — click <span className="font-medium">+ Add</span> to create your first one.</p>
+                                )}
+                                {(leg.yearly_contract_schedule || []).length > 0 && (
+                                  <div className="space-y-1">
+                                    <div className={`grid gap-1.5 text-[10px] text-muted font-medium px-0.5 ${leg.yearly_schedule_direction === 'none' ? 'grid-cols-[64px_64px_1fr_24px]' : 'grid-cols-[64px_64px_1fr_1fr_50px_24px]'}`}>
+                                      <span>From&nbsp;yr</span><span>To&nbsp;yr</span><span>Strike Gap</span>
+                                      {leg.yearly_schedule_direction !== 'none' && (<><span>Spot Adj</span><span>Unit</span></>)}
+                                      <span />
+                                    </div>
+                                    {(leg.yearly_contract_schedule || []).map((row, ri) => (
+                                      <div key={ri} className={`grid gap-1.5 items-center ${leg.yearly_schedule_direction === 'none' ? 'grid-cols-[64px_64px_1fr_24px]' : 'grid-cols-[64px_64px_1fr_1fr_50px_24px]'}`}>
+                                        <input
+                                          type="number"
+                                          placeholder="yr"
+                                          min={2010} max={2040}
+                                          value={row.year === 'start' ? '' : (row.year ?? '')}
+                                          onChange={e => {
+                                            const next = [...(leg.yearly_contract_schedule || [])];
+                                            next[ri] = { ...next[ri], year: e.target.value };
+                                            updateLeg(leg.id, 'yearly_contract_schedule', next);
+                                          }}
+                                          className="h-7 px-1.5 border border-default rounded text-xs text-center bg-surface w-full placeholder:text-muted/50"
+                                        />
+                                        <input
+                                          type="number"
+                                          placeholder="onward"
+                                          min={2010} max={2040}
+                                          value={row.to ?? ''}
+                                          onChange={e => {
+                                            const next = [...(leg.yearly_contract_schedule || [])];
+                                            next[ri] = { ...next[ri], to: e.target.value };
+                                            updateLeg(leg.id, 'yearly_contract_schedule', next);
+                                          }}
+                                          title="End year (leave blank = onward)"
+                                          className="h-7 px-1.5 border border-default rounded text-xs text-center bg-surface w-full placeholder:text-muted/60"
+                                        />
+                                        <select
+                                          value={row.gap ?? ''}
+                                          onChange={e => {
+                                            const next = [...(leg.yearly_contract_schedule || [])];
+                                            next[ri] = { ...next[ri], gap: e.target.value };
+                                            updateLeg(leg.id, 'yearly_contract_schedule', next);
+                                          }}
+                                          className="h-7 px-2 border border-default rounded text-xs text-center bg-surface w-full"
+                                          title="Strike gap for this range"
+                                        >
+                                          <option value="">Gap</option>
+                                          {strikeIntervalOptionsForIndex(leg.index || instrument).map(g => <option key={g} value={g}>{g}</option>)}
+                                        </select>
+                                        {leg.yearly_schedule_direction !== 'none' && (<>
+                                        <input
+                                          type="number"
+                                          placeholder="Adj"
+                                          value={row.adj ?? ''}
+                                          onChange={e => {
+                                            const next = [...(leg.yearly_contract_schedule || [])];
+                                            next[ri] = { ...next[ri], adj: e.target.value };
+                                            updateLeg(leg.id, 'yearly_contract_schedule', next);
+                                          }}
+                                          className="h-7 px-2 border border-default rounded text-xs text-center bg-surface w-full placeholder:text-muted/50"
+                                        />
+                                        <select
+                                          value={row.adj_unit || 'points'}
+                                          onChange={e => {
+                                            const next = [...(leg.yearly_contract_schedule || [])];
+                                            next[ri] = { ...next[ri], adj_unit: e.target.value };
+                                            updateLeg(leg.id, 'yearly_contract_schedule', next);
+                                          }}
+                                          className="h-7 px-1 border border-default rounded text-xs bg-surface w-full"
+                                          title="Spot-adjustment unit"
+                                        >
+                                          <option value="points">pt</option>
+                                          <option value="percent">%</option>
+                                        </select>
+                                        </>)}
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const next = [...(leg.yearly_contract_schedule || [])];
+                                            next.splice(ri, 1);
+                                            updateLeg(leg.id, 'yearly_contract_schedule', next);
+                                          }}
+                                          className="flex items-center justify-center h-7 w-6 text-muted hover:text-loss transition-colors"
+                                          title="Remove range"
+                                        >
+                                          <Trash2 size={12} />
+                                        </button>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
                             )}
                           </div>
                         )}
@@ -5282,30 +5686,15 @@ const StrategyBuilder = () => {
               filterInfo={strFilter.enabled ? `Filtered by ${strFilter.configLabel}` : null}
               filterSegments={strFilter.enabled ? strFilter.segments : null}
               showStrSegment={strFilter.enabled}
-              rulesPayload={buildPayload()}
+              rulesPayload={rulesSubmittedPayloadRef.current || buildPayload()}
               rulesFilterName={strFilter.enabled ? strFilter.filterName : null}
-              strategyConfig={{
-                instrument,
-                legs,
-                entryDaysBefore,
-                exitDaysBefore,
-                // YEARLY: contract and cadence are different calendars, so the
-                // export name must carry both or two very different runs would
-                // land on the same filename.
-                expiryBasis,
-                rolloverCadence,
-                yearlyExitMonthsBefore,
-                yearlyRollMonths,
-                spotAdjustmentEnabled,
-                spotAdjustmentDirection,
-                spotAdjustmentValue: normalizedSpotAdjustmentValue,
-                spotAdjustmentUnits,
-                // Midcap cross-index spot adjustment (for the filename).
-                midcapSpotAdjustmentEnabled: midcapSpotAdjEnabled && legs.some(l => l.segment === 'midcap100'),
-                midcapSpotAdjustmentDirection: midcapSpotAdjDirection,
-                midcapSpotAdjustmentValue: clampSpotAdjustmentValue(midcapSpotAdjValue, midcapSpotAdjUnits),
-                midcapSpotAdjustmentUnits: midcapSpotAdjUnits,
-              }}
+              // Snapshot taken when THIS run was submitted (see
+              // rulesSubmittedPayloadRef above) — not live legs/config, which
+              // may have been edited since without re-running. Falls back to a
+              // live build only if somehow no run has ever completed (should be
+              // unreachable here since this block only renders when
+              // displayResults is truthy).
+              strategyConfig={resultsSnapshotConfig || buildStrategyConfigSnapshot()}
             />
             <div className="flex flex-wrap items-center gap-4 px-4 py-3 bg-surface border border-default border-t-0 rounded-b-xl">
               {/* Slippage is per-leg now (set on each leg card) and already
@@ -5405,6 +5794,7 @@ const StrategyBuilder = () => {
             nLegs={legs.filter(l => String(l.segment || '').toLowerCase() !== 'midcap100').length}
             checked={optimChecked} setChecked={setOptimChecked}
             savedValues={optimSavedValues} setSavedValues={setOptimSavedValues}
+            unitChoice={optimUnitChoice} setUnitChoice={setOptimUnitChoice}
             method={optimMethod} setMethod={setOptimMethod}
             sampleN={optimSampleN} setSampleN={setOptimSampleN}
             algorithm={optimAlgorithm} setAlgorithm={setOptimAlgorithm}

@@ -33,7 +33,8 @@ if not exist ".env" (
 
 if not exist "algotest-worker-image.tar" (
     echo ERROR: algotest-worker-image.tar is missing from this folder.
-    echo Copy it here from the main box first.
+    echo Copy the refreshed tar from the main box first. It was rebuilt on
+    echo August 8, 2026.
     pause
     exit /b 1
 )

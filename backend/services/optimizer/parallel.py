@@ -209,6 +209,52 @@ def _chunk(combos: List[Dict[str, Any]], n_chunks: int) -> List[List[Dict[str, A
     return chunks
 
 
+# ── Per-combo phase profiler (OPTIM_PROFILE=1) ──────────────────────────────
+# Measured externally, the per-combo path accounts for only ~1.08s of a ~2.43s
+# wall slot per worker (engine ~925ms + post-engine ~150ms, most of it the two
+# Rust workbook builds). ~1.35s was unaccounted for, and naming a culprit
+# without measuring is what produced three wrong diagnoses before this. These
+# probes time every phase INCLUDING the persistence calls, so the gap has
+# nowhere left to hide. Off unless OPTIM_PROFILE=1 — a perf_counter pair per
+# phase is cheap, but this stays opt-in so production runs are untouched.
+_PROFILE = os.environ.get("OPTIM_PROFILE", "0").strip().lower() in ("1", "true", "yes")
+_PROFILE_EVERY = int(os.environ.get("OPTIM_PROFILE_EVERY", "100"))
+_prof_acc: Dict[str, float] = {}
+_prof_n = 0
+
+
+def _pm(bucket: str, t0: float) -> float:
+    """Accumulate elapsed since t0 into `bucket`; returns a fresh timestamp."""
+    if _PROFILE:
+        _prof_acc[bucket] = _prof_acc.get(bucket, 0.0) + (time.perf_counter() - t0)
+    return time.perf_counter()
+
+
+def _pflush(combo_id: int, final: bool = False) -> None:
+    """Log the accumulated phase breakdown every _PROFILE_EVERY combos.
+
+    `final=True` forces a report at batch end: the counter is PER-PROCESS, and a
+    96-combo sweep across 12 forked children gives each only ~8 combos, so a
+    threshold-only flush printed nothing at all (observed).
+    """
+    global _prof_n
+    if not _PROFILE:
+        return
+    if not final:
+        _prof_n += 1
+    if not _prof_n:
+        return
+    if not final and _prof_n % _PROFILE_EVERY:
+        return
+    tot = sum(_prof_acc.values()) or 1e-9
+    parts = " ".join(
+        f"{k}={v / _prof_n * 1000:.0f}ms/{100 * v / tot:.0f}%"
+        for k, v in sorted(_prof_acc.items(), key=lambda kv: -kv[1])
+    )
+    logger.info("[OPTIM_PROFILE] pid=%d n=%d avg_total=%.0fms | %s",
+                os.getpid(), _prof_n, tot / _prof_n * 1000, parts)
+
+
 def _rust_loop_mode_safe() -> str:
     """OPTIMIZE_RUST_LOOP mode, resilient in forked workers (default "0" on any error)."""
     try:
@@ -544,10 +590,13 @@ def _worker_entrypoint(
                 # of the resume overwriting combo 1 of the original). Popped
                 # before apply_combo_for_optim so it is never read as a payload
                 # path — same contract as __optim_callback__.
+                _p = time.perf_counter()
                 _orig_id = combo.pop("__combo_id__", None) if isinstance(combo, dict) else None
                 merged = apply_combo_for_optim(base_payload, combo)
                 t_combo = time.perf_counter()
+                _p = _pm("setup", _p)
                 trades_df, summary = _run_single_backtest(merged)
+                _p = _pm("engine", _p)
                 elapsed_ms = round((time.perf_counter() - t_combo) * 1000.0, 2)
                 _rust_mode = _rust_loop_mode_safe()
                 if _rust_mode == "1":
@@ -605,6 +654,7 @@ def _worker_entrypoint(
                     # _inline_wm) so the finalize pass never rebuilds it from CSV.
                     _wm_over, _wm_pw, _has_mc = _inline_wm(trades_df, _has_mc, "inline",
                                                   starting_combo_id + i)
+                _p = _pm("metrics", _p)
                 labels = label_combo(merged)
                 _combo_id = _orig_id if _orig_id is not None else starting_combo_id + i
                 combo_label_safe = f"{_combo_id}_{safe_filename(labels['combo_label'])}"
@@ -633,6 +683,12 @@ def _worker_entrypoint(
                         "put_strike_label": labels["put_strike_label"],
                         "call_strike_label": labels["call_strike_label"],
                         "spot_adjustment": labels["spot_adjustment"],
+                        # Leg-wise view (additive) — one block per EXISTING leg, so a
+                        # 2-leg sweep emits no L3 columns. See combo_labeler.
+                        "leg_cols": labels.get("leg_cols") or [],
+                        "overall_adjustment": labels.get("overall_adjustment") or "",
+                        "midcap_leg": labels.get("midcap_leg") or "",
+                        "midcap_adj": labels.get("midcap_adj") or "",
                     },
                     "summary": flat_summary,
                     "summary_pw": _summary_pw,
@@ -651,17 +707,21 @@ def _worker_entrypoint(
                 }
                 if flat_summary.get("count", 0) == 0:
                     failures += 1
+                _p = _pm("row+wm_write", _p)
                 result_store.append_result(job_id, row)
                 result_store.increment_done(job_id)
+                _p = _pm("redis_write", _p)
                 _skip_ts = os.environ.get("OPTIMIZE_SKIP_TRADESHEETS", "0").strip().lower() in ("1", "true", "yes")
                 if not _skip_ts and not trades_df.empty:
                     result_store.write_combo_tradesheet(job_id, combo_label_safe, trades_df)
+                    _p = _pm("csv_write", _p)
                     _tdays = (_runner_mod._RUST_CONTEXT or {}).get("trading_days") or []
                     # Leg-wise "Rules" first sheet — identical to the backtest
                     # (build_rules_sheet is the Python mirror of the JS buildRulesSheet;
                     # _write_rules_sheet renders it). merged = this combo's payload.
                     from services.optimizer.rules_sheet import build_rules_sheet as _brs
                     _rules_sheet = _brs(merged, _filter_name)
+                    _p = _pm("rules_sheet", _p)
                     # Build the variant(s) this job will actually DOWNLOAD.
                     # Previously the overall variant was written unconditionally
                     # and the patchwise one only under _INLINE_FINALIZE — so a
@@ -708,6 +768,8 @@ def _worker_entrypoint(
                             yearly=_is_yearly,
                             rules_sheet=_rules_sheet,
                         )
+                _p = _pm("xlsx_write", _p)
+                _pflush(_combo_id)
                 done += 1
                 logger.info(
                     "[OPTIM] combo %d done | %s | trades=%d pnl=%.0f obj=%.4f | %.0fms",
@@ -726,6 +788,7 @@ def _worker_entrypoint(
                 if not first_error:
                     first_error = str(exc)
                 logger.warning("[OPTIM_PARALLEL] combo %d failed: %s", starting_combo_id + i, exc)
+        _pflush(0, final=True)
         return {"done": done, "failures": failures, "error": first_error}
     except Exception as exc:
         logger.error("[OPTIM_PARALLEL] worker crashed: %s\n%s", exc, traceback.format_exc())

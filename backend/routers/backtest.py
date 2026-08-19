@@ -194,6 +194,42 @@ def _queue_depth(queue_name: str) -> int:
         return 0
 
 
+# Celery has no "unknown task" state: an id it never heard of reports PENDING,
+# identical to a job genuinely waiting in a queue. We stamp a marker at enqueue
+# so a PENDING job with no marker can be reported as lost instead of spinning
+# forever in the UI. TTL matches result_expires=86400 (worker/celery.py) — a
+# job that has not started within a day is not coming back.
+_JOB_KNOWN_TTL = 86400
+
+
+def _mark_job_known(job_id: str) -> None:
+    try:
+        import redis
+        client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        client.setex(f"bt:known:{job_id}", _JOB_KNOWN_TTL, "1")
+    except Exception as exc:
+        logger.debug("could not mark job %s known: %s", job_id, exc)
+
+
+def _job_known(job_id: str) -> bool:
+    """Fail open: if Redis is unreachable we must not declare a live job dead."""
+    try:
+        import redis
+        client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        return bool(client.exists(f"bt:known:{job_id}"))
+    except Exception:
+        return True
+
+
+def _forget_job(job_id: str) -> None:
+    try:
+        import redis
+        client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        client.delete(f"bt:known:{job_id}")
+    except Exception:
+        pass
+
+
 def _real_backtest_active() -> bool:
     """True if an actual run_algotest_job (a user's 'Run Backtest' click) is
     currently executing on either backtest worker — NOT a warm_backtest_cache_task.
@@ -338,7 +374,19 @@ def _recalculate_trade_prices(
                     # pre-scaling behaviour.
                     _row_lots = 1
                 else:
-                    _row_lot_size = int(get_lot_size(_row_index, row.get('Entry Date')) or 1) or 1
+                    # get_lot_size_for_index now RAISES for an index it doesn't
+                    # recognize (services/index_metadata.py) rather than silently
+                    # returning 1 — correct for a LIVE pricing run, but this path
+                    # recomputes an uploaded/legacy tradesheet row-by-row where an
+                    # unrecognized/malformed Index string is exactly the kind of
+                    # bad legacy data this function already tolerates (see the
+                    # "don't guess" comment above for a missing Index). One bad
+                    # row must not crash the whole recalculation — fall back to
+                    # the SAME safe no-op (lots=1) as that sibling case.
+                    try:
+                        _row_lot_size = int(get_lot_size(_row_index, row.get('Entry Date')) or 1) or 1
+                    except ValueError:
+                        _row_lot_size = 1
                     _qty_raw = _normalize_recalc_numeric(row.get('Qty'))
                     _qty = float(_qty_raw) if _qty_raw and _qty_raw > 0 else float(_row_lot_size)
                     _row_lots = max(1, int(round(_qty / _row_lot_size)))
@@ -881,6 +929,7 @@ async def queue_algotest_job(request: Request):
     payload["_client_ip"] = origin_ip
     payload["node_id"] = node_id
     task = run_algotest_job.apply_async(args=[payload], queue=queue_name)
+    _mark_job_known(task.id)
     if node_id:
         from services import node_registry
         node_registry.record_job_node(task.id, node_id)
@@ -1020,6 +1069,18 @@ async def get_algotest_job_status(job_id: str):
         state = "FAILURE"
         info = {"error": "Task metadata corrupted"}
     if state == "PENDING":
+        if not _job_known(job_id):
+            # Unknown id: never enqueued, cancelled, or its result was lost when
+            # a worker was recreated mid-flight (acks are early, so the broker
+            # message is already gone). Reporting "queued" makes the UI poll a
+            # job that will never arrive.
+            return {
+                "status": "failed",
+                "error": (
+                    "This job is no longer tracked — it was cancelled, expired, "
+                    "or lost when the workers were restarted. Please run it again."
+                ),
+            }
         return {
             "status": "queued",
             "queue_depth": _queue_depth("backtests") + _queue_depth("backtests_fast"),
@@ -1050,6 +1111,9 @@ async def cancel_algotest_job(job_id: str):
         celery_app.control.revoke(job_id, terminate=True)
     except Exception as exc:
         logger.warning("Could not revoke backtest %s: %s", job_id, exc)
+    # A revoked task never writes a result, so it stays PENDING forever; drop the
+    # marker so status reports it as finished rather than perpetually queued.
+    _forget_job(job_id)
     try:
         from services import memory_gate, node_registry
         memory_gate.release(job_id, node_id=node_registry.get_job_node(job_id))

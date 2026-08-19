@@ -44,8 +44,8 @@ it never competes with the main box's local memory budget.
 
 `algotest-worker-image.tar` in this folder was built from
 `algotest-backend-app:latest` via `docker save` and is already up to date as
-of this writing. Re-run this after any backend code change, before copying
-the folder again:
+of this writing. It was refreshed on August 8, 2026. Re-run this after any
+backend code change, before copying the folder again:
 ```bash
 docker save algotest-backend-app:latest -o remote-worker/algotest-worker-image.tar
 ```

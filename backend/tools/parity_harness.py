@@ -35,11 +35,15 @@ For each of a few representative strategy payloads (short date range for speed):
      OVERLAPPING key (equal? differ? by how many decimals for floats?), and
      lists keys present in only one of the two separately.
 
-  4. Compares the tradesheet column-set the two paths would emit. The optimizer
-     per-combo CSV is written by result_store.write_combo_tradesheet(), which is
-     literally `trades_df.to_csv(...)` on the SAME trades_df -- so the columns
-     are identical by construction. The harness confirms this and prints the
-     column list so a future refactor that changes columns is caught.
+  4. Prints the tradesheet column-set for manual inspection. NOTE: this is NOT
+     an automated column-drift check -- the harness does not build or diff a
+     second frame from the optimizer's real per-combo CSV path. It only prints
+     the backtest trades_df's columns; it relies on the code-reading fact that
+     result_store.write_combo_tradesheet() is currently just
+     `trades_df.to_csv(...)` on this SAME trades_df, so the columns happen to
+     match today. If write_combo_tradesheet's column handling ever changes,
+     this printout alone will NOT catch it -- that would require a real
+     comparison, out of scope for this harness.
 
   5. Prints a per-payload PASS/FAIL banner (PASS = zero diverging overlapping
      summary fields) with a table of every diverging field.
@@ -281,15 +285,18 @@ def run_one(name: str, payload: Dict[str, Any]) -> None:
         print(f"  Keys only in OPTIMIZER summary ({len(only_op)}): "
               + ", ".join(only_op))
 
-    # --- 4) Tradesheet column comparison ---
-    # result_store.write_combo_tradesheet(job_id, label, trades_df) is just
-    # trades_df.to_csv(index=False) on this exact trades_df, so the optimizer
-    # per-combo CSV has these exact columns. We assert that here and print them
-    # so any future column drift shows up in the baseline.
+    # --- 4) Tradesheet columns (manual inspection only -- NOT a drift check) ---
+    # This just prints trades_df's columns; it does not build or diff a second
+    # frame from the optimizer's real per-combo CSV path
+    # (result_store.write_combo_tradesheet). As of this writing that function is
+    # just trades_df.to_csv(...) on this SAME trades_df, so today the columns
+    # happen to match -- that's a code-reading fact, not something verified at
+    # runtime here. A future change to write_combo_tradesheet's column handling
+    # would NOT be caught by this printout.
     cols = list(trades_df.columns)
     print(f"\n  Tradesheet columns ({len(cols)}): {cols}")
-    print("  (Optimizer per-combo CSV = trades_df.to_csv on this same frame -> "
-          "identical column-set by construction.)")
+    print("  (Printed for manual inspection only -- no automated comparison "
+          "against the optimizer's actual CSV output was performed.)")
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,11 @@ struct LegCfg {
     /// cadence contract, which is what makes a mixed basket (CE weekly + PE
     /// yearly) work. False on every non-yearly path, where it is never read.
     is_yearly: bool,
+    /// Per-December-contract strike-gap schedule: (contract_year, strike_gap),
+    /// mirroring engine_rust.py::_yearly_schedule_row. Empty for every leg
+    /// without a schedule (all existing configs), where it is never read — so
+    /// this is opt-in and byte-identical when absent.
+    yearly_schedule: Vec<(i32, f64)>,
 }
 
 /// Per-leg strike carry policy. Both modes are the same mechanism — resolve a
@@ -286,6 +291,28 @@ fn opens_new_epoch(
     }
     // A weekly/monthly leg re-strikes at EVERY entry.
     true
+}
+
+/// Sticky per-December-contract strike gap for a yearly leg. Mirrors
+/// engine_rust.py::_yearly_schedule_row: the applicable row is the one with the
+/// greatest contract-year <= the held contract's December year; None before the
+/// first row (caller then keeps the leg's base gap — the opt-in / fallback
+/// guarantee). `expiry` is the pinned December date (e.g. "2023-12-28").
+fn yearly_gap(leg: &LegCfg, expiry: &str) -> Option<f64> {
+    if leg.yearly_schedule.is_empty() {
+        return None;
+    }
+    let held: i32 = expiry.get(0..4)?.parse().ok()?;
+    let mut best: Option<(i32, f64)> = None;
+    for &(yr, gap) in &leg.yearly_schedule {
+        if yr <= held {
+            match best {
+                Some((by, _)) if by >= yr => {}
+                _ => best = Some((yr, gap)),
+            }
+        }
+    }
+    best.map(|(_, g)| g)
 }
 
 fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
@@ -451,6 +478,28 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
 
+        // Per-December-contract schedule: parse (contract_year, strike_gap) pairs
+        // so a yearly leg re-strikes on the scheduled gap for each December it
+        // holds. `contract` arrives as a "YYYY" string (frontend) or an int.
+        let yearly_schedule: Vec<(i32, f64)> = leg
+            .get_item("yearly_contract_schedule").ok().flatten()
+            .and_then(|v| v.downcast::<PyList>().ok().map(|lst| {
+                lst.iter().filter_map(|row| {
+                    let d = row.downcast::<PyDict>().ok()?;
+                    let yr = d.get_item("contract").ok().flatten().and_then(|c| {
+                        c.extract::<String>().ok()
+                            .and_then(|s| s.get(0..4).and_then(|y| y.parse::<i32>().ok()))
+                            .or_else(|| c.extract::<i64>().ok().map(|n| n as i32))
+                    })?;
+                    let gap = d.get_item("strike_gap").ok().flatten().and_then(|g| {
+                        g.extract::<f64>().ok()
+                            .or_else(|| g.extract::<i64>().ok().map(|n| n as f64))
+                    })?;
+                    if gap > 0.0 { Some((yr, gap)) } else { None }
+                }).collect()
+            }))
+            .unwrap_or_default();
+
         out.push(LegCfg {
             option_type: leg
                 .get_item("option_type").ok().flatten()
@@ -482,6 +531,7 @@ fn extract_leg_cfgs(payload: &PyDict) -> PyResult<(Vec<LegCfg>, Option<Unsupport
                 "fixed" => StrikeMode::Fixed,
                 _ => StrikeMode::Fresh, // matches the Python default
             },
+            yearly_schedule,
         });
     }
     Ok((out, None))
@@ -1124,6 +1174,35 @@ fn validate_or_shift_strike(
     None
 }
 
+/// Re-validate a CARRIED (Fixed-mode held) strike on a break/foreign-boundary
+/// re-entry. A held strike that is merely `ZeroContracts` — LISTED and priced,
+/// just no turnover that one session (e.g. a deep-OTM yearly hedge on a thin
+/// day) — must be HELD and marked at its close, NOT shifted toward ATM: shifting
+/// silently drifts a Fixed hedge permanently off its strike. Only a genuinely
+/// `Missing` (unlisted) carried strike walks, which is the case the carry
+/// re-validation was written for. Fresh strike SELECTION never comes here, so
+/// the universal liquidity shift on entry/roll/spot-adj is unchanged.
+fn revalidate_carried_strike(
+    carried: f64,
+    atm: f64,
+    interval: f64,
+    is_call: bool,
+    entry_date: &str,
+    expiry: &str,
+    index: &str,
+    opt_type: &str,
+    max_shifts: i32,
+) -> Option<(f64, i32)> {
+    if let crate::OptionDataStatus::ZeroContracts =
+        crate::lookup_option_status(entry_date, index, carried, opt_type, expiry)
+    {
+        return Some((carried, 0)); // priced-but-thin held strike → hold, don't shift
+    }
+    validate_or_shift_strike(
+        carried, atm, interval, is_call, entry_date, expiry, index, opt_type, max_shifts,
+    )
+}
+
 /// ATM CE + PE prices for straddle_width / atm_straddle_prem_pct, using the
 /// TRADEABLE price (filters zero-turnover/stale closes) — a straddle price
 /// built from a dead, untraded contract's stale close silently corrupts the
@@ -1169,6 +1248,55 @@ fn straddle_atm_prices(
             return Some((wc, wp, source));
         }
     }
+    // All 4 fixed anchors are dead (base gap + 3 widened roundings, all still
+    // clustered within a few gap-widths of spot). Do NOT give up here — walk
+    // outward strike-by-strike, in BOTH directions from ATM, at the leg's own
+    // gap, until a strike is found where CE AND PE are BOTH tradeable at once
+    // (a straddle needs both sides at the SAME strike). This is the case that
+    // motivated the fix: on 2020-03-25 the near-ATM strikes were all
+    // zero-turnover, but real NSE volume existed ~700 points out (strike 9000
+    // vs spot ~8318) — the fixed anchors above never look that far because
+    // each is just a coarser rounding of the SAME spot, not an outward search.
+    // Each direction walks independently until it hits the real chain edge
+    // (Missing) or a generous safety cap — never stops early just because the
+    // near side is thin, matching validate_or_shift_strike's own outward walk.
+    use crate::OptionDataStatus;
+    let mut up_alive = true;
+    let mut down_alive = true;
+    let mut step = 1i32;
+    while step <= 2000 && (up_alive || down_alive) {
+        for dir in [1.0f64, -1.0f64] {
+            let alive = if dir > 0.0 { &mut up_alive } else { &mut down_alive };
+            if !*alive {
+                continue;
+            }
+            let candidate = atm + dir * (step as f64) * interval;
+            if candidate <= 0.0 {
+                *alive = false;
+                continue;
+            }
+            let ce_status = crate::lookup_option_status(entry_date, index, candidate, "CE", expiry);
+            let pe_status = crate::lookup_option_status(entry_date, index, candidate, "PE", expiry);
+            if let (OptionDataStatus::Tradeable(cpx), OptionDataStatus::Tradeable(ppx)) =
+                (&ce_status, &pe_status)
+            {
+                if *cpx > 0.0 && *ppx > 0.0 {
+                    let source = format!(
+                        "{}→walk{:+.0}pt (ATM {} zero turnover)",
+                        fmt_g(interval), dir * (step as f64) * interval, missing,
+                    );
+                    return Some((*cpx, *ppx, source));
+                }
+            }
+            // Chain edge: neither side is even listed any further out this way.
+            if matches!(ce_status, OptionDataStatus::Missing)
+                && matches!(pe_status, OptionDataStatus::Missing)
+            {
+                *alive = false;
+            }
+        }
+        step += 1;
+    }
     None
 }
 
@@ -1188,6 +1316,18 @@ fn compute_strike_for_leg(
     strike_shift_max: i32,
     resolved: &HashMap<i64, f64>,
 ) -> Option<(f64, f64)> {
+    // Per-December-contract schedule: a yearly leg re-strikes on the schedule's
+    // gap for the contract it holds (keyed by the spec's December year in
+    // `expiry`), so every spot-adj / breach / roll re-strike stays on the
+    // scheduled grid — the same rule the Python builders apply, now native so
+    // OPTIMIZE_RUST_LOOP=1 matches. Absent schedule → keeps the leg's base gap.
+    let leg_owned;
+    let leg = if let Some(g) = yearly_gap(leg, expiry) {
+        leg_owned = LegCfg { strike_interval: g, ..leg.clone() };
+        &leg_owned
+    } else {
+        leg
+    };
     let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
     let is_call = leg.option_type.eq_ignore_ascii_case("CE")
         || leg.option_type.eq_ignore_ascii_case("CALL")
@@ -1549,6 +1689,11 @@ fn leg_cfg_from_dict(leg: &PyDict) -> Option<LegCfg> {
         // strike lookup has no epoch to carry from.
         rollover_strike_mode: StrikeMode::Fresh,
         is_yearly: false,
+        // Empty: this one-off lookup is driven by the Python schedule builders,
+        // which pass the already-resolved per-contract gap in `strike_interval`,
+        // so re-resolving here would double-apply. The batched resolve_trade_specs
+        // path (extract_leg_cfgs) carries the real schedule.
+        yearly_schedule: Vec::new(),
     })
 }
 
@@ -1756,7 +1901,7 @@ fn resolve_per_leg_core(
                     let is_call = matches!(
                         leg.option_type.to_ascii_uppercase().as_str(), "CE" | "CALL" | "C"
                     );
-                    match validate_or_shift_strike(
+                    match revalidate_carried_strike(
                         carried, atm, leg.strike_interval, is_call, entry_date, leg_expiry,
                         &cfg.index, &leg.option_type, cfg.strike_shift_max,
                     ) {
@@ -1894,7 +2039,7 @@ pub(crate) fn resolve_trade_specs_core(
                             // one, where the strike can go unlisted/illiquid.
                             let atm = (entry_spot / leg.strike_interval).round() * leg.strike_interval;
                             let is_call = matches!(leg.option_type.to_ascii_uppercase().as_str(), "CE" | "CALL" | "C");
-                            match validate_or_shift_strike(
+                            match revalidate_carried_strike(
                                 carried, atm, leg.strike_interval, is_call, entry_date, leg_expiry,
                                 &cfg.index, &leg.option_type, cfg.strike_shift_max,
                             ) {

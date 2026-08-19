@@ -58,6 +58,18 @@ services:
       # Build combo tradesheets in Rust (all 4 sheets in one native call) — matches
       # the main box. Cell-identical to openpyxl; ~1.5x faster real optims. Set 0 to revert.
       OPTIMIZE_RUST_XLSX: "1"
+      # MUST match the main box (docker-compose.yml:244). Unset, engine_rust.py:5774
+      # takes the pre-MIXED_FUT_RUST branch, which drops the OPTION leg from a mixed
+      # FUTURES+OPTIONS strategy — the node returns a futures-only tradesheet.
+      MIXED_FUT_RUST: "1"
+      # Same reason: the main box runs strict Rust-only lookups (docker-compose.yml:139).
+      # Leaving this unset let the node resolve lookups by a different path.
+      FAST_LOOKUP_MODE: "rust"
+      # code_version.py now fingerprints the VALUES of the calc-path env vars, so
+      # these MUST match the main box backend exactly or the node is flagged stale
+      # ("outdated") forever regardless of image freshness. Backend sets both.
+      ENGINE_BACKEND: "rust"
+      BACKTEST_INCLUDE_MAE_MFE: "1"
       BULK_LOAD_MAX_MEMORY_MB: "1500"
       PYTHONOPTIMIZE: "1"
     # The image's default USER (appuser, non-root — backend/Dockerfile:9) can't

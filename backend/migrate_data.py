@@ -983,10 +983,21 @@ def _rewarm_caches_after_import(symbols, max_date) -> None:
         return
     try:
         from worker.tasks import warm_backtest_cache_task
+        # Route through the SAME day-span policy every other caller of this task
+        # uses (routers/backtest.py:_backtest_queue_for_payload,
+        # BACKTEST_FAST_QUEUE_MAX_DAYS=550), instead of hardcoding
+        # "backtests_fast". A 2000-01-01..max_date span is ~25 years — it always
+        # exceeded the threshold, so every full-history rewarm was silently
+        # monopolizing the single-concurrency fast queue (--concurrency=1,
+        # meant for short-range warms so they don't queue behind a real
+        # backtest) instead of landing on the multi-worker slow queue where a
+        # multi-decade rebuild belongs.
+        from routers.backtest import _backtest_queue_for_payload
         for sym in symbols:
+            _warm_payload = {"index": sym, "from_date": "2000-01-01", "to_date": max_date}
             warm_backtest_cache_task.apply_async(
-                args=[{"index": sym, "from_date": "2000-01-01", "to_date": max_date}],
-                queue="backtests_fast",
+                args=[_warm_payload],
+                queue=_backtest_queue_for_payload(_warm_payload),
             )
         logger.info("[CACHE] Queued cache re-warm for %s through %s", symbols, max_date)
     except Exception as e:

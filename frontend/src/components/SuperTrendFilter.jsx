@@ -20,7 +20,19 @@ const formatDate = (date) => {
 
 const formatDateDisplay = (date) => {
   if (!date) return '';
-  return date.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  // parseSegments() builds these Date objects from date-ONLY ISO strings
+  // ('2019-05-10'), which JS parses as UTC midnight. toLocaleDateString()
+  // renders in the browser's LOCAL timezone, so for any client west of UTC
+  // (America/*, etc.) that UTC midnight reads as the PREVIOUS calendar day —
+  // segment previews/badges silently showed one day earlier than the real
+  // boundary, with no error. Reproduced: TZ=America/New_York rendered
+  // '2019-05-10' as 09/05/2019. Read the UTC fields directly instead of
+  // going through the local-timezone-dependent locale formatter — correct
+  // because every Date here is always UTC-midnight by construction.
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = date.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
 };
 
 const SkeletonLine = () => (

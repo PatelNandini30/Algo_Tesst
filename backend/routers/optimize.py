@@ -19,13 +19,15 @@ import json
 import logging
 import os
 import re
+from email.utils import formatdate
 import threading
 import time
 import zipfile
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from services import node_registry
 from services.optimizer import result_store
@@ -43,6 +45,130 @@ from services.index_metadata import validate_index_payload
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ── Resumable downloads ─────────────────────────────────────────────────────
+# Starlette 0.27's FileResponse ignores the Range header entirely (support only
+# landed in 0.45): it answers every request with 200 + the whole body and never
+# sends Accept-Ranges. For a 7.9 GB tradesheet ZIP that means the client must
+# hold one unbroken stream for the entire transfer — a single blip restarts it
+# from byte 0, and no download manager can resume or parallelise. On a LAN PC
+# pulling ~8 GB that is the difference between "downloads" and "never finishes".
+#
+# Serving it from nginx via X-Accel-Redirect would be faster still (sendfile,
+# no Python in the data path), but the frontend container mounts no volumes, so
+# it cannot see /data/cache. This keeps the file path in the backend and costs
+# one chunked read loop.
+_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+_RANGE_CHUNK = 1024 * 1024
+
+
+def _file_response(
+    request: Request,
+    path: str,
+    media_type: str,
+    filename: str,
+) -> Response:
+    """FileResponse + HTTP Range, so large downloads can resume.
+
+    Honours a single `bytes=start-end` range (what browsers and download
+    managers actually send; multipart ranges are not worth the complexity).
+    Without a Range header this is a normal 200 that merely advertises
+    Accept-Ranges, so existing callers are unaffected.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        raise HTTPException(status_code=404, detail="File not found")
+    size = st.st_size
+
+    # A browser only RESUMES a broken transfer if it can first prove the file
+    # did not change underneath it, which means it needs a validator to send
+    # back in If-Range. Accept-Ranges alone makes curl work but leaves Chrome
+    # restarting from zero, so serve a cheap stable ETag on both code paths.
+    etag = f'"{size:x}-{int(st.st_mtime):x}"'
+    last_mod = formatdate(st.st_mtime, usegmt=True)
+    headers = {
+        "X-Filename": filename,
+        "Accept-Ranges": "bytes",
+        "ETag": etag,
+        "Last-Modified": last_mod,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+
+    # If-Range: honour the range only when the validator still matches;
+    # otherwise fall through to a full 200 so the client restarts cleanly
+    # against the new file rather than splicing two different versions.
+    if_range = (request.headers.get("if-range") or "").strip()
+    stale = bool(if_range) and if_range not in (etag, last_mod)
+
+    m = _RANGE_RE.match((request.headers.get("range") or "").strip().lower())
+    if not m or stale:
+        return FileResponse(
+            path, media_type=media_type, filename=filename,
+            headers={"X-Filename": filename, "Accept-Ranges": "bytes",
+                     "ETag": etag, "Last-Modified": last_mod},
+        )
+
+    raw_start, raw_end = m.group(1), m.group(2)
+    if raw_start == "":
+        # Suffix form "bytes=-N" — the LAST n bytes.
+        n = int(raw_end or 0)
+        if n <= 0:
+            raise HTTPException(status_code=416, detail="Invalid range")
+        start, end = max(0, size - n), size - 1
+    else:
+        start = int(raw_start)
+        end = int(raw_end) if raw_end else size - 1
+        end = min(end, size - 1)
+
+    if start >= size or start > end:
+        # 416 MUST carry the real size or the client cannot correct itself.
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+
+    length = end - start + 1
+
+    async def _iter():
+        # Stop reading/sending once the client is gone. Without this, an
+        # aborted Range download of a multi-GB ZIP (tradesheets.zip, WOW/MOM
+        # parts) kept reading the ENTIRE REST of the file off disk and
+        # attempting to send it to a dead socket — granian swallows the
+        # failed send as a warning instead of raising, so nothing stopped the
+        # generator: one aborted 2.5 GB download logged 2500+ "[WARNING] ASGI
+        # transport error: SendError" lines (one per failed 1 MB chunk) and
+        # wasted the matching disk I/O, every time. Checked every chunk, not
+        # just once, since a client can disconnect at any point mid-stream —
+        # the check itself is cheap (an in-memory flag on the ASGI receive
+        # channel), the expensive part (the disk read) is what this skips.
+        #
+        # Disk I/O goes through asyncio.to_thread, not a direct blocking
+        # fh.read() in this async generator. A SYNC generator (the previous
+        # shape) gets its blocking calls moved to a threadpool automatically
+        # by Starlette's StreamingResponse (iterate_in_threadpool) — but an
+        # async generator is trusted to already be non-blocking, so without
+        # to_thread every 1 MB read would run directly on granian's single
+        # event loop (--workers 1) and stall /health and every other request
+        # for the read's duration. to_thread restores the same off-loop
+        # guarantee the sync version had, while still allowing the
+        # is_disconnected() check between reads.
+        remaining = length
+        fh = await asyncio.to_thread(open, path, "rb")
+        try:
+            await asyncio.to_thread(fh.seek, start)
+            while remaining > 0:
+                if await request.is_disconnected():
+                    break
+                chunk = await asyncio.to_thread(fh.read, min(_RANGE_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+        finally:
+            await asyncio.to_thread(fh.close)
+
+    headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    headers["Content-Length"] = str(length)
+    return StreamingResponse(_iter(), status_code=206, media_type=media_type, headers=headers)
 
 
 def _prepared_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -128,9 +254,21 @@ async def preview_optimization(request: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=str(exc))
 
     grid_size = count_combinations(param_specs)
-    # 250 ms per combo observed at P=1 on 2-year NIFTY; divide by actual parallelism.
-    _parallelism = max(1, int(os.environ.get("OPTIMIZE_PARALLELISM", "1") or "1"))
-    est_seconds = int(total * 0.25 / _parallelism)
+    # Calibrated from COMPLETED jobs on this box — task wall-time / combos — not
+    # from a CPU model:
+    #     1,008 combos -> 183.8s  = 0.18 s each
+    #     1,260 combos -> 253.1s  = 0.20 s each
+    #     3,969 combos -> 1695.3s = 0.43 s each        (all at 10-12 workers)
+    # It has to be an end-to-end figure because the serial tail (ZIP, WOW/MOM,
+    # summary) is ~40% of a job and does not shrink with more workers.
+    #
+    # The old form divided a per-combo constant by OPTIMIZE_PARALLELISM. That
+    # double-counted the workers: the constant was already a parallel wall-clock
+    # observation, and OPTIMIZE_PARALLELISM is usually unset in the API container
+    # (so it silently fell back to 1). Between them it predicted 22 min for a
+    # sweep that really takes ~5 h, and 874 min for one that takes ~5 h.
+    _est_per_combo = float(os.environ.get("OPTIMIZE_EST_SECONDS_PER_COMBO", "0.30"))
+    est_seconds = int(total * _est_per_combo)
     return {
         "grid_size": grid_size,
         "planned_runs": total,
@@ -261,6 +399,18 @@ async def resume_optimize_job(job_id: str):
     same param_specs, same expansion order. A job whose combos are all present
     is not re-run — it is simply finalized.
     """
+    # Resume ENQUEUES a real sweep (run_optimize_job.apply_async below), so it
+    # needs the same deploy gate as /optimize/jobs. It was ungated — and resume
+    # is precisely what gets clicked right after an interruption, i.e. right
+    # after a deploy, which is when a sweep is most likely to span two code
+    # versions and report numbers matching neither.
+    from services.maintenance import is_maintenance
+    if is_maintenance():
+        raise HTTPException(
+            status_code=503,
+            detail="System is under maintenance — optimizations are temporarily "
+                   "disabled. Please try again shortly.",
+        )
     meta = result_store.get_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail=f"Unknown optimize job {job_id}")
@@ -396,20 +546,27 @@ async def get_optimize_job(job_id: str):
 
 
 @router.get("/optimize/jobs/{job_id}/results")
-async def get_optimize_results(
+def get_optimize_results(
     job_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=2000),
     sort_by: Optional[str] = None,
     order: str = Query("desc", regex="^(asc|desc)$"),
+    patchwise: bool = Query(True),
 ):
-    """Paginated, sortable result rows. `sort_by` is a summary-dict key."""
+    """Paginated, sortable result rows. `sort_by` is a summary-dict key.
+
+    Patchwise by default, matching every download endpoint — the on-screen table
+    used to show OVERALL while the downloaded file was patchwise, so the same
+    combo read differently in the two places.
+    """
     result = result_store.get_results(
         job_id,
         offset=offset,
         limit=limit,
         sort_key=sort_by,
         descending=(order == "desc"),
+        patchwise=patchwise,
     )
     meta = result_store.get_meta(job_id)
     return {
@@ -419,6 +576,9 @@ async def get_optimize_results(
         "sort_by": sort_by,
         "order": order,
         "total": result["total"],
+        "basis": "patchwise" if patchwise else "overall",
+        "pw_missing": result.get("pw_missing", 0),
+        "leg_presence": result.get("leg_presence") or {},
         "rows": result["rows"],
         "meta": meta,
     }
@@ -429,7 +589,7 @@ async def get_optimize_results(
 # When a user downloads a single combo's tradesheet we compute MAE/MFE here
 # and cache it back to the CSV so the second download is instant.
 
-_ohlc_pandas_cache: Dict[str, "tuple[Any, List[str]]"] = {}
+_ohlc_pandas_cache: Dict[str, "tuple[float, tuple[Any, List[str]]]"] = {}  # key -> (mtime, (ohlc_pd, trading_days))
 _ohlc_pandas_lock = threading.Lock()
 
 
@@ -440,19 +600,30 @@ def _get_ohlc_pandas_for_index(index_str: str):
     datetime64[ms] dates, category strings, float32 prices, int32 strike_r.
     """
     key = index_str.upper()
+    from services import rust_fast_path as _rfp
+    feather = _rfp._cache_root() / f"arrow-v2:bulk:{key}:full" / "options.feather"
+    if not feather.exists():
+        raise FileNotFoundError(f"OHLC feather missing: {feather}")
+    # Keyed on (index, feather mtime), not index alone. A rewarm/rebuild
+    # (rebuild_feather.py / build_cache) REWRITES this same fixed path in
+    # place with fresh data, but this cache never checked for that — the
+    # first download after backend startup pinned a snapshot that every LATER
+    # download kept serving, silently, until the process happened to restart.
+    # Trades past the old feather's cutoff joined no High/Low rows, so MAE/MFE
+    # read 0.0 ("never went adverse") instead of "no data", and Live DD
+    # silently improved — no exception, nothing distinguishing stale from
+    # current. mtime is a local stat() call, no Redis round-trip needed.
+    _mtime = feather.stat().st_mtime
     with _ohlc_pandas_lock:
-        if key in _ohlc_pandas_cache:
-            return _ohlc_pandas_cache[key]
+        _cached = _ohlc_pandas_cache.get(key)
+        if _cached is not None and _cached[0] == _mtime:
+            return _cached[1]
         import pyarrow as _pa
         import pyarrow.ipc as _pa_ipc
         import pyarrow.compute as _pc
         import pandas as _pd
-        from services import rust_fast_path as _rfp
         _pa.set_cpu_count(1)
         _pa.set_io_thread_count(1)
-        feather = _rfp._cache_root() / f"arrow-v2:bulk:{key}:full" / "options.feather"
-        if not feather.exists():
-            raise FileNotFoundError(f"OHLC feather missing: {feather}")
         _t0 = time.time()
         needed = ["Symbol", "Date", "ExpiryDate", "StrikePrice", "OptionType", "High", "Low"]
         reader = _pa_ipc.open_file(str(feather))
@@ -478,8 +649,8 @@ def _get_ohlc_pandas_for_index(index_str: str):
             "[OPTIM_DL] OHLC pandas cached for %s: %d rows, %d trading days in %.2fs",
             key, len(ohlc_pd), len(trading_days), time.time() - _t0,
         )
-        _ohlc_pandas_cache[key] = (ohlc_pd, trading_days)
-        return _ohlc_pandas_cache[key]
+        _ohlc_pandas_cache[key] = (_mtime, (ohlc_pd, trading_days))
+        return ohlc_pd, trading_days
 
 
 def _enrich_tradesheet_with_mae_mfe(csv_path: str, index_str: str) -> bool:
@@ -669,6 +840,10 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
             state["done"] = i + 1
         state["done"] = 0
         state["phase"] = "building"
+        # Combos whose workbook could not be built. In a patchwise ZIP we refuse to
+        # substitute the overall-basis CSV, so the archive must say what is absent
+        # rather than appear complete.
+        _zip_failures: list = []
 
         # Midcap cross-index overlay config (from the run's base payload). When
         # present, each combo XLSX gets the same Midcap/Combined columns + summary
@@ -779,13 +954,40 @@ def _build_zip_blocking(job_id: str, patchwise: bool = False) -> None:
                             arc_base = f"{tradesheets_root}/{label_safe}"
                         if xlsx_bytes is not None:
                             zf.writestr(f"{arc_base}.xlsx", xlsx_bytes)
-                        else:
+                        elif not patchwise:
                             logger.warning("[ZIP] XLSX failed for %s: %s — using CSV",
                                            label_safe, err)
                             csv_path = os.path.join(trades_dir, f"{label_safe}.csv")
                             if os.path.isfile(csv_path):
                                 zf.write(csv_path, f"{arc_base}.csv")
+                        else:
+                            # The per-combo CSV is OVERALL-basis. Dropping it into a
+                            # _patchwise ZIP put a continuous-equity file beside
+                            # per-patch-reset siblings, with only the extension (.csv
+                            # vs .xlsx) hinting at it — the Cumulative/Peak/DD columns
+                            # silently contradict every other combo in the archive.
+                            # Record the failure visibly instead of substituting a
+                            # different basis.
+                            logger.error("[ZIP] XLSX failed for %s: %s — OMITTED from the "
+                                         "patchwise ZIP (its CSV is overall-basis)",
+                                         label_safe, err)
+                            _zip_failures.append((label_safe, str(err)))
                         state["done"] += 1
+
+            if _zip_failures:
+                # A ZIP quietly short of combos looks identical to a complete one.
+                # Name the missing combos inside the archive so the absence travels
+                # with the file.
+                _manifest = [
+                    "These combinations are MISSING from this archive.",
+                    "Their workbook could not be built, and in a patchwise ZIP the",
+                    "per-combo CSV is NOT a substitute (it is overall-basis).",
+                    "",
+                ]
+                _manifest += ["%s\t%s" % (_lbl, _e) for _lbl, _e in _zip_failures]
+                zf.writestr(f"{tradesheets_root}/MISSING_COMBOS.txt", "\n".join(_manifest))
+                logger.error("[ZIP] %d combo(s) omitted from job %s — listed in "
+                             "MISSING_COMBOS.txt", len(_zip_failures), job_id[:8])
 
         os.replace(tmp_path, out_path)
         state["status"] = "ready"
@@ -823,7 +1025,7 @@ async def get_download_base(job_id: str):
 
 
 @router.get("/optimize/jobs/{job_id}/tradesheets.zip")
-async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(True)):
+async def download_tradesheets_zip(request: Request, job_id: str, patchwise: bool = Query(True)):
     """
     Returns the tradesheets ZIP, building it on first request.
 
@@ -834,6 +1036,7 @@ async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(True)):
     Pass ?patchwise=true to get a ZIP where the combined chain resets to 100
     at each FILTER_END boundary (separate on-disk cache from the default build).
     """
+    result_store.mark_job_access(job_id)  # keep this job's cache alive (idle timer)
     # Disk-cache shortcut: if the ZIP already exists, serve it directly even
     # when Redis meta has expired (TTL) or been wiped (e.g., compose down).
     cache_path = _zip_cache_path(job_id, patchwise)
@@ -843,12 +1046,7 @@ async def download_tradesheets_zip(job_id: str, patchwise: bool = Query(True)):
         _level1 = _safe_zip_name(_zip_naming.get("level1", "")) if _zip_naming else ""
         _pw_suffix = "_patchwise" if patchwise else "_overall"
         filename = f"{_level1}{_pw_suffix}.zip" if _level1 else f"optimize_{job_id[:8]}_tradesheets{_pw_suffix}.zip"
-        return FileResponse(
-            cache_path,
-            media_type="application/zip",
-            filename=filename,
-            headers={"X-Filename": filename},
-        )
+        return _file_response(request, cache_path, "application/zip", filename)
 
     meta = result_store.get_meta(job_id)
     if not meta:
@@ -958,29 +1156,149 @@ async def download_optimization_summary(job_id: str, request: Request):
     """
     from services.optimizer.summary_workbook import build_summary_workbook
 
+    result_store.mark_job_access(job_id)  # keep this job's cache alive (idle timer)
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Body must be JSON")
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=400, detail="`rows` must be a non-empty list")
+        # Server-side load. The browser relaying every row back to us costs ~2,746
+        # bytes each: 63,504 combos is a 174 MB POST and 100,000 is 275 MB, both
+        # far past nginx's client_max_body_size (50M), so a big sweep's export
+        # died with a 413 that looked like a broken download.
+        #
+        # This is NOT a second implementation of the sweep-label logic the
+        # docstring warns about — these are the SAME stored rows the caller would
+        # have fetched from /results, read straight back out, plus the same
+        # patchwise override the UI applies before exporting.
+        rows = result_store.get_all_results(job_id)
+        if not rows:
+            raise HTTPException(status_code=404, detail="No results for this job")
+        if bool(payload.get("patchwise", True)):
+            # Delegate to the SAME function the browser calls for the on-screen
+            # table and the manual export (get_optim_summary) instead of a second,
+            # divergent implementation. That function's own CSV-recompute fallback
+            # (used when a combo has no inline summary_pw) covers cases this block
+            # used to miss entirely.
+            _tdir = result_store.get_trades_dir(job_id)
+            _unfixable = sum(
+                1 for r in rows
+                if not r.get("summary_pw")
+                and not os.path.isfile(os.path.join(_tdir, f"{r.get('combo_label_safe') or ''}.csv"))
+            )
+            if _unfixable == len(rows):
+                # HARD FAIL. Every row would carry OVERALL numbers inside a file the
+                # caller asked to be patchwise — and the filename says "_patchwise_".
+                # That is undetectable downstream: row count, columns and entry count
+                # all look right, only the VALUES are from the wrong basis (measured
+                # on job 788dbf1f: DD% -44.66 vs -25.47). Refusing is the only honest
+                # outcome; ask for ?patchwise=false if the overall basis is wanted.
+                raise HTTPException(
+                    status_code=409,
+                    detail=("Patchwise summary unavailable for this job: no combo has "
+                            "patchwise metrics (the pre-built source is missing and no "
+                            "row carries summary_pw). Re-run finalize, rebuild with "
+                            "tools/summary_from_trades.py, or request the overall basis."),
+                )
+            _pw = {x["combo_id"]: x["summary"] for x in (await get_optim_summary(job_id, patchwise=True))["rows"]}
+            for _r in rows:
+                _s = _pw.get(_r.get("combo_id"))
+                if _s:
+                    _r["summary"] = _s
+        _sb = payload.get("sort_by")
+        if _sb:
+            result_store.sort_rows(rows, _sb, str(payload.get("order", "desc")) != "asc")
+        logger.info("[OPTIM] summary.xlsx built server-side for %s (%d rows)",
+                    job_id[:8], len(rows))
     rule_rows = payload.get("rule_rows") or []
     rules_sheet = payload.get("rules_sheet") or None
+    # SERVER-SIDE FALLBACK for the "Rules" sheet.
+    #
+    # build_summary_workbook only adds the tab `if rules_sheet:`, and that block is
+    # derived in the BROWSER (optimSummaryExport.js -> buildRulesSheet(base_payload)).
+    # So the tab silently vanishes whenever the caller can't supply it:
+    #   * any server-side/CLI fetch (curl POST {"patchwise":true}) — every summary
+    #     downloaded that way came out with only the Optimization Summary sheet;
+    #   * a UI download after the job's Redis meta expired (OPTIMIZE_RESULT_TTL,
+    #     24h) — the frontend fetches meta for base_payload, gets nothing, and
+    #     quietly skips Rules.
+    # meta already persists base_payload AND param_specs for exactly this kind of
+    # reconstruction (see runner.init_job's extra={...}), and rules_sheet.py is the
+    # Python mirror of the JS buildRulesSheet, so rebuild it here rather than
+    # shipping an incomplete workbook. Caller-supplied rows always win.
+    if not rules_sheet:
+        try:
+            _meta = result_store.get_meta(job_id) or {}
+            _bp = _meta.get("base_payload") or {}
+            if _bp:
+                from services.optimizer.rules_sheet import build_rules_sheet as _brs
+                # zip_naming.level1 IS the filter's name (frontend buildZipNaming
+                # takes filterName and puts it there) — every other build_rules_sheet
+                # caller uses it. The payload only carries the ID, which is the
+                # useless literal "custom" for an uploaded CSV, so reading it here
+                # is what made this sheet say 'Filter: custom' with no identity.
+                _fname = ((_meta.get("zip_naming") or {}).get("level1")
+                          or _bp.get("filter_label")
+                          or _bp.get("filter") or _bp.get("filter_config") or None)
+                if str(_fname or "").strip().lower() in ("", "none", "no filter"):
+                    _fname = None
+                rules_sheet = _brs(_bp, _fname)
+                # Mirror of the frontend's buildOptimizedParamsRows: which axes were
+                # swept, and over what values. Without it the rebuilt sheet would
+                # describe the strategy but not the sweep.
+                _specs = _meta.get("param_specs") or []
+                if rules_sheet and _specs:
+                    _opt = [["section", f"OPTIMIZED PARAMETERS  ({len(rows)} combinations)"]]
+                    for _sp in _specs:
+                        if not isinstance(_sp, dict) or not _sp.get("path"):
+                            continue
+                        if _sp.get("kind") == "range":
+                            _val = (f"{_sp.get('min')} → {_sp.get('max')} "
+                                    f"step {_sp.get('step')}")
+                        else:
+                            _vals = _sp.get("values") or []
+                            _val = ", ".join(str(v) for v in _vals)
+                            if _vals:
+                                _val += f"  ({len(_vals)})"
+                        _opt.append(["kv", str(_sp.get("path")), _val or "—"])
+                    if len(_opt) > 1:
+                        rules_sheet = list(rules_sheet) + [["spacer"]] + _opt
+                logger.info("[OPTIM] summary.xlsx: rebuilt Rules sheet from meta for %s",
+                            job_id[:8])
+        except Exception as _rs_exc:
+            logger.warning("[OPTIM] summary.xlsx: Rules rebuild failed for %s: %s",
+                           job_id[:8], _rs_exc)
     try:
-        xlsx = build_summary_workbook(rows, rule_rows, rules_sheet=rules_sheet)
+        # CPU-bound (openpyxl) — offload it. This endpoint now handles EVERY
+        # export (step 2 stopped the client relaying rows below a threshold),
+        # so a build running inline on the single granian worker's event loop
+        # would stall /health and every other request for the whole build.
+        xlsx = await run_in_threadpool(build_summary_workbook, rows, rule_rows, rules_sheet=rules_sheet)
     except Exception as exc:
         logger.exception("[OPTIM] summary workbook build failed for %s", job_id)
         raise HTTPException(status_code=500, detail=f"summary build failed: {exc}")
+    # Name it after the sweep, exactly as tradesheets.zip and wow_mom.xlsx do.
+    # A fixed "optimize_summary.xlsx" meant every sweep's summary landed under
+    # the same name, so two of them in one folder silently became
+    # "optimize_summary (1).xlsx" with nothing to say which run it belonged to.
+    _naming = (result_store.get_meta(job_id) or {}).get("zip_naming") or {}
+    _level1 = _safe_zip_name(_naming.get("level1", "")) if _naming else ""
+    _pw_suffix = "_patchwise" if bool(payload.get("patchwise", True)) else "_overall"
+    filename = (f"{_level1}{_pw_suffix}_Summary.xlsx" if _level1
+                else f"optimize_{job_id[:8]}_summary{_pw_suffix}.xlsx")
     return StreamingResponse(
         io.BytesIO(xlsx),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="optimize_summary.xlsx"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Filename": filename,
+        },
     )
 
 
 @router.get("/optimize/jobs/{job_id}/wow_mom.xlsx")
-async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
+async def download_wow_mom(request: Request, job_id: str, patchwise: bool = Query(True)):
     """
     Merged WOW & MOM summary across ALL combos: two sheets ('WOW Summary' +
     'MOM Summary'), each stacking one block per combo (titled by combo label).
@@ -995,6 +1313,7 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
         write_merged_wow_mom, variant_labels, adj_label_from_combo_label,
     )
 
+    result_store.mark_job_access(job_id)  # keep this job's cache alive (idle timer)
     meta = result_store.get_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1004,17 +1323,27 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
     zip_naming = meta.get("zip_naming") or {}
     lvl1 = _safe_zip_name(zip_naming.get("level1", "")) if zip_naming else ""
     _pw_suffix = "_patchwise" if patchwise else "_overall"
-    fname_out = f"{lvl1}{_pw_suffix}_WOW_MOM.xlsx" if lvl1 else f"optimize_{job_id[:8]}{_pw_suffix}_WOW_MOM.xlsx"
+    # Keep the historical strategy-based filename. Job IDs are internal
+    # identifiers and should not leak into the user-facing Excel filename.
+    fname_out = f"{lvl1}{_pw_suffix}_WOW_MOM.xlsx" if lvl1 else f"WOW_MOM{_pw_suffix}.xlsx"
+
+    # Large sweeps ship as a ZIP of part workbooks instead of one file — a single
+    # workbook for 50,176 combos is 164M cells (13-20 GB) and cannot be built,
+    # let alone opened. Check this before the single-workbook cache so a stale
+    # workbook-path artifact can never make a parts archive download as `.xlsx`.
+    parts_zip = result_store.wow_mom_parts_zip_path(job_id, patchwise)
+    if os.path.isfile(parts_zip):
+        zip_name = (fname_out[:-5] if fname_out.lower().endswith(".xlsx") else fname_out) + "_parts.zip"
+        return _file_response(request, parts_zip, "application/zip", zip_name)
 
     # Serve from disk cache if already built — first click builds, every
     # subsequent click is instant.
     cache_path = result_store.wow_mom_cache_path(job_id, patchwise)
     if os.path.isfile(cache_path):
-        return FileResponse(
-            cache_path,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            filename=fname_out,
-            headers={"X-Filename": fname_out},
+        return _file_response(
+            request, cache_path,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            fname_out,
         )
 
     trades_dir = result_store.get_trades_dir(job_id)
@@ -1052,12 +1381,14 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
         raise HTTPException(status_code=404, detail="No combos found for this job.")
 
     combos: List[Dict[str, Any]] = []
+    _wm_dropped: List[str] = []
     for fname in combo_csvs:
         label_safe = fname[:-4]
         try:
             tdf = pd.read_csv(os.path.join(trades_dir, fname))
         except Exception as exc:
             logger.warning("[WOW_MOM] read failed %s: %s", fname, exc)
+            _wm_dropped.append(fname)
             continue
         try:
             cleaned, has_midcap = build_cleaned_for_combo(
@@ -1067,6 +1398,7 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
             )
         except Exception as exc:
             logger.warning("[WOW_MOM] cleaned build failed %s: %s", fname, exc)
+            _wm_dropped.append(fname)
             continue
         cc = cols_by_safe.get(label_safe) or {}
         strike_disp = _wm_strike_display(cc)
@@ -1091,21 +1423,69 @@ async def download_wow_mom(job_id: str, patchwise: bool = Query(True)):
             "yearly": _wm_yearly,
         })
 
-    wb = Workbook()
-    wb.remove(wb.active)
+    if _wm_dropped and os.environ.get("OPTIM_WOW_MOM_ALLOW_PARTIAL") != "1":
+        # No completeness check existed here at all: the axes (adj_seen/
+        # row_order/all_wow_years/all_mom_years in wow_mom.py) are derived from
+        # `combos`, so a dropped combo doesn't just miss one cell — it can
+        # shift which grid cells/rows/columns other combos land under, and
+        # nothing in the workbook says any combo was dropped. A workbook
+        # documented as covering every combo must not silently cover fewer.
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"WOW/MOM: {len(_wm_dropped)}/{len(combo_csvs)} combo(s) could not be "
+                f"read/built and would be silently missing from the grid: "
+                f"{_wm_dropped[:10]}. Set OPTIM_WOW_MOM_ALLOW_PARTIAL=1 to accept a "
+                f"partial grid deliberately, or re-run finalize for this job."
+            ),
+        )
+    if _wm_dropped:
+        logger.warning(
+            "[WOW_MOM] %d/%d combo(s) dropped from the grid (OPTIM_WOW_MOM_ALLOW_PARTIAL=1): %s",
+            len(_wm_dropped), len(combo_csvs), _wm_dropped[:10],
+        )
+
+    # Rust render path, same as the pre-build in runner.py. This is the
+    # on-demand branch — reached when the cached file is missing — and it used to
+    # be the one place a download was still assembled by openpyxl, inside the API
+    # process. Measured 15.6x slower there, so a cache miss on a big sweep tied up
+    # a request worker for minutes.
+    from services.optimizer.wow_mom import _OpsWorkbook
+    import algotest_native as _an
+
+    # Same memory guard as the pre-build in runner.py, and it matters MORE here:
+    # this runs inside the API process, so an OOM takes the whole backend down
+    # with it, not just one worker. ~3,272 cells per combo across the four
+    # sheets; a 50,176-combo sweep needs 13-20 GB and was SIGKILLed.
+    _wm_budget_mb = float(os.environ.get("OPTIM_WOW_MOM_MAX_MB", "3500"))
+    _wm_projected_mb = len(combos) * 3272 * 100 / 1e6
+    if _wm_projected_mb > _wm_budget_mb:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"WOW/MOM for {len(combos)} combos needs ~{_wm_projected_mb/1000:.1f} GB "
+                f"of memory (limit {_wm_budget_mb/1000:.1f} GB). The tradesheets ZIP and "
+                "summary are unaffected — download those instead."
+            ),
+        )
+
+    wb = _OpsWorkbook()
     if not write_merged_wow_mom(wb, combos):
         raise HTTPException(status_code=400, detail="No WOW/MOM data (combos produced 0 trades).")
 
-    # Save to disk cache so subsequent clicks are instant.
+    # Write the cache file, then serve those exact bytes — one render, not two,
+    # and the download can no longer differ from what the cache holds.
+    tmp_path = cache_path + ".building"
+    _an.write_layout_workbook_xlsx(wb.to_ops(), tmp_path)
     try:
-        tmp_path = cache_path + ".building"
-        wb.save(tmp_path)
         os.replace(tmp_path, cache_path)
+        _served = cache_path
     except Exception as _ce:
         logger.warning("[WOW_MOM] cache write failed for %s: %s", job_id[:8], _ce)
+        _served = tmp_path
 
-    buf = io.BytesIO()
-    wb.save(buf)
+    with open(_served, "rb") as _fh:
+        buf = io.BytesIO(_fh.read())
     buf.seek(0)
 
     return StreamingResponse(
@@ -1124,6 +1504,7 @@ async def download_combo_tradesheet(job_id: str, combo_id: int):
     Return the tradesheet CSV for a single combination, looked up by combo_id.
     The CSV is fetched on-demand — no re-run needed, file was written during the job.
     """
+    result_store.mark_job_access(job_id)  # keep this job's cache alive (idle timer)
     meta = result_store.get_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1176,7 +1557,7 @@ async def download_combo_tradesheet(job_id: str, combo_id: int):
 
 @router.get("/optimize/jobs/{job_id}/combo/{combo_id}/tradesheet.xlsx")
 async def download_combo_tradesheet_xlsx(
-    job_id: str, combo_id: int, patchwise: bool = Query(False)
+    request: Request, job_id: str, combo_id: int, patchwise: bool = Query(True)
 ):
     """
     Return the styled XLSX tradesheet for a single combination — the EXACT same
@@ -1185,9 +1566,10 @@ async def download_combo_tradesheet_xlsx(
     the ZIP entry); otherwise builds it on-demand via the same code path the
     sweep uses (result_store.write_combo_xlsx), caches it to disk, and serves it.
 
-    ?patchwise=true serves the per-patch-reset variant (patchwise/ subdir),
-    matching the patchwise ZIP; default false = overall.
+    Defaults to the per-patch-reset variant (patchwise/ subdir), matching the
+    patchwise ZIP and every other download endpoint. ?patchwise=false opts out.
     """
+    result_store.mark_job_access(job_id)  # keep this job's cache alive (idle timer)
     meta = result_store.get_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1276,12 +1658,23 @@ async def download_combo_tradesheet_xlsx(
                     rules_sheet=_dl_rules_sheet,
                 )
             else:
+                # zip_naming.level1 IS the filter's name (see the patchwise branch
+                # above) — omitting it here made this endpoint's own comment false
+                # ("SAME builder the ZIP uses so the output is identical to the ZIP
+                # entry"): filter_name gates whether build_combo_xlsx emits the
+                # 'Patch wise' sheet, so an on-demand OVERALL download of a
+                # filtered job silently had one fewer sheet than the ZIP's copy of
+                # the exact same combo. Demonstrated: filter_name='' -> no sheet,
+                # filter_name set -> sheet present (excel_builder.py's want_patch).
+                _zip_naming = meta.get("zip_naming") or {}
+                _overall_filter_name = (_zip_naming.get("level1") or "") if _zip_naming else ""
                 result_store.write_combo_xlsx(
                     job_id, combo_label_safe, tdf, row.get("summary") or {},
                     combo_label=combo_label, from_date=from_date, to_date=to_date,
                     index_str=index_str, trading_days=trading_days,
                     midcap_legs=midcap_legs, midcap_spot_adjustment=midcap_sa,
-                    midcap_symbol=midcap_sym, filter_segments=filter_segments,
+                    midcap_symbol=midcap_sym, filter_name=_overall_filter_name,
+                    filter_segments=filter_segments,
                     yearly=_dl_yearly,
                     rules_sheet=_dl_rules_sheet,
                 )
@@ -1293,11 +1686,10 @@ async def download_combo_tradesheet_xlsx(
 
     _pw = "_patchwise" if patchwise else ""
     filename = f"combo_{combo_id}_{combo_label_safe[:60]}{_pw}.xlsx"
-    return FileResponse(
-        xlsx_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=filename,
-        headers={"X-Filename": filename},
+    return _file_response(
+        request, xlsx_path,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename,
     )
 
 
@@ -1347,6 +1739,7 @@ async def get_optim_summary(job_id: str, patchwise: bool = Query(True)):
         import pandas as pd
         from services.optimizer.excel_builder import compute_xlsx_summary_metrics as _cmetrics
         out = []
+        _fell_back = []  # combo_ids that got OVERALL metrics under a patchwise request
         for r in all_results:
             _stored = r.get("summary") or {}
             # Fast path: patchwise metrics already computed inline in the worker.
@@ -1362,6 +1755,7 @@ async def get_optim_summary(job_id: str, patchwise: bool = Query(True)):
                     "[OPTIM_DL] no inline patchwise summary and no CSV for %s; "
                     "serving OVERALL summary for this combo", _ls or "<unlabeled>",
                 )
+                _fell_back.append(r.get("combo_id"))
                 out.append({"combo_id": r.get("combo_id"), "summary": _stored})
                 continue
             try:
@@ -1375,11 +1769,26 @@ async def get_optim_summary(job_id: str, patchwise: bool = Query(True)):
                 out.append({"combo_id": r.get("combo_id"), "summary": {**_stored, **_m}})
             except Exception as _e:
                 logger.warning("[OPTIM_DL] patchwise summary skipped for %s: %s", _ls, _e)
+                _fell_back.append(r.get("combo_id"))
                 out.append({"combo_id": r.get("combo_id"), "summary": _stored})
-        return out
+        return out, _fell_back
 
-    rows = await asyncio.get_event_loop().run_in_executor(None, _build)
-    return {"rows": rows}
+    rows, pw_missing_ids = await asyncio.get_event_loop().run_in_executor(None, _build)
+    if pw_missing_ids:
+        # Not a hard-fail here — this endpoint also serves the LIVE on-screen
+        # table while a job is still finalizing, and a temporary miss for a few
+        # combos must not break the whole panel. But the response used to give
+        # NO way for a caller to tell "all patchwise" from "some rows are
+        # silently OVERALL under a patchwise combo_id" — every downstream
+        # consumer must be able to make that distinction rather than treat the
+        # response as uniformly patchwise. POST /summary.xlsx's own hard 409
+        # check is independent of this field.
+        logger.warning(
+            "[OPTIM_DL] /summary patchwise=true: %d/%d combos fell back to "
+            "OVERALL metrics for %s: %s",
+            len(pw_missing_ids), len(rows), job_id[:8], pw_missing_ids[:10],
+        )
+    return {"rows": rows, "pw_missing": len(pw_missing_ids), "pw_missing_combo_ids": pw_missing_ids[:20]}
 
 
 @router.delete("/optimize/jobs/{job_id}")

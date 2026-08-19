@@ -66,110 +66,179 @@ const formatDateToDdMmYyyy = (value) => {
   return value;
 };
 
+// Mirrors backend/services/optimizer/combo_labeler.py's _INDEX_ABBREV /
+// _MIDCAP_SYM_ABBREV / _EXPIRY_FILENAME_CODE so a standalone backtest filename
+// and an optimizer combo filename read identically for the same strategy.
+// Token scheme is FILENAME_FORMAT.md (see the shared drive doc); everything
+// below reads real field names off StrategyBuilder.jsx's raw leg state, which
+// this component receives as `config.legs` (buildStrategyConfigSnapshot).
+const INDEX_ABBREV = { NIFTY: 'NF', BANKNIFTY: 'BNF', FINNIFTY: 'FNF', MIDCPNIFTY: 'MCN' };
+const MIDCAP_SYM_ABBREV = { MIDCAP100: 'MC100' };
+// FILENAME_FORMAT.md only defines W/NW/M/NM — YEARLY is an EOD-only cadence
+// its source repo doesn't have, so 'Y' is a local extension.
+const EXPIRY_ABBREV = {
+  weekly: 'W', weekly_expiry: 'W',
+  monthly: 'M', monthly_expiry: 'M',
+  yearly: 'Y',
+  next_weekly: 'NW', weekly_t1: 'NW',
+  next_monthly: 'NM', monthly_t1: 'NM',
+};
+const indexAbbrev = (sym) => {
+  const s = String(sym || 'NIFTY').toUpperCase();
+  return INDEX_ABBREV[s] || s;
+};
+const expiryAbbrev = (raw) => {
+  const key = String(raw || '').trim().toLowerCase();
+  return EXPIRY_ABBREV[key] || (raw ? String(raw).toUpperCase() : 'W');
+};
+
+// Numbers: integers stay whole; else trimmed to <=2 decimals (0.30 -> 0.3).
+const fmtNum = (v) => {
+  const n = Number(v) || 0;
+  return Number.isInteger(n) ? String(n) : parseFloat(n.toFixed(2)).toString();
+};
+// unit(basis): a basis string containing "pct"/"percent" -> 'pct', else 'pts'.
+// This repo spells its mode enums PERCENT/POINTS rather than pct/pts, so the
+// check is a substring match on the lowercased raw value either way.
+const unitOf = (basis) => {
+  const b = String(basis || '').toLowerCase();
+  return (b.includes('pct') || b.includes('percent')) ? 'pct' : 'pts';
+};
+const REENTRY_MODE = {
+  RE_ASAP: 'asap', RE_ASAP_REV: 'asaprev',
+  RE_MOMENTUM: 'momentum', RE_MOMENTUM_REV: 'momentumrev',
+  LAZY_LEG: 'lazy',
+};
+const reentryMode = (mode) => REENTRY_MODE[String(mode || '').toUpperCase()] || 'asap';
+const sideCode = (position) => {
+  const p = String(position || '').toLowerCase();
+  if (p.startsWith('b') || p === 'long') return 'B';
+  return 'S';
+};
+
+// Strike-criteria token, per FILENAME_FORMAT.md's table (initials + value).
+// Two things the spec doesn't cover, because this app has them and the doc's
+// source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing — extends the
+// spec's own RtL prefix with a _G{gaps} suffix, alongside its _TV/_D) and
+// Delta-basis anything (no delta strike mode exists here at all, confirmed
+// absent from StrategyBuilder.jsx, so 'D'/'_D' tokens never appear).
+const strikeCriteriaToken = (leg) => {
+  const criteria = leg.strike_criteria || 'strike_type';
+  if (criteria === 'closest_premium') return `CP${fmtNum(leg.premium_value)}`;
+  if (criteria === 'premium_gte') return `Pgte${fmtNum(leg.premium_value)}`;
+  if (criteria === 'premium_lte') return `Plte${fmtNum(leg.premium_value)}`;
+  if (criteria === 'premium_range') return `PR${fmtNum(leg.premium_min)}_${fmtNum(leg.premium_max)}`;
+  if (criteria === 'straddle_width') return `SW${fmtNum(leg.straddle_multiplier ?? 0.5)}`;
+  if (criteria === 'pct_of_atm') {
+    const moneyness = (leg.pct_atm_moneyness || 'OTM').toUpperCase();
+    return `pctoA${fmtNum(leg.pct_value)}_${moneyness}`;
+  }
+  if (criteria === 'atm_straddle_prem_pct') return `ASP${fmtNum(leg.atm_straddle_prem_pct)}pct`;
+  if (criteria === 'synthetic_future') return 'SF';
+  if (criteria === 'rel_leg') return `RtL${Number(leg.ref_leg) || 1}_G${fmtNum(leg.offset)}`;
+  if (criteria === 'rel_leg_premium') return `RtL${Number(leg.ref_leg) || 1}`;
+  if (criteria.startsWith('time_value')) {
+    const base = criteria === 'time_value_gte' ? 'TVgte' : criteria === 'time_value_lte' ? 'TVlte' : 'TV';
+    const side = String(leg.tv_moneyness || 'ATM').toUpperCase();
+    const cap = Number(leg.tv_range_pct) || 0;
+    return `${base}${fmtNum(leg.premium_value)}${unitOf(leg.tv_units)}` +
+      (side !== 'ATM' ? `_${side}` : '') +
+      (cap ? `_rng${fmtNum(cap)}pct` : '');
+  }
+  return String(leg.strike_type || 'ATM').toUpperCase().replace(/\s+/g, '');
+};
+
+// "On" toggle tokens, appended only when active, in FILENAME_FORMAT.md's
+// order. This app has no Breakeven / Wait&Trade / Scale&Trade leg controls
+// (confirmed absent — intraday-only features), so those three are skipped
+// entirely; Volume Filter and Roll Forward are never named, per spec.
+const onToggleTokens = (leg) => {
+  const out = [];
+  if (leg.target_enabled && Number(leg.target_value) > 0) {
+    out.push(`TP${fmtNum(leg.target_value)}${unitOf(leg.target_mode)}`);
+  }
+  if (leg.stop_loss_enabled && Number(leg.stop_loss_value) > 0) {
+    out.push(`SL${fmtNum(leg.stop_loss_value)}${unitOf(leg.stop_loss_mode)}`);
+  }
+  if (leg.trail_sl_enabled) {
+    out.push(`TS${fmtNum(leg.trail_sl_trigger)}_${fmtNum(leg.trail_sl_move)}${unitOf(leg.trail_sl_mode)}`);
+  }
+  if (leg.sl_buffer_enabled && Number(leg.sl_buffer_value) > 0) {
+    out.push(`SLB${fmtNum(leg.sl_buffer_value)}${unitOf(leg.sl_buffer_mode)}_${fmtNum(leg.sl_buffer_pct)}pct`);
+  }
+  if (leg.re_entry_sl_enabled) {
+    out.push(`RoS${fmtNum(leg.re_entry_sl_count)}${reentryMode(leg.re_entry_sl_mode)}`);
+  }
+  if (leg.re_entry_target_enabled) {
+    out.push(`RoT${fmtNum(leg.re_entry_target_count)}${reentryMode(leg.re_entry_target_mode)}`);
+  }
+  return out;
+};
+
+// Per-leg adjustment token. This app only has "Spot Adjustment" as a leg-own
+// sub-trigger — no Spot-vs-Strike / Adjustment-Relative-to-Leg controls exist
+// here (confirmed absent from StrategyBuilder.jsx) — so `spot_adj_enabled`
+// doubles as both the spec's adjOn parent and the sub-trigger.
+const adjustmentToken = (leg) => {
+  if (!leg.spot_adj_enabled) return null;
+  const dir = ['rise', 'fall', 'both'].includes(leg.spot_adj_direction) ? leg.spot_adj_direction : 'rise';
+  return `adj_${dir}_${fmtNum(leg.spot_adj_value)}${unitOf(leg.spot_adj_units)}`;
+};
+
 const buildExcelFileName = (config) => {
   if (!config) return `backtest.xlsx`;
 
-  const parts = [config.instrument || 'backtest'];
+  const parts = [];
 
-  const _stratIdx = String(config.instrument || '').toUpperCase();
-  // Same-type leg counts (CE/PE) — when a strategy has 2+ legs of the same
-  // option type (e.g. Monthly PE + Weekly PE), each leg's filename segment
-  // gets an L{n} tag below so the name doesn't collapse into two identical-
-  // looking "SELL_PE_SW_..." runs that don't say which leg is which.
-  const _typeCounts = {};
-  (config.legs || []).forEach(l => {
-    if ((l.segment || '') === 'futures' || (l.segment || '') === 'midcap100') return;
-    const o = (l.option_type || '').toLowerCase();
-    const ot = o === 'call' ? 'CE' : o === 'put' ? 'PE' : o.toUpperCase();
-    if (ot) _typeCounts[ot] = (_typeCounts[ot] || 0) + 1;
-  });
-  (config.legs || []).forEach((leg, _legPos) => {
-    // Multi-index: tag a cross-index leg with its own index so the export name
-    // reflects it (e.g. ...+MIDCPNIFTY-BUY-FUT-MONTHLY). Same-index legs unchanged.
+  const _stratIdx = String(config.instrument || 'NIFTY').toUpperCase();
+  parts.push(_stratIdx);
+  (config.legs || []).forEach((leg) => {
     const _legIdx = String(leg.index || _stratIdx).toUpperCase();
-    if (leg.segment !== 'midcap100' && _legIdx && _legIdx !== _stratIdx) {
-      parts.push(_legIdx);
-    }
     if (leg.segment === 'midcap100') {
-      // Cross-index Midcap leg — name it by position + symbol + pricing mode,
-      // e.g. BUY_MIDCAP100_Hypothetical_Future  /  SELL_MIDCAP100_Spot.
+      // Cross-index Midcap overlay leg — not an options/futures "leg" in
+      // FILENAME_FORMAT.md's sense at all, so this block is unchanged.
       parts.push((leg.position || 'buy').toUpperCase());
-      const sym = (leg.symbol || 'NIFTYMIDCAP100').toUpperCase().replace('NIFTY', '');
-      parts.push(sym || 'MIDCAP100');
+      const sym = (leg.symbol || 'NIFTYMIDCAP100').toUpperCase().replace('NIFTY', '') || 'MIDCAP100';
+      parts.push(MIDCAP_SYM_ABBREV[sym] || sym);
       const mode = (leg.midcap_mode || 'hypothetical').toLowerCase();
-      parts.push(mode === 'hypothetical' ? 'Hypothetical_Future' : 'Spot');
+      parts.push(mode === 'hypothetical' ? 'Hypothetical_Future_Mnly' : 'Spot');
       return;
     }
+
+    const _lots = Math.round(Number(leg.lot ?? leg.lots ?? 1));
+    // Not in FILENAME_FORMAT.md — kept so a lots-only sweep still gets a
+    // distinct filename (otherwise two combos differing only in lots collide
+    // and overwrite each other in the ZIP).
+    const lotsToken = (Number.isFinite(_lots) && _lots > 1) ? `${_lots}lt` : null;
+    // Leg's own index — only shown when it differs from the strategy default
+    // (multi-index feature; FILENAME_FORMAT.md's source repo is single-index
+    // and has no such token, so a normal single-index run stays byte-identical
+    // to the spec's worked examples).
+    const idxTok = _legIdx !== _stratIdx ? indexAbbrev(_legIdx) : null;
+
     if (leg.segment === 'futures') {
-      parts.push((leg.position || 'sell').toUpperCase());
-      parts.push('FUT');
-      const exp = (leg.expiry || '').toUpperCase().replace('_', '');
-      if (exp) parts.push(exp);
-    } else {
-      const opt = (() => {
-        const o = (leg.option_type || '').toLowerCase();
-        if (o === 'call') return 'CE';
-        if (o === 'put') return 'PE';
-        return o.toUpperCase();
-      })();
-      // Only when 2+ legs share this option type (e.g. Monthly PE + Weekly PE)
-      // — a single CE/single PE strategy's filename is byte-identical to before.
-      if (opt && (_typeCounts[opt] || 0) > 1) parts.push(`L${_legPos + 1}`);
-      parts.push((leg.position || 'sell').toUpperCase());
-      if (opt) parts.push(opt);
-      const criteria = leg.strike_criteria || 'strike_type';
-      if (criteria === 'pct_of_atm') {
-        const pctVal = leg.pct_value != null ? parseFloat(leg.pct_value) : 0;
-        const moneyness = (leg.pct_atm_moneyness || 'OTM').toUpperCase();
-        const pctStr = Number.isInteger(pctVal) ? String(pctVal) : parseFloat(pctVal.toFixed(2)).toString();
-        parts.push(`ATM_${pctStr}PCT_${moneyness}`);
-      } else if (criteria === 'atm_straddle_prem_pct') {
-        parts.push('STRADDLE');
-      } else if (criteria === 'straddle_width') {
-        const mult = leg.straddle_multiplier != null ? parseFloat(leg.straddle_multiplier) : 0.5;
-        const multStr = Number.isInteger(mult) ? String(mult) : parseFloat(mult.toFixed(2)).toString();
-        // The engine's +/- sign is a raw offset applied identically to every
-        // leg (no CE/PE meaning at the engine level) — but for the filename,
-        // translate it into ITM/OTM per option_type, matching combo_labeler.py:
-        //   CE '+' (above ATM) = OTM   |   CE '-' (below ATM) = ITM
-        //   PE '-' (below ATM) = OTM   |   PE '+' (above ATM) = ITM
-        const _isCall = opt === 'CE';
-        const _aboveAtm = (leg.straddle_direction || '+').trim() !== '-';
-        const moneyness = mult === 0 ? 'ATM' : (_aboveAtm ? (_isCall ? 'OTM' : 'ITM') : (_isCall ? 'ITM' : 'OTM'));
-        parts.push(`SW_${multStr}X_${moneyness}`);
-      } else if (criteria === 'rel_leg') {
-        // Relative-to-Leg (Iron Condor wing): reflect parent + offset in gaps,
-        // e.g. REL_L1_2G  /  REL_L3_-1G — instead of a misleading "ATM".
-        const ref = Number(leg.ref_leg) || 1;
-        const off = Number(leg.offset) || 0;
-        parts.push(`REL_L${ref}_${off}G`);
-      } else if (criteria.startsWith('time_value')) {
-        // 'TV100' / 'TV100_GTE' / 'TV100_LTE' — same token combo_labeler.py
-        // writes, so an optim combo folder matches a standalone backtest file.
-        const tv = leg.premium_value != null ? parseFloat(leg.premium_value) : 0;
-        const tvStr = Number.isInteger(tv) ? String(tv) : parseFloat(tv.toFixed(2)).toString();
-        const suffix = criteria === 'time_value_gte' ? '_GTE'
-          : criteria === 'time_value_lte' ? '_LTE' : '';
-        const side = String(leg.tv_moneyness || 'ATM').toUpperCase();
-        const cap = Number(leg.tv_range_pct) || 0;
-        // Unit always spelled out (PTS/PCT); range cap gets its own RNG
-        // token so the two percentages in a name can't be confused.
-        const unit = String(leg.tv_units || 'points') === 'percent' ? 'PCT' : 'PTS';
-        parts.push(`TV${tvStr}${unit}${suffix}_${side}` + (cap ? `_RNG${cap}PCT` : ''));
-      } else {
-        parts.push((leg.strike_type || 'atm').toUpperCase());
-      }
-      const exp = (leg.expiry || '').toUpperCase().replace('_', '');
-      if (exp) parts.push(exp);
+      const legParts = [];
+      if (idxTok) legParts.push(idxTok);
+      legParts.push('M', sideCode(leg.position), 'FUT');
+      if (lotsToken) legParts.push(lotsToken);
+      parts.push(legParts.join('_'));
+      return;
     }
-    const fmtVal = v => Number.isInteger(v) ? String(v) : parseFloat(Number(v).toFixed(2)).toString();
-    if (leg.sl_buffer_enabled && leg.sl_buffer_value > 0 && leg.sl_buffer_pct > 0) {
-      const modeSuffix = (leg.sl_buffer_mode || 'POINTS').includes('PERCENT') ? '%' : 'PTS';
-      parts.push(`SL_${fmtVal(leg.sl_buffer_value)}${modeSuffix}_Buffer_${fmtVal(leg.sl_buffer_pct)}%`);
-    } else if (leg.stop_loss_enabled && leg.stop_loss_value > 0) {
-      const modeSuffix = (leg.stop_loss_mode || 'POINTS').includes('PERCENT') ? '%' : 'PTS';
-      parts.push(`SL_${fmtVal(leg.stop_loss_value)}${modeSuffix}`);
-    }
+
+    const opt = (() => {
+      const o = (leg.option_type || '').toLowerCase();
+      if (o === 'call') return 'CE';
+      if (o === 'put') return 'PE';
+      return o.toUpperCase();
+    })();
+    const legParts = [];
+    if (idxTok) legParts.push(idxTok);
+    legParts.push(expiryAbbrev(leg.expiry), opt, sideCode(leg.position), strikeCriteriaToken(leg));
+    if (lotsToken) legParts.push(lotsToken);
+    legParts.push(...onToggleTokens(leg));
+    const adjTok = adjustmentToken(leg);
+    if (adjTok) legParts.push(adjTok);
+    parts.push(legParts.join('_'));
   });
 
   const entry = config.entryDaysBefore != null ? `T${config.entryDaysBefore}` : null;
@@ -214,7 +283,8 @@ const buildExcelFileName = (config) => {
     parts.push(`Midcap_Spot_Adjustment_${saDir}${valStr ? `_${valStr}${unit}` : ''}`);
   }
 
-  return parts.join('_') + '.xlsx';
+  // FILENAME_FORMAT.md: strip anything that isn't A-Z a-z 0-9 . _ - after joining.
+  return parts.join('_').replace(/[^A-Za-z0-9._-]/g, '') + '.xlsx';
 };
 
 
@@ -1084,8 +1154,13 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 
                 <div className="border-b border-default pb-2">
                   <p className="font-bold text-primary mb-0.5">Average Profit per Trade</p>
+                  {/* was stats.avgWinPct (avg % of WINNING trades only) — identical
+                      to the "Average Profit on Winning Trades" tile below it, and
+                      unit-mismatched (this label is rupees per backend's
+                      avg_profit_per_trade = total_pnl / count over ALL trades,
+                      computed at line ~639 but never rendered until now). */}
                   <p className="font-normal text-primary">
-                    {stats.avgWinPct >= 0 ? '+' : ''}{Math.abs(stats.avgWinPct).toFixed(2)}%
+                    {stats.avgProfitPerTrade >= 0 ? '+' : '-'}₹{Math.abs(stats.avgProfitPerTrade).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
                   </p>
                 </div>
                 
@@ -1133,7 +1208,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 
                 <div className="border-b border-default pb-2">
                   <p className="font-bold text-primary mb-0.5">CAR/MDD</p>
-                  <p className="font-normal text-primary">{(Math.abs(stats.maxDDPct) > 0 ? (stats.cagr / 100) / Math.abs(stats.maxDDPct) : 0).toFixed(4)}</p>
+                  <p className="font-normal text-primary">{(Math.abs(stats.maxDDPct) > 0 ? stats.cagr / Math.abs(stats.maxDDPct) : 0).toFixed(2)}%</p>
                 </div>
                 
                 <div className="border-b border-default pb-2">

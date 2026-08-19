@@ -34,6 +34,7 @@ Usage:
 """
 
 import os
+import glob
 import json
 import hashlib
 import logging
@@ -52,6 +53,15 @@ def _compute_engine_version() -> str:
     Auto-generate cache version from calculation-path file hashes.
     Any code change to the engine or fast lookup wrappers automatically
     invalidates cached results on the next Docker build.
+
+    The Rust engine is hashed via the COMPILED .so, not an enumerated list of
+    .rs source files — a hand-curated file list silently misses any source
+    file not named in it (e.g. a fix landing in native/src/simulate.rs was
+    invisible to this cache version because only native/src/lib.rs was listed
+    here, so Redis kept serving pre-fix results for already-cached date ranges
+    even after the engine itself was rebuilt and redeployed). Hashing the .so
+    directly covers every Rust change automatically, regardless of which
+    source file it lands in.
     """
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     hash_paths = [
@@ -65,8 +75,8 @@ def _compute_engine_version() -> str:
         os.path.join(root, 'services', 'multi_index_feature.py'),
         os.path.join(root, 'services', 'leg_filter.py'),
         os.path.join(root, 'services', 'trade_anchor.py'),
-        os.path.join(root, 'native', 'src', 'lib.rs'),
     ]
+    so_globs = ('/usr/local/lib/python*/site-packages/algotest_native*.so',)
     try:
         hasher = hashlib.md5()
         for path in hash_paths:
@@ -75,6 +85,11 @@ def _compute_engine_version() -> str:
             hasher.update(os.path.relpath(path, root).encode("utf-8"))
             with open(path, 'rb') as f:
                 hasher.update(f.read())
+        for pat in so_globs:
+            for so in sorted(glob.glob(pat)):
+                hasher.update(os.path.basename(so).encode("utf-8"))
+                with open(so, 'rb') as f:
+                    hasher.update(f.read())
         digest = hasher.hexdigest()[:8]
         logger.info(f"[REDIS] Cache version (calculation hash): {digest}")
         return digest

@@ -13,57 +13,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, X, Loader2, Settings, ArrowDown, ArrowUp, FileDown } from 'lucide-react';
 import { MASTER_SUMMARY_COLUMNS } from '../utils/strategyParamSchema';
-import { buildSummaryWorkbookBlob, rulesFilename, triggerBlobDownload } from '../utils/optimSummaryExport';
+import { buildSummaryWorkbookBlob, rulesFilename, triggerBlobDownload, downloadWhenReady } from '../utils/optimSummaryExport';
 import { resolveDownloadBase } from '../utils/downloadBase';
 
 const POLL_MS = 1500;
-const FETCH_LIMIT = 500;
+// NO row cap anywhere: the table and the export both show every combination,
+// however large the sweep. The old FETCH_LIMIT=500 silently truncated both —
+// a 1512-combo sweep exported only Sr.No 1..500.
+const LIVE_REFRESH_MS = 8000;   // how often the LIVE table re-pulls (not a row cap)
 
 // Build a human-readable column header from a payload path like
 // "legs.0.stopLoss.value" → "Leg 1 SL %".
-function friendlyParamLabel(path) {
-  if (!path) return '';
-  const parts = String(path).split('.');
-  // legs.<i>.<field>.value | trigger | move | mode | etc.
-  if (parts[0] === 'legs' && parts.length >= 3) {
-    const idx = Number(parts[1]);
-    const field = parts[2];
-    const sub = parts[3] || '';
-    const legName = `Leg ${isFinite(idx) ? idx + 1 : '?'}`;
-    const friendlyField = {
-      stopLoss: 'SL',
-      targetProfit: 'TP',
-      trailSL: 'Trail',
-      slWithBuffer: 'SLB',
-      lots: 'Lots',
-      strike_interval: 'Strike Interval',
-      strike_selection: 'Strike',
-    }[field] || field;
-    const friendlySub = sub === 'value' ? '%'
-      : sub === 'trigger' ? 'Trigger'
-      : sub === 'move' ? 'Move'
-      : sub === 'mode' ? 'Mode'
-      : sub === 'buffer_pct' ? 'Buffer %'
-      : sub ? sub : '';
-    return [legName, friendlyField, friendlySub].filter(Boolean).join(' ');
-  }
-  // Top-level keys
-  const FRIENDLY_TOP = {
-    entry_dte: 'Entry DTE',
-    exit_dte: 'Exit DTE',
-    slippage_pct: 'Slippage %',
-    overall_sl_value: 'Overall SL',
-    overall_target_value: 'Overall TP',
-    buffer_strike_value: 'Buffer Strike',
-    spot_adjustment_pct: 'Spot Adj',
-    spot_adjustment_direction: 'Spot Adj Dir',
-  };
-  if (FRIENDLY_TOP[path]) return FRIENDLY_TOP[path];
-  // Fallback: title-case the dotted path
-  return parts
-    .map((p) => p.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()))
-    .join(' ');
-}
 
 export default function OptimizationResults({
   jobId,
@@ -80,6 +40,16 @@ export default function OptimizationResults({
   const [rows, setRows] = useState([]);
   const [sortKey, setSortKey] = useState(defaultObjective || 'total_pnl');
   const [order, setOrder] = useState('desc');
+  // PAGED, not the whole sweep. Holding and rendering every combo (previously
+  // 93.7 MB of row JSON + ~600k DOM cells at 21,168 combos, ~222 MB / 1.4M
+  // cells at 50,176) is what OOM'd the tab. The table shows PAGE_SIZE rows at
+  // a time; export/download/auto-download all go through the server-built
+  // workbook path (buildSummaryWorkbookBlob), which never fetches rows into
+  // the browser at all.
+  const [offset, setOffset] = useState(0);
+  const [totalRows, setTotalRows] = useState(0);
+  const [serverLegPresence, setServerLegPresence] = useState(null);
+  const PAGE_SIZE = 100;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [downloadingRows, setDownloadingRows] = useState(new Set());
@@ -161,7 +131,7 @@ export default function OptimizationResults({
     const title = status === 'failed' ? 'Optimization failed' : 'Optimization complete';
     const body = status === 'failed'
       ? 'Your parameter sweep hit an error — open the panel to see details.'
-      : `Your parameter sweep finished — ${rows.length || meta?.total || ''} combos ready to review.`;
+      : `Your parameter sweep finished — ${totalRows || meta?.total || ''} combos ready to review.`;
     if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
       try { new Notification(title, { body }); } catch {}
     }
@@ -179,17 +149,34 @@ export default function OptimizationResults({
 
   const fetchAll = useCallback(async () => {
     if (!jobId) return;
-    const url = `/api/optimize/jobs/${jobId}/results?offset=0&limit=${FETCH_LIMIT}&sort_by=${sortKey}&order=${order}`;
     try {
+      const url = `/api/optimize/jobs/${jobId}/results?offset=${offset}&limit=${PAGE_SIZE}` +
+                  `&sort_by=${sortKey}&order=${order}` +
+                  `&patchwise=${jobDownloadIsPatchwise ? 'true' : 'false'}`;
       const r = await fetch(url);
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
       setRows(data.rows || []);
-      setMeta(data.meta || null);
+      setTotalRows(Number(data.total || 0));
+      setServerLegPresence(data.leg_presence || null);
+      if (data.meta) setMeta(data.meta);
     } catch (e) {
       setError(String(e.message || e));
     }
-  }, [jobId, sortKey, order]);
+  }, [jobId, sortKey, order, offset, jobDownloadIsPatchwise]);
+
+  // Throttled variant for the live poll. The table shows EVERY combo (no row
+  // cap), but a sweep with thousands of rows must not re-download all of them
+  // every POLL_MS — that is bandwidth for data changing a few rows at a time.
+  // Limiting the REFRESH RATE keeps the full result set without the hammering;
+  // completion always triggers an immediate unthrottled fetch below.
+  const lastLiveFetchRef = useRef(0);
+  const fetchAllThrottled = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastLiveFetchRef.current < LIVE_REFRESH_MS) return;
+    lastLiveFetchRef.current = now;
+    await fetchAll();
+  }, [fetchAll]);
 
   // Poll while running.
   useEffect(() => {
@@ -217,7 +204,7 @@ export default function OptimizationResults({
           sawRunningJobRef.current = jobId;
           if (data.status !== 'queued') {
             // Refresh partial results so the table fills in as combos complete.
-            fetchAll();
+            fetchAllThrottled();
           }
         }
       } catch {
@@ -283,42 +270,16 @@ export default function OptimizationResults({
   const eta = meta?.eta_seconds;
   const phase = meta?.phase || 'running';
 
-  // Discover optimized-parameter columns from rows. Each row carries the
-  // combo dict under `row.combo` — keys are payload paths like
-  // "legs.0.stopLoss.value". We render one column per unique key, in the
-  // order they first appear across all rows, immediately after Sr. No.
-  const paramColumns = useMemo(() => {
-    const seen = [];
-    const seenSet = new Set();
-    for (const r of rows) {
-      const combo = r.combo || {};
-      for (const k of Object.keys(combo)) {
-        if (!seenSet.has(k)) {
-          seenSet.add(k);
-          seen.push({ key: k, label: friendlyParamLabel(k) });
-        }
-      }
-    }
-    return seen;
-  }, [rows]);
-
-  // Detect which leg types are present so conditional columns can be hidden.
-  // A leg type is "present" if any row has a non-zero value for its P&L key.
-  const legPresence = useMemo(() => {
-    let hasCE = false;
-    let hasPE = false;
-    let hasSpot = false;
-    let hasMidcap = false;
-    for (const r of rows) {
-      const s = r.summary || {};
-      if (!hasCE && s.ce_pnl_total != null && Math.abs(Number(s.ce_pnl_total)) > 0.01) hasCE = true;
-      if (!hasPE && s.pe_pnl_total != null && Math.abs(Number(s.pe_pnl_total)) > 0.01) hasPE = true;
-      if (!hasSpot && s.long_spot_pnl != null && Math.abs(Number(s.long_spot_pnl)) > 0.01) hasSpot = true;
-      if (!hasMidcap && s.has_midcap) hasMidcap = true;
-      if (hasCE && hasPE && hasSpot && hasMidcap) break;
-    }
-    return { hasCE, hasPE, hasSpot, hasMidcap, notMidcap: !hasMidcap };
-  }, [rows]);
+  // Leg presence (which conditional columns to show) comes from the SERVER now
+  // (computed over the job's FULL result set by result_store.get_results, via
+  // summary_workbook.compute_leg_presence) rather than from the rows on the
+  // current page. Computing it client-side from a 100-row page would make
+  // conditional columns (Midcap, Spot) appear/disappear as the user pages,
+  // since which legs appear can differ page to page.
+  const legPresence = useMemo(
+    () => ({ ...(serverLegPresence || {}), notMidcap: !(serverLegPresence || {}).hasMidcap }),
+    [serverLegPresence],
+  );
 
   // Filter MASTER_SUMMARY_COLUMNS based on which leg types are actually present.
   const visibleColumns = useMemo(() => {
@@ -340,6 +301,7 @@ export default function OptimizationResults({
   }, [rows]);
 
   function toggleSort(key) {
+    setOffset(0);
     if (sortKey === key) {
       setOrder(order === 'desc' ? 'asc' : 'desc');
     } else {
@@ -349,55 +311,33 @@ export default function OptimizationResults({
   }
 
   async function exportExcel() {
-    // Honor the user-selected download method. For patchwise, pull the
-    // patchwise-recomputed per-combo metrics from the backend (same compute that
-    // builds the patchwise ZIP's summary.csv) so this excel matches the ZIP.
-    let summaryByCombo = null;
-    if (jobDownloadIsPatchwise) {
-      try {
-        const _base = await resolveDownloadBase(jobId);
-        const r = await fetch(`${_base}/api/optimize/jobs/${jobId}/summary?patchwise=true`);
-        if (r.ok) {
-          const data = await r.json();
-          summaryByCombo = new Map(
-            (data.rows || []).map((x) => [String(x.combo_id), x.summary || {}])
-          );
-        } else {
-          alert('Failed to build patchwise summary — exporting overall instead.');
-        }
-      } catch (e) {
-        alert(`Failed to build patchwise summary (${e?.message || e}) — exporting overall instead.`);
-      }
+    // The workbook (rows AND, for patchwise, the per-combo overlay) is now built
+    // entirely server-side (routers/optimize.py's POST summary.xlsx delegates to
+    // the same get_optim_summary the table itself uses) — the browser no longer
+    // fetches or holds a second/third full copy of the sweep to export it. The
+    // "abort, never fall through" guarantee that used to live here now lives in
+    // that endpoint's 409 (no combo has patchwise metrics); buildSummaryWorkbookBlob
+    // throws on any non-2xx response, which this catches below.
+    try {
+      const blob = await buildSummaryWorkbookBlob(
+        ruleConfig, jobId, meta?.base_payload, jobDownloadIsPatchwise,
+        { by: sortKey, order },
+      );
+      triggerBlobDownload(blob, rulesFilename(ruleConfig, jobId, jobDownloadIsPatchwise ? '_patchwise' : '_overall'));
+    } catch (e) {
+      alert(`Export failed (${e?.message || e}) — nothing was downloaded.`);
     }
-
-    // Shared builder (utils/optimSummaryExport.js) — identical logic path
-    // used by the auto-download queue, so a manual export and an
-    // auto-downloaded one are always byte-for-byte the same.
-    const blob = await buildSummaryWorkbookBlob(rows, ruleConfig, summaryByCombo, jobId, meta?.base_payload);
-    triggerBlobDownload(blob, rulesFilename(ruleConfig, jobId, jobDownloadIsPatchwise ? '_patchwise' : '_overall'));
   }
 
   async function downloadWowMom() {
+    // Native streaming download, same helper the tradesheets ZIP uses. A large
+    // sweep's WOW/MOM comes back as a multi-hundred-MB parts ZIP, and the old
+    // `await r.blob()` buffered all of it into the tab that just OOM'd on the
+    // results table.
     try {
-      const query = jobDownloadIsPatchwise ? '?patchwise=true' : '';
+      const query = jobDownloadIsPatchwise ? '?patchwise=true' : '?patchwise=false';
       const _base = await resolveDownloadBase(jobId);
-      const r = await fetch(`${_base}/api/optimize/jobs/${jobId}/wow_mom.xlsx${query}`);
-      if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        alert(err.detail || err.error || 'Failed to download WOW/MOM summary');
-        return;
-      }
-      const blob = await r.blob();
-      const filename =
-        r.headers.get('x-filename') ||
-        `optimize_${jobId.slice(0, 8)}_WOW_MOM.xlsx`;
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      await downloadWhenReady(`${_base}/api/optimize/jobs/${jobId}/wow_mom.xlsx${query}`);
     } catch (e) {
       alert(`Failed to download WOW/MOM summary: ${e?.message || e}`);
     }
@@ -415,7 +355,7 @@ export default function OptimizationResults({
       const _base = await resolveDownloadBase(jobId);
       const zipUrl = patchwise
         ? `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=true`
-        : `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip`;
+        : `${_base}/api/optimize/jobs/${jobId}/tradesheets.zip?patchwise=false`;
       while (true) {
         // Headers-only probe, then native navigation — a ~300 MB ZIP must NOT
         // go through r.blob() (whole file into tab memory → silent failure).
@@ -915,7 +855,7 @@ export default function OptimizationResults({
                     </td>
                     {visibleColumns.map((c, idx) => {
                       let v;
-                      if (c.key === 'sr_no') v = i + 1;
+                      if (c.key === 'sr_no') v = offset + i + 1;
                       else if (c.key in cols) v = cols[c.key];
                       else v = summary[c.key];
                       const cell = (
@@ -967,6 +907,42 @@ export default function OptimizationResults({
             </tbody>
           </table>
         </div>
+        {totalRows > PAGE_SIZE && (
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            gap: 12, padding: '10px 6px', fontSize: 12,
+          }}>
+            <button
+              onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+              disabled={offset === 0}
+              style={{
+                padding: '4px 10px', borderRadius: 4,
+                border: '1px solid var(--border-strong, #d1d5db)',
+                background: 'transparent',
+                cursor: offset === 0 ? 'not-allowed' : 'pointer',
+                opacity: offset === 0 ? 0.4 : 1,
+              }}
+            >
+              ← Prev
+            </button>
+            <span style={{ opacity: 0.7 }}>
+              {offset + 1}–{Math.min(offset + PAGE_SIZE, totalRows)} of {totalRows}
+            </span>
+            <button
+              onClick={() => setOffset(offset + PAGE_SIZE)}
+              disabled={offset + PAGE_SIZE >= totalRows}
+              style={{
+                padding: '4px 10px', borderRadius: 4,
+                border: '1px solid var(--border-strong, #d1d5db)',
+                background: 'transparent',
+                cursor: offset + PAGE_SIZE >= totalRows ? 'not-allowed' : 'pointer',
+                opacity: offset + PAGE_SIZE >= totalRows ? 0.4 : 1,
+              }}
+            >
+              Next →
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

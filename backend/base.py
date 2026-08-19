@@ -1052,7 +1052,7 @@ def compute_analytics(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         mdd_start_date = peak_date.strftime('%Y-%m-%d')
         mdd_end_date   = trough_date.strftime('%Y-%m-%d')
 
-    car_mdd = round(min(99999.0, (cagr / 100.0) / abs(max_dd_pct)), 4) if max_dd_pct != 0 else 0
+    car_mdd = round(min(99999.0, cagr / abs(max_dd_pct)), 4) if max_dd_pct != 0 else 0
     recovery_factor = round(min(99999.0, total_pnl / abs(max_dd_pts)), 2) if max_dd_pts != 0 else 0
 
     if 'Spot P&L' in df.columns:

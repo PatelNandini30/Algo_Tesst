@@ -86,6 +86,8 @@ MASTER_SUMMARY_COLUMNS: List[Dict[str, str]] = [
     {"key": "combined_pnl_pct_sum", "label": "Combined Net P&L %", "conditional": "hasMidcap"},
 ]
 
+_RATIO_FMT_KEYS = {"car_mdd", "car_mdd_live"}
+
 _HEADER_FILL = PatternFill("solid", fgColor="FF1E3A8A")
 _HEADER_FONT = Font(bold=True, color="FFFFFFFF")
 
@@ -118,6 +120,63 @@ def visible_columns_for(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             if not c.get("conditional") or presence.get(c["conditional"]) is True]
 
 
+def legwise_columns_for(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Extra master-summary columns: one BLOCK PER LEG, plus the strategy-wide
+    adjustment and the Midcap overlay.
+
+    Why: the three packed columns (Put/Call ATM or ITM, Spot Adjustment) squeeze
+    every leg into one cell — two same-type legs collapse to "L1_ATM/L3_OTM2",
+    adjustments concatenate to "L1RiseBy1%_L2MoveBy1%", a futures leg vanishes,
+    and nothing says which INDEX a leg belongs to. These columns are ADDITIVE:
+    the originals keep their position so saved filters and downstream sheets are
+    unaffected.
+
+    Emitted per leg that ACTUALLY EXISTS (a 2-leg sweep gets no L3 columns), and
+    ordered BY LEG — L1 strike, L1 adj, L2 strike, L2 adj — so one leg reads as a
+    block instead of being scattered across the sheet. Headers come from the
+    first row's leg_cols; leg identity (index/type/expiry/side) is constant for a
+    sweep because only strike_selection.* and spot_adjustment.* are ever swept.
+    """
+    first = next((r for r in rows if (r.get("combo_columns") or {}).get("leg_cols")), None)
+    if not first:
+        return []                       # pre-change jobs: no leg_cols stored -> unchanged sheet
+    cols: List[Dict[str, str]] = [{"key": "overall_adjustment", "label": "Overall Adjustment"}]
+    if any((r.get("combo_columns") or {}).get("midcap_leg") for r in rows):
+        cols.append({"key": "midcap_leg", "label": "Midcap Leg"})
+        cols.append({"key": "midcap_adj", "label": "Midcap Adj"})
+    for i, lc in enumerate((first.get("combo_columns") or {}).get("leg_cols") or []):
+        # The header can bake in the leg's expiry cadence (e.g. "L1 NF CE Wkly
+        # Sell"), but expiry IS a swept axis in some sweeps — asserting row 0's
+        # cadence as a static column header over every row silently mislabels
+        # every combo whose leg traded a DIFFERENT cadence. Fall back to the
+        # expiry-free header when any row's own leg_cols[i]["hdr"] disagrees
+        # with row 0's — a leg identity (index/type/side) IS constant for a
+        # sweep (only strike_selection.*/spot_adjustment.*/expiry are ever
+        # swept), so the stable header is always honest.
+        _all_hdrs = {
+            (((r.get("combo_columns") or {}).get("leg_cols") or [{}] * (i + 1))[i] or {}).get("hdr")
+            for r in rows
+            if len(((r.get("combo_columns") or {}).get("leg_cols")) or []) > i
+        }
+        if len(_all_hdrs) > 1:
+            hdr = str(lc.get("hdr_stable") or lc.get("hdr") or f"L{i + 1}")
+        else:
+            hdr = str(lc.get("hdr") or f"L{i + 1}")
+        cols.append({"key": f"__leg{i}_strike", "label": hdr})
+        cols.append({"key": f"__leg{i}_adj", "label": f"L{i + 1} Adj"})
+    return cols
+
+
+def _legwise_value(key: str, cols: Dict[str, Any]) -> Any:
+    """Resolve a __leg{i}_{field} key against that row's stored leg_cols."""
+    try:
+        idx, field = key[len("__leg"):].split("_", 1)
+        lc = (cols.get("leg_cols") or [])[int(idx)]
+        return lc.get(field, "")
+    except (ValueError, IndexError, TypeError, AttributeError):
+        return ""
+
+
 def build_summary_workbook(rows: List[Dict[str, Any]],
                            rule_rows: Optional[List[List[Any]]] = None,
                            rules_sheet: Optional[List[List[Any]]] = None) -> bytes:
@@ -131,7 +190,22 @@ def build_summary_workbook(rows: List[Dict[str, Any]],
                   master summary's Rules sheet is identical to the backtest's.
     """
     visible = visible_columns_for(rows)
-    wb = Workbook()
+    # Insert the leg-wise block immediately AFTER the packed "Spot Adjustment"
+    # column, so the sweep-config columns stay together and the metrics that
+    # follow keep their relative order.
+    _extra = legwise_columns_for(rows)
+    if _extra:
+        _at = next((i for i, c in enumerate(visible)
+                    if c["key"] == "spot_adjustment"), len(visible) - 1)
+        visible = visible[:_at + 1] + _extra + visible[_at + 1:]
+    # Rust render path — the LAST openpyxl builder on a user-facing path.
+    # The block below is unchanged; it just runs against the ops-emitting
+    # stand-in and is rendered by algotest_native. openpyxl charged a
+    # style-table hash per cell assignment, which at 63,504 combos (one row
+    # each, ~40 columns) is millions of hashes inside an API request.
+    from services.optimizer.wow_mom import _OpsWorkbook
+
+    wb = _OpsWorkbook(with_active=True)
     ws = wb.active
     ws.title = "Optimization Summary"
 
@@ -156,26 +230,49 @@ def build_summary_workbook(rows: List[Dict[str, Any]],
         summary = row.get("summary") or {}
         cols = row.get("combo_columns") or {}
         # combo_columns wins over summary — identical precedence to the JS.
-        vals = [cols[c["key"]] if c["key"] in cols else summary.get(c["key"])
+        vals = [_legwise_value(c["key"], cols) if c["key"].startswith("__leg")
+                else (cols[c["key"]] if c["key"] in cols else summary.get(c["key"]))
                 for c in data_cols]
         ws.append([i + 1] + vals)
-        for cell in ws[ws.max_row]:
+        row_cells = ws[ws.max_row]
+        for j, cell in enumerate(row_cells):
             if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                cell.number_format = "0.00"
+                key = data_cols[j - 1]["key"] if j > 0 else None
+                # Literal-quoted "%" (not Excel's "0.00%" format code) — the stored
+                # value is already the display number; Excel's native % format code
+                # would multiply it by 100 again, which is not wanted here.
+                cell.number_format = '0.00"%"' if key in _RATIO_FMT_KEYS else "0.00"
 
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 16
 
     # Leg-wise "Rules" sheet as the FIRST tab — identical to the backtest download
     # (same buildRulesSheet rows, same _write_rules_sheet renderer).
+    # `_rules_ops` already renders this sheet for the Rust writer (it is what the
+    # per-combo tradesheet uses), so the ops go straight in front of the summary
+    # sheet — index 0, same "Rules is the first tab" contract as before.
+    sheets = []
     if rules_sheet:
-        try:
-            from services.optimizer.excel_builder import _write_rules_sheet
-            _write_rules_sheet(wb, rules_sheet)
-        except Exception as _rs_exc:
-            import logging
-            logging.getLogger(__name__).warning("[OPTIM] summary Rules sheet skipped: %s", _rs_exc)
+        from services.optimizer.excel_builder import _rules_ops
+        sheets.append(_rules_ops(rules_sheet))
+    sheets.append(ws.to_ops())
 
-    buf = BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+    # No openpyxl fallback: a native failure raises rather than quietly handing
+    # back a workbook that is missing its Rules tab (what the old try/except
+    # around _write_rules_sheet did — the download simply arrived incomplete).
+    import os
+    import tempfile
+
+    import algotest_native as _an
+
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        _an.write_layout_workbook_xlsx(sheets, tmp)
+        with open(tmp, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass

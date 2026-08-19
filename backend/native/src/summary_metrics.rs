@@ -273,7 +273,24 @@ pub fn compute_summary_metrics(
     for k in &order {
         let idxs = &groups[k];
         let leg_refs: Vec<&Leg> = idxs.iter().map(|&i| &legs[i]).collect();
-        let main = leg_refs.iter().find(|l| l.is_main).copied().unwrap_or(leg_refs[0]);
+        // ANCHOR RULE, not "first is_main leg in row order". Leg order must never
+        // change a statistic (services/trade_anchor.py is the canonical Python
+        // implementation this mirrors). The old `find`-first pattern made Entry
+        // Spot -- the %P&L/NAV denominator here -- depend on which leg the user
+        // put first in the builder: a CARRIED longer-dated leg (older Entry Date,
+        // no re-entry flags, so also `is_main`) listed ahead of a same-cycle
+        // fresh leg picked the CARRIED leg's stale Entry Spot instead of the
+        // cycle's actual one. The anchor is the main-leg row with the LATEST
+        // Entry Date, ties broken by the LOWEST Leg number; a leg with no
+        // parseable Entry Date sorts last (via `date_ms(...).unwrap_or(i64::MIN)`)
+        // so it can never hijack the anchor. Falls back to `leg_refs[0]` only
+        // when NO leg is `is_main` (every leg is a re-entry/lazy row), matching
+        // the old behavior for that edge case.
+        let main = leg_refs.iter()
+            .filter(|l| l.is_main)
+            .max_by_key(|l| (date_ms(&l.entry_date).unwrap_or(i64::MIN), -l.leg_i))
+            .copied()
+            .unwrap_or(leg_refs[0]);
         let spot = main.entry_spot.unwrap_or(0.0);
         let raw_net = match main.net_pnl {
             Some(v) => v,
@@ -526,7 +543,7 @@ pub fn compute_summary_metrics(
         m
     };
     if has_midcap { combined_max_dd = max_dd_pct; }
-    let car_mdd = if max_dd_pct != 0.0 { (opt_cagr / 100.0) / max_dd_pct.abs() } else { 0.0 };
+    let car_mdd = if max_dd_pct != 0.0 { opt_cagr / max_dd_pct.abs() } else { 0.0 };
 
     let opt_sum = if ce_sum != 0.0 || pe_sum != 0.0 { ce_sum + pe_sum } else if fut_sum != 0.0 { fut_sum } else { sum_net };
     let _ = opt_sum;
@@ -610,7 +627,7 @@ pub fn compute_summary_metrics(
     let (o1m, o1a) = ldd_exc(1, 1);
     let (o2m, o2a) = ldd_exc(2, 2);
     let (o3m, o3a) = ldd_exc(3, 3);
-    let car_mdd_live = if live_dd_min != 0.0 { (opt_cagr / 100.0) / live_dd_min.abs() } else { 0.0 };
+    let car_mdd_live = if live_dd_min != 0.0 { opt_cagr / live_dd_min.abs() } else { 0.0 };
 
     let spot_chg = s_f64("spot_change").unwrap_or(py_round(spot_sum_gated, 2));
     let spot_chg_pct = s_f64("spot_change_pct").unwrap_or(py_round(spot_pct_sum * 100.0, 4));

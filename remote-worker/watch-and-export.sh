@@ -23,9 +23,12 @@ INTERVAL="${WATCH_INTERVAL:-10}"
 TAR="remote-worker/algotest-worker-image.tar"
 
 fingerprint() {
-  # mtime+path of every backend source file (py + Dockerfiles), excluding caches
-  # and Rust build artifacts (those aren't in the image build context anyway).
-  find backend -type f \( -name '*.py' -o -name 'Dockerfile*' \) \
+  # mtime+path of every backend source file (py + Dockerfiles + Rust engine
+  # sources/manifests, since native/ gets compiled into algo-backend-base and
+  # baked into the image), excluding caches and Rust build artifacts (target/
+  # isn't in the image build context anyway).
+  find backend -type f \( -name '*.py' -o -name 'Dockerfile*' \
+    -o -path 'backend/native/src/*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
     -not -path '*/__pycache__/*' -not -path '*/native/target/*' \
     -printf '%T@ %p\n' 2>/dev/null | sort | sha256sum | cut -d' ' -f1
 }

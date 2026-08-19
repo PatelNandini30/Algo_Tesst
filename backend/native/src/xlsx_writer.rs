@@ -494,6 +494,32 @@ pub fn write_layout_sheet_xlsx(sheet: &Bound<'_, PyDict>, path: String) -> PyRes
     Ok(())
 }
 
+// N layout sheets → ONE workbook, in the order given.
+//
+// The merged WOW/MOM file is many sheets (WOW Summary, MOM Summary, MIN pivot
+// pages, plus overflow pages when a sweep exceeds Excel's 16,384-column limit),
+// so neither existing entry point fits: write_layout_sheet_xlsx is one-sheet,
+// and write_workbook_xlsx hard-codes the per-combo tradesheet's tab order.
+//
+// This is the hot path for big sweeps. Building that workbook through openpyxl
+// cost 432s for 3,969 combos, and profiling showed 91% of it was openpyxl
+// hashing style objects on every cell assignment (31M calls to
+// Serialisable.__hash__) — not the XML write, which was only 9%. Emitting plain
+// layout-ops from Python and rendering them here skips that entirely.
+#[pyfunction]
+pub fn write_layout_workbook_xlsx(sheets: &Bound<'_, PyList>, path: String) -> PyResult<()> {
+    let mut wb = Workbook::new();
+    for item in sheets.iter() {
+        let d = item.downcast::<PyDict>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("sheets must be a list of dicts")
+        })?;
+        wb.push_worksheet(build_layout_sheet(d)?);
+    }
+    wb.save(&path)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(())
+}
+
 // ── Combined workbook: every sheet in one .xlsx, in build_combo_xlsx order ──
 // [Rules] · Trade Sheet (Rust from cleaned) · Summary · [Patch wise] · WOW & MOM.
 // patch_ops / wow_ops are None when that sheet is absent (matching openpyxl).
