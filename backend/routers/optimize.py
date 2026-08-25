@@ -411,7 +411,14 @@ async def resume_optimize_job(job_id: str):
             detail="System is under maintenance — optimizations are temporarily "
                    "disabled. Please try again shortly.",
         )
-    meta = result_store.get_meta(job_id)
+    try:
+        meta = result_store.get_meta(job_id)
+    except Exception as exc:
+        # Redis can time out while a large job is publishing progress. Return
+        # a retryable state instead of turning a transient broker delay into a
+        # server error in the UI.
+        logger.warning("optimizer status Redis read failed for %s: %s", job_id, exc)
+        meta = None
     if not meta:
         raise HTTPException(status_code=404, detail=f"Unknown optimize job {job_id}")
     if meta.get("status") == "running":
@@ -458,7 +465,7 @@ async def resume_optimize_job(job_id: str):
         "auto_download": bool(meta.get("auto_download")),
         "resume": True,
     }
-    node_id = meta.get("node_id")
+    node_id = meta.get("node_id") or node_registry.get_job_node(job_id)
     queue_name = f"optimize@{node_id}" if node_id else "optimize"
     # Same task id as the original job so job_id, trades dir and result list all
     # continue to line up.
@@ -538,6 +545,17 @@ async def get_optimize_job(job_id: str):
         return {"status": "unknown", "celery_state": celery_state}
 
     status = meta.get("status") or "running"
+    # A cgroup/OOM kill can happen after every combo is stored, during artifact
+    # finalization. The task is then terminal FAILURE but the last heartbeat in
+    # meta still says running/finalizing, which made the UI poll forever and hid
+    # the existing Resume path. Celery is authoritative for this terminal case.
+    if status == "running" and celery_state == "FAILURE":
+        status = "failed"
+        try:
+            _failure = celery_app.AsyncResult(job_id).result
+            meta = {**meta, "error": str(_failure or "Optimizer worker was lost during finalization")}
+        except Exception:
+            meta = {**meta, "error": "Optimizer worker was lost during finalization"}
     return {
         "status": status,
         "celery_state": celery_state,
@@ -1457,7 +1475,7 @@ async def download_wow_mom(request: Request, job_id: str, patchwise: bool = Quer
     # this runs inside the API process, so an OOM takes the whole backend down
     # with it, not just one worker. ~3,272 cells per combo across the four
     # sheets; a 50,176-combo sweep needs 13-20 GB and was SIGKILLed.
-    _wm_budget_mb = float(os.environ.get("OPTIM_WOW_MOM_MAX_MB", "3500"))
+    _wm_budget_mb = result_store.wow_mom_memory_budget_mb()
     _wm_projected_mb = len(combos) * 3272 * 100 / 1e6
     if _wm_projected_mb > _wm_budget_mb:
         raise HTTPException(

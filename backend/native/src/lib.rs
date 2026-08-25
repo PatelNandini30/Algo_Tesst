@@ -525,8 +525,8 @@ pub(crate) fn lookup_strikes_for_date(
     // traded) plus ExpiryDate=2023-06-28 rows on 28-Jun only.
     //
     // Without this, an exact-match miss returned an empty chain, so every
-    // CHAIN-SCANNING strike mode (time_value*, closest_premium, premium_gte/lte,
-    // premium_range, atm_straddle_prem_pct) failed to resolve a strike and
+    // CHAIN-SCANNING strike mode (time_value*, delta, closest_premium,
+    // premium_gte/lte, premium_range, atm_straddle_prem_pct) failed to resolve a strike and
     // SILENTLY DROPPED the trade, while ATM/ITMn/OTMn survived because they only
     // need a price. Measured: entry 21-Jun-2023 / expiry 28-Jun-2023 gave 0
     // strikes where 2023-06-29 gave 111, leaving a 13-day hole mid-patch

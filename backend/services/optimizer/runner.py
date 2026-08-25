@@ -1170,7 +1170,7 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
             # flat at ~800 MB for 2,500-combo parts, 21 parts in 6.4 min on a real
             # 50,176-combo job. Paging fixes Excel's sheet limits, not memory, so
             # it does not help here — only bounding the batch does.
-            _wm_budget_mb = float(os.environ.get("OPTIM_WOW_MOM_MAX_MB", "3500"))
+            _wm_budget_mb = result_store.wow_mom_memory_budget_mb()
             _wm_projected_mb = len(combos) * 3272 * 100 / 1e6
             if _wm_projected_mb > _wm_budget_mb:
                 _chunk = int(os.environ.get("OPTIM_WOW_MOM_PART_COMBOS", "2500"))
@@ -2518,7 +2518,12 @@ def run_optimization(
                "base_payload": base_payload,
                "param_specs": list(param_specs),
                "auto_download": bool(auto_download),
-               "client_ip": client_ip},
+               "client_ip": client_ip,
+               # Persist artifact ownership for resume/download. The short-lived
+               # node-registry mapping can expire before a large finalization;
+               # without this, Resume incorrectly queues on the main box even
+               # though all per-combo files live on the remote node's disk.
+               "node_id": node_id},
     )
 
     result_store.write_run_config(

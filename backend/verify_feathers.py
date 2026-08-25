@@ -65,8 +65,14 @@ def main():
             print(f"  {sym}: no DB rows, skip", flush=True)
             continue
         need, why = False, []
-        if not op.exists() or not sp.exists():
-            need, why = True, ["missing feather file"]
+        if not op.exists():
+            need, why = True, ["missing options.feather"]
+        elif not sp.exists():
+            if db_s_min is None:
+                # No spot data in DB for this symbol (individual equity) — expected.
+                print(f"  {sym}: no spot data in DB, skip", flush=True)
+                continue
+            need, why = True, ["missing spot.feather"]
         else:
             try:
                 o_min, o_max = _extent(op)

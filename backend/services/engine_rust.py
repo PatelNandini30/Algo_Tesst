@@ -26,6 +26,8 @@ Python-side strategy logic.
 from __future__ import annotations
 
 import bisect
+import contextvars
+import datetime
 import logging
 import math
 import os
@@ -590,6 +592,11 @@ def _apply_filter_end_last_per_patch(
             r["exit_reason"] = "+".join(toks_wo_clamp) or "EXPIRY"
 
 
+_DTE_DAY_BASIS: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "dte_day_basis", default="trading"
+)
+
+
 def _trading_day_n_before(expiry_str: str, n: int, trading_days: List[str]) -> Optional[str]:
     """Return the trading day n steps before expiry (expiry - n td). n=0 → expiry itself."""
     if not trading_days or not expiry_str:
@@ -597,6 +604,9 @@ def _trading_day_n_before(expiry_str: str, n: int, trading_days: List[str]) -> O
     idx_exp = bisect.bisect_right(trading_days, expiry_str) - 1
     if idx_exp < 0:
         return None
+    if _DTE_DAY_BASIS.get() == "calendar":
+        target = (datetime.date.fromisoformat(expiry_str) - datetime.timedelta(days=max(0, int(n)))).isoformat()
+        return _last_trading_day_on_or_before(target, trading_days)
     idx_exit = idx_exp - n
     if idx_exit < 0:
         return None
@@ -623,6 +633,134 @@ def _trading_day_gap_left(from_str: str, to_str: str, trading_days: List[str]) -
 _STRIKE_INTERVALS: Dict[str, float] = {
     "NIFTY": 50.0, "BANKNIFTY": 100.0, "FINNIFTY": 50.0, "MIDCPNIFTY": 25.0,
 }
+
+# ── Delta strike selection — hardcoded IV per index ───────────────────────────
+# EOD backtester has no live greeks; we approximate Black-Scholes delta using a
+# fixed implied-volatility research assumption for each index.
+# r=0 simplification: negligible effect on delta for short-dated indices.
+_DELTA_IV: Dict[str, float] = {
+    "NIFTY": 0.13, "BANKNIFTY": 0.16, "FINNIFTY": 0.14,
+    "MIDCPNIFTY": 0.16, "SENSEX": 0.14, "BANKEX": 0.16,
+}
+_DELTA_IV_DEFAULT = 0.15
+_INV_SQRT2PI = 0.3989422804014327  # 1/sqrt(2π)
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via Abramowitz & Stegun (error < 7.5e-8)."""
+    t = 1.0 / (1.0 + 0.2316419 * abs(x))
+    p = 1.0 - _INV_SQRT2PI * math.exp(-0.5 * x * x) * t * (
+        0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))
+    )
+    return p if x >= 0.0 else 1.0 - p
+
+
+def _bs_delta(spot: float, strike: float, days_to_expiry: float,
+              sigma: float, is_call: bool) -> float:
+    """Black-Scholes delta (r=0). Returns absolute value for puts so callers
+    always compare against a positive user-supplied target (0–1)."""
+    T = max(days_to_expiry, 0.5) / 365.0   # floor at half-day to avoid div/0
+    if spot <= 0 or strike <= 0 or sigma <= 0:
+        return 0.5
+    d1 = (math.log(spot / strike) + 0.5 * sigma * sigma * T) / (sigma * math.sqrt(T))
+    call_delta = _norm_cdf(d1)
+    return call_delta if is_call else 1.0 - call_delta  # abs(put delta)
+
+
+def _delta_legs(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """{1-based leg_id: strike_selection} for every leg using delta selection.
+    Empty (the common case) ⇒ the post-pass is a no-op."""
+    out: Dict[int, Dict[str, Any]] = {}
+    for i, leg in enumerate(payload.get("legs") or [], start=1):
+        if not isinstance(leg, dict):
+            continue
+        sel = leg.get("strike_selection") or {}
+        if isinstance(sel, dict) and str(sel.get("type") or "").lower().strip() == "delta":
+            out[i] = sel
+    return out
+
+
+def _apply_delta_to_specs(
+    specs: List[Dict[str, Any]],
+    payload: Dict[str, Any],
+    delta_legs: Dict[int, Dict[str, Any]],
+    lot_size: int,
+) -> List[Dict[str, Any]]:
+    """Rewrite each delta leg's strike to the one whose ACTUAL |delta| (from the
+    ingested EOD delta history) is closest to the user's target — replacing the
+    Black-Scholes APPROXIMATION the resolver used as a placeholder.
+
+    Runs once, after every spec builder has converged (mirrors
+    _apply_rel_leg_premium_to_specs), so all entry modes are covered without a
+    Rust rebuild. The ideal (closest-delta) strike is stashed as
+    `requested_strike`; the actual pick walks the delta-ranked list to the first
+    TRADEABLE strike, so when liquidity forces a move the existing Strike Shift
+    Reason column reports it automatically.
+
+    Graceful degradation: if the delta history has no data for a (date, expiry),
+    the leg keeps whatever strike the resolver already produced (the BS pick) —
+    never dropped.
+    """
+    if not delta_legs:
+        return specs
+    try:
+        from services import delta_lookup
+    except Exception:
+        return specs
+    if not delta_lookup.has_data():
+        logger.warning("[DELTA] no delta history loaded — delta legs fall back to the "
+                       "BS approximation for this run.")
+        return specs
+    try:
+        import algotest_native  # type: ignore
+    except Exception:
+        algotest_native = None  # type: ignore
+
+    base_index = str(payload.get("index") or "NIFTY").upper()
+    legs_src = payload.get("legs") or []
+    for s in specs:
+        lid = int(s.get("leg_id") or 0)
+        sel = delta_legs.get(lid)
+        if not sel:
+            continue
+        opt = str(s.get("option_type") or "").upper()
+        ot = "CE" if opt in ("CE", "CALL", "C") else ("PE" if opt in ("PE", "PUT", "P") else "")
+        if not ot:
+            continue
+        entry_iso = _normalize_iso(s.get("entry_date"))
+        expiry_iso = _normalize_iso(s.get("expiry"))
+        if not (entry_iso and expiry_iso):
+            continue
+        leg = legs_src[lid - 1] if 0 <= lid - 1 < len(legs_src) else {}
+        index_up = str(leg.get("index") or base_index).upper()
+        try:
+            target = float(sel.get("delta") or 0.30)
+        except (TypeError, ValueError):
+            target = 0.30
+        ranked = delta_lookup.candidates_by_delta(index_up, entry_iso, expiry_iso, ot, target)
+        if not ranked:
+            continue  # no delta data for this date/expiry — keep the resolver's pick
+        ideal = ranked[0]
+        picked = None
+        if algotest_native is not None and hasattr(algotest_native, "get_option_price_tradeable"):
+            for cand in ranked:
+                try:
+                    px = algotest_native.get_option_price_tradeable(
+                        entry_iso, index_up, float(cand), ot, expiry_iso)
+                except Exception:
+                    px = None
+                if px is not None and float(px) > 0:
+                    picked = cand
+                    break
+        if picked is None:
+            picked = ideal  # nothing tradeable (or native absent) — take the ideal
+        s["strike"] = float(picked)
+        # Only stamp requested_strike when it actually differs, so an unshifted
+        # delta pick doesn't manufacture a spurious Strike Shift Reason.
+        if abs(float(ideal) - float(picked)) > 1e-6:
+            s["requested_strike"] = float(ideal)
+    return specs
+
 
 _NEXT_EXPIRY_TYPES: frozenset = frozenset({"NEXT_WEEKLY", "WEEKLY_T1", "NEXT_MONTHLY", "MONTHLY_T1"})
 
@@ -1297,6 +1435,13 @@ def _inject_per_leg_rollover_inputs(
         leg["_spot_adj_direction"] = direction
         leg["_spot_adj_pct"] = pct
 
+    # ── ADJUSTMENT RELATIVE TO LEG (opt-in per leg) ─────────────────────────────
+    # A leg can inherit its reference leg's adjustment dates — "also adjust
+    # whenever the reference leg adjusts". Runs after every leg's own breaches are
+    # computed above so a dependent leg can copy them in. No-op unless a leg sets
+    # the flag ⇒ the OFF path stays byte-identical.
+    _apply_adjustment_relative_to_leg(legs)
+
     # ── PER-LEG ROLLOVER + FILTER: segment-start boundaries ─────────────────────
     # A filter segment that OPENS mid-contract must enter the active contract
     # fresh at the open — exactly what the non-per-leg fixed-entry builder does.
@@ -1382,7 +1527,9 @@ def _annotate_per_leg_spot_adj_exit_reason(
         # RISE/FALL is fixed for one-directional; for 'both' _spot_adj_reason_tag
         # resolves it from the trigger-day spot vs entry threshold (fallback RISE).
         tag = _spot_adj_reason_tag(direction, 0.0, None, pct, units)
-        lbl = f"{tag} (Leg {lid} {typ} {cadence})".strip()
+        _rel_ref = l.get("_adj_rel_ref")
+        _rel_sfx = f" rel Leg {int(_rel_ref)}" if _rel_ref else ""
+        lbl = f"{tag} (Leg {lid} {typ} {cadence}{_rel_sfx})".strip()
         breach_label[lid] = {_normalize_iso(str(b)): lbl for b in breaches}
     if not breach_label:
         return
@@ -1402,6 +1549,56 @@ def _annotate_per_leg_spot_adj_exit_reason(
         if labels:
             base = str(r.get("exit_reason") or "").strip() or "SCHEDULED_EXIT"
             r["exit_reason"] = f"{base} + {' + '.join(sorted(set(labels)))}"
+
+
+def _apply_adjustment_relative_to_leg(legs: List[Dict[str, Any]]) -> None:
+    """ADJUSTMENT RELATIVE TO LEG (opt-in per leg): a leg flagged
+    ``adjustment_relative_to_leg={enabled, ref_leg}`` ALSO re-strikes whenever its
+    REFERENCE leg adjusts — it inherits the reference leg's spot-adjustment breach
+    dates (``_spot_adj_breaches``) as extra boundaries of its own, unioned with any
+    breaches it computed for itself.
+
+    Assumes every leg already carries ``_spot_adj_breaches`` (the per-leg spot-adj
+    walk ran first). This ONLY adds dates to the same channel Phase-4 already feeds
+    into the Rust union schedule + force-fresh re-strike + exit-reason labeller — no
+    new mechanism. ``ref_leg`` is 1-based and must reference an EARLIER leg (mirrors
+    ``rel_leg``/``rel_leg_premium``): that both prevents cycles and lets a chain
+    (leg C rel B rel A) inherit transitively, since legs are processed in order and
+    an earlier leg's list is already extended by the time a later leg reads it.
+
+    No-op for any leg without the flag ⇒ every existing run stays byte-identical.
+    If the reference leg has no spot-adjustment, its breach list is empty and this
+    is inert (the dependent leg simply never gets a relative trigger).
+    """
+    n = len(legs)
+    for i, leg in enumerate(legs):
+        if not isinstance(leg, dict):
+            continue
+        _rel = leg.get("adjustment_relative_to_leg") or {}
+        if not bool(_rel.get("enabled")):
+            continue
+        try:
+            ref = int(_rel.get("ref_leg") or 0)
+        except (TypeError, ValueError):
+            ref = 0
+        if ref < 1 or ref >= (i + 1):
+            raise ValueError(
+                f"Leg {i + 1}: 'Adjustment Relative to Leg' must reference an EARLIER "
+                f"leg (got {ref or '(unset)'}). Reorder the legs so the driver comes first."
+            )
+        ref_leg = legs[ref - 1]
+        if not isinstance(ref_leg, dict):
+            continue
+        ref_breaches = ref_leg.get("_spot_adj_breaches") or []
+        own = leg.get("_spot_adj_breaches") or []
+        leg["_spot_adj_breaches"] = sorted(set(map(str, own)) | set(map(str, ref_breaches)))
+        leg["_adj_rel_ref"] = ref
+        # Give the exit-reason labeller coherent direction/pct even when this leg
+        # has no OWN spot-adj — it inherits the reference leg's semantics.
+        if leg.get("_spot_adj_direction") is None:
+            leg["_spot_adj_direction"] = ref_leg.get("_spot_adj_direction") or "both"
+        if leg.get("_spot_adj_pct") is None:
+            leg["_spot_adj_pct"] = ref_leg.get("_spot_adj_pct") or 0.0
 
 
 def _apply_per_leg_qty(payload: Dict[str, Any]) -> None:
@@ -2766,6 +2963,40 @@ def _compute_strike_for_leg_python(
         # Candidates are already tradeable, so this walk is a no-op; kept so the
         # requested_strike bookkeeping matches every other mode.
         return _validate(chosen) if chosen is not None else None
+
+    if sel_type == "delta":
+        # Delta-based strike selection — EOD approximation via Black-Scholes.
+        # User supplies target delta (0–1, absolute value for both CE and PE).
+        # Chain is scanned on the leg's own strike grid; only tradeable strikes
+        # are eligible; nearest |delta - target| wins, then nearest to ATM.
+        chain = _strikes_for_date_tolerant(
+            algotest_native, entry_date, index_up, expiry, opt_type)
+        if not chain:
+            return None
+        if interval > 0:
+            chain = [(s, p) for s, p in chain
+                     if abs(s / interval - round(s / interval)) < 1e-9] or chain
+        target_delta = float(sel.get("delta") or 0.3)
+        sigma = _DELTA_IV.get(index_up, _DELTA_IV_DEFAULT)
+        try:
+            from datetime import date as _dt
+            _dte = max((_dt.fromisoformat(expiry) - _dt.fromisoformat(entry_date)).days, 0)
+        except Exception:
+            _dte = 7
+        is_ce = opt_type in ("CE", "CALL", "C")
+        cands = []
+        for s, _ in chain:
+            if algotest_native.get_option_price_tradeable(
+                    entry_date, index_up, s, opt_type, expiry) is None:
+                continue
+            d = _bs_delta(entry_spot, s, float(_dte), sigma, is_ce)
+            cands.append((s, d))
+        if not cands:
+            return None
+        cands.sort(key=lambda it: (
+            round(abs(it[1] - target_delta), 6), abs(it[0] - atm),
+            -it[0] if is_ce else it[0]))
+        return _validate(float(cands[0][0]))
 
     if sel_type in ("straddle_width", "atm_straddle_prem_pct"):
         # Fast path: the ENTIRE computation (formula, tradeable check,
@@ -4385,12 +4616,31 @@ def _apply_carry_slippage_guard(priced: List[Dict[str, Any]]) -> None:
     # 12-Mar-2019 re-entry can carry trade_id 68, sorting after the 2020 epoch),
     # so ordering by trade_id would compare a carry row against a later epoch's
     # contract and wrongly flag it as a change (double-charging slippage). Entry
-    # date is the true chronology; trade_id/leg_id only break ties.
+    # date is the true chronology.
+    #
+    # The tiebreak MUST NOT use trade_id: in the multi-index / midcap cascade
+    # trade_ids are assigned in payload-LEG order (multi_index_feature.py's
+    # per-leg _sub_seq), so swapping two legs re-numbers the same rows. When a
+    # leg has two rows on the SAME entry date (a spot-adj truncate + same-day
+    # re-entry), a trade_id tiebreak then reorders them by leg order, flipping
+    # the open/close (carry-vs-trade) neighbour check and therefore the slippage
+    # — leg order silently changing stats, which is forbidden. Break ties on the
+    # row's OWN contract identity (exit date, then strike/expiry) instead, which
+    # is identical regardless of leg order. leg_id is the final, stable tiebreak.
     def _edate(r: Dict[str, Any]) -> str:
         return _normalize_iso(r.get("entry_date") or "") or str(r.get("entry_date") or "")
+
+    def _xdate(r: Dict[str, Any]) -> str:
+        return _normalize_iso(r.get("exit_date") or "") or str(r.get("exit_date") or "")
     order = sorted(
         range(len(priced)),
-        key=lambda i: (_edate(priced[i]), _tid(priced[i]), int(priced[i].get("leg_id") or 0)),
+        key=lambda i: (
+            _edate(priced[i]),
+            _xdate(priced[i]),
+            str(priced[i].get("strike")),
+            str(priced[i].get("expiry")),
+            int(priced[i].get("leg_id") or 0),
+        ),
     )
     # Group chronological indices per leg to find each contract's OPEN and CLOSE
     # rows. Slippage is a real transaction cost, charged once per side of a
@@ -4441,18 +4691,24 @@ def _apply_carry_slippage_guard(priced: List[Dict[str, Any]]) -> None:
     affected: set = set()
     for _leg, idxs in _by_leg.items():
         keys = [(str(priced[i].get("strike")), str(priced[i].get("expiry"))) for i in idxs]
+        edts = [_edate(priced[i]) for i in idxs]
+        xdts = [_xdate(priced[i]) for i in idxs]
         n = len(idxs)
         for pos, i in enumerate(idxs):
             r = priced[i]
             k = keys[pos]
-            # A carry is decided purely by the contract: same (strike, expiry) as
-            # the neighbour → held → no slippage on that side. A leg that keeps the
-            # same contract across a filter-patch gap (e.g. a carried yearly hedge
-            # while another leg owns the patches) is HELD, not re-traded, so it is
-            # never slipped there — matching the original behaviour. Slippage
-            # applies only where the contract actually changes (strike or expiry).
-            is_open = (pos == 0) or (k != keys[pos - 1])
-            is_close = (pos == n - 1) or (k != keys[pos + 1])
+            # A true carry requires temporal contiguity: the previous row's EXIT
+            # date must equal this row's ENTRY date (a seamless same-day roll). A
+            # gap means the leg went FLAT in between — e.g. a filter patch ended
+            # (FILTER_END) and a new patch re-entered months later — which is a
+            # real sell + buy and must be slipped, even when the strike/expiry
+            # happens to match across the gap. Without this, a new patch that
+            # re-enters at the same contract was wrongly treated as a hold and
+            # charged no slippage on either side.
+            _gap_before = (pos > 0) and (xdts[pos - 1] != edts[pos])
+            _gap_after = (pos < n - 1) and (xdts[pos] != edts[pos + 1])
+            is_open = (pos == 0) or (k != keys[pos - 1]) or _gap_before
+            is_close = (pos == n - 1) or (k != keys[pos + 1]) or _gap_after
             _posn = r.get("position")
             _pct = r.get("slippage_pct")
             cur_e = r.get("entry_price")
@@ -4490,6 +4746,139 @@ def _apply_carry_slippage_guard(priced: List[Dict[str, Any]]) -> None:
         if len(rows) > 1:
             total = round(sum(float(r.get("net_pnl") or 0.0) for r in rows), 4)
             min(rows, key=lambda r: int(r.get("leg_id") or 1))["net_pnl"] = total
+
+
+def _apply_capital_sizing(priced: List[Dict[str, Any]], payload: Dict[str, Any]) -> None:
+    """Capital-weighted per-leg sizing (opt-in; futures-only feature).
+
+    Replaces the STATIC per-leg `lots` multiplier with a DYNAMIC quantity
+    derived from a user capital bucket and this leg's own fill price::
+
+        qty = (alloc_pct / 100) * total_capital / entry_price   (decimal, no lot_size)
+
+    Fixed capital, NO compounding: the bucket is the same reference every cycle
+    (prior P&L is never folded back in). Two re-anchor cadences:
+
+      * v1 — re-derive qty at EVERY entry. Each rollover opens a fresh fill, so
+        qty tracks the new entry price row-by-row.
+      * v2 — freeze qty across rollovers; re-derive ONLY at a filter-segment
+        boundary, anchored on that segment's FIRST fill. No filter ⇒ one
+        segment ⇒ qty set once at the first trade and held for the whole run.
+
+    `lots` is the universal multiplier every downstream calc scales by (per-leg
+    P&L, Net P&L, MAE/MFE, % P&L, NAV/DD — see _apply_per_leg_qty), so we set it
+    per row and let the existing pipeline do the rest; `_cap_qty` marks the row
+    so the tradesheet Qty column shows the raw decimal quantity. net_pnl is then
+    recomputed exactly as _apply_carry_slippage_guard's re-price does.
+
+    No-op unless payload['capital_sizing'].enabled AND at least one leg carries
+    capital_alloc_pct ⇒ every existing run stays byte-identical. Shared by the
+    backtest and optimizer (both funnel through priced_to_tradesheet_records).
+    """
+    cfg = payload.get("capital_sizing")
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return
+    try:
+        total_capital = float(cfg.get("total_capital") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if total_capital <= 0:
+        return
+    version = "v2" if str(cfg.get("version") or "v1").lower() == "v2" else "v1"
+
+    alloc_by_leg: Dict[int, float] = {}
+    for _i, _leg in enumerate((payload.get("legs") or []), start=1):
+        if not isinstance(_leg, dict):
+            continue
+        _a = _leg.get("capital_alloc_pct")
+        if _a in (None, ""):
+            continue
+        try:
+            alloc_by_leg[_i] = float(_a) / 100.0   # percent; may exceed 100 (leverage)
+        except (TypeError, ValueError):
+            continue
+    if not alloc_by_leg:
+        return
+
+    # v2 anchors qty per filter segment. Load the same (start_iso, end_iso)
+    # ranges the FILTER_END tagger uses so "re-derive at filter end" lines up
+    # exactly with where the tradesheet is actually split.
+    _seg_ranges: Optional[List[Tuple[str, str]]] = None
+    if version == "v2":
+        try:
+            _seg_ranges = _load_filter_segments(payload)
+        except Exception:
+            _seg_ranges = None
+
+    def _seg_index(iso: str) -> int:
+        if not _seg_ranges:
+            return 0                       # no filter ⇒ one segment for the whole run
+        for _si, (_s, _e) in enumerate(_seg_ranges):
+            if _s <= iso <= _e:
+                return _si
+        return -1                          # outside every segment ⇒ its own anchor
+
+    # v2 anchor price per (leg_id, segment): the FIRST fill in that group, by
+    # entry date. v1 uses each row's own entry price so no anchor map is needed.
+    _anchor: Dict[Tuple[int, int], float] = {}
+    if version == "v2":
+        for _row in sorted(
+            priced,
+            key=lambda r: (int(r.get("leg_id") or 1), _normalize_iso(r.get("entry_date")) or ""),
+        ):
+            _lid = int(_row.get("leg_id") or 1)
+            if _lid not in alloc_by_leg:
+                continue
+            _ep = float(_row.get("entry_price") or 0.0)
+            if _ep <= 0:
+                continue
+            _anchor.setdefault(
+                (_lid, _seg_index(_normalize_iso(_row.get("entry_date")) or "")), _ep
+            )
+
+    _touched_trades: set = set()
+    for _row in priced:
+        _lid = int(_row.get("leg_id") or 1)
+        if _lid not in alloc_by_leg:
+            continue
+        _ep = float(_row.get("entry_price") or 0.0)
+        if _ep <= 0:
+            continue
+        if version == "v2":
+            _px = _anchor.get(
+                (_lid, _seg_index(_normalize_iso(_row.get("entry_date")) or "")), _ep
+            )
+        else:
+            _px = _ep
+        if _px <= 0:
+            continue
+        qty = alloc_by_leg[_lid] * total_capital / _px
+        _row["lots"] = qty            # decimal multiplier — lot_size deliberately excluded
+        _row["_cap_qty"] = qty        # marks the row for decimal Qty display
+        _row["_cap_total"] = total_capital          # total capital for downstream % calcs
+        _row["_cap_alloc"] = alloc_by_leg[_lid]    # this leg's allocation fraction
+        _touched_trades.add(_row.get("trade_id"))
+
+    if not _touched_trades:
+        return
+
+    # Recompute net_pnl for touched trades only (points × each row's own lots,
+    # trade total onto the lowest leg) — mirrors the _apply_carry_slippage_guard
+    # re-price. Non-sized legs keep their original lots ⇒ unchanged contribution.
+    _by_trade: Dict[Any, List[Dict[str, Any]]] = {}
+    for _row in priced:
+        if _row.get("trade_id") in _touched_trades:
+            _by_trade.setdefault(_row.get("trade_id"), []).append(_row)
+    for _tid_key, _rows in _by_trade.items():
+        for _r in _rows:
+            _ep = float(_r.get("entry_price") or 0.0)
+            _xp = float(_r.get("exit_price") or 0.0)
+            _pos = str(_r.get("position") or "SELL").upper()
+            _lots = float(_r.get("lots") or 1)
+            _r["net_pnl"] = round(((_ep - _xp) if _pos == "SELL" else (_xp - _ep)) * _lots, 4)
+        if len(_rows) > 1:
+            _total = round(sum(float(_r.get("net_pnl") or 0.0) for _r in _rows), 4)
+            min(_rows, key=lambda r: int(r.get("leg_id") or 1))["net_pnl"] = _total
 
 
 def priced_to_tradesheet_records(
@@ -4591,6 +4980,12 @@ def priced_to_tradesheet_records(
     # the backtest and the optimizer (which share this converter) apply it
     # identically.
     _apply_carry_slippage_guard(priced)
+    # CAPITAL SIZING (opt-in, futures-only): re-derive each sized leg's `lots`
+    # from a user capital bucket ÷ fill price (v1 per rollover, v2 per filter
+    # segment) and recompute net_pnl. No-op unless payload['capital_sizing'] is
+    # enabled ⇒ ordinary runs untouched. Runs here so backtest and optimizer,
+    # which share this converter, size identically.
+    _apply_capital_sizing(priced, payload)
     # Spot P&L is a trade-level quantity and rides ONE row per trade. That row
     # is the trade's LOWEST PRESENT leg — not literally leg 1, because a leg
     # can be absent: an individual per-leg filter file removes it from the
@@ -4665,12 +5060,23 @@ def priced_to_tradesheet_records(
         fut_pnl = per_leg_pnl if is_fut else 0
         pct_pnl = round(net_pnl / entry_spot * 100.0, 4) if entry_spot else 0.0
         _row_lots_int = int(row.get("lots") or 1)
+        # CAPITAL SIZING (opt-in): _apply_capital_sizing set this row's `lots` to
+        # a decimal qty = alloc% × capital ÷ fill price and marked `_cap_qty`.
+        # Show that raw decimal quantity (NO lot_size) and carry the float
+        # multiplier on the record so the downstream MAE/MFE scale uses the same
+        # decimal, not a truncated int.
+        _cap_qty = row.get("_cap_qty")
         # PER-LEG QUANTITY override → show the raw qty; else lots × lot_size.
         _ql_id = int(row.get("leg_id") or 1)
-        if _ql_id in _qty_override_by_leg:
+        if _cap_qty is not None:
+            qty = round(float(_cap_qty), 4)
+            _rec_lots_val: Any = float(_cap_qty)
+        elif _ql_id in _qty_override_by_leg:
             qty = _qty_override_by_leg[_ql_id]
+            _rec_lots_val = _row_lots_int
         else:
             qty = _row_lots_int * int(row.get("lot_size") or lot_size or 1)
+            _rec_lots_val = _row_lots_int
         # FUTURES: Strike = '' (matches Python engine convention); options: float.
         strike_val = "" if is_fut else float(row.get("strike") or 0.0)
         # Strike Shift Reason — populated whenever the engine moved the
@@ -4736,13 +5142,15 @@ def priced_to_tradesheet_records(
             # (Task 7, see algotest_job.py MAE/MFE write site). Not part of
             # excel_builder._build_key_order's explicit whitelist, so it never
             # reaches Excel output.
-            "lots": _row_lots_int,
+            "lots": _rec_lots_val,
             "Entry Price": entry_px,
             "Exit Price": exit_px,
             "Raw Entry Price": float(row.get("raw_entry_price") or entry_px),
             "Raw Exit Price": float(row.get("raw_exit_price") or exit_px),
             "MAE": 0.0,
             "MFE": 0.0,
+            "_cap_total": row.get("_cap_total"),
+            "_cap_alloc": row.get("_cap_alloc"),
             "buffer_strike_enabled": False,
             "buffer_position": None,
             "buffer_ref_price": None,
@@ -4891,7 +5299,7 @@ _KNOWN_STRIKE_SEL_TYPES: frozenset = frozenset({
     "", "strike_type", "rel_leg", "pct_of_atm",
     "closest_premium", "premium_gte", "premium_lte", "premium_range",
     "time_value", "time_value_gte", "time_value_lte",
-    "straddle_width", "atm_straddle_prem_pct",
+    "straddle_width", "atm_straddle_prem_pct", "delta",
     # Resolved by a Python spec post-pass, never by either per-leg resolver —
     # the leg reaches them swapped to an ATM placeholder. Listed so the
     # hard-fail below doesn't reject it as unknown.
@@ -4916,6 +5324,16 @@ def _assert_known_strike_modes(payload: Dict[str, Any]) -> None:
         if not isinstance(_sel, dict):
             _sel = {}
         _t = str(_sel.get("type") or "strike_type").lower().strip()
+        if _t == "delta":
+            _delta_raw = _sel.get("delta")
+            if _delta_raw in (None, ""):
+                _delta_raw = 0.30
+            try:
+                _target_delta = float(_delta_raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"Leg {_i}: Delta must be a number between 0.01 and 0.99")
+            if not 0.01 <= _target_delta <= 0.99:
+                raise ValueError(f"Leg {_i}: Delta must be between 0.01 and 0.99")
         if _t in _KNOWN_STRIKE_SEL_TYPES or _t.startswith(("atm", "itm", "otm")):
             continue
         raise RuntimeError(
@@ -4989,7 +5407,7 @@ def _supports_reentry_strike(leg_src: Dict[str, Any]) -> bool:
 
 _BUFFER_PREMIUM_TYPES = frozenset({
     "closest_premium", "premium_gte", "premium_lte", "premium_range",
-    "atm_straddle_prem_pct", "straddle_width",
+    "atm_straddle_prem_pct", "straddle_width", "delta",
 })
 _BUFFER_STRIKE_INTERVALS: Dict[str, int] = {
     "NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50, "MIDCPNIFTY": 25,
@@ -5115,20 +5533,65 @@ _RELPREM_LOT_SIZES: Dict[str, int] = {
 }
 
 
-def _relprem_cadence_days(leg_expiry: Any) -> float:
-    """Days per cycle for the SHORTER leg's cadence — the unit the divisor counts.
+_RELPREM_WINDOW_CACHE: Dict[tuple, int] = {}
 
-    The divisor is "how many of the shorter leg's cycles fit in the longer leg's
-    life": weekly -> ÷7 (52/yr), monthly -> ÷30.44 (12/yr), yearly -> ÷365.25.
-    Hardcoding ÷7 made a MONTHLY child divide by weeks (~52) instead of months
-    (~12), so its target came out ~4.3x too small.
+
+def _relprem_cycle_window(longer_expiry_iso: Any, longer_type: Any,
+                          shorter_type: Any, index: str) -> int:
+    """rel_leg_premium divisor N = how many SHORTER-cadence expiries fall inside
+    the LONGER contract's OWN calendar cycle (its month for a monthly contract,
+    its year for a yearly one), from the REAL (holiday-shifted) expiry calendar.
+
+    Entry-date INDEPENDENT: N is a property of the reference CONTRACT, not of
+    when the trade opened. This is the spec ("weeks in its month/year") — the old
+    `(longer_exp - entry).days / cadence` counted weeks REMAINING, so N shrank
+    every week for the same contract and the child strike drifted from far-OTM
+    early in the cycle to ATM near expiry. Verified against NSE bhavcopy: a yearly
+    24000-CE ref (30-Dec-2025) gives 52 weekly expiries in 2025 → 2119.70/52 ≈
+    40.76, matching the desk's Actual-Prem column. Cached per (index, cadence,
+    window). Returns 0 when it can't resolve (caller skips/falls through).
     """
-    e = str(leg_expiry or "").upper()
-    if e.startswith("YEAR"):
-        return 365.25
-    if e.startswith("MONTH"):
-        return 365.25 / 12.0  # 30.4375
-    return 7.0  # weekly / next-weekly / default
+    from datetime import date as _d, timedelta
+    try:
+        d = _d.fromisoformat(str(longer_expiry_iso)[:10])
+    except (ValueError, TypeError):
+        return 0
+    lt = str(longer_type or "").upper()
+    if "YEAR" in lt:
+        ws, we = _d(d.year, 1, 1), _d(d.year, 12, 31)
+    elif "MONTH" in lt:
+        ws = _d(d.year, d.month, 1)
+        we = _d(d.year + d.month // 12, d.month % 12 + 1, 1) - timedelta(days=1)
+    else:
+        return 0  # a weekly "longer" leg spans no multi-cycle window
+    st = str(shorter_type or "").upper()
+    cadence = "monthly" if "MONTH" in st else ("yearly" if "YEAR" in st else "weekly")
+    key = (str(index).upper(), cadence, ws.isoformat(), we.isoformat())
+    if key not in _RELPREM_WINDOW_CACHE:
+        try:
+            from base import get_expiry_dates  # type: ignore
+            # get_expiry_dates returns a DataFrame (dates in 'Current Expiry'),
+            # NOT a list — `df or []` raises "truth value ambiguous" and iterating
+            # a DataFrame yields column names, so both must be avoided.
+            _edf = get_expiry_dates(str(index).upper(), cadence, ws.isoformat(), we.isoformat())
+            exps = (
+                _edf["Current Expiry"].tolist()
+                if (_edf is not None and hasattr(_edf, "empty")
+                    and not _edf.empty and "Current Expiry" in _edf.columns)
+                else []
+            )
+        except Exception:
+            exps = []
+        cnt = 0
+        for e in exps:
+            try:
+                ed = _d.fromisoformat(_normalize_iso(str(e))[:10])
+            except (ValueError, TypeError):
+                continue
+            if ws <= ed <= we:
+                cnt += 1
+        _RELPREM_WINDOW_CACHE[key] = cnt
+    return _RELPREM_WINDOW_CACHE[key]
 
 
 def _relprem_legs(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
@@ -5300,22 +5763,17 @@ def _apply_rel_leg_premium_to_specs(
         if ref_prem is None or float(ref_prem) <= 0:
             continue
 
-        # 2. Cycle divisor — (longer_exp - entry) counted in the SHORTER leg's
-        #    cadence: how many of its cycles fit in the longer leg's remaining
-        #    life. Weekly child ÷7, monthly child ÷30.44, yearly ÷365.25 — NOT a
-        #    hardcoded ÷7 (that made a monthly child divide by weeks). Ref longer
-        #    than child (the normal case) divides; a shorter ref multiplies.
+        # 2. Cycle divisor — how many SHORTER-cadence expiries fall in the LONGER
+        #    contract's OWN calendar cycle (month/year), from the real expiry
+        #    calendar. Entry-date INDEPENDENT (a property of the contract). Ref
+        #    longer than child (the normal case) divides; a shorter ref multiplies.
         if ref_expiry >= child_expiry:
             longer_exp = ref_expiry
-            _cyc = _relprem_cadence_days(child_leg.get("expiry"))
+            longer_type, shorter_type = ref_leg.get("expiry"), child_leg.get("expiry")
         else:
             longer_exp = child_expiry
-            _cyc = _relprem_cadence_days(ref_leg.get("expiry"))
-        try:
-            n = (_date.fromisoformat(longer_exp)
-                 - _date.fromisoformat(entry_iso)).days / _cyc
-        except ValueError:
-            continue
+            longer_type, shorter_type = child_leg.get("expiry"), ref_leg.get("expiry")
+        n = _relprem_cycle_window(longer_exp, longer_type, shorter_type, index_up)
         if n <= 0:
             continue
         time_scale = (1.0 / n) if ref_expiry >= child_expiry else n
@@ -5335,13 +5793,28 @@ def _apply_rel_leg_premium_to_specs(
         except (TypeError, ValueError, ZeroDivisionError):
             qty_scale = 1.0
 
-        target = float(ref_prem) * time_scale * qty_scale
+        # TV mode: strip ref leg's intrinsic before dividing.
+        # For OTM/ATM ref legs intrinsic=0 so TV==premium — identical result.
+        _use_tv = str(sel.get("rel_ref_mode") or "premium").lower() == "tv"
+        ref_base = float(ref_prem)
+        if _use_tv:
+            _ref_is_ce = ref_type in ("CE", "CALL", "C")
+            try:
+                _ref_spot = float(algotest_native.get_spot_price(entry_iso, index_up) or 0.0)
+            except Exception:
+                _ref_spot = 0.0
+            if _ref_spot > 0:
+                _ref_intrinsic = max(
+                    (_ref_spot - ref_strike) if _ref_is_ce else (ref_strike - _ref_spot), 0.0)
+                ref_base = max(ref_base - _ref_intrinsic, 0.0)
+
+        target = ref_base * time_scale * qty_scale
         logger.info(
             "[RELPREM_DBG] tid=%s leg=%s entry=%s ref_strike=%s ref_exp=%s "
-            "child_exp=%s ref_prem=%.2f n=%.2f time_scale=%.5f qty=%.4f target=%.3f",
+            "child_exp=%s ref_prem=%.2f ref_base=%.2f n=%.2f time_scale=%.5f qty=%.4f target=%.3f use_tv=%s",
             s.get("trade_id"), child_id, entry_iso, ref_strike,
-            ref_expiry, child_expiry, float(ref_prem), float(n), time_scale,
-            qty_scale, target,
+            ref_expiry, child_expiry, float(ref_prem), ref_base, float(n), time_scale,
+            qty_scale, target, _use_tv,
         )
 
         # 4. Same chain scan every other premium mode uses. Unlike
@@ -5359,8 +5832,16 @@ def _apply_rel_leg_premium_to_specs(
         # spec right now IS the ATM strike — no separate spot lookup needed for
         # the scan's |strike-atm| tie-break.
         atm = round(float(s.get("strike") or 0.0) / interval) * interval
+        # For TV mode we also need entry_spot to compute each child candidate's TV.
+        _entry_spot = 0.0
+        if _use_tv:
+            try:
+                _entry_spot = float(algotest_native.get_spot_price(entry_iso, index_up) or 0.0)
+            except Exception:
+                _entry_spot = 0.0
         picked = _relprem_pick_strike(
-            entry_iso, index_up, is_ce, child_expiry, interval, target, atm)
+            entry_iso, index_up, is_ce, child_expiry, interval, target, atm,
+            use_tv=_use_tv, entry_spot=_entry_spot)
         if picked is None:
             continue
 
@@ -5379,33 +5860,69 @@ def _apply_rel_leg_premium_to_specs(
 def _relprem_pick_strike(
     entry_iso: str, index_up: str, is_ce: bool, child_expiry: str,
     interval: float, target: float, atm: float,
+    use_tv: bool = False, entry_spot: float = 0.0,
 ) -> Optional[float]:
-    """Nearest-premium tradeable grid strike to `target`. Shared by the initial
+    """Nearest tradeable grid strike to `target`. Shared by the initial
     post-pass AND the spot-adjustment re-entry (engine_rust.py ~9060) so a leg
-    that spot-adjusts mid-cycle re-picks by the same premium rule instead of
-    falling back to ATM. Returns None when the chain has no qualifying strike.
+    that spot-adjusts mid-cycle re-picks by the same rule instead of falling
+    back to ATM. Returns None when the chain has no qualifying strike.
 
-    Rank by |premium-target|, then |strike-atm|, then CE-prefers-higher; walk
-    that order and stop at the first tradeable strike (a stable sort makes this
-    identical to filtering-then-min but at ~1-3 native lookups, not one/strike).
+    use_tv=True: compare by time value (close - intrinsic) instead of premium.
+    Rank by |value-target|, then |strike-atm|, then CE-prefers-higher.
     """
     import algotest_native  # type: ignore
     chain = _strikes_for_date_tolerant(
         algotest_native, entry_iso, index_up, child_expiry, "CE" if is_ce else "PE")
+    # On-grid AND tradeable only. Tradeable is filtered UP FRONT (not after the
+    # ranking) so a stale-close strike's fabricated premium/TV can't sit in the
+    # ordering at all.
+    def _val(k: float, p: float) -> float:
+        if use_tv and entry_spot > 0:
+            intrinsic = max((entry_spot - k) if is_ce else (k - entry_spot), 0.0)
+            return p - intrinsic
+        return p
     cands = [
-        (k, p) for (k, p) in chain
+        (k, _val(k, p)) for (k, p) in chain
         if abs(k / interval - round(k / interval)) < 1e-9
+        and _relprem_tradeable(entry_iso, index_up, k, is_ce, child_expiry)
     ]
     if not cands:
         return None
-    cands.sort(key=lambda it: (
-        abs(it[1] - target), abs(it[0] - atm), -it[0] if is_ce else it[0]))
-    item = next(
-        (it for it in cands
-         if _relprem_tradeable(entry_iso, index_up, it[0], is_ce, child_expiry)),
-        None,
-    )
-    return float(item[0]) if item else None
+    # STEPWISE outward from ATM, stop at the crossing — NOT a chain-wide
+    # min|value-target| sort. Premium and time value both change monotonically
+    # with distance from ATM WITHIN one side, so the answer is the nearest strike
+    # where the value crosses the target. A global sort lands far from ATM when a
+    # distant strike's value coincidentally matches (measured: 2024-06-19 picked a
+    # 15000 PE at spot 23516 — 8516 pts away, prem 0.75). Mirrors the plain
+    # time_value selector (~engine_rust.py:2697): split OTM/ITM (monotonic only
+    # within a side), walk each outward, take the nearest crossing.
+    _ref = entry_spot if entry_spot > 0 else atm   # side split needs a spot proxy
+    _TIE = 6
+
+    def _order(seq):
+        return sorted(seq, key=lambda x: (abs(x[0] - atm), -x[0] if is_ce else x[0]))
+
+    def _walk(seq):
+        best = None
+        for k, v in _order(seq):
+            d = round(abs(v - target), _TIE)
+            if best is None or d < best[0]:
+                best = (d, k, v)
+            elif d == best[0]:
+                if v >= 0.0 > best[2]:   # tie -> prefer non-negative (TV) value
+                    best = (d, k, v)
+                break
+            else:
+                break   # stepped past the crossing; further out only worsens
+        return best
+
+    _itm = [c for c in cands if (_ref - c[0] if is_ce else c[0] - _ref) > 0.0]
+    _otm = [c for c in cands if (_ref - c[0] if is_ce else c[0] - _ref) <= 0.0]
+    hits = [h for h in (_walk(_otm), _walk(_itm)) if h]
+    if not hits:
+        return None
+    best = min(hits, key=lambda h: (h[0], 0 if h[2] >= 0.0 else 1, abs(h[1] - atm)))
+    return float(best[1])
 
 
 def _relprem_tradeable(
@@ -5485,7 +6002,7 @@ def _apply_relprem_from_adjusted(
         if not refinfo or not (entry_iso and child_expiry):
             out.append(s)
             continue
-        _, ref_strike, ref_expiry, ref_type = refinfo
+        ref_entry_iso, ref_strike, ref_expiry, ref_type = refinfo
         if not (ref_strike and ref_expiry):
             out.append(s)
             continue
@@ -5494,30 +6011,33 @@ def _apply_relprem_from_adjusted(
         ref_leg = legs[int(sel.get("ref_leg") or 0) - 1] if 0 <= int(sel.get("ref_leg") or 0) - 1 < len(legs) else {}
         index_up = str(child_leg.get("index") or base_index).upper()
 
+        # locked mode: use ref leg's OWN entry date for the premium lookup — so
+        # all child cycles sharing the same ref entry get an identical target.
+        # (N no longer depends on the entry date; it's the ref contract's full
+        # cycle.) Resets naturally when ref gets a new entry (rollover, spot-adj,
+        # patch reset) because _ref_at then returns a different refinfo.
+        _locked = str(sel.get("rel_ref_mode") or "premium").lower() == "premium_locked"
+        _prem_date = ref_entry_iso if _locked else entry_iso
+
         try:
             ref_prem = algotest_native.get_option_price(
-                entry_iso, index_up, float(ref_strike), ref_type, ref_expiry)
+                _prem_date, index_up, float(ref_strike), ref_type, ref_expiry)
         except Exception:
             ref_prem = None
         if not ref_prem or float(ref_prem) <= 0:
             out.append(s)
             continue
 
-        # Divisor in the SHORTER leg's cadence (weekly ÷7, monthly ÷30.44,
-        # yearly ÷365.25) — same rule as the initial pass, see
-        # _relprem_cadence_days.
+        # Divisor N = shorter-cadence expiries in the longer contract's own
+        # calendar cycle (month/year), entry-date independent — same rule as the
+        # initial pass, see _relprem_cycle_window.
         if ref_expiry >= child_expiry:
             longer_exp = ref_expiry
-            _cyc = _relprem_cadence_days(child_leg.get("expiry"))
+            longer_type, shorter_type = ref_leg.get("expiry"), child_leg.get("expiry")
         else:
             longer_exp = child_expiry
-            _cyc = _relprem_cadence_days(ref_leg.get("expiry"))
-        try:
-            weeks = (_rp_date.fromisoformat(longer_exp)
-                     - _rp_date.fromisoformat(entry_iso)).days / _cyc
-        except ValueError:
-            out.append(s)
-            continue
+            longer_type, shorter_type = child_leg.get("expiry"), ref_leg.get("expiry")
+        weeks = _relprem_cycle_window(longer_exp, longer_type, shorter_type, index_up)
         if weeks <= 0:
             out.append(s)
             continue
@@ -5531,7 +6051,20 @@ def _apply_relprem_from_adjusted(
                          / (float(child_leg.get("lots") or 1) * child_ls))
         except (TypeError, ValueError, ZeroDivisionError):
             qty_scale = 1.0
-        target = float(ref_prem) * time_scale * qty_scale
+        # TV mode: strip ref leg's intrinsic before dividing (same rule as initial pass).
+        _use_tv = str(sel.get("rel_ref_mode") or "premium").lower() == "tv"
+        ref_base = float(ref_prem)
+        try:
+            spot = float(algotest_native.get_spot_price(entry_iso, index_up) or 0.0) or float(s.get("strike") or 0.0)
+        except Exception:
+            spot = float(s.get("strike") or 0.0)
+        if _use_tv and spot > 0:
+            _ref_is_ce = ref_type in ("CE", "CALL", "C")
+            _ref_intrinsic = max(
+                (spot - ref_strike) if _ref_is_ce else (ref_strike - spot), 0.0)
+            ref_base = max(ref_base - _ref_intrinsic, 0.0)
+
+        target = ref_base * time_scale * qty_scale
 
         try:
             interval = float(child_leg.get("strike_interval") or 0) or float(
@@ -5539,13 +6072,10 @@ def _apply_relprem_from_adjusted(
         except (TypeError, ValueError):
             interval = float(_BUFFER_STRIKE_INTERVALS.get(index_up, 50))
         is_ce = str(s.get("option_type") or "").upper() in ("CE", "CALL", "C")
-        try:
-            spot = algotest_native.get_spot_price(entry_iso, index_up) or float(s.get("strike") or 0.0)
-        except Exception:
-            spot = float(s.get("strike") or 0.0)
         atm = round(float(spot) / interval) * interval
         picked = _relprem_pick_strike(
-            entry_iso, index_up, is_ce, child_expiry, interval, target, atm)
+            entry_iso, index_up, is_ce, child_expiry, interval, target, atm,
+            use_tv=_use_tv, entry_spot=spot if _use_tv else 0.0)
         logger.info(
             "[RELPREM_ADJ] tid=%s leg=%s entry=%s ref_strike=%s ref_prem=%.2f "
             "weeks=%.2f target=%.3f picked=%s",
@@ -5950,6 +6480,11 @@ def run_rust_engine_pipeline(
       * A list of priced trade rows otherwise. Empty list means the strategy
         produced no trades (e.g., no resolvable expiries in the range).
     """
+    _DTE_DAY_BASIS.set(
+        "calendar"
+        if str((payload or {}).get("dte_day_basis", "trading")).lower() == "calendar"
+        else "trading"
+    )
     try:
         import algotest_native  # type: ignore
     except ImportError:
@@ -6568,6 +7103,15 @@ def run_rust_engine_pipeline(
                 _relprem_targets[
                     (int(_rs.get("leg_id") or 0), _normalize_iso(_rs.get("expiry") or ""))
                 ] = float(_rt)
+
+    # ── Delta strike selection: override BS approximation with ACTUAL deltas ──
+    # Same single-site pattern as rel_leg_premium — after every builder has
+    # converged. Rewrites each delta leg's strike to the closest-ACTUAL-|delta|
+    # tradeable strike from the ingested EOD delta history. Inert when no leg
+    # uses delta selection.
+    _delta = _delta_legs(payload)
+    if _delta:
+        specs = _apply_delta_to_specs(specs, payload, _delta, int(lot_size))
 
     # ── Slice 6b: no_rollover post-processing ───────────────────────────────
     # Keep only the first trade per segment (or globally when no filter).
@@ -9536,7 +10080,21 @@ def run_rust_engine_pipeline(
             # THIS row; the leg still gets appended below with its own
             # (already-resolved) exit, it just doesn't get overwritten.
             _sa_leg_filter_ended = _is_leg_filter_ended(leg, final_exit)
-            if spot_adj_clamp and final_exit >= spot_adj_clamp and not _sa_leg_filter_ended:
+            # A filter-ended leg CAN still be cut EARLIER by a whole-trade spot-adj
+            # breach: the breach date precedes the leg's filter end, so it sits
+            # INSIDE the leg's own window. The leg exits with the trade and
+            # re-enters via the Phase-3 cascade for the residual window — the
+            # "every leg exits together, no row left holding one leg while the
+            # other runs on" rule (see the earliest-wins compare above). The guard
+            # only needs to block a clamp that would push the exit LATER than the
+            # file allows, which `final_exit >= spot_adj_clamp` already prevents;
+            # skipping the clamp for ALL filter-ended legs instead left Leg 2
+            # running to its range end while Leg 1 exited at the breach — the
+            # Trade 45 / 80-81 overlap. Same date (clamp == filter end) still keeps
+            # the LEG_FILTER_END label untouched.
+            if spot_adj_clamp and final_exit >= spot_adj_clamp and (
+                not _sa_leg_filter_ended or spot_adj_clamp < final_exit
+            ):
                 final_exit = spot_adj_clamp
                 reason = _sa_clamp_reason
                 _reason_cands.append((spot_adj_clamp, reason))
@@ -9947,22 +10505,6 @@ def run_rust_engine_pipeline(
                                 # snapped range end (resolve_leg_window already
                                 # snapped it and dropped degenerate windows).
                                 _sa_leg_this_exit = _sa_leg_exit
-                            # A TRUNCATED filtered leg (its range ends before the
-                            # trade's natural exit) re-enters ONLY on its OWN
-                            # spot-adj breach. When some OTHER leg's breach drives
-                            # this hop, this leg is still running the bounded
-                            # segment its filter file / mid-cycle split assigned it
-                            # — resurrecting it here double-books it against that
-                            # segment (the Trade 45 / 80-81 overlap: Leg 2 running
-                            # to its range end AND re-entering at Leg 1's breach).
-                            # _sa_casc_leg_set is the set of legs that triggered at
-                            # this hop; a fully-in-range filtered leg is NOT
-                            # truncated and still re-books with the whole trade.
-                            if (
-                                _leg_was_truncated(_sa_leg)
-                                and _sa_lid not in (_sa_casc_leg_set or frozenset())
-                            ):
-                                continue
                         _sa_prev_strike = (
                             _sa_prev_strike_by_leg.get(_sa_lid)
                             or float(_sa_leg.get("strike") or 0.0)
@@ -10194,9 +10736,13 @@ def run_rust_engine_pipeline(
                                 ).upper() in ("CE", "CALL", "C")
                                 _rp_atm = round(
                                     _sa_spot / _sa_leg_interval) * _sa_leg_interval
+                                _rp_use_tv = str(
+                                    (_sa_leg.get("strike_selection") or {}).get("rel_ref_mode") or "premium"
+                                ).lower() == "tv"
                                 _sa_strike = _relprem_pick_strike(
                                     _sa_cur_entry, _sa_index, _rp_is_ce,
                                     _sa_leg_expiry, _sa_leg_interval, _rp_tgt, _rp_atm,
+                                    use_tv=_rp_use_tv, entry_spot=_sa_spot if _rp_use_tv else 0.0,
                                 ) or float(_sa_prev_strike or 0.0)
                             else:
                                 _sa_strike = _compute_strike_for_leg_python(

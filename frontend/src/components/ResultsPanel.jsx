@@ -118,17 +118,24 @@ const sideCode = (position) => {
 
 // Strike-criteria token, per FILENAME_FORMAT.md's table (initials + value).
 // Two things the spec doesn't cover, because this app has them and the doc's
-// source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing — extends the
-// spec's own RtL prefix with a _G{gaps} suffix, alongside its _TV/_D) and
-// Delta-basis anything (no delta strike mode exists here at all, confirmed
-// absent from StrategyBuilder.jsx, so 'D'/'_D' tokens never appear).
+// source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing) and the EOD
+// fixed-IV Delta strike mode.
 const strikeCriteriaToken = (leg) => {
   const criteria = leg.strike_criteria || 'strike_type';
   if (criteria === 'closest_premium') return `CP${fmtNum(leg.premium_value)}`;
   if (criteria === 'premium_gte') return `Pgte${fmtNum(leg.premium_value)}`;
   if (criteria === 'premium_lte') return `Plte${fmtNum(leg.premium_value)}`;
   if (criteria === 'premium_range') return `PR${fmtNum(leg.premium_min)}_${fmtNum(leg.premium_max)}`;
-  if (criteria === 'straddle_width') return `SW${fmtNum(leg.straddle_multiplier ?? 0.5)}`;
+  if (criteria === 'straddle_width') {
+    // The engine's +/- is a raw offset applied identically to both legs; for the
+    // filename translate it to ITM/OTM per option type (CE + = OTM, CE - = ITM;
+    // PE reversed). Without this, a +/- direction sweep collapses to one token.
+    const mult = Number(leg.straddle_multiplier ?? 0.5);
+    const isCall = String(leg.option_type || '').toLowerCase() !== 'put' && String(leg.option_type || '').toUpperCase() !== 'PE';
+    const aboveAtm = String(leg.straddle_direction || '+').trim() !== '-';
+    const moneyness = mult === 0 ? 'ATM' : (aboveAtm ? (isCall ? 'OTM' : 'ITM') : (isCall ? 'ITM' : 'OTM'));
+    return `SW${fmtNum(mult)}_${moneyness}`;
+  }
   if (criteria === 'pct_of_atm') {
     const moneyness = (leg.pct_atm_moneyness || 'OTM').toUpperCase();
     return `pctoA${fmtNum(leg.pct_value)}_${moneyness}`;
@@ -137,6 +144,7 @@ const strikeCriteriaToken = (leg) => {
   if (criteria === 'synthetic_future') return 'SF';
   if (criteria === 'rel_leg') return `RtL${Number(leg.ref_leg) || 1}_G${fmtNum(leg.offset)}`;
   if (criteria === 'rel_leg_premium') return `RtL${Number(leg.ref_leg) || 1}`;
+  if (criteria === 'delta') return `D${fmtNum((Number(leg.delta_value) || 0.3) * 100)}`;
   if (criteria.startsWith('time_value')) {
     const base = criteria === 'time_value_gte' ? 'TVgte' : criteria === 'time_value_lte' ? 'TVlte' : 'TV';
     const side = String(leg.tv_moneyness || 'ATM').toUpperCase();
@@ -810,7 +818,21 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
         from_date: meta.from_date || '',
         to_date: meta.to_date || '',
         index: meta.index || 'NIFTY',
-        midcap_legs: meta.midcap_legs || null,
+        // Source the overlay legs from the SAME payload the Rules sheet is built
+        // from, falling back to it when the result meta lacks them (stale cache /
+        // a result that predates meta.midcap_legs). Without this fallback a strategy
+        // whose Rules sheet shows a Midcap leg silently downloaded a NIFTY-only
+        // Trade Sheet, because compute_midcap_for_rows early-returns when it gets
+        // no legs — the exact "why isn't hypothetical midcap in the tradesheet" bug.
+        // Prefer rulesPayload.midcap_legs when it carries capital_alloc_pct (sizing
+        // was active) but meta.midcap_legs is stale and lacks it — meta is always
+        // truthy so the plain || never reaches rulesPayload otherwise.
+        midcap_legs: (() => {
+          const fromRules = rulesPayload?.midcap_legs;
+          const fromMeta = meta.midcap_legs;
+          if (fromRules?.some(l => l.capital_alloc_pct > 0)) return fromRules;
+          return fromMeta || fromRules || null;
+        })(),
         midcap_spot_adjustment: meta.midcap_spot_adjustment || null,
         filter_segments: _segs,
         patchwise: !!patchwise,

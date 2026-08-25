@@ -80,6 +80,9 @@ _DYNAMIC_COST = os.environ.get("HEAVY_DYNAMIC_COST", "1").strip().lower() not in
 # duplicated the ~600 MB overlay cache (~1.9 GB/child); if that regresses, this
 # constant is a lie and the gate will under-reserve again.
 _PER_CHILD_MB = int(os.environ.get("HEAVY_COST_OPTIMIZE_PER_CHILD_MB", "400"))
+_MULTI_INDEX_PER_CHILD_MB = int(os.environ.get(
+    "HEAVY_COST_OPTIMIZE_MULTI_INDEX_PER_CHILD_MB", "600",
+))
 _COST_MODEL = {
     # base_mb, per_year_mb, floor_mb  (base + per_year*7 ≈ the flat _COSTS above)
     "backtest": (
@@ -188,6 +191,18 @@ def _span_years(base_payload: dict) -> float:
         return 7.0
 
 
+def _is_multi_index_payload(base_payload: dict) -> bool:
+    p = base_payload or {}
+    base = str(p.get("index") or p.get("symbol") or "NIFTY").strip().upper()
+    symbols = {base}
+    for leg in list(p.get("legs") or []) + list(p.get("midcap_legs") or []):
+        if isinstance(leg, dict):
+            sym = str(leg.get("index") or "").strip().upper()
+            if sym:
+                symbols.add(sym)
+    return len(symbols) > 1
+
+
 def cost_for_job(kind: str, base_payload: dict = None, p_override: int = 0) -> int:
     """#2 — DYNAMIC active-memory reservation (MB), scaled by the job's date
     span: base + per_year × years, clamped to [floor, flat-ceiling]. Never
@@ -237,7 +252,12 @@ def cost_for_job(kind: str, base_payload: dict = None, p_override: int = 0) -> i
             except Exception:
                 pass                      # unreadable -> keep full width (conservative)
         if p > 1:
-            est += (p - 1) * _PER_CHILD_MB
+            per_child_mb = (
+                max(_PER_CHILD_MB, _MULTI_INDEX_PER_CHILD_MB)
+                if _is_multi_index_payload(base_payload)
+                else _PER_CHILD_MB
+            )
+            est += (p - 1) * per_child_mb
             # Deliberately NOT clamped to `ceiling`: that ceiling encodes the old
             # span-only assumption, and clamping a genuine ~11 GB job down to
             # 4500 MB is precisely what let the box overcommit. Clamp to the budget

@@ -55,7 +55,7 @@ class TestWhitelistAcceptsSimpleShapes(unittest.TestCase):
     def test_recognized_strike_modes(self):
         for t in ("strike_type", "", "pct_of_atm", "rel_leg", "closest_premium",
                   "premium_gte", "premium_lte", "premium_range", "straddle_width",
-                  "atm_straddle_prem_pct", "atm", "itm2", "otm1"):
+                  "atm_straddle_prem_pct", "delta", "atm", "itm2", "otm1"):
             p = {"legs": [_leg(strike_selection={"type": t})]}
             self.assertIsNone(rust_batch_unsupported(p), f"{t!r} should be supported")
 

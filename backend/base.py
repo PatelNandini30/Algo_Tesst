@@ -1623,10 +1623,18 @@ def _invalidate_stale_bulk_lookup(sym_upper: str) -> None:
     except Exception:
         pass
     try:
-        import algotest_native
-        algotest_native.clear_cache()
+        # Native residency and rust_fast_path's key/signature markers are one
+        # cache state.  Clearing only algotest_native left the Python markers
+        # populated, so the next same-feather load returned "ready" without
+        # repopulating Rust and every affected optimizer combo produced no trades.
+        from services import rust_fast_path as _rf
+        _rf.clear_cache()
     except Exception:
-        pass
+        try:
+            import algotest_native
+            algotest_native.clear_cache()
+        except Exception:
+            pass
     # On-disk feathers for this symbol. Range-scoped caches are safe to drop, but
     # NEVER delete the authoritative ":full" feather: deleting it and letting the
     # next (possibly narrow-range) load rebuild it is exactly what TRUNCATES the

@@ -1,0 +1,49 @@
+name: algotest-rust-shadow
+
+services:
+  rust-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: algotest-rust-shadow:local
+    container_name: algotest-rust-shadow-api
+    restart: "no"
+    init: true
+    environment:
+      RUST_SHADOW_PORT: "18200"
+      RUST_SHADOW_HOST: "0.0.0.0"
+      RUST_SHADOW_REPOSITORY_ROOT: /market
+      RUST_SHADOW_STATE_DIR: /state
+      RUST_SHADOW_MEMORY_LIMIT_MB: "2048"
+      RUST_SHADOW_OPTIMIZER_CHUNK: "256"
+      RUST_SHADOW_MAX_COMBINATIONS: "1000000"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:${RUST_SHADOW_PORT:-18200}:18200"
+    volumes:
+      - ../cleaned_csvs:/market/cleaned_csvs:ro
+      - ../expiryData:/market/expiryData:ro
+      - ../strikeData:/market/strikeData:ro
+      - ../Filter:/market/Filter:ro
+      - rust-shadow-state:/state
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    mem_limit: 4g
+    mem_reservation: 3g
+    cpus: 8
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:18200/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  rust-shadow-state:
+    name: algotest-rust-shadow-state

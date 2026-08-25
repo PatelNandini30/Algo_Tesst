@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal, Cpu, Upload, FileText, X } from 'lucide-react';
+import { Play, Plus, Trash2, Info, Save, AlertTriangle, Loader2, RefreshCw, Sun, Moon, Beaker, LayoutGrid, BarChart3, SlidersHorizontal, Cpu, Upload, FileText, X, Wallet } from 'lucide-react';
 import { format, parse, isValid } from 'date-fns';
 import ResultsPanel from './ResultsPanel';
 import SuperTrendFilter from './SuperTrendFilter';
@@ -833,6 +833,7 @@ const StrategyBuilder = () => {
   const [strikeShiftMaxSteps, setStrikeShiftMaxSteps] = useState(1);
   const [entryDaysBefore, setEntryDaysBefore] = useState(2);
   const [exitDaysBefore, setExitDaysBefore] = useState(0);
+  const [dteDayBasis, setDteDayBasis] = useState('trading');
   const [delayTime, setDelayTime] = useState('09:15');
   const [squareOffMode, setSquareOffMode] = useState('partial');
   const [legs, setLegs] = useState([]);
@@ -985,6 +986,8 @@ const StrategyBuilder = () => {
     // from an earlier leg's resolved strike, shifted `offset` gaps further OTM.
     ref_leg: 1,
     offset: 0,
+    rel_ref_mode: 'premium',   // 'premium' | 'premium_locked' | 'tv'
+    delta_value: 0.3,          // target delta (0–1, absolute) for delta strike mode
     // Midcap100 cross-index overlay leg (segment === 'midcap100'):
     midcap_mode: 'hypothetical',     // 'spot' | 'hypothetical'
     cost_pct_per_month: 0.5,         // carry cost for hypothetical mode
@@ -1083,6 +1086,14 @@ const StrategyBuilder = () => {
   // STRYK sidebar nav (cosmetic — does not gate any rendering/logic)
   const [activeView, setActiveView] = useState('build');
   const resultsRef = useRef(null);
+  // CAPITAL SIZING (opt-in, futures-only): user defines a capital bucket and a
+  // per-leg allocation %; qty = alloc% x capital / fill price (decimal, no
+  // lot_size). v1 re-sizes every rollover, v2 only at a filter-segment end.
+  // Off by default ⇒ payload is byte-identical to today when unused.
+  const [sizingOpen, setSizingOpen] = useState(false);
+  const [sizingEnabled, setSizingEnabled] = useState(false);
+  const [totalCapital, setTotalCapital] = useState('');
+  const [sizingVersion, setSizingVersion] = useState('v1');
   // Advanced rules & settings accordion — presentation only; controls stay mounted
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [legwiseOpen, setLegwiseOpen] = useState(false);
@@ -1316,6 +1327,16 @@ const StrategyBuilder = () => {
         position: (l.position || 'buy').toUpperCase(),
         lots: l.lot || 1,
         symbol: 'NIFTYMIDCAP100',
+        // CAPITAL SIZING: carry this overlay leg's allocation % + the shared
+        // capital bucket/version so the backend can size the Midcap Hypo P&L
+        // (qty = alloc% × capital ÷ Midcap entry). Only when Sizing is on.
+        ...(sizingEnabled && Number(l.capital_alloc_pct) > 0 && Number(totalCapital) > 0
+          ? {
+              capital_alloc_pct: Number(l.capital_alloc_pct),
+              capital_total: Number(totalCapital),
+              capital_version: sizingVersion === 'v2' ? 'v2' : 'v1',
+            }
+          : {}),
       }));
     const midcap_spot_adjustment = (midcap_legs.length && midcapSpotAdjEnabled)
       ? {
@@ -1326,7 +1347,7 @@ const StrategyBuilder = () => {
         }
       : null;
     return { midcap_legs, midcap_spot_adjustment };
-  }, [legs, midcapSpotAdjEnabled, midcapSpotAdjDirection, midcapSpotAdjValue, midcapSpotAdjUnits, clampSpotAdjustmentValue]);
+  }, [legs, midcapSpotAdjEnabled, midcapSpotAdjDirection, midcapSpotAdjValue, midcapSpotAdjUnits, clampSpotAdjustmentValue, sizingEnabled, totalCapital, sizingVersion]);
 
   const projectTradesForOverlay = useCallback((trades) => {
     // One projected row per Trade id (matching the Excel export's grouping):
@@ -1639,10 +1660,7 @@ const StrategyBuilder = () => {
   ]);
 
   // Memoize static derived values so they don't rebuild on every keystroke
-  const daysOptions = useMemo(
-    () => expiryBasis === 'weekly' ? [0, 1, 2, 3, 4] : Array.from({ length: 25 }, (_, i) => i),
-    [expiryBasis]
-  );
+  const daysOptions = useMemo(() => Array.from({ length: 51 }, (_, i) => i), []);
 
   const strikeTypeOpts = useMemo(() => [
     ...Array.from({ length: 20 }, (_, i) => ({ value: `itm${20 - i}`, label: `ITM ${20 - i}` })),
@@ -2232,6 +2250,12 @@ const StrategyBuilder = () => {
         // Emitted only when > 0, so legs without it send a byte-identical payload
         // and the engine falls back to lots × index-lot-size exactly as before.
         ...(Number(l.qty) > 0 ? { qty: Math.trunc(Number(l.qty)) } : {}),
+        // CAPITAL SIZING: this leg's allocation % of the capital bucket. May
+        // exceed 100 (leverage). Emitted only when sizing is on and a value is
+        // set ⇒ absent otherwise, keeping the payload byte-identical.
+        ...(sizingEnabled && Number(l.capital_alloc_pct) > 0
+          ? { capital_alloc_pct: Number(l.capital_alloc_pct) }
+          : {}),
         // Per-leg index (multi-index feature). Defaults to the strategy index,
         // so single-index strategies are unaffected.
         index: String(l.index || instrument).toUpperCase(),
@@ -2290,6 +2314,16 @@ const StrategyBuilder = () => {
             direction: ['rise', 'fall', 'both'].includes(l.spot_adj_direction)
               ? l.spot_adj_direction
               : 'rise',
+          };
+        }
+        // Adjustment Relative to Leg: this leg inherits its reference leg's
+        // adjustment dates ("also adjust whenever the reference leg adjusts").
+        // Emitted only when opted in ⇒ existing payloads stay byte-identical.
+        // ref_leg is the 1-based number of an EARLIER leg (dropdown enforces it).
+        if (l.adj_rel_enabled) {
+          leg.adjustment_relative_to_leg = {
+            enabled: true,
+            ref_leg: Number(l.adj_rel_ref_leg) || 1,
           };
         }
         // Per-contract schedule (yearly legs only): emit only when the leg is
@@ -2375,6 +2409,10 @@ const StrategyBuilder = () => {
           // expiry-count ratio between the two legs and by their lot sizes.
           // ref_leg is 1-based and MUST reference an earlier leg.
           leg.strike_selection.ref_leg = Number(l.ref_leg) || 1;
+          leg.strike_selection.rel_ref_mode = l.rel_ref_mode || 'premium';
+        }
+        if (l.strike_criteria === 'delta') {
+          leg.strike_selection.delta = Number(l.delta_value) || 0.3;
         }
         if (l.strike_criteria === 'straddle_width') {
           leg.straddle_multiplier = l.straddle_multiplier ?? 0.5;
@@ -2533,6 +2571,13 @@ const StrategyBuilder = () => {
 
     return {
       index: instrument,
+      // CAPITAL SIZING (opt-in, futures-only): qty per sized leg =
+      // alloc% x total_capital / fill price (decimal, no lot_size). Emitted only
+      // when enabled with a positive capital ⇒ every other run is byte-identical.
+      // Per-leg alloc% rides each leg as capital_alloc_pct (below).
+      ...(sizingEnabled && Number(totalCapital) > 0
+        ? { capital_sizing: { enabled: true, total_capital: Number(totalCapital), version: sizingVersion === 'v2' ? 'v2' : 'v1' } }
+        : {}),
       // Opt-in flag routing this run to the isolated multi-index feature on the
       // backend. Absent/false for every existing single-index strategy.
       multi_index_mode: multiIndexMode,
@@ -2558,6 +2603,7 @@ const StrategyBuilder = () => {
       per_leg_rollover: perLegRollover,
       entry_dte: entryDaysBefore,
       exit_dte: exitDaysBefore,
+      dte_day_basis: dteDayBasis,
       square_off_mode: squareOffMode,
       spot_adjustment_enabled: spotAdjustmentEnabled,
       spot_adjustment_direction: spotAdjustmentDirection,
@@ -2867,6 +2913,7 @@ const StrategyBuilder = () => {
   const strykNav = [
     { id: 'build', label: 'Build', Icon: LayoutGrid, onClick: () => { setActiveView('build'); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
     { id: 'results', label: 'Results', Icon: BarChart3, disabled: !displayResults, onClick: () => { if (displayResults) { setActiveView('results'); resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }); } } },
+    { id: 'sizing', label: 'Sizing', Icon: Wallet, onClick: () => setSizingOpen(true) },
     { id: 'optimize', label: 'Optimize', Icon: SlidersHorizontal, onClick: () => setOptimPanelOpen(true) },
   ];
 
@@ -3110,8 +3157,9 @@ const StrategyBuilder = () => {
                     previous roll / run start, so a single strategy-level
                     entry/exit offset is meaningless there. */}
                 {backtestMode === 'eod' && !perLegRollover && (
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
+                  <div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
                       <label className="field-label">Entry (days before expiry)</label>
                       <select
                         value={entryDaysBefore}
@@ -3120,8 +3168,8 @@ const StrategyBuilder = () => {
                       >
                         {daysOptions.map(d => <option key={d}>{d}</option>)}
                       </select>
-                    </div>
-                    <div>
+                      </div>
+                      <div>
                       <label className="field-label">Exit (days before expiry)</label>
                       <select
                         value={exitDaysBefore}
@@ -3130,8 +3178,27 @@ const StrategyBuilder = () => {
                       >
                         {daysOptions.map(d => <option key={d}>{d}</option>)}
                       </select>
+                      </div>
+                    </div>
+                    <div className="mt-3">
+                      <label className="field-label">Count days as</label>
+                      <select
+                        value={dteDayBasis}
+                        onChange={e => setDteDayBasis(e.target.value)}
+                        className="w-full h-9 px-3 border border-default rounded text-sm bg-surface"
+                      >
+                        <option value="trading">Trading days (existing/default)</option>
+                        <option value="calendar">Calendar days</option>
+                      </select>
                     </div>
                   </div>
+                )}
+
+                {backtestMode === 'eod' && !perLegRollover && (
+                  <p className="text-[11px] text-muted mt-1">
+                    T-50 means 50 {dteDayBasis === 'calendar' ? 'calendar days' : 'trading sessions'} before expiry. Entry must normally be a larger T-number than Exit
+                    (for example, Entry T-50 and Exit T-2).
+                  </p>
                 )}
 
                 {backtestMode === 'eod' && legs.length > 0 && legs.every(l => l.segment === 'futures') && legs.some(l => l.expiry === 'next_monthly') && (
@@ -4135,6 +4202,7 @@ const StrategyBuilder = () => {
                       <option value="time_value">Time Value (nearest)</option>
                       <option value="time_value_gte">Time Value &gt;=</option>
                       <option value="time_value_lte">Time Value &lt;=</option>
+                      <option value="delta">Delta</option>
                       <option value="straddle_width">Straddle Width</option>
                       <option value="pct_of_atm">% of ATM</option>
                       <option value="synthetic_future">Synthetic Future</option>
@@ -4280,6 +4348,25 @@ const StrategyBuilder = () => {
                       </>
                     )}
 
+                    {draftLeg.strike_criteria === 'delta' && (
+                      <>
+                        <label className="field-label">Delta</label>
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1 h-8">
+                            <input
+                              type="number" min="0.01" max="0.99" step="0.01"
+                              value={draftLeg.delta_value ?? 0.3}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, delta_value: parseFloat(e.target.value) || 0.3 }))}
+                              className="w-20 h-8 px-2 border border-default rounded text-xs text-center" />
+                            <span className="text-xs text-muted whitespace-nowrap">(0–1)</span>
+                          </div>
+                          <span className="text-xs text-muted">
+                            {`e.g. 0.30 = 30Δ — approximated via Black-Scholes (EOD, r=0)`}
+                          </span>
+                        </div>
+                      </>
+                    )}
+
                     {draftLeg.strike_criteria === 'atm_straddle_prem_pct' && (
                       <>
                         <label className="field-label">&nbsp;</label>
@@ -4353,9 +4440,22 @@ const StrategyBuilder = () => {
                             >
                               {legs.map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
                             </select>
+                            <select
+                              value={draftLeg.rel_ref_mode ?? 'premium'}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, rel_ref_mode: e.target.value }))}
+                              className="h-8 px-2 border border-default rounded text-xs bg-surface font-medium"
+                            >
+                              <option value="premium">Premium (MTM)</option>
+                              <option value="premium_locked">Premium (Locked)</option>
+                              <option value="tv">TV (Time Value)</option>
+                            </select>
                           </div>
                           <span className="text-xs text-muted">
-                            {`Target premium = Leg ${draftLeg.ref_leg ?? 1} entry premium ÷ expiries in its life, adjusted for lot size`}
+                            {draftLeg.rel_ref_mode === 'tv'
+                              ? `Target = Leg ${draftLeg.ref_leg ?? 1} time value ÷ expiries in its life`
+                              : draftLeg.rel_ref_mode === 'premium_locked'
+                              ? `Target locked at Leg ${draftLeg.ref_leg ?? 1} original fill ÷ N — resets on rollover/spot-adj/patch`
+                              : `Target premium = Leg ${draftLeg.ref_leg ?? 1} entry premium ÷ expiries in its life, adjusted for lot size`}
                           </span>
                         </div>
                       </>
@@ -4555,6 +4655,7 @@ const StrategyBuilder = () => {
                                   <option value="time_value">Time Value (nearest)</option>
                                   <option value="time_value_gte">Time Value &gt;=</option>
                                   <option value="time_value_lte">Time Value &lt;=</option>
+                                  <option value="delta">Delta</option>
                                   <option value="straddle_width">Straddle Width</option>
                                   <option value="pct_of_atm">% of ATM</option>
                                   <option value="synthetic_future">Synthetic Future</option>
@@ -4658,6 +4759,27 @@ const StrategyBuilder = () => {
                                     </>
                                   )}
 
+                                  {leg.strike_criteria === 'delta' && (
+                                    <>
+                                      <label className="field-label">Delta</label>
+                                      <div className="flex flex-col gap-0.5">
+                                        <div className="flex items-center gap-1 h-7">
+                                          <input
+                                            type="number" min="0.01" max="0.99" step="0.01"
+                                            value={leg.delta_value ?? 0.3}
+                                            onChange={e => {
+                                              const value = Number(e.target.value);
+                                              updateLeg(leg.id, 'delta_value', Number.isFinite(value) ? value : 0.3);
+                                            }}
+                                            className="w-20 h-7 px-2 border border-default rounded text-xs text-center"
+                                          />
+                                          <span className="text-xs text-muted whitespace-nowrap">(0–1)</span>
+                                        </div>
+                                        <span className="text-xs text-muted">0.30 = 30Δ (EOD approximation)</span>
+                                      </div>
+                                    </>
+                                  )}
+
                                   {leg.strike_criteria === 'pct_of_atm' && (
                                     <>
                                       <label className="field-label">&nbsp;</label>
@@ -4757,9 +4879,22 @@ const StrategyBuilder = () => {
                                           >
                                             {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
                                           </select>
+                                          <select
+                                            value={leg.rel_ref_mode ?? 'premium'}
+                                            onChange={e => updateLeg(leg.id, 'rel_ref_mode', e.target.value)}
+                                            className="h-7 px-2 border border-default rounded text-xs bg-surface font-medium"
+                                          >
+                                            <option value="premium">Premium (MTM)</option>
+                                            <option value="premium_locked">Premium (Locked)</option>
+                                            <option value="tv">TV (Time Value)</option>
+                                          </select>
                                         </div>
                                         <span className="text-xs text-muted">
-                                          {`Leg ${leg.ref_leg ?? 1} premium ÷ expiries in its life`}
+                                          {leg.rel_ref_mode === 'tv'
+                                            ? `Leg ${leg.ref_leg ?? 1} time value ÷ expiries in its life`
+                                            : leg.rel_ref_mode === 'premium_locked'
+                                            ? `Locked at Leg ${leg.ref_leg ?? 1} original fill ÷ N — resets on rollover/spot-adj/patch`
+                                            : `Leg ${leg.ref_leg ?? 1} premium ÷ expiries in its life`}
                                         </span>
                                       </div>
                                     </>
@@ -4842,6 +4977,33 @@ const StrategyBuilder = () => {
                             )}
                             {!leg.spot_adj_enabled && (
                               <span className="text-[10px] text-muted">Uses strategy-level Spot Adjustment</span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Adjustment Relative to Leg — this leg ALSO re-strikes
+                            whenever its reference (earlier) leg adjusts; it inherits
+                            that leg's spot-adjustment dates. Needs per-leg rollover on
+                            and a reference leg that itself has spot-adjustment. */}
+                        {leg.segment === 'options' && idx > 0 && (
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <Toggle
+                              enabled={Boolean(leg.adj_rel_enabled)}
+                              onToggle={(val) => updateLeg(leg.id, 'adj_rel_enabled', val !== undefined ? Boolean(val) : !leg.adj_rel_enabled)}
+                              size="sm"
+                            />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Adjustment Relative to Leg</span>
+                            {leg.adj_rel_enabled && (
+                              <>
+                                <select
+                                  value={leg.adj_rel_ref_leg ?? 1}
+                                  onChange={e => updateLeg(leg.id, 'adj_rel_ref_leg', Number(e.target.value) || 1)}
+                                  className="h-7 px-2 border border-default rounded text-xs bg-surface"
+                                >
+                                  {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                                </select>
+                                <span className="text-[10px] text-muted">also adjust whenever the reference leg adjusts</span>
+                              </>
                             )}
                           </div>
                         )}
@@ -5786,6 +5948,92 @@ const StrategyBuilder = () => {
             </div>
           )}
         </div>
+        {sizingOpen && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            onClick={() => setSizingOpen(false)}
+            style={{ position: 'fixed', inset: 0, zIndex: 9000, background: 'rgba(8,10,16,0.72)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '5vh 16px', overflowY: 'auto' }}
+          >
+            <div
+              onClick={e => e.stopPropagation()}
+              className="bg-surface rounded-lg border border-default shadow-sm"
+              style={{ width: 'min(680px, 96vw)' }}
+            >
+              <div className="px-4 py-3 border-b border-subtle flex items-center justify-between">
+                <h3 className="section-heading flex items-center gap-2"><Wallet size={14} /> Sizing — Capital-Weighted Quantity</h3>
+                <button type="button" onClick={() => setSizingOpen(false)} style={{ color: 'var(--text-secondary)' }}><X size={16} /></button>
+              </div>
+              <div className="p-4 space-y-4">
+                <label className="flex items-center gap-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
+                  <input type="checkbox" checked={sizingEnabled} onChange={e => setSizingEnabled(e.target.checked)} />
+                  Enable capital-weighted sizing (futures only)
+                </label>
+                <div className={sizingEnabled ? '' : 'opacity-40 pointer-events-none'}>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="field-label">Total Capital (₹)</label>
+                      <input type="number" min={0} value={totalCapital}
+                        onChange={e => setTotalCapital(e.target.value === '' ? '' : (Number(e.target.value) || 0))}
+                        placeholder="e.g. 700000000"
+                        className="w-full px-2 py-1.5 rounded-md border border-default bg-base text-sm" />
+                    </div>
+                    <div>
+                      <label className="field-label">Re-size cadence</label>
+                      <SegBtn
+                        options={[
+                          { value: 'v1', label: 'V1 · every rollover' },
+                          { value: 'v2', label: 'V2 · filter-end only' },
+                        ]}
+                        value={sizingVersion}
+                        onChange={setSizingVersion}
+                      />
+                    </div>
+                  </div>
+                  <div className="mt-4">
+                    <label className="field-label">Per-leg allocation %  <span style={{ color: 'var(--text-muted)' }}>(independent · may exceed 100 = leverage)</span></label>
+                    <div className="space-y-2 mt-1">
+                      {legs.map((l) => {
+                        const alloc = Number(l.capital_alloc_pct) || 0;
+                        const bucket = (Number(totalCapital) || 0) * alloc / 100;
+                        const seg = String(l.segment || '').toLowerCase();
+                        const isMidcap = seg === 'midcap100';
+                        const isFut = seg === 'futures' || isMidcap;   // overlay hypo-future is sizable
+                        const label = isMidcap
+                          ? `NIFTYMIDCAP100 ${l.position} overlay`
+                          : `${(l.index || instrument)} ${l.position} ${l.segment}${!isFut ? ' (non-futures)' : ''}`;
+                        return (
+                          <div key={l.id} className="flex items-center gap-3 text-sm">
+                            <span style={{ minWidth: 190, fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.72rem', color: isFut ? 'var(--text-primary)' : 'var(--text-muted)' }}>
+                              {label}
+                            </span>
+                            <input type="number" min={0} step="any" value={l.capital_alloc_pct ?? ''}
+                              onChange={e => updateLeg(l.id, 'capital_alloc_pct', e.target.value === '' ? '' : (Number(e.target.value) || 0))}
+                              placeholder="%"
+                              style={{ width: 90 }}
+                              className="px-2 py-1 rounded-md border border-default bg-base" />
+                            <span style={{ fontFamily: 'IBM Plex Mono, monospace', fontSize: '0.68rem', color: 'var(--text-secondary)' }}>
+                              bucket ₹{bucket.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-3 text-xs" style={{ color: 'var(--text-muted)' }}>
+                      qty = alloc% × capital ÷ entry price (decimal, no lot size). Fixed capital, no compounding.
+                      V1 re-derives qty at every rollover; V2 holds it across rollovers and re-derives only at a filter-segment end.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div className="px-4 py-3 border-t border-subtle flex justify-end">
+                <button type="button" onClick={() => setSizingOpen(false)}
+                  className="px-3 py-1.5 rounded-md text-xs font-semibold"
+                  style={{ background: 'var(--accent)', color: '#fff' }}>Done</button>
+              </div>
+            </div>
+          </div>
+        )}
         {optimPanelOpen && (
           <OptimizePanel
             isOpen={optimPanelOpen}

@@ -71,6 +71,16 @@ def _strike_label(ss: Optional[Dict[str, Any]], opt_type: Any = "") -> str:
         ref = ss.get("ref_leg")
         return (f"Relative to Leg {_num(ref if ref is not None else 1)} Premium, "
                 f"÷ weeks to expiry ÷ lots")
+    if t == "DELTA":
+        delta = ss.get("delta")
+        if delta is None:
+            delta = 0.3
+        try:
+            delta_pct = float(delta) * 100.0
+        except (TypeError, ValueError):
+            delta_pct = 30.0
+        return (f"Delta: {_num(delta)} ({_num(delta_pct)}Δ, "
+                "closest actual EOD delta)")
     if t.startswith("TIME_VALUE"):
         op = ">=" if t == "TIME_VALUE_GTE" else "<=" if t == "TIME_VALUE_LTE" else "nearest"
         tv = ss.get("time_value")
@@ -109,6 +119,13 @@ def _leg_section(rows: List, leg: Dict[str, Any], n: int, per_leg: bool = False)
     _qov = leg.get("qty") or leg.get("_qty_override")
     if _qov:
         _kv(rows, "Quantity (override)", _qov)
+    # Capital-weighted sizing: this leg's allocation % of the bucket.
+    try:
+        _alloc = float(leg.get("capital_alloc_pct") or 0)
+    except (TypeError, ValueError):
+        _alloc = 0
+    if _alloc > 0:
+        _kv(rows, "Capital Allocation", f"{_alloc:g}% of bucket (qty = alloc x capital / fill price)")
     if leg.get("index"):
         _kv(rows, "Index", leg.get("index"))
     _kv(rows, "Expiry", _expiry(leg.get("expiry")))
@@ -161,6 +178,16 @@ def _leg_section(rows: List, leg: Dict[str, Any], n: int, per_leg: bool = False)
         _kv(rows, "Spot Adjustment", f"Yes ({d} {_num(sa.get('pct'))}{u})")
     else:
         _kv(rows, "Spot Adjustment", "Uses strategy-level setting")
+
+    # Adjustment Relative to Leg: this leg also re-strikes whenever its reference
+    # leg adjusts. Shown so the config is self-documenting in the workbook.
+    rel = leg.get("adjustment_relative_to_leg") or {}
+    try:
+        _rel_ref = int(rel.get("ref_leg") or 0)
+    except (TypeError, ValueError):
+        _rel_ref = 0
+    if rel.get("enabled") and _rel_ref > 0:
+        _kv(rows, "Adjustment Relative to Leg", f"Yes (follows Leg {_rel_ref})")
 
     # Per-December-contract schedule (yearly legs): each row is a From→To year
     # range; the range runs until the next row's From (sticky), last row = onward.
@@ -246,8 +273,19 @@ def build_rules_sheet(payload: Optional[Dict[str, Any]], filter_name: Optional[s
         _kv(rows, "Backtest Date Range", f"{payload.get('date_from') or ''} → {payload.get('date_to') or ''}")
     _kv(rows, "Expiry", _expiry(payload.get("expiry_type")))
     _kv(rows, "Entry / Exit DTE", f"T-{payload.get('entry_dte') or 0} to T-{payload.get('exit_dte') or 0}")
+    _kv(rows, "DTE Day Basis", "Calendar days" if str(payload.get("dte_day_basis") or "trading").lower() == "calendar" else "Trading days (default)")
     if payload.get("square_off_mode"):
         _kv(rows, "Square-off Mode", payload.get("square_off_mode"))
+
+    _cap = payload.get("capital_sizing")
+    if isinstance(_cap, dict) and _cap.get("enabled"):
+        try:
+            _tc = float(_cap.get("total_capital") or 0)
+        except (TypeError, ValueError):
+            _tc = 0
+        if _tc > 0:
+            _ver = "V2 (re-size at filter-end only)" if str(_cap.get("version") or "v1").lower() == "v2" else "V1 (re-size every rollover)"
+            _kv(rows, "Capital Sizing", f"On — Total {_tc:g}, {_ver}, fixed capital / no compounding")
 
     is_yearly = str(payload.get("expiry_type") or "").upper() == "YEARLY"
     if is_yearly:

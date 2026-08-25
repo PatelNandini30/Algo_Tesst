@@ -66,17 +66,51 @@ def _ensure_group_symbol_loaded(symbol: str, from_date: str, to_date: str, force
     bulk_load_options' other bookkeeping (_bhav_by_date_symbol, _bulk_loaded)."""
     global _bulk_engine_activated
     from services import rust_fast_path as rf
-    if force_full or not _bulk_engine_activated:
-        # Full bulk load (replaces the native cache with THIS symbol). Used on the
-        # first call of a process (perf activation) and as the recovery path when a
-        # group's additive merge left its symbol not fully resident.
+
+    symbol = str(symbol or "").strip().upper()
+
+    def _resident() -> bool:
+        """Use Rust itself as the authority; Python cache keys are only hints."""
+        try:
+            import algotest_native as _an
+            return bool(_an.is_loaded()) and symbol in set(_an.cache_symbols() or [])
+        except Exception:
+            return False
+
+    def _full_load() -> None:
         from base import bulk_load_options
         from services.algotest_job import _build_fast_lookup_from_bulk
         bulk_load_options(symbol, from_date, to_date)
         _build_fast_lookup_from_bulk(symbol, from_date, to_date)
+
+    if force_full or not _bulk_engine_activated:
+        # Full bulk load (replaces the native cache with THIS symbol). Used on the
+        # first call of a process (perf activation) and as the recovery path when a
+        # group's additive merge left its symbol not fully resident.
+        _full_load()
         _bulk_engine_activated = True
-        return
-    rf.ensure_symbol_merged(symbol)
+        if _resident():
+            return
+        # A full load reporting success while Rust is empty is never a valid
+        # warm state.  Fall through to the additive recovery once, then fail
+        # clearly instead of letting the engine manufacture an empty group.
+
+    if not _resident():
+        rf.ensure_symbol_merged(symbol)
+    # Guard: if the additive merge didn't actually land the symbol in the native
+    # cache (e.g. a data_version invalidation cleared it in the fork child just
+    # before the merge, leaving the Rust process with no NIFTY while MIDCPNIFTY
+    # is resident), fall back to a full reload so the resident check downstream
+    # doesn't refuse to price the fused run. This is the exact cause of the
+    # "[SYNC_FUSED] symbols ['NIFTY'] not resident after merge" failures seen
+    # when a parallel optim worker inherits an invalidated data_version from the
+    # parent and calls merge_cache on an already-stale native state.
+    if not _resident():
+        _full_load()
+    if not _resident():
+        raise RuntimeError(
+            f"Rust cache reload completed but {symbol} is still not resident"
+        )
 
 
 def _leg_index(leg: dict, default_index: str) -> str:
@@ -1129,9 +1163,10 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
     # return the currently-loaded base index's spot/premium — Rust's symbol_ids
     # lookup has no such flaw.)
     try:
-        from services.engine_rust import _compute_strike_for_leg_python
+        from services.engine_rust import _compute_strike_for_leg_python, _compute_spot_adjustment_trigger as _catrig
     except Exception:
         _compute_strike_for_leg_python = None
+        _catrig = None
 
     by_sym: Dict[str, List[dict]] = {}
     # Roll months a YEARLY overlay leg may pin to (NSE lists long-dated contracts
@@ -1462,6 +1497,11 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                         else _pick_weekly if leg_exp.startswith("WEEK")
                         else _pick_monthly
                     )
+                    # DROP FIX: monthly overlay on a DIFFERENT index picks its OWN
+                    # near-month (holdable on the entry day) not NIFTY's window-end
+                    # (`sel_iso`). Pre-2025 MIDCPNIFTY last-Mon vs NIFTY last-Thu: sel_iso
+                    # pointed at MCN's NEXT month → untradeable on entry → leg dropped.
+                    _pick_ref = entry_iso if _pick is _pick_monthly else sel_iso
 
                     # PREMIUM-BASED STRIKE MODES on an overlay (non-base) leg.
                     # _compute_strike_for_leg_python resolves straddle_width /
@@ -1492,7 +1532,7 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                         for _pd in (0, 1, -1, 2, -2, 3, -3):
                             _ps = _atm_probe + _pd * interval
                             _probe_expiry = _pick(
-                                opt_exps, sel_iso,
+                                opt_exps, _pick_ref,
                                 lambda e, _s=_ps: _premium(entry_iso, _s, opt, e) is not None,
                                 floor_month=_floor_month,
                             )
@@ -1530,7 +1570,7 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     for _ds in (0, 1, -1, 2, -2, 3, -3):
                         cs = base_strike + _ds * interval
                         c = _pick(
-                            opt_exps, sel_iso,
+                            opt_exps, _pick_ref,
                             lambda e, _s=cs: _premium(entry_iso, _s, opt, e) is not None and _premium(exit_iso, _s, opt, e) is not None,
                             floor_month=_floor_month,
                         )
@@ -1582,6 +1622,22 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     # P&L = points x THIS leg's own lots — same convention/reason
                     # as the futures branch above.
                     pnl = round(((xp - ep) if pos == "BUY" else (ep - xp)) * lots, 2)
+                    # Parse per-leg spot-adjustment config (same shape as fused _leg_sa_cfg).
+                    _ov_sa_cfg = None
+                    if not is_fut and _catrig is not None:
+                        _ov_sa_raw = leg.get("spot_adjustment") or {}
+                        if isinstance(_ov_sa_raw, dict) and _ov_sa_raw.get("enabled"):
+                            try:
+                                _ov_p = float(_ov_sa_raw.get("pct") or 0)
+                                if _ov_p > 0:
+                                    _ov_u = str(_ov_sa_raw.get("units") or "percent").lower()
+                                    if _ov_u not in ("percent", "points"): _ov_u = "percent"
+                                    _ov_d = str(_ov_sa_raw.get("direction") or "rise").lower()
+                                    if _ov_d not in ("rise", "fall", "both"): _ov_d = "rise"
+                                    if _ov_u == "percent": _ov_p = max(0.25, min(5.0, _ov_p))
+                                    _ov_sa_cfg = {"pct": _ov_p, "units": _ov_u, "direction": _ov_d}
+                            except Exception:
+                                pass
                     typ = opt
                     # Straddle-width context for THIS index. The base leg gets these
                     # from engine_rust; an overlay leg on another index was left blank,
@@ -1651,49 +1707,89 @@ def _overlay_legs_onto_base(base_df, overlay_legs, default_index, effective_from
                     rows.append(_row)
                     logger.warning("[MULTI_INDEX] %s", _blank_reason)
                     continue
-                rows.append({
-                    # Use the leg's CONFIGURED position so the sheet keeps the user's
-                    # leg order (falls back to the old append-after-base numbering
-                    # when the caller didn't stamp _orig_leg_no).
-                    "Trade": int(tid),
-                    "Leg": int(leg.get("_orig_leg_no") or (max_leg + leg_off)),
-                    "Index": int(tid),
-                    "Entry Date": entry_dt, "Exit Date": exit_dt, "Expiry": contract,
-                    "Type": typ, "Strike": strike if not is_fut else "", "B/S": pos,
-                    # Explicit lots so downstream consumers (e.g. the charges
-                    # recalc fallback in routers/backtest.py) never have to
-                    # derive it from Qty/lot_size or misread "Index" — on THIS
-                    # row "Index" is the numeric trade id (see `int(tid)` above
-                    # and run_multi_index_feature's `combined["Index"] =
-                    # combined["Trade"]`), not a symbol, so a lot_size lookup
-                    # keyed off it would silently be bogus.
-                    "lots": lots,
-                    "Qty": lots * lot_size, "Entry Price": ep, "Exit Price": xp,
-                    "Raw Entry Price": ep_raw, "Raw Exit Price": xp_raw,
-                    "Entry Spot": round(es, 2), "Exit Spot": round(xs, 2),
-                    # This index's OWN spot move over the hold. Was blank on overlay
-                    # rows while the base leg showed it, so a MIDCPNIFTY leg gave no
-                    # indication of what its underlying did. "Spot P&L %" is NOT
-                    # stored — excel_builder derives it as Spot P&L / Entry Spot on
-                    # each row, which for this row is MIDCPNIFTY's own spot.
-                    "Spot P&L": round(xs - es, 2) if (es and xs) else 0.0,
-                    "CE P&L": ce, "PE P&L": pe, "FUT P&L": fut, "Net P&L": pnl,
-                    "% P&L": round(pnl / es * 100.0, 4) if es else 0.0,
-                    **_sw_ctx,
-                    # MAE/MFE must be commensurate with % P&L, which is lots-scaled
-                    # (points x lots) — summary_metrics.rs:336 compounds NAV by
-                    # % P&L while :362 applies MAE to that same NAV, so leaving
-                    # MAE unscaled understates Live DD / Max DD by ~1/lots. Both
-                    # _fmm (futures branch above) and _omm (option branch above)
-                    # return a plain unscaled ratio into these same `_mae`/`_mfe`
-                    # locals, so scale once here by THIS leg's own `lots` (the
-                    # local set at the top of this leg's iteration) — lot_size
-                    # excluded. Same convention as services/algotest_job.py.
-                    "Exit Reason": "OVERLAY", "MAE": round(_mae * lots, 4), "MFE": round(_mfe * lots, 4),
-                    "Strike Shift Reason": _shift_reason,
-                    "Group Index": sym,
-                    "Group Expiry": ("MONTHLY" if is_fut else str(leg.get("expiry") or leg.get("expiry_type") or "MONTHLY").upper()),
-                })
+                # Own spot-adjustment cascade for this overlay leg. When _ov_sa_cfg
+                # is None (SA disabled) the loop runs exactly once and emits the same
+                # single row as before — byte-identical for non-SA configs.
+                _leg_no = int(leg.get("_orig_leg_no") or (max_leg + leg_off))
+                _grp_exp = ("MONTHLY" if is_fut else str(leg.get("expiry") or leg.get("expiry_type") or "MONTHLY").upper())
+                _sa_cur_entry_iso = entry_iso
+                _sa_cur_entry_dt = entry_dt
+                _sa_cur_strike = float(strike)
+                _sa_mark = float(espot) if espot else 0.0   # SA baseline = entry spot
+                _sa_guard = 0
+                _spot_series: Dict[str, float] = {}  # lazy-built for SA trigger
+                while True:
+                    _sa_guard += 1
+                    _sa_trig = None
+                    if _ov_sa_cfg and _sa_mark > 0 and _sa_guard <= 250 and _catrig is not None:
+                        if not _spot_series:
+                            # Build MCN spot dict once per window (only when SA enabled)
+                            for _sd in _sorted_td:
+                                if _sa_cur_entry_iso < _sd <= exit_iso:
+                                    _sv = rf.get_spot_price(_sd, sym)
+                                    if _sv is not None:
+                                        _spot_series[_sd] = float(_sv)
+                        _spot_tail = {d: v for d, v in _spot_series.items() if d > _sa_cur_entry_iso}
+                        if _spot_tail:
+                            _sa_trig = _catrig(
+                                _sa_cur_entry_iso, _sa_mark, exit_iso,
+                                _ov_sa_cfg["direction"], _ov_sa_cfg["pct"],
+                                _ov_sa_cfg["units"], _sorted_td, _spot_tail,
+                            )
+                    # sub-window exit = breach date if SA fired, otherwise original exit
+                    _sub_exit_iso = _sa_trig if _sa_trig else exit_iso
+                    _sub_exit_dt = pd.Timestamp(_sub_exit_iso)
+                    _sub_ep_raw = round(float(_premium(_sa_cur_entry_iso, _sa_cur_strike, opt, contract) or ep_raw), 2)
+                    _sub_xp_raw = round(float(_premium(_sub_exit_iso, _sa_cur_strike, opt, contract) or xp_raw), 2)
+                    _sub_ep, _sub_xp = _slip(_sub_ep_raw, _sub_xp_raw, pos)
+                    _sub_pnl = round(((_sub_xp - _sub_ep) if pos == "BUY" else (_sub_ep - _sub_xp)) * lots, 2)
+                    _sub_ce = _sub_pnl if opt == "CE" else 0.0
+                    _sub_pe = _sub_pnl if opt == "PE" else 0.0
+                    _sub_es = float(rf.get_spot_price(_sa_cur_entry_iso, sym) or espot or 0.0)
+                    _sub_xs = float(rf.get_spot_price(_sub_exit_iso, sym) or xspot or 0.0)
+                    _sub_reason = "OVERLAY"
+                    if _sa_trig:
+                        _trig_sp = _spot_series.get(_sa_trig) or _sub_xs
+                        _sub_reason = ("SPOT_ADJ_RISE" if _trig_sp >= _sa_mark else "SPOT_ADJ_FALL") + \
+                                      " (Leg %d %s %s)" % (_leg_no, opt, _grp_exp.title())
+                    rows.append({
+                        "Trade": int(tid),
+                        "Leg": _leg_no,
+                        "Index": int(tid),
+                        "Entry Date": _sa_cur_entry_dt, "Exit Date": _sub_exit_dt, "Expiry": contract,
+                        "Type": typ, "Strike": _sa_cur_strike if not is_fut else "", "B/S": pos,
+                        "lots": lots,
+                        "Qty": lots * lot_size, "Entry Price": _sub_ep, "Exit Price": _sub_xp,
+                        "Raw Entry Price": _sub_ep_raw, "Raw Exit Price": _sub_xp_raw,
+                        "Entry Spot": round(_sub_es, 2), "Exit Spot": round(_sub_xs, 2),
+                        "Spot P&L": round(_sub_xs - _sub_es, 2) if (_sub_es and _sub_xs) else 0.0,
+                        "CE P&L": _sub_ce, "PE P&L": _sub_pe, "FUT P&L": 0.0, "Net P&L": _sub_pnl,
+                        "% P&L": round(_sub_pnl / _sub_es * 100.0, 4) if _sub_es else 0.0,
+                        **_sw_ctx,
+                        "Exit Reason": _sub_reason,
+                        "MAE": round(_mae * lots, 4), "MFE": round(_mfe * lots, 4),
+                        "Strike Shift Reason": _shift_reason,
+                        "Group Index": sym,
+                        "Group Expiry": _grp_exp,
+                    })
+                    if not _sa_trig:
+                        break   # no breach in remaining window — done
+                    # re-anchor for next sub-window
+                    _new_sp = _spot_series.get(_sa_trig, _sub_xs)
+                    _new_strike = None
+                    if _compute_strike_for_leg_python is not None:
+                        try:
+                            _new_strike = _compute_strike_for_leg_python(
+                                leg, _new_sp, float(interval),
+                                entry_date=_sa_trig, expiry=contract, index=sym,
+                            )
+                        except Exception:
+                            pass
+                    _sa_cur_strike = float(_new_strike) if _new_strike else round(_new_sp / float(interval)) * float(interval)
+                    _sa_mark = _new_sp
+                    _sa_cur_entry_iso = _sa_trig
+                    _sa_cur_entry_dt = _sub_exit_dt
+                    _shift_reason = ""   # no shift reason on continuation rows
     return rows
 
 
@@ -2704,9 +2800,33 @@ def _run_sync_fused_groups(
         return out
 
     def _monthly_cycles_for(sym: str, grp_expiry: str, seg: str) -> List[Dict[str, str]]:
-        """This group's OWN near/holdable contract per merged window (Path A verbatim)."""
+        """This group's contract for every shared cadence window.
+
+        Same-frequency cross-index pairs use the stateful advance-both walk with
+        this group as the base track. Selecting the non-driving group independently
+        discarded that state and could leave NIFTY in March after MIDCPNIFTY had
+        already advanced to April.
+        """
         if sym == cadence_index and grp_expiry.upper() == cadence and seg == cadence_segment:
             return list(_cycles)
+        _tracks = _sync_tracks(non_yearly, default_index, default_expiry)
+        _same_frequency = len({t[1] for t in _tracks}) == 1
+        _track = (
+            sym,
+            "WEEKLY" if grp_expiry.upper().startswith("WEEK") else "MONTHLY",
+            seg,
+        )
+        if _same_frequency and len({(t[0], t[1]) for t in _tracks}) > 1 and _track in _tracks:
+            _gc, _gb = _build_sync_cycles(
+                non_yearly, grp_expiry, sym, default_index, default_expiry,
+                effective_from, effective_to, payload, seg,
+            )
+            if _gb == _bounds and [(c["start"], c["end"]) for c in _gc] == windows:
+                return _gc
+            logger.warning(
+                "[SYNC_FUSED] per-track stateful schedule mismatch for %s/%s/%s; "
+                "falling back to holdable contracts", sym, grp_expiry, seg,
+            )
         series = _roll_series(sym, grp_expiry, effective_from, wide_to, seg)
         if not series:
             return []
@@ -3547,15 +3667,39 @@ def run_sync_weekly_cadence(
             and str(l.get("segment") or "OPTIONS").upper() not in ("FUTURE", "FUTURES")
         )
 
+    def _sa_active(l):
+        _sa = l.get("spot_adjustment") or l.get("spotAdjustment")
+        return isinstance(_sa, dict) and bool(_sa.get("enabled"))
+
+    def _has_sltp(l):
+        for _k in ("stopLoss", "targetProfit", "trailSL", "slWithBuffer"):
+            _v = l.get(_k)
+            if isinstance(_v, dict) and _v:
+                return True
+        return False
+
+    # Cross-index own spot-adjustments must be evaluated in one shared cascade.
+    # The legacy base+overlay path evaluates the base engine first and only prices
+    # the overlay afterwards, so an overlay breach cannot cut/re-enter the other
+    # index. Route only multi-index SA strategies; single-index and single-leg
+    # strategies remain on their existing, already-correct paths.
+    _distinct_indices = {_leg_index(l, default_index) for l in legs}
+    _cross_index_sa = len(_distinct_indices) > 1 and any(_sa_active(l) for l in legs)
+    if _cross_index_sa and not any(_has_sltp(l) for l in legs):
+        return _run_sync_fused_groups(
+            payload, effective_from, effective_to, legs,
+            default_index, default_expiry,
+        )
+
     # NEW per-index synced-engine path (opt-in within this opt-in path): reached
     # ONLY when the strategy mixes a genuinely YEARLY option leg with at least one
     # real non-yearly (monthly/weekly) leg. The old "one base engine run + overlay
     # re-pricing" core below cannot express this (a yearly leg pinned to the merged
     # near-month contract loses December — BUG A — and an overlay leg can never fire
     # its own spot-adjustment — BUG B). Every config WITHOUT a yearly option leg
-    # (single-index never reaches here; the same-frequency monthly+monthly and mixed
-    # weekly+monthly shapes) falls straight through to the untouched original code,
-    # so Shape A and every previously-verified behaviour is byte-identical.
+    # Cross-index own-SA shapes have already routed to fused above. Every remaining
+    # config WITHOUT a yearly option leg (including single-index and no-SA shapes)
+    # falls through to the original code unchanged.
     _yearly_here = [l for l in legs if _is_yearly_opt(l)]
     _nonyearly_here = [l for l in legs if not _is_yearly_opt(l)]
     if _yearly_here and _nonyearly_here:
@@ -3568,17 +3712,6 @@ def run_sync_weekly_cadence(
         # SL/Target/Trail/Buffer, or with NO spot_adjustment, fall back to Path A
         # (per-index) — which for a no-spot-adj config is byte-identical to fused.
         # The explicit flag still forces fused (opt-in override).
-        def _sa_active(l):
-            _sa = l.get("spot_adjustment")
-            return isinstance(_sa, dict) and bool(_sa.get("enabled"))
-
-        def _has_sltp(l):
-            for _k in ("stopLoss", "targetProfit", "trailSL", "slWithBuffer"):
-                _v = l.get(_k)
-                if isinstance(_v, dict) and _v:
-                    return True
-            return False
-
         # A real FUTURES leg is ONLY supported by the fused path (Path A hits the
         # engine's YEARLY+FUTURES blocker and errors). So a futures leg forces fused
         # too — not just active spot_adjustment. Path A never traded a futures config

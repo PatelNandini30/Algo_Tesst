@@ -45,6 +45,19 @@ async def lifespan(app):
         start_background_warmup()
     except Exception as exc:
         logging.getLogger(__name__).warning(f"Warmup start failed: {exc}")
+    # Preload the Midcap-overlay index-OHLC cache so the FIRST tradesheet download
+    # after a (re)start can price the overlay. The native INDEX_OHLC cache is
+    # per-process and loads lazily on first request; if that first request lands
+    # before the cache is warm, compute_midcap_for_rows sees the engine as
+    # unavailable and the Trade Sheet drops the Midcap/Combined columns. Best-effort
+    # and non-fatal: a missing feather just leaves the lazy load to run later.
+    for _sym in [s.strip().upper() for s in
+                 os.environ.get("INDEX_OHLC_PRELOAD_SYMBOLS", "NIFTYMIDCAP100").split(",") if s.strip()]:
+        try:
+            from services import index_ohlc_store
+            index_ohlc_store.ensure_index_ohlc_loaded(_sym)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("index-OHLC preload for %s failed: %s", _sym, exc)
     yield
 
 # Create the FastAPI app

@@ -211,6 +211,31 @@ def _is_bullish_leg(leg: Dict) -> bool:
     )
 
 
+def _normalize_mae_for_capital_sizing(rows: List[Dict]) -> None:
+    """In-place: when rows carry _cap_total (set by _apply_capital_sizing),
+    convert MAE/MFE from (price_pct × qty) to % of total capital.
+    No-op when capital sizing was not active (no _cap_total on rows).
+    Only applied to FUT rows (capital sizing is futures-only)."""
+    for r in rows:
+        if str(r.get("Type") or "").upper() != "FUT":
+            continue
+        cap_total = _to_num(r.get("_cap_total"))
+        if not cap_total:
+            continue
+        # For futures MAE/MFE the engine used entry_price (futures price) as
+        # the denominator in _calculate_mae_mfe_from_extremes, so use Entry Price.
+        ep = _to_num(r.get("Entry Price")) or _to_num(r.get("Entry Spot"))
+        if not ep:
+            continue
+        for field in ("MAE", "MFE"):
+            v = _to_num(r.get(field))
+            if v is not None and v != 0.0:
+                # raw = (price_pct/100 × qty) × 100 = price_pct × qty
+                # MAE ₹ = raw × ep / 100; MAE % of cap = MAE ₹ / cap_total × 100
+                #       = raw × ep / cap_total
+                r[field] = round(v * ep / cap_total, 4)
+
+
 def _calc_trade_mae(legs: List[Dict], net_pnl_pct: Optional[float] = None):
     """Replicate calcTradeMae from JS.
 
@@ -384,7 +409,14 @@ def _build_key_order(rows: List[Dict], has_midcap: bool = False) -> List[str]:
     if not has_midcap:
         order += ["Net P&L", "% P&L", "Cumulative", "Peak", "DD", "%DD", "Lowest NAV", "Actual Live DD"]
     if has_midcap:
-        order += _MIDCAP_COLS
+        _mc_cols = list(_MIDCAP_COLS)
+        # "Midcap Qty" (the capital-sized hypothetical qty) is shown ONLY when a
+        # Midcap leg actually carries capital_alloc_pct — otherwise the column is
+        # omitted entirely (no blank column), matching how has_buffer/has_straddle
+        # gate their columns. Positioned right after Midcap Exit Spot.
+        if any(_to_num(r.get("_cap_total")) for r in rows):
+            _mc_cols.insert(_mc_cols.index("Midcap Exit Spot") + 1, "Midcap Qty")
+        order += _mc_cols
     order.append("Exit Reason")
     if has_strike_shift:
         order.append("Strike Shift Reason")
@@ -740,10 +772,19 @@ def _build_cleaned_rows(rows: List[Dict], key_order: List[str], tm: Dict,
                 es  = _to_num(trade.get("Entry Spot"))
                 val = (pnl / es) if (pnl is not None and es and es != 0) else ""
             elif key == "FUT P&L %":
-                # Per-leg futures P&L as a fraction of Entry Spot (matches CE/PE P&L %).
                 pnl = _to_num(trade.get("FUT P&L"))
-                es  = _to_num(trade.get("Entry Spot"))
-                val = (pnl / es) if (pnl is not None and es and es != 0) else ""
+                cap_total = _to_num(trade.get("_cap_total"))
+                cap_alloc = _to_num(trade.get("_cap_alloc"))
+                if pnl is not None and cap_total and cap_alloc:
+                    leg_cap = cap_alloc * cap_total
+                    val = (pnl / leg_cap) if leg_cap else ""
+                else:
+                    es = _to_num(trade.get("Entry Spot"))
+                    val = (pnl / es) if (pnl is not None and es and es != 0) else ""
+            elif key == "Midcap Qty":
+                # Dynamically-added column (not in _MIDCAP_COLS_SET) — must read
+                # from the midcap overlay row, not the NIFTY trade row.
+                val = (mc or {}).get("Midcap Qty", "") if first else ""
             else:
                 val = trade.get(key, "")
             if val is None or (isinstance(val, float) and math.isnan(val)):
@@ -2038,8 +2079,11 @@ def compute_xlsx_summary_metrics(
     else:
         rows = trades_df.where(trades_df.notna(), None).to_dict("records")
 
+    _normalize_mae_for_capital_sizing(rows)
+
     midcap_by_trade, midcap_summary, has_midcap = compute_midcap_for_rows(
         rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
+        filter_segments=filter_segments,
     )
 
     # ── Rust-ONLY (no Python fallback — user policy). This entire summary engine
@@ -2074,9 +2118,14 @@ def compute_xlsx_summary_metrics(
                 if _fu is None:
                     continue
                 _ft += _fu
-                _es = _to_num(_r.get("Entry Spot"))
-                if _es not in (None, 0):
-                    _fp += _fu / _es
+                _cap_t = _to_num(_r.get("_cap_total"))
+                _cap_a = _to_num(_r.get("_cap_alloc"))
+                if _cap_t and _cap_a:
+                    _fp += _fu / (_cap_a * _cap_t)
+                else:
+                    _es = _to_num(_r.get("Entry Spot"))
+                    if _es not in (None, 0):
+                        _fp += _fu / _es
             _rust_sm["fut_pnl_total"] = round(_ft, 2)
             _rust_sm["fut_pnl_pct"] = round(_fp * 100, 4)
         return _rust_sm
@@ -2553,8 +2602,139 @@ def _project_rows_for_midcap(rows: List[Dict]) -> List[Dict]:
     return out
 
 
+def _apply_capital_weight_to_midcap(result, proj, midcap_legs, filter_segments):
+    """Capital-weight the Midcap overlay (opt-in; futures-only feature).
+
+    The Rust overlay engine prices each trade's Midcap leg as ``points × lots``.
+    This rescales it in place to ``points × qty`` where
+    ``qty = alloc% × total_capital ÷ Midcap entry`` (decimal, no lot_size),
+    mirroring the main-leg _apply_capital_sizing so a NIFTY future + Midcap
+    overlay size the same way. Fixed capital, no compounding:
+      * v1 — qty re-derived each trade (its own Midcap entry).
+      * v2 — qty frozen across rollovers; re-derived only at a filter-segment
+        boundary (anchored on that segment's first Midcap entry).
+
+    Rescales per trade: Midcap Leg P&L / %, Midcap MAE / MFE, and Combined Net
+    P&L / %. The Combined Net MAE/DD/NAV columns are formed downstream from these
+    per-trade values, so they follow automatically. nifty_pnl is recovered as
+    ``Combined − Midcap Leg P&L`` (so it already carries the main leg's own
+    capital sizing, if any).
+
+    No-op unless a Midcap leg carries capital_alloc_pct + capital_total ⇒ every
+    existing overlay run stays byte-identical. Single sized Midcap leg is exact;
+    a >1 sized-leg config uses the first leg's factor (ponytail: the summed
+    overlay P&L can't be decomposed per leg — uncommon, logged).
+    """
+    rows = (result or {}).get("results") or []
+    if not rows or not midcap_legs:
+        return
+    sized = [l for l in midcap_legs
+             if isinstance(l, dict) and _to_num(l.get("capital_alloc_pct"))]
+    if not sized:
+        return
+    leg = sized[0]
+    try:
+        alloc = float(leg.get("capital_alloc_pct")) / 100.0        # may exceed 1 (leverage)
+        total = float(leg.get("capital_total") or 0.0)
+    except (TypeError, ValueError):
+        return
+    if total <= 0 or alloc <= 0:
+        return
+    lots = float(leg.get("lots") or leg.get("lot") or 1) or 1.0
+    version = "v2" if str(leg.get("capital_version") or "v1").lower() == "v2" else "v1"
+    if len(sized) > 1:
+        logger.warning("[MIDCAP_CAP] %d capital-sized Midcap legs; using the first "
+                       "leg's factor (summed overlay P&L can't be decomposed).", len(sized))
+
+    # trade_id -> entry date (for v2 filter-segment anchoring).
+    _entry = {}
+    for p in (proj or []):
+        d = _parse_date(p.get("entry_date"))
+        if d is not None:
+            _entry[str(p.get("trade_id"))] = d
+
+    _seg = []
+    if version == "v2":
+        for s in (filter_segments or []):
+            sd = _parse_date(s.get("start") or s.get("Start") or s.get("from") or s.get("start_date"))
+            ed = _parse_date(s.get("end") or s.get("End") or s.get("to") or s.get("end_date"))
+            if sd and ed:
+                _seg.append((sd, ed))
+        _seg.sort()
+
+    def _seg_ix(d):
+        if not _seg or d is None:
+            return 0
+        for i, (a, b) in enumerate(_seg):
+            if a <= d <= b:
+                return i
+        return -1
+
+    # v2 anchor price per segment: first available Midcap entry in that segment,
+    # in trade order.
+    _anchor = {}
+    if version == "v2":
+        for rr in rows:
+            if not rr.get("available"):
+                continue
+            me = _to_num(rr.get("Midcap Entry Spot"))
+            if not me:
+                continue
+            _anchor.setdefault(_seg_ix(_entry.get(str(rr.get("trade_id")))), me)
+
+    for rr in rows:
+        if not rr.get("available"):
+            continue
+        me = _to_num(rr.get("Midcap Entry Spot"))
+        if not me:
+            continue
+        anchor_px = _anchor.get(_seg_ix(_entry.get(str(rr.get("trade_id")))), me) if version == "v2" else me
+        if not anchor_px:
+            continue
+        qty = alloc * total / anchor_px
+        factor = qty / lots
+        # Display: expose the hypothetical (capital-sized) qty on the row, the way
+        # the main leg shows its sized Qty. Written ONLY here — i.e. only when a
+        # Midcap leg actually carries capital_alloc_pct/total (the guards above
+        # return before this point otherwise), so it appears only when sizing is
+        # genuinely active. Raw entry/exit for this leg are the Midcap Entry/Exit
+        # Spot columns already on the row.
+        rr["Midcap Qty"] = round(qty, 2)
+        mc = _to_num(rr.get("Midcap Leg P&L")) or 0.0
+        comb = _to_num(rr.get("Combined Net P&L")) or 0.0
+        nifty = comb - mc                    # main leg P&L (already sized if set)
+        mc_new = mc * factor
+        comb_new = nifty + mc_new
+        rr["Midcap Leg P&L"] = round(mc_new, 4)
+        leg_cap = alloc * total
+        # Midcap P&L % = Midcap P&L (₹) / midcap allocated capital × 100
+        rr["Midcap Leg P&L %"] = round(mc_new / leg_cap * 100, 4) if leg_cap else 0.0
+        for k in ("Midcap MAE", "Midcap MFE"):
+            v = _to_num(rr.get(k))
+            if v is not None:
+                v_scaled = v * factor        # price_pct × qty
+                # % of total capital = (v_scaled × anchor_px / 100) / total × 100
+                #                    = v_scaled × anchor_px / total
+                rr[k] = round(v_scaled * anchor_px / total, 4) if total else round(v_scaled, 4)
+        rr["Combined Net P&L"] = round(comb_new, 4)
+        # Combined P&L % = Combined P&L (₹) / total capital × 100
+        rr["Combined Net P&L %"] = round(comb_new / total * 100, 4) if total else 0.0
+
+    # Recompute the summary totals from the rescaled rows.
+    summ = result.get("summary")
+    if isinstance(summ, dict):
+        summ["midcap_leg_pnl_sum"] = round(sum(_to_num(r.get("Midcap Leg P&L")) or 0.0
+                                               for r in rows if r.get("available")), 4)
+        summ["midcap_leg_pnl_pct_sum"] = round(sum(_to_num(r.get("Midcap Leg P&L %")) or 0.0
+                                                   for r in rows if r.get("available")), 4)
+        summ["combined_pnl_sum"] = round(sum(_to_num(r.get("Combined Net P&L")) or 0.0
+                                             for r in rows if r.get("available")), 4)
+        summ["combined_pnl_pct_sum"] = round(sum(_to_num(r.get("Combined Net P&L %")) or 0.0
+                                                 for r in rows if r.get("available")), 4)
+
+
 def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustment,
-                            symbol: str = "NIFTYMIDCAP100"):
+                            symbol: str = "NIFTYMIDCAP100", filter_segments=None):
     """Compute the Midcap overlay per combo via the SAME native engine the
     backtest uses (rust_fast_path.compute_midcap_legs) — RUST ONLY, no Python
     fallback (matches the backtest's rust-only policy). If the native path is
@@ -2603,6 +2783,10 @@ def compute_midcap_for_rows(rows: List[Dict], midcap_legs, midcap_spot_adjustmen
                 "override deliberately." % (len(proj), len(midcap_legs))
             )
         return {}, None, False
+    # CAPITAL SIZING (opt-in): rescale the Rust overlay P&L from points×lots to
+    # points×qty when a Midcap leg carries capital_alloc_pct. No-op otherwise.
+    _apply_capital_weight_to_midcap(result, proj, midcap_legs, filter_segments)
+
     by_trade = {
         str(rr.get("trade_id")): rr
         for rr in (result.get("results") or [])
@@ -2719,9 +2903,12 @@ def build_combo_xlsx(
 
     midcap_by_trade, midcap_summary, has_midcap = compute_midcap_for_rows(
         rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
+        filter_segments=filter_segments,
     )
 
-
+    # When capital sizing was active, convert MAE/MFE from (price_pct × qty) to
+    # % of total capital so _aggregate_trades Combined Final MAE uses the right unit.
+    _normalize_mae_for_capital_sizing(rows)
 
     key_order, has_calls, has_puts, has_futures = _build_key_order(rows, has_midcap)
     tm, _grouped, _sorted_keys = _aggregate_trades(rows, has_midcap, midcap_by_trade,
@@ -2846,6 +3033,7 @@ def build_cleaned_for_combo(
         rows = trades_df.where(trades_df.notna(), None).to_dict("records")
     midcap_by_trade, _midcap_summary, has_midcap = compute_midcap_for_rows(
         rows, midcap_legs, midcap_spot_adjustment, midcap_symbol,
+        filter_segments=filter_segments,
     )
     key_order, _hc, _hp, _hf = _build_key_order(rows, has_midcap)
     tm, _grouped, _sorted_keys = _aggregate_trades(

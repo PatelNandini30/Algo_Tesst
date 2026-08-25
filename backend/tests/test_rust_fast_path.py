@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import polars as pl
 
@@ -32,6 +33,24 @@ class TestRustFastPath(unittest.TestCase):
     def test_can_use_rust_for_legs_rejects_futures(self):
         legs = [{"segment": "FUTURES"}]
         self.assertFalse(rust_fast_path.can_use_rust_for_legs(legs))
+
+    def test_clear_cache_resets_native_and_python_residency_markers(self):
+        native = mock.Mock()
+        rust_fast_path._loaded_cache_key = "arrow-v2:bulk:NIFTY:full"
+        rust_fast_path._loaded_cache_signature = ((1, 2), (3, 4))
+        rust_fast_path._loaded_feather_root = "/tmp/fake"
+        rust_fast_path._merged_symbols.add("NIFTY")
+        rust_fast_path._loaded_signatures["fake"] = ((1, 2), (3, 4))
+
+        with mock.patch.object(rust_fast_path, "_load_native", return_value=native):
+            rust_fast_path.clear_cache()
+
+        native.clear_cache.assert_called_once_with()
+        self.assertIsNone(rust_fast_path._loaded_cache_key)
+        self.assertIsNone(rust_fast_path._loaded_cache_signature)
+        self.assertIsNone(rust_fast_path._loaded_feather_root)
+        self.assertEqual(rust_fast_path._merged_symbols, set())
+        self.assertEqual(rust_fast_path._loaded_signatures, {})
 
 
 if __name__ == "__main__":

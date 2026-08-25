@@ -5,9 +5,11 @@ from services.data_loader import get_bulk_options_df, get_bulk_spot_df
 from services.rust_fast_path import build_cache
 import polars as pl
 
-sym = sys.argv[1]
-frm = sys.argv[2]
-to = sys.argv[3]
+args = [a for a in sys.argv[1:] if not a.startswith('-')]
+no_bump = '--no-bump' in sys.argv
+sym = args[0]
+frm = args[1]
+to  = args[2]
 print(f'REBUILD {sym} {frm}..{to}', flush=True)
 
 r = bulk_load_options(sym, frm, to)
@@ -26,12 +28,15 @@ print('build_cache:', ok, flush=True)
 # An explicit rebuild fixes the feather's DATA (e.g. un-truncates spot), so any
 # result cached against the old (wrong) feather must be invalidated. This is the
 # correct place for the bump — a one-off operator action, not every feather write.
-try:
-    from services.backtest_cache import bump_data_version
-    v = bump_data_version()
-    print('bumped data_version ->', v, flush=True)
-except Exception as e:
-    print('data_version bump skipped:', e, flush=True)
+if no_bump:
+    print('data_version bump skipped (--no-bump)', flush=True)
+else:
+    try:
+        from services.backtest_cache import bump_data_version
+        v = bump_data_version()
+        print('bumped data_version ->', v, flush=True)
+    except Exception as e:
+        print('data_version bump skipped:', e, flush=True)
 
 o = pl.read_ipc(f'/data/cache/arrow/arrow-v2:bulk:{sym.upper()}:full/options.feather')
 print(f'VERIFY options.feather: {o.height} rows, {str(o["Date"].min())[:10]} -> {str(o["Date"].max())[:10]}', flush=True)

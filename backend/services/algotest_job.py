@@ -437,7 +437,10 @@ def _try_rust_engine(payload, index, effective_from, effective_to):
                 # branches above (FUT via _fut_leg_mae_mfe and CE/PE via
                 # _calculate_leg_mae_mfe) return a plain unscaled ratio, so
                 # scale once here by this record's own lots (lot_size excluded).
-                _rec_lots = int(rec.get("lots") or 1)
+                # float(): integer lots are unchanged (1 → 1.0, ratio×1.0 == ratio×1)
+                # so existing runs are byte-identical, but a capital-sizing decimal
+                # qty scales MAE/MFE without truncation.
+                _rec_lots = float(rec.get("lots") or 1)
                 if mae_val is not None:
                     rec["MAE"] = mae_val * _rec_lots
                 if mfe_val is not None:

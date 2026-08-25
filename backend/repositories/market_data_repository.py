@@ -549,6 +549,8 @@ class MarketDataRepository:
         high_col  = self._pick_any(cols, ["high_price", "high"], close_col)
         low_col   = self._pick_any(cols, ["low_price",  "low"],  close_col)
         open_col  = self._pick_any(cols, ["open_price", "open"], close_col)
+        delta_sel = "delta"   if "delta"  in cols else "NULL::NUMERIC"
+        iv_sel    = "iv_pct"  if "iv_pct" in cols else "NULL::NUMERIC"
 
         from_date = _normalize_sql_date(from_date, "1900-01-01")
         to_date = _normalize_sql_date(to_date, "2099-12-31")
@@ -566,7 +568,9 @@ class MarketDataRepository:
                 {low_col}       AS "Low",
                 {close_col}     AS "Close",
                 COALESCE(contracts, 0) AS "Contracts",
-                COALESCE(settled_price, {close_col}) AS "SettledPrice"
+                COALESCE(settled_price, {close_col}) AS "SettledPrice",
+                {delta_sel}     AS "Delta",
+                {iv_sel}        AS "IVPct"
             FROM option_data
             WHERE symbol      = :symbol
               AND {date_col}  >= :from_date

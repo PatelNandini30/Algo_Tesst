@@ -145,10 +145,8 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
     (initials + value): 'pctoA2_OTM' / 'ATM' / 'SW0.5' / 'CP50' / etc.
 
     Two things the spec doesn't cover, because this app has them and the
-    doc's source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing —
-    extends the spec's own RtL prefix with a _G{gaps} suffix, alongside its
-    _TV/_D) and Delta-basis anything (no delta strike mode exists here at
-    all, confirmed absent from StrategyBuilder.jsx).
+    doc's source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing) and
+    the EOD fixed-IV Delta strike mode.
 
     option_type is required for pct_of_atm because the direction field is
     stored as '+'/'-' (engine sign convention), not 'OTM'/'ITM'. The semantic
@@ -221,7 +219,19 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
             mult = float(strike_selection.get("straddle_multiplier", 0.5))
         except (TypeError, ValueError):
             mult = 0.5
-        return f"SW{_fmt_num(mult)}"
+        # Engine's +/- is a raw offset applied identically to both legs; for the
+        # filename translate it to ITM/OTM per option type (CE + = OTM, CE - =
+        # ITM; PE reversed) so a +/- direction sweep doesn't collapse to one
+        # token. Matches ResultsPanel.jsx's strikeCriteriaToken.
+        is_call = option_type.upper().startswith("C")
+        above_atm = str(strike_selection.get("straddle_direction") or "+").strip() != "-"
+        if mult == 0.0:
+            moneyness = "ATM"
+        elif above_atm:
+            moneyness = "OTM" if is_call else "ITM"
+        else:
+            moneyness = "ITM" if is_call else "OTM"
+        return f"SW{_fmt_num(mult)}_{moneyness}"
     if kind == "rel_leg":
         # Gap-offset Iron Condor wing has no FILENAME_FORMAT.md equivalent —
         # extend RtL with a _G{gaps} suffix (mirrors _TV/_D there). Matches
@@ -241,6 +251,12 @@ def _strike_label(strike_selection: Optional[Dict[str, Any]], option_type: str =
         except (TypeError, ValueError):
             ref = 1
         return f"RtL{ref}"
+    if kind == "delta":
+        try:
+            delta = float(strike_selection.get("delta") or 0.3)
+        except (TypeError, ValueError):
+            delta = 0.3
+        return f"D{_fmt_num(delta * 100.0)}"
     if kind.startswith("time_value"):
         tv = strike_selection.get("time_value")
         if tv is None:
@@ -575,6 +591,37 @@ def _per_leg_spot_adjustment_map(payload: Dict[str, Any]) -> Dict[int, str]:
     return out
 
 
+def _capital_sizing_label(payload: Dict[str, Any]) -> str:
+    """Filename token for capital-weighted sizing, or '' when unused.
+
+    e.g. 'CAP700000000_L1-70_L2-30_V1'. Includes each sized leg's allocation so
+    two different allocation configs file to different folders. Empty when the
+    Sizing feature is off ⇒ existing combo labels stay byte-identical.
+    """
+    cap = payload.get("capital_sizing")
+    if not isinstance(cap, dict) or not cap.get("enabled"):
+        return ""
+    try:
+        total = float(cap.get("total_capital") or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    parts = [f"CAP{_fmt_num(total)}"]
+    for _i, _leg in enumerate((payload.get("legs") or []), start=1):
+        if not isinstance(_leg, dict):
+            continue
+        _a = _leg.get("capital_alloc_pct")
+        if _a in (None, ""):
+            continue
+        try:
+            parts.append(f"L{_i}-{_fmt_num(float(_a))}")
+        except (TypeError, ValueError):
+            continue
+    parts.append("V2" if str(cap.get("version") or "v1").lower() == "v2" else "V1")
+    return "_".join(parts)
+
+
 def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     """
     Inspect a (combo-applied) payload and return the master-summary columns
@@ -704,6 +751,10 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
     # single global expiry token would be wrong for at least one leg. The
     # combo-level `expiry` value is still returned below for the master-summary
     # column, which wants one column value regardless of per-leg mixing.
+    # Capital-weighted sizing token (empty ⇒ no change to existing labels).
+    _cap_tok = _capital_sizing_label(payload)
+    if _cap_tok:
+        parts.append(_cap_tok)
     parts.append(shift)
     combo_label = "_".join(parts)
 

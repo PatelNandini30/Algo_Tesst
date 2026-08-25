@@ -470,8 +470,15 @@ async def warm_cache(request: dict):
         return {"status": "error", "message": "Missing from_date or to_date"}
 
     warm_timeout = float(os.environ.get("WARM_CACHE_WAIT_SECONDS", "90"))
+    warm_inflight_ttl = max(
+        int(warm_timeout) + 30,
+        int(os.environ.get("WARM_CACHE_INFLIGHT_TTL_SECONDS", "86400")),
+    )
     warm_payload = {"index": symbol, "from_date": from_date, "to_date": to_date}
-    queue_name = _backtest_queue_for_payload(warm_payload)
+    # Warmups use their own low-priority queue.  They must not share the
+    # single-concurrency real-backtest queue, otherwise date-picker activity
+    # can leave user backtests waiting behind thousands of speculative loads.
+    queue_name = "backtests_warm"
 
     # Debounced date-picker edits (StrategyBuilder fires one of these per
     # keystroke-pause) were each enqueuing a brand-new warm_backtest_cache_task
@@ -492,9 +499,11 @@ async def warm_cache(request: dict):
             existing_id = _r.get(inflight_key)
             if existing_id:
                 existing_state = celery_app.AsyncResult(existing_id).state
-                if existing_state in ("PENDING", "STARTED", "RETRY"):
+                if existing_state in ("PENDING", "STARTED", "PROCESSING", "RETRY"):
                     task = celery_app.AsyncResult(existing_id)
                     reused_inflight = True
+                else:
+                    _r.delete(inflight_key)
         except Exception:
             pass
     # A real "Run Backtest" click is the only thing that should ever occupy
@@ -509,16 +518,54 @@ async def warm_cache(request: dict):
             "message": "A backtest is currently running — skipping background cache warm.",
         }
 
+    # Background warming must never queue ahead of real work.  In particular,
+    # an old backlog used to grow by one task on every date-picker pause while
+    # the concurrency=1 worker was busy.  A cold real backtest is slower but
+    # correct, so skip speculative warming whenever this queue already has work.
+    if task is None and _queue_depth(queue_name) > 0:
+        return {
+            "status": "skipped",
+            "queue": queue_name,
+            "message": "Backtest queue is busy — skipping background cache warm.",
+        }
+
     if task is None:
-        task = warm_backtest_cache_task.apply_async(
-            args=[warm_payload],
-            queue=queue_name,
-        )
+        # Claim the in-flight slot atomically.  The previous GET -> enqueue ->
+        # SET sequence allowed simultaneous browser tabs to enqueue duplicates
+        # before either request published its task id.
+        import uuid
+        proposed_id = str(uuid.uuid4())
+        claimed = True
         if _r is not None:
             try:
-                _r.set(inflight_key, task.id, ex=int(warm_timeout) + 30)
+                claimed = bool(_r.set(
+                    inflight_key, proposed_id, nx=True, ex=warm_inflight_ttl,
+                ))
             except Exception:
-                pass
+                claimed = True  # Redis guard unavailable: preserve old behavior
+        if not claimed:
+            try:
+                existing_id = _r.get(inflight_key) if _r is not None else None
+                if existing_id:
+                    task = celery_app.AsyncResult(existing_id)
+                    reused_inflight = True
+            except Exception:
+                task = None
+        if task is None:
+            try:
+                task = warm_backtest_cache_task.apply_async(
+                    args=[warm_payload],
+                    queue=queue_name,
+                    task_id=proposed_id,
+                )
+            except Exception:
+                if _r is not None:
+                    try:
+                        if _r.get(inflight_key) == proposed_id:
+                            _r.delete(inflight_key)
+                    except Exception:
+                        pass
+                raise
 
     # Only the request that actually CREATED this task blocks on task.get() —
     # a request that reused an in-flight task_id (dedup above) must NOT also
@@ -780,6 +827,7 @@ async def download_backtest_tradesheet_xlsx(request: Request):
             df[_c] = pd.to_numeric(df[_c], errors="coerce")
 
     midcap_legs = body.get("midcap_legs") or None
+    logging.warning("[DL_DEBUG] midcap_legs received: %s", midcap_legs)
     midcap_sa   = body.get("midcap_spot_adjustment") or None
     midcap_sym  = (
         (midcap_legs[0].get("symbol") if (midcap_legs and isinstance(midcap_legs[0], dict)) else None)
@@ -1044,6 +1092,15 @@ def midcap_overlay(request: dict):
         result = rust_fast_path.compute_midcap_legs(rows, midcap_legs, midcap_sa, symbol)
         if result is None:
             raise HTTPException(status_code=500, detail="Rust midcap computation failed.")
+        # CAPITAL SIZING (opt-in): the Rust overlay prices points×lots; when a
+        # Midcap leg carries capital_alloc_pct+capital_total, rescale to points×qty
+        # and expose "Midcap Qty" — the SAME function the optimizer uses, so a
+        # backtest and its optim combo size identically. No-op unless configured.
+        try:
+            from services.optimizer.excel_builder import _apply_capital_weight_to_midcap
+            _apply_capital_weight_to_midcap(result, rows, midcap_legs, request.get('filter_segments'))
+        except Exception as _cexc:
+            logging.warning("midcap capital sizing skipped: %s", _cexc)
         return result
     except HTTPException:
         raise
@@ -1068,6 +1125,10 @@ async def get_algotest_job_status(job_id: str):
         logger.warning("Malformed Celery metadata for job %s: %s", job_id, exc)
         state = "FAILURE"
         info = {"error": "Task metadata corrupted"}
+    except Exception as exc:
+        logger.warning("Celery status read failed for job %s: %s", job_id, exc)
+        state = "PROCESSING"
+        info = {"message": "Status temporarily unavailable; retrying"}
     if state == "PENDING":
         if not _job_known(job_id):
             # Unknown id: never enqueued, cancelled, or its result was lost when

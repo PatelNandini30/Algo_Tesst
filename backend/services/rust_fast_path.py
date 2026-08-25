@@ -136,11 +136,20 @@ def ensure_symbol_merged(symbol: str) -> bool:
 
 
 def clear_cache() -> None:
-    global _loaded_cache_key
+    """Clear the native cache and every Python-side residency marker.
+
+    These values form one state machine.  Leaving the key/signature populated
+    after ``native.clear_cache()`` lets ``build_cache`` take its same-file
+    shortcut even though Rust has no resident MarketCache.
+    """
+    global _loaded_cache_key, _loaded_cache_signature, _loaded_feather_root
     native = _load_native()
     _calendar_cache.clear()
     _loaded_cache_key = None
+    _loaded_cache_signature = None
+    _loaded_feather_root = None
     _merged_symbols.clear()
+    _loaded_signatures.clear()
     _SPOT_SERIES_MEMO.clear()
     if native is None:
         return
@@ -412,7 +421,16 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None, symbol: Op
                         pass
                 if _keep:
                     _sig = (_file_signature(options_path), _file_signature(spot_path))
-                    if not (_loaded_cache_key == key and _loaded_cache_signature == _sig):
+                    _native_loaded = False
+                    try:
+                        _native_loaded = bool(native.is_loaded())
+                    except Exception:
+                        pass
+                    if not (
+                        _native_loaded
+                        and _loaded_cache_key == key
+                        and _loaded_cache_signature == _sig
+                    ):
                         _activate_feather(native, options_path, spot_path, symbol, key, _sig)
                         _loaded_cache_key = key
                         _loaded_cache_signature = _sig
@@ -477,7 +495,16 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None, symbol: Op
         # last loaded (catches the case where the feather was regenerated on
         # disk but our in-memory Rust cache still holds the old data).
         current_sig = (_file_signature(options_path), _file_signature(spot_path))
-        if _loaded_cache_key == key and _loaded_cache_signature == current_sig:
+        _native_loaded = False
+        try:
+            _native_loaded = bool(native.is_loaded())
+        except Exception:
+            pass
+        if (
+            _native_loaded
+            and _loaded_cache_key == key
+            and _loaded_cache_signature == current_sig
+        ):
             logger.info("[RUST_FAST] cache already loaded for %s", key)
             return True
 
@@ -539,7 +566,7 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None, symbol: Op
             # zero-turnover (stale-price) records.  Older feather files without
             # this column still work: the Rust cache treats absence as "tradeable"
             # for backwards compatibility.
-            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close", "Contracts", "SettledPrice"])
+            _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close", "Contracts", "SettledPrice", "Delta", "IVPct"])
             _write_feather(spot_df, spot_path, ["Date", "Symbol", "Close"] if "Symbol" in getattr(spot_df, "columns", []) else ["Date", "Close"])
             # NOTE: deliberately NO data_version bump here. Bumping on every feather
             # write made bulk_load_options see the token change on the NEXT load and
@@ -877,12 +904,40 @@ def clear_futures_cache() -> None:
 
 
 def get_future_price(symbol: str, date, expiry) -> Optional[float]:
-    """Futures close for (symbol, date, expiry) from the native cache, or None."""
+    """Futures close for (symbol, date, expiry) from the native cache, or None.
+
+    Carries a ±1-day expiry tolerance — the SAME rule the option price lookups
+    already have (native get_option_price / _strikes_for_date_tolerant). NSE
+    shifts an expiry when the scheduled day is a holiday and the feather then
+    splits the contract across two labels: e.g. 29-Jun-2023 was a holiday, so
+    the June FUTIDX carries ExpiryDate=2023-06-29 up to 27-Jun and 2023-06-28
+    on 28-Jun only. Without this tolerance a trade holding the 2023-06-29
+    contract can't price its 28-Jun expiry-day exit (returns None) and the
+    trade skips / mis-rolls. Falls back ONLY when the exact expiry misses, so
+    every ordinary date is byte-identical."""
     native = _load_native()
     if native is None or not hasattr(native, "get_future_price"):
         return None
+    _d = _to_date_str(date)
+    _sym = str(symbol).upper()
+    _exp = _to_date_str(expiry)
     try:
-        return native.get_future_price(_to_date_str(date), str(symbol).upper(), _to_date_str(expiry))
+        px = native.get_future_price(_d, _sym, _exp)
+        if px is not None:
+            return px
+        # Exact expiry missed — try the holiday-relabelled neighbour (±1 day).
+        try:
+            import pandas as _pd
+            _ts = _pd.Timestamp(_exp)
+            if not _pd.isna(_ts):
+                for _off in (1, -1):
+                    _alt = (_ts + _pd.Timedelta(days=_off)).strftime("%Y-%m-%d")
+                    _apx = native.get_future_price(_d, _sym, _alt)
+                    if _apx is not None:
+                        return _apx
+        except Exception:
+            pass
+        return None
     except Exception as exc:
         logger.debug("[RUST_FAST] get_future_price failed: %s", exc)
         return None

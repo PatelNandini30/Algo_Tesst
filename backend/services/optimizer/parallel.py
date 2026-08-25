@@ -69,7 +69,42 @@ def _live_available_mb() -> Optional[int]:
     return None
 
 
-def cap_parallelism_for_live_ram(requested: int, live_optims: int = 1) -> int:
+def _cgroup_available_mb() -> Optional[int]:
+    """Free RAM inside THIS container's cgroup (memory.max - memory.current) in
+    MB, or None if unreadable. The fork-width clamp must honour this: MemAvailable
+    reports the whole box, but forks are killed by the container's cgroup OOM when
+    the sum of their working sets exceeds the container limit — even while the box
+    still shows GBs free. Bounding by the smaller of the two is what prevents the
+    'signal 9 (SIGKILL) -> batch chunk lost' the wide multi-index sweep hit."""
+    limit = _cgroup_mem_limit_mb()
+    if not limit:
+        return None
+    try:
+        with open("/sys/fs/cgroup/memory.current") as fh:
+            current = int(fh.read().strip()) // (1024 * 1024)
+    except Exception:
+        return None
+    return max(0, limit - current)
+
+
+def _is_multi_index_payload(payload: Optional[Dict[str, Any]]) -> bool:
+    """Whether one optimization needs more than one resident symbol cache."""
+    p = payload or {}
+    base = str(p.get("index") or p.get("symbol") or "NIFTY").strip().upper()
+    symbols = {base}
+    for leg in list(p.get("legs") or []) + list(p.get("midcap_legs") or []):
+        if isinstance(leg, dict):
+            sym = str(leg.get("index") or "").strip().upper()
+            if sym:
+                symbols.add(sym)
+    return len(symbols) > 1
+
+
+def cap_parallelism_for_live_ram(
+    requested: int,
+    live_optims: int = 1,
+    private_mb_override: int = 0,
+) -> int:
     """Clamp requested workers against current MemAvailable.
 
     This keeps the optimizer dynamic: the same combo can safely run with a
@@ -116,12 +151,23 @@ def cap_parallelism_for_live_ram(requested: int, live_optims: int = 1) -> int:
     avail = _live_available_mb()
     if avail is None:
         return req
+    # Bound by the SMALLER of whole-box MemAvailable and this container's own
+    # cgroup headroom. Forks are reaped by the container's cgroup OOM (signal 9)
+    # when their combined working set exceeds the container limit, no matter how
+    # much RAM the host still reports — so sizing against the host alone lets a
+    # near-full container fan out into an instant OOM.
+    cg_avail = _cgroup_available_mb()
+    if cg_avail is not None:
+        avail = min(avail, cg_avail)
     try:
         floor_mb = max(0, int(os.environ.get("HEAVY_GATE_LIVE_RAM_FLOOR_MB", "1500")))
     except (TypeError, ValueError):
         floor_mb = 1500
     try:
-        private_mb = max(100, int(os.environ.get("OPTIMIZE_WORKER_PRIVATE_MB", "700")))
+        private_mb = max(
+            100,
+            int(private_mb_override or os.environ.get("OPTIMIZE_WORKER_PRIVATE_MB", "700")),
+        )
     except (TypeError, ValueError):
         private_mb = 700
     # Use the same headroom floor as the gate, but scale the private-worker
@@ -800,7 +846,12 @@ def _worker_entrypoint(
             pass
 
 
-def split_width(solo_ceiling: int, parallelism: int, node_id: Optional[str] = None) -> int:
+def split_width(
+    solo_ceiling: int,
+    parallelism: int,
+    node_id: Optional[str] = None,
+    base_payload: Optional[Dict[str, Any]] = None,
+) -> int:
     """How many children this sweep may fork RIGHT NOW.
 
     Re-derived every batch from three live constraints, so the width tracks the
@@ -836,6 +887,18 @@ def split_width(solo_ceiling: int, parallelism: int, node_id: Optional[str] = No
     claimants = live + waiting
     by_optims = max(1, solo_ceiling // claimants)
     try:
+        if _is_multi_index_payload(base_payload):
+            # A multi-symbol worker dirties more CoW pages during symbol merge,
+            # expiry synchronization and recovery reloads than a single-index
+            # worker.  Size only those jobs with the conservative measurement;
+            # existing single-index fork width is unchanged.
+            private_mb = max(
+                int(os.environ.get("OPTIMIZE_WORKER_PRIVATE_MB", "700")),
+                int(os.environ.get("OPTIMIZE_MULTI_INDEX_WORKER_PRIVATE_MB", "600")),
+            )
+            return max(1, cap_parallelism_for_live_ram(
+                by_optims, claimants, private_mb_override=private_mb,
+            ))
         return max(1, cap_parallelism_for_live_ram(by_optims, claimants))
     except Exception:
         return max(1, min(parallelism, by_optims))
@@ -1001,7 +1064,7 @@ def run_parallel(
     # free — enough for P=3). Re-measuring keeps it honest both ways: it still can
     # never exceed what RAM allows right now, so it cannot OOM.
     def _current_p() -> int:
-        return split_width(solo_ceiling, parallelism, node_id)
+        return split_width(solo_ceiling, parallelism, node_id, base_payload)
 
     # Combos per worker per batch. Bigger = fewer re-forks (less overhead) but
     # coarser reaction to another optim arriving; this is the knob to turn if

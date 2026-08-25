@@ -62,6 +62,7 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDate;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use pyo3::prelude::*;
@@ -124,6 +125,22 @@ fn trading_day_before(
     Some(trading_days[idx_after - want].clone())
 }
 
+fn day_before_expiry(
+    expiry: &str,
+    days_before: u32,
+    trading_days: &[String],
+    calendar_days: bool,
+) -> Option<String> {
+    if !calendar_days {
+        return trading_day_before(expiry, days_before, trading_days);
+    }
+    let expiry_date = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
+    let target = expiry_date - chrono::Duration::days(days_before as i64);
+    let target_iso = target.format("%Y-%m-%d").to_string();
+    let idx_after = trading_days.partition_point(|d| d.as_str() <= target_iso.as_str());
+    (idx_after > 0).then(|| trading_days[idx_after - 1].clone())
+}
+
 /// Mirrors `base.calculate_strike_from_selection` exactly.
 ///
 /// Supported selections: `ATM`, `ITM1..N`, `OTM1..N`. Other modes
@@ -182,6 +199,40 @@ enum StrikeSel {
     /// differs. Negative time values (deep ITM, close < intrinsic) stay in the
     /// candidate set deliberately — target 0 with candidates -1 and 5 must pick -1.
     TimeValue { target: f64, cmp: TvCmp, side: TvSide, range_pct: f64, pct_units: bool },
+    /// Absolute Black-Scholes Delta target (0 < delta < 1). EOD mode derives
+    /// Delta from spot, strike, calendar DTE and fixed per-index IV assumptions.
+    Delta(f64),
+}
+
+fn delta_iv(index: &str) -> f64 {
+    match index.trim().to_uppercase().as_str() {
+        "NIFTY" => 0.13,
+        "BANKNIFTY" => 0.16,
+        "FINNIFTY" => 0.14,
+        "MIDCPNIFTY" => 0.16,
+        "SENSEX" => 0.14,
+        "BANKEX" => 0.16,
+        _ => 0.15,
+    }
+}
+
+fn norm_cdf(x: f64) -> f64 {
+    const INV_SQRT_2PI: f64 = 0.3989422804014327;
+    let t = 1.0 / (1.0 + 0.2316419 * x.abs());
+    let p = 1.0 - INV_SQRT_2PI * (-0.5 * x * x).exp() * t
+        * (0.319381530 + t * (-0.356563782 + t * (1.781477937
+            + t * (-1.821255978 + t * 1.330274429))));
+    if x >= 0.0 { p } else { 1.0 - p }
+}
+
+fn bs_abs_delta(spot: f64, strike: f64, calendar_dte: f64, sigma: f64, is_call: bool) -> f64 {
+    if spot <= 0.0 || strike <= 0.0 || sigma <= 0.0 {
+        return 0.5;
+    }
+    let t = calendar_dte.max(0.5) / 365.0;
+    let d1 = ((spot / strike).ln() + 0.5 * sigma * sigma * t) / (sigma * t.sqrt());
+    let call_delta = norm_cdf(d1);
+    if is_call { call_delta } else { 1.0 - call_delta }
 }
 
 /// How a TimeValue selection filters the chain before picking the nearest.
@@ -336,6 +387,18 @@ fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
         }
         // UI's compact form: {type: "ATM"} | {type: "ITM1"} | {type: "OTM2"} | …
         // Treat any token starting with ATM/ITM/OTM as a direct Fixed selector.
+        // Long form: {type: "itm"/"otm", value: N} — the offset lives in `value`,
+        // so fold it into the token (ITM5). Without this, `atm_offset_strike`
+        // parses the empty suffix of a bare "ITM"/"OTM", returns None, and the
+        // whole leg (hence every trade) drops silently — empty specs. The DTE /
+        // per-leg-rollover Rust path is the only one that hits this branch with
+        // the long form; the fixed-entry Python builder resolves it separately,
+        // which is why a filtered run worked while the no-filter run returned 0.
+        "atm" => Some(StrikeSel::Fixed("ATM".to_string())),
+        m if m == "itm" || m == "otm" => {
+            let n = read_f64("value").unwrap_or(0.0).round() as i64;
+            Some(StrikeSel::Fixed(format!("{}{}", mode.to_uppercase(), n)))
+        }
         m if m.starts_with("atm") || m.starts_with("itm") || m.starts_with("otm") => {
             Some(StrikeSel::Fixed(mode.to_uppercase()))
         }
@@ -396,6 +459,7 @@ fn extract_strike_sel(leg: &PyDict) -> Option<StrikeSel> {
                 "percent" | "pct" | "%"
             ),
         }),
+        "delta" => Some(StrikeSel::Delta(read_f64("delta").unwrap_or(0.30))),
         _ => None,
     }
 }
@@ -630,6 +694,7 @@ fn build_rollover_schedule_pinned(
     exit_dte: u32,
     rollover_min_days: u32,
     cycles: Option<&[YearlyCycle]>,
+    calendar_days: bool,
 ) -> Vec<(i64, String, String, String, String, bool)> {
     let mut out: Vec<(i64, String, String, String, String, bool)> = Vec::new();
     if expiry_dates.is_empty() || trading_days.is_empty() {
@@ -640,11 +705,11 @@ fn build_rollover_schedule_pinned(
     // expiry_dates must be sorted ascending; the caller passes them sorted.
     let mut sched: Vec<(String, String, String, String)> = Vec::new(); // (entry, exit, cur_exp, next_exp)
     for (i, cur_exp) in expiry_dates.iter().enumerate() {
-        let entry = match trading_day_before(cur_exp, entry_dte, trading_days) {
+        let entry = match day_before_expiry(cur_exp, entry_dte, trading_days, calendar_days) {
             Some(v) => v,
             None => continue,
         };
-        let scheduled_exit = match trading_day_before(cur_exp, exit_dte, trading_days) {
+        let scheduled_exit = match day_before_expiry(cur_exp, exit_dte, trading_days, calendar_days) {
             Some(v) => v,
             None => continue,
         };
@@ -1602,6 +1667,47 @@ fn compute_strike_for_leg(
             };
             hit.map(|(_, s, _)| s)
         }
+        StrikeSel::Delta(target) => {
+            let chain = lookup_strikes_for_date(entry_date, index, expiry, &leg.option_type)?;
+            let iv = leg.strike_interval;
+            let on_grid: Vec<(f64, f64)> = if iv > 0.0 {
+                chain.iter().copied()
+                    .filter(|(s, _)| ((s / iv) - (s / iv).round()).abs() < 1e-9)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let source = if on_grid.is_empty() { chain } else { on_grid };
+            let dte = match (
+                NaiveDate::parse_from_str(entry_date, "%Y-%m-%d"),
+                NaiveDate::parse_from_str(expiry, "%Y-%m-%d"),
+            ) {
+                (Ok(entry), Ok(exp)) => (exp - entry).num_days().max(0) as f64,
+                _ => 7.0,
+            };
+            let sigma = delta_iv(index);
+            source.into_iter()
+                .filter(|(strike, _)| {
+                    lookup_option_price_tradeable(
+                        entry_date, index, *strike, &leg.option_type, expiry,
+                    ).is_some()
+                })
+                .min_by(|a, b| {
+                    let da = ((bs_abs_delta(entry_spot, a.0, dte, sigma, is_call) - *target)
+                        .abs() * 1.0e6).round() / 1.0e6;
+                    let db = ((bs_abs_delta(entry_spot, b.0, dte, sigma, is_call) - *target)
+                        .abs() * 1.0e6).round() / 1.0e6;
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| (a.0 - atm).abs().partial_cmp(&(b.0 - atm).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| if is_call {
+                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                })
+                .map(|(strike, _)| strike)
+        }
         StrikeSel::StraddleWidth { multiplier, direction } => {
             // shift = multiplier × (ATM CE + ATM PE), then snap. direction is a
             // raw +/- sign applied identically to every leg — "+" always adds
@@ -1790,6 +1896,7 @@ pub(crate) struct ResolveCfg {
     index: String,
     entry_dte: u32,
     exit_dte: u32,
+    calendar_days: bool,
     slippage_pct: f64,
     strike_shift_max: i32,
     rollover_active: bool,
@@ -1853,6 +1960,12 @@ fn resolve_per_leg_core(
     // rolls on its own schedule, so both maps are keyed by leg_id).
     let mut epoch_strike: HashMap<i64, f64> = HashMap::new();
     let mut prev_own_entry: HashMap<i64, String> = HashMap::new();
+    // PER-LEG LOCKED MTM: index in `out` of each leg's currently-open row. A leg
+    // mid-hold while ANOTHER leg rolls does NOT open a fresh slice — it carries its
+    // ONE position and just extends that row's exit (marked-to-market across the
+    // foreign boundary). It re-books (a new row) only on its OWN event: own roll,
+    // spot-adj breach, or filter seg start.
+    let mut open_spec: HashMap<i64, usize> = HashMap::new();
 
     'row: for (trade_id, entry_date, exit_date, slots) in &schedule {
         let entry_spot = match spot_by_date.get(entry_date) {
@@ -1865,10 +1978,31 @@ fn resolve_per_leg_core(
         }
         let mut buf: Vec<TradeSpec> = Vec::with_capacity(cfg.legs.len());
         let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
+        // Open rows to extend once this row commits — deferred so a `continue 'row`
+        // on a later leg leaves earlier legs' rows untouched (atomic per row).
+        let mut carry_extends: Vec<usize> = Vec::new();
         for (leg_idx, leg) in cfg.legs.iter().enumerate() {
             let leg_id = (leg_idx + 1) as i64;
             let slot = &slots[leg_idx];
             let leg_expiry = &slot.contract;
+
+            // LOCKED-MTM CARRY: this row is NOT one of this leg's own events and the
+            // leg already holds an open row ⇒ it stays that single position. Reuse the
+            // epoch strike for rel-leg references, mark its open row to extend to this
+            // window's exit, and emit NO new slice. First appearance (no open row yet)
+            // falls through to open one. Own-event rows (own_boundary / breach / seg
+            // start) always re-book below — so single-leg == normal is unchanged: a
+            // lone leg owns every boundary and never takes this carry path.
+            let leg_event = slot.own_boundary || slot.breach_spot_adj || slot.seg_start_entry;
+            if !leg_event {
+                if let Some(&idx) = open_spec.get(&leg_id) {
+                    if let Some(&s) = epoch_strike.get(&leg_id) {
+                        resolved.insert(leg_id, s);
+                    }
+                    carry_extends.push(idx);
+                    continue;
+                }
+            }
 
             // Roll (own boundary) ⇒ epoch rule decides Fresh vs carry.
             // Carry (foreign boundary, i.e. a row created because ANOTHER leg
@@ -1936,7 +2070,17 @@ fn resolve_per_leg_core(
                 slippage_pct: cfg.slippage_pct,
             });
         }
+        // Row commits: append the new slices, record each as its leg's open row,
+        // then extend carried legs' open rows to this window's exit (locked-MTM: one
+        // position marked-to-market across the foreign boundary, not re-booked).
+        let base = out.len();
         out.extend(buf);
+        for i in base..out.len() {
+            open_spec.insert(out[i].leg_id, i);
+        }
+        for idx in carry_extends {
+            out[idx].exit_date = exit_date.clone();
+        }
         // Advance the OWN-entry anchor only for legs that rolled this row, and
         // only for a trade that actually emitted (a `continue 'row` skips this).
         for (leg_idx, slot) in slots.iter().enumerate() {
@@ -1980,7 +2124,7 @@ pub(crate) fn resolve_trade_specs_core(
     if cfg.rollover_active {
         let schedule = build_rollover_schedule_pinned(
             &expiries_sorted, &td, cfg.entry_dte, cfg.exit_dte, cfg.rollover_min_days,
-            cfg.yearly_cycles.as_deref(),
+            cfg.yearly_cycles.as_deref(), cfg.calendar_days,
         );
         // YEARLY strike epochs. Only touched when the contract is pinned — on
         // every existing weekly/monthly run `epoch_strike` is never read or
@@ -2090,11 +2234,11 @@ pub(crate) fn resolve_trade_specs_core(
 
     let mut next_trade_id: i64 = 1;
     'dte_trade: for expiry in expiry_dates {
-        let entry_date = match trading_day_before(expiry, cfg.entry_dte, &td) {
+        let entry_date = match day_before_expiry(expiry, cfg.entry_dte, &td, cfg.calendar_days) {
             Some(v) => v,
             None => continue,
         };
-        let exit_date = match trading_day_before(expiry, cfg.exit_dte, &td) {
+        let exit_date = match day_before_expiry(expiry, cfg.exit_dte, &td, cfg.calendar_days) {
             Some(v) => v,
             None => continue,
         };
@@ -2180,6 +2324,11 @@ pub fn resolve_trade_specs(
         .get_item("exit_dte").ok().flatten()
         .and_then(|v| v.extract::<u32>().ok())
         .unwrap_or(0);
+    let calendar_days = payload
+        .get_item("dte_day_basis").ok().flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .map(|v| v.eq_ignore_ascii_case("calendar"))
+        .unwrap_or(false);
     let slippage_pct = payload
         .get_item("slippage_pct").ok().flatten()
         .and_then(|v| v.extract::<f64>().ok())
@@ -2323,7 +2472,7 @@ pub fn resolve_trade_specs(
     };
 
     let cfg = ResolveCfg {
-        legs, index, entry_dte, exit_dte, slippage_pct, strike_shift_max,
+        legs, index, entry_dte, exit_dte, calendar_days, slippage_pct, strike_shift_max,
         rollover_active, rollover_min_days, lot_size, yearly_cycles,
         per_leg_rollover, leg_rollover_expiries, leg_exit_dte, leg_cycles,
         leg_breach_dates, seg_starts,
@@ -3021,12 +3170,28 @@ mod rollover_schedule_tests {
         YearlyCycle { contract: contract.into(), start: start.into(), end: end.into() }
     }
 
+    #[test]
+    fn calendar_dte_subtracts_calendar_days_then_snaps_to_market_day() {
+        let td = ["2026-03-26", "2026-03-27", "2026-03-30"]
+            .iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 30-Mar T-2 calendar = Saturday 28-Mar, so execution snaps to Fri 27-Mar.
+        assert_eq!(
+            day_before_expiry("2026-03-30", 2, &td, true).as_deref(),
+            Some("2026-03-27"),
+        );
+        // Legacy trading basis counts two sessions back from Monday => Thursday.
+        assert_eq!(
+            day_before_expiry("2026-03-30", 2, &td, false).as_deref(),
+            Some("2026-03-26"),
+        );
+    }
+
     /// UNPINNED (every existing weekly/monthly run): contract == cadence element.
     /// The T0/T0 same-day chain yields entry = prev expiry, exit = cur expiry.
     #[test]
     fn unpinned_contract_is_the_cadence_element() {
         let out = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 0, None,
+            &monthly_2019(), &trading_days(), 0, 0, 0, None, false,
         );
         // Record 1 is skipped (entry == exit) and seeds the chain.
         assert_eq!(out.len(), 10);
@@ -3139,7 +3304,7 @@ mod rollover_schedule_tests {
 
         // Normal (unpinned) monthly T0/T0 — the reference. Its same-day chain
         // 0-DTE-skips MARCH and emits [28-Mar, 25-Apr] holding APRIL first.
-        let normal = build_rollover_schedule_pinned(&expiries, &td, 0, 0, 0, None);
+        let normal = build_rollover_schedule_pinned(&expiries, &td, 0, 0, 0, None, false);
         // Single monthly leg, exit T-0, no cycles, no breaches.
         let per_leg = build_rollover_schedule_per_leg(
             &run_start, &[expiries.clone()], &[0], &[None], &[Vec::new()], &[], &td,
@@ -3160,6 +3325,127 @@ mod rollover_schedule_tests {
         // dropped 01-Mar → 28-Mar front-month stub.
         assert_eq!((per_leg[0].1.as_str(), per_leg[0].2.as_str()), ("2019-03-28", "2019-04-25"));
         assert_eq!(per_leg[0].3[0].contract, "2019-04-25");
+    }
+
+    /// PER-LEG LOCKED MTM (money path): a carried leg is ONE position across a
+    /// foreign boundary, NOT a fresh weekly slice. Leg 1 = monthly (locked, own
+    /// roll 17-Feb / 17-Mar), Leg 2 = weekly. The monthly leg must emit a SINGLE
+    /// spec spanning 17-Feb→17-Mar even though the weekly leg rolls 4× underneath
+    /// it — mirrors the agreed July CE-18800 mock (one row, not weekly slices).
+    #[test]
+    fn per_leg_locked_leg_spans_foreign_boundaries() {
+        let td = weekdays_feb_mar_2026();
+        let weekly: Vec<String> = [
+            "2026-02-05", "2026-02-12", "2026-02-19", "2026-02-26",
+            "2026-03-05", "2026-03-12", "2026-03-19", "2026-03-26",
+        ].iter().map(|s| s.to_string()).collect();
+        let monthly: Vec<String> =
+            ["2026-02-26", "2026-03-26"].iter().map(|s| s.to_string()).collect();
+        // Both ATM SELL, Fresh mode (re-strike on own roll ⇒ never hits the carried
+        // re-validation path, so no external listing data is needed in-test).
+        let mk = |ot: &str| LegCfg {
+            option_type: ot.to_string(),
+            position: "SELL".to_string(),
+            lots: 1,
+            strike_interval: 100.0,
+            strike: StrikeSel::Fixed("ATM".to_string()),
+            straddle_use_joint: false,
+            rollover_strike_mode: StrikeMode::Fresh,
+            is_yearly: false,
+            yearly_schedule: Vec::new(),
+        };
+        let cfg = ResolveCfg {
+            legs: vec![mk("CE"), mk("PE")],
+            index: "NIFTY".to_string(),
+            entry_dte: 0,
+            exit_dte: 0,
+            calendar_days: false,
+            slippage_pct: 0.0,
+            strike_shift_max: 0,
+            rollover_active: true,
+            rollover_min_days: 0,
+            lot_size: 65,
+            yearly_cycles: None,
+            per_leg_rollover: true,
+            leg_rollover_expiries: vec![monthly, weekly],
+            leg_exit_dte: vec![7, 1], // monthly T-7 (locked), weekly T-1 (rolls)
+            leg_cycles: vec![None, None],
+            leg_breach_dates: vec![Vec::new(), Vec::new()],
+            seg_starts: Vec::new(),
+        };
+        let spot: HashMap<String, f64> =
+            td.iter().map(|d| (d.clone(), 25_000.0)).collect();
+
+        // Seed the shared market cache so ATM (25 000) validates as tradeable for
+        // every boundary date × contract. No other test reads CACHE, so this is
+        // isolated; cleared at the end of the test regardless.
+        {
+            let mut mc = crate::MarketCache::default();
+            let sym: u16 = 0;
+            mc.symbol_ids.insert("NIFTY".to_string(), sym);
+            let sk = crate::to_i64_strike(25_000.0);
+            let all_exp: Vec<&String> = cfg.leg_rollover_expiries.iter().flatten().collect();
+            for d in &td {
+                let dd = crate::date_str_to_days(d).unwrap();
+                for exp in &all_exp {
+                    let ed = crate::date_str_to_days(exp).unwrap();
+                    for ot in ["CE", "PE"] {
+                        mc.options.insert((dd, sym, sk, crate::opt_type_to_id(ot), ed), 100.0);
+                    }
+                }
+            }
+            *crate::CACHE.write().unwrap() = Some(mc);
+        }
+
+        let specs = resolve_per_leg_core(&cfg, &td, &spot);
+
+        let leg1: Vec<_> = specs.iter().filter(|s| s.leg_id == 1).collect();
+        let leg2: Vec<_> = specs.iter().filter(|s| s.leg_id == 2).collect();
+
+        // The locked monthly leg holds ONE position across its whole cycle: a spec
+        // ENTERING on its own roll (17-Feb) and carried across every weekly boundary
+        // (25-Feb / 04-Mar / 11-Mar) to the tail of its contract (18-Mar) — one row,
+        // not four weekly slices.
+        assert!(
+            leg1.iter().any(|s| s.entry_date == "2026-02-17" && s.exit_date == "2026-03-18"),
+            "monthly leg must span 17-Feb→18-Mar as ONE row, got {:?}",
+            leg1.iter().map(|s| (s.entry_date.as_str(), s.exit_date.as_str())).collect::<Vec<_>>()
+        );
+        // It must NOT re-book on a pure weekly (foreign) boundary.
+        for s in &leg1 {
+            assert!(
+                !["2026-02-25", "2026-03-04", "2026-03-11"].contains(&s.entry_date.as_str()),
+                "locked leg wrongly re-booked on a foreign weekly boundary: {}",
+                s.entry_date
+            );
+        }
+        // The weekly leg still rolls every week ⇒ strictly more rows than the locked leg.
+        assert!(
+            leg2.len() > leg1.len(),
+            "weekly leg should have more rows ({}) than locked monthly ({})",
+            leg2.len(),
+            leg1.len()
+        );
+
+        *crate::CACHE.write().unwrap() = None; // don't leak seeded cache to other tests
+    }
+
+    /// REGRESSION (money path): the long-form strike token that `extract_strike_sel`
+    /// now composes for {type:"itm"/"otm", value:N} must resolve to a real strike.
+    /// A bare "ITM"/"OTM" (the pre-fix behaviour) parses an empty suffix → None →
+    /// every trade drops → empty specs (the no-filter per-leg-rollover bug).
+    #[test]
+    fn composed_itm_otm_tokens_resolve() {
+        let spot = 20_040.0;
+        let gap = 100.0; // ATM = 20_000
+        // CE: ITM below ATM, OTM above.
+        assert_eq!(atm_offset_strike(spot, gap, "ITM5", "CE"), Some(19_500.0));
+        assert_eq!(atm_offset_strike(spot, gap, "OTM2", "CE"), Some(20_200.0));
+        assert_eq!(atm_offset_strike(spot, gap, "ITM0", "CE"), Some(20_000.0));
+        // PE mirrors.
+        assert_eq!(atm_offset_strike(spot, gap, "ITM5", "PE"), Some(20_500.0));
+        // Bare token (what the bug produced) is unresolvable — guards the fix.
+        assert_eq!(atm_offset_strike(spot, gap, "ITM", "CE"), None);
     }
 
     /// REGRESSION (money path): a filter segment opening MID-CONTRACT must emit a
@@ -3214,7 +3500,7 @@ mod rollover_schedule_tests {
     fn pinned_holds_december_across_every_cadence_segment() {
         let cycles = vec![cyc("2019-12-26", "2019-01-01", "2019-12-26")];
         let out = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles), false,
         );
         assert_eq!(out.len(), 10);
         for r in &out {
@@ -3237,7 +3523,7 @@ mod rollover_schedule_tests {
     fn pinned_last_segment_of_year_holds_the_current_december() {
         let cycles = vec![cyc("2019-12-26", "2019-01-01", "2019-12-26")];
         let out = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles), false,
         );
         let last = out.last().unwrap();
         assert_eq!(last.1, "2019-11-28", "chained entry, not the step-1 entry");
@@ -3256,7 +3542,7 @@ mod rollover_schedule_tests {
             cyc("2020-12-31", "2019-11-26", "2020-11-26"),
         ];
         let out = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles), false,
         );
         // 31-Oct -> 28-Nov exits AFTER the T-1 boundary (26-Nov), so it must open
         // on the NEXT December rather than truncate.
@@ -3282,7 +3568,7 @@ mod rollover_schedule_tests {
             cyc("2020-12-31", "2019-11-26", "2020-11-26"),
         ];
         let out = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles), false,
         );
         for e in ["2019-03-28", "2019-11-28", "2019-12-26"] {
             assert!(out.iter().any(|r| r.2 == e), "cadence boundary {e} missing from exits");
@@ -3298,10 +3584,10 @@ mod rollover_schedule_tests {
     fn min_dte_is_inert_when_pinned() {
         let cycles = vec![cyc("2019-12-26", "2019-01-01", "2019-12-26")];
         let with_min = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 5, Some(&cycles),
+            &monthly_2019(), &trading_days(), 0, 0, 5, Some(&cycles), false,
         );
         let without = build_rollover_schedule_pinned(
-            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles),
+            &monthly_2019(), &trading_days(), 0, 0, 0, Some(&cycles), false,
         );
         assert_eq!(with_min, without, "min-DTE must not perturb the pinned schedule");
         for r in &with_min {

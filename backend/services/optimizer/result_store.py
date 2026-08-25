@@ -161,6 +161,44 @@ WOW_MOM_LAYOUT_VERSION = "wm5"   # wm5: pivot sheets use the summary grid's
                                 #      captioned per-combo sheets
 
 
+def wow_mom_memory_budget_mb() -> float:
+    """Safe upper bound for one in-memory WOW/MOM workbook.
+
+    The old fixed 3.5 GB threshold let an 8,281-combo workbook through at an
+    estimated 2.7 GB, but that estimate excludes the optimizer's resident market
+    caches and renderer overhead; the remote worker was then cgroup-OOM-killed.
+    Keep the configurable ceiling, cap it against current host/cgroup headroom,
+    and default to 2 GB so this grid is emitted as bounded parts on every node.
+    """
+    try:
+        configured = max(512.0, float(os.environ.get("OPTIM_WOW_MOM_MAX_MB", "2000")))
+    except (TypeError, ValueError):
+        configured = 2000.0
+    headroom = []
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    headroom.append(int(line.split()[1]) / 1024.0)
+                    break
+    except Exception:
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory.max") as fh:
+            raw_max = fh.read().strip()
+        with open("/sys/fs/cgroup/memory.current") as fh:
+            raw_cur = fh.read().strip()
+        if raw_max != "max":
+            headroom.append(max(0.0, (int(raw_max) - int(raw_cur)) / (1024.0 * 1024.0)))
+    except Exception:
+        pass
+    if not headroom:
+        return configured
+    # Use at most 30% of currently available RAM: workbook construction is not
+    # the only resident allocation in either the optimizer or API process.
+    return max(512.0, min(configured, min(headroom) * 0.30))
+
+
 def wow_mom_cache_path(job_id: str, patchwise: bool = False) -> str:
     """Canonical path for a job's pre-built WOW/MOM XLSX file."""
     os.makedirs(ZIP_CACHE_DIR, exist_ok=True)

@@ -47,6 +47,22 @@ class SplitAwareCost(unittest.TestCase):
         importlib.reload(mg)
         mg.resize("", 1234)          # must not raise
 
+    def test_multi_index_reserves_more_private_memory(self):
+        os.environ["OPTIMIZE_PARALLELISM"] = "4"
+        os.environ["HEAVY_COST_OPTIMIZE_PER_CHILD_MB"] = "300"
+        os.environ["HEAVY_COST_OPTIMIZE_MULTI_INDEX_PER_CHILD_MB"] = "600"
+        import importlib, services.memory_gate as mg
+        importlib.reload(mg)
+        common = {"date_from": "2025-01-01", "date_to": "2025-06-30"}
+        single = mg.cost_for_job("optimize", {
+            **common, "index": "NIFTY", "legs": [{"index": "NIFTY"}],
+        }, p_override=4)
+        multi = mg.cost_for_job("optimize", {
+            **common, "index": "NIFTY",
+            "legs": [{"index": "NIFTY"}, {"index": "MIDCPNIFTY"}],
+        }, p_override=4)
+        self.assertEqual(multi - single, 3 * 300)
+
 
 class ForkWidthAdaptive(unittest.TestCase):
     """Width is re-derived per batch from live optims AND current free RAM, so it

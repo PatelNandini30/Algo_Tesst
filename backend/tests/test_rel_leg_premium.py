@@ -63,10 +63,40 @@ from services import engine_rust as E  # noqa: E402
 _prev_native = None
 
 
+_prev_get_expiry = None
+
+
+def _stub_get_expiry_dates(symbol, expiry_type="weekly", from_date=None, to_date=None):
+    """Deterministic offline expiry calendar for the divisor count: every Thursday
+    in [from_date, to_date] for a weekly cadence, the last Thursday of each month
+    for a monthly cadence. Aug-2022 → 4 weekly expiries (4/11/18/25), the count
+    the full-cycle divisor must produce. Keeps the suite off the real DB/feather.
+    """
+    from datetime import date, timedelta
+    s, e = date.fromisoformat(from_date), date.fromisoformat(to_date)
+    thursdays = []
+    d = s
+    while d <= e:
+        if d.weekday() == 3:
+            thursdays.append(d.isoformat())
+        d += timedelta(days=1)
+    if str(expiry_type).lower().startswith("month"):
+        by_month = {}
+        for iso in thursdays:
+            dd = date.fromisoformat(iso)
+            by_month[(dd.year, dd.month)] = iso     # last Thursday wins
+        return list(by_month.values())
+    return thursdays
+
+
 def setUpModule():
-    global _prev_native
+    global _prev_native, _prev_get_expiry
     _prev_native = sys.modules.get("algotest_native")
     sys.modules["algotest_native"] = _StubNative("algotest_native")
+    import base
+    _prev_get_expiry = base.get_expiry_dates
+    base.get_expiry_dates = _stub_get_expiry_dates
+    E._RELPREM_WINDOW_CACHE.clear()                  # drop any real-DB entry
 
 
 def tearDownModule():
@@ -74,6 +104,10 @@ def tearDownModule():
         sys.modules["algotest_native"] = _prev_native
     else:
         sys.modules.pop("algotest_native", None)
+    if _prev_get_expiry is not None:
+        import base
+        base.get_expiry_dates = _prev_get_expiry
+    E._RELPREM_WINDOW_CACHE.clear()
 
 
 def _specs(child_lots=1, ref_lots=1, entry="2022-08-04"):
@@ -105,41 +139,42 @@ def _payload(child_lots=1, ref_lots=1):
 
 
 def _run(payload, specs):
-    """Post-pass, returning the child spec. Pure date arithmetic — no calendar."""
+    """Post-pass, returning the child spec. Divisor N comes from the stubbed
+    expiry calendar (_stub_get_expiry_dates), so this stays offline."""
     out = E._apply_rel_leg_premium_to_specs(
         specs, payload, E._relprem_legs(payload), 65)
     return next((s for s in out if s["leg_id"] == 3), None)
 
 
 class TestDivisor(unittest.TestCase):
-    def test_divisor_is_weeks_from_entry_to_ref_expiry(self):
-        """Research-team rule: N = (ref_expiry - entry).days / 7, a raw float.
-
-        Ref = 25-Aug-2022 (monthly here, but the formula is cadence-agnostic),
-        entry 04-Aug -> 21 days -> 3.0 weeks. Same maths for a yearly ref.
+    def test_divisor_is_ref_full_cycle_not_weeks_remaining(self):
+        """N = child-cadence expiries in the REFERENCE contract's OWN calendar
+        cycle (Aug-2022 monthly ref -> 4 August weeklies), from the real expiry
+        calendar. A property of the contract, NOT of the entry date.
         """
         child = _run(_payload(), _specs())
-        self.assertAlmostEqual(child["rel_leg_premium_n"], 3.0, places=2)
-        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 3.0, places=4)
+        self.assertAlmostEqual(child["rel_leg_premium_n"], 4.0, places=6)
+        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 4.0, places=4)
 
-    def test_cadence_days_per_child_expiry(self):
-        """Divisor unit = the child leg's cadence: weekly 7, monthly 30.44, yearly 365.25."""
-        self.assertEqual(E._relprem_cadence_days("WEEKLY"), 7.0)
-        self.assertEqual(E._relprem_cadence_days(""), 7.0)          # default weekly
-        self.assertAlmostEqual(E._relprem_cadence_days("MONTHLY"), 365.25 / 12.0, places=4)
-        self.assertEqual(E._relprem_cadence_days("YEARLY"), 365.25)
+    def test_divisor_independent_of_entry_date(self):
+        """The bug this fixes: N must NOT shrink as the entry nears expiry. An
+        early and a late entry in the SAME ref cycle get the SAME N (the full
+        cycle), so the child strike no longer drifts from far-OTM to ATM."""
+        n_early = _run(_payload(), _specs(entry="2022-08-04"))["rel_leg_premium_n"]
+        n_late = _run(_payload(), _specs(entry="2022-08-18"))["rel_leg_premium_n"]
+        self.assertAlmostEqual(n_early, 4.0, places=6)
+        self.assertAlmostEqual(n_late, 4.0, places=6)
+        self.assertEqual(n_early, n_late)
 
-    def test_weekly_child_unchanged_but_monthly_divides_by_months(self):
-        """Weekly child keeps ÷7 (=3.0); the SAME dates as a monthly child divide
-        by months (21 days ÷ 30.44 = 0.69), not weeks. Regression for a monthly
-        child being computed as weekly."""
+    def test_child_cadence_sets_what_is_counted(self):
+        """N counts CHILD-cadence expiries inside the ref's cycle: a weekly child
+        -> 4 (the August weeklies); a monthly child -> 1 (the one August monthly)."""
         weekly = _run(_payload(), _specs())                        # leg 3 = WEEKLY
-        self.assertAlmostEqual(weekly["rel_leg_premium_n"], 3.0, places=2)
+        self.assertAlmostEqual(weekly["rel_leg_premium_n"], 4.0, places=6)
         p = _payload()
         p["legs"][2]["expiry"] = "MONTHLY"                         # child now monthly
         monthly = _run(p, _specs())
-        self.assertAlmostEqual(
-            monthly["rel_leg_premium_n"], 21.0 / (365.25 / 12.0), places=2)  # 0.69
+        self.assertAlmostEqual(monthly["rel_leg_premium_n"], 1.0, places=6)
 
     def test_ref_read_survives_zero_turnover_ref(self):
         """The reference is often a long-dated deep-OTM leg with no turnover.
@@ -155,16 +190,7 @@ class TestDivisor(unittest.TestCase):
             _UNTRADED.discard(17150.0)
         self.assertIsNotNone(child)                  # resolved, not dropped
         self.assertEqual(child["strike"], 17600.0)   # same pick as the traded case
-        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 3.0, places=4)
-
-    def test_divisor_shrinks_as_entry_nears_expiry(self):
-        """N now tracks weeks REMAINING to expiry — the research formula, not a
-        fixed cycle count. Entering later in the ref's life shrinks it."""
-        n_early = _run(_payload(), _specs(entry="2022-08-04"))["rel_leg_premium_n"]
-        n_late = _run(_payload(), _specs(entry="2022-08-18"))["rel_leg_premium_n"]
-        self.assertAlmostEqual(n_early, 3.0, places=2)   # 21 days -> 3.0 wk
-        self.assertAlmostEqual(n_late, 1.0, places=2)    # 7 days  -> 1.0 wk
-        self.assertLess(n_late, n_early)
+        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 4.0, places=4)
 
 
 class TestLots(unittest.TestCase):
@@ -188,16 +214,16 @@ class TestLots(unittest.TestCase):
         """More lots on the ref raises the target, so a richer strike wins."""
         one = _run(_payload(ref_lots=1), _specs())
         three = _run(_payload(ref_lots=3), _specs())
-        # N=3.0. 1 lot -> target 32.80 -> 17600 @ 25.85 (6.95 off).
-        #        3 lots -> target 98.40 -> 17500 @ 108.00 (9.60 off, beats 17550's 12.40).
+        # N=4.0. 1 lot -> target 24.60 -> 17600 @ 25.85 (1.25 off).
+        #        3 lots -> target 73.80 -> 17550 @ 86.00 (12.20 off, beats 17600's 47.95).
         self.assertEqual(one["strike"], 17600.0)
-        self.assertEqual(three["strike"], 17500.0)
+        self.assertEqual(three["strike"], 17550.0)
         self.assertLess(three["strike"], one["strike"])     # closer to ATM
 
 
 class TestChainFilters(unittest.TestCase):
     def test_off_grid_strike_is_never_selected(self):
-        """17575 @ 33.00 is the nearest premium to the 32.80 target but off-grid."""
+        """17575 @ 33.00 is off-grid; the 24.60 target must skip it for a grid strike."""
         specs = _specs()
         child = _run(_payload(), specs)
         self.assertNotEqual(child["strike"], 17575.0)
@@ -210,7 +236,7 @@ class TestChainFilters(unittest.TestCase):
         self.assertNotEqual(child["strike"], 17650.0)
 
     def test_picks_nearest_qualifying_premium(self):
-        """N=3.0, target 32.80 -> 17600 @ 25.85 is nearest on the filtered grid chain."""
+        """N=4.0, target 24.60 -> 17600 @ 25.85 is nearest on the filtered grid chain."""
         child = _run(_payload(), _specs())
         self.assertEqual(child["strike"], 17600.0)
         # Derived strikes must not be reported as forced liquidity shifts.

@@ -1107,7 +1107,15 @@ def _merge_polars_with_pandas(existing: Optional[pl.DataFrame], new_dfs: list) -
     if len(parts) == 1:
         combined = parts[0]
     else:
-        combined = pl.concat(parts, how="vertical_relaxed")
+        # `diagonal_relaxed`, not `vertical_relaxed`: the cached frame and a fresh
+        # DB slice can differ in COLUMN COUNT (e.g. a 12-col feather-derived cache
+        # vs a 13-col DB query that added a column). vertical_relaxed only relaxes
+        # dtypes and raises "schema lengths differ" on a column-count mismatch,
+        # which crashed every delta-load after a feather rebuild. diagonal unions
+        # the columns and null-fills the gaps, so the merge is robust to either
+        # source's schema; the dedup + downstream reads use a fixed column subset,
+        # so the extra null column is harmless.
+        combined = pl.concat(parts, how="diagonal_relaxed")
         try:
             combined = combined.unique(
                 subset=["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice"],

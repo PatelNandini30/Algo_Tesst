@@ -93,7 +93,7 @@ _RUST_STRIKE_TYPES = frozenset({
     "rel_leg", "pct_of_atm",
     "closest_premium", "premium_gte", "premium_lte", "premium_range",
     "time_value", "time_value_gte", "time_value_lte",
-    "straddle_width", "atm_straddle_prem_pct",
+    "straddle_width", "atm_straddle_prem_pct", "delta",
 })
 # expiry values that mean "trade a contract one expiry further out" — Python-orchestrated.
 _NEXT_EXPIRY_TYPES = frozenset({"NEXT_WEEKLY", "WEEKLY_T1", "NEXT_MONTHLY", "MONTHLY_T1"})
@@ -508,7 +508,8 @@ def run_shadow_summary_check(
         if midcap_legs:
             from services.optimizer.excel_builder import compute_midcap_for_rows
             mbt, msumm, _has = compute_midcap_for_rows(
-                records, midcap_legs, midcap_spot_adjustment, midcap_symbol or "NIFTYMIDCAP100")
+                records, midcap_legs, midcap_spot_adjustment, midcap_symbol or "NIFTYMIDCAP100",
+                filter_segments=filter_segments)
             mbt = mbt or None
 
         opt_m = algotest_native.compute_optim_metrics(records, base_summary)
@@ -550,7 +551,8 @@ def rust_authoritative_summary(
     if midcap_legs:
         from services.optimizer.excel_builder import compute_midcap_for_rows
         mbt, msumm, _has = compute_midcap_for_rows(
-            records, midcap_legs, midcap_spot_adjustment, midcap_symbol or "NIFTYMIDCAP100")
+            records, midcap_legs, midcap_spot_adjustment, midcap_symbol or "NIFTYMIDCAP100",
+            filter_segments=filter_segments)
         mbt = mbt or None
     opt_m = algotest_native.compute_optim_metrics(records, base_summary or {})
     flat = {**(base_summary or {}), **opt_m}

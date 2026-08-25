@@ -137,23 +137,32 @@ def run_optimize_job(self, spec: dict):
         _max_optims = 2
     try:
         from services.optimizer import result_store as _rs_gate
-        _slot_waited = False
-        while _rs_gate.active_optim_count(node_id) >= _max_optims:
-            if not _slot_waited:
-                logger.info(
-                    "[OPTIM] job %s waiting for an optimizer slot (%d already running, cap=%d)",
-                    rid[:8], _rs_gate.active_optim_count(node_id), _max_optims,
-                )
-                self.update_state(
-                    state='PROCESSING',
-                    meta={'status': f'queued: {_max_optims} optimizations already running',
-                          'client_ip': client_ip},
-                )
-                _slot_waited = True
-            time.sleep(3)
+        if _rs_gate.active_optim_count(node_id) >= _max_optims:
+            # Too many optims already running — put this task back in the Redis
+            # queue and exit immediately. The job holds ZERO memory while waiting
+            # (it hasn't loaded any data yet) and will be retried after a delay.
+            # This is strictly better than the old spin-wait (time.sleep loop
+            # inside the worker): the old loop held a Celery worker slot and kept
+            # the job memory-resident even though it was doing nothing.
+            logger.info(
+                "[OPTIM] job %s requeued — %d/%d optimizer slots in use (ip=%s)",
+                rid[:8], _rs_gate.active_optim_count(node_id), _max_optims, client_ip,
+            )
+            self.update_state(
+                state='PROCESSING',
+                meta={'status': f'queued: {_max_optims} optimizations already running',
+                      'client_ip': client_ip},
+            )
+            # countdown=30 keeps responsiveness; max_retries=720 = 6h patience.
+            raise self.retry(countdown=30, max_retries=720)
         _rs_gate.register_active_optim(rid, node_id)
-    except Exception:
-        pass
+    except self.MaxRetriesExceededError:
+        return _sanitize_result({'status': 'error', 'message': 'timed out waiting for optimizer slot', 'client_ip': client_ip})
+    except Exception as _gate_exc:
+        from celery.exceptions import Retry as _CeleryRetry
+        if isinstance(_gate_exc, _CeleryRetry):
+            raise  # let Celery handle the requeue
+        logger.warning("[OPTIM] slot-gate error (%s) — proceeding anyway", _gate_exc)
     memory_gate.acquire(
         rid,
         # #2 dynamic cost: scale reservation by this optim's date span.
@@ -238,6 +247,29 @@ def warm_backtest_cache_task(self, params: dict):
 
         from_date = _normalize_cache_date(from_date)
         to_date = _normalize_cache_date(to_date)
+
+        # Do not spend a full option-table load on symbols that cannot produce
+        # a usable backtest.  Several equities have option rows but no
+        # underlying spot series or expiry calendar; warming them only creates
+        # a large DB read followed by a guaranteed missing-spot.feather error.
+        try:
+            from repositories.market_data_repository import MarketDataRepository
+            from database import engine as _db_engine
+            _repo = MarketDataRepository(_db_engine)
+            _spot = _repo.get_spot_data(index, from_date, to_date)
+            _expiry = _repo.get_expiry_data(index, "weekly")
+            if _spot is None or _spot.empty or _expiry is None or _expiry.empty:
+                return {
+                    'status': 'skipped',
+                    'message': f'Skipping cache warm for {index}: spot or expiry data is unavailable',
+                    'stats': {'options_rows': 0, 'spot_rows': len(_spot) if _spot is not None else 0,
+                              'expiry_rows': len(_expiry) if _expiry is not None else 0},
+                }
+        except Exception as exc:
+            # A preflight failure must not turn into a large speculative DB
+            # load. Real backtests perform their normal authoritative loading.
+            logger.warning('[WARM] preflight failed for %s; skipping warm: %s', index, exc)
+            return {'status': 'skipped', 'message': f'Warm preflight unavailable for {index}'}
 
         self.update_state(state='PROCESSING', meta={'status': 'Warming worker data cache'})
         stats = bulk_load_options(index, from_date, to_date)

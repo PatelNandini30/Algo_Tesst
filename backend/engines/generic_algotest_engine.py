@@ -296,6 +296,7 @@ _bhav_ohlc_cache: dict = {}
 _BHAV_OHLC_CACHE_MAX = 300
 
 
+
 def _last_trading_day_on_or_before(trading_calendar_df, target_date):
     target_ts = pd.Timestamp(target_date)
     arr = trading_calendar_df['date'].values.astype('datetime64[ns]')
@@ -314,6 +315,8 @@ def _next_trading_day_after(trading_calendar_df, target_date):
     if idx >= len(arr):
         return None
     return pd.Timestamp(arr[idx])
+
+
 
 
 def _date_key(value):

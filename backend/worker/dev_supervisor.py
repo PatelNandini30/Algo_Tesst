@@ -99,10 +99,86 @@ def _max_mtime() -> float:
     return latest
 
 
+import re as _re
+
+
+def _watched_queues() -> list:
+    """Queue name(s) this worker consumes, parsed from the Celery command
+    (--queues=X / --queues X / -Q X). Used to see undelivered work still
+    sitting in the broker that the worker hasn't reserved yet."""
+    m = _re.search(r"(?:--queues[=\s]+|-Q[=\s]+)([\w,]+)", CHILD_CMD)
+    return [q for q in m.group(1).split(",") if q] if m else []
+
+
+def _queue_pending() -> bool:
+    """True if any queue this worker consumes has messages WAITING in the broker
+    but not yet reserved by the worker. Celery-on-Redis stores each queue as a
+    Redis list keyed by the queue name, so LLEN is the undelivered depth. This
+    is the gap that dropped a job: a submitted-but-not-yet-started optim is
+    invisible to inspect.active/reserved, so the reload grabbed it mid-restart
+    and SIGTERM'd it. On any error we can't prove the queue is empty → treat as
+    pending so we never restart into a queued job."""
+    qs = _watched_queues()
+    if not qs:
+        return False
+    try:
+        import redis
+        c = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+        return any(int(c.llen(q) or 0) > 0 for q in qs)
+    except Exception as exc:
+        _log(f"queue-depth check failed ({exc}) — treating as PENDING (won't restart)")
+        return True
+
+
+def _nested_pool_busy() -> bool:
+    """True while a task-owned subprocess still belongs to the worker group.
+
+    Celery's normal prefork children are direct children of the Celery main
+    process.  Optimizer batch workers are one level deeper; if their Celery
+    parent is OOM-killed they become orphans but retain the same process group.
+    Celery inspect can then report "idle" while those children are still
+    computing, and restarting closes their result pipes (BrokenPipeError).
+    """
+    if not _proc or _proc.poll() is not None:
+        return False
+    try:
+        main_pid = int(_proc.pid)
+        worker_pgid = os.getpgid(main_pid)
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid == main_pid:
+                continue
+            try:
+                # /proc/PID/stat: pid (comm) state ppid pgrp ...; split after
+                # the final ')' because comm itself may contain spaces.
+                raw = open(f"/proc/{pid}/stat", "r", encoding="utf-8").read()
+                fields = raw[raw.rfind(")") + 2:].split()
+                state, ppid, pgrp = fields[0], int(fields[1]), int(fields[2])
+            except (OSError, ValueError, IndexError):
+                continue
+            if state != "Z" and pgrp == worker_pgid and ppid != main_pid:
+                return True
+    except (OSError, ValueError):
+        # Uncertainty must defer reload, matching the broker/inspect checks.
+        return True
+    return False
+
+
 def _worker_idle() -> bool:
     """True only when THIS container's worker has no active/reserved/scheduled
-    tasks. On persistent uncertainty returns False (never restart while unsure).
-    Retries briefly so a transient broker/DNS blip doesn't wrongly block reload."""
+    tasks AND nothing waiting in its queue(s). On persistent uncertainty returns
+    False (never restart while unsure). Retries briefly so a transient
+    broker/DNS blip doesn't wrongly block reload."""
+    # A nested optimizer child may outlive an OOM-killed Celery task parent.
+    # Never restart until it exits and closes its own side of the batch pipe.
+    if _nested_pool_busy():
+        return False
+    # Broker-side pending work (submitted, not yet reserved) — checked first so a
+    # queued optim is never caught in a restart.
+    if _queue_pending():
+        return False
     from worker.celery import celery_app
     local = f"celery@{socket.gethostname()}"
     last_exc = None
