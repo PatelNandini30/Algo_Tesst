@@ -27,7 +27,7 @@ from sqlalchemy import text
 
 from database import get_engine
 from services import rust_fast_path as _rf
-from services.data_loader import get_bulk_options_df, get_bulk_spot_df
+from services.data_loader import get_bulk_options_df, get_bulk_spot_df, bulk_clear
 from base import bulk_load_options
 
 try:
@@ -91,6 +91,41 @@ def main():
                     need = True; why.append(f"spot end {s_max}<{db_s_max}")
                 if s_max < o_max:
                     need = True; why.append(f"spot<opt end {s_max}<{o_max}")
+                # Spot feather MUST carry a Symbol column. Without it Rust stores the
+                # spot under the shared unnamed (u16::MAX) bucket, which lets a second
+                # index in a fused multi-index run receive THIS index's spot (wrong ATM
+                # → "built NO specs"). Rebuild any unnamed spot feather so it is named.
+                if db_s_min is not None:
+                    try:
+                        _scols = pl.read_ipc(str(sp), n_rows=0).columns
+                        if "Symbol" not in _scols:
+                            need = True; why.append("spot missing Symbol column (unnamed bucket)")
+                    except Exception:
+                        pass
+                # SYMBOL CONTAMINATION guard (the real MIDCPNIFTY bug): the OPTIONS
+                # feather held NIFTY's data (Symbol='NIFTY', 8.6M rows) because it was
+                # built from a stale process-global options DataFrame belonging to a
+                # previously-loaded symbol. A MIDCPNIFTY backtest then found no options
+                # under its own symbol id → engine declined / "built NO specs". A
+                # feather whose options Symbol column contains ANY symbol other than
+                # its own directory symbol is corrupt — rebuild it. (Also covers the
+                # spot feather.) Cheap: single-column distinct scan.
+                try:
+                    _osyms = set(str(x).upper() for x in
+                                 pl.scan_ipc(str(op)).select("Symbol").unique().collect()["Symbol"].to_list()
+                                 if x is not None)
+                    if _osyms and _osyms != {sym}:
+                        need = True; why.append(f"options Symbol {sorted(_osyms)} != {sym} (contaminated)")
+                except Exception:
+                    pass
+                try:
+                    _ssyms = set(str(x).upper() for x in
+                                 pl.scan_ipc(str(sp)).select("Symbol").unique().collect()["Symbol"].to_list()
+                                 if x is not None)
+                    if _ssyms and _ssyms != {sym}:
+                        need = True; why.append(f"spot Symbol {sorted(_ssyms)} != {sym} (contaminated)")
+                except Exception:
+                    pass
                 # spot start clipped: only if it starts AFTER both the options start
                 # AND the DB spot start (i.e. it's a real clip, not a data-availability
                 # limit like BANKNIFTY, whose spot only exists from 2020 while options
@@ -113,10 +148,24 @@ def main():
                     cli.delete(f"bulk:{sym}:full")
                 except Exception:
                     pass
+            # Reset the process-global bulk DataFrames BEFORE loading this symbol.
+            # Without this, the spot global from the PRIOR symbol (e.g. NIFTY, whose
+            # wide date range covers MIDCPNIFTY's) is reused symbol-blindly on the
+            # feather-shortcut / range-covered path, so build_cache below wrote
+            # NIFTY's spot into MIDCPNIFTY's feather (spot 2024-11-22 = 23907 instead
+            # of 12306) → "[SYNC_FUSED] group MIDCPNIFTY built NO specs". Clearing
+            # forces a fresh per-symbol DB load of BOTH options and spot.
+            bulk_clear()
             bulk_load_options(sym, lo, hi)
             odf, sdf = get_bulk_options_df(), get_bulk_spot_df()
             if odf is None or odf.is_empty():
                 print(f"  {sym}: no options after reload, skip", flush=True)
+                continue
+            # Never write a feather with a mismatched/empty spot: if this symbol has
+            # spot in the DB but the loaded spot df is empty (shortcut left it unset),
+            # skip rather than baking a wrong-symbol/zero spot into the cache.
+            if db_s_max and (sdf is None or sdf.is_empty()):
+                print(f"  {sym}: spot df empty despite DB spot — skip (avoid corrupt feather)", flush=True)
                 continue
             _rf.build_cache(odf, sdf, cache_key=f"bulk:{sym}:full")
             o_min, o_max = _extent(op)

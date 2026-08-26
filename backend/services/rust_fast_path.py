@@ -562,11 +562,49 @@ def build_cache(options_df, spot_df, cache_key: Optional[str] = None, symbol: Op
                 logger.debug("[RUST_FAST] schema check failed: %s", _sc)
 
         if not options_path.exists() or not spot_path.exists():
+            # ── SYMBOL CONTAMINATION guard (root-cause chokepoint) ───────────────
+            # This is a per-symbol feather keyed `...:bulk:<SYM>:full`. If the
+            # options DataFrame carries a Symbol column naming a DIFFERENT symbol,
+            # it belongs to another index (a stale process-global from a prior
+            # load, symbol-blindly reused) and must NOT be written here — that is
+            # exactly how MIDCPNIFTY's options.feather came to hold NIFTY's 8.6M
+            # rows, so every MIDCPNIFTY backtest found no options under its own id
+            # and the engine declined / "built NO specs". Refuse rather than bake
+            # the wrong index into the cache. verify_feathers self-heals on deploy.
+            _tgt_sym = (symbol or "").strip().upper()
+            if not _tgt_sym:
+                _kp = key.split(":")  # e.g. arrow-v2:bulk:NIFTY:full
+                _tgt_sym = _kp[-2].upper() if len(_kp) >= 2 else ""
+            if (_tgt_sym and options_df is not None and not options_df.is_empty()
+                    and "Symbol" in getattr(options_df, "columns", [])):
+                _osyms = set(str(x).upper() for x in options_df["Symbol"].unique().to_list() if x is not None)
+                if _osyms and _osyms != {_tgt_sym}:
+                    logger.error(
+                        "[RUST_FAST] REFUSING to write %s: options Symbol %s != %s "
+                        "(contaminated — stale cross-symbol DataFrame)", key, sorted(_osyms), _tgt_sym)
+                    return False
             # Contracts is additive — used by the strike-shift validator to skip
             # zero-turnover (stale-price) records.  Older feather files without
             # this column still work: the Rust cache treats absence as "tradeable"
             # for backwards compatibility.
             _write_feather(options_df, options_path, ["Date", "Symbol", "ExpiryDate", "OptionType", "StrikePrice", "Open", "High", "Low", "Close", "Contracts", "SettledPrice", "Delta", "IVPct"])
+            # ALWAYS stamp Symbol on the spot feather (universal, every index). A spot
+            # feather WITHOUT a Symbol column is stored by Rust under the shared unnamed
+            # bucket (u16::MAX). In a multi-index resident cache that unnamed bucket is
+            # the ONE path by which a second index (e.g. MIDCPNIFTY) can receive the
+            # first index's spot (lib.rs lookup_spot_price fallback) → wrong ATM →
+            # run_rust_engine_pipeline "built NO specs". Naming every spot removes the
+            # ambiguity entirely: each index resolves only its own named bucket, and a
+            # genuine date gap returns None (loader fallback) instead of leaking.
+            if (spot_df is not None and not spot_df.is_empty()
+                    and "Symbol" not in getattr(spot_df, "columns", [])):
+                _sym_for_spot = (symbol or "").strip().upper()
+                if not _sym_for_spot:
+                    _kp = key.split(":")  # e.g. arrow-v2:bulk:NIFTY:full
+                    _sym_for_spot = _kp[-2].upper() if len(_kp) >= 2 else ""
+                if _sym_for_spot:
+                    import polars as _pl_sym
+                    spot_df = spot_df.with_columns(_pl_sym.lit(_sym_for_spot).alias("Symbol"))
             _write_feather(spot_df, spot_path, ["Date", "Symbol", "Close"] if "Symbol" in getattr(spot_df, "columns", []) else ["Date", "Close"])
             # NOTE: deliberately NO data_version bump here. Bumping on every feather
             # write made bulk_load_options see the token change on the NEXT load and
