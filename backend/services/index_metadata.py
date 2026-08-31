@@ -20,7 +20,10 @@ INDEX_CONFIGS = {
     # contracts spanning 2010-2030, while BANKNIFTY/MIDCPNIFTY/FINNIFTY have
     # none. Listing it only here makes validate_index_payload reject it on the
     # other indices for free, rather than silently returning zero trades.
-    "NIFTY": IndexConfig("NIFTY", True, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY", "YEARLY"), 50),
+    # QUARTERLY (Mar/Jun/Sep/Dec long-dated contracts) is the same NIFTY-only
+    # pinning; it normalizes to YEARLY downstream (_apply_quarterly_expiry) but
+    # must pass raw-body validation here first.
+    "NIFTY": IndexConfig("NIFTY", True, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY", "YEARLY", "QUARTERLY"), 50),
     "BANKNIFTY": IndexConfig("BANKNIFTY", True, ("MONTHLY", "NEXT_MONTHLY"), 100),
     "MIDCPNIFTY": IndexConfig("MIDCPNIFTY", True, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY"), 25),
     "SENSEX": IndexConfig("SENSEX", False, ("WEEKLY", "MONTHLY", "NEXT_WEEKLY", "NEXT_MONTHLY"), 100),

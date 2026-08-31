@@ -282,6 +282,133 @@ def _build_leg_dict_for_overall(spec: Dict[str, Any], expiry_date: str) -> Dict[
     }
 
 
+def _overall_exit_slippage(price: float, position: str, pct: float) -> float:
+    """Exit-side slippage on a mark, mirroring native apply_slippage(side='exit').
+    SELL exit buys back (pays more → +pct); BUY exit sells (receives less → −pct)."""
+    pct = float(pct or 0.0)
+    if pct <= 0:
+        return round(price, 2)
+    factor = (1.0 + pct / 100.0) if str(position).upper() == "SELL" else (1.0 - pct / 100.0)
+    return round(max(0.0, price * factor), 2)
+
+
+def _check_overall_sl_target_py(
+    entry_iso: str,
+    exit_iso: str,
+    expiry_iso: str,
+    leg_dicts: List[Dict[str, Any]],
+    index: str,
+    trading_days: List[str],
+    sl_thresh: Optional[float],
+    tgt_thresh: Optional[float],
+    per_leg_results: Optional[List[Dict[str, Any]]],
+    sl_mode: str,
+    tgt_mode: str,
+    slippage: float,
+    spot_by_date: Dict[str, float],
+) -> Optional[Tuple[str, str]]:
+    """Python re-implementation of the native check_overall_stop_loss_target.
+
+    The native function's internal price store is NOT populated on the engine_rust
+    EOD path, so it never found a mark and Overall SL/Target silently never fired.
+    This mirrors its logic using the lookups this path DOES have —
+    ``algotest_native.get_option_price`` per day for premium modes and
+    ``spot_by_date`` for underlying modes — so the check actually hits.
+
+    Scans the holding window (trading days in ``(entry, exit]``) — which is already
+    calendar/trading-day aware via the entry/exit anchors — and returns
+    ``(exit_date_iso, "OVERALL_SL"|"OVERALL_TARGET")`` for the EARLIEST day a
+    threshold is crossed, else ``None``. Legs marked ``triggered`` in
+    ``per_leg_results`` are excluded from the combined mark (partial square-off);
+    complete mode simply has no early per-leg exits, so nothing is excluded.
+    """
+    if sl_thresh is None and tgt_thresh is None:
+        return None
+    import algotest_native  # type: ignore  # function-local, as everywhere else here
+    sl_is_u = sl_mode in ("underlying_pts", "underlying_pct")
+    tgt_is_u = tgt_mode in ("underlying_pts", "underlying_pct")
+    holding = [d for d in trading_days if entry_iso < d <= exit_iso]
+    if not holding:
+        return None
+    # A leg leaves the combined mark ONLY if it exited EARLY on its OWN per-leg
+    # SL/Target — keyed by exit_reason, NOT by "has any exit reason". (The upstream
+    # `triggered` flag is set for a plain scheduled EXPIRY too, which wrongly
+    # excluded every leg and zeroed the mark — why Overall SL/Target never fired.)
+    # Partial square-off: the early-closed leg drops out on days after its exit;
+    # its still-open siblings keep the overall check live. Complete mode has no
+    # early per-leg exits, so nothing drops.
+    early_close: Dict[int, str] = {}
+    for li, res in enumerate(per_leg_results or []):
+        if not isinstance(res, dict):
+            continue
+        rsn = str(res.get("exit_reason") or "").upper()
+        xd = res.get("exit_date")
+        if xd and (rsn in _SL_REASONS or rsn in _TGT_REASONS):
+            early_close[li] = _normalize_iso(str(xd))
+
+    def _open(li: int, d: str) -> bool:
+        c = early_close.get(li)
+        return not (c and d > c)
+
+    entry_spot = spot_by_date.get(entry_iso) if (sl_is_u or tgt_is_u) else None
+
+    for d in holding:
+        # Premium-mode combined mark (skip early-closed legs + futures + missing marks).
+        combined = 0.0
+        has_data = False
+        for li, leg in enumerate(leg_dicts):
+            if not _open(li, d) or str(leg.get("segment", "OPTIONS")).upper() in ("FUTURE", "FUTURES"):
+                continue
+            strike = _maybe_float(leg.get("strike"))
+            entry_prem = _maybe_float(leg.get("entry_premium"))
+            if strike is None or entry_prem is None:
+                continue
+            expiry = leg.get("_resolved_expiry") or expiry_iso
+            try:
+                raw = algotest_native.get_option_price(d, index, strike, leg.get("option_type"), expiry)
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            pos = str(leg.get("position") or "SELL").upper()
+            cur = _overall_exit_slippage(float(raw), pos, slippage)
+            lots = _maybe_float(leg.get("lots")) or 1.0
+            lot_size = _maybe_float(leg.get("lot_size")) or 1.0
+            leg_pnl = (cur - entry_prem) if pos == "BUY" else (entry_prem - cur)
+            combined += leg_pnl * lots * lot_size
+            has_data = True
+
+        # Underlying (spot-move) modes — driven off spot only, direction from the
+        # first still-open leg. Not gated on option data (the native over-gated it).
+        if (sl_is_u or tgt_is_u) and entry_spot:
+            cur_spot = spot_by_date.get(d)
+            if cur_spot:
+                first = next((leg for li, leg in enumerate(leg_dicts) if _open(li, d)), None)
+                if first is not None:
+                    move = cur_spot - entry_spot
+                    move_pct = (move / entry_spot * 100.0) if entry_spot else 0.0
+                    pos = str(first.get("position") or "SELL").upper()
+                    opt = str(first.get("option_type") or "CE").upper()
+                    if (opt == "CE" and pos == "SELL") or (opt == "PE" and pos == "BUY"):
+                        adv_pts, adv_pct = move, move_pct
+                    else:
+                        adv_pts, adv_pct = -move, -move_pct
+                    if sl_is_u and sl_thresh is not None:
+                        if (adv_pts if sl_mode == "underlying_pts" else adv_pct) >= sl_thresh:
+                            return d, "OVERALL_SL"
+                    if tgt_is_u and tgt_thresh is not None:
+                        if (-adv_pts if tgt_mode == "underlying_pts" else -adv_pct) >= tgt_thresh:
+                            return d, "OVERALL_TARGET"
+
+        if not has_data:
+            continue
+        if not sl_is_u and sl_thresh is not None and combined <= -sl_thresh:
+            return d, "OVERALL_SL"
+        if not tgt_is_u and tgt_thresh is not None and combined >= tgt_thresh:
+            return d, "OVERALL_TARGET"
+    return None
+
+
 _SL_REASONS = {"STOP_LOSS", "TRAIL_SL", "COMPLETE_STOP_LOSS", "STOP_LOSS_BUFFER", "STOP_LOSS_BUFFER_GAP", "SL_WITH_BUFFER"}
 _TGT_REASONS = {"TARGET", "COMPLETE_TARGET"}
 
@@ -289,6 +416,22 @@ _TGT_REASONS = {"TARGET", "COMPLETE_TARGET"}
 def _resolve_atm_strike(spot: float, strike_interval: float) -> float:
     """ATM strike = nearest multiple of strike_interval. Matches Python ATM."""
     return round(spot / strike_interval) * strike_interval
+
+
+def _vs_strike_fires(spot: float, strike: float, direction: str, margin_pct: float) -> bool:
+    """Spot Above/Below Strike trigger (per-leg). Fires when spot crosses the leg's
+    own current strike, shifted early by `margin_pct` of strike. Strict compare —
+    spot exactly on the (shifted) level does NOT fire.
+
+        margin = round(strike * pct / 100)
+        above  -> spot > strike - margin
+        below  -> spot < strike + margin
+
+    See leg_spot_adjustment_above_below_margin_logic.md (§3, Cases A–H)."""
+    margin = round(strike * (margin_pct or 0.0) / 100.0)
+    if str(direction).lower() == "above":
+        return spot > (strike - margin)
+    return spot < (strike + margin)
 
 
 def _spot_adj_reason_tag(
@@ -755,10 +898,16 @@ def _apply_delta_to_specs(
         if picked is None:
             picked = ideal  # nothing tradeable (or native absent) — take the ideal
         s["strike"] = float(picked)
-        # Only stamp requested_strike when it actually differs, so an unshifted
-        # delta pick doesn't manufacture a spurious Strike Shift Reason.
+        # The delta re-pick is authoritative over requested_strike for this leg:
+        # stamp it ONLY when the ideal (closest-actual-delta) strike was skipped
+        # for a tradeable one, and CLEAR any stale value the resolver's BS
+        # placeholder walk left behind. Otherwise a clean delta pick inherits the
+        # placeholder's requested_strike and manufactures a spurious "zero
+        # turnover" Strike Shift Reason on a fully-liquid strike.
         if abs(float(ideal) - float(picked)) > 1e-6:
             s["requested_strike"] = float(ideal)
+        else:
+            s.pop("requested_strike", None)
     return specs
 
 
@@ -1154,10 +1303,20 @@ def resolve_expiry_inputs(
     # Purely additive: nothing else pre-supplies yearly_cycles, so every existing
     # path (including real YEARLY) still falls through to the builder below.
     if etype == "YEARLY" and payload.get("yearly_cycles"):
-        # `sync_cadence_expiries` (the MERGED roll boundaries across every leg's
-        # index) is the cadence when supplied: the cadence list is what drives
-        # entry/exit in Rust, so the earliest-expiry-wins boundary has to arrive
-        # here, not just in the cycles (which only pin the contract).
+        # Cross-index fused path: `sync_cadence_expiries` carries the MERGED roll
+        # boundaries (earliest-expiry-wins across both indices). The old code passed
+        # these as `expiry_dates`, but that is wrong for the non-driving index:
+        # `expiry_dates` is also used by resolve_trade_specs_core to look up actual
+        # option contracts in the native cache (simulate.rs:2199 iterates
+        # `for expiry in expiry_dates`). When NIFTY's Dec-26 appears in the shared
+        # cadence, MIDCPNIFTY's resolver looks for options expiring Dec-26 → none
+        # exist (MIDCPNIFTY expires Dec-30) → empty specs → "built NO specs".
+        #
+        # The entry/exit timing for a YEARLY-pinned group is driven by
+        # `yearly_cycles[i]["start"/"end"]` (simulate.rs build_rollover_schedule_pinned),
+        # NOT by the `expiry_dates` list. So the correct expiry_dates for each group
+        # are its OWN contract dates (yearly_cycles[i]["contract"]) — which are already
+        # per-index correct (MIDCPNIFTY Dec-30, NIFTY Dec-26). Pass those instead.
         explicit = payload.get("sync_cadence_expiries")
         if explicit:
             return ([str(d) for d in explicit], list(payload["yearly_cycles"]))
@@ -1435,6 +1594,78 @@ def _inject_per_leg_rollover_inputs(
         leg["_spot_adj_direction"] = direction
         leg["_spot_adj_pct"] = pct
 
+    # ── SPOT ABOVE/BELOW STRIKE (opt-in per leg) ────────────────────────────────
+    # Trigger B: cut + re-enter the instant the index spot crosses THIS leg's own
+    # currently-traded strike (a LEVEL condition, distinct from the spot-MOVE trigger
+    # above). Optional `margin_pct` shifts the comparison level so it fires a bit
+    # early. Breaches are UNIONED into `_spot_adj_breaches`, so re-entry, filter
+    # segments, cascade, exit-reason and MAE/MFE all reuse the existing machinery
+    # unchanged. No-op unless a leg opts in ⇒ OFF path stays byte-identical.
+    # Runs after the spot-MOVE loop (so both triggers merge) and before ARL (so a
+    # follower leg inherits these boundaries too).
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        _vs = leg.get("vs_strike_adjustment") or {}
+        if not bool(_vs.get("enabled")):
+            continue
+        _dir = str(_vs.get("direction") or "above").lower()
+        if _dir not in ("above", "below"):
+            continue
+        _margin_pct = _maybe_float(_vs.get("margin_pct")) or 0.0
+        _leg_index = str(leg.get("index") or index).upper()
+        _vs_sbd = _leg_spot_map(_leg_index)
+        _vs_interval = _maybe_float(leg.get("strike_interval")) or _STRIKE_INTERVALS.get(_leg_index, 50.0)
+        _leg_xdte = int(leg.get("exit_dte") or 0)
+        _roll_dates = set()
+        for _exp in (leg.get("_rollover_expiries") or []):
+            _rd = _trading_day_n_before(str(_exp), _leg_xdte, td_sorted)
+            if _rd:
+                _roll_dates.add(_rd)
+        _sorted_exps = sorted(str(e) for e in (leg.get("_rollover_expiries") or []))
+
+        def _active_expiry(_d: str) -> Optional[str]:
+            for _e in _sorted_exps:
+                if _e >= _d:
+                    return _e
+            return _sorted_exps[-1] if _sorted_exps else None
+
+        def _seg_strike(_d: str, _spot: float) -> Optional[float]:
+            # Strike THIS leg would trade if it (re-)entered on day _d — universal
+            # across ATM/ITM/OTM/pct/premium via the shared resolver.
+            return _compute_strike_for_leg_python(
+                leg, _spot, _vs_interval,
+                entry_date=_d, expiry=_active_expiry(_d), index=_leg_index,
+            )
+
+        _vs_breaches: List[str] = []
+        _cur_strike: Optional[float] = None
+        for d in td_sorted:
+            if d < from_date or d > to_date:
+                continue
+            spot = _vs_sbd.get(d)
+            if spot is None:
+                continue
+            # Segment (re-)entry — first day, own roll, filter-segment open, or a
+            # still-unresolved strike (premium mode, missing data): (re)pick the
+            # strike and don't fire the entry day itself (spec: scan starts the day
+            # AFTER entry). Retries next day if the strike is still None.
+            if _cur_strike is None or d in _roll_dates or d in _seg_start_resets:
+                _cur_strike = _seg_strike(d, spot)
+                continue
+            if _vs_strike_fires(spot, _cur_strike, _dir, _margin_pct):
+                _vs_breaches.append(d)
+                # Re-enter fresh at this day's spot; re-arm level against new strike.
+                _cur_strike = _seg_strike(d, spot)
+        if _vs_breaches:
+            _own = leg.get("_spot_adj_breaches") or []
+            leg["_spot_adj_breaches"] = sorted(set(map(str, _own)) | set(map(str, _vs_breaches)))
+            # ponytail: vs-strike breaches reuse the SPOT_ADJ_* exit tag (they ARE
+            # spot-driven). Add a distinct STRIKE_CROSS tag if the sheet needs to
+            # tell the two triggers apart.
+            if leg.get("_spot_adj_direction") is None:
+                leg["_spot_adj_direction"] = "both"
+
     # ── ADJUSTMENT RELATIVE TO LEG (opt-in per leg) ─────────────────────────────
     # A leg can inherit its reference leg's adjustment dates — "also adjust
     # whenever the reference leg adjusts". Runs after every leg's own breaches are
@@ -1599,6 +1830,41 @@ def _apply_adjustment_relative_to_leg(legs: List[Dict[str, Any]]) -> None:
             leg["_spot_adj_direction"] = ref_leg.get("_spot_adj_direction") or "both"
         if leg.get("_spot_adj_pct") is None:
             leg["_spot_adj_pct"] = ref_leg.get("_spot_adj_pct") or 0.0
+
+
+def _expand_breach_set_with_rel(brset: Set[int], legs: List[Dict[str, Any]]) -> Set[int]:
+    """ADJUSTMENT RELATIVE TO LEG on the NON-per-leg-rollover spot-adj cascade.
+
+    Given the set of 1-based leg ids that breached on a trade's cut date (the legs
+    that re-strike; the rest hold), add any leg whose ``adjustment_relative_to_leg``
+    references a leg already in the set — so it ALSO re-strikes ("follows the
+    reference leg"). Transitive (a follower of a follower) via fixpoint. Returns the
+    same set unchanged when no leg opts in ⇒ every existing run stays byte-identical.
+
+    This is the normal-rollover twin of the ``_spot_adj_breaches`` inheritance
+    ``_apply_adjustment_relative_to_leg`` does for the per-leg-rollover path.
+    """
+    out = set(brset)
+    changed = True
+    while changed:
+        changed = False
+        for i, lg in enumerate(legs or []):
+            if not isinstance(lg, dict):
+                continue
+            lid = i + 1
+            if lid in out:
+                continue
+            rel = lg.get("adjustment_relative_to_leg") or {}
+            if not rel.get("enabled"):
+                continue
+            try:
+                ref = int(rel.get("ref_leg") or 0)
+            except (TypeError, ValueError):
+                ref = 0
+            if ref in out:
+                out.add(lid)
+                changed = True
+    return out
 
 
 def _apply_per_leg_qty(payload: Dict[str, Any]) -> None:
@@ -5109,6 +5375,11 @@ def priced_to_tradesheet_records(
                                 _cause = "strike not listed"
                             elif _st == "zero_contracts":
                                 _cause = "zero turnover"
+                            elif _st == "tradeable":
+                                # Requested strike WAS liquid — the move is a
+                                # delta re-pick to the closest-actual-delta strike,
+                                # not a liquidity shift. Never call it zero turnover.
+                                _cause = "delta re-pick"
                     except Exception:
                         pass
                     _atm_f = (round(entry_spot / _intvl) * _intvl) if entry_spot else _act_f
@@ -5562,8 +5833,16 @@ def _relprem_cycle_window(longer_expiry_iso: Any, longer_type: Any,
     elif "MONTH" in lt:
         ws = _d(d.year, d.month, 1)
         we = _d(d.year + d.month // 12, d.month % 12 + 1, 1) - timedelta(days=1)
+    elif "WEEK" in lt:
+        # A weekly "longer" leg's cycle IS that one week → exactly ONE weekly
+        # expiry falls in it → N=1 (÷ weeks-to-expiry = ÷1: the child collects the
+        # ref premium once). Previously `return 0`, which tripped the caller's
+        # `if n <= 0: continue` and silently DROPPED a weekly-ref rel_leg_premium
+        # leg on every cycle (the whole strategy ran CE-only). Universal: any
+        # index, filter on/off, backtest+optim — same single chokepoint.
+        return 1
     else:
-        return 0  # a weekly "longer" leg spans no multi-cycle window
+        return 0  # unknown cadence — genuinely unresolvable; caller skips
     st = str(shorter_type or "").upper()
     cadence = "monthly" if "MONTH" in st else ("yearly" if "YEAR" in st else "weekly")
     key = (str(index).upper(), cadence, ws.isoformat(), we.isoformat())
@@ -5574,12 +5853,13 @@ def _relprem_cycle_window(longer_expiry_iso: Any, longer_type: Any,
             # NOT a list — `df or []` raises "truth value ambiguous" and iterating
             # a DataFrame yields column names, so both must be avoided.
             _edf = get_expiry_dates(str(index).upper(), cadence, ws.isoformat(), we.isoformat())
-            exps = (
-                _edf["Current Expiry"].tolist()
-                if (_edf is not None and hasattr(_edf, "empty")
-                    and not _edf.empty and "Current Expiry" in _edf.columns)
-                else []
-            )
+            if _edf is None:
+                exps = []
+            elif hasattr(_edf, "empty"):          # pandas DataFrame (production path)
+                exps = (_edf["Current Expiry"].tolist()
+                        if (not _edf.empty and "Current Expiry" in _edf.columns) else [])
+            else:                                  # plain list/iterable of dates (test stubs)
+                exps = list(_edf)
         except Exception:
             exps = []
         cnt = 0
@@ -5592,6 +5872,30 @@ def _relprem_cycle_window(longer_expiry_iso: Any, longer_type: Any,
                 cnt += 1
         _RELPREM_WINDOW_CACHE[key] = cnt
     return _RELPREM_WINDOW_CACHE[key]
+
+
+def _relprem_weeks_remaining(entry_iso: Any, longer_expiry_iso: Any,
+                             shorter_type: Any) -> float:
+    """Divisor N = shorter-cadence periods REMAINING from the child's ENTRY to the
+    longer leg's expiry — the "÷ weeks to expiry" rule (the previous-code behavior).
+
+    Entry-date DEPENDENT: N shrinks as expiry nears — a yearly ref on 30-Sep with a
+    26-Dec expiry gives ~12 (weeks left), NOT 52 (the full-cycle count). So the child
+    sizes off the premium spread over the life ACTUALLY remaining, never a fixed
+    52/4. Used everywhere (both passes, every cadence) — one rule, no conflict.
+    """
+    from datetime import date as _d
+    try:
+        e = _d.fromisoformat(str(entry_iso)[:10])
+        x = _d.fromisoformat(str(longer_expiry_iso)[:10])
+    except (ValueError, TypeError):
+        return 0.0
+    days = (x - e).days
+    if days <= 0:
+        return 0.0
+    st = str(shorter_type or "").upper()
+    cad = 365.0 if "YEAR" in st else (30.4 if "MONTH" in st else 7.0)
+    return max(1.0, days / cad)
 
 
 def _relprem_legs(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
@@ -5712,6 +6016,27 @@ def _apply_rel_leg_premium_to_specs(
     for s in specs:
         by_trade.setdefault(s.get("trade_id"), {})[int(s.get("leg_id") or 0)] = s
 
+    # COLLAPSED-REF LOOKUP: when the ref leg is locked/collapsed it spans several
+    # child weeks as ONE row, so the child's weekly trade_id won't contain it.
+    # Index every leg's specs so a child can find the ref contract COVERING its
+    # entry date. Empty-effect on aligned (same-trade) legs — they hit by_trade first.
+    ref_by_leg: Dict[int, list] = {}
+    for s in specs:
+        ref_by_leg.setdefault(int(s.get("leg_id") or 0), []).append(s)
+
+    # LOCKED REFERENCE: earliest entry_date each (leg, strike, expiry) CONTRACT was
+    # first opened — the date its premium was "locked in". A *_locked child reads the
+    # ref's premium/TV at the CONTRACT's entry (constant all cycle), not at its own
+    # weekly entry (which drifts MTM). Re-locks when the ref re-strikes or rolls (new
+    # strike/expiry ⇒ new key). Works with a weekly-sliced ref (no collapse needed).
+    ref_lock_entry: Dict[tuple, str] = {}
+    for s in specs:
+        _k = (int(s.get("leg_id") or 0), round(float(s.get("strike") or 0.0), 2),
+              _normalize_iso(str(s.get("expiry") or "")))
+        _e = _normalize_iso(str(s.get("entry_date") or ""))
+        if _e and (_k not in ref_lock_entry or _e < ref_lock_entry[_k]):
+            ref_lock_entry[_k] = _e
+
     out: List[Dict[str, Any]] = []
     for s in specs:
         child_id = int(s.get("leg_id") or 0)
@@ -5723,9 +6048,20 @@ def _apply_rel_leg_premium_to_specs(
         ref_id = int(sel.get("ref_leg") or 0)
         ref_spec = by_trade.get(s.get("trade_id"), {}).get(ref_id)
         if ref_spec is None:
-            # Ref leg never resolved for this cycle -> drop just this leg, the
-            # same thing rel_leg does on a missing parent.
-            continue
+            # Ref leg not in THIS child's trade — the ref is locked/collapsed and
+            # spans this child's week as one row. Find the ref contract whose
+            # [entry, exit] window covers the child's entry date so the child still
+            # sizes off the held ref (instead of dropping, which starved the PE on
+            # every non-roll week under per-leg rollover).
+            _ce = _normalize_iso(str(s.get("entry_date") or ""))
+            for _rs in ref_by_leg.get(ref_id, []):
+                _re = _normalize_iso(str(_rs.get("entry_date") or ""))
+                _rx = _normalize_iso(str(_rs.get("exit_date") or ""))
+                if _re and _rx and _re <= _ce < _rx:
+                    ref_spec = _rs
+                    break
+            if ref_spec is None:
+                continue
 
         child_leg = legs[child_id - 1] if 0 <= child_id - 1 < len(legs) else {}
         ref_leg = legs[ref_id - 1] if 0 <= ref_id - 1 < len(legs) else {}
@@ -5753,10 +6089,24 @@ def _apply_rel_leg_premium_to_specs(
         # so the initial child strike is sensible for the cascade's date pass.
         ref_strike = float(ref_spec.get("strike") or 0.0)
         ref_type = str(ref_spec.get("option_type") or "").upper()
+        # LOCKED vs MTM reference date. `*_locked` modes read the ref at the ref
+        # CONTRACT's own entry (premium locked in at open, constant all cycle);
+        # plain modes read at the child's weekly entry (marks to market, drifts).
+        _mode = str(sel.get("rel_ref_mode") or "premium").lower()
+        _locked = _mode.endswith("_locked")
+        # LOCKED: read the ref at the ref CONTRACT's first entry (premium locked in
+        # at open, constant all cycle), re-locking only when the ref re-strikes/rolls.
+        # Constant per cycle → child target is one value per cycle ("100 ÷ N = 25 all
+        # month"). MTM mode reads at the child's weekly entry, which drifts.
+        _prem_date = entry_iso
+        if _locked:
+            _lk = ref_lock_entry.get((ref_id, round(ref_strike, 2), ref_expiry))
+            if _lk:
+                _prem_date = _lk
         ref_prem = None
         try:
             ref_prem = algotest_native.get_option_price(
-                entry_iso, index_up, ref_strike, ref_type, ref_expiry,
+                _prem_date, index_up, ref_strike, ref_type, ref_expiry,
             )
         except Exception:
             ref_prem = None
@@ -5773,7 +6123,7 @@ def _apply_rel_leg_premium_to_specs(
         else:
             longer_exp = child_expiry
             longer_type, shorter_type = child_leg.get("expiry"), ref_leg.get("expiry")
-        n = _relprem_cycle_window(longer_exp, longer_type, shorter_type, index_up)
+        n = _relprem_weeks_remaining(entry_iso, longer_exp, shorter_type)
         if n <= 0:
             continue
         time_scale = (1.0 / n) if ref_expiry >= child_expiry else n
@@ -5795,12 +6145,14 @@ def _apply_rel_leg_premium_to_specs(
 
         # TV mode: strip ref leg's intrinsic before dividing.
         # For OTM/ATM ref legs intrinsic=0 so TV==premium — identical result.
-        _use_tv = str(sel.get("rel_ref_mode") or "premium").lower() == "tv"
+        _use_tv = _mode.startswith("tv")
         ref_base = float(ref_prem)
         if _use_tv:
             _ref_is_ce = ref_type in ("CE", "CALL", "C")
             try:
-                _ref_spot = float(algotest_native.get_spot_price(entry_iso, index_up) or 0.0)
+                # intrinsic at the SAME date the premium was read (locked or MTM),
+                # so TV = premium − intrinsic is a consistent single snapshot.
+                _ref_spot = float(algotest_native.get_spot_price(_prem_date, index_up) or 0.0)
             except Exception:
                 _ref_spot = 0.0
             if _ref_spot > 0:
@@ -6028,16 +6380,16 @@ def _apply_relprem_from_adjusted(
             out.append(s)
             continue
 
-        # Divisor N = shorter-cadence expiries in the longer contract's own
-        # calendar cycle (month/year), entry-date independent — same rule as the
-        # initial pass, see _relprem_cycle_window.
+        # Divisor N = shorter-cadence periods REMAINING from the child's entry to
+        # the longer leg's expiry ("÷ weeks to expiry"). Entry-date dependent —
+        # same rule as the initial pass, see _relprem_weeks_remaining.
         if ref_expiry >= child_expiry:
             longer_exp = ref_expiry
             longer_type, shorter_type = ref_leg.get("expiry"), child_leg.get("expiry")
         else:
             longer_exp = child_expiry
             longer_type, shorter_type = child_leg.get("expiry"), ref_leg.get("expiry")
-        weeks = _relprem_cycle_window(longer_exp, longer_type, shorter_type, index_up)
+        weeks = _relprem_weeks_remaining(entry_iso, longer_exp, shorter_type)
         if weeks <= 0:
             out.append(s)
             continue
@@ -7581,6 +7933,11 @@ def run_rust_engine_pipeline(
         # the strategy cadence so the label matches the contract actually traded.
         if _exp == "YEARLY" and str(payload.get("expiry_type") or "").upper() != "YEARLY":
             _exp = str(payload.get("expiry_type") or "").upper()
+        # QUARTERLY normalizes to YEARLY internally (same pinned-contract path);
+        # surface the real basis so the Exit Reason reads "Quarterly", not "Yearly".
+        # Per-leg hint wins (mixed baskets); strategy hint covers a pure quarterly run.
+        if _exp == "YEARLY" and ((_s or {}).get("_quarterly") or payload.get("_quarterly")):
+            _exp = "QUARTERLY"
         _bits = [
             str((_s or {}).get("option_type") or "").upper(),
             _exp.title(),
@@ -8513,6 +8870,9 @@ def run_rust_engine_pipeline(
                     )
                     _brset = {int(_s[3:]) for _s in _reason_srcs if _s.startswith("LEG")}
                     if _brset:
+                        # ADJUSTMENT RELATIVE TO LEG: a leg following any breaching
+                        # leg re-strikes with it (else it holds its old strike).
+                        _brset = _expand_breach_set_with_rel(_brset, legs_src)
                         spot_adj_breach_leg_set[trade_id] = _brset
 
     # Slice 5: Overall SL / Target detection.
@@ -8657,7 +9017,10 @@ def run_rust_engine_pipeline(
             if spot_adj_clamp and spot_adj_clamp < overall_cycle_exit:
                 overall_cycle_exit = spot_adj_clamp
             try:
-                result = algotest_native.check_overall_stop_loss_target(
+                # Native check_overall_stop_loss_target's internal price store is
+                # unpopulated on the EOD engine_rust path, so it never fired. Use the
+                # Python re-implementation that reads the lookups this path has.
+                result = _check_overall_sl_target_py(
                     _normalize_iso(first_leg["entry_date"]),
                     overall_cycle_exit,
                     _normalize_iso(first_leg["expiry"]),
@@ -8670,15 +9033,15 @@ def run_rust_engine_pipeline(
                     overall_sl_type_norm,
                     overall_target_type_norm,
                     slippage,
+                    spot_by_date,
                 )
             except Exception as exc:
                 logger.warning("[ENGINE_RUST] Overall SL check failed for trade %s: %s", trade_id, exc)
                 continue
-            if isinstance(result, dict):
-                trig_date = result.get("exit_date")
-                if trig_date:
-                    overall_overrides[trade_id] = _normalize_iso(trig_date)
-                    overall_reasons[trade_id] = str(result.get("exit_reason") or "OVERALL_SL").upper()
+            if result:
+                trig_date, trig_reason = result
+                overall_overrides[trade_id] = _normalize_iso(trig_date)
+                overall_reasons[trade_id] = str(trig_reason or "OVERALL_SL").upper()
 
     # ── Fix 4: re-anchor fixed-strike strikes BEFORE SL-with-Buffer detection ──
     # The SL-with-Buffer pre-pass (Slice 4b above) and the re-entry synthesis
@@ -11007,17 +11370,41 @@ def run_rust_engine_pipeline(
         by_trade.keys(),
         key=lambda tid: by_trade[tid][0]["entry_date"],
     )
+    # Overlap prevention historically dropped any trade whose scheduled entry
+    # falls before the previous trade's ACTUAL (possibly early SL/Target/Trail)
+    # exit — serialising the book. But TP / SL / Trail / SL-buffer / overall are
+    # EXIT controls: they change WHEN a trade exits, never WHICH expiries are
+    # entered. With NO risk control the pipeline returns every scheduled expiry
+    # (overlapping monthly positions are normal), so a pure exit-control run MUST
+    # trade the identical expiry set — otherwise selecting a Target/SL silently
+    # deletes cadence entries. That was the bug: a monthly T-45/T-21 book traded
+    # 89 expiries with no risk control but only 64 once TP/SL was added, because
+    # an early SL exit pulled `trade_actual_exit` in and this filter then dropped
+    # the next expiry whose entry preceded it (user report 2026-08-26: "when
+    # SL/TP is selected it skips an expiry").
+    #
+    # Only RE-ENTRY and SPOT-ADJUSTMENT actually SYNTHESISE extra overlapping
+    # trades (a re-entry on the SL day, a spot-adj mini-trade) that must be
+    # serialised against their parent — so gate the drop to exactly those cases.
+    # Every other risk control keeps the full DTE schedule, identical to a
+    # no-risk run. NOTE: this deliberately deviates from the old Python engine
+    # (generic_algotest_engine.py:3680), which serialised unconditionally; the
+    # live Rust no-risk path already does not serialise, and matching it is the
+    # intended behaviour.
+    _overlap_prevention = (
+        bool(reentry_specs) or bool(_bt_bridge_specs) or bool(_sa_leg_reentry_specs)
+        or has_spot_adj or has_midcap_spot_adj or has_midcp_spot_adj
+        or _has_leg_spot_adj_early
+    )
     kept_trades: set = set()
     prev_exit: Optional[str] = None
     for tid in trade_ids_sorted:
         entry_date = by_trade[tid][0]["entry_date"]
-        if prev_exit is not None and entry_date < prev_exit:
-            # Strict overlap (entry before prev ACTUAL exit). Same-day
-            # chaining (entry == prev_exit) is allowed — mirrors Python's
-            # `entry_ts < _dte_last_exit` at generic_algotest_engine.py:4016.
-            # Use actual exit (post SL/SLB/SpotAdj) not scheduled expiry so
-            # a re-entry on the SL day is never incorrectly dropped because
-            # the parent's scheduled expiry is still in the future.
+        if _overlap_prevention and prev_exit is not None and entry_date < prev_exit:
+            # Strict overlap (entry before prev ACTUAL exit). Same-day chaining
+            # (entry == prev_exit) is allowed. Only reached for re-entry /
+            # spot-adjustment strategies (see gate above) — pure TP/SL keeps
+            # every scheduled expiry.
             continue
         kept_trades.add(tid)
         prev_exit = trade_actual_exit[tid]

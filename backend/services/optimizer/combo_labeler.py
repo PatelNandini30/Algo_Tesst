@@ -363,10 +363,13 @@ def _expiry_label(payload: Dict[str, Any]) -> str:
     # fall-through below mislabelled it "Monthly". Surface it (with the roll
     # cadence) instead.
     if str(payload.get("expiry_type") or "").upper() == "YEARLY":
+        # QUARTERLY normalizes to YEARLY (pinned Mar/Jun/Sep/Dec) but carries a
+        # _quarterly hint so the label reads "Quarterly" rather than "Yearly".
+        base = "Quarterly" if payload.get("_quarterly") else "Yearly"
         cadence = str(payload.get("rollover_cadence") or "").lower()
         if cadence in ("weekly", "monthly"):
-            return "Yearly_" + cadence[:1].upper() + cadence[1:]
-        return "Yearly"
+            return base + "_" + cadence[:1].upper() + cadence[1:]
+        return base
     legs = payload.get("legs") or []
     leg_expiries = {
         (leg.get("expiry") or "").lower()
@@ -814,7 +817,42 @@ def label_combo(payload: Dict[str, Any]) -> Dict[str, str]:
         # "(strategy)" distinguishes "inherits the payload-level knob" from "none",
         # which the packed column cannot express.
         _adj_val = _own if _own else ("(strategy)" if _has_global_adj else "-")
-        leg_cols.append({"hdr": _hdr, "hdr_stable": _hdr_stable, "strike": _strike, "adj": _adj_val})
+        # Per-leg RISK controls (Target / Stop Loss / SL-with-Buffer / Trail /
+        # Re-entry on Target / Re-entry on SL). These are swept axes too, but the
+        # summary only ever exposed strike + spot-adj, so a TP/SL/RoT sweep showed
+        # NO column telling which combo used which value. Captured here as readable
+        # display values; summary_workbook emits a column only when a leg actually
+        # carries the control (so no-risk sweeps are unchanged). Filename tokens
+        # (_on_toggle_tokens) are unaffected.
+        def _amt(_d):
+            try:
+                _v = float((_d or {}).get("value") or 0)
+            except (TypeError, ValueError):
+                return "-"
+            return f"{_fmt_num(_v)}{_unit_of((_d or {}).get('mode'))}" if _v > 0 else "-"
+        def _reentry(_d):
+            _d = _d or {}
+            try:
+                _c = float(_d.get("count") or 0)
+            except (TypeError, ValueError):
+                return "-"
+            return f"{_fmt_num(_c)} {_reentry_mode(_d.get('mode'))}" if _c > 0 else "-"
+        _trail = _leg.get("trailSL") or {}
+        try:
+            _trail_on = float(_trail.get("trigger") or 0) > 0 or float(_trail.get("move") or 0) > 0
+        except (TypeError, ValueError):
+            _trail_on = False
+        _ts_val = (f"{_fmt_num(_trail.get('trigger'))}/{_fmt_num(_trail.get('move'))}"
+                   f"{_unit_of(_trail.get('mode'))}") if _trail_on else "-"
+        leg_cols.append({
+            "hdr": _hdr, "hdr_stable": _hdr_stable, "strike": _strike, "adj": _adj_val,
+            "tp": _amt(_leg.get("targetProfit")),
+            "sl": _amt(_leg.get("stopLoss")),
+            "slb": _amt(_leg.get("slWithBuffer")),
+            "ts": _ts_val,
+            "rot": _reentry(_leg.get("reEntryOnTarget")),
+            "ros": _reentry(_leg.get("reEntryOnSL")),
+        })
 
     # Strategy-wide adjustments live in their own column, NOT in a leg block —
     # they apply to every leg, so numbering them would be a lie.

@@ -1960,12 +1960,6 @@ fn resolve_per_leg_core(
     // rolls on its own schedule, so both maps are keyed by leg_id).
     let mut epoch_strike: HashMap<i64, f64> = HashMap::new();
     let mut prev_own_entry: HashMap<i64, String> = HashMap::new();
-    // PER-LEG LOCKED MTM: index in `out` of each leg's currently-open row. A leg
-    // mid-hold while ANOTHER leg rolls does NOT open a fresh slice — it carries its
-    // ONE position and just extends that row's exit (marked-to-market across the
-    // foreign boundary). It re-books (a new row) only on its OWN event: own roll,
-    // spot-adj breach, or filter seg start.
-    let mut open_spec: HashMap<i64, usize> = HashMap::new();
 
     'row: for (trade_id, entry_date, exit_date, slots) in &schedule {
         let entry_spot = match spot_by_date.get(entry_date) {
@@ -1978,31 +1972,10 @@ fn resolve_per_leg_core(
         }
         let mut buf: Vec<TradeSpec> = Vec::with_capacity(cfg.legs.len());
         let mut resolved: HashMap<i64, f64> = HashMap::with_capacity(cfg.legs.len());
-        // Open rows to extend once this row commits — deferred so a `continue 'row`
-        // on a later leg leaves earlier legs' rows untouched (atomic per row).
-        let mut carry_extends: Vec<usize> = Vec::new();
         for (leg_idx, leg) in cfg.legs.iter().enumerate() {
             let leg_id = (leg_idx + 1) as i64;
             let slot = &slots[leg_idx];
             let leg_expiry = &slot.contract;
-
-            // LOCKED-MTM CARRY: this row is NOT one of this leg's own events and the
-            // leg already holds an open row ⇒ it stays that single position. Reuse the
-            // epoch strike for rel-leg references, mark its open row to extend to this
-            // window's exit, and emit NO new slice. First appearance (no open row yet)
-            // falls through to open one. Own-event rows (own_boundary / breach / seg
-            // start) always re-book below — so single-leg == normal is unchanged: a
-            // lone leg owns every boundary and never takes this carry path.
-            let leg_event = slot.own_boundary || slot.breach_spot_adj || slot.seg_start_entry;
-            if !leg_event {
-                if let Some(&idx) = open_spec.get(&leg_id) {
-                    if let Some(&s) = epoch_strike.get(&leg_id) {
-                        resolved.insert(leg_id, s);
-                    }
-                    carry_extends.push(idx);
-                    continue;
-                }
-            }
 
             // Roll (own boundary) ⇒ epoch rule decides Fresh vs carry.
             // Carry (foreign boundary, i.e. a row created because ANOTHER leg
@@ -2070,17 +2043,7 @@ fn resolve_per_leg_core(
                 slippage_pct: cfg.slippage_pct,
             });
         }
-        // Row commits: append the new slices, record each as its leg's open row,
-        // then extend carried legs' open rows to this window's exit (locked-MTM: one
-        // position marked-to-market across the foreign boundary, not re-booked).
-        let base = out.len();
         out.extend(buf);
-        for i in base..out.len() {
-            open_spec.insert(out[i].leg_id, i);
-        }
-        for idx in carry_extends {
-            out[idx].exit_date = exit_date.clone();
-        }
         // Advance the OWN-entry anchor only for legs that rolled this row, and
         // only for a trade that actually emitted (a `continue 'row` skips this).
         for (leg_idx, slot) in slots.iter().enumerate() {
@@ -3325,109 +3288,6 @@ mod rollover_schedule_tests {
         // dropped 01-Mar → 28-Mar front-month stub.
         assert_eq!((per_leg[0].1.as_str(), per_leg[0].2.as_str()), ("2019-03-28", "2019-04-25"));
         assert_eq!(per_leg[0].3[0].contract, "2019-04-25");
-    }
-
-    /// PER-LEG LOCKED MTM (money path): a carried leg is ONE position across a
-    /// foreign boundary, NOT a fresh weekly slice. Leg 1 = monthly (locked, own
-    /// roll 17-Feb / 17-Mar), Leg 2 = weekly. The monthly leg must emit a SINGLE
-    /// spec spanning 17-Feb→17-Mar even though the weekly leg rolls 4× underneath
-    /// it — mirrors the agreed July CE-18800 mock (one row, not weekly slices).
-    #[test]
-    fn per_leg_locked_leg_spans_foreign_boundaries() {
-        let td = weekdays_feb_mar_2026();
-        let weekly: Vec<String> = [
-            "2026-02-05", "2026-02-12", "2026-02-19", "2026-02-26",
-            "2026-03-05", "2026-03-12", "2026-03-19", "2026-03-26",
-        ].iter().map(|s| s.to_string()).collect();
-        let monthly: Vec<String> =
-            ["2026-02-26", "2026-03-26"].iter().map(|s| s.to_string()).collect();
-        // Both ATM SELL, Fresh mode (re-strike on own roll ⇒ never hits the carried
-        // re-validation path, so no external listing data is needed in-test).
-        let mk = |ot: &str| LegCfg {
-            option_type: ot.to_string(),
-            position: "SELL".to_string(),
-            lots: 1,
-            strike_interval: 100.0,
-            strike: StrikeSel::Fixed("ATM".to_string()),
-            straddle_use_joint: false,
-            rollover_strike_mode: StrikeMode::Fresh,
-            is_yearly: false,
-            yearly_schedule: Vec::new(),
-        };
-        let cfg = ResolveCfg {
-            legs: vec![mk("CE"), mk("PE")],
-            index: "NIFTY".to_string(),
-            entry_dte: 0,
-            exit_dte: 0,
-            calendar_days: false,
-            slippage_pct: 0.0,
-            strike_shift_max: 0,
-            rollover_active: true,
-            rollover_min_days: 0,
-            lot_size: 65,
-            yearly_cycles: None,
-            per_leg_rollover: true,
-            leg_rollover_expiries: vec![monthly, weekly],
-            leg_exit_dte: vec![7, 1], // monthly T-7 (locked), weekly T-1 (rolls)
-            leg_cycles: vec![None, None],
-            leg_breach_dates: vec![Vec::new(), Vec::new()],
-            seg_starts: Vec::new(),
-        };
-        let spot: HashMap<String, f64> =
-            td.iter().map(|d| (d.clone(), 25_000.0)).collect();
-
-        // Seed the shared market cache so ATM (25 000) validates as tradeable for
-        // every boundary date × contract. No other test reads CACHE, so this is
-        // isolated; cleared at the end of the test regardless.
-        {
-            let mut mc = crate::MarketCache::default();
-            let sym: u16 = 0;
-            mc.symbol_ids.insert("NIFTY".to_string(), sym);
-            let sk = crate::to_i64_strike(25_000.0);
-            let all_exp: Vec<&String> = cfg.leg_rollover_expiries.iter().flatten().collect();
-            for d in &td {
-                let dd = crate::date_str_to_days(d).unwrap();
-                for exp in &all_exp {
-                    let ed = crate::date_str_to_days(exp).unwrap();
-                    for ot in ["CE", "PE"] {
-                        mc.options.insert((dd, sym, sk, crate::opt_type_to_id(ot), ed), 100.0);
-                    }
-                }
-            }
-            *crate::CACHE.write().unwrap() = Some(mc);
-        }
-
-        let specs = resolve_per_leg_core(&cfg, &td, &spot);
-
-        let leg1: Vec<_> = specs.iter().filter(|s| s.leg_id == 1).collect();
-        let leg2: Vec<_> = specs.iter().filter(|s| s.leg_id == 2).collect();
-
-        // The locked monthly leg holds ONE position across its whole cycle: a spec
-        // ENTERING on its own roll (17-Feb) and carried across every weekly boundary
-        // (25-Feb / 04-Mar / 11-Mar) to the tail of its contract (18-Mar) — one row,
-        // not four weekly slices.
-        assert!(
-            leg1.iter().any(|s| s.entry_date == "2026-02-17" && s.exit_date == "2026-03-18"),
-            "monthly leg must span 17-Feb→18-Mar as ONE row, got {:?}",
-            leg1.iter().map(|s| (s.entry_date.as_str(), s.exit_date.as_str())).collect::<Vec<_>>()
-        );
-        // It must NOT re-book on a pure weekly (foreign) boundary.
-        for s in &leg1 {
-            assert!(
-                !["2026-02-25", "2026-03-04", "2026-03-11"].contains(&s.entry_date.as_str()),
-                "locked leg wrongly re-booked on a foreign weekly boundary: {}",
-                s.entry_date
-            );
-        }
-        // The weekly leg still rolls every week ⇒ strictly more rows than the locked leg.
-        assert!(
-            leg2.len() > leg1.len(),
-            "weekly leg should have more rows ({}) than locked monthly ({})",
-            leg2.len(),
-            leg1.len()
-        );
-
-        *crate::CACHE.write().unwrap() = None; // don't leak seeded cache to other tests
     }
 
     /// REGRESSION (money path): the long-form strike token that `extract_strike_sel`

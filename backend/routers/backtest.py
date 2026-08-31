@@ -827,7 +827,14 @@ async def download_backtest_tradesheet_xlsx(request: Request):
             df[_c] = pd.to_numeric(df[_c], errors="coerce")
 
     midcap_legs = body.get("midcap_legs") or None
-    logging.warning("[DL_DEBUG] midcap_legs received: %s", midcap_legs)
+    # CAPITAL SIZING auto-heal (shared with the live /midcap-overlay endpoint):
+    # ensure each Midcap leg carries capital_alloc_pct + capital_total so Midcap
+    # Qty / P&L% / Combined P&L% compute. See heal_midcap_capital_legs.
+    try:
+        from services.optimizer.excel_builder import heal_midcap_capital_legs
+        midcap_legs = heal_midcap_capital_legs(midcap_legs, trades)
+    except Exception as _he:
+        logging.warning("midcap capital heal skipped: %s", _he)
     midcap_sa   = body.get("midcap_spot_adjustment") or None
     midcap_sym  = (
         (midcap_legs[0].get("symbol") if (midcap_legs and isinstance(midcap_legs[0], dict)) else None)
@@ -854,9 +861,10 @@ async def download_backtest_tradesheet_xlsx(request: Request):
             midcap_symbol=midcap_sym, filter_segments=filter_segments,
             patchwise=patchwise, force_patch_wise=True,
             rules_sheet=rules_sheet,
-            # YEARLY: every trade shares one December Expiry, so WOW keys on
-            # Exit Date rather than collapsing the whole year into ISO week 52.
-            yearly=str(body.get("expiry_type") or "").upper() == "YEARLY",
+            # YEARLY/QUARTERLY: every trade shares one long-dated Expiry, so WOW
+            # keys on Exit Date rather than collapsing into an ISO week. QUARTERLY
+            # is the same pinned-contract shape (Mar/Jun/Sep/Dec) → same handling.
+            yearly=str(body.get("expiry_type") or "").upper() in ("YEARLY", "QUARTERLY"),
         )
 
     # Default (thread) executor: a single workbook build is light, and a local
@@ -1097,7 +1105,12 @@ def midcap_overlay(request: dict):
         # and expose "Midcap Qty" — the SAME function the optimizer uses, so a
         # backtest and its optim combo size identically. No-op unless configured.
         try:
-            from services.optimizer.excel_builder import _apply_capital_weight_to_midcap
+            from services.optimizer.excel_builder import (
+                _apply_capital_weight_to_midcap, heal_midcap_capital_legs,
+            )
+            # Heal the legs the SAME way the download endpoint does, so the
+            # on-screen grid and the exported Excel size the Midcap leg identically.
+            midcap_legs = heal_midcap_capital_legs(midcap_legs, rows)
             _apply_capital_weight_to_midcap(result, rows, midcap_legs, request.get('filter_segments'))
         except Exception as _cexc:
             logging.warning("midcap capital sizing skipped: %s", _cexc)

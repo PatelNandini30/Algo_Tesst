@@ -26,19 +26,27 @@ python start_backend.py
 
 # Frontend dev
 cd frontend && npm install && npm run dev
-cd frontend && npm run build      # outputs to frontend/dist/, do NOT hand-edit
+cd frontend && npm run build      # vite outDir is frontend/build/ (NOT dist/), do NOT hand-edit
 
 # IMPORTANT: this network sits behind a SonicWALL DPI-SSL firewall that re-signs
 # TLS, so a bare `npm install`/`npm ci` fails with SELF_SIGNED_CERT_IN_CHAIN and
 # then dies with the misleading "Exit handler never called!" (NOT an OOM/HDD issue).
-# Disable strict TLS for the install. The dist is also root-owned, so build off the
-# host in a node container and copy dist back (no host sudo):
+# Disable strict TLS for the install. The output tree is also root-owned, so build
+# off the host in a node container and copy it back (no host sudo). NOTE: vite.config
+# sets outDir: 'build' and Dockerfile does `COPY build` — so the real output is
+# frontend/build/, not dist/. The stale root-owned build/ MUST be removed before the
+# build or vite chokes ("Failed to resolve …/assets/index-*.js from …/build/index.html").
+# Use a workdir NAME distinct from the output dir (/work, not /build) to avoid collision:
 #   docker run --rm -e NODE_TLS_REJECT_UNAUTHORIZED=0 -v "$PWD/frontend":/src \
 #     node:22-bookworm-slim sh -c 'npm config set strict-ssl false; \
-#       mkdir -p /build && cp -r /src/. /build/ && cd /build && rm -rf node_modules dist && \
+#       mkdir -p /work && cp -r /src/. /work/ && cd /work && rm -rf node_modules dist build && \
 #       npm install --no-audit --no-fund && npm run build && \
-#       rm -rf /src/dist && cp -r /build/dist /src/dist'
-# Then publish: docker compose up -d --build frontend  (the image just COPYs dist).
+#       rm -rf /src/build && cp -r /work/build /src/build'
+# Then publish. The nginx image bakes the bundle via `COPY build` at image-build time
+# (no volume mount), so making it permanent needs an image rebuild:
+#   docker compose up -d --build frontend      # user-authorized builds only
+# To push a bundle live WITHOUT a rebuild (survives until the container is recreated):
+#   docker cp frontend/build/. algotest-frontend:/usr/share/nginx/html/
 
 # Tests (unittest, not pytest — even though pytest is in .pytest_cache)
 python -m unittest discover backend/tests
@@ -106,7 +114,8 @@ Key implications:
 - Python: 4-space, snake_case functions/modules, PascalCase classes. No formatter or linter is wired up — match surrounding style.
 - React: PascalCase component files (`StrategyBuilder.jsx`), 2-space indent, semicolons. Helpers in lower case (`constants.js`).
 - Commit style: free-form is accepted; prefer Conventional Commits (`feat:`, `fix:`, `chore:`) when practical.
-- **Never** edit `frontend/dist/` by hand. It is generated.
+- **NEVER run ANY state-changing git command without explicit per-command permission from the user.** Read-only inspection (`git status`, `git log`, `git diff`, `git show`) is fine. Anything that stages, commits, moves, or discards state — `git add`, `git commit`, `git checkout`, `git reset`, `git restore`, `git branch`, `git rebase`, `git clean` — must be proposed first and run ONLY after the user explicitly says yes. `git stash` is BANNED outright: it has previously destroyed uncommitted work (root-owned Docker files blocked the pop → the whole working tree reverted and hours of uncommitted work were lost from disk).
+- **Never** edit `frontend/build/` by hand (vite's outDir; `dist/` is legacy/unused). It is generated.
 - **Never** raise Docker memory limits without updating the budget header in `docker-compose.yml`. The total must fit in 16 GB RAM with the ~24 GB SSD swap as headroom.
 
 ## Graphify workflow

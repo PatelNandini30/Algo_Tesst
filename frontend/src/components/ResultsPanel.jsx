@@ -116,11 +116,16 @@ const sideCode = (position) => {
   return 'S';
 };
 
+// leg.ref_leg (rel_leg / rel_leg_premium) is the target leg's stable `id`,
+// not its position — see legPositionById() in StrategyBuilder.jsx for why.
+// Translate to a 1-based position here too, for the filename token.
+const legPositionById = (allLegs, id) => (allLegs || []).findIndex(l => l.id === id) + 1;
+
 // Strike-criteria token, per FILENAME_FORMAT.md's table (initials + value).
 // Two things the spec doesn't cover, because this app has them and the doc's
 // source repo doesn't: 'rel_leg' (gap-offset Iron Condor wing) and the EOD
 // fixed-IV Delta strike mode.
-const strikeCriteriaToken = (leg) => {
+const strikeCriteriaToken = (leg, allLegs) => {
   const criteria = leg.strike_criteria || 'strike_type';
   if (criteria === 'closest_premium') return `CP${fmtNum(leg.premium_value)}`;
   if (criteria === 'premium_gte') return `Pgte${fmtNum(leg.premium_value)}`;
@@ -142,8 +147,8 @@ const strikeCriteriaToken = (leg) => {
   }
   if (criteria === 'atm_straddle_prem_pct') return `ASP${fmtNum(leg.atm_straddle_prem_pct)}pct`;
   if (criteria === 'synthetic_future') return 'SF';
-  if (criteria === 'rel_leg') return `RtL${Number(leg.ref_leg) || 1}_G${fmtNum(leg.offset)}`;
-  if (criteria === 'rel_leg_premium') return `RtL${Number(leg.ref_leg) || 1}`;
+  if (criteria === 'rel_leg') return `RtL${legPositionById(allLegs, leg.ref_leg) || 1}_G${fmtNum(leg.offset)}`;
+  if (criteria === 'rel_leg_premium') return `RtL${legPositionById(allLegs, leg.ref_leg) || 1}`;
   if (criteria === 'delta') return `D${fmtNum((Number(leg.delta_value) || 0.3) * 100)}`;
   if (criteria.startsWith('time_value')) {
     const base = criteria === 'time_value_gte' ? 'TVgte' : criteria === 'time_value_lte' ? 'TVlte' : 'TV';
@@ -241,7 +246,7 @@ const buildExcelFileName = (config) => {
     })();
     const legParts = [];
     if (idxTok) legParts.push(idxTok);
-    legParts.push(expiryAbbrev(leg.expiry), opt, sideCode(leg.position), strikeCriteriaToken(leg));
+    legParts.push(expiryAbbrev(leg.expiry), opt, sideCode(leg.position), strikeCriteriaToken(leg, config.legs));
     if (lotsToken) legParts.push(lotsToken);
     legParts.push(...onToggleTokens(leg));
     const adjTok = adjustmentToken(leg);
@@ -1230,7 +1235,7 @@ const ResultsPanel = ({ results, onClose, showCloseButton = true, filterInfo, sh
                 
                 <div className="border-b border-default pb-2">
                   <p className="font-bold text-primary mb-0.5">CAR/MDD</p>
-                  <p className="font-normal text-primary">{(Math.abs(stats.maxDDPct) > 0 ? stats.cagr / Math.abs(stats.maxDDPct) : 0).toFixed(2)}%</p>
+                  <p className="font-normal text-primary">{(Math.abs(stats.maxDDPct) > 0 ? stats.cagr / Math.abs(stats.maxDDPct) : 0).toFixed(2)}</p>
                 </div>
                 
                 <div className="border-b border-default pb-2">

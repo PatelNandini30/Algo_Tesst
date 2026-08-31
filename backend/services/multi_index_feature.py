@@ -1129,6 +1129,27 @@ def _reload_bulk_if_needed(symbol: str, from_date: str, to_date: str) -> None:
     key = (str(symbol).upper(), str(from_date), str(to_date), _dv)
     if _last_bulk_load_key == key:
         return
+    # RESIDENCY-AWARE SKIP (fixes the multi-index eviction churn): a bulk_load
+    # here goes through the Rust feather shortcut, which calls native.load_cache()
+    # — a REPLACE that evicts every OTHER resident symbol. In a fused multi-index
+    # sweep the parent already loaded BOTH symbols (MIDCPNIFTY + NIFTY) and each
+    # fork inherits them copy-on-write, but `_last_bulk_load_key` is a per-process
+    # global that the fork does NOT inherit as "loaded" — so the first
+    # NoAdjustment combo would reload the cadence index and KICK OUT the co-resident
+    # NIFTY, forcing every later adj combo to re-merge it (the per-combo
+    # "[RUST_FAST] kept existing wider feather" churn, and the intermittent
+    # "built NO specs" when a re-merge lands the cache in a bad state). If this
+    # symbol is ALREADY resident in the native cache (inherited full-range from the
+    # parent), the data is present — just record the key and return without
+    # evicting anything. A genuine data_version change still misses the key and
+    # forces a real reload below.
+    try:
+        import algotest_native as _an
+        if bool(_an.is_loaded()) and str(symbol).upper() in set(_an.cache_symbols() or []):
+            _last_bulk_load_key = key
+            return
+    except Exception:
+        pass
     try:
         _safe_clear_fast_lookup()
         bulk_clear_options()
@@ -2330,7 +2351,22 @@ def _run_sync_per_index_groups(
         sub["yearly_cycles"] = gcycles
         sub["sync_cadence_expiries"] = _bounds
         sub["sync_cadence_expiry_type"] = "weekly" if cadence == "WEEKLY" else "monthly"
-        sub["rollover_min_days_to_expiry"] = 0  # YEARLY + min-days is rejected
+        sub["rollover_min_days_to_expiry"] = 0
+        # FORCE the pinned-rollover schedule. The fused sub-run's whole design is
+        # "YEARLY-pin each leg to its own per-cycle CONTRACT while sync_cadence_expiries
+        # drives entry/exit". Rust only builds that pinned schedule when
+        # rollover_active is true (rollover_toggle AND expiry_type in WEEKLY/MONTHLY/
+        # YEARLY — see simulate.rs build_rollover_schedule_pinned gate). If
+        # rollover_toggle doesn't survive into this sub (e.g. a combo payload that
+        # didn't carry it), Rust falls to the unpinned DTE path, which IGNORES
+        # yearly_cycles and looks options up at the raw expiry_dates = the SHARED
+        # cadence (the OTHER index's expiry, e.g. NIFTY's Dec-26). MIDCPNIFTY has no
+        # option at Dec-26 (its contract is Dec-30) → "built NO specs". Proven via
+        # the [SYNC_FUSED] diagnostic (spot/ATM correct, PE@cadence-expiry=None,
+        # PE@contract-expiry=272.90). Forcing the toggle makes the pinned path
+        # deterministic so the CONTRACT is always used for the option lookup.
+        sub["rollover_toggle"] = True
+        sub["no_rollover"] = False  # YEARLY + min-days is rejected
         sub.pop("multi_index_mode", None)
         sub.pop("sync_weekly_roll", None)
 
@@ -2973,6 +3009,21 @@ def _run_sync_fused_groups(
         sub["sync_cadence_expiries"] = _bounds
         sub["sync_cadence_expiry_type"] = "weekly" if cadence == "WEEKLY" else "monthly"
         sub["rollover_min_days_to_expiry"] = 0
+        # FORCE the pinned-rollover schedule. The fused sub-run's whole design is
+        # "YEARLY-pin each leg to its own per-cycle CONTRACT while sync_cadence_expiries
+        # drives entry/exit". Rust only builds that pinned schedule when
+        # rollover_active is true (rollover_toggle AND expiry_type in WEEKLY/MONTHLY/
+        # YEARLY — see simulate.rs build_rollover_schedule_pinned gate). If
+        # rollover_toggle doesn't survive into this sub (e.g. a combo payload that
+        # didn't carry it), Rust falls to the unpinned DTE path, which IGNORES
+        # yearly_cycles and looks options up at the raw expiry_dates = the SHARED
+        # cadence (the OTHER index's expiry, e.g. NIFTY's Dec-26). MIDCPNIFTY has no
+        # option at Dec-26 (its contract is Dec-30) → "built NO specs". Proven via
+        # the [SYNC_FUSED] diagnostic (spot/ATM correct, PE@cadence-expiry=None,
+        # PE@contract-expiry=272.90). Forcing the toggle makes the pinned path
+        # deterministic so the CONTRACT is always used for the option lookup.
+        sub["rollover_toggle"] = True
+        sub["no_rollover"] = False
         sub.pop("multi_index_mode", None)
         sub.pop("sync_weekly_roll", None)
         sub.pop("multi_index_sync_fused", None)
@@ -3002,6 +3053,63 @@ def _run_sync_fused_groups(
             square_off_mode=payload.get("square_off_mode", "partial"),
             return_specs_only=True,
         )
+        if not _specs:
+            # SELF-HEAL: an empty spec list here is almost always a transient native-
+            # cache state — the fork inherited a worker whose Rust cache was left
+            # inconsistent by the idle auto-reload (the symbol's options resolve to
+            # nothing even though the feather on disk is correct and the same combo
+            # succeeds on a freshly-started worker). Force a full reload of THIS
+            # group's symbol from disk, re-merge every other group symbol so the
+            # fused run stays multi-symbol resident, and retry the spec build ONCE.
+            # Only ever runs on the failure path, so a healthy run is byte-identical.
+            try:
+                import algotest_native as _an_dbg
+                _ed0 = _expiries[0] if _expiries else None
+                _en0 = None
+                for _d in _days:
+                    if _spots.get(_d):
+                        _en0 = _d; break
+                _sp0 = _spots.get(_en0) if _en0 else None
+                _si0 = float((sub.get("legs") or [{}])[0].get("strike_interval") or 100)
+                _atm0 = (round(_sp0 / _si0) * _si0) if _sp0 else None
+                _pe = _an_dbg.get_option_price(_en0, sym, _atm0, "PE", _ed0) if (_en0 and _atm0 and _ed0) else None
+                _ce = _an_dbg.get_option_price(_en0, sym, _atm0, "CE", _ed0) if (_en0 and _atm0 and _ed0) else None
+                _cyc0 = gcycles[0] if gcycles else None
+                logger.warning(
+                    "[SYNC_FUSED] group %s built NO specs — resident=%s spots=%d entry=%s spot=%s "
+                    "atm=%s expiry0=%s cyc0=%s PE@atm=%s CE@atm=%s ss=%s — retrying once",
+                    sym, _an_dbg.cache_symbols(), len(_spots), _en0, _sp0, _atm0, _ed0, _cyc0,
+                    _pe, _ce, (sub.get("legs") or [{}])[0].get("strike_selection"),
+                )
+            except Exception as _dexc:
+                logger.warning("[SYNC_FUSED] diag failed: %s", _dexc)
+            # RETRY with this group's OWN CONTRACT dates as expiry_dates. PROVEN
+            # ROOT CAUSE: the empty spec list is the Rust spec-builder resolving the
+            # option lookup against the SHARED cadence expiry (the other index's
+            # expiry, e.g. NIFTY's Dec-26) instead of THIS group's own contract
+            # (MIDCPNIFTY's Dec-30). The option exists only at the contract expiry
+            # (verified: PE@Dec-26=None, PE@Dec-30=272.90). Nondeterministically the
+            # pinned path picks the cadence instead of the contract; forcing
+            # expiry_dates to the group's own contracts makes the lookup land on the
+            # real contract regardless of which internal path Rust takes. yearly_cycles
+            # still carries the {contract,start,end} windows so entry/exit stay pinned.
+            # Only runs on the failure path → healthy combos are byte-identical.
+            try:
+                _own_contracts = sorted({str(c.get("contract")) for c in (gcycles or []) if c.get("contract")})
+                if _own_contracts:
+                    _specs = run_rust_engine_pipeline(
+                        sub,
+                        expiry_dates=_own_contracts,
+                        trading_days=_days,
+                        lot_size=_lot,
+                        spot_by_date=_spots,
+                        square_off_mode=payload.get("square_off_mode", "partial"),
+                        return_specs_only=True,
+                    )
+            except Exception as _heal_exc:
+                logger.warning("[SYNC_FUSED] self-heal (own-contract expiries) failed for %s: %s", sym, _heal_exc)
+            if _specs:
+                logger.info("[SYNC_FUSED] group %s recovered via own-contract expiries (%d specs)", sym, len(_specs))
         if not _specs:
             raise RuntimeError(
                 "[SYNC_FUSED] group %s built NO specs despite %d valid cadence cycles."

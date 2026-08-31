@@ -53,7 +53,7 @@ USE_POSTGRESQL = os.getenv("USE_POSTGRESQL", "true").lower() == "true"
 # PostgreSQL default max_connections = 100, so pool + overflow should be <= 15
 # 7 processes × 10 connections = 70, safely under max_connections=100
 POOL_SIZE    = int(os.getenv("DB_POOL_SIZE", "5"))           # Persistent connections
-MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "5"))        # Additional connections under load
+MAX_OVERFLOW = int(os.getenv("DB_POOL_MAX_OVERFLOW", os.getenv("DB_MAX_OVERFLOW", "5")))  # compose uses DB_POOL_MAX_OVERFLOW; keep old name as fallback
 POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))     # Seconds to wait for connection
 POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))    # Recycle connections every 30 min
 STATEMENT_TIMEOUT = int(os.getenv("DB_STATEMENT_TIMEOUT", "1800000"))  # 5 min query timeout

@@ -86,8 +86,6 @@ MASTER_SUMMARY_COLUMNS: List[Dict[str, str]] = [
     {"key": "combined_pnl_pct_sum", "label": "Combined Net P&L %", "conditional": "hasMidcap"},
 ]
 
-_RATIO_FMT_KEYS = {"car_mdd", "car_mdd_live"}
-
 _HEADER_FILL = PatternFill("solid", fgColor="FF1E3A8A")
 _HEADER_FONT = Font(bold=True, color="FFFFFFFF")
 
@@ -164,6 +162,22 @@ def legwise_columns_for(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             hdr = str(lc.get("hdr") or f"L{i + 1}")
         cols.append({"key": f"__leg{i}_strike", "label": hdr})
         cols.append({"key": f"__leg{i}_adj", "label": f"L{i + 1} Adj"})
+        # Per-leg RISK controls (Target / Stop Loss / SL-Buffer / Trail /
+        # Re-entry on Target / Re-entry on SL). Emitted ONLY when at least one
+        # combo actually carries that control for this leg — a strike/adj-only
+        # sweep is byte-identical to before (no empty risk columns). Values come
+        # from combo_labeler's leg_cols; _legwise_value resolves __leg{i}_{field}
+        # generically, so no extra plumbing is needed.
+        for _fld, _lbl in (("tp", "Target"), ("sl", "Stop Loss"), ("slb", "SL Buffer"),
+                           ("ts", "Trail SL"), ("rot", "Re-Entry Tgt"), ("ros", "Re-Entry SL")):
+            _present = any(
+                str((((r.get("combo_columns") or {}).get("leg_cols") or [{}] * (i + 1))[i] or {}).get(_fld) or "").strip()
+                not in ("", "-")
+                for r in rows
+                if len(((r.get("combo_columns") or {}).get("leg_cols")) or []) > i
+            )
+            if _present:
+                cols.append({"key": f"__leg{i}_{_fld}", "label": f"L{i + 1} {_lbl}"})
     return cols
 
 
@@ -237,11 +251,8 @@ def build_summary_workbook(rows: List[Dict[str, Any]],
         row_cells = ws[ws.max_row]
         for j, cell in enumerate(row_cells):
             if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                key = data_cols[j - 1]["key"] if j > 0 else None
-                # Literal-quoted "%" (not Excel's "0.00%" format code) — the stored
-                # value is already the display number; Excel's native % format code
-                # would multiply it by 100 again, which is not wanted here.
-                cell.number_format = '0.00"%"' if key in _RATIO_FMT_KEYS else "0.00"
+                # CAR/MDD (and everything else) render as a plain ratio, not a percent.
+                cell.number_format = "0.00"
 
     for col in ws.columns:
         ws.column_dimensions[col[0].column_letter].width = 16

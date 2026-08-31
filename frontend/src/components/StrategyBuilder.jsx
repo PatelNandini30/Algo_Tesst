@@ -46,7 +46,10 @@ const INDEX_CONFIG = {
     // 'yearly' = NSE's long-dated DECEMBER contract. NIFTY-only: it has 24 such
     // contracts (2010-2030) while BANKNIFTY/MIDCPNIFTY/FINNIFTY have none, so
     // listing it here alone is what keeps it off the other indices.
-    expiryBases: ['weekly', 'monthly', 'yearly'],
+    // 'quarterly' = the same long-dated pinning as 'yearly' but rolling through
+    // Mar/Jun/Sep/Dec (4 contracts/yr) instead of December-only. NIFTY-only for
+    // the same reason yearly is: only NIFTY lists long-dated quarterly contracts.
+    expiryBases: ['weekly', 'monthly', 'yearly', 'quarterly'],
     defaultExpiryBasis: 'weekly',
     defaultOptionExpiry: 'weekly',
     strikeInterval: 50,
@@ -102,6 +105,7 @@ const EXPIRY_BASIS_LABELS = {
   weekly: 'Weekly Expiry',
   monthly: 'Monthly Expiry',
   yearly: 'Yearly Expiry (December)',
+  quarterly: 'Quarterly Expiry (Mar/Jun/Sep/Dec)',
 };
 
 const WEEKLY_OPTION_EXPIRIES = [
@@ -117,6 +121,10 @@ const WEEKLY_OPTION_EXPIRIES = [
 // December contract only to legs set to Yearly; the rest trade their cadence
 // contract. The roll cadence stays a strategy-level control (rolloverCadence).
 const YEARLY_LEG_EXPIRY = { value: 'yearly', label: 'Yearly (December)' };
+// Same additive, mixable model as YEARLY_LEG_EXPIRY but for the quarterly basis:
+// a leg set to Quarterly pins the Mar/Jun/Sep/Dec long-dated contract; other legs
+// trade their own cadence. Backend normalizes 'quarterly' -> YEARLY + 4 months.
+const QUARTERLY_LEG_EXPIRY = { value: 'quarterly', label: 'Quarterly (Mar/Jun/Sep/Dec)' };
 
 const MONTHLY_OPTION_EXPIRIES = [
   { value: 'monthly', label: 'Monthly' },
@@ -136,7 +144,10 @@ const getOptionExpiryOptions = (symbol, basis) => {
   // Under a YEARLY basis, Yearly is APPENDED to the normal list rather than
   // replacing it, so each leg chooses independently. Replacing the list forced
   // every leg to Yearly, which made a mixed basket impossible.
-  return String(basis || '').toLowerCase() === 'yearly' ? [...base, YEARLY_LEG_EXPIRY] : base;
+  const b = String(basis || '').toLowerCase();
+  if (b === 'yearly') return [...base, YEARLY_LEG_EXPIRY];
+  if (b === 'quarterly') return [...base, QUARTERLY_LEG_EXPIRY];
+  return base;
 };
 
 const normalizeReEntryMode = (mode) => {
@@ -149,9 +160,10 @@ const normalizeExpiryForIndex = (expiry, symbol, segment = 'options', basis) => 
   const current = String(expiry || '').toLowerCase();
   if (options.some(opt => opt.value === current)) return current;
   if (segment === 'futures') return 'monthly';
-  return String(basis || '').toLowerCase() === 'yearly'
-    ? 'yearly'
-    : getIndexConfig(symbol).defaultOptionExpiry;
+  const b = String(basis || '').toLowerCase();
+  if (b === 'yearly') return 'yearly';
+  if (b === 'quarterly') return 'quarterly';
+  return getIndexConfig(symbol).defaultOptionExpiry;
 };
 
 const DATE_YEAR_MIN = 1900;
@@ -423,6 +435,22 @@ const StrikeIntervalSelect = ({ value, onChange, className = '', index = null })
     ))}
   </select>
   );
+};
+
+// "Relative to Leg" references (ref_leg / adj_rel_ref_leg) are stored as the
+// TARGET LEG'S STABLE `id`, never its array position — position shifts
+// whenever a leg is added/removed, but the id never does, so a saved
+// reference always keeps resolving to the same leg. Position (what the
+// backend actually consumes) is derived fresh, only at the point of use.
+const legPositionById = (legs, id) => legs.findIndex(l => l.id === id) + 1; // 1-based; 0 = not found/unset
+const legRefLabel = (leg, i) => {
+  if (!leg) return `Leg ${i + 1}`;
+  const dir = leg.position === 'sell' ? 'Sell' : 'Buy';
+  const opt = leg.segment === 'futures' ? 'FUT' : (leg.option_type === 'call' ? 'CE' : 'PE');
+  const hint = leg.strike_criteria === 'strike_type'
+    ? String(leg.strike_type || '').toUpperCase()
+    : String(leg.strike_criteria || '').replace(/_/g, ' ');
+  return `Leg ${i + 1} — ${dir} ${opt}${hint ? ' ' + hint : ''}`;
 };
 
 function getBufferPreview(value, unit, applyTo, posAbove, posBelow, indexName = 'NIFTY') {
@@ -816,7 +844,8 @@ const StrategyBuilder = () => {
   // yearly because it would advance the contract to the next cadence element.
   // Switching away from yearly leaves the user's choices alone.
   useEffect(() => {
-    if (expiryBasis !== 'yearly') return;
+    // Quarterly shares yearly's pinning gate — same forced rollover + no min-DTE.
+    if (!['yearly', 'quarterly'].includes(expiryBasis)) return;
     setRolloverToggle(true);
     setNoRollover(false);
     setRolloverMinDaysToExpiry(0);
@@ -984,7 +1013,9 @@ const StrategyBuilder = () => {
     straddle_direction: '+',
     // Relative-to-leg strike (Iron Condor / spread wing): strike is derived
     // from an earlier leg's resolved strike, shifted `offset` gaps further OTM.
-    ref_leg: 1,
+    // Stores the target leg's stable `id` (null = not yet picked) — see
+    // legPositionById() above for why this isn't a raw position number.
+    ref_leg: null,
     offset: 0,
     rel_ref_mode: 'premium',   // 'premium' | 'premium_locked' | 'tv'
     delta_value: 0.3,          // target delta (0–1, absolute) for delta strike mode
@@ -1425,7 +1456,22 @@ const StrategyBuilder = () => {
       const es = _midcapNum(anchor['Entry Spot'] ?? anchor.entry_spot) || 0;
       const pct = es ? Math.round((net / es) * 100.0 * 1e4) / 1e4 : 0;
 
-      out.push({ trade_id: key, entry_date: entry, exit_date: exit, nifty_pnl: net, nifty_pnl_pct: pct });
+      // Carry the NIFTY futures leg's capital-sizing fields so the /midcap-overlay
+      // endpoint can size the Midcap leg (heal_midcap_capital_legs derives the
+      // capital bucket from _cap_total or Qty x Entry Price). Without these the
+      // on-screen grid showed a blank Midcap Qty while the download — which sends
+      // the full trade rows — filled it. Only a sized FUT leg carries them, so
+      // ordinary runs push nothing extra.
+      const futLeg = all.find(t => String(t.Type || t.type || '').toUpperCase() === 'FUT');
+      const sizeFields = futLeg ? {
+        Type: 'FUT',
+        Leg: legNo(futLeg),
+        Qty: _midcapNum(futLeg.Qty),
+        'Entry Price': _midcapNum(futLeg['Entry Price']),
+        _cap_total: _midcapNum(futLeg._cap_total),
+        _cap_alloc: _midcapNum(futLeg._cap_alloc),
+      } : {};
+      out.push({ trade_id: key, entry_date: entry, exit_date: exit, nifty_pnl: net, nifty_pnl_pct: pct, ...sizeFields });
     }
     return out;
   }, []);
@@ -1924,7 +1970,16 @@ const StrategyBuilder = () => {
   const removeLeg = (id) => {
     const leg = legs.find(l => l.id === id);
     const lazyIds = [leg?.lazy_leg_sl_id, leg?.lazy_leg_target_id].filter(Boolean);
-    setLegs(prev => prev.filter(l => l.id !== id));
+    setLegs(prev => prev
+      .filter(l => l.id !== id)
+      // Any other leg that referenced the removed leg would otherwise keep a
+      // dangling id — clear it so the dropdown forces an explicit re-pick
+      // instead of silently resolving to whatever now sits in that slot.
+      .map(l => ({
+        ...l,
+        ref_leg: l.ref_leg === id ? null : l.ref_leg,
+        adj_rel_ref_leg: l.adj_rel_ref_leg === id ? null : l.adj_rel_ref_leg,
+      })));
     if (lazyIds.length) {
       setLazyLegs(prev => {
         const next = { ...prev };
@@ -1939,12 +1994,22 @@ const StrategyBuilder = () => {
     if (field === 'segment' || field === 'expiry') {
       next.expiry = normalizeExpiryForIndex(next.expiry, instrument, next.segment, expiryBasis);
     }
+    // Switching TO a relative-leg criteria: auto-pick the reference only when
+    // there's exactly one earlier leg (unambiguous); otherwise leave it unset
+    // so the dropdown forces an explicit choice instead of silently
+    // defaulting to "Leg 1."
+    if (field === 'strike_criteria' && (value === 'rel_leg' || value === 'rel_leg_premium')) {
+      const earlier = prev.slice(0, idx);
+      if (!earlier.some(x => x.id === next.ref_leg)) {
+        next.ref_leg = earlier.length === 1 ? earlier[0].id : null;
+      }
+    }
     // Relative-to-Leg (Iron Condor wing): when a leg becomes rel_leg or its
     // parent changes, auto-configure it as the protective wing of that parent —
     // same option type, opposite position (Sell short → Buy wing).
     if ((field === 'strike_criteria' && value === 'rel_leg') ||
         (field === 'ref_leg' && next.strike_criteria === 'rel_leg')) {
-      const parent = prev[(Number(next.ref_leg) || 1) - 1];
+      const parent = prev.find(x => x.id === next.ref_leg);
       if (parent && parent.segment === 'options') {
         next.option_type = parent.option_type;
         next.position = parent.position === 'sell' ? 'buy' : 'sell';
@@ -2319,11 +2384,23 @@ const StrategyBuilder = () => {
         // Adjustment Relative to Leg: this leg inherits its reference leg's
         // adjustment dates ("also adjust whenever the reference leg adjusts").
         // Emitted only when opted in ⇒ existing payloads stay byte-identical.
-        // ref_leg is the 1-based number of an EARLIER leg (dropdown enforces it).
+        // adj_rel_ref_leg is stored as the target leg's stable id; the backend
+        // wants a 1-based position, translated fresh right here so it always
+        // matches this leg's CURRENT spot in the array (see legPositionById).
         if (l.adj_rel_enabled) {
           leg.adjustment_relative_to_leg = {
             enabled: true,
-            ref_leg: Number(l.adj_rel_ref_leg) || 1,
+            ref_leg: legPositionById(legs, l.adj_rel_ref_leg) || 1,
+          };
+        }
+        // Spot Above/Below Strike: cut + re-enter when spot crosses this leg's own
+        // current strike (± margin% early). Emitted only when opted in ⇒ existing
+        // payloads stay byte-identical.
+        if (l.vs_strike_enabled) {
+          leg.vs_strike_adjustment = {
+            enabled: true,
+            direction: l.vs_strike_direction === 'below' ? 'below' : 'above',
+            margin_pct: Math.max(0, Number(l.vs_strike_margin_pct) || 0),
           };
         }
         // Per-contract schedule (yearly legs only): emit only when the leg is
@@ -2399,16 +2476,18 @@ const StrategyBuilder = () => {
         }
         if (l.strike_criteria === 'rel_leg') {
           // Wing strike = leg #ref_leg's resolved strike ± offset*gap (+ CALL /
-          // − PUT, applied engine-side). ref_leg is the 1-based leg number and
-          // MUST reference an earlier leg (validated before run).
-          leg.strike_selection.ref_leg = Number(l.ref_leg) || 1;
+          // − PUT, applied engine-side). l.ref_leg is the target leg's stable
+          // id; translated to a 1-based position here, fresh, so it always
+          // matches the CURRENT array order (MUST reference an earlier leg,
+          // validated before run).
+          leg.strike_selection.ref_leg = legPositionById(legs, l.ref_leg) || 1;
           leg.strike_selection.offset = Number(l.offset) || 0;
         }
         if (l.strike_criteria === 'rel_leg_premium') {
           // Premium target = leg #ref_leg's actual entry fill, rescaled by the
           // expiry-count ratio between the two legs and by their lot sizes.
-          // ref_leg is 1-based and MUST reference an earlier leg.
-          leg.strike_selection.ref_leg = Number(l.ref_leg) || 1;
+          // l.ref_leg is a stable id, translated to position fresh (see above).
+          leg.strike_selection.ref_leg = legPositionById(legs, l.ref_leg) || 1;
           leg.strike_selection.rel_ref_mode = l.rel_ref_mode || 'premium';
         }
         if (l.strike_criteria === 'delta') {
@@ -2591,10 +2670,10 @@ const StrategyBuilder = () => {
       // engine pin the December contract (simulate.rs rollover gate). Omitting
       // 'yearly' here silently stripped it from the payload even though the UI
       // toggle was on, so the run fell back to trading the cadence expiries.
-      rollover_toggle: (rolloverToggle || noRollover) && ['weekly', 'monthly', 'yearly'].includes(expiryBasis),
-      // min-DTE is REJECTED by the engine under yearly (it would advance the
-      // contract to the next cadence element). T-n is the yearly roll-early knob.
-      rollover_min_days_to_expiry: (rolloverToggle && expiryBasis !== 'yearly') ? rolloverMinDaysToExpiry : 0,
+      rollover_toggle: (rolloverToggle || noRollover) && ['weekly', 'monthly', 'yearly', 'quarterly'].includes(expiryBasis),
+      // min-DTE is REJECTED by the engine under yearly/quarterly (it would advance
+      // the contract to the next cadence element). T-n is the roll-early knob.
+      rollover_min_days_to_expiry: (rolloverToggle && !['yearly', 'quarterly'].includes(expiryBasis)) ? rolloverMinDaysToExpiry : 0,
       no_rollover: noRollover && ['weekly', 'monthly'].includes(expiryBasis),
       no_rollover_min_days: (noRollover && expiryBasis !== 'yearly') ? noRolloverMinDays : 0,
       // PER-LEG ROLLOVER: each leg rolls on its own expiry + own exit T-n
@@ -2661,14 +2740,17 @@ const StrategyBuilder = () => {
       date_from: getApiStartDate(startDate),
       date_to: getApiEndDate(endDate),
       expiry_type: effectiveExpiryType,
-      // YEARLY only (ignored by every other basis): the roll cadence and the
-      // T-n months at which the December contract rolls to the next December.
-      ...(effectiveExpiryType === 'YEARLY' ? {
+      // YEARLY + QUARTERLY (ignored by every other basis): the roll cadence and
+      // the T-n at which the long-dated contract rolls to the next one.
+      ...(['YEARLY', 'QUARTERLY'].includes(effectiveExpiryType) ? {
         rollover_cadence: rolloverCadence,
         yearly_exit_months_before: Math.max(0, Math.min(11, Number(yearlyExitMonthsBefore) || 0)),
-        // Long-dated months to roll through. December is always included (the
-        // anchor); sorting keeps the payload stable so the cache key doesn't
-        // churn on checkbox order. Absent/December-only == existing behaviour.
+      } : {}),
+      // YEARLY only: the user-chosen roll-through months. QUARTERLY is fixed to
+      // Mar/Jun/Sep/Dec (the backend forces this), so it never sends this.
+      ...(effectiveExpiryType === 'YEARLY' ? {
+        // December is always included (the anchor); sorting keeps the payload
+        // stable so the cache key doesn't churn on checkbox order.
         yearly_roll_months: Array.from(new Set(['12', ...yearlyRollMonths])).sort(),
       } : {}),
       filter: strFilter.enabled ? strFilter.configId : null,
@@ -2792,21 +2874,41 @@ const StrategyBuilder = () => {
     if (!validateExpiry()) return;
 
     // Relative-to-leg (Iron Condor wing) sanity: a rel_leg leg must reference an
-    // EARLIER leg (1-based position < its own). A dangling reference — e.g. after
-    // deleting the parent leg — would otherwise be silently dropped by the engine
-    // (0 trades) with no explanation. Fail loudly instead.
+    // EARLIER leg (1-based position < its own). ref_leg is stored as the
+    // target leg's id, so this also catches "never picked" (null) and
+    // "dangling" (id no longer in `legs`, e.g. after deleting the parent leg)
+    // — legPositionById returns 0 for both, same as an out-of-range position.
+    // Either way this would otherwise be silently dropped/misresolved by the
+    // engine with no explanation. Fail loudly instead.
     // rel_leg_premium shares the earlier-leg rule for the same reason, so it is
     // validated by the same pass.
     const relLegErrors = legs.reduce((acc, leg, idx) => {
       if (leg.strike_criteria !== 'rel_leg' && leg.strike_criteria !== 'rel_leg_premium') return acc;
-      const ref = Number(leg.ref_leg) || 0;
-      if (ref < 1 || ref > idx) acc.push(`Leg ${idx + 1}`);
+      const pos = legPositionById(legs, leg.ref_leg);
+      if (pos < 1 || pos > idx) acc.push(`Leg ${idx + 1}`);
       return acc;
     }, []);
     if (relLegErrors.length > 0) {
       showValidationError(
-        `Relative-to-Leg strike on ${relLegErrors.join(', ')} points to a missing or later leg. ` +
-        `Set it to reference an earlier leg (the short leg it protects).`,
+        `Relative-to-Leg strike on ${relLegErrors.join(', ')} has no (or an invalid) reference leg. ` +
+        `Pick the earlier leg it protects.`,
+        6000
+      );
+      return; // Hard block
+    }
+
+    // Adjustment Relative to Leg shares the same id-based reference and the
+    // same failure mode (never picked / dangling after a delete) — same guard.
+    const adjRelErrors = legs.reduce((acc, leg, idx) => {
+      if (!leg.adj_rel_enabled) return acc;
+      const pos = legPositionById(legs, leg.adj_rel_ref_leg);
+      if (pos < 1 || pos > idx) acc.push(`Leg ${idx + 1}`);
+      return acc;
+    }, []);
+    if (adjRelErrors.length > 0) {
+      showValidationError(
+        `Adjustment Relative to Leg on ${adjRelErrors.join(', ')} has no (or an invalid) reference leg. ` +
+        `Pick the earlier leg it should follow.`,
         6000
       );
       return; // Hard block
@@ -3080,9 +3182,9 @@ const StrategyBuilder = () => {
                   </div>
                 )}
 
-                {/* Yearly (December) — contract and roll cadence are two
-                    different calendars, so both need their own control. */}
-                {backtestMode === 'eod' && expiryBasis === 'yearly' && (
+                {/* Yearly (December) / Quarterly (Mar/Jun/Sep/Dec) — contract and
+                    roll cadence are two different calendars, both need a control. */}
+                {backtestMode === 'eod' && ['yearly', 'quarterly'].includes(expiryBasis) && (
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="field-label">Roll every</label>
@@ -3099,7 +3201,7 @@ const StrategyBuilder = () => {
                       </p>
                     </div>
                     <div>
-                      <label className="field-label">Roll to next December</label>
+                      <label className="field-label">{expiryBasis === 'quarterly' ? 'Roll to next quarter' : 'Roll to next December'}</label>
                       <select
                         value={yearlyExitMonthsBefore}
                         onChange={e => setYearlyExitMonthsBefore(+e.target.value)}
@@ -3112,7 +3214,9 @@ const StrategyBuilder = () => {
                       </select>
                       <p className="text-[11px] text-secondary mt-1">
                         {yearlyExitMonthsBefore === 0
-                          ? 'Holds 26-Dec-2019 to expiry, then rolls to 31-Dec-2020.'
+                          ? (expiryBasis === 'quarterly'
+                              ? 'Holds each quarter contract to expiry, then rolls to the next (Mar→Jun→Sep→Dec).'
+                              : 'Holds 26-Dec-2019 to expiry, then rolls to 31-Dec-2020.')
                           : `Exits ${yearlyExitMonthsBefore} month${yearlyExitMonthsBefore === 1 ? '' : 's'} early and re-enters the next long-dated contract at a fresh strike.`}
                       </p>
                     </div>
@@ -3231,7 +3335,7 @@ const StrategyBuilder = () => {
                     contract when rollover is active (simulate.rs rollover gate),
                     so without this the run silently falls back to trading the
                     cadence expiries. */}
-                {backtestMode === 'eod' && ['weekly', 'monthly', 'yearly'].includes(expiryBasis) && (
+                {backtestMode === 'eod' && ['weekly', 'monthly', 'yearly', 'quarterly'].includes(expiryBasis) && (
                   <div className="bg-surface shadow-sm border border-default rounded-xl p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <div className="flex flex-col gap-0.5">
@@ -3252,7 +3356,7 @@ const StrategyBuilder = () => {
                         YEARLY: it advances the contract to the next CADENCE
                         element, which would swap December for a weekly. T-n
                         ("Roll to next December") is the yearly roll-early knob. */}
-                    {rolloverToggle && expiryBasis !== 'yearly' && (
+                    {rolloverToggle && !['yearly', 'quarterly'].includes(expiryBasis) && (
                       <div className="space-y-2 pt-2 border-t border-default">
                         <p className="text-[11px] font-medium text-secondary pl-2">Min. days to expiry</p>
                         <p className="text-[10px] text-muted pl-2">
@@ -4066,7 +4170,9 @@ const StrategyBuilder = () => {
                     ? 'Hypothetical overlay · follows NIFTY trade dates · no real strike or expiry'
                     : (expiryBasis === 'yearly'
                         ? 'Yearly: holds the December contract · round-1000 strikes are the liquid ones'
-                        : (isMidcp ? 'Weekly (till Nov 2024) & monthly · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50'));
+                        : (expiryBasis === 'quarterly'
+                            ? 'Quarterly: holds the Mar/Jun/Sep/Dec contract · round-1000 strikes are the liquid ones'
+                            : (isMidcp ? 'Weekly (till Nov 2024) & monthly · Strike gap 25' : 'Weekly & monthly expiries · Strike gap 50')));
                   const barLabel = isMidcap100Tab ? 'MIDCAP100 OVERLAY' : activeIdx;
                   return (
                     <div style={{
@@ -4182,10 +4288,19 @@ const StrategyBuilder = () => {
                     <select value={draftLeg.strike_criteria}
                       onChange={e => setDraftLeg(prev => {
                         const next = { ...prev, strike_criteria: e.target.value };
+                        // Switching TO a relative-leg criteria: auto-pick the
+                        // reference only when there's exactly one existing leg
+                        // (unambiguous); otherwise leave it unset so the
+                        // dropdown below forces an explicit choice.
+                        if (e.target.value === 'rel_leg' || e.target.value === 'rel_leg_premium') {
+                          if (!legs.some(x => x.id === next.ref_leg)) {
+                            next.ref_leg = legs.length === 1 ? legs[0].id : null;
+                          }
+                        }
                         // Auto-configure a Relative-to-Leg wing from its parent short:
                         // same option type, opposite position (Sell → Buy).
                         if (e.target.value === 'rel_leg') {
-                          const parent = legs[(Number(prev.ref_leg) || 1) - 1];
+                          const parent = legs.find(x => x.id === next.ref_leg);
                           if (parent && parent.segment === 'options') {
                             next.option_type = parent.option_type;
                             next.position = parent.position === 'sell' ? 'buy' : 'sell';
@@ -4391,11 +4506,11 @@ const StrategyBuilder = () => {
                         <div className="flex flex-col gap-0.5">
                           <div className="flex items-center gap-1 h-8">
                             <select
-                              value={draftLeg.ref_leg ?? 1}
+                              value={draftLeg.ref_leg ?? ''}
                               onChange={e => setDraftLeg(prev => {
-                                const ref = parseInt(e.target.value, 10) || 1;
+                                const ref = e.target.value === '' ? null : Number(e.target.value);
                                 const next = { ...prev, ref_leg: ref };
-                                const parent = legs[ref - 1];
+                                const parent = legs.find(x => x.id === ref);
                                 if (parent && parent.segment === 'options') {
                                   next.option_type = parent.option_type;
                                   next.position = parent.position === 'sell' ? 'buy' : 'sell';
@@ -4404,7 +4519,8 @@ const StrategyBuilder = () => {
                               })}
                               className="h-8 px-2 border border-default rounded text-xs bg-surface font-medium"
                             >
-                              {legs.map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                              {legs.length > 1 && <option value="">Select a leg…</option>}
+                              {legs.map((l, i) => <option key={l.id} value={l.id}>{legRefLabel(l, i)}</option>)}
                             </select>
                             <span className="text-xs text-muted whitespace-nowrap">offset</span>
                             <input
@@ -4421,7 +4537,7 @@ const StrategyBuilder = () => {
                               const isCE = ['call', 'ce'].includes((draftLeg.option_type || '').toLowerCase());
                               const off = draftLeg.offset ?? 0;
                               const dir = isCE ? (off >= 0 ? '+' : '−') : (off >= 0 ? '−' : '+');
-                              return `strike = Leg ${draftLeg.ref_leg ?? 1} ${dir}${Math.abs(off)} gaps (further OTM ⇒ larger offset)`;
+                              return `strike = Leg ${legPositionById(legs, draftLeg.ref_leg) || '?'} ${dir}${Math.abs(off)} gaps (further OTM ⇒ larger offset)`;
                             })()}
                           </span>
                         </div>
@@ -4434,11 +4550,12 @@ const StrategyBuilder = () => {
                         <div className="flex flex-col gap-0.5">
                           <div className="flex items-center gap-1 h-8">
                             <select
-                              value={draftLeg.ref_leg ?? 1}
-                              onChange={e => setDraftLeg(prev => ({ ...prev, ref_leg: parseInt(e.target.value, 10) || 1 }))}
+                              value={draftLeg.ref_leg ?? ''}
+                              onChange={e => setDraftLeg(prev => ({ ...prev, ref_leg: e.target.value === '' ? null : Number(e.target.value) }))}
                               className="h-8 px-2 border border-default rounded text-xs bg-surface font-medium"
                             >
-                              {legs.map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                              {legs.length > 1 && <option value="">Select a leg…</option>}
+                              {legs.map((l, i) => <option key={l.id} value={l.id}>{legRefLabel(l, i)}</option>)}
                             </select>
                             <select
                               value={draftLeg.rel_ref_mode ?? 'premium'}
@@ -4452,10 +4569,10 @@ const StrategyBuilder = () => {
                           </div>
                           <span className="text-xs text-muted">
                             {draftLeg.rel_ref_mode === 'tv'
-                              ? `Target = Leg ${draftLeg.ref_leg ?? 1} time value ÷ expiries in its life`
+                              ? `Target = Leg ${legPositionById(legs, draftLeg.ref_leg) || '?'} time value ÷ expiries in its life`
                               : draftLeg.rel_ref_mode === 'premium_locked'
-                              ? `Target locked at Leg ${draftLeg.ref_leg ?? 1} original fill ÷ N — resets on rollover/spot-adj/patch`
-                              : `Target premium = Leg ${draftLeg.ref_leg ?? 1} entry premium ÷ expiries in its life, adjusted for lot size`}
+                              ? `Target locked at Leg ${legPositionById(legs, draftLeg.ref_leg) || '?'} original fill ÷ N — resets on rollover/spot-adj/patch`
+                              : `Target premium = Leg ${legPositionById(legs, draftLeg.ref_leg) || '?'} entry premium ÷ expiries in its life, adjusted for lot size`}
                           </span>
                         </div>
                       </>
@@ -4839,11 +4956,12 @@ const StrategyBuilder = () => {
                                       <div className="flex flex-col gap-0.5">
                                         <div className="flex items-center gap-1">
                                           <select
-                                            value={leg.ref_leg ?? 1}
-                                            onChange={e => updateLeg(leg.id, 'ref_leg', parseInt(e.target.value, 10) || 1)}
+                                            value={leg.ref_leg ?? ''}
+                                            onChange={e => updateLeg(leg.id, 'ref_leg', e.target.value === '' ? null : Number(e.target.value))}
                                             className="h-7 px-2 border border-default rounded text-xs bg-surface font-medium"
                                           >
-                                            {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                                            {idx > 1 && <option value="">Select a leg…</option>}
+                                            {legs.slice(0, idx).map((l, i) => <option key={l.id} value={l.id}>{legRefLabel(l, i)}</option>)}
                                           </select>
                                           <span className="text-xs text-muted whitespace-nowrap">offset</span>
                                           <input
@@ -4860,7 +4978,7 @@ const StrategyBuilder = () => {
                                             const isCE = ['call', 'ce'].includes((leg.option_type || '').toLowerCase());
                                             const off = leg.offset ?? 0;
                                             const dir = isCE ? (off >= 0 ? '+' : '−') : (off >= 0 ? '−' : '+');
-                                            return `Leg ${leg.ref_leg ?? 1} ${dir}${Math.abs(off)} gaps`;
+                                            return `Leg ${legPositionById(legs, leg.ref_leg) || '?'} ${dir}${Math.abs(off)} gaps`;
                                           })()}
                                         </span>
                                       </div>
@@ -4873,11 +4991,12 @@ const StrategyBuilder = () => {
                                       <div className="flex flex-col gap-0.5">
                                         <div className="flex items-center gap-1">
                                           <select
-                                            value={leg.ref_leg ?? 1}
-                                            onChange={e => updateLeg(leg.id, 'ref_leg', parseInt(e.target.value, 10) || 1)}
+                                            value={leg.ref_leg ?? ''}
+                                            onChange={e => updateLeg(leg.id, 'ref_leg', e.target.value === '' ? null : Number(e.target.value))}
                                             className="h-7 px-2 border border-default rounded text-xs bg-surface font-medium"
                                           >
-                                            {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                                            {idx > 1 && <option value="">Select a leg…</option>}
+                                            {legs.slice(0, idx).map((l, i) => <option key={l.id} value={l.id}>{legRefLabel(l, i)}</option>)}
                                           </select>
                                           <select
                                             value={leg.rel_ref_mode ?? 'premium'}
@@ -4891,10 +5010,10 @@ const StrategyBuilder = () => {
                                         </div>
                                         <span className="text-xs text-muted">
                                           {leg.rel_ref_mode === 'tv'
-                                            ? `Leg ${leg.ref_leg ?? 1} time value ÷ expiries in its life`
+                                            ? `Leg ${legPositionById(legs, leg.ref_leg) || '?'} time value ÷ expiries in its life`
                                             : leg.rel_ref_mode === 'premium_locked'
-                                            ? `Locked at Leg ${leg.ref_leg ?? 1} original fill ÷ N — resets on rollover/spot-adj/patch`
-                                            : `Leg ${leg.ref_leg ?? 1} premium ÷ expiries in its life`}
+                                            ? `Locked at Leg ${legPositionById(legs, leg.ref_leg) || '?'} original fill ÷ N — resets on rollover/spot-adj/patch`
+                                            : `Leg ${legPositionById(legs, leg.ref_leg) || '?'} premium ÷ expiries in its life`}
                                         </span>
                                       </div>
                                     </>
@@ -4981,6 +5100,44 @@ const StrategyBuilder = () => {
                           </div>
                         )}
 
+                        {/* Spot Above/Below Strike — cut + re-enter the instant spot
+                            crosses THIS leg's own current strike (a level trigger,
+                            distinct from Own Spot Adj which measures distance from
+                            entry). Optional margin% fires it a bit early. */}
+                        {leg.segment === 'options' && !(String(leg.expiry || '') === 'yearly' && leg.yearly_schedule_enabled) && (
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <Toggle
+                              enabled={Boolean(leg.vs_strike_enabled)}
+                              onToggle={(val) => updateLeg(leg.id, 'vs_strike_enabled', val !== undefined ? Boolean(val) : !leg.vs_strike_enabled)}
+                              size="sm"
+                            />
+                            <span className="text-xs font-medium text-secondary whitespace-nowrap">Spot Above/Below Strike</span>
+                            {leg.vs_strike_enabled && (
+                              <>
+                                <SegBtn
+                                  size="sm"
+                                  options={[
+                                    { value: 'above', label: 'Above' },
+                                    { value: 'below', label: 'Below' },
+                                  ]}
+                                  value={leg.vs_strike_direction || 'above'}
+                                  onChange={v => updateLeg(leg.id, 'vs_strike_direction', v)}
+                                />
+                                <span className="text-[10px] text-muted whitespace-nowrap">margin</span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  step={0.25}
+                                  value={leg.vs_strike_margin_pct ?? 0}
+                                  onChange={e => updateLeg(leg.id, 'vs_strike_margin_pct', Math.max(0, parseFloat(e.target.value) || 0))}
+                                  className="w-20 h-7 px-2 border border-default rounded text-xs text-center bg-surface"
+                                />
+                                <span className="text-[10px] text-muted">% of strike — fires early (0 = at strike)</span>
+                              </>
+                            )}
+                          </div>
+                        )}
+
                         {/* Adjustment Relative to Leg — this leg ALSO re-strikes
                             whenever its reference (earlier) leg adjusts; it inherits
                             that leg's spot-adjustment dates. Needs per-leg rollover on
@@ -4989,18 +5146,31 @@ const StrategyBuilder = () => {
                           <div className="flex flex-wrap items-center gap-2 pt-1">
                             <Toggle
                               enabled={Boolean(leg.adj_rel_enabled)}
-                              onToggle={(val) => updateLeg(leg.id, 'adj_rel_enabled', val !== undefined ? Boolean(val) : !leg.adj_rel_enabled)}
+                              onToggle={(val) => {
+                                const enabled = val !== undefined ? Boolean(val) : !leg.adj_rel_enabled;
+                                updateLeg(leg.id, 'adj_rel_enabled', enabled);
+                                // Auto-pick only when unambiguous (exactly one
+                                // earlier leg) — otherwise leave unset so the
+                                // dropdown below forces an explicit choice.
+                                if (enabled) {
+                                  const earlier = legs.slice(0, idx);
+                                  if (!earlier.some(x => x.id === leg.adj_rel_ref_leg) && earlier.length === 1) {
+                                    updateLeg(leg.id, 'adj_rel_ref_leg', earlier[0].id);
+                                  }
+                                }
+                              }}
                               size="sm"
                             />
                             <span className="text-xs font-medium text-secondary whitespace-nowrap">Adjustment Relative to Leg</span>
                             {leg.adj_rel_enabled && (
                               <>
                                 <select
-                                  value={leg.adj_rel_ref_leg ?? 1}
-                                  onChange={e => updateLeg(leg.id, 'adj_rel_ref_leg', Number(e.target.value) || 1)}
+                                  value={leg.adj_rel_ref_leg ?? ''}
+                                  onChange={e => updateLeg(leg.id, 'adj_rel_ref_leg', e.target.value === '' ? null : Number(e.target.value))}
                                   className="h-7 px-2 border border-default rounded text-xs bg-surface"
                                 >
-                                  {legs.slice(0, idx).map((_, i) => <option key={i} value={i + 1}>{`Leg ${i + 1}`}</option>)}
+                                  {idx > 1 && <option value="">Select a leg…</option>}
+                                  {legs.slice(0, idx).map((l, i) => <option key={l.id} value={l.id}>{legRefLabel(l, i)}</option>)}
                                 </select>
                                 <span className="text-[10px] text-muted">also adjust whenever the reference leg adjusts</span>
                               </>

@@ -147,30 +147,31 @@ def _run(payload, specs):
 
 
 class TestDivisor(unittest.TestCase):
-    def test_divisor_is_ref_full_cycle_not_weeks_remaining(self):
-        """N = child-cadence expiries in the REFERENCE contract's OWN calendar
-        cycle (Aug-2022 monthly ref -> 4 August weeklies), from the real expiry
-        calendar. A property of the contract, NOT of the entry date.
+    def test_divisor_is_weeks_remaining_to_ref_expiry(self):
+        """N = child-cadence periods REMAINING from the child's ENTRY to the ref's
+        expiry ("÷ weeks to expiry"). Entry 04-Aug, ref expiry 25-Aug → 21 days ÷
+        7 = 3 weekly periods left. Entry-date DEPENDENT (the previous-code rule).
         """
         child = _run(_payload(), _specs())
-        self.assertAlmostEqual(child["rel_leg_premium_n"], 4.0, places=6)
-        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 4.0, places=4)
+        self.assertAlmostEqual(child["rel_leg_premium_n"], 3.0, places=6)
+        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 3.0, places=4)
 
-    def test_divisor_independent_of_entry_date(self):
-        """The bug this fixes: N must NOT shrink as the entry nears expiry. An
-        early and a late entry in the SAME ref cycle get the SAME N (the full
-        cycle), so the child strike no longer drifts from far-OTM to ATM."""
+    def test_divisor_shrinks_toward_expiry(self):
+        """Weeks-to-expiry: N SHRINKS as the entry nears the ref's expiry. An early
+        entry (04-Aug → 25-Aug = 21d/7 = 3) has more periods left than a late entry
+        (18-Aug → 25-Aug = 7d/7 = 1)."""
         n_early = _run(_payload(), _specs(entry="2022-08-04"))["rel_leg_premium_n"]
         n_late = _run(_payload(), _specs(entry="2022-08-18"))["rel_leg_premium_n"]
-        self.assertAlmostEqual(n_early, 4.0, places=6)
-        self.assertAlmostEqual(n_late, 4.0, places=6)
-        self.assertEqual(n_early, n_late)
+        self.assertAlmostEqual(n_early, 3.0, places=6)
+        self.assertAlmostEqual(n_late, 1.0, places=6)
+        self.assertGreater(n_early, n_late)
 
     def test_child_cadence_sets_what_is_counted(self):
-        """N counts CHILD-cadence expiries inside the ref's cycle: a weekly child
-        -> 4 (the August weeklies); a monthly child -> 1 (the one August monthly)."""
+        """N counts CHILD-cadence periods remaining to the ref's expiry: a weekly
+        child over 21 days → 3; a monthly child over the same 21 days → <1, floored
+        to 1 (at least one period)."""
         weekly = _run(_payload(), _specs())                        # leg 3 = WEEKLY
-        self.assertAlmostEqual(weekly["rel_leg_premium_n"], 4.0, places=6)
+        self.assertAlmostEqual(weekly["rel_leg_premium_n"], 3.0, places=6)
         p = _payload()
         p["legs"][2]["expiry"] = "MONTHLY"                         # child now monthly
         monthly = _run(p, _specs())
@@ -190,7 +191,7 @@ class TestDivisor(unittest.TestCase):
             _UNTRADED.discard(17150.0)
         self.assertIsNotNone(child)                  # resolved, not dropped
         self.assertEqual(child["strike"], 17600.0)   # same pick as the traded case
-        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 4.0, places=4)
+        self.assertAlmostEqual(child["rel_leg_premium_target"], 98.40 / 3.0, places=4)
 
 
 class TestLots(unittest.TestCase):
@@ -214,10 +215,10 @@ class TestLots(unittest.TestCase):
         """More lots on the ref raises the target, so a richer strike wins."""
         one = _run(_payload(ref_lots=1), _specs())
         three = _run(_payload(ref_lots=3), _specs())
-        # N=4.0. 1 lot -> target 24.60 -> 17600 @ 25.85 (1.25 off).
-        #        3 lots -> target 73.80 -> 17550 @ 86.00 (12.20 off, beats 17600's 47.95).
+        # N=3.0. 1 lot -> target 32.80 -> 17600 @ 25.85 (nearest on-grid).
+        #        3 lots -> target 98.40 -> 17500 @ 108.00 (9.6 off, beats 17550's 12.4).
         self.assertEqual(one["strike"], 17600.0)
-        self.assertEqual(three["strike"], 17550.0)
+        self.assertEqual(three["strike"], 17500.0)
         self.assertLess(three["strike"], one["strike"])     # closer to ATM
 
 

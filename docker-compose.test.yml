@@ -1,0 +1,59 @@
+# Isolated TEST override — never touches the live stack.
+# Run ONLY as its own project so containers/networks/volumes don't collide:
+#
+#   docker compose -p algotest_test -f docker-compose.yml -f docker-compose.test.yml \
+#     up -d backend redis postgres
+#
+# Isolation walls:
+#   * -p algotest_test           -> project-prefixed network + volumes (live pgdata/
+#                                   redis_data/algo_cache untouched; test gets fresh ones)
+#   * container_name overridden  -> base compose pins "algotest-*"; must differ or clash
+#   * host ports remapped        -> avoid live 8000/5432/6379
+#   * backend bind-mounts ./backend_test (a COPY) not ./backend -> code edits stay isolated
+#   * small mem_limits           -> can't tip the RAM-tight live box into OOM
+#
+# Prereq: make the isolated code copy (excludes the 2.3 GB native/target; the Rust .so
+# is loaded from site-packages, not /app/native — see main compose line 253):
+#   rsync -a --exclude 'native/target' ./backend/ ./backend_test/
+# Only bring this up when the live box is quiet (no active optim, swap well under 50%).
+
+services:
+  postgres:
+    container_name: algotest-test-postgres
+    ports:
+      - "5442:5432"
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.0"
+
+  redis:
+    container_name: algotest-test-redis
+    ports:
+      - "6389:6379"
+    deploy:
+      resources:
+        limits:
+          memory: 300M
+          cpus: "0.5"
+
+  backend:
+    container_name: algotest-test-backend
+    ports:
+      - "8100:8000"
+    # Override the whole volume list (compose replaces sequences, not merges):
+    # read-only reference data shared, algo_cache is a FRESH test volume,
+    # and code comes from the isolated ./backend_test copy.
+    volumes:
+      - ./cleaned_csvs:/data/cleaned_csvs:ro
+      - ./expiryData:/data/expiryData:ro
+      - ./strikeData:/data/strikeData:ro
+      - ./Filter:/data/Filter:ro
+      - algo_cache:/data/cache
+      - ./backend_test:/app
+    deploy:
+      resources:
+        limits:
+          memory: 2000M
+          cpus: "1.0"

@@ -1373,12 +1373,11 @@ def get_trading_calendar(from_date, to_date, db_path='bhavcopy_data.db'):
         DataFrame with columns: ['date']
     """
     if _use_postgres():
-        try:
-            return _repo.get_trading_calendar(from_date=str(from_date), to_date=str(to_date))
-        except Exception:
-            # Compatibility fallback to sqlite path below
-            pass
-    
+        # PostgreSQL-only deployment: the sqlite `bhavcopy` fallback below can never
+        # succeed (no such table) and only masks the real DB error as the misleading
+        # "bhavcopy does not exist". Surface the true Postgres error instead.
+        return _repo.get_trading_calendar(from_date=str(from_date), to_date=str(to_date))
+
     conn = sqlite3.connect(db_path)
     
     query = f"""
@@ -1776,19 +1775,23 @@ def _cached_spot_lookup(epoch: int, date_str: str, index_upper: str, db_path: st
     except Exception:
         pass
 
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        query = """SELECT close FROM bhavcopy WHERE date = ? AND symbol = ? AND strike IS NULL AND option_type IS NULL LIMIT 1"""
-        cursor.execute(query, (date_str, index_upper))
-        result = cursor.fetchone()
-        conn.close()
-        if result:
-            val = float(result[0])
-            _spot_lookup_cache[cache_key] = val
-            return val
-    except Exception:
-        pass
+    # Legacy sqlite `bhavcopy` fallback — only meaningful on non-Postgres setups.
+    # On PostgreSQL-only deployments the table never exists, so skip the dead
+    # connect/query entirely instead of failing silently on every cache miss.
+    if not _use_postgres():
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            query = """SELECT close FROM bhavcopy WHERE date = ? AND symbol = ? AND strike IS NULL AND option_type IS NULL LIMIT 1"""
+            cursor.execute(query, (date_str, index_upper))
+            result = cursor.fetchone()
+            conn.close()
+            if result:
+                val = float(result[0])
+                _spot_lookup_cache[cache_key] = val
+                return val
+        except Exception:
+            pass
 
     return None
 

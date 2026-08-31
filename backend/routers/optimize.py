@@ -217,7 +217,7 @@ async def get_lan_nodes(request: Request):
     caller_ip = _client_ip(request)
     try:
         from services.code_version import compute_code_version
-        my_version = compute_code_version()
+        my_version = compute_code_version(fresh=True)  # main box: recompute from live disk
     except Exception:
         my_version = ""
     nodes = node_registry.list_nodes()
@@ -1179,6 +1179,21 @@ async def download_optimization_summary(job_id: str, request: Request):
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Body must be JSON")
+    # Disk-cache shortcut: serve the workbook pre-built at finalize even after the
+    # Redis meta/results have expired (TTL) — same pattern as tradesheets.zip.
+    # Only for the default patchwise + unsorted request (the pre-built basis);
+    # overall / sorted / caller-supplied-rows fall through to the live build below.
+    if (bool(payload.get("patchwise", True)) and not payload.get("sort_by")
+            and not payload.get("rows")):
+        _sx = result_store.patchwise_summary_xlsx_path(job_id)
+        if os.path.isfile(_sx):
+            _naming = (result_store.get_meta(job_id) or {}).get("zip_naming") or {}
+            _l1 = _safe_zip_name(_naming.get("level1", "")) if _naming else ""
+            _fn = (f"{_l1}_patchwise_Summary.xlsx" if _l1
+                   else f"optimize_{job_id[:8]}_summary_patchwise.xlsx")
+            return _file_response(
+                request, _sx,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", _fn)
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
         # Server-side load. The browser relaying every row back to us costs ~2,746

@@ -55,6 +55,37 @@ def _date_chunks(from_date: str, to_date: str, chunk_years: int):
         current = chunk_end + _pd.Timedelta(days=1)
 
 
+_QUARTERLY_ROLL_MONTHS = ["03", "06", "09", "12"]
+
+
+def _apply_quarterly_expiry(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """QUARTERLY is just YEARLY pinned to Mar/Jun/Sep/Dec (4 rolls/year instead of
+    the December-only 1). Rewrite the token to the existing YEARLY path so every
+    downstream feature (rollover, spot-adjustment breach, filter, strike modes,
+    optimizer, multi-index) works UNCHANGED, and leave a `_quarterly` hint used
+    only for display labels. Handles strategy-level AND per-leg (mixed) expiry.
+
+    Strict no-op for every non-quarterly payload → nothing existing changes.
+    Idempotent (re-running after normalization sees YEARLY, not QUARTERLY).
+    Mutates in place (same list objects downstream builders read) and returns it.
+    """
+    if str(payload.get("expiry_type") or "").upper() == "QUARTERLY":
+        payload["expiry_type"] = "YEARLY"
+        payload["_quarterly"] = True
+        # FORCE the canonical quarterly params (not "default if unset"): quarterly
+        # is DEFINITIONALLY Mar/Jun/Sep/Dec with pinning ON. The frontend's yearly
+        # controls otherwise inject roll_months=['12'] and rollover_toggle=false
+        # for the quarterly basis; force them so the run can't degenerate.
+        payload["yearly_roll_months"] = list(_QUARTERLY_ROLL_MONTHS)
+        payload["rollover_toggle"] = True
+    for leg in (payload.get("legs") or []):
+        if isinstance(leg, dict) and str(leg.get("expiry") or "").upper() == "QUARTERLY":
+            leg["expiry"] = "YEARLY"
+            leg["_quarterly"] = True
+            leg["yearly_roll_months"] = list(_QUARTERLY_ROLL_MONTHS)
+    return payload
+
+
 def _normalize_request(request: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(request or {})
     payload['index'] = normalize_index(payload.get('index', 'NIFTY'))
@@ -62,6 +93,7 @@ def _normalize_request(request: Dict[str, Any]) -> Dict[str, Any]:
     payload['to_date'] = _normalize_cache_date(payload.get('date_to') or payload.get('to_date'))
     payload['date_from'] = payload['from_date']
     payload['date_to'] = payload['to_date']
+    _apply_quarterly_expiry(payload)
     return payload
 
 

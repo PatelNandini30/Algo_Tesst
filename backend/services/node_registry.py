@@ -98,7 +98,7 @@ def is_stale(node_id: str) -> bool:
         return False
     try:
         from services.code_version import compute_code_version
-        my = compute_code_version()
+        my = compute_code_version(fresh=True)  # main box: recompute from live disk
         node = get_node(node_id)
         nv = (node or {}).get("version") or ""
         return bool(my and nv and nv != my)

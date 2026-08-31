@@ -1,9 +1,15 @@
 import unittest
 
 try:  # in-container layout (/app == backend/) vs. repo-root layout
-    from services.engine_rust import _apply_adjustment_relative_to_leg
+    from services.engine_rust import (
+        _apply_adjustment_relative_to_leg,
+        _expand_breach_set_with_rel,
+    )
 except ModuleNotFoundError:  # pragma: no cover
-    from backend.services.engine_rust import _apply_adjustment_relative_to_leg
+    from backend.services.engine_rust import (
+        _apply_adjustment_relative_to_leg,
+        _expand_breach_set_with_rel,
+    )
 
 
 class TestAdjustmentRelativeToLeg(unittest.TestCase):
@@ -82,6 +88,35 @@ class TestAdjustmentRelativeToLeg(unittest.TestCase):
         ]
         with self.assertRaises(ValueError):
             _apply_adjustment_relative_to_leg(legs)
+
+
+class TestExpandBreachSet(unittest.TestCase):
+    """Normal-rollover cascade: a follower re-strikes when its reference breaches."""
+
+    def _legs(self):
+        return [
+            {"option_type": "CE"},  # leg 1 (has own spot-adj, breaches)
+            {"option_type": "PE", "adjustment_relative_to_leg": {"enabled": True, "ref_leg": 1}},
+        ]
+
+    def test_follower_added_when_ref_breaches(self):
+        self.assertEqual(_expand_breach_set_with_rel({1}, self._legs()), {1, 2})
+
+    def test_no_expand_when_ref_not_in_set(self):
+        # leg 1 did NOT breach ⇒ follower does not re-strike
+        self.assertEqual(_expand_breach_set_with_rel({3}, self._legs() + [{"option_type": "CE"}]), {3})
+
+    def test_off_path_unchanged(self):
+        legs = [{"option_type": "CE"}, {"option_type": "PE"}]
+        self.assertEqual(_expand_breach_set_with_rel({1}, legs), {1})
+
+    def test_transitive_chain(self):
+        legs = [
+            {"option_type": "CE"},
+            {"option_type": "PE", "adjustment_relative_to_leg": {"enabled": True, "ref_leg": 1}},
+            {"option_type": "CE", "adjustment_relative_to_leg": {"enabled": True, "ref_leg": 2}},
+        ]
+        self.assertEqual(_expand_breach_set_with_rel({1}, legs), {1, 2, 3})
 
 
 if __name__ == "__main__":

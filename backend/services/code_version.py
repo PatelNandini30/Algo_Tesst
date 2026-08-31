@@ -56,10 +56,18 @@ _HASH_ENV = (
 _cached = None
 
 
-def compute_code_version() -> str:
-    """Short hex fingerprint of the calc code + Rust engine. Cached per process."""
+def compute_code_version(fresh: bool = False) -> str:
+    """Short hex fingerprint of the calc code + Rust engine. Cached per process.
+
+    `fresh=True` bypasses the cache and recomputes from the current on-disk
+    source. The main box runs bind-mounted source that changes UNDER the live
+    process, so its staleness-baseline must be recomputed each time — otherwise
+    the backend keeps comparing remotes against a fingerprint frozen at its
+    startup and flags every node "outdated" until it's restarted. Baked remote
+    images are immutable, so their own heartbeat can keep using the cache.
+    """
     global _cached
-    if _cached is not None:
+    if _cached is not None and not fresh:
         return _cached
     h = hashlib.sha256()
     files = []

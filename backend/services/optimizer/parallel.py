@@ -892,9 +892,17 @@ def split_width(
             # expiry synchronization and recovery reloads than a single-index
             # worker.  Size only those jobs with the conservative measurement;
             # existing single-index fork width is unchanged.
+            # Measured on THIS box: a FUSED multi-index fork (NIFTY + MIDCPNIFTY,
+            # both feathers + OHLC + the fused-simulate working set) does NOT peak
+            # at a steady ~830 MB — heavy combos spike to ~1650 MB, and the clamp
+            # reads the cgroup at a transient low point between batches, so 600 and
+            # even 1000 let it pick P=4/8 which then overran the 9 GB container
+            # cgroup → kernel SIGKILL (signal 9). 1800 MB reflects the real spike
+            # (P≈2 at typical free RAM), which fits with headroom. Env-tunable:
+            # lower it on a bigger box for more parallelism.
             private_mb = max(
                 int(os.environ.get("OPTIMIZE_WORKER_PRIVATE_MB", "700")),
-                int(os.environ.get("OPTIMIZE_MULTI_INDEX_WORKER_PRIVATE_MB", "600")),
+                int(os.environ.get("OPTIMIZE_MULTI_INDEX_WORKER_PRIVATE_MB", "1800")),
             )
             return max(1, cap_parallelism_for_live_ram(
                 by_optims, claimants, private_mb_override=private_mb,

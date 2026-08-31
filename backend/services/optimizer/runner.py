@@ -316,6 +316,7 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
         _safe_clear_fast_lookup,
         _should_build_fast_lookup,
     )
+    from services.fast_lookup import clear_fast_lookup
 
     index = payload.get("index") or payload.get("symbol") or "NIFTY"
     from_date = _normalize_cache_date(
@@ -327,8 +328,17 @@ def _prepare_market_data(payload: Dict[str, Any], lean: bool = False) -> Dict[st
     logger.info("[OPTIM] _prepare_market_data: index=%r from_date=%r to_date=%r payload_keys=%s",
                 index, from_date, to_date, sorted(payload.keys()))
 
-    # Clear any stale state from a prior task in the same worker.
-    _safe_clear_fast_lookup()
+    # Clear any stale state from a prior task in the same worker, including
+    # the native Rust MarketCache. Without the native clear, a worker that was
+    # recycled by the idle auto-reloader can inherit a stale in-process cache
+    # from a prior job. Forked combo workers inherit the parent's copy-on-write
+    # memory, so every fork gets the bad state → fused cross-index spec builds
+    # fail ("group MIDCPNIFTY built NO specs") because the inherited cache holds
+    # stale or partial symbol data. clear_native=True resets it to a clean slate.
+    try:
+        clear_fast_lookup(clear_native=True)
+    except Exception:
+        pass
     try:
         from base import bulk_clear_options
         bulk_clear_options()
@@ -1024,6 +1034,20 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
     if not meta:
         return
 
+    # Opt-out: skip the (heavy) WOW/MOM prebuild when flagged, per-job via a Redis
+    # key or globally via env. The patchwise/overall SUMMARY sheet is built by a
+    # separate path (summary_workbook.build_summary_workbook), so a caller who only
+    # wants the summary avoids the WOW/MOM iteration over every combo's tradesheet
+    # — the slowest, most memory-hungry part of finalization on a large sweep.
+    try:
+        _r = result_store._redis()
+        if (_r is not None and _r.get(f"optim:{job_id}:skip_wow_mom")) or \
+           os.environ.get("OPTIM_SKIP_WOW_MOM") == "1":
+            logger.info("[OPTIM] WOW/MOM prebuild SKIPPED for %s (opt-out flag set) — summary sheet unaffected", job_id)
+            return
+    except Exception:
+        pass
+
     trades_dir = result_store.get_trades_dir(job_id)
     if not os.path.isdir(trades_dir):
         return
@@ -1305,6 +1329,50 @@ def _prebuild_wow_mom(job_id: str, base_payload: dict, want_patchwise: bool = Tr
                 _json.dump({"rows": _pw_rows}, _fh)
             os.replace(_tmp, _summary_cache)
             logger.info("[OPTIM] patchwise summary pre-built for job %s (%d rows)", job_id[:8], len(_pw_rows))
+            # Persist a COMPLETE patchwise Summary WORKBOOK so the online
+            # /summary.xlsx download survives the Redis TTL (like the zip +
+            # WOW/MOM disk artifacts). combo_columns come from _all_results;
+            # patchwise metrics from _pw_rows; Rules sheet from the live meta.
+            try:
+                from services.optimizer.summary_workbook import build_summary_workbook
+                from services.optimizer.rules_sheet import build_rules_sheet
+                _pw_by_id = {r["combo_id"]: r["summary"] for r in _pw_rows}
+                _full = [{
+                    "combo_id":      r.get("combo_id"),
+                    "combo_label":   r.get("combo_label"),
+                    "combo_columns": r.get("combo_columns"),
+                    "summary":       _pw_by_id.get(r.get("combo_id")) or r.get("summary"),
+                } for r in _all_results if r.get("combo_id") in _pw_by_id]
+                _meta = result_store.get_meta(job_id) or {}
+                _fname = ((_meta.get("zip_naming") or {}).get("level1")
+                          or base_payload.get("filter_label")
+                          or base_payload.get("filter") or None)
+                if str(_fname or "").strip().lower() in ("", "none", "no filter"):
+                    _fname = None
+                _rules = build_rules_sheet(base_payload, _fname)
+                _specs = _meta.get("param_specs") or []
+                if _rules and _specs:
+                    _opt = [["section", f"OPTIMIZED PARAMETERS  ({len(_full)} combinations)"]]
+                    for _sp in _specs:
+                        if not isinstance(_sp, dict) or not _sp.get("path"):
+                            continue
+                        if _sp.get("kind") == "range":
+                            _v = f"{_sp.get('min')} → {_sp.get('max')} step {_sp.get('step')}"
+                        else:
+                            _vals = _sp.get("values") or []
+                            _v = ", ".join(str(x) for x in _vals) + (f"  ({len(_vals)})" if _vals else "")
+                        _opt.append(["kv", str(_sp.get("path")), _v or "—"])
+                    if len(_opt) > 1:
+                        _rules = list(_rules) + [["spacer"]] + _opt
+                _xlsx = build_summary_workbook(_full, [], rules_sheet=_rules)
+                _sx = result_store.patchwise_summary_xlsx_path(job_id)
+                _sx_tmp = _sx + ".building"
+                with open(_sx_tmp, "wb") as _fh:
+                    _fh.write(_xlsx)
+                os.replace(_sx_tmp, _sx)
+                logger.info("[OPTIM] patchwise Summary.xlsx pre-built for job %s (%d rows)", job_id[:8], len(_full))
+            except Exception as _sx_exc:
+                logger.warning("[OPTIM] Summary.xlsx pre-build failed for job %s: %s", job_id[:8], _sx_exc)
         except Exception as exc:
             logger.warning("[OPTIM] patchwise summary pre-build failed for job %s: %s", job_id[:8], exc)
 
@@ -2472,6 +2540,12 @@ def run_optimization(
     process because it needs the ask/tell feedback loop.
     """
     obj = resolve_objective(objective)
+    # Name this job's on-disk trades folder + ZIP + Summary/WOW-MOM xlsx by the
+    # SAME source the download pipeline uses — zip_naming.level1 (the filter name)
+    # — so the backup artifacts on disk match what the download serves. Sourced
+    # from the zip_naming passed in (no Redis); falls back to job_id when there's
+    # no filter name, mirroring the download's own optimize_{job8} fallback.
+    result_store.register_job_slug(job_id, zip_naming)
     # Route a single-index YEARLY-options + FUTURES sweep to the unified-cadence
     # path HERE, in the parent, before any market-data prep or forking. Doing it
     # per-combo inside the child instead flips the payload to multi_index_mode

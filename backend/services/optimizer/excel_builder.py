@@ -89,6 +89,19 @@ def _to_num(v) -> Optional[float]:
         return None
 
 
+def _safe_round(v, ndigits=None):
+    """round() that never raises on inf/nan — returns 0 for non-finite input.
+    Guards the NAV/DD compounding chains: with an unfixed capital-sized % feeding
+    them, the cumulative product can overflow to inf, and Python's round(inf) with
+    no ndigits raises OverflowError, 500-ing the whole download."""
+    try:
+        if v is None or not math.isfinite(float(v)):
+            return 0
+    except (TypeError, ValueError):
+        return 0
+    return round(v, ndigits) if ndigits is not None else round(v)
+
+
 def _parse_date(v) -> Optional[datetime]:
     if isinstance(v, datetime):
         return v
@@ -414,7 +427,17 @@ def _build_key_order(rows: List[Dict], has_midcap: bool = False) -> List[str]:
         # Midcap leg actually carries capital_alloc_pct — otherwise the column is
         # omitted entirely (no blank column), matching how has_buffer/has_straddle
         # gate their columns. Positioned right after Midcap Exit Spot.
-        if any(_to_num(r.get("_cap_total")) for r in rows):
+        # Show Midcap Qty when capital sizing is active. Detect via _cap_total (new
+        # engine) or decimal Qty (old engine — qty = alloc×capital/price is fractional).
+        def _has_cap_sizing():
+            for r in rows:
+                if _to_num(r.get("_cap_total")):
+                    return True
+                q = _to_num(r.get("Qty"))
+                if q and q > 0 and abs(q - round(q)) > 1e-6:
+                    return True
+            return False
+        if _has_cap_sizing():
             _mc_cols.insert(_mc_cols.index("Midcap Exit Spot") + 1, "Midcap Qty")
         order += _mc_cols
     order.append("Exit Reason")
@@ -588,8 +611,8 @@ def _aggregate_trades(rows: List[Dict], has_midcap: bool = False,
             # Live DD divides by the PREVIOUS trade's peak (AV_prev), not this
             # trade's peak — a trade that closes at a new high is still measured
             # against the peak established going into it.
-            lowest_nav = round(prev_cum * (1 + mae / 100) * 100) / 100
-            actual_ldd = round((lowest_nav / prev_peak - 1) * 10000) / 100
+            lowest_nav = _safe_round(prev_cum * (1 + mae / 100) * 100) / 100
+            actual_ldd = _safe_round((lowest_nav / prev_peak - 1) * 10000) / 100
             t["lowestNav"] = lowest_nav
             t["actualLDD"] = actual_ldd
             first_done = True
@@ -1651,8 +1674,8 @@ def _summary_layout(
             peak = max(peak, cumulative)
             mae = p["mae"]
             if mae is not None and prev_peak != 0:
-                lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
-                actual_ldd = round((lowest_nav / prev_peak - 1) * 10000) / 100
+                lowest_nav = _safe_round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
+                actual_ldd = _safe_round((lowest_nav / prev_peak - 1) * 10000) / 100
                 ldds.append(actual_ldd)
             prev_cum = cumulative
             prev_exit_reason = p.get("exitReason") or ""
@@ -1833,7 +1856,7 @@ def _summary_layout(
               bg=_RED_BG, align="C", border=True)
     sink.row_height(r, 18); r += 1
 
-    _kv("Return / MaxDD", f"{car_mdd:.2f}%", r, "A", True, _GREEN_TX if car_mdd >= 0 else _RED_TX); r += 1
+    _kv("Return / MaxDD", f"{car_mdd:.2f}", r, "A", True, _GREEN_TX if car_mdd >= 0 else _RED_TX); r += 1
 
     r += 1
 
@@ -2002,8 +2025,8 @@ def _summary_layout(
     _kv("Avg Actual Live DD",   f"{live_dd_avg:.2f}%", r, "D", False, _RED_TX); r += 1
     _kv("Avg Combined Final MAE" if has_midcap else "Avg Final MAE",
         f"{avg_final_mae:.2f}%", r, "A", False, _RED_TX); r += 1
-    _kv("CAR/MDD (Booked)",     f"{car_mdd:.2f}%",       r, "A", True,  _GREEN_TX if car_mdd     >= 0 else _RED_TX)
-    _kv("CAR/MDD Live",         f"{car_mdd_live:.2f}%",  r, "D", True,  _GREEN_TX if car_mdd_live >= 0 else _RED_TX); r += 1
+    _kv("CAR/MDD (Booked)",     f"{car_mdd:.2f}",       r, "A", True,  _GREEN_TX if car_mdd     >= 0 else _RED_TX)
+    _kv("CAR/MDD Live",         f"{car_mdd_live:.2f}",  r, "D", True,  _GREEN_TX if car_mdd_live >= 0 else _RED_TX); r += 1
 
     r += 1
     _kv("+ve Outlier 1", _fmt_pct(_p1), r, "A", False, _GREEN_TX)
@@ -2445,8 +2468,8 @@ def compute_xlsx_summary_metrics(
                 # Revised rule: every trade (incl. first, prev_cum = 100) anchors
                 # the low to prev_cum * (1 + FinalMAE%); Live DD divides by the
                 # PREVIOUS trade's peak (AV_prev), not this trade's peak.
-                lowest_nav = round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
-                actual_ldd = round((lowest_nav / prev_peak - 1) * 10000) / 100
+                lowest_nav = _safe_round(prev_cum * (1.0 + mae / 100.0) * 100) / 100
+                actual_ldd = _safe_round((lowest_nav / prev_peak - 1) * 10000) / 100
                 ldds.append(actual_ldd)
                 first_done = True
             else:
@@ -2588,18 +2611,130 @@ def _project_rows_for_midcap(rows: List[Dict]) -> List[Dict]:
         # the optimizer's Combined % vs a direct backtest by ~0.003%/trade
         # (~0.03% over a full run) even though the rupee P&L is identical.
         es = _to_num(main.get("Entry Spot")) or 0.0
-        pct = round(net / es * 100.0, 4) if es else 0.0
+        # CAPITAL SIZING: when a FUT leg is capital-sized, net = price_move × qty
+        # (a large ₹ amount). Dividing that by Entry Spot yields an astronomical %
+        # (qty × price%) that blows up the Combined NAV chain to infinity. Instead
+        # express it as % of the leg's deployed capital = Σ over FUT legs of
+        # (leg P&L / (Qty × Entry Price)); Qty × Entry Price == alloc × total.
+        # Detect sizing by a decimal Qty on a FUT leg (or an explicit _cap_total).
+        _cap_pct = None
+        for _l in legs:
+            if str(_l.get("Type") or "").upper() != "FUT":
+                continue
+            _q = _to_num(_l.get("Qty"))
+            _ep = _to_num(_l.get("Entry Price")) or _to_num(_l.get("Entry Spot"))
+            _sized = _to_num(_l.get("_cap_total")) or (_q and abs(_q - round(_q)) > 1e-6)
+            if _sized and _q and _ep:
+                _fp = _to_num(_l.get("FUT P&L")) or 0.0
+                _cap_pct = (_cap_pct or 0.0) + (_fp / (_q * _ep) * 100.0)
+        if _cap_pct is not None:
+            pct = round(_cap_pct, 4)
+        else:
+            pct = round(net / es * 100.0, 4) if es else 0.0
         def _iso(v):
             d = _parse_date(v)
             return d.strftime("%Y-%m-%d") if d else None
+        # The sized FUT leg's Qty. Under V2 (fixed capital per filter segment) this
+        # is FROZEN within a segment and re-derived only at each segment's first
+        # fill — so a change in this value marks a segment boundary. The Midcap V2
+        # anchoring reads it to re-anchor at the SAME boundaries the NIFTY leg used,
+        # independent of whether the download request carried filter_segments.
+        _nq = None
+        for _l in legs:
+            if str(_l.get("Type") or "").upper() == "FUT":
+                _q = _to_num(_l.get("Qty"))
+                if _q:
+                    _nq = _q
+                    break
         out.append({
             "trade_id":      k,
             "entry_date":    _iso(main.get("Entry Date") or main.get("entry_date")),
             "exit_date":     _iso(main.get("Exit Date") or main.get("exit_date")),
             "nifty_pnl":     net,
             "nifty_pnl_pct": pct,
+            "nifty_qty":     _nq,
         })
     return out
+
+
+def heal_midcap_capital_legs(midcap_legs, trade_rows):
+    """Ensure each Midcap leg carries BOTH capital_alloc_pct AND capital_total,
+    deriving whatever is missing from the trade rows. Returns the (possibly
+    patched) midcap_legs list.
+
+    SHARED by the download endpoint and the live /midcap-overlay endpoint so the
+    on-screen backtest grid and the exported Excel size the Midcap leg identically
+    — the two used to diverge because only the download path healed the legs, so
+    Midcap Qty showed in the file but was blank in the results grid.
+
+    Derivation, robust to old/new engine:
+      * capital_total: prefer `_cap_total` stamped on a row (new engine); else
+        reconstruct from a sized FUT row's Qty × Entry Price (== alloc_N × total),
+        assuming a 50/50 split ⇒ total = 2 × that.
+      * capital_alloc_pct (when missing): the remainder of the NIFTY legs'
+        allocations, or 50% when none are known.
+    No-op when the legs already carry both, or nothing can be derived.
+    """
+    if not midcap_legs or not trade_rows:
+        return midcap_legs
+    def _f(v):
+        try: return float(v) if v not in (None, "", "nan") else 0.0
+        except (TypeError, ValueError): return 0.0
+    # NIFTY leg allocation fraction (for both the total derivation and the midcap
+    # remainder). Prefer the engine-stamped _cap_alloc; else infer from the midcap
+    # leg's OWN alloc (nifty = 100% - midcap%). NEVER hard-assume 50/50 — that
+    # broke non-even splits like 40/60 (derived an 8Cr total for a 10Cr bucket).
+    seen = {}
+    for t in trade_rows:
+        lid = t.get("Leg") or 1
+        a = _f(t.get("_cap_alloc"))
+        if a > 0 and lid not in seen:
+            seen[lid] = a
+    nifty_frac = sum(seen.values()) if seen else 0.0            # e.g. 0.40
+    _mc_alloc_pct = next((_f(l.get("capital_alloc_pct")) for l in midcap_legs
+                          if isinstance(l, dict) and _f(l.get("capital_alloc_pct")) > 0), 0.0)
+    if nifty_frac <= 0 and _mc_alloc_pct > 0:
+        nifty_frac = max(0.0, 1.0 - _mc_alloc_pct / 100.0)     # infer from midcap's 60% -> 40%
+
+    derived_total = next((_f(t.get("_cap_total")) for t in trade_rows if _f(t.get("_cap_total")) > 0), 0.0)
+    if derived_total <= 0:
+        fut = next((t for t in trade_rows
+                    if str(t.get("Type","")).upper() == "FUT"
+                    and _f(t.get("Qty")) > 0 and _f(t.get("Qty")) != int(_f(t.get("Qty")))), None) \
+              or next((t for t in trade_rows if str(t.get("Type","")).upper() == "FUT" and _f(t.get("Qty")) > 0), None)
+        if fut:
+            _np = _f(fut.get("Qty")) * (_f(fut.get("Entry Price")) or _f(fut.get("Entry Spot")))  # = nifty_frac x total
+            if _np > 0:
+                # total = nifty_portion / nifty_frac (exact for the real split);
+                # fall back to x2 (50/50) only when the split is truly unknown.
+                derived_total = (_np / nifty_frac) if nifty_frac > 0 else _np * 2
+    if derived_total <= 0:
+        return midcap_legs
+    remainder_pct = max(0.0, 100.0 - nifty_frac * 100) if nifty_frac > 0 else 50.0
+
+    # Infer the sizing CADENCE from the NIFTY leg's own qty pattern when the midcap
+    # leg doesn't carry capital_version. V2 freezes qty per filter segment (fewer
+    # distinct FUT qty than trades); V1 re-derives every trade (distinct == trades).
+    # The midcap leg must mirror the NIFTY leg's cadence — the download stripped
+    # capital_version, so it silently ran V1 and Midcap Qty changed every trade
+    # while NIFTY stayed frozen per segment (the "midcap v2 not freezing" bug).
+    _fut_qtys = [round(_f(t.get("Qty")), 4) for t in trade_rows
+                 if str(t.get("Type","")).upper() == "FUT" and _f(t.get("Qty")) > 0]
+    inferred_version = "v2" if (_fut_qtys and len(set(_fut_qtys)) < len(_fut_qtys)) else "v1"
+
+    out, patched = [], False
+    for l in midcap_legs:
+        if not isinstance(l, dict):
+            out.append(l); continue
+        _l = dict(l)
+        if _f(_l.get("capital_alloc_pct")) <= 0:
+            _l["capital_alloc_pct"] = remainder_pct or 50.0; patched = True
+        if _f(_l.get("capital_total")) <= 0:
+            _l["capital_total"] = derived_total; patched = True
+        if not _l.get("capital_version"):
+            _l["capital_version"] = inferred_version; patched = True
+        out.append(_l)
+    return out if patched else midcap_legs
 
 
 def _apply_capital_weight_to_midcap(result, proj, midcap_legs, filter_segments):
@@ -2646,13 +2781,25 @@ def _apply_capital_weight_to_midcap(result, proj, midcap_legs, filter_segments):
         logger.warning("[MIDCAP_CAP] %d capital-sized Midcap legs; using the first "
                        "leg's factor (summed overlay P&L can't be decomposed).", len(sized))
 
-    # trade_id -> entry date (for v2 filter-segment anchoring).
+    # trade_id -> entry date and NIFTY sized qty (for v2 segment anchoring).
     _entry = {}
+    _nqty = {}
     for p in (proj or []):
+        _tid = str(p.get("trade_id"))
         d = _parse_date(p.get("entry_date"))
         if d is not None:
-            _entry[str(p.get("trade_id"))] = d
+            _entry[_tid] = d
+        _nqty[_tid] = _to_num(p.get("nifty_qty"))
 
+    # v2 needs a per-trade SEGMENT KEY. Two sources, in priority order:
+    #   1) date-based filter segments (if the request carried usable ones), OR
+    #   2) the NIFTY leg's frozen qty: under v2 it re-derives ONLY at each
+    #      segment's first fill, so a change in nifty_qty (in trade order) marks a
+    #      new segment. This mirrors the NIFTY leg's own v2 anchoring EXACTLY and
+    #      is independent of whether filter_segments reached this endpoint — the
+    #      previous code silently degraded to a single anchor (one qty for the
+    #      whole run) whenever they didn't, which is the "midcap v2 not resetting"
+    #      bug. Falls back to 0 (single segment) only when neither source exists.
     _seg = []
     if version == "v2":
         for s in (filter_segments or []):
@@ -2662,25 +2809,46 @@ def _apply_capital_weight_to_midcap(result, proj, midcap_legs, filter_segments):
                 _seg.append((sd, ed))
         _seg.sort()
 
-    def _seg_ix(d):
-        if not _seg or d is None:
+    # nifty-qty-run segment id per trade_id, computed in chronological trade order.
+    _nq_seg = {}
+    if version == "v2" and not _seg:
+        _ordered = sorted(
+            (str(p.get("trade_id")) for p in (proj or [])),
+            key=lambda t: (_entry.get(t) or datetime.max, t),
+        )
+        _sid, _prev_q = -1, object()
+        for _t in _ordered:
+            _q = _nqty.get(_t)
+            if _q is None:
+                # no NIFTY qty (unsized or missing) — keep it in the current run
+                _nq_seg[_t] = max(_sid, 0)
+                continue
+            if _prev_q is None or _q != _prev_q:
+                _sid += 1
+            _nq_seg[_t] = _sid
+            _prev_q = _q
+
+    def _seg_key(tid):
+        if version != "v2":
             return 0
-        for i, (a, b) in enumerate(_seg):
-            if a <= d <= b:
-                return i
-        return -1
+        if _seg:
+            d = _entry.get(tid)
+            if d is not None:
+                for i, (a, b) in enumerate(_seg):
+                    if a <= d <= b:
+                        return i
+            return -1
+        return _nq_seg.get(tid, 0)
 
     # v2 anchor price per segment: first available Midcap entry in that segment,
-    # in trade order.
+    # in chronological trade order (so the anchor is the segment's FIRST entry).
     _anchor = {}
     if version == "v2":
-        for rr in rows:
-            if not rr.get("available"):
-                continue
-            me = _to_num(rr.get("Midcap Entry Spot"))
-            if not me:
-                continue
-            _anchor.setdefault(_seg_ix(_entry.get(str(rr.get("trade_id")))), me)
+        for rr in sorted(
+            (r for r in rows if r.get("available") and _to_num(r.get("Midcap Entry Spot"))),
+            key=lambda r: (_entry.get(str(r.get("trade_id"))) or datetime.max, str(r.get("trade_id"))),
+        ):
+            _anchor.setdefault(_seg_key(str(rr.get("trade_id"))), _to_num(rr.get("Midcap Entry Spot")))
 
     for rr in rows:
         if not rr.get("available"):
@@ -2688,7 +2856,7 @@ def _apply_capital_weight_to_midcap(result, proj, midcap_legs, filter_segments):
         me = _to_num(rr.get("Midcap Entry Spot"))
         if not me:
             continue
-        anchor_px = _anchor.get(_seg_ix(_entry.get(str(rr.get("trade_id")))), me) if version == "v2" else me
+        anchor_px = _anchor.get(_seg_key(str(rr.get("trade_id"))), me) if version == "v2" else me
         if not anchor_px:
             continue
         qty = alloc * total / anchor_px

@@ -8,7 +8,8 @@ Key layout:
     optim:{job_id}:results          — list of compact JSON rows, one per combo
     optim:{job_id}:parquet_path     — set if results were spilled to disk
 
-TTL: 24 hours by default.
+TTL: 48 hours by default (safety window for jobs not yet backed up; the
+auto-save sidecar purges a job's keys immediately once it's copied to SMB).
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ def _resolve_redis_params():
 
 
 REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD = _resolve_redis_params()
-OPTIM_TTL = int(os.getenv("OPTIMIZE_RESULT_TTL", "86400"))
+OPTIM_TTL = int(os.getenv("OPTIMIZE_RESULT_TTL", "172800"))  # 48h safety window (was 24h)
 OPTIM_SPILL_THRESHOLD = int(os.getenv("OPTIMIZE_PARQUET_SPILL_AT", "10000"))
 OPTIM_PARQUET_DIR = os.getenv("OPTIMIZE_PARQUET_DIR", "/data/cache/optim_results")
 
@@ -144,11 +145,68 @@ def prune_zip_cache(max_gb: float = None) -> int:
     return freed
 
 
+# --- Descriptive on-disk naming ------------------------------------------
+# The per-job trades folder and ZIP are named "{combo_label}__{job8}" instead
+# of the raw job UUID, using the SAME backend labeling code that names the
+# per-combo .xlsx files (combo_labeler.label_combo + safe_filename). The name
+# is computed ONCE from the base payload at job start and written to a tiny
+# on-disk slug registry under the shared /data volume — so every process
+# (worker that writes, backend that serves the download) resolves the same
+# path with NO Redis lookup, and it survives Redis meta TTL expiry. Jobs with
+# no slug file (legacy, or pre-registration) fall back to the raw job_id, so
+# existing caches keep resolving.
+import re as _re
+_SLUG_DIR = os.path.join(
+    os.getenv("OPTIMIZE_TRADES_DIR", "/data/cache/optim_trades"), ".slugs")
+# Mirror routers/optimize.py _safe_zip_name: strip only path-illegal chars.
+_UNSAFE_ZIP_RE = _re.compile(r'[/\\:*?"<>|]')
+
+
+def register_job_slug(job_id: str, zip_naming: Optional[Dict[str, Any]] = None) -> str:
+    """Compute & persist this job's on-disk dir/file name. Call once at start.
+
+    Uses the SAME source the download pipeline names artifacts from —
+    `zip_naming['level1']` (the frontend filter name) — so the saved folder,
+    ZIP, Summary.xlsx and WOW/MOM xlsx match what the download serves. Sourced
+    from the zip_naming passed into run_optimization (NOT Redis). Falls back to
+    the raw job_id when there is no filter name (mirrors the download's own
+    `optimize_{job8}` fallback)."""
+    name = job_id
+    try:
+        # Sanitize exactly like the download pipeline's _safe_zip_name
+        # (routers/optimize.py) — strip only path-illegal chars, PRESERVE spaces —
+        # so the on-disk name matches the served filename's descriptive part.
+        level1 = _UNSAFE_ZIP_RE.sub('_', str((zip_naming or {}).get("level1") or "").strip())
+        if level1:
+            name = f"{level1}__{job_id[:8]}"
+    except Exception:
+        pass
+    try:
+        os.makedirs(_SLUG_DIR, exist_ok=True)
+        with open(os.path.join(_SLUG_DIR, job_id), "w") as fh:
+            fh.write(name)
+    except Exception:
+        pass
+    return name
+
+
+def _job_dir_name(job_id: str) -> str:
+    """Resolve a job's descriptive dir name (slug registry), else raw job_id."""
+    try:
+        with open(os.path.join(_SLUG_DIR, job_id)) as fh:
+            n = fh.read().strip()
+            if n:
+                return n
+    except Exception:
+        pass
+    return job_id
+
+
 def zip_cache_path(job_id: str, patchwise: bool = False) -> str:
     """Canonical path for a job's pre-built ZIP file."""
     os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
     ver = f"{ZIP_BUILDER_VERSION}-pw" if patchwise else ZIP_BUILDER_VERSION
-    return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ver}.zip")
+    return os.path.join(ZIP_CACHE_DIR, f"{_job_dir_name(job_id)}.{ver}.zip")
 
 
 # Bumped on its own when only the WOW/MOM grid LAYOUT changes, so those
@@ -205,7 +263,7 @@ def wow_mom_cache_path(job_id: str, patchwise: bool = False) -> str:
     suffix = "-pw" if patchwise else ""
     return os.path.join(
         ZIP_CACHE_DIR,
-        f"{job_id}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.xlsx",
+        f"{_job_dir_name(job_id)}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.xlsx",
     )
 
 
@@ -223,7 +281,7 @@ def wow_mom_parts_zip_path(job_id: str, patchwise: bool = False) -> str:
     suffix = "-pw" if patchwise else ""
     return os.path.join(
         ZIP_CACHE_DIR,
-        f"{job_id}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.parts.zip",
+        f"{_job_dir_name(job_id)}.{ZIP_BUILDER_VERSION}-{WOW_MOM_LAYOUT_VERSION}{suffix}.parts.zip",
     )
 
 
@@ -299,7 +357,15 @@ def ensure_xlsx_version(job_id: str) -> int:
 def patchwise_summary_cache_path(job_id: str) -> str:
     """Canonical path for a job's pre-built patchwise summary JSON file."""
     os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
-    return os.path.join(ZIP_CACHE_DIR, f"{job_id}.{ZIP_BUILDER_VERSION}-pw-summary.json")
+    return os.path.join(ZIP_CACHE_DIR, f"{_job_dir_name(job_id)}.{ZIP_BUILDER_VERSION}-pw-summary.json")
+
+
+def patchwise_summary_xlsx_path(job_id: str) -> str:
+    """Canonical path for a job's pre-built patchwise Summary WORKBOOK, persisted
+    at finalize so /summary.xlsx survives the Redis TTL (mirrors the zip + WOW/MOM
+    on-disk artifacts)."""
+    os.makedirs(ZIP_CACHE_DIR, exist_ok=True)
+    return os.path.join(ZIP_CACHE_DIR, f"{_job_dir_name(job_id)}.{ZIP_BUILDER_VERSION}-pw-Summary.xlsx")
 
 
 _client: Optional[redis.Redis] = None
@@ -765,7 +831,7 @@ OPTIM_TRADES_DIR = os.getenv("OPTIMIZE_TRADES_DIR", "/data/cache/optim_trades")
 
 
 def get_trades_dir(job_id: str) -> str:
-    return os.path.join(OPTIM_TRADES_DIR, job_id)
+    return os.path.join(OPTIM_TRADES_DIR, _job_dir_name(job_id))
 
 
 def mark_job_access(job_id: str) -> None:

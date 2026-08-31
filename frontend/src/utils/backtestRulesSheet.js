@@ -67,6 +67,11 @@ function _strikeLabel(ss, optType) {
     // backtest workbook and an optim combo workbook read the same.
     return `Relative to Leg ${_num(ss.ref_leg ?? 1)} Premium, ÷ weeks to expiry ÷ lots`;
   }
+  if (type === 'DELTA') {
+    // Wording kept identical to backend/services/optimizer/rules_sheet.py.
+    const delta = ss.delta ?? 0.3;
+    return `Delta: ${_num(delta)} (${_num(Number(delta) * 100)}Δ, closest actual EOD delta)`;
+  }
   if (type.startsWith('TIME_VALUE')) {
     const op = type === 'TIME_VALUE_GTE' ? '>=' : type === 'TIME_VALUE_LTE' ? '<=' : 'nearest';
     const side = String(ss.moneyness || 'ATM').toUpperCase();
@@ -303,6 +308,42 @@ export function buildRulesSheet(payload, filterName) {
     push('Filter', `Per-leg (${_perLegFilterCount} leg${_perLegFilterCount === 1 ? '' : 's'} filtered — see leg sections below)`);
   } else {
     push('Filter', 'No Filter');
+  }
+
+  // ── Capital-weighted sizing (opt-in; futures-only) ────────────────────────
+  // Emitted only when sizing is enabled with a capital bucket, so ordinary runs
+  // are unchanged. Documents the exact inputs behind the Qty / Midcap Qty
+  // columns: bucket, cadence, and each sized leg's allocation %.
+  const _cs = payload.capital_sizing;
+  const _legsForSizing = Array.isArray(payload.legs) ? payload.legs : [];
+  const _mcForSizing = Array.isArray(payload.midcap_legs) ? payload.midcap_legs : [];
+  const _totalCap = Number(_cs?.total_capital)
+    || Number(_mcForSizing.find(l => Number(l?.capital_total) > 0)?.capital_total)
+    || 0;
+  const _anyAlloc = _legsForSizing.some(l => Number(l?.capital_alloc_pct) > 0)
+    || _mcForSizing.some(l => Number(l?.capital_alloc_pct) > 0);
+  if ((_cs?.enabled || _anyAlloc) && _totalCap > 0) {
+    rows.push(['section', 'Capital Sizing']);
+    push('Enabled', 'Yes (capital-weighted quantity — futures only)');
+    push('Total Capital', `₹${_totalCap.toLocaleString('en-IN')}`);
+    const _ver = String(_cs?.version || _mcForSizing.find(l => l?.capital_version)?.capital_version || 'v1').toLowerCase();
+    push('Re-size Cadence', _ver === 'v2' ? 'V2 — filter-segment end only' : 'V1 — every rollover');
+    push('Qty Basis', 'alloc% × capital ÷ entry price (decimal, no lot size; fixed capital, no compounding)');
+    _legsForSizing.forEach((l, i) => {
+      const a = Number(l?.capital_alloc_pct);
+      if (a > 0) {
+        const bucket = _totalCap * a / 100;
+        push(`Leg ${i + 1} Allocation`, `${_num(a)}%  (bucket ₹${bucket.toLocaleString('en-IN', { maximumFractionDigits: 0 })})`);
+      }
+    });
+    _mcForSizing.forEach((l, i) => {
+      const a = Number(l?.capital_alloc_pct);
+      if (a > 0) {
+        const bucket = _totalCap * a / 100;
+        push(`Midcap Leg ${i + 1} Allocation`, `${_num(a)}%  (bucket ₹${bucket.toLocaleString('en-IN', { maximumFractionDigits: 0 })})`);
+      }
+    });
+    rows.push(['spacer']);
   }
 
   rows.push(['spacer']);
