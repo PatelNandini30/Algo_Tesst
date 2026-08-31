@@ -644,6 +644,17 @@ def _worker_entrypoint(
             and _skip_ts_job_total is not None
             and _skip_ts_job_total > _skip_ts_threshold
         )
+        # WOW/MOM skip — SAME threshold as tradesheets (user rule: above the
+        # limit a sweep produces neither the tradesheets ZIP nor WOW/MOM, only
+        # the Summary). Skips the per-combo WOW/MOM compute + on-disk store; the
+        # merged workbook + download are refused in routers/optimize.py on the
+        # same total, so nothing tries to read what we never wrote. NOT tied to
+        # the static OPTIMIZE_SKIP_TRADESHEETS flag (that is tradesheet-only).
+        _skip_wm = (
+            _skip_ts_threshold > 0
+            and _skip_ts_job_total is not None
+            and _skip_ts_job_total > _skip_ts_threshold
+        )
 
         done = 0
         failures = 0
@@ -679,8 +690,10 @@ def _worker_entrypoint(
                     _has_mc = bool(flat_summary.get("has_midcap"))
                     # _has_mc already came from the Rust summary — keep it as the
                     # authority and only let the cleaned build confirm it.
-                    _wm_over, _wm_pw, _has_mc = _inline_wm(
-                        trades_df, _has_mc, "rust-mode", starting_combo_id + i)
+                    _wm_over = _wm_pw = None
+                    if not _skip_wm:
+                        _wm_over, _wm_pw, _has_mc = _inline_wm(
+                            trades_df, _has_mc, "rust-mode", starting_combo_id + i)
                 else:
                     optim_extra = compute_optim_metrics(trades_df, summary)
                     flat_summary = {**summary, **optim_extra}
@@ -720,8 +733,11 @@ def _worker_entrypoint(
                             _summary_pw = None
                     # WOW/MOM data, computed OUTSIDE the _INLINE_FINALIZE gate (see
                     # _inline_wm) so the finalize pass never rebuilds it from CSV.
-                    _wm_over, _wm_pw, _has_mc = _inline_wm(trades_df, _has_mc, "inline",
-                                                  starting_combo_id + i)
+                    # Skipped above the combo threshold — the download is refused
+                    # there, so this data would never be read (stays None from above).
+                    if not _skip_wm:
+                        _wm_over, _wm_pw, _has_mc = _inline_wm(trades_df, _has_mc, "inline",
+                                                      starting_combo_id + i)
                 _p = _pm("metrics", _p)
                 labels = label_combo(merged)
                 _combo_id = _orig_id if _orig_id is not None else starting_combo_id + i
@@ -765,8 +781,8 @@ def _worker_entrypoint(
                     # Redis against a 500 MB maxmemory. `wm_on_disk` tells the
                     # finalizer to load it from there instead of rebuilding from
                     # CSV, so the fast path survives without the memory cost.
-                    "wm_on_disk": result_store.write_combo_wm(
-                        job_id, combo_label_safe, _wm_over, _wm_pw),
+                    "wm_on_disk": (False if _skip_wm else result_store.write_combo_wm(
+                        job_id, combo_label_safe, _wm_over, _wm_pw)),
                     "has_midcap": bool(_has_mc),
                     "inline_finalized": _summary_pw is not None,
                     "objective_value": obj.extract(flat_summary),

@@ -1042,6 +1042,17 @@ async def get_download_base(job_id: str):
     return {"download_base": _download_base_for_job(job_id)}
 
 
+def _large_sweep_skip(meta: dict) -> int:
+    """Return the combo threshold (>0) when this job is a 'large sweep' whose
+    per-combo tradesheets + WOW/MOM were skipped at compute time
+    (OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS in parallel.py), else 0. Same env +
+    job total the worker gates on, so a download refuses to build an artifact
+    that was never produced (instead of silently returning an empty one)."""
+    threshold = int(os.environ.get("OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS", "0") or "0")
+    total = int((meta or {}).get("total") or 0)
+    return threshold if (threshold > 0 and total > threshold) else 0
+
+
 @router.get("/optimize/jobs/{job_id}/tradesheets.zip")
 async def download_tradesheets_zip(request: Request, job_id: str, patchwise: bool = Query(True)):
     """
@@ -1073,6 +1084,15 @@ async def download_tradesheets_zip(request: Request, job_id: str, patchwise: boo
         raise HTTPException(
             status_code=400,
             detail=f"Job is not complete (status: {meta.get('status')})",
+        )
+
+    _skip_n = _large_sweep_skip(meta)
+    if _skip_n:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Per-combo tradesheets are not generated for sweeps above "
+                    f"{_skip_n} combos (this job has {meta.get('total')}). "
+                    f"Download the Summary instead, or re-run a smaller sweep."),
         )
 
     trades_dir = result_store.get_trades_dir(job_id)
@@ -1352,6 +1372,15 @@ async def download_wow_mom(request: Request, job_id: str, patchwise: bool = Quer
         raise HTTPException(status_code=404, detail="Job not found")
     if meta.get("status") != "success":
         raise HTTPException(status_code=400, detail=f"Job is not complete (status: {meta.get('status')})")
+
+    _skip_n = _large_sweep_skip(meta)
+    if _skip_n:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"WOW/MOM is not generated for sweeps above {_skip_n} combos "
+                    f"(this job has {meta.get('total')}). Download the Summary instead, "
+                    f"or re-run a smaller sweep."),
+        )
 
     zip_naming = meta.get("zip_naming") or {}
     lvl1 = _safe_zip_name(zip_naming.get("level1", "")) if zip_naming else ""

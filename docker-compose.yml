@@ -386,6 +386,10 @@ services:
       # to run. Keep the two services in step.
       OPTIMIZE_MAX_COMBOS: "250000"
       OPTIMIZE_MAX_RAW_COMBOS: "1000000"
+      # MUST mirror worker-optimize: the tradesheets.zip / wow_mom.xlsx download
+      # endpoints (routers/optimize.py) read this HERE to refuse building an
+      # artifact the worker skipped above the threshold. Keep the two in step.
+      OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS: "5000"
     user: "0:0"
     volumes: *backend-volumes
     depends_on:
@@ -742,6 +746,13 @@ services:
       # enriched later, causing the two summaries to disagree.
       OPTIMIZE_SKIP_MAE_MFE: "0"
       OPTIMIZE_SKIP_TRADESHEETS: "0"
+      # Above this many combos a sweep produces NEITHER the per-combo tradesheets
+      # ZIP nor WOW/MOM — only the Summary. Saves the per-combo tradesheet/WOW-MOM
+      # writes and the (OOM-prone) merged-workbook build on huge sweeps. The
+      # backend service mirrors this so the download endpoints refuse to build
+      # what the worker skipped. 0 = off. Per-combo sheets can be rebuilt on
+      # demand from raw trades.
+      OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS: "5000"
       FAST_LOOKUP_RANGE_FILTER: "0"
       # Fork-safe threading for the optimizer worker.
       # POLARS_MAX_THREADS=1: keep Polars single-threaded in the parent so
