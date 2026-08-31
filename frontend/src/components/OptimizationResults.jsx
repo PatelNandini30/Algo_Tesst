@@ -220,6 +220,13 @@ export default function OptimizationResults({
   const total = meta?.total ?? totalCombos ?? 0;
   const progressPct = total > 0 ? Math.round((done / total) * 100) : 0;
   const status = meta?.status || jobStatus || 'queued';
+  // Above this combo count the backend skips per-combo tradesheets + WOW/MOM
+  // (only the Summary is produced) — the ZIP / WOW-MOM endpoints return 409.
+  // Mirror it here so the two buttons are disabled with an explanation instead
+  // of erroring on click. MUST match OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS.
+  const SKIP_ARTIFACTS_ABOVE_COMBOS = 5000;
+  const artifactsSkipped = total > SKIP_ARTIFACTS_ABOVE_COMBOS;
+  const artifactsSkippedNote = `Not generated for sweeps above ${SKIP_ARTIFACTS_ABOVE_COMBOS.toLocaleString()} combos — download the Summary (Export XLSX) instead.`;
 
   // Free the optimizer worker if the user closes the tab, hard-refreshes, or
   // navigates away mid-run. `pagehide` covers close/refresh/navigation but not a
@@ -548,19 +555,21 @@ export default function OptimizationResults({
               </button>
             <button
               onClick={downloadWowMom}
-              disabled={rows.length === 0 || status !== 'success'}
-              title={`Download the merged WOW/MOM summary for all combos (${jobDownloadIsPatchwise ? 'Patchwise DD' : 'Overall System DD'})`}
+              disabled={rows.length === 0 || status !== 'success' || artifactsSkipped}
+              title={artifactsSkipped
+                ? artifactsSkippedNote
+                : `Download the merged WOW/MOM summary for all combos (${jobDownloadIsPatchwise ? 'Patchwise DD' : 'Overall System DD'})`}
               style={{
                 padding: '6px 12px',
                 fontSize: 11,
                 border: '1px solid var(--border-strong, #d1d5db)',
                 borderRadius: 6,
                 background: 'transparent',
-                cursor: (rows.length === 0 || status !== 'success') ? 'not-allowed' : 'pointer',
+                cursor: (rows.length === 0 || status !== 'success' || artifactsSkipped) ? 'not-allowed' : 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 6,
-                opacity: (rows.length === 0 || status !== 'success') ? 0.4 : 1,
+                opacity: (rows.length === 0 || status !== 'success' || artifactsSkipped) ? 0.4 : 1,
               }}
             >
               <Download size={12} /> WOW & MOM ({jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'})
@@ -568,25 +577,27 @@ export default function OptimizationResults({
             <div style={{ position: 'relative' }}>
               <button
                 onClick={() => downloadTradesheets(jobDownloadIsPatchwise)}
-                disabled={status !== 'success' || rows.length === 0 || zipDownloading}
+                disabled={status !== 'success' || rows.length === 0 || zipDownloading || artifactsSkipped}
                 style={{
                   padding: '6px 12px',
                   fontSize: 11,
                   border: '1px solid var(--border-strong, #d1d5db)',
                   borderRadius: 6,
                   background: 'transparent',
-                  cursor: (status !== 'success' || rows.length === 0 || zipDownloading) ? 'not-allowed' : 'pointer',
+                  cursor: (status !== 'success' || rows.length === 0 || zipDownloading || artifactsSkipped) ? 'not-allowed' : 'pointer',
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 6,
-                  opacity: (status !== 'success' || rows.length === 0) ? 0.4 : 1,
+                  opacity: (status !== 'success' || rows.length === 0 || artifactsSkipped) ? 0.4 : 1,
                 }}
                 title={
-                  status !== 'success'
-                    ? 'Available after run completes'
-                    : zipDownloading
-                      ? 'ZIP is being built…'
-                      : `Download all tradesheets as ZIP (${jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'} DD — chosen at launch)`
+                  artifactsSkipped
+                    ? artifactsSkippedNote
+                    : status !== 'success'
+                      ? 'Available after run completes'
+                      : zipDownloading
+                        ? 'ZIP is being built…'
+                        : `Download all tradesheets as ZIP (${jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'} DD — chosen at launch)`
                 }
               >
                 <Download size={12} />
@@ -597,6 +608,11 @@ export default function OptimizationResults({
                   : `Download Tradesheets ZIP (${jobDownloadIsPatchwise ? 'Patchwise' : 'Overall'})`}
               </button>
             </div>
+            {artifactsSkipped && status === 'success' && (
+              <span style={{ fontSize: 10, color: 'var(--text-muted, #6b7280)', maxWidth: 260, lineHeight: 1.3 }}>
+                {artifactsSkippedNote}
+              </span>
+            )}
             {(status === 'running' || status === 'queued') && (
               <button
                 onClick={cancelJob}
