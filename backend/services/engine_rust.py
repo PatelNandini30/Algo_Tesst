@@ -6219,19 +6219,20 @@ def _relprem_pick_strike(
     that spot-adjusts mid-cycle re-picks by the same rule instead of falling
     back to ATM. Returns None when the chain has no qualifying strike.
 
-    use_tv=True: compare by time value (close - intrinsic) instead of premium.
-    Rank by |value-target|, then |strike-atm|, then CE-prefers-higher.
+    The child strike is ALWAYS matched by PREMIUM. The TV basis
+    (rel_ref_mode=tv) only changes the REFERENCE/target — Leg 1's time value ÷ N,
+    stripped in _apply_rel_leg_premium_to_specs — after which the child is picked
+    so its own PREMIUM ≈ target (user spec 2026-08: "select premium, not TV").
+    `use_tv`/`entry_spot` are kept for call-site compatibility but no longer alter
+    candidate scoring. Rank by |premium-target|, then |strike-atm|, then CE-prefers-higher.
     """
     import algotest_native  # type: ignore
     chain = _strikes_for_date_tolerant(
         algotest_native, entry_iso, index_up, child_expiry, "CE" if is_ce else "PE")
     # On-grid AND tradeable only. Tradeable is filtered UP FRONT (not after the
-    # ranking) so a stale-close strike's fabricated premium/TV can't sit in the
+    # ranking) so a stale-close strike's fabricated premium can't sit in the
     # ordering at all.
     def _val(k: float, p: float) -> float:
-        if use_tv and entry_spot > 0:
-            intrinsic = max((entry_spot - k) if is_ce else (k - entry_spot), 0.0)
-            return p - intrinsic
         return p
     cands = [
         (k, _val(k, p)) for (k, p) in chain

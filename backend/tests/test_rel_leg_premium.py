@@ -244,6 +244,39 @@ class TestChainFilters(unittest.TestCase):
         self.assertEqual(child["requested_strike"], child["strike"])
 
 
+class TestTvModeSelectsByPremium(unittest.TestCase):
+    """TV basis derives the target from the REFERENCE leg's time value, but the
+    CHILD strike is chosen by its own PREMIUM — not its own time value.
+    Regression for the 2026-08 change: a high target used to land on the ATM
+    strike (highest time value); it must now land on the ITM strike whose
+    PREMIUM equals the target."""
+
+    @staticmethod
+    def _stub_chain(chain):
+        import types as _t
+        st = _t.ModuleType("algotest_native")
+        st.get_strikes_for_date = lambda d, i, e, ot: sorted(chain.items())
+        st.get_option_price_tradeable = lambda d, i, s, ot, e: chain.get(float(s))
+        return st
+
+    def test_child_picked_by_premium_not_time_value(self):
+        # CE child, spot 17500. ITM strikes carry premium >> their time value:
+        #   17400 prem 160 (intrinsic 100, TV 60) | 17500 prem 108 (TV 108).
+        # target 160 -> premium match = 17400; a time-value match would pick 17500
+        # (TV 108, the nearest TV to 160). Assert the premium match wins.
+        chain = {17300.0: 210.0, 17400.0: 160.0, 17500.0: 108.0,
+                 17600.0: 60.0, 17700.0: 30.0}
+        prev = sys.modules.get("algotest_native")
+        sys.modules["algotest_native"] = self._stub_chain(chain)
+        try:
+            picked = E._relprem_pick_strike(
+                "2022-08-04", "NIFTY", True, "2022-08-11",
+                100.0, 160.0, 17500.0, use_tv=True, entry_spot=17500.0)
+        finally:
+            sys.modules["algotest_native"] = prev
+        self.assertEqual(picked, 17400.0)
+
+
 class TestSymmetry(unittest.TestCase):
     def test_shorter_ref_multiplies_instead_of_dividing(self):
         """Weekly ref under a monthly child: N becomes a multiplier, not a divisor."""
