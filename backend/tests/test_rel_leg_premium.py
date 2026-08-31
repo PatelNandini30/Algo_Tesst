@@ -277,6 +277,53 @@ class TestTvModeSelectsByPremium(unittest.TestCase):
         self.assertEqual(picked, 17400.0)
 
 
+class TestLockedFreezesDivisor(unittest.TestCase):
+    """Locked freezes the ÷N divisor at the lock date: two child rolls sharing one
+    reference contract get an IDENTICAL N and target; MTM lets N shrink week to week.
+    Regression for the 2026-08 change — before it, only the premium was locked and
+    N stayed live, so the locked target still drifted (100÷4 → 100÷3 → …)."""
+
+    @staticmethod
+    def _two_child_rolls():
+        # One monthly PE reference (leg 2, 17150 / 25-Aug) entered on two weeks;
+        # a weekly CE child (leg 3) each week. Same ref contract both weeks.
+        def trade(tid, entry, child_exp):
+            common = {"trade_id": tid, "index": "NIFTY", "entry_date": entry, "exit_date": child_exp}
+            return [
+                dict(common, leg_id=2, expiry="2022-08-25", strike=17150.0, option_type="PE"),
+                dict(common, leg_id=3, expiry=child_exp, strike=17400.0, option_type="CE"),
+            ]
+        return trade(1, "2022-08-04", "2022-08-11") + trade(2, "2022-08-11", "2022-08-18")
+
+    def _run_mode(self, mode):
+        payload = _payload()
+        payload["legs"][2]["strike_selection"]["rel_ref_mode"] = mode
+        out = E._apply_rel_leg_premium_to_specs(
+            self._two_child_rolls(), payload, E._relprem_legs(payload), 65)
+        return {s["trade_id"]: s for s in out if s["leg_id"] == 3}
+
+    def test_mtm_divisor_shrinks_across_weeks(self):
+        mtm = self._run_mode("premium")
+        # week 1 entry 04-Aug -> 25-Aug = 21d/7 = 3.0 ; week 2 entry 11-Aug = 14d/7 = 2.0
+        self.assertAlmostEqual(mtm[1]["rel_leg_premium_n"], 3.0, places=2)
+        self.assertAlmostEqual(mtm[2]["rel_leg_premium_n"], 2.0, places=2)
+
+    def test_locked_freezes_divisor_and_target(self):
+        locked = self._run_mode("premium_locked")
+        # both rolls anchor N at the lock date (04-Aug) -> N = 3.0 for both
+        self.assertAlmostEqual(locked[1]["rel_leg_premium_n"], 3.0, places=2)
+        self.assertAlmostEqual(locked[2]["rel_leg_premium_n"], 3.0, places=2)
+        # premium constant (stub) + N frozen -> identical target -> identical strike
+        self.assertEqual(locked[1]["rel_leg_premium_target"], locked[2]["rel_leg_premium_target"])
+        self.assertEqual(locked[1]["strike"], locked[2]["strike"])
+
+    def test_tv_locked_also_freezes_divisor(self):
+        """tv_locked must freeze N too (the alignment: endswith('_locked'))."""
+        tvl = self._run_mode("tv_locked")
+        self.assertAlmostEqual(tvl[1]["rel_leg_premium_n"], 3.0, places=2)
+        self.assertAlmostEqual(tvl[2]["rel_leg_premium_n"], 3.0, places=2)
+
+
 class TestSymmetry(unittest.TestCase):
     def test_shorter_ref_multiplies_instead_of_dividing(self):
         """Weekly ref under a monthly child: N becomes a multiplier, not a divisor."""

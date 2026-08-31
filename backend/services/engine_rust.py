@@ -6123,7 +6123,12 @@ def _apply_rel_leg_premium_to_specs(
         else:
             longer_exp = child_expiry
             longer_type, shorter_type = child_leg.get("expiry"), ref_leg.get("expiry")
-        n = _relprem_weeks_remaining(entry_iso, longer_exp, shorter_type)
+        # LOCKED also freezes N: anchor it at the lock date (_prem_date), not the
+        # child's live weekly entry, so the whole target = premium ÷ N is held flat
+        # across the cycle and re-derives only when the ref re-locks (rollover /
+        # adjustment / strike change). _prem_date == entry_iso in non-locked modes,
+        # so MTM/premium/tv stay byte-identical.
+        n = _relprem_weeks_remaining(_prem_date, longer_exp, shorter_type)
         if n <= 0:
             continue
         time_scale = (1.0 / n) if ref_expiry >= child_expiry else n
@@ -6369,7 +6374,7 @@ def _apply_relprem_from_adjusted(
         # (N no longer depends on the entry date; it's the ref contract's full
         # cycle.) Resets naturally when ref gets a new entry (rollover, spot-adj,
         # patch reset) because _ref_at then returns a different refinfo.
-        _locked = str(sel.get("rel_ref_mode") or "premium").lower() == "premium_locked"
+        _locked = str(sel.get("rel_ref_mode") or "premium").lower().endswith("_locked")
         _prem_date = ref_entry_iso if _locked else entry_iso
 
         try:
@@ -6390,7 +6395,8 @@ def _apply_relprem_from_adjusted(
         else:
             longer_exp = child_expiry
             longer_type, shorter_type = child_leg.get("expiry"), ref_leg.get("expiry")
-        weeks = _relprem_weeks_remaining(entry_iso, longer_exp, shorter_type)
+        # LOCKED freezes N too — anchor at the lock date (_prem_date); see initial pass.
+        weeks = _relprem_weeks_remaining(_prem_date, longer_exp, shorter_type)
         if weeks <= 0:
             out.append(s)
             continue
