@@ -623,6 +623,28 @@ def _worker_entrypoint(
                 return None, None, has_mc
             return wm_over, wm_pw, bool(found_mc)
 
+        # Tradesheet skip decision — computed ONCE per worker, not per combo.
+        # Dynamic on the job's own total combo count (not a per-worker chunk
+        # size, which would vary): OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS lets
+        # large sweeps skip the expensive per-combo CSV/XLSX write (profiled at
+        # ~300ms/combo, and a real source of disk-I/O contention at high fork
+        # widths) while small sweeps keep full tradesheets. 0 (default) means
+        # "no threshold" — falls back to the static OPTIMIZE_SKIP_TRADESHEETS
+        # flag only.
+        _skip_ts_static = os.environ.get("OPTIMIZE_SKIP_TRADESHEETS", "0").strip().lower() in ("1", "true", "yes")
+        _skip_ts_threshold = int(os.environ.get("OPTIMIZE_SKIP_TRADESHEETS_ABOVE_COMBOS", "0") or "0")
+        _skip_ts_job_total = None
+        if _skip_ts_threshold > 0:
+            try:
+                _skip_ts_job_total = (result_store.get_meta(job_id) or {}).get("total")
+            except Exception:
+                _skip_ts_job_total = None
+        _skip_ts = _skip_ts_static or (
+            _skip_ts_threshold > 0
+            and _skip_ts_job_total is not None
+            and _skip_ts_job_total > _skip_ts_threshold
+        )
+
         done = 0
         failures = 0
         first_error = None
@@ -757,7 +779,6 @@ def _worker_entrypoint(
                 result_store.append_result(job_id, row)
                 result_store.increment_done(job_id)
                 _p = _pm("redis_write", _p)
-                _skip_ts = os.environ.get("OPTIMIZE_SKIP_TRADESHEETS", "0").strip().lower() in ("1", "true", "yes")
                 if not _skip_ts and not trades_df.empty:
                     result_store.write_combo_tradesheet(job_id, combo_label_safe, trades_df)
                     _p = _pm("csv_write", _p)
