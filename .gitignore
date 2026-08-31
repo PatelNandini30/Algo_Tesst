@@ -29,3 +29,19 @@ remote-worker/.env
 
 # Persisted ./start.sh --optimize preference (local, per-box)
 .start-optimize
+
+# --- Generated / non-source artifacts: NEVER commit (they broke pushes: a
+# 4.4 GB zip in downloads/ exceeded GitHub's 100 MB blob limit → HTTP 500). ---
+# Optimizer/backtest output ZIPs, xlsx and data dumps (multi-GB).
+downloads/
+# AI assistant transcripts — notes, not source.
+claude_conversation/
+codex-session-*.md
+codex_conversation/
+# Runtime logs.
+*.log
+# Local scratch / debug scripts and backups.
+backend/gop*.py
+backend/ovdbg*.py
+*.bak_*
+ai-skills-pack-main/
