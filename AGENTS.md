@@ -41,3 +41,13 @@ Rules:
 - Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
 - If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
 - After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+
+## Repository Hygiene Rules
+- Keep the repository root limited to entry-point configuration, top-level documentation, and launch files.
+- Do not create scratch, temporary, generated, benchmark-output, or assistant-session files in the repository root.
+- Put long-form documentation under `docs/`, exploratory work under `research/`, and generated outputs under an ignored artifact/output directory.
+- Never commit `.env`, credentials, tokens, database dumps, large raw market datasets, build caches, or generated frontend bundles.
+- Keep stable test fixtures small and place them with the tests that require them.
+- Use descriptive permanent filenames; avoid names such as `NEW.py`, `test2.py`, `rf5b.py`, or numbered scratch variants for production code.
+- Before adding a new top-level directory, document its purpose in `docs/REPOSITORY_STRUCTURE.md`.
+- Repository-organization work must be done on a dedicated branch and verified before merging into `main`.

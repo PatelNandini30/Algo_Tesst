@@ -45,3 +45,35 @@ backend/gop*.py
 backend/ovdbg*.py
 *.bak_*
 ai-skills-pack-main/
+
+# Environment files: keep local configuration out of Git.
+.env
+.env.*
+!.env.example
+
+# Common local/generated artifacts.
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+# Repository cleanup: raw exports and generated validation outputs.
+NFO_PREPARED/
+backend/prebuilt-next/
+/backend/*.xlsx
+/backend/_*.json
+/csv_schema_discovery_report.json
+/csv_schema_discovery_report.md
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+*.feather
+*.arrow
+# Deliberate test fixtures remain eligible for tracking.
+!backend/tests/fixtures/**/*.db
+!backend/tests/fixtures/**/*.sqlite
+!backend/tests/fixtures/**/*.sqlite3
+!backend/tests/fixtures/**/*.parquet
+!backend/tests/fixtures/**/*.feather
+!backend/tests/fixtures/**/*.arrow
+# frontend/build remains tracked while Dockerfile requires COPY build.
